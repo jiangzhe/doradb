@@ -46,6 +46,8 @@ pub enum Error {
     RowNotFound,
     #[error("insufficient free space for in-place update")]
     InsufficientFreeSpaceForInplaceUpdate,
+    #[error("Transaction system shutdown")]
+    TransactionSystemShutdown,
 }
 
 impl From<TryFromSliceError> for Error {

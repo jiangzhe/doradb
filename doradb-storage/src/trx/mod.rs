@@ -16,15 +16,24 @@
 //!       it's invisible, undo change and go to next version in the chain...
 //!    d) If less than current STS, return current version.
 pub mod redo;
-pub mod sys;
+pub mod sys_v1;
+pub mod sys_v10;
+pub mod sys_v3;
+pub mod sys_v4;
+pub mod sys_v5;
+pub mod sys_v6;
+pub mod sys_v7;
+pub mod sys_v8;
+pub mod sys_v9;
 pub mod undo;
 
 use crate::buffer::guard::PageGuard;
 use crate::buffer::FixedBufferPool;
 use crate::latch::LatchFallbackMode;
 use crate::row::RowPage;
-use crate::trx::redo::{RedoBin, RedoEntry, RedoLog};
+use crate::trx::redo::{RedoBin, RedoEntry, RedoKind, RedoLog};
 use crate::trx::undo::SharedUndoEntry;
+use crate::value::Val;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -40,6 +49,8 @@ pub const MIN_ACTIVE_TRX_ID: TrxID = (1 << 63) + 1;
 pub struct ActiveTrx {
     pub trx_id: Arc<AtomicU64>,
     pub sts: TrxID,
+    // which log partition it belongs to.
+    pub log_partition_idx: usize,
     // transaction-level undo logs.
     trx_undo: Vec<SharedUndoEntry>,
     // statement-level undo logs.
@@ -57,11 +68,17 @@ impl ActiveTrx {
         ActiveTrx {
             trx_id: Arc::new(AtomicU64::new(trx_id)),
             sts,
+            log_partition_idx: 0,
             trx_undo: vec![],
             stmt_undo: vec![],
             trx_redo: vec![],
             stmt_redo: vec![],
         }
+    }
+
+    #[inline]
+    pub fn set_log_partition(&mut self, log_partition_idx: usize) {
+        self.log_partition_idx = log_partition_idx;
     }
 
     /// Returns transaction id of current transaction.
@@ -130,11 +147,34 @@ impl ActiveTrx {
     pub fn rollback(self) {
         todo!()
     }
+
+    /// Add one redo log entry.
+    /// This function is only use for test purpose.
+    #[inline]
+    pub fn add_pseudo_redo_log_entry(&mut self) {
+        // self.trx_redo.push(RedoEntry{page_id: 0, row_id: 0, kind: RedoKind::Delete})
+        // simulate sysbench record
+        // uint64 + int32 + int32 + char(60) + char(120)
+        self.trx_redo.push(RedoEntry {
+            page_id: 0,
+            row_id: 0,
+            kind: RedoKind::Insert(vec![
+                Val::Byte8(123),
+                Val::Byte4(1),
+                Val::Byte4(2),
+                Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
+                Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
+            ]),
+        })
+    }
 }
+
+static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
+static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
 pub struct PreparedTrx {
-    pub trx_id: Arc<AtomicU64>,
+    trx_id: Arc<AtomicU64>,
     pub sts: TrxID,
     pub redo_bin: Option<RedoBin>,
     pub undo: Vec<SharedUndoEntry>,
@@ -145,7 +185,7 @@ impl PreparedTrx {
     pub fn fill_cts(self, cts: TrxID) -> PrecommitTrx {
         let mut redo_bin = self.redo_bin;
         if let Some(redo_bin) = redo_bin.as_mut() {
-            backfill_cts(redo_bin, cts);
+            // todo: fill cts into binary log.
         }
         PrecommitTrx {
             trx_id: self.trx_id,
@@ -157,18 +197,33 @@ impl PreparedTrx {
     }
 }
 
-#[inline]
-fn backfill_cts(redo_bin: &mut [u8], cts: TrxID) {
-    // todo
-}
-
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
 pub struct PrecommitTrx {
-    pub trx_id: Arc<AtomicU64>,
+    trx_id: Arc<AtomicU64>,
     pub sts: TrxID,
     pub cts: TrxID,
     pub redo_bin: Option<RedoBin>,
     pub undo: Vec<SharedUndoEntry>,
+}
+
+impl PrecommitTrx {
+    #[inline]
+    pub fn redo_bin_len(&self) -> usize {
+        self.redo_bin.as_ref().map(|bin| bin.len()).unwrap_or(0)
+    }
+
+    /// Commit this transaction, the only thing to do is replace ongoing transaction ids
+    /// in undo log with cts, and this is atomic operation.
+    #[inline]
+    pub fn commit(self) -> CommittedTrx {
+        assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
+        self.trx_id.store(self.cts, Ordering::SeqCst);
+        CommittedTrx {
+            sts: self.sts,
+            cts: self.cts,
+            undo: self.undo,
+        }
+    }
 }
 
 pub struct CommittedTrx {

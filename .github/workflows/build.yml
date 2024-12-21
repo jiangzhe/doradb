@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     services:
       mysql:
         image: mysql:8.0.30-debian
@@ -18,6 +18,8 @@ jobs:
           MYSQL_ROOT_PASSWORD: password
         options: --health-cmd="mysqladmin ping" --health-interval=5s --health-timeout=2s --health-retries=3
     steps:
+    - name: Install libaio
+      run: sudo apt-get install -y libaio1 libaio-dev
     - name: Checkout repository
       uses: actions/checkout@v2
     - name: Build
