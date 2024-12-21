@@ -1,16 +1,22 @@
-use crate::trx::redo::RedoLogger;
+use crate::error::{Error, Result};
+use crate::io::{
+    align_to_sector_size, pwrite, AIOError, AIOManager, AIOManagerConfig, Buf, DirectBuf,
+    FreeListWithFactory, IocbRawPtr, PageBuf, SparseFile, AIO,
+};
 use crate::trx::{
-    ActiveTrx, CommittedTrx, PrecommitTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS,
+    ActiveTrx, CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS,
     MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
 };
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
 use parking_lot::{Condvar, Mutex, MutexGuard};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::os::fd::{AsRawFd, RawFd};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// TransactionSystem controls lifecycle of all transactions.
 ///
@@ -61,16 +67,10 @@ pub struct TransactionSystem {
     ///
     /// Note: this field may not reflect the latest value, but is enough for GC purpose.
     min_active_sts: CachePadded<AtomicU64>,
-    /// Group commit implementation.
-    group_commit: CachePadded<Mutex<GroupCommit>>,
-    /// list of precommitted transactions.
-    /// Once user sends COMMIT command or statement is auto-committed. The transaction
-    /// will be assign CTS and put into this list, waiting for log writer thread to
-    /// persist its
-    // precommit_trx_list: CachePadded<(Mutex<Vec<PrecommitTrx>>, Condvar)>,
-    /// Rollbacked transaction snapshot timestamp list.
-    /// This list is used to calculate active sts list.
-    rollback_sts_list: CachePadded<Mutex<BTreeSet<TrxID>>>,
+    /// Round-robin partition id generator.
+    partition_id: CachePadded<AtomicUsize>,
+    /// Multiple log partitions.
+    log_partitions: CachePadded<Box<[CachePadded<LogPartition>]>>,
     /// Persisted commit timestamp is the maximum commit timestamp of all persisted redo
     /// logs. Precommit transactions are already notified by group committer. This global
     /// atomic variable is used by query or GC thread to perform GC.
@@ -79,23 +79,11 @@ pub struct TransactionSystem {
     /// When a transaction is committed, it will be put into this queue in sequence.
     /// Head is always oldest and tail is newest.
     gc_info: CachePadded<Mutex<GCInfo>>,
-    /// Log writer controls how to persist redo log buffer to disk.
-    redo_logger: Mutex<Option<Box<dyn RedoLogger>>>,
-    /// Background GC thread identify which transactions can be garbage collected and
-    /// calculate watermark for other thread to cooperate.
-    gc_thread: Mutex<Option<GCThread>>,
+    /// Transaction system configuration.
+    config: CachePadded<TrxSysConfig>,
 }
 
 impl TransactionSystem {
-    /// Create a static transaction system.
-    /// Which can be used in multi-threaded environment.
-    #[inline]
-    pub fn new_static() -> &'static Self {
-        let sys = Self::new();
-        let boxed = Box::new(sys);
-        Box::leak(boxed)
-    }
-
     /// Drop static transaction system.
     ///
     /// # Safety
@@ -116,7 +104,16 @@ impl TransactionSystem {
         let trx_id = sts | (1 << 63);
         debug_assert!(sts < MAX_SNAPSHOT_TS);
         debug_assert!(trx_id >= MIN_ACTIVE_TRX_ID);
-        ActiveTrx::new(trx_id, sts)
+        // assign log partition index so current transaction will stick
+        // to certain log partititon for commit.
+        let log_partition_idx = if self.config.log_partitions == 1 {
+            0
+        } else {
+            self.partition_id.fetch_add(1, Ordering::Relaxed) % self.config.log_partitions
+        };
+        let mut trx = ActiveTrx::new(trx_id, sts);
+        trx.set_log_partition(log_partition_idx);
+        trx
     }
 
     /// Commit an active transaction.
@@ -126,469 +123,82 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub fn commit(&self, trx: ActiveTrx) {
+    pub async fn commit(&self, trx: ActiveTrx) -> Result<()> {
         // Prepare redo log first, this may take some time,
-        // so keep it out of lock scope, and only fill cts then.
+        // so keep it out of lock scope, and we can fill cts after the lock is held.
+        let partition = &*self.log_partitions[trx.log_partition_idx];
         let prepared_trx = trx.prepare();
-        // start group commit
-        let mut group_commit_g = self.group_commit.lock();
-        let cts = self.ts.fetch_add(1, Ordering::SeqCst);
-        debug_assert!(cts < MAX_COMMIT_TS);
-        let precommit_trx = prepared_trx.fill_cts(cts);
-        match group_commit_g.groups.len() {
-            0 => self.act_as_single_trx_leader(precommit_trx, group_commit_g),
-            1 => {
-                let curr_group = group_commit_g.groups.front_mut().unwrap();
-                match &mut curr_group.kind {
-                    // There is only one commit group and it's processing, so current thread
-                    // becomes leader of next group, and waits for previous one to finish,
-                    // and then start processing.
-                    CommitGroupKind::Processing => {
-                        self.act_as_next_group_leader(precommit_trx, group_commit_g)
-                    }
-                    kind => {
-                        // this is the second transaction entering a non-started commit group,
-                        // it should add itself to this group and setup notifier.
-                        debug_assert!({
-                            (matches!(kind, CommitGroupKind::Single(_))
-                                && curr_group.notifier.is_none())
-                                || (matches!(kind, CommitGroupKind::Multi(_))
-                                    && curr_group.notifier.is_some())
-                        });
-                        kind.add_trx(precommit_trx);
-                        let notify = curr_group
-                            .notifier
-                            .get_or_insert_with(|| Arc::new(CommitGroupNotify::default()));
-                        let notify = Arc::clone(notify);
-                        drop(group_commit_g); // release lock to let other transactions enter or leader start.
-
-                        // wait for leader to finish group commit
-                        loop {
-                            let mut status_g = notify.status.lock();
-                            if status_g.finished {
-                                // in current implementation, persisted cts must be greater than or equal to
-                                // cts of any transaction in the same group.
-                                debug_assert!(cts <= status_g.persisted_cts);
-                                break;
-                            }
-                            notify.follower_cv.wait(&mut status_g);
-                        }
-                    }
-                }
+        if prepared_trx.redo_bin.is_none() {
+            if prepared_trx.undo.is_empty() {
+                // This is a read-only transaction, so directly return is ok.
+                // self.log_partitions[trx.log_partition_idx].end_active_sts(trx.sts);
+                return Ok(());
             }
-            2 => {
-                // This is common scenario: previous group commit is running, and next group is already established.
-                // Just join it.
-                debug_assert!(matches!(
-                    group_commit_g.groups.front().unwrap().kind,
-                    CommitGroupKind::Processing
-                ));
-                debug_assert!(!matches!(
-                    group_commit_g.groups.back().unwrap().kind,
-                    CommitGroupKind::Processing
-                ));
-                let curr_group = group_commit_g.groups.back_mut().unwrap();
-                debug_assert!({
-                    (matches!(&curr_group.kind, CommitGroupKind::Single(_))
-                        && curr_group.notifier.is_none())
-                        || (matches!(&curr_group.kind, CommitGroupKind::Multi(_))
-                            && curr_group.notifier.is_some())
-                });
-                curr_group.kind.add_trx(precommit_trx);
-                let notify = curr_group
-                    .notifier
-                    .get_or_insert_with(|| Arc::new(CommitGroupNotify::default()));
-                let notify = Arc::clone(notify);
-                drop(group_commit_g); // release lock to let other transactions enter or leader start.
-
-                // wait for leader to finish group commit
-                loop {
-                    let mut status_g = notify.status.lock();
-                    if status_g.finished {
-                        // in current implementation, persisted cts must be greater than or equal to
-                        // cts of any transaction in the same group.
-                        debug_assert!(cts <= status_g.persisted_cts);
-                        break;
-                    }
-                    notify.follower_cv.wait(&mut status_g);
-                }
-            }
-            _ => unreachable!("group commit can only have two groups at the same time"),
+            // There might be scenario that the transaction does not change anything
+            // logically, but have undo logs.
+            // For example, a transaction
+            // 1) insert one row.
+            // 2) delete it.
+            // 3) commit.
+            //
+            // The preparation should shrink redo logs on row level and finally there
+            // is no redo entry. But we have undo logs and already put them into
+            // page-level undo maps.
+            // In such case, we pass this transaction to group commit, and it will
+            // directly succeeds if it's group leader.
+            // Otherwise, it always joins last group successfully.
         }
+        // start group commit
+        partition.commit(prepared_trx, &self.ts).await
+
+        // partition.end_active_sts(trx.sts);
     }
 
     /// Rollback active transaction.
     #[inline]
     pub fn rollback(&self, trx: ActiveTrx) {
-        let sts = trx.sts;
+        // let sts = trx.sts;
+        // let log_partition_idx = trx.log_partition_idx;
         trx.rollback();
-        let mut g = self.rollback_sts_list.lock();
-        let rollback_inserted = g.insert(sts);
-        debug_assert!(rollback_inserted);
+        // self.log_partitions[log_partition_idx].end_active_sts(sts);
     }
 
-    /// Start background GC thread.
-    /// This method should be called once transaction system is initialized.
+    /// Returns statistics of group commit.
     #[inline]
-    pub fn start_gc_thread(&'static self) {
-        let mut gc_thread_g = self.gc_thread.lock();
-        if gc_thread_g.is_some() {
-            panic!("GC thread should be created only once");
+    pub fn trx_sys_stats(&self) -> TrxSysStats {
+        let mut stats = TrxSysStats::default();
+        for partition in &*self.log_partitions {
+            stats.trx_count += partition.stats.trx_count.load(Ordering::Relaxed);
+            stats.commit_count += partition.stats.commit_count.load(Ordering::Relaxed);
+            stats.log_bytes += partition.stats.log_bytes.load(Ordering::Relaxed);
+            stats.sync_count += partition.stats.sync_count.load(Ordering::Relaxed);
+            stats.sync_nanos += partition.stats.sync_nanos.load(Ordering::Relaxed);
+            stats.io_submit_count += partition.stats.io_submit_count.load(Ordering::Relaxed);
+            stats.io_submit_nanos += partition.stats.io_submit_nanos.load(Ordering::Relaxed);
+            stats.io_wait_count += partition.stats.io_wait_count.load(Ordering::Relaxed);
+            stats.io_wait_nanos += partition.stats.io_wait_nanos.load(Ordering::Relaxed);
         }
-        let (tx, rx) = flume::unbounded();
-        let handle = thread::Builder::new()
-            .name("GC-Thread".to_string())
-            .spawn(move || {
-                while let Ok(committed_trx_list) = rx.recv() {
-                    self.gc(committed_trx_list);
-                }
-            })
+        stats
+    }
+
+    /// Start background sync thread.
+    /// This method should be called once transaction system is initialized,
+    /// and should after start_gc_thread().
+    #[inline]
+    fn start_sync_threads(&'static self) {
+        // Start threads for all log partitions
+        for (idx, partition) in self.log_partitions.iter().enumerate() {
+            let thread_name = format!("Sync-Thread-{}", idx);
+            let partition = &**partition;
+
+            let builder = thread::Builder::new().name(thread_name);
+            let handle = if self.config.log_drop {
+                builder.spawn(move || partition.io_loop_noop(&self.config))
+            } else {
+                builder.spawn(move || partition.io_loop(&self.config))
+            }
             .unwrap();
-
-        *gc_thread_g = Some(GCThread(handle));
-        drop(gc_thread_g); // release lock here
-
-        // put sender into group commit, so group commit leader can send
-        // persisted transaction list to GC thread.
-        let mut group_commit_g = self.group_commit.lock();
-        debug_assert!(group_commit_g.gc_chan.is_none());
-        group_commit_g.gc_chan = Some(tx);
-    }
-
-    /// Stop background GC thread.
-    /// The method should be called before shutdown transaction system if GC thread
-    /// is enabled.
-    #[inline]
-    pub fn stop_gc_thread(&self) {
-        let mut group_commit_g = self.group_commit.lock();
-        if group_commit_g.gc_chan.is_none() {
-            return;
-        }
-        group_commit_g.gc_chan = None;
-        drop(group_commit_g);
-
-        let mut gc_thread_g = self.gc_thread.lock();
-        if let Some(gc_thread) = gc_thread_g.take() {
-            gc_thread.0.join().unwrap();
-        } else {
-            panic!("GC thread should be stopped only once");
-        }
-    }
-
-    /// Set redo logger.
-    #[inline]
-    pub fn set_redo_logger(&self, logger: Box<dyn RedoLogger>) {
-        let mut logger_g = self.redo_logger.lock();
-        if logger_g.is_some() {
-            panic!("redo logger can be set only once");
-        }
-        *logger_g = Some(logger);
-    }
-
-    #[inline]
-    fn commit_single_trx(
-        &self,
-        trx: PrecommitTrx,
-        gc_chan: Option<Sender<Vec<CommittedTrx>>>,
-    ) -> TrxID {
-        let cts = trx.cts;
-        
-        // persist log
-        if let Some(redo_bin) = trx.redo_bin {
-            let mut g = self.redo_logger.lock();
-            if let Some(logger) = g.as_mut() {
-                logger.write(trx.cts, redo_bin);
-                logger.sync();
-            }
-        }
-
-        // backfill cts
-        trx.trx_id.store(cts, Ordering::SeqCst);
-
-        // update global persisted cts.
-        // this is safe because group commit allows only one commit group
-        // to execute, so the update values of persisted cts is always
-        // monotonously increasing.
-        self.persisted_cts.store(cts, Ordering::SeqCst);
-
-        if let Some(gc_chan) = gc_chan {
-            let _ = gc_chan.send(vec![CommittedTrx {
-                sts: trx.sts,
-                cts: trx.cts,
-                undo: trx.undo,
-            }]);
-        }
-        cts
-    }
-
-    #[inline]
-    fn commit_multi_trx(
-        &self,
-        mut trx_list: Vec<PrecommitTrx>,
-        gc_chan: Option<Sender<Vec<CommittedTrx>>>,
-    ) -> TrxID {
-        debug_assert!(trx_list.len() > 1);
-        debug_assert!({
-            trx_list
-                .iter()
-                .zip(trx_list.iter().skip(1))
-                .all(|(l, r)| l.cts < r.cts)
-        });
-        let max_cts = trx_list.last().unwrap().cts;
-        
-        // persist log
-        {
-            let mut g = self.redo_logger.lock();
-            if let Some(logger) = g.as_mut() {
-                for trx in &mut trx_list {
-                    if let Some(redo_bin) = trx.redo_bin.take() {
-                        logger.write(trx.cts, redo_bin);
-                    }
-                }
-                logger.sync();
-            }
-        }
-        // Instead of letting each thread backfill its CTS in undo logs,
-        // we delegate this action to group commit leader because it's
-        // a very cheap operation via Arc<AtomicU64>::store().
-        for trx in &trx_list {
-            trx.trx_id.store(trx.cts, Ordering::SeqCst);
-        }
-
-        // update global persisted cts.
-        // this is safe because group commit allows only one commit group
-        // to execute, so the update values of persisted cts is always
-        // monotonously increasing.
-        self.persisted_cts.store(max_cts, Ordering::SeqCst);
-
-        if let Some(gc_chan) = gc_chan {
-            let _ = gc_chan.send(
-                trx_list
-                    .into_iter()
-                    .map(|trx| CommittedTrx {
-                        sts: trx.sts,
-                        cts: trx.cts,
-                        undo: trx.undo,
-                    })
-                    .collect(),
-            );
-        }
-        max_cts
-    }
-
-    #[inline]
-    fn act_as_single_trx_leader(
-        &self,
-        precommit_trx: PrecommitTrx,
-        mut group_commit_g: MutexGuard<'_, GroupCommit>,
-    ) {
-        // no group commit running, current thread is just leader and do single transaction commit.
-        let new_group = CommitGroup {
-            kind: CommitGroupKind::Processing,
-            notifier: None,
-        };
-        group_commit_g.groups.push_back(new_group);
-        let gc_chan = group_commit_g.gc_chan.clone();
-        drop(group_commit_g);
-
-        let cts = self.commit_single_trx(precommit_trx, gc_chan);
-
-        // Here we remove the first finished group and let other transactions to enter commit phase.
-        // new transaction may join the group which is not started, or form a new group and wait.
-        let curr_group = {
-            let mut group_commit_g = self.group_commit.lock();
-            debug_assert!(group_commit_g.groups.len() >= 1);
-            debug_assert!(matches!(
-                group_commit_g.groups.front().unwrap().kind,
-                CommitGroupKind::Processing
-            ));
-            group_commit_g.groups.pop_front().unwrap()
-        };
-
-        // Now notify follower to make progress if any.
-        if let Some(notifier) = curr_group.notifier {
-            let mut g = notifier.status.lock();
-            g.finished = true;
-            g.persisted_cts = cts;
-            notifier.follower_cv.notify_one();
-        }
-    }
-
-    #[inline]
-    fn act_as_next_group_leader(
-        &self,
-        precommit_trx: PrecommitTrx,
-        mut group_commit_g: MutexGuard<'_, GroupCommit>,
-    ) {
-        // First group is processing, so become leader and create a new group.
-        let new_group = CommitGroup {
-            kind: CommitGroupKind::Single(precommit_trx),
-            notifier: None,
-        };
-        group_commit_g.groups.push_back(new_group);
-
-        // Become follower of first group. If there is no notifier, add one.
-        let notify = group_commit_g
-            .groups
-            .front_mut()
-            .unwrap()
-            .notifier
-            .get_or_insert_with(|| Arc::new(CommitGroupNotify::default()));
-        let notify = Arc::clone(&notify);
-        drop(group_commit_g); // release lock to let other transactions join the new group.
-
-        // Wait until first group to finish.
-        loop {
-            let mut status_g = notify.status.lock();
-            if status_g.finished {
-                // does not care about persisted cts
-                break;
-            }
-            notify.follower_cv.wait(&mut status_g);
-        }
-
-        // now previous group finishes, start current group.
-        let (kind, gc_chan) = {
-            let mut group_commit_g = self.group_commit.lock();
-            // previous leader removed its group before notifying next leader.
-            // and new transactions must join this group because it's not started.
-            // so group count must be 1.
-            debug_assert!(group_commit_g.groups.len() == 1);
-            let curr_group = group_commit_g.groups.front_mut().unwrap();
-            let kind = mem::replace(&mut curr_group.kind, CommitGroupKind::Processing);
-            let gc_chan = group_commit_g.gc_chan.clone();
-            (kind, gc_chan)
-        }; // Here release the lock so other transactions can form new group.
-
-        // persist redo log, backfill cts for each transaction, and get back maximum persisted cts.
-        let persisted_cts = match kind {
-            CommitGroupKind::Single(trx) => self.commit_single_trx(trx, gc_chan),
-            CommitGroupKind::Multi(trx_list) => self.commit_multi_trx(trx_list, gc_chan),
-            _ => unreachable!("invalid group commit kind"),
-        };
-
-        let curr_group = {
-            let mut group_commit_g = self.group_commit.lock();
-            debug_assert!(group_commit_g.groups.len() >= 1);
-            debug_assert!(matches!(
-                group_commit_g.groups.front().unwrap().kind,
-                CommitGroupKind::Processing
-            ));
-            group_commit_g.groups.pop_front().unwrap()
-        };
-
-        if let Some(notifier) = curr_group.notifier {
-            let mut g = notifier.status.lock();
-            g.finished = true;
-            g.persisted_cts = persisted_cts;
-            notifier.follower_cv.notify_all();
-        }
-    }
-
-    #[inline]
-    fn gc(&self, trx_list: Vec<CommittedTrx>) {
-        if trx_list.is_empty() {
-            return;
-        }
-        let persisted_cts = trx_list
-            .last()
-            .expect("committed transaction list is not empty")
-            .cts;
-
-        // Re-calculate GC info, including active_sts_list, committed_trx_list, old_trx_list
-        // min_active_sts.
-        {
-            let mut gc_info_g = self.gc_info.lock();
-
-            let GCInfo {
-                committed_trx_list,
-                old_trx_list,
-                active_sts_list,
-            } = &mut *gc_info_g;
-
-            // swap out active sts list for update.
-            let mut next_active_sts_list = mem::take(active_sts_list);
-
-            // add all potential active sts
-            let next_min_active_sts = if let Some(max) = next_active_sts_list.last() {
-                *max + 1
-            } else {
-                MIN_SNAPSHOT_TS
-            };
-            let next_max_active_sts = self.ts.load(Ordering::Relaxed);
-            for ts in next_min_active_sts..next_max_active_sts {
-                let sts_inserted = next_active_sts_list.insert(ts);
-                debug_assert!(sts_inserted);
-            }
-
-            // remove sts and cts of committed transactions
-            for trx in &trx_list {
-                let sts_removed = next_active_sts_list.remove(&trx.sts);
-                debug_assert!(sts_removed);
-                let cts_removed = next_active_sts_list.remove(&trx.cts);
-                debug_assert!(cts_removed);
-            }
-
-            // remove rollback sts
-            {
-                let mut removed_rb_sts = vec![];
-                let mut rb_g = self.rollback_sts_list.lock();
-                for rb_sts in (&rb_g).iter() {
-                    if next_active_sts_list.remove(rb_sts) {
-                        removed_rb_sts.push(*rb_sts);
-                    } // otherwise, rollback trx is added after latest sts is acquired, which should be very rare.
-                }
-                for rb_sts in removed_rb_sts {
-                    let rb_sts_removed = rb_g.remove(&rb_sts);
-                    debug_assert!(rb_sts_removed);
-                }
-            }
-            // calculate smallest active sts
-            // 1. if active_sts_list is empty, means there is no new transaction after group commit.
-            // so maximum persisted cts + 1 can be used.
-            // 2. otherwise, use minimum value in active_sts_list.
-            let min_active_sts = if let Some(min) = next_active_sts_list.first() {
-                *min
-            } else {
-                persisted_cts + 1
-            };
-
-            // update smallest active sts
-            self.min_active_sts.store(min_active_sts, Ordering::SeqCst);
-
-            // update active_sts_list
-            *active_sts_list = next_active_sts_list;
-
-            // populate committed transaction list
-            committed_trx_list.extend(trx_list);
-
-            // move committed transactions to old transaction list, waiting for GC.
-            while let Some(trx) = committed_trx_list.front() {
-                if trx.cts < min_active_sts {
-                    old_trx_list.push(committed_trx_list.pop_front().unwrap());
-                } else {
-                    break;
-                }
-            }
-
-            // todo: implement undo cleaner based on old transaction list.
-            // currently just ignore.
-            old_trx_list.clear();
-        }
-    }
-
-    #[inline]
-    fn new() -> Self {
-        TransactionSystem {
-            ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            min_active_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            group_commit: CachePadded::new(Mutex::new(GroupCommit::new())),
-            rollback_sts_list: CachePadded::new(Mutex::new(BTreeSet::new())),
-            // initialize to MIN_SNAPSHOT_TS is fine, the actual value relies on recovery process.
-            persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            gc_info: CachePadded::new(Mutex::new(GCInfo::new())),
-            redo_logger: Mutex::new(None),
-            gc_thread: Mutex::new(None),
+            *partition.sync_thread.lock() = Some(handle);
         }
     }
 }
@@ -598,8 +208,598 @@ unsafe impl Sync for TransactionSystem {}
 impl Drop for TransactionSystem {
     #[inline]
     fn drop(&mut self) {
-        self.stop_gc_thread();
+        let log_partitions = &*self.log_partitions;
+        // notify sync thread to quit for each log partition.
+        for partition in log_partitions {
+            let mut group_commit_g = partition.group_commit.0.lock();
+            group_commit_g.queue.push_back(CommitMessage::Shutdown);
+            if group_commit_g.queue.len() == 1 {
+                partition.group_commit.1.notify_one(); // notify sync thread to quit.
+            }
+        }
+        for partition in log_partitions {
+            let sync_thread = { partition.sync_thread.lock().take().unwrap() };
+            sync_thread.join().unwrap();
+        }
+        // finally close log files
+        for partition in log_partitions {
+            let mut group_commit_g = partition.group_commit.0.lock();
+            let log_file = group_commit_g.log_file.take().unwrap();
+            partition.aio_mgr.drop_sparse_file(log_file);
+        }
     }
+}
+
+pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
+pub const DEFAULT_LOG_IO_MAX_SIZE: usize = 8192;
+pub const DEFAULT_LOG_FILE_PREFIX: &'static str = "redo.log";
+pub const DEFAULT_LOG_PARTITIONS: usize = 1;
+pub const MAX_LOG_PARTITIONS: usize = 99; // big enough for log partitions, so fix two digits in file name.
+pub const DEFAULT_LOG_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GB, sparse file will not occupy space until actual write.
+pub const DEFAULT_LOG_SYNC: LogSync = LogSync::Fsync;
+pub const DEFAULT_LOG_DROP: bool = false;
+pub const DEFAULT_GC: bool = false;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSync {
+    None,
+    Fsync,
+    Fdatasync,
+}
+
+impl FromStr for LogSync {
+    type Err = Error;
+
+    #[inline]
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("fsync") {
+            Ok(LogSync::Fsync)
+        } else if s.eq_ignore_ascii_case("fdatasync") {
+            Ok(LogSync::Fdatasync)
+        } else if s.eq_ignore_ascii_case("none") {
+            Ok(LogSync::None)
+        } else {
+            Err(Error::InvalidArgument)
+        }
+    }
+}
+
+pub struct TrxSysConfig {
+    // Controls infight IO request number of each log file.
+    io_depth_per_log: usize,
+    // Controls maximum IO size of each IO request.
+    // This only limit the combination of multiple transactions.
+    // If single transaction has very large redo log. It is kept
+    // what it is and send to AIO manager as one IO request.
+    max_io_size: usize,
+    // Prefix of log file.
+    // the complete file name pattern is:
+    // <file-prefix>.<partition_idx>.<file-sequence>
+    // e.g. redo.log.0.00000001
+    log_file_prefix: String,
+    // Log partition number.
+    log_partitions: usize,
+    // Controls the maximum size of each log file.
+    // Log file will be rotated once the size limit is reached.
+    // a u32 suffix is appended at end of the file name in
+    // hexdigit format.
+    log_file_max_size: usize,
+    // Controls which method to sync data on disk.
+    // By default, use fsync(),
+    // Can be switched to fdatasync() or not sync.
+    log_sync: LogSync,
+    // Drop log directly. If this parameter is set to true,
+    // log_sync parameter will be discarded.
+    log_drop: bool,
+    gc: bool,
+}
+
+impl TrxSysConfig {
+    /// How many commits can be issued concurrently.
+    #[inline]
+    pub fn io_depth_per_log(mut self, io_depth_per_log: usize) -> Self {
+        self.io_depth_per_log = io_depth_per_log;
+        self
+    }
+
+    /// How large single IO operation can be.
+    #[inline]
+    pub fn max_io_size(mut self, max_io_size: usize) -> Self {
+        self.max_io_size = max_io_size;
+        self
+    }
+
+    /// Whether to enable GC.
+    #[inline]
+    pub fn gc(mut self, gc: bool) -> Self {
+        self.gc = gc;
+        self
+    }
+
+    /// Log file name.
+    #[inline]
+    pub fn log_file_prefix(mut self, log_file_prefix: String) -> Self {
+        self.log_file_prefix = log_file_prefix;
+        self
+    }
+
+    /// Maximum size of single log file.
+    #[inline]
+    pub fn log_file_max_size(mut self, log_file_max_size: usize) -> Self {
+        self.log_file_max_size = align_to_sector_size(log_file_max_size);
+        self
+    }
+
+    /// Controls how many files can be used for concurrent logging.
+    #[inline]
+    pub fn log_partitions(mut self, log_partitions: usize) -> Self {
+        assert!(log_partitions > 0 && log_partitions <= MAX_LOG_PARTITIONS);
+        self.log_partitions = log_partitions;
+        self
+    }
+
+    /// Sync method of log files.
+    #[inline]
+    pub fn log_sync(mut self, log_sync: LogSync) -> Self {
+        self.log_sync = log_sync;
+        self
+    }
+
+    #[inline]
+    pub fn log_drop(mut self, log_drop: bool) -> Self {
+        self.log_drop = log_drop;
+        self
+    }
+
+    fn setup_log_partition(&self, idx: usize) -> LogPartition {
+        let aio_mgr = AIOManagerConfig::default()
+            .max_events(self.io_depth_per_log)
+            .build()
+            .expect("create AIO manager");
+
+        let file_seq = 0;
+        let file_name = log_file_name(&self.log_file_prefix, idx, file_seq);
+        let log_file = aio_mgr
+            .create_sparse_file(&file_name, self.log_file_max_size)
+            .expect("create log file");
+
+        let group_commit = GroupCommit {
+            queue: VecDeque::new(),
+            log_file: Some(log_file),
+            file_seq,
+        };
+        let max_io_size = self.max_io_size;
+        LogPartition {
+            group_commit: CachePadded::new((Mutex::new(group_commit), Condvar::new())),
+            persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+            aio_mgr,
+            idx,
+            max_io_size,
+            file_prefix: log_file_prefix(&self.log_file_prefix, idx),
+            buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
+                PageBuf::uninit(max_io_size)
+            }),
+            sync_thread: Mutex::new(None),
+            stats: CachePadded::new(LogPartitionStats::default()),
+        }
+    }
+
+    /// Build transaction system with logging and GC, leak it to heap
+    /// for the convenience to share the singleton among multiple threads.
+    #[inline]
+    pub fn build_static(self) -> &'static TransactionSystem {
+        let mut log_partitions = Vec::with_capacity(self.log_partitions);
+        for idx in 0..self.log_partitions {
+            let partition = self.setup_log_partition(idx);
+            log_partitions.push(CachePadded::new(partition));
+        }
+        let trx_sys = TransactionSystem {
+            ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+            min_active_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+            partition_id: CachePadded::new(AtomicUsize::new(0)),
+            log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
+            persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+            gc_info: CachePadded::new(Mutex::new(GCInfo::new())),
+            config: CachePadded::new(self),
+        };
+        let trx_sys = Box::leak(Box::new(trx_sys));
+        trx_sys.start_sync_threads();
+        trx_sys
+    }
+}
+
+impl Default for TrxSysConfig {
+    #[inline]
+    fn default() -> Self {
+        TrxSysConfig {
+            io_depth_per_log: DEFAULT_LOG_IO_DEPTH,
+            max_io_size: DEFAULT_LOG_IO_MAX_SIZE,
+            log_file_prefix: String::from(DEFAULT_LOG_FILE_PREFIX),
+            log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,
+            log_partitions: DEFAULT_LOG_PARTITIONS,
+            log_sync: DEFAULT_LOG_SYNC,
+            log_drop: DEFAULT_LOG_DROP,
+            gc: DEFAULT_GC,
+        }
+    }
+}
+
+struct LogPartition {
+    // Group commit of this partition.
+    group_commit: CachePadded<(Mutex<GroupCommit>, Condvar)>,
+    // Maximum persisted CTS of this partition.
+    persisted_cts: CachePadded<AtomicU64>,
+    /// AIO manager to handle async IO with libaio.
+    aio_mgr: AIOManager,
+    // Index of log partition in total partitions, starts from 0.
+    idx: usize,
+    // Maximum IO size of each group.
+    max_io_size: usize,
+    // Log file prefix, including partition number.
+    file_prefix: String,
+    // Free list of page buffer, which is used by commit group to concat
+    // redo logs.
+    buf_free_list: FreeListWithFactory<PageBuf>,
+    // Standalone thread to handle transaction commit.
+    // Including submit IO requests, wait IO responses
+    // and do fsync().
+    sync_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Stats of transaction system.
+    stats: CachePadded<LogPartitionStats>,
+}
+
+impl LogPartition {
+    #[inline]
+    fn buf(&self, data: &[u8]) -> Buf {
+        if data.len() > self.max_io_size {
+            let buf = DirectBuf::uninit(data.len());
+            Buf::Direct(buf)
+        } else {
+            let mut buf = self.buf_free_list.pop_elem_or_new();
+            buf.set_len(data.len());
+            buf.clone_from_slice(0, data);
+            Buf::Reuse(buf)
+        }
+    }
+
+    #[inline]
+    fn create_new_group(
+        &self,
+        mut trx: PrecommitTrx,
+        mut group_commit_g: MutexGuard<'_, GroupCommit>,
+    ) -> Receiver<()> {
+        let cts = trx.cts;
+        let redo_bin = trx.redo_bin.take().unwrap();
+        debug_assert!(!redo_bin.is_empty());
+        // inside the lock, we only need to determine which range of the log file this transaction
+        // should write to.
+        let log_file = group_commit_g.log_file.as_ref().unwrap();
+        let offset = match log_file.alloc(redo_bin.len()) {
+            Ok((offset, _)) => offset,
+            Err(AIOError::OutOfRange) => {
+                // todo: rotate if log file is full.
+                todo!();
+            }
+            Err(_) => unreachable!(),
+        };
+        let fd = log_file.as_raw_fd();
+        let log_buf = self.buf(&redo_bin);
+        let (sync_signal, sync_notifier) = flume::unbounded();
+        let new_group = CommitGroup {
+            trx_list: vec![trx],
+            max_cts: cts,
+            fd,
+            offset,
+            log_buf,
+            sync_signal,
+            sync_notifier: sync_notifier.clone(),
+        };
+        group_commit_g
+            .queue
+            .push_back(CommitMessage::Group(new_group));
+        drop(group_commit_g);
+
+        sync_notifier
+    }
+
+    /// Transaction has no redo log, so we can just acquire CTS and finish it immediately.
+    #[inline]
+    fn commit_without_redo(&self, trx: PreparedTrx, ts: &AtomicU64) {
+        let sts = trx.sts;
+        let cts = ts.fetch_add(1, Ordering::SeqCst);
+        let committed_trx = trx.fill_cts(cts).commit();
+        // todo: GC
+        // self.end_active_sts(sts);
+    }
+
+    #[inline]
+    async fn commit(&self, trx: PreparedTrx, ts: &AtomicU64) -> Result<()> {
+        if trx.redo_bin.is_none() {
+            self.commit_without_redo(trx, ts);
+            return Ok(());
+        }
+        let mut group_commit_g = self.group_commit.0.lock();
+        let cts = ts.fetch_add(1, Ordering::SeqCst);
+        debug_assert!(cts < MAX_COMMIT_TS);
+        let precommit_trx = trx.fill_cts(cts);
+        if group_commit_g.queue.is_empty() {
+            let sync_notifier = self.create_new_group(precommit_trx, group_commit_g);
+            self.group_commit.1.notify_one(); // notify sync thread to work.
+
+            let _ = sync_notifier.recv_async().await; // wait for fsync
+            assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
+            return Ok(());
+        }
+        let last_group = match group_commit_g.queue.back_mut().unwrap() {
+            CommitMessage::Shutdown => return Err(Error::TransactionSystemShutdown),
+            CommitMessage::Group(group) => group,
+        };
+        if last_group.can_join(&precommit_trx) {
+            let sync_notifier = last_group.join(precommit_trx);
+            drop(group_commit_g); // unlock to let other transactions to enter commit phase.
+
+            let _ = sync_notifier.recv_async().await; // wait for fsync
+            assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
+            return Ok(());
+        }
+
+        let sync_notifier = self.create_new_group(precommit_trx, group_commit_g);
+
+        let _ = sync_notifier.recv_async().await; // wait for fsync
+        assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
+        Ok(())
+    }
+
+    #[inline]
+    fn update_stats(
+        &self,
+        trx_count: usize,
+        commit_count: usize,
+        log_bytes: usize,
+        sync_count: usize,
+        sync_nanos: usize,
+    ) {
+        self.stats.trx_count.fetch_add(trx_count, Ordering::Relaxed);
+        self.stats
+            .commit_count
+            .fetch_add(commit_count, Ordering::Relaxed);
+        self.stats.log_bytes.fetch_add(log_bytes, Ordering::Relaxed);
+        self.stats
+            .sync_count
+            .fetch_add(sync_count, Ordering::Relaxed);
+        self.stats
+            .sync_nanos
+            .fetch_add(sync_nanos, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn try_fetch_io_reqs(
+        &self,
+        io_reqs: &mut Vec<IocbRawPtr>,
+        sync_groups: &mut VecDeque<SyncGroup>,
+    ) -> bool {
+        let mut group_commit_g = self.group_commit.0.lock();
+        loop {
+            match group_commit_g.queue.pop_front() {
+                None => return false,
+                Some(CommitMessage::Shutdown) => return true,
+                Some(CommitMessage::Group(cg)) => {
+                    let (iocb_ptr, sg) = cg.split();
+                    io_reqs.push(iocb_ptr);
+                    sync_groups.push_back(sg);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn fetch_io_reqs(
+        &self,
+        io_reqs: &mut Vec<IocbRawPtr>,
+        sync_groups: &mut VecDeque<SyncGroup>,
+    ) -> bool {
+        let mut group_commit_g = self.group_commit.0.lock();
+        loop {
+            loop {
+                match group_commit_g.queue.pop_front() {
+                    None => break,
+                    Some(CommitMessage::Shutdown) => {
+                        return true;
+                    }
+                    Some(CommitMessage::Group(cg)) => {
+                        let (iocb_ptr, sg) = cg.split();
+                        io_reqs.push(iocb_ptr);
+                        sync_groups.push_back(sg);
+                    }
+                }
+            }
+            if !io_reqs.is_empty() {
+                return false;
+            }
+            self.group_commit
+                .1
+                .wait_for(&mut group_commit_g, Duration::from_secs(1));
+        }
+    }
+
+    #[inline]
+    fn io_loop_noop(&self, config: &TrxSysConfig) {
+        let io_depth = config.io_depth_per_log;
+        let mut io_reqs = Vec::with_capacity(io_depth * 2);
+        let mut sync_groups = VecDeque::with_capacity(io_depth * 2);
+        let mut shutdown = false;
+        loop {
+            if !shutdown {
+                shutdown |= self.fetch_io_reqs(&mut io_reqs, &mut sync_groups);
+            }
+            if !io_reqs.is_empty() {
+                let mut trx_count = 0;
+                let mut commit_count = 0;
+                let mut log_bytes = 0;
+                for sg in &sync_groups {
+                    trx_count += sg.trx_list.len();
+                    commit_count += 1;
+                    log_bytes += sg.log_bytes;
+                }
+
+                let max_cts = sync_groups.back().as_ref().unwrap().max_cts;
+
+                self.persisted_cts.store(max_cts, Ordering::SeqCst);
+
+                io_reqs.clear();
+                sync_groups.clear();
+                self.update_stats(trx_count, commit_count, log_bytes, 1, 0);
+            }
+            if shutdown {
+                return;
+            }
+        }
+    }
+
+    #[inline]
+    fn io_loop(&self, config: &TrxSysConfig) {
+        let syncer = {
+            self.group_commit
+                .0
+                .lock()
+                .log_file
+                .as_ref()
+                .unwrap()
+                .syncer()
+        };
+        let io_depth = config.io_depth_per_log;
+        let mut inflight = BTreeMap::new();
+        let mut in_progress = 0;
+        let mut io_reqs = Vec::with_capacity(io_depth * 2);
+        let mut sync_groups = VecDeque::with_capacity(io_depth * 2);
+        let mut events = self.aio_mgr.events();
+        let mut written = vec![];
+        let mut shutdown = false;
+        loop {
+            debug_assert!(
+                io_reqs.len() == sync_groups.len(),
+                "pending IO number equals to pending group number"
+            );
+            if !shutdown {
+                if in_progress == 0 {
+                    // there is no processing AIO, so we can block on waiting for next request.
+                    shutdown |= self.fetch_io_reqs(&mut io_reqs, &mut sync_groups);
+                } else {
+                    // only try non-blocking way to fetch incoming requests, because we also
+                    // need to finish previous IO.
+                    shutdown |= self.try_fetch_io_reqs(&mut io_reqs, &mut sync_groups);
+                }
+            }
+            let (io_submit_count, io_submit_nanos) = if !io_reqs.is_empty() {
+                let start = Instant::now();
+                // try to submit as many IO requests as possible
+                let limit = io_depth - in_progress;
+                let submit_count = self.aio_mgr.submit_limit(&mut io_reqs, limit);
+                // add sync groups to inflight tree.
+                for sync_group in sync_groups.drain(..submit_count) {
+                    let res = inflight.insert(sync_group.max_cts, sync_group);
+                    debug_assert!(res.is_none());
+                }
+                in_progress += submit_count;
+                debug_assert!(in_progress <= io_depth);
+                (1, start.elapsed().as_nanos() as usize)
+            } else {
+                (0, 0)
+            };
+
+            // wait for any request to be done.
+            let (io_wait_count, io_wait_nanos) = if in_progress != 0 {
+                let start = Instant::now();
+                let finish_count =
+                    self.aio_mgr
+                        .wait_at_least(&mut events, 1, |cts, res| match res {
+                            Ok(len) => {
+                                let sg = inflight.get_mut(&cts).expect("finish inflight IO");
+                                debug_assert!(sg.aio.buf.as_ref().unwrap().aligned_len() == len);
+                                sg.finished = true;
+                            }
+                            Err(err) => {
+                                let sg = inflight.remove(&cts).unwrap();
+                                unimplemented!(
+                                    "AIO error: task.cts={}, task.log_bytes={}, {}",
+                                    sg.max_cts,
+                                    sg.log_bytes,
+                                    err
+                                )
+                            }
+                        });
+                in_progress -= finish_count;
+                (1, start.elapsed().as_nanos() as usize)
+            } else {
+                (0, 0)
+            };
+
+            // after logs are written to disk, we need to do fsync to make sure its durablity.
+            // Also, we need to check if any previous transaction is also done and notify them.
+            written.clear();
+            let (trx_count, commit_count, log_bytes) = shrink_inflight(&mut inflight, &mut written);
+            if !written.is_empty() {
+                let max_cts = written.last().unwrap().max_cts;
+
+                let start = Instant::now();
+                match config.log_sync {
+                    LogSync::Fsync => syncer.fsync(),
+                    LogSync::Fdatasync => syncer.fdatasync(),
+                    LogSync::None => (),
+                }
+                let sync_dur = start.elapsed();
+
+                self.persisted_cts.store(max_cts, Ordering::SeqCst);
+
+                // put IO buffer back into free list.
+                for mut sync_group in written.drain(..) {
+                    if let Some(Buf::Reuse(elem)) = sync_group.aio.take_buf() {
+                        self.buf_free_list.push_elem(elem); // return buf to free list for future reuse
+                    }
+                    drop(sync_group); // notify transaction thread to continue.
+                }
+
+                self.update_stats(
+                    trx_count,
+                    commit_count,
+                    log_bytes,
+                    1,
+                    sync_dur.as_nanos() as usize,
+                );
+            }
+            if io_submit_count != 0 {
+                self.stats
+                    .io_submit_count
+                    .fetch_add(io_submit_count, Ordering::Relaxed);
+                self.stats
+                    .io_submit_nanos
+                    .fetch_add(io_submit_nanos, Ordering::Relaxed);
+            }
+            if io_wait_count != 0 {
+                self.stats
+                    .io_wait_count
+                    .fetch_add(io_wait_count, Ordering::Relaxed);
+                self.stats
+                    .io_wait_nanos
+                    .fetch_add(io_wait_nanos, Ordering::Relaxed);
+            }
+
+            if shutdown && inflight.is_empty() {
+                return;
+            }
+        }
+    }
+}
+
+struct GroupCommit {
+    // Commit group queue, there can be multiple groups in commit phase.
+    // Each of them submit IO request to AIO manager and then wait for
+    // pwrite & fsync done.
+    queue: VecDeque<CommitMessage>,
+    // Current log file.
+    log_file: Option<SparseFile>,
+    // sequence of current file in this partition, starts from 0.
+    file_seq: u32,
 }
 
 /// GCInfo is only used for GroupCommitter to store and analyze GC related information,
@@ -632,87 +832,132 @@ impl GCInfo {
     }
 }
 
-struct GroupCommit {
-    /// Groups of committing transactions.
-    /// At most 2.
-    groups: VecDeque<CommitGroup>,
-    /// Channel to send old transaction list to GC thread.
-    /// If GC thread is not initialized, these out-of-date transactions are just
-    /// ignored.
-    gc_chan: Option<Sender<Vec<CommittedTrx>>>,
+enum CommitMessage {
+    Group(CommitGroup),
+    Shutdown,
 }
 
-impl GroupCommit {
-    #[inline]
-    fn new() -> Self {
-        GroupCommit {
-            groups: VecDeque::new(),
-            gc_chan: None,
-        }
-    }
-}
-
-/// GroupCommit is an abstraction to group multiple transactions
-/// and write and sync logs in batch mode.
-/// The first transaction thread arrived in the group becomes the
-/// group leader, and take care of all transactions log persistence.
-/// It's used to improve logging performance.
+/// CommitGroup groups multiple transactions with only
+/// one log IO and at most one fsync() call.
+/// It is controlled by two parameters:
+/// 1. Maximum IO size, e.g. 16KB.
+/// 2. Timeout to wait for next transaction to join.
 struct CommitGroup {
-    kind: CommitGroupKind,
-    notifier: Option<Arc<CommitGroupNotify>>,
+    trx_list: Vec<PrecommitTrx>,
+    max_cts: TrxID,
+    fd: RawFd,
+    offset: usize,
+    log_buf: Buf,
+    sync_signal: Sender<()>,
+    sync_notifier: Receiver<()>,
 }
 
-enum CommitGroupKind {
-    Processing,
-    Single(PrecommitTrx),
-    Multi(Vec<PrecommitTrx>),
-}
-
-impl CommitGroupKind {
+impl CommitGroup {
     #[inline]
-    fn add_trx(&mut self, trx: PrecommitTrx) {
-        match self {
-            CommitGroupKind::Processing => {
-                unreachable!("Transaction cannot be added to processing commit group")
-            }
-            CommitGroupKind::Multi(trx_list) => trx_list.push(trx),
-            _ => match mem::replace(self, CommitGroupKind::Processing) {
-                CommitGroupKind::Single(leader_trx) => {
-                    let mut trx_list = vec![];
-                    trx_list.push(leader_trx);
-                    trx_list.push(trx);
-                    *self = CommitGroupKind::Multi(trx_list);
-                }
-                _ => unreachable!(),
-            },
+    fn can_join(&self, trx: &PrecommitTrx) -> bool {
+        if let Some(redo_bin) = trx.redo_bin.as_ref() {
+            return redo_bin.len() <= self.log_buf.remaining_capacity();
         }
+        true
     }
+
+    #[inline]
+    fn join(&mut self, mut trx: PrecommitTrx) -> Receiver<()> {
+        debug_assert!(self.max_cts < trx.cts);
+        if let Some(redo_bin) = trx.redo_bin.take() {
+            self.log_buf.clone_from_slice(&redo_bin);
+        }
+        self.max_cts = trx.cts;
+        self.trx_list.push(trx);
+        self.sync_notifier.clone()
+    }
+
+    #[inline]
+    fn split(self) -> (IocbRawPtr, SyncGroup) {
+        let log_bytes = self.log_buf.aligned_len();
+        let aio = pwrite(self.max_cts, self.fd, self.offset, self.log_buf);
+        let iocb_ptr = aio.iocb.load(Ordering::Relaxed);
+        let sync_group = SyncGroup {
+            trx_list: self.trx_list,
+            max_cts: self.max_cts,
+            log_bytes,
+            aio,
+            sync_signal: self.sync_signal,
+            finished: false,
+        };
+        (iocb_ptr, sync_group)
+    }
+}
+
+struct SyncGroup {
+    trx_list: Vec<PrecommitTrx>,
+    max_cts: TrxID,
+    log_bytes: usize,
+    aio: AIO,
+    // Signal to notify transaction threads.
+    // This field won't be used, until the group is dropped.
+    #[allow(dead_code)]
+    sync_signal: Sender<()>,
+    finished: bool,
 }
 
 #[derive(Default)]
-struct CommitGroupNotify {
-    status: Mutex<CommitGroupStatus>,
-    follower_cv: Condvar,
+pub struct TrxSysStats {
+    pub commit_count: usize,
+    pub trx_count: usize,
+    pub log_bytes: usize,
+    pub sync_count: usize,
+    pub sync_nanos: usize,
+    pub io_submit_count: usize,
+    pub io_submit_nanos: usize,
+    pub io_wait_count: usize,
+    pub io_wait_nanos: usize,
 }
 
-struct CommitGroupStatus {
-    finished: bool,
-    persisted_cts: TrxID,
+#[derive(Default)]
+pub struct LogPartitionStats {
+    pub commit_count: AtomicUsize,
+    pub trx_count: AtomicUsize,
+    pub log_bytes: AtomicUsize,
+    pub sync_count: AtomicUsize,
+    pub sync_nanos: AtomicUsize,
+    pub io_submit_count: AtomicUsize,
+    pub io_submit_nanos: AtomicUsize,
+    pub io_wait_count: AtomicUsize,
+    pub io_wait_nanos: AtomicUsize,
 }
 
-impl Default for CommitGroupStatus {
-    #[inline]
-    fn default() -> Self {
-        CommitGroupStatus {
-            finished: false,
-            persisted_cts: MIN_SNAPSHOT_TS,
+#[inline]
+fn log_file_name(file_prefix: &str, idx: usize, file_seq: u32) -> String {
+    format!("{}.{}.{:08x}", file_prefix, idx, file_seq)
+}
+
+#[inline]
+fn log_file_prefix(file_prefix: &str, idx: usize) -> String {
+    format!("{}.{}", file_prefix, idx)
+}
+
+#[inline]
+fn shrink_inflight(
+    tree: &mut BTreeMap<TrxID, SyncGroup>,
+    buffer: &mut Vec<SyncGroup>,
+) -> (usize, usize, usize) {
+    let mut trx_count = 0;
+    let mut commit_count = 0;
+    let mut log_bytes = 0;
+    while let Some(entry) = tree.first_entry() {
+        let task = entry.get();
+        if task.finished {
+            trx_count += task.trx_list.len();
+            commit_count += 1;
+            log_bytes += task.log_bytes;
+            buffer.push(entry.remove());
+        } else {
+            break; // stop at the transaction which is not persisted.
         }
     }
+    (trx_count, commit_count, log_bytes)
 }
-
-/// GarbageCollector is a single thread to identify which transaction should
-/// be GC. The real GC work can be done.
-pub struct GCThread(JoinHandle<()>);
 
 #[cfg(test)]
 mod tests {
@@ -725,14 +970,14 @@ mod tests {
 
     #[test]
     fn test_transaction_system() {
-        let trx_sys = TransactionSystem::new_static();
+        let trx_sys = TrxSysConfig::default().build_static();
         {
             let trx = trx_sys.new_trx();
-            trx_sys.commit(trx);
+            smol::block_on(trx_sys.commit(trx));
         }
         std::thread::spawn(|| {
             let trx = trx_sys.new_trx();
-            trx_sys.commit(trx);
+            smol::block_on(trx_sys.commit(trx));
         })
         .join()
         .unwrap();
@@ -872,7 +1117,7 @@ mod tests {
     #[test]
     fn test_single_thread_trx_begin_and_commit() {
         const COUNT: usize = 1000000;
-        let trx_sys = TransactionSystem::new_static();
+        let trx_sys = TrxSysConfig::default().build_static();
         {
             // hook persisted_ts to u64::MAX to allaw all transactions immediately finish.
             trx_sys.persisted_cts.store(u64::MAX, Ordering::SeqCst);
@@ -882,7 +1127,7 @@ mod tests {
             let start = Instant::now();
             for _ in 0..COUNT {
                 let trx = trx_sys.new_trx();
-                trx_sys.commit(trx);
+                smol::block_on(trx_sys.commit(trx));
             }
             let dur = start.elapsed();
             println!(
@@ -892,80 +1137,6 @@ mod tests {
                 COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
             );
         }
-        unsafe {
-            TransactionSystem::drop_static(trx_sys);
-        }
-    }
-
-    #[test]
-    fn test_multi_threads_trx_begin_and_commit() {
-        const COUNT: usize = 1000000;
-        const THREADS: usize = 4;
-        let stop = Arc::new(AtomicBool::new(false));
-        let trx_sys = TransactionSystem::new_static();
-        {
-            // hook persisted_ts to u64::MAX to allaw all transactions immediately finish.
-            trx_sys.persisted_cts.store(u64::MAX, Ordering::SeqCst);
-        }
-        {
-            let mut handles = vec![];
-            for _ in 1..THREADS {
-                let stop = Arc::clone(&stop);
-                let handle =
-                    std::thread::spawn(move || worker_thread_trx_begin_and_commit(trx_sys, &stop));
-                handles.push(handle);
-            }
-            let mut count = 0;
-            let start = Instant::now();
-            for _ in 0..COUNT {
-                let trx = trx_sys.new_trx();
-                trx_sys.commit(trx);
-                count += 1;
-            }
-            stop.store(true, Ordering::SeqCst);
-            for handle in handles {
-                count += handle.join().unwrap();
-            }
-            let dur = start.elapsed();
-            println!(
-                "{:?} transaction begin and commit cost {:?} microseconds, avg {:?} trx/s",
-                count,
-                dur.as_micros(),
-                count as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
-            );
-        }
-        unsafe {
-            TransactionSystem::drop_static(trx_sys);
-        }
-    }
-
-    #[inline]
-    fn worker_thread_trx_begin_and_commit(trx_sys: &TransactionSystem, stop: &AtomicBool) -> usize {
-        let mut count = 0usize;
-        while !stop.load(Ordering::Relaxed) {
-            let trx = trx_sys.new_trx();
-            trx_sys.commit(trx);
-            count += 1;
-        }
-        count
-    }
-
-    #[test]
-    fn test_trx_sys_group_commit() {
-        let trx_sys = TransactionSystem::new_static();
-        trx_sys.start_gc_thread();
-        {
-            let new_trx = trx_sys.new_trx();
-            trx_sys.commit(new_trx);
-        }
-        // sts=1, cts=2, next_ts=3
-        assert!(trx_sys.ts.load(Ordering::Relaxed) == 3);
-        // sleep 100 millisecond should be enough for GC thread to
-        // analyze and update minimum active sts.
-        thread::sleep(std::time::Duration::from_millis(100));
-        // all active transactions ended, so min_active_sts should equal to next_ts.
-        assert!(trx_sys.min_active_sts.load(Ordering::Relaxed) == 3);
-        trx_sys.stop_gc_thread();
         unsafe {
             TransactionSystem::drop_static(trx_sys);
         }
