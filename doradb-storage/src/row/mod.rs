@@ -2,12 +2,12 @@ pub mod ops;
 
 use crate::buffer::frame::{BufferFrame, BufferFrameAware};
 use crate::buffer::page::PAGE_SIZE;
-use crate::table::layout::Layout;
-use crate::table::SchemaRef;
 use crate::row::ops::{
     DeleteResult, DeleteRow, InsertResult, InsertRow, SelectResult, UpdateCol, UpdateResult,
     UpdateRow, UpdateWithUndoResult,
 };
+use crate::table::layout::Layout;
+use crate::table::SchemaRef;
 use crate::value::*;
 use std::fmt;
 use std::mem;
@@ -237,7 +237,11 @@ impl RowPage {
     }
 
     #[inline]
-    pub fn update_with_undo(&mut self, schema: SchemaRef<'_>, update: &UpdateRow) -> UpdateWithUndoResult {
+    pub fn update_with_undo(
+        &mut self,
+        schema: SchemaRef<'_>,
+        update: &UpdateRow,
+    ) -> UpdateWithUndoResult {
         // column indexes must be in range
         debug_assert!(
             {

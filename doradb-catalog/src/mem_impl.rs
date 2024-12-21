@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::{
-    ObjID, Catalog, ColIndex, Column, ColumnAttr, ColumnID, Key, Schema, SchemaID, Table, TableID,
+    Catalog, ColIndex, Column, ColumnAttr, ColumnID, Key, ObjID, Schema, SchemaID, Table, TableID,
     TableSpec,
 };
 use indexmap::IndexMap;

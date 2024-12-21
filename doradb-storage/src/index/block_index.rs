@@ -7,8 +7,8 @@ use crate::error::{
     Validation::{Invalid, Valid},
 };
 use crate::latch::LatchFallbackMode;
-use crate::table::layout::Layout;
 use crate::row::{RowID, RowPage};
+use crate::table::layout::Layout;
 use parking_lot::Mutex;
 use std::mem;
 

@@ -16,15 +16,18 @@
 //!       it's invisible, undo change and go to next version in the chain...
 //!    d) If less than current STS, return current version.
 pub mod redo;
-pub mod sys;
+pub mod sys_v1;
+pub mod sys_v3;
+pub mod sys_v4;
 pub mod undo;
 
 use crate::buffer::guard::PageGuard;
 use crate::buffer::FixedBufferPool;
 use crate::latch::LatchFallbackMode;
 use crate::row::RowPage;
-use crate::trx::redo::{RedoBin, RedoEntry, RedoLog};
+use crate::trx::redo::{RedoBin, RedoEntry, RedoKind, RedoLog};
 use crate::trx::undo::SharedUndoEntry;
+use crate::value::Val;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -130,7 +133,30 @@ impl ActiveTrx {
     pub fn rollback(self) {
         todo!()
     }
+
+    /// Add one redo log entry.
+    /// This function is only use for test purpose.
+    #[inline]
+    pub fn add_pseudo_redo_log_entry(&mut self) {
+        // self.trx_redo.push(RedoEntry{page_id: 0, row_id: 0, kind: RedoKind::Delete})
+        // simulate sysbench record
+        // uint64 + int32 + int32 + char(60) + char(120)
+        self.trx_redo.push(RedoEntry {
+            page_id: 0,
+            row_id: 0,
+            kind: RedoKind::Insert(vec![
+                Val::Byte8(123),
+                Val::Byte4(1),
+                Val::Byte4(2),
+                Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
+                Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
+            ]),
+        })
+    }
 }
+
+static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
+static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
 pub struct PreparedTrx {
