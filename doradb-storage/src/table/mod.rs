@@ -2,8 +2,8 @@ pub mod layout;
 pub mod mvcc;
 
 use crate::buffer::FixedBufferPool;
-use crate::table::layout::Layout;
 use crate::index::block_index::BlockIndex;
+use crate::table::layout::Layout;
 use crate::table::mvcc::MvccTable;
 
 pub type Schema = Vec<Layout>;

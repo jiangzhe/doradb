@@ -1,14 +1,14 @@
-use crate::table::{Table, TableID, SchemaRef};
-use crate::trx::ActiveTrx;
-use crate::trx::undo::{UndoKind, UndoEntry, UndoChain};
-use crate::trx::redo::RedoEntry;
 use crate::buffer::guard::PageExclusiveGuard;
+use crate::row::ops::{InsertResult, InsertRow};
 use crate::row::RowPage;
-use crate::row::ops::{InsertRow, InsertResult};
-use std::sync::Arc;
+use crate::table::{SchemaRef, Table, TableID};
+use crate::trx::redo::RedoEntry;
+use crate::trx::undo::{UndoChain, UndoEntry, UndoKind};
+use crate::trx::ActiveTrx;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::ops::Deref;
-use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// MvccTable is a thin wrapper on table to extend MVCC behaviors.
 pub struct MvccTable<'a>(pub(super) &'a Table<'a>);

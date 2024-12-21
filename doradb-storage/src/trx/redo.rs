@@ -32,10 +32,10 @@ pub type RedoBin = Vec<u8>;
 /// It's responsible to persist redo logs and wait for it's persisted.
 pub trait RedoLogger {
     /// Write redo binary logs to disk.
-    fn write(&mut self, cts: TrxID, redo_bin: RedoBin);
+    fn write(&mut self, cts: TrxID, redo_bin: RedoBin) -> usize;
 
     /// wait for previous written logs to be persisted.
-    fn sync(&mut self);
+    fn flush(&mut self);
 }
 
 #[cfg(test)]

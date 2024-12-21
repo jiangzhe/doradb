@@ -3,9 +3,10 @@ use crate::trx::{
     ActiveTrx, CommittedTrx, PrecommitTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS,
     MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
 };
-use crossbeam_utils::CachePadded;
+use crossbeam_utils::{Backoff, CachePadded};
 use flume::{Receiver, Sender};
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use std::cell::UnsafeCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -62,7 +63,7 @@ pub struct TransactionSystem {
     /// Note: this field may not reflect the latest value, but is enough for GC purpose.
     min_active_sts: CachePadded<AtomicU64>,
     /// Group commit implementation.
-    group_commit: CachePadded<Mutex<GroupCommit>>,
+    group_commit_v1: CachePadded<Mutex<GroupCommit>>,
     /// list of precommitted transactions.
     /// Once user sends COMMIT command or statement is auto-committed. The transaction
     /// will be assign CTS and put into this list, waiting for log writer thread to
@@ -84,6 +85,12 @@ pub struct TransactionSystem {
     /// Background GC thread identify which transactions can be garbage collected and
     /// calculate watermark for other thread to cooperate.
     gc_thread: Mutex<Option<GCThread>>,
+
+    /// Group commit v2.
+    /// Support concurrent group commit on different redo logs.
+    group_commit_v2: UnsafeCell<Box<[CachePadded<Mutex<GroupCommit>>]>>,
+    /// redo logger for group commit v2.
+    redo_logger_v2: Mutex<Option<Box<[Box<dyn RedoLogger>]>>>,
 }
 
 impl TransactionSystem {
@@ -126,12 +133,12 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub fn commit(&self, trx: ActiveTrx) {
+    pub fn commit_v1(&self, trx: ActiveTrx) {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and only fill cts then.
         let prepared_trx = trx.prepare();
         // start group commit
-        let mut group_commit_g = self.group_commit.lock();
+        let mut group_commit_g = self.group_commit_v1.lock();
         let cts = self.ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = prepared_trx.fill_cts(cts);
@@ -147,7 +154,7 @@ impl TransactionSystem {
                         self.act_as_next_group_leader(precommit_trx, group_commit_g)
                     }
                     kind => {
-                        // this is the second transaction entering a non-started commit group,
+                        // this is at least the second transaction entering a non-started commit group,
                         // it should add itself to this group and setup notifier.
                         debug_assert!({
                             (matches!(kind, CommitGroupKind::Single(_))
@@ -163,16 +170,10 @@ impl TransactionSystem {
                         drop(group_commit_g); // release lock to let other transactions enter or leader start.
 
                         // wait for leader to finish group commit
-                        loop {
-                            let mut status_g = notify.status.lock();
-                            if status_g.finished {
-                                // in current implementation, persisted cts must be greater than or equal to
-                                // cts of any transaction in the same group.
-                                debug_assert!(cts <= status_g.persisted_cts);
-                                break;
-                            }
-                            notify.follower_cv.wait(&mut status_g);
-                        }
+                        let mut status_g = notify.status.lock();
+                        notify
+                            .follower_cv
+                            .wait_while(&mut status_g, |g| !g.finished);
                     }
                 }
             }
@@ -202,16 +203,10 @@ impl TransactionSystem {
                 drop(group_commit_g); // release lock to let other transactions enter or leader start.
 
                 // wait for leader to finish group commit
-                loop {
-                    let mut status_g = notify.status.lock();
-                    if status_g.finished {
-                        // in current implementation, persisted cts must be greater than or equal to
-                        // cts of any transaction in the same group.
-                        debug_assert!(cts <= status_g.persisted_cts);
-                        break;
-                    }
-                    notify.follower_cv.wait(&mut status_g);
-                }
+                let mut status_g = notify.status.lock();
+                notify
+                    .follower_cv
+                    .wait_while(&mut status_g, |g| !g.finished);
             }
             _ => unreachable!("group commit can only have two groups at the same time"),
         }
@@ -230,7 +225,7 @@ impl TransactionSystem {
     /// Start background GC thread.
     /// This method should be called once transaction system is initialized.
     #[inline]
-    pub fn start_gc_thread(&'static self) {
+    pub fn start_gc_thread_v1(&'static self) {
         let mut gc_thread_g = self.gc_thread.lock();
         if gc_thread_g.is_some() {
             panic!("GC thread should be created only once");
@@ -250,7 +245,7 @@ impl TransactionSystem {
 
         // put sender into group commit, so group commit leader can send
         // persisted transaction list to GC thread.
-        let mut group_commit_g = self.group_commit.lock();
+        let mut group_commit_g = self.group_commit_v1.lock();
         debug_assert!(group_commit_g.gc_chan.is_none());
         group_commit_g.gc_chan = Some(tx);
     }
@@ -259,8 +254,8 @@ impl TransactionSystem {
     /// The method should be called before shutdown transaction system if GC thread
     /// is enabled.
     #[inline]
-    pub fn stop_gc_thread(&self) {
-        let mut group_commit_g = self.group_commit.lock();
+    pub fn stop_gc_thread_v1(&self) {
+        let mut group_commit_g = self.group_commit_v1.lock();
         if group_commit_g.gc_chan.is_none() {
             return;
         }
@@ -285,20 +280,26 @@ impl TransactionSystem {
         *logger_g = Some(logger);
     }
 
+    /// Returns statistics of group commit.
+    #[inline]
+    pub fn group_commit_stats_v1(&self) -> GroupCommitStats {
+        self.group_commit_v1.lock().stats
+    }
+
     #[inline]
     fn commit_single_trx(
         &self,
         trx: PrecommitTrx,
         gc_chan: Option<Sender<Vec<CommittedTrx>>>,
-    ) -> TrxID {
+    ) -> (TrxID, usize) {
         let cts = trx.cts;
-        
+        let mut log_bytes = 0;
         // persist log
         if let Some(redo_bin) = trx.redo_bin {
             let mut g = self.redo_logger.lock();
             if let Some(logger) = g.as_mut() {
-                logger.write(trx.cts, redo_bin);
-                logger.sync();
+                log_bytes += logger.write(trx.cts, redo_bin);
+                logger.flush();
             }
         }
 
@@ -318,7 +319,7 @@ impl TransactionSystem {
                 undo: trx.undo,
             }]);
         }
-        cts
+        (cts, log_bytes)
     }
 
     #[inline]
@@ -326,7 +327,7 @@ impl TransactionSystem {
         &self,
         mut trx_list: Vec<PrecommitTrx>,
         gc_chan: Option<Sender<Vec<CommittedTrx>>>,
-    ) -> TrxID {
+    ) -> (TrxID, usize) {
         debug_assert!(trx_list.len() > 1);
         debug_assert!({
             trx_list
@@ -335,17 +336,17 @@ impl TransactionSystem {
                 .all(|(l, r)| l.cts < r.cts)
         });
         let max_cts = trx_list.last().unwrap().cts;
-        
+        let mut log_bytes = 0;
         // persist log
         {
             let mut g = self.redo_logger.lock();
             if let Some(logger) = g.as_mut() {
                 for trx in &mut trx_list {
                     if let Some(redo_bin) = trx.redo_bin.take() {
-                        logger.write(trx.cts, redo_bin);
+                        log_bytes += logger.write(trx.cts, redo_bin);
                     }
                 }
-                logger.sync();
+                logger.flush();
             }
         }
         // Instead of letting each thread backfill its CTS in undo logs,
@@ -373,7 +374,7 @@ impl TransactionSystem {
                     .collect(),
             );
         }
-        max_cts
+        (max_cts, log_bytes)
     }
 
     #[inline]
@@ -391,17 +392,21 @@ impl TransactionSystem {
         let gc_chan = group_commit_g.gc_chan.clone();
         drop(group_commit_g);
 
-        let cts = self.commit_single_trx(precommit_trx, gc_chan);
+        let (cts, log_bytes) = self.commit_single_trx(precommit_trx, gc_chan);
 
         // Here we remove the first finished group and let other transactions to enter commit phase.
         // new transaction may join the group which is not started, or form a new group and wait.
         let curr_group = {
-            let mut group_commit_g = self.group_commit.lock();
+            let mut group_commit_g = self.group_commit_v1.lock();
             debug_assert!(group_commit_g.groups.len() >= 1);
             debug_assert!(matches!(
                 group_commit_g.groups.front().unwrap().kind,
                 CommitGroupKind::Processing
             ));
+            // update stats
+            group_commit_g.stats.commit_count += 1;
+            group_commit_g.stats.trx_count += 1;
+            group_commit_g.stats.log_bytes += log_bytes;
             group_commit_g.groups.pop_front().unwrap()
         };
 
@@ -438,18 +443,16 @@ impl TransactionSystem {
         drop(group_commit_g); // release lock to let other transactions join the new group.
 
         // Wait until first group to finish.
-        loop {
+        {
             let mut status_g = notify.status.lock();
-            if status_g.finished {
-                // does not care about persisted cts
-                break;
-            }
-            notify.follower_cv.wait(&mut status_g);
+            notify
+                .follower_cv
+                .wait_while(&mut status_g, |g| !g.finished);
         }
 
         // now previous group finishes, start current group.
         let (kind, gc_chan) = {
-            let mut group_commit_g = self.group_commit.lock();
+            let mut group_commit_g = self.group_commit_v1.lock();
             // previous leader removed its group before notifying next leader.
             // and new transactions must join this group because it's not started.
             // so group count must be 1.
@@ -461,19 +464,30 @@ impl TransactionSystem {
         }; // Here release the lock so other transactions can form new group.
 
         // persist redo log, backfill cts for each transaction, and get back maximum persisted cts.
-        let persisted_cts = match kind {
-            CommitGroupKind::Single(trx) => self.commit_single_trx(trx, gc_chan),
-            CommitGroupKind::Multi(trx_list) => self.commit_multi_trx(trx_list, gc_chan),
+        let (persisted_cts, trx_count, log_bytes) = match kind {
+            CommitGroupKind::Single(trx) => {
+                let (cts, log_bytes) = self.commit_single_trx(trx, gc_chan);
+                (cts, 1, log_bytes)
+            }
+            CommitGroupKind::Multi(trx_list) => {
+                let count = trx_list.len();
+                let (cts, log_bytes) = self.commit_multi_trx(trx_list, gc_chan);
+                (cts, count, log_bytes)
+            }
             _ => unreachable!("invalid group commit kind"),
         };
 
         let curr_group = {
-            let mut group_commit_g = self.group_commit.lock();
+            let mut group_commit_g = self.group_commit_v1.lock();
             debug_assert!(group_commit_g.groups.len() >= 1);
             debug_assert!(matches!(
                 group_commit_g.groups.front().unwrap().kind,
                 CommitGroupKind::Processing
             ));
+            // update stats
+            group_commit_g.stats.commit_count += 1;
+            group_commit_g.stats.trx_count += trx_count;
+            group_commit_g.stats.log_bytes += log_bytes;
             group_commit_g.groups.pop_front().unwrap()
         };
 
@@ -582,13 +596,16 @@ impl TransactionSystem {
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
             min_active_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            group_commit: CachePadded::new(Mutex::new(GroupCommit::new())),
+            group_commit_v1: CachePadded::new(Mutex::new(GroupCommit::new())),
             rollback_sts_list: CachePadded::new(Mutex::new(BTreeSet::new())),
             // initialize to MIN_SNAPSHOT_TS is fine, the actual value relies on recovery process.
             persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
             gc_info: CachePadded::new(Mutex::new(GCInfo::new())),
             redo_logger: Mutex::new(None),
             gc_thread: Mutex::new(None),
+            // test multiple log streams to support concurrent group commits.
+            group_commit_v2: UnsafeCell::new(Box::new([])),
+            redo_logger_v2: Mutex::new(None),
         }
     }
 }
@@ -598,7 +615,7 @@ unsafe impl Sync for TransactionSystem {}
 impl Drop for TransactionSystem {
     #[inline]
     fn drop(&mut self) {
-        self.stop_gc_thread();
+        self.stop_gc_thread_v1();
     }
 }
 
@@ -640,6 +657,8 @@ struct GroupCommit {
     /// If GC thread is not initialized, these out-of-date transactions are just
     /// ignored.
     gc_chan: Option<Sender<Vec<CommittedTrx>>>,
+
+    stats: GroupCommitStats,
 }
 
 impl GroupCommit {
@@ -648,6 +667,7 @@ impl GroupCommit {
         GroupCommit {
             groups: VecDeque::new(),
             gc_chan: None,
+            stats: GroupCommitStats::default(),
         }
     }
 }
@@ -710,6 +730,13 @@ impl Default for CommitGroupStatus {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+pub struct GroupCommitStats {
+    pub commit_count: usize,
+    pub trx_count: usize,
+    pub log_bytes: usize,
+}
+
 /// GarbageCollector is a single thread to identify which transaction should
 /// be GC. The real GC work can be done.
 pub struct GCThread(JoinHandle<()>);
@@ -728,11 +755,11 @@ mod tests {
         let trx_sys = TransactionSystem::new_static();
         {
             let trx = trx_sys.new_trx();
-            trx_sys.commit(trx);
+            trx_sys.commit_v1(trx);
         }
         std::thread::spawn(|| {
             let trx = trx_sys.new_trx();
-            trx_sys.commit(trx);
+            trx_sys.commit_v1(trx);
         })
         .join()
         .unwrap();
@@ -882,7 +909,7 @@ mod tests {
             let start = Instant::now();
             for _ in 0..COUNT {
                 let trx = trx_sys.new_trx();
-                trx_sys.commit(trx);
+                trx_sys.commit_v1(trx);
             }
             let dur = start.elapsed();
             println!(
@@ -919,7 +946,7 @@ mod tests {
             let start = Instant::now();
             for _ in 0..COUNT {
                 let trx = trx_sys.new_trx();
-                trx_sys.commit(trx);
+                trx_sys.commit_v1(trx);
                 count += 1;
             }
             stop.store(true, Ordering::SeqCst);
@@ -944,7 +971,7 @@ mod tests {
         let mut count = 0usize;
         while !stop.load(Ordering::Relaxed) {
             let trx = trx_sys.new_trx();
-            trx_sys.commit(trx);
+            trx_sys.commit_v1(trx);
             count += 1;
         }
         count
@@ -953,19 +980,24 @@ mod tests {
     #[test]
     fn test_trx_sys_group_commit() {
         let trx_sys = TransactionSystem::new_static();
-        trx_sys.start_gc_thread();
+        trx_sys.start_gc_thread_v1();
         {
             let new_trx = trx_sys.new_trx();
-            trx_sys.commit(new_trx);
+            trx_sys.commit_v1(new_trx);
         }
         // sts=1, cts=2, next_ts=3
+        for _ in 0..20 {
+            // 2 seconds should be enough
+            if trx_sys.ts.load(Ordering::Relaxed) == 3
+                && trx_sys.min_active_sts.load(Ordering::Relaxed) == 3
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
         assert!(trx_sys.ts.load(Ordering::Relaxed) == 3);
-        // sleep 100 millisecond should be enough for GC thread to
-        // analyze and update minimum active sts.
-        thread::sleep(std::time::Duration::from_millis(100));
-        // all active transactions ended, so min_active_sts should equal to next_ts.
         assert!(trx_sys.min_active_sts.load(Ordering::Relaxed) == 3);
-        trx_sys.stop_gc_thread();
+        trx_sys.stop_gc_thread_v1();
         unsafe {
             TransactionSystem::drop_static(trx_sys);
         }
