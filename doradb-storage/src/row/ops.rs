@@ -1,8 +1,6 @@
-use crate::row::{Row, RowID};
-use crate::trx::redo::RedoKind;
+use crate::row::{Row, RowID, RowMut};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 pub enum SelectResult<'a> {
     Ok(Row<'a>),
@@ -18,21 +16,22 @@ impl SelectResult<'_> {
     }
 }
 
-#[derive(Debug)]
-pub struct InsertRow(pub Vec<Val>);
+pub enum SelectMvccResult {
+    Ok(Vec<Val>),
+    RowNotFound,
+    InvalidIndex,
+}
 
-impl InsertRow {
-    /// Create redo log
+impl SelectMvccResult {
     #[inline]
-    pub fn create_redo(&self) -> RedoKind {
-        RedoKind::Insert(self.0.clone())
+    pub fn is_ok(&self) -> bool {
+        matches!(self, SelectMvccResult::Ok(_))
     }
 }
 
 pub enum InsertResult {
     Ok(RowID),
-    RowIDExhausted,
-    NoFreeSpace,
+    NoFreeSpaceOrRowID,
 }
 
 impl InsertResult {
@@ -43,75 +42,60 @@ impl InsertResult {
     }
 }
 
-#[derive(Debug)]
-pub struct DeleteRow(pub RowID);
-
-pub enum DeleteResult {
-    Ok,
-    RowNotFound,
-    RowAlreadyDeleted,
+pub enum InsertMvccResult {
+    Ok(RowID),
+    WriteConflict,
+    DuplicateKey,
 }
 
-impl DeleteResult {
-    /// Returns if delete succeeds.
+impl InsertMvccResult {
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, DeleteResult::Ok)
+        matches!(self, InsertMvccResult::Ok(_))
     }
 }
 
-#[derive(PartialEq, Eq)]
-pub struct UpdateRow {
-    pub row_id: RowID,
-    pub cols: Vec<UpdateCol>,
-}
-
-impl UpdateRow {
-    /// Create redo log based on changed values.
-    #[inline]
-    pub fn create_redo(&self, undo: &[UpdateCol]) -> Option<RedoKind> {
-        let hashset: HashSet<_> = undo.iter().map(|uc| uc.idx).collect();
-        let vals: Vec<UpdateCol> = self
-            .cols
-            .iter()
-            .filter(|uc| hashset.contains(&uc.idx))
-            .cloned()
-            .collect();
-        if vals.is_empty() {
-            return None;
-        }
-        Some(RedoKind::Update(vals))
-    }
+pub enum MoveInsertResult {
+    Ok,
+    None,
+    WriteConflict,
+    DuplicateKey,
+    Retry,
 }
 
 pub enum UpdateResult {
-    Ok,
+    // RowID may change if the update is out-of-place.
+    Ok(RowID),
     RowNotFound,
     RowDeleted,
-    NoFreeSpace,
+    // if space is not enough, we perform a logical deletion+insert to
+    // achieve the update sematics. The returned values are user columns
+    // of original row.
+    NoFreeSpace(Vec<Val>),
 }
 
 impl UpdateResult {
     /// Returns if update succeeds.
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, UpdateResult::Ok)
+        matches!(self, UpdateResult::Ok(..))
     }
 }
 
-#[derive(PartialEq, Eq)]
-pub enum UpdateWithUndoResult {
-    Ok(Vec<UpdateCol>),
+pub enum UpdateMvccResult {
+    Ok(RowID),
     RowNotFound,
     RowDeleted,
-    NoFreeSpace,
+    NoFreeSpace(Vec<Val>, Vec<UpdateCol>), // with user columns of original row returned for out-of-place update
+    WriteConflict,
+    Retry(Vec<UpdateCol>),
 }
 
-impl UpdateWithUndoResult {
+impl UpdateMvccResult {
     /// Returns if update with undo succeeds.
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, UpdateWithUndoResult::Ok(_))
+        matches!(self, UpdateMvccResult::Ok(_))
     }
 }
 
@@ -119,4 +103,29 @@ impl UpdateWithUndoResult {
 pub struct UpdateCol {
     pub idx: usize,
     pub val: Val,
+}
+
+pub enum UpdateRow<'a> {
+    Ok(RowMut<'a>),
+    NoFreeSpace(Vec<Val>),
+}
+
+pub enum DeleteResult {
+    Ok,
+    RowNotFound,
+    RowAlreadyDeleted,
+}
+
+pub enum DeleteMvccResult {
+    Ok,
+    RowNotFound,
+    RowAlreadyDeleted,
+    WriteConflict,
+}
+
+impl DeleteMvccResult {
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        matches!(self, DeleteMvccResult::Ok)
+    }
 }

@@ -3,6 +3,7 @@
 //! Its goal is to testing system bottleneck on starting and committing transactions.
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
+use doradb_storage::session::Session;
 use doradb_storage::trx::sys::{LogSync, TransactionSystem, TrxSysConfig};
 use easy_parallel::Parallel;
 use std::str::FromStr;
@@ -85,9 +86,10 @@ fn main() {
 
 #[inline]
 async fn worker(trx_sys: &TransactionSystem, stop: Arc<AtomicBool>, wg: WaitGroup) {
+    let mut session = Session::new();
     let stop = &*stop;
     while !stop.load(Ordering::Relaxed) {
-        let mut trx = trx_sys.new_trx();
+        let mut trx = session.begin_trx(trx_sys);
         trx.add_pseudo_redo_log_entry();
         let _ = trx_sys.commit(trx).await;
     }

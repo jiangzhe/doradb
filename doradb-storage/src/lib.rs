@@ -6,6 +6,7 @@ pub mod error;
 pub mod index;
 pub mod latch;
 pub mod row;
+pub mod session;
 pub mod table;
 pub mod trx;
 pub mod value;

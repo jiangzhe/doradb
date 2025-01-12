@@ -7,7 +7,6 @@ use libaio_abi::*;
 use libc::{
     c_long, close, fdatasync, fsync, ftruncate, open, EAGAIN, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC,
 };
-use std::collections::VecDeque;
 use std::ffi::CString;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -114,49 +113,6 @@ impl AIO {
 }
 
 impl Drop for AIO {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            drop(Box::from_raw(self.iocb.load(Ordering::Relaxed)));
-        }
-    }
-}
-
-pub struct CacheAIO {
-    pub iocb: IocbPtr,
-    pub buf: Option<CacheBuf>,
-    pub key: AIOKey,
-}
-
-impl CacheAIO {
-    #[inline]
-    fn new(
-        key: AIOKey,
-        fd: RawFd,
-        offset: usize,
-        mut buf: CacheBuf,
-        priority: u16,
-        flags: u32,
-        opcode: io_iocb_cmd,
-    ) -> Self {
-        let mut iocb = Box::new(iocb::default());
-        iocb.aio_fildes = fd as u32;
-        iocb.aio_lio_opcode = opcode as u16;
-        iocb.aio_reqprio = priority;
-        iocb.buf = buf.as_mut_ptr();
-        iocb.count = buf.data_len_aligned() as u64;
-        iocb.offset = offset as u64;
-        iocb.flags = flags;
-        iocb.data = key; // store and send back via io_event
-        CacheAIO {
-            key,
-            buf: Some(buf),
-            iocb: AtomicPtr::new(Box::into_raw(iocb)),
-        }
-    }
-}
-
-impl Drop for CacheAIO {
     #[inline]
     fn drop(&mut self) {
         unsafe {

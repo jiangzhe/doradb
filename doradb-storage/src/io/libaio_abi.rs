@@ -54,8 +54,6 @@ impl Default for iocb {
 
 unsafe impl Send for iocb {}
 
-pub const IOCB_FLAG_RESFD: u32 = 1;
-
 #[derive(Clone)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
