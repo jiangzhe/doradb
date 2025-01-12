@@ -1,23 +1,64 @@
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, dealloc, Layout as AllocLayout};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
-// use bitcode::{Encode, Decode};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
+pub const PAGE_VAR_HEADER: usize = 8;
 pub const PAGE_VAR_LEN_INLINE: usize = 6;
 pub const PAGE_VAR_LEN_PREFIX: usize = 4;
 const _: () = assert!(mem::size_of::<PageVar>() == 8);
 
+pub const MEM_VAR_HEADER: usize = 16;
 pub const MEM_VAR_LEN_INLINE: usize = 14;
 pub const MEM_VAR_LEN_PREFIX: usize = 6;
 const _: () = assert!(mem::size_of::<MemVar>() == 16);
 
+/// Layout defines the memory layout of columns
+/// stored in row page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Layout {
+    Byte1, // i8, u8, bool, char(1) with ascii/latin charset
+    Byte2, // i16, u16, decimal(1-2)
+    Byte4, // i32, u32, f32, decimal(3-8)
+    Byte8, // i64, u64, f64, decimal(9-18)
+    // Byte16,  // decimal(19-38)
+    VarByte, // bytes, string, no more than 60k.
+}
+
+impl Layout {
+    #[inline]
+    pub const fn inline_len(&self) -> usize {
+        match self {
+            Layout::Byte1 => 1,
+            Layout::Byte2 => 2,
+            Layout::Byte4 => 4,
+            Layout::Byte8 => 8,
+            // Layout::Byte16 => 16,
+            // 2-byte len, 2-byte offset, 4-byte prefix
+            // or inline version, 2-byte len, at most 6 inline bytes
+            Layout::VarByte => 8,
+        }
+    }
+
+    #[inline]
+    pub fn is_fixed(&self) -> bool {
+        match self {
+            Layout::VarByte => false,
+            _ => true,
+        }
+    }
+}
+
 /// Val is value representation of row-store.
 /// The variable-length data may require new allocation
 /// because we cannot rely on page data.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Default, Deserialize, Eq, Hash)]
 pub enum Val {
+    #[default]
     Null,
     Byte1(Byte1Val),
     Byte2(Byte2Val),
@@ -43,8 +84,6 @@ impl PartialEq for Val {
         }
     }
 }
-
-impl Eq for Val {}
 
 impl fmt::Debug for Val {
     #[inline]
@@ -113,6 +152,13 @@ impl From<&[u8]> for Val {
     #[inline]
     fn from(value: &[u8]) -> Self {
         Val::VarByte(MemVar::new(value))
+    }
+}
+
+impl From<&str> for Val {
+    #[inline]
+    fn from(value: &str) -> Self {
+        Val::VarByte(MemVar::new(value.as_bytes()))
     }
 }
 
@@ -211,7 +257,13 @@ impl<'a> From<&'a str> for ValRef<'a> {
 
 /// Value is a marker trait to represent
 /// fixed-length column value in row page.
-pub trait Value {}
+pub trait Value: Sized {
+    const LAYOUT: Layout;
+
+    unsafe fn atomic_store(&self, ptr: *mut u8);
+
+    unsafe fn atomic_load(ptr: *mut u8) -> Self;
+}
 
 pub trait ToValue {
     type Target: Value;
@@ -226,7 +278,20 @@ pub trait Byte1ValSlice {
     fn as_i8s_mut(&mut self) -> &mut [i8];
 }
 
-impl Value for Byte1Val {}
+impl Value for Byte1Val {
+    const LAYOUT: Layout = Layout::Byte1;
+    #[inline]
+    unsafe fn atomic_store(&self, ptr: *mut u8) {
+        let atom = AtomicU8::from_ptr(ptr);
+        atom.store(*self, Ordering::Relaxed);
+    }
+
+    #[inline]
+    unsafe fn atomic_load(ptr: *mut u8) -> Self {
+        let atom = AtomicU8::from_ptr(ptr);
+        atom.load(Ordering::Relaxed)
+    }
+}
 
 impl Byte1ValSlice for [Byte1Val] {
     #[inline]
@@ -262,7 +327,22 @@ pub trait Byte2ValSlice {
 
     fn as_i16s_mut(&mut self) -> &mut [i16];
 }
-impl Value for Byte2Val {}
+impl Value for Byte2Val {
+    const LAYOUT: Layout = Layout::Byte2;
+    #[inline]
+    unsafe fn atomic_store(&self, ptr: *mut u8) {
+        debug_assert!(ptr as usize % 2 == 0);
+        let atom = AtomicU16::from_ptr(ptr as *mut _);
+        atom.store(*self, Ordering::Relaxed);
+    }
+
+    #[inline]
+    unsafe fn atomic_load(ptr: *mut u8) -> Self {
+        debug_assert!(ptr as usize % 2 == 0);
+        let atom = AtomicU16::from_ptr(ptr as *mut _);
+        atom.load(Ordering::Relaxed)
+    }
+}
 
 impl ToValue for u16 {
     type Target = Byte2Val;
@@ -303,7 +383,22 @@ pub trait Byte4ValSlice {
     fn as_f32s_mut(&mut self) -> &mut [f32];
 }
 
-impl Value for Byte4Val {}
+impl Value for Byte4Val {
+    const LAYOUT: Layout = Layout::Byte4;
+    #[inline]
+    unsafe fn atomic_store(&self, ptr: *mut u8) {
+        debug_assert!(ptr as usize % 4 == 0);
+        let atom = AtomicU32::from_ptr(ptr as *mut _);
+        atom.store(*self, Ordering::Relaxed);
+    }
+
+    #[inline]
+    unsafe fn atomic_load(ptr: *mut u8) -> Self {
+        debug_assert!(ptr as usize % 4 == 0);
+        let atom = AtomicU32::from_ptr(ptr as *mut _);
+        atom.load(Ordering::Relaxed)
+    }
+}
 
 impl Byte4ValSlice for [Byte4Val] {
     #[inline]
@@ -354,7 +449,22 @@ pub trait Byte8ValSlice {
     fn as_f64s_mut(&mut self) -> &mut [f64];
 }
 
-impl Value for Byte8Val {}
+impl Value for Byte8Val {
+    const LAYOUT: Layout = Layout::Byte8;
+    #[inline]
+    unsafe fn atomic_store(&self, ptr: *mut u8) {
+        debug_assert!(ptr as usize % 8 == 0);
+        let atom = AtomicU64::from_ptr(ptr as *mut _);
+        atom.store(*self, Ordering::Relaxed);
+    }
+
+    #[inline]
+    unsafe fn atomic_load(ptr: *mut u8) -> Self {
+        debug_assert!(ptr as usize % 8 == 0);
+        let atom = AtomicU64::from_ptr(ptr as *mut _);
+        atom.load(Ordering::Relaxed)
+    }
+}
 
 impl ToValue for u64 {
     type Target = Byte8Val;
@@ -401,6 +511,7 @@ impl Byte8ValSlice for [Byte8Val] {
 /// offset and prfix. Entire value is located at
 /// tail of page.
 #[derive(Clone, Copy)]
+#[repr(align(8))]
 pub union PageVar {
     i: PageVarInline,
     o: PageVarOutline,
@@ -444,6 +555,15 @@ impl PageVar {
     #[inline]
     pub fn len(&self) -> usize {
         unsafe { self.i.len as usize }
+    }
+
+    /// Returns offset if outlined.
+    #[inline]
+    pub fn offset(&self) -> Option<usize> {
+        if self.is_inlined() {
+            return None;
+        }
+        unsafe { Some(self.o.offset as usize) }
     }
 
     /// Returns whether the value is inlined.
@@ -545,14 +665,14 @@ impl PageVar {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(8))]
 struct PageVarInline {
     len: u16,
     data: [u8; PAGE_VAR_LEN_INLINE],
 }
 
 #[derive(Debug, Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(8))]
 struct PageVarOutline {
     len: u16,
     offset: u16,
@@ -603,7 +723,7 @@ impl MemVar {
             let o = outline.assume_init_mut();
             o.len = data.len() as u16;
             o.prefix.copy_from_slice(&data[..MEM_VAR_LEN_PREFIX]);
-            let layout = Layout::from_size_align_unchecked(data.len(), 1);
+            let layout = AllocLayout::from_size_align_unchecked(data.len(), 1);
             o.ptr = alloc(layout);
             let bs = std::slice::from_raw_parts_mut(o.ptr, data.len());
             bs.copy_from_slice(data);
@@ -662,6 +782,22 @@ impl MemVar {
     }
 }
 
+impl Hash for MemVar {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl PartialEq for MemVar {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for MemVar {}
+
 impl Clone for MemVar {
     #[inline]
     fn clone(&self) -> Self {
@@ -681,7 +817,7 @@ impl Drop for MemVar {
         let len = self.len();
         if len > MEM_VAR_LEN_INLINE {
             unsafe {
-                let layout = Layout::from_size_align_unchecked(len, 1);
+                let layout = AllocLayout::from_size_align_unchecked(len, 1);
                 dealloc(self.o.ptr, layout);
             }
         }
@@ -784,7 +920,7 @@ impl Clone for MemVarOutline {
     #[inline]
     fn clone(&self) -> Self {
         unsafe {
-            let layout = Layout::from_size_align_unchecked(self.len as usize, 1);
+            let layout = AllocLayout::from_size_align_unchecked(self.len as usize, 1);
             let ptr = alloc(layout);
             MemVarOutline {
                 len: self.len,
@@ -798,6 +934,12 @@ impl Clone for MemVarOutline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_var_len() {
+        assert!(mem::size_of::<MemVar>() == MEM_VAR_HEADER);
+        assert!(mem::size_of::<PageVar>() == PAGE_VAR_HEADER);
+    }
 
     #[test]
     fn test_page_var() {

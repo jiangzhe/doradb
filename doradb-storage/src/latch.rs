@@ -88,6 +88,7 @@ impl HybridLatch {
             if (ver & LATCH_EXCLUSIVE_BIT) != LATCH_EXCLUSIVE_BIT {
                 break;
             }
+            std::hint::spin_loop();
         }
         HybridGuard::new(self, GuardState::Optimistic, ver)
     }
@@ -231,9 +232,8 @@ impl<'a> HybridGuard<'a> {
     }
 
     /// Convert lock mode to optimistic.
-    /// Then the guard can be saved and used in future.
     #[inline]
-    pub fn downgrade(&mut self) {
+    pub fn downgrade(mut self) -> Self {
         match self.state {
             GuardState::Exclusive => {
                 let ver = self.version + LATCH_EXCLUSIVE_BIT;
@@ -243,12 +243,24 @@ impl<'a> HybridGuard<'a> {
                 }
                 self.version = ver;
                 self.state = GuardState::Optimistic;
+                HybridGuard {
+                    lock: self.lock,
+                    version: self.version,
+                    state: self.state,
+                }
             }
-            GuardState::Shared => unsafe {
-                self.lock.lock.unlock_shared();
+            GuardState::Shared => {
+                unsafe {
+                    self.lock.lock.unlock_shared();
+                }
                 self.state = GuardState::Optimistic;
-            },
-            GuardState::Optimistic => (),
+                HybridGuard {
+                    lock: self.lock,
+                    version: self.version,
+                    state: self.state,
+                }
+            }
+            GuardState::Optimistic => self,
         }
     }
 
@@ -272,14 +284,7 @@ impl<'a> HybridGuard<'a> {
                 Invalid
             }
             GuardState::Shared => Valid(()),
-            GuardState::Exclusive => {
-                // downgrade to optimistic lock and then retry
-                self.downgrade();
-                // even though other thread may acquire the exclusive lock
-                // inbetween, version validation will make sure caller will
-                // be notified to retry.
-                self.try_shared()
-            }
+            GuardState::Exclusive => panic!("try shared on exclusive lock is not allowed"),
         }
     }
 
@@ -304,10 +309,7 @@ impl<'a> HybridGuard<'a> {
                 }
                 Invalid
             }
-            GuardState::Shared => {
-                self.downgrade();
-                self.try_exclusive()
-            }
+            GuardState::Shared => panic!("try exclusive on shared lock is not allowed"),
             GuardState::Exclusive => Valid(()),
         }
     }
@@ -328,6 +330,12 @@ impl<'a> HybridGuard<'a> {
             });
         }
         Err(Error::InvalidState)
+    }
+
+    #[inline]
+    pub fn refresh_version(&mut self) {
+        debug_assert!(self.state == GuardState::Optimistic);
+        self.version = self.lock.version_acq();
     }
 }
 

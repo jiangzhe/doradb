@@ -3,6 +3,7 @@ use crate::io::{
     align_to_sector_size, pwrite, AIOError, AIOManager, AIOManagerConfig, Buf, DirectBuf,
     FreeListWithFactory, IocbRawPtr, PageBuf, SparseFile, AIO,
 };
+use crate::session::Session;
 use crate::trx::{
     ActiveTrx, CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS,
     MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
@@ -97,7 +98,7 @@ impl TransactionSystem {
 
     /// Create a new transaction.
     #[inline]
-    pub fn new_trx(&self) -> ActiveTrx {
+    pub fn new_trx<'a>(&self, session: &'a mut Session) -> ActiveTrx<'a> {
         // active transaction list is calculated by group committer thread
         // so here we just generate STS and TrxID.
         let sts = self.ts.fetch_add(1, Ordering::SeqCst);
@@ -111,7 +112,7 @@ impl TransactionSystem {
         } else {
             self.partition_id.fetch_add(1, Ordering::Relaxed) % self.config.log_partitions
         };
-        let mut trx = ActiveTrx::new(trx_id, sts);
+        let mut trx = ActiveTrx::new(session, trx_id, sts);
         trx.set_log_partition(log_partition_idx);
         trx
     }
@@ -123,15 +124,16 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub async fn commit(&self, trx: ActiveTrx) -> Result<()> {
+    pub async fn commit(&self, trx: ActiveTrx<'_>) -> Result<()> {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_partition_idx];
         let prepared_trx = trx.prepare();
         if prepared_trx.redo_bin.is_none() {
             if prepared_trx.undo.is_empty() {
-                // This is a read-only transaction, so directly return is ok.
-                // self.log_partitions[trx.log_partition_idx].end_active_sts(trx.sts);
+                // This is a read-only transaction, drop it is safe.
+                debug_assert!(prepared_trx.readonly());
+                drop(prepared_trx);
                 return Ok(());
             }
             // There might be scenario that the transaction does not change anything
@@ -647,7 +649,15 @@ impl LogPartition {
                 self.persisted_cts.store(max_cts, Ordering::SeqCst);
 
                 io_reqs.clear();
-                sync_groups.clear();
+
+                for mut sync_group in sync_groups.drain(..) {
+                    mem::take(&mut sync_group.trx_list)
+                        .into_iter()
+                        .for_each(|trx| {
+                            trx.commit();
+                        });
+                }
+
                 self.update_stats(trx_count, commit_count, log_bytes, 1, 0);
             }
             if shutdown {
@@ -756,6 +766,13 @@ impl LogPartition {
                     if let Some(Buf::Reuse(elem)) = sync_group.aio.take_buf() {
                         self.buf_free_list.push_elem(elem); // return buf to free list for future reuse
                     }
+                    // commit transactions to let waiting read operations to continue
+                    // todo: send to GC thread.
+                    mem::take(&mut sync_group.trx_list)
+                        .into_iter()
+                        .for_each(|trx| {
+                            trx.commit();
+                        });
                     drop(sync_group); // notify transaction thread to continue.
                 }
 
@@ -971,13 +988,15 @@ mod tests {
     #[test]
     fn test_transaction_system() {
         let trx_sys = TrxSysConfig::default().build_static();
+        let mut session = Session::new();
         {
-            let trx = trx_sys.new_trx();
-            smol::block_on(trx_sys.commit(trx));
+            let trx = session.begin_trx(trx_sys);
+            let _ = smol::block_on(trx_sys.commit(trx));
         }
         std::thread::spawn(|| {
-            let trx = trx_sys.new_trx();
-            smol::block_on(trx_sys.commit(trx));
+            let mut session = Session::new();
+            let trx = session.begin_trx(trx_sys);
+            let _ = smol::block_on(trx_sys.commit(trx));
         })
         .join()
         .unwrap();
@@ -1118,6 +1137,7 @@ mod tests {
     fn test_single_thread_trx_begin_and_commit() {
         const COUNT: usize = 1000000;
         let trx_sys = TrxSysConfig::default().build_static();
+        let mut session = Session::new();
         {
             // hook persisted_ts to u64::MAX to allaw all transactions immediately finish.
             trx_sys.persisted_cts.store(u64::MAX, Ordering::SeqCst);
@@ -1126,8 +1146,8 @@ mod tests {
         {
             let start = Instant::now();
             for _ in 0..COUNT {
-                let trx = trx_sys.new_trx();
-                smol::block_on(trx_sys.commit(trx));
+                let trx = session.begin_trx(trx_sys);
+                assert!(smol::block_on(trx_sys.commit(trx)).is_ok());
             }
             let dur = start.elapsed();
             println!(

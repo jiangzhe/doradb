@@ -2,14 +2,54 @@ use crate::buffer::page::PageID;
 use crate::row::ops::UpdateCol;
 use crate::row::RowID;
 use crate::table::TableID;
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Weak};
+use crate::trx::{SharedTrxStatus, TrxID, GLOBAL_VISIBLE_COMMIT_TS};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
-/// UndoMap is page level hash map to store undo chain of rows.
-/// If UndoMap is empty, this page has all data visible to all transactions.
-pub type UndoMap = HashMap<RowID, SharedUndoEntry>;
+pub struct UndoMap {
+    entries: Box<[RwLock<Option<UndoHead>>]>,
+    // occupied: usize,
+}
+
+impl UndoMap {
+    #[inline]
+    pub fn new(len: usize) -> Self {
+        let vec: Vec<_> = (0..len).map(|_| RwLock::new(None)).collect();
+        UndoMap {
+            entries: vec.into_boxed_slice(),
+            // occupied: 0,
+        }
+    }
+
+    #[inline]
+    pub fn occupied(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| if entry.read().is_some() { 1 } else { 0 })
+            .sum()
+    }
+
+    #[inline]
+    pub fn read(&self, row_idx: usize) -> RwLockReadGuard<'_, Option<UndoHead>> {
+        self.entries[row_idx].read()
+    }
+
+    #[inline]
+    pub fn write(&self, row_idx: usize) -> RwLockWriteGuard<'_, Option<UndoHead>> {
+        self.entries[row_idx].write()
+    }
+
+    #[inline]
+    pub fn ptr(&self, row_idx: usize) -> UndoHeadPtr {
+        unsafe {
+            let ptr = &self.entries[row_idx] as *const _ as *mut _;
+            UndoHeadPtr(NonNull::new_unchecked(ptr))
+        }
+    }
+}
 
 /// UndoKind represents the kind of original operation.
 /// So the actual undo action should be opposite of the kind.
@@ -107,7 +147,6 @@ pub enum UndoKind {
     ///
     /// 3. Delete -> Update.
     ///
-    /// 4. Delete -> Move.
     Delete,
     /// Copy old versions of updated columns.
     ///
@@ -134,35 +173,189 @@ pub enum UndoKind {
     Update(Vec<UpdateCol>),
 }
 
-/// SharedUndoEntry is a reference-counted pointer to UndoEntry.
 /// The transaction generates undo log, and page-level undo
 /// map will also hold its shared copy to track all visible
 /// versions of modified rows.
-pub type SharedUndoEntry = Arc<UndoEntry>;
+pub struct SharedUndoEntry(UndoEntryPtr);
 
-/// PrevUndoEntry is used for garbage collector to unlink its
-/// previous entry to itself.
-pub type PrevUndoEntry = Weak<UndoEntry>;
+unsafe impl Send for SharedUndoEntry {}
+
+impl Deref for SharedUndoEntry {
+    type Target = UndoEntryPtr;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for SharedUndoEntry {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl SharedUndoEntry {
+    #[inline]
+    pub fn new(table_id: TableID, page_id: PageID, row_id: RowID, kind: UndoKind) -> Self {
+        let entry = UndoEntry {
+            table_id,
+            page_id,
+            row_id,
+            kind,
+            chain: RwLock::new(UndoChain {
+                prev: None,
+                next: None,
+            }),
+            ref_count: AtomicU32::new(1),
+        };
+        let ptr = Box::leak(Box::new(entry));
+        SharedUndoEntry(UndoEntryPtr(unsafe { NonNull::new_unchecked(ptr) }))
+    }
+
+    #[inline]
+    pub fn clone(this: &SharedUndoEntry) -> SharedUndoEntry {
+        this.as_ref().ref_count.fetch_add(1, Ordering::Relaxed);
+        SharedUndoEntry(this.leak())
+    }
+}
+
+impl Drop for SharedUndoEntry {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            let ref_count = self.as_ref().ref_count.fetch_sub(1, Ordering::Relaxed);
+            if ref_count == 1 {
+                // last referenece, call destructor now
+                drop(Box::from_raw(self.as_mut()));
+            }
+        }
+    }
+}
+
+/// UndoEntryPtr is an atomic pointer to UndoEntry.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct UndoEntryPtr(NonNull<UndoEntry>);
+
+impl UndoEntryPtr {
+    #[inline]
+    pub(crate) fn as_ref(&self) -> &UndoEntry {
+        unsafe { self.0.as_ref() }
+    }
+
+    #[inline]
+    pub(crate) unsafe fn as_mut(&mut self) -> &mut UndoEntry {
+        self.0.as_mut()
+    }
+
+    /// Leak a not reference counted pointer of the undo entry.
+    /// Caller must make sure it will not outlive the entry.
+    ///
+    /// This is used in MVCC forward processing.
+    /// We only count the pointers from old version to new version
+    /// to enable fast GC processing.
+    /// The validity of pointer lifetime is guaranteed by GC logic.
+    #[inline]
+    pub fn leak(&self) -> Self {
+        UndoEntryPtr(self.0)
+    }
+}
 
 pub struct UndoEntry {
-    /// This field stores uncommitted TrxID, or committed timestamp.
+    /// This field stores uncommitted TrxID, committed timestamp.
+    /// Or preparing status, which may block read.
     /// It uses shared pointer and atomic variable to support
     /// fast backfill.
-    pub ts: Arc<AtomicU64>,
+    // pub status: Arc<SharedTrxStatus>,
     pub table_id: TableID,
     pub page_id: PageID,
     pub row_id: RowID,
     pub kind: UndoKind,
-    pub chain: Mutex<UndoChain>,
+    pub chain: RwLock<UndoChain>,
+    ref_count: AtomicU32,
 }
 
-/// UndoChain stores prev chain, and next chain.
+/// UndoChain stores prev pointer, next pointer, next status, and current ref count.
 /// Prev chain is used for garbage collection.
 /// Next chain is used for visibility check.
-#[derive(Default)]
 pub struct UndoChain {
     /// Pointer to the newer version.
+    /// This pointer is reference counted.
     pub prev: Option<PrevUndoEntry>,
-    /// Pointer to the older version.
-    pub next: Option<SharedUndoEntry>,
+    /// Status of older version and pointer to the older version.
+    pub next: Option<NextUndoEntry>,
+}
+
+pub enum PrevUndoEntry {
+    Head(UndoHeadPtr),
+    Entry(SharedUndoEntry),
+}
+
+pub struct NextUndoEntry {
+    pub status: NextUndoStatus,
+    pub entry: UndoEntryPtr,
+}
+
+pub enum NextUndoStatus {
+    // If transaction modify a row multiple times.
+    // It will link multiple undo entries with the
+    // same timestamp.
+    // One optimization is to compact such entries.
+    // In another way, we only keep the timestmap
+    // on top of the entry, and mark other entries
+    // as SameAsPrev.
+    SameAsPrev,
+    CTS(TrxID),
+}
+
+pub struct UndoHead {
+    pub status: Arc<SharedTrxStatus>,
+    pub entry: Option<UndoEntryPtr>,
+}
+
+/// A not reference counted pointer to undo head.
+/// Because all undo heads are stored in continuous memory
+/// area allocated in heap and no re-allocation is allowed.
+/// So we can make sure pointer is always valid.
+#[derive(Clone)]
+pub struct UndoHeadPtr(NonNull<RwLock<Option<UndoHead>>>);
+
+impl UndoHeadPtr {
+    #[inline]
+    pub fn as_ref(&self) -> &RwLock<Option<UndoHead>> {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+pub enum NextTrxCTS {
+    #[default]
+    None,
+    Value(TrxID),
+    Myself,
+}
+
+impl NextTrxCTS {
+    #[inline]
+    pub fn undo_status(self) -> NextUndoStatus {
+        match self {
+            NextTrxCTS::None => NextUndoStatus::CTS(GLOBAL_VISIBLE_COMMIT_TS),
+            NextTrxCTS::Value(cts) => NextUndoStatus::CTS(cts),
+            NextTrxCTS::Myself => NextUndoStatus::SameAsPrev,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_undo_head_size() {
+        println!(
+            "size of RwLock<Option<UndoHead>> is {}",
+            std::mem::size_of::<RwLock<Option<UndoHead>>>()
+        );
+    }
 }

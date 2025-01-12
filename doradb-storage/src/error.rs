@@ -32,10 +32,6 @@ pub enum Error {
     // buffer pool errors
     #[error("insufficient memory({0})")]
     InsufficientMemory(usize),
-    #[error("insufficient buffer pool({0})")]
-    InsufficientBufferPool(u64),
-    #[error("page id out of bound({0})")]
-    PageIdOutOfBound(u64),
     #[error("empty free list of buffer pool")]
     EmptyFreeListOfBufferPool,
     // latch errors
@@ -161,15 +157,6 @@ macro_rules! verify_continue {
         match $exp {
             Validation::Invalid => continue,
             Validation::Valid(v) => v,
-        }
-    };
-}
-
-macro_rules! bypass_res {
-    ($exp:expr) => {
-        match $exp {
-            Ok(res) => res,
-            Err(e) => return Validation::Valid(Err(e)),
         }
     };
 }
