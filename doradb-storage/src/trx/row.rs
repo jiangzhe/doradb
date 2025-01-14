@@ -276,7 +276,7 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub fn build_undo_chain(
         &mut self,
-        trx: &ActiveTrx<'_>,
+        trx: &ActiveTrx,
         new_entry: &SharedUndoEntry,
         old_cts: NextTrxCTS,
     ) {

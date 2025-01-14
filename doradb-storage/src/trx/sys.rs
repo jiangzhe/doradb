@@ -3,7 +3,7 @@ use crate::io::{
     align_to_sector_size, pwrite, AIOError, AIOManager, AIOManagerConfig, Buf, DirectBuf,
     FreeListWithFactory, IocbRawPtr, PageBuf, SparseFile, AIO,
 };
-use crate::session::Session;
+use crate::session::{InternalSession, IntoSession, Session};
 use crate::trx::{
     ActiveTrx, CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS,
     MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
@@ -98,7 +98,7 @@ impl TransactionSystem {
 
     /// Create a new transaction.
     #[inline]
-    pub fn new_trx<'a>(&self, session: &'a mut Session) -> ActiveTrx<'a> {
+    pub fn new_trx<'a>(&self, session: Option<Box<InternalSession>>) -> ActiveTrx {
         // active transaction list is calculated by group committer thread
         // so here we just generate STS and TrxID.
         let sts = self.ts.fetch_add(1, Ordering::SeqCst);
@@ -124,7 +124,7 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub async fn commit(&self, trx: ActiveTrx<'_>) -> Result<()> {
+    pub async fn commit(&self, trx: ActiveTrx) -> Result<Session> {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_partition_idx];
@@ -133,8 +133,7 @@ impl TransactionSystem {
             if prepared_trx.undo.is_empty() {
                 // This is a read-only transaction, drop it is safe.
                 debug_assert!(prepared_trx.readonly());
-                drop(prepared_trx);
-                return Ok(());
+                return Ok(prepared_trx.into_session());
             }
             // There might be scenario that the transaction does not change anything
             // logically, but have undo logs.
@@ -152,8 +151,6 @@ impl TransactionSystem {
         }
         // start group commit
         partition.commit(prepared_trx, &self.ts).await
-
-        // partition.end_active_sts(trx.sts);
     }
 
     /// Rollback active transaction.
@@ -469,7 +466,7 @@ impl LogPartition {
         &self,
         mut trx: PrecommitTrx,
         mut group_commit_g: MutexGuard<'_, GroupCommit>,
-    ) -> Receiver<()> {
+    ) -> (Session, Receiver<()>) {
         let cts = trx.cts;
         let redo_bin = trx.redo_bin.take().unwrap();
         debug_assert!(!redo_bin.is_empty());
@@ -487,6 +484,7 @@ impl LogPartition {
         let fd = log_file.as_raw_fd();
         let log_buf = self.buf(&redo_bin);
         let (sync_signal, sync_notifier) = flume::unbounded();
+        let session = trx.split_session();
         let new_group = CommitGroup {
             trx_list: vec![trx],
             max_cts: cts,
@@ -501,55 +499,54 @@ impl LogPartition {
             .push_back(CommitMessage::Group(new_group));
         drop(group_commit_g);
 
-        sync_notifier
+        (session, sync_notifier)
     }
 
     /// Transaction has no redo log, so we can just acquire CTS and finish it immediately.
     #[inline]
-    fn commit_without_redo(&self, trx: PreparedTrx, ts: &AtomicU64) {
-        let sts = trx.sts;
+    fn commit_without_redo(&self, trx: PreparedTrx, ts: &AtomicU64) -> Session {
         let cts = ts.fetch_add(1, Ordering::SeqCst);
         let committed_trx = trx.fill_cts(cts).commit();
         // todo: GC
-        // self.end_active_sts(sts);
+        committed_trx.into_session()
     }
 
     #[inline]
-    async fn commit(&self, trx: PreparedTrx, ts: &AtomicU64) -> Result<()> {
+    async fn commit(&self, trx: PreparedTrx, ts: &AtomicU64) -> Result<Session> {
         if trx.redo_bin.is_none() {
-            self.commit_without_redo(trx, ts);
-            return Ok(());
+            let session = self.commit_without_redo(trx, ts);
+            return Ok(session);
         }
         let mut group_commit_g = self.group_commit.0.lock();
         let cts = ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
-            let sync_notifier = self.create_new_group(precommit_trx, group_commit_g);
+            let (session, sync_notifier) = self.create_new_group(precommit_trx, group_commit_g);
             self.group_commit.1.notify_one(); // notify sync thread to work.
 
             let _ = sync_notifier.recv_async().await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
-            return Ok(());
+            return Ok(session);
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
             CommitMessage::Shutdown => return Err(Error::TransactionSystemShutdown),
             CommitMessage::Group(group) => group,
         };
         if last_group.can_join(&precommit_trx) {
-            let sync_notifier = last_group.join(precommit_trx);
+            let (session, sync_notifier) = last_group.join(precommit_trx);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
 
             let _ = sync_notifier.recv_async().await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
-            return Ok(());
+            return Ok(session);
         }
 
-        let sync_notifier = self.create_new_group(precommit_trx, group_commit_g);
+        let (session, sync_notifier) = self.create_new_group(precommit_trx, group_commit_g);
 
         let _ = sync_notifier.recv_async().await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
-        Ok(())
+        Ok(session)
     }
 
     #[inline]
@@ -879,14 +876,15 @@ impl CommitGroup {
     }
 
     #[inline]
-    fn join(&mut self, mut trx: PrecommitTrx) -> Receiver<()> {
+    fn join(&mut self, mut trx: PrecommitTrx) -> (Session, Receiver<()>) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
             self.log_buf.clone_from_slice(&redo_bin);
         }
         self.max_cts = trx.cts;
+        let session = trx.split_session();
         self.trx_list.push(trx);
-        self.sync_notifier.clone()
+        (session, self.sync_notifier.clone())
     }
 
     #[inline]
@@ -979,6 +977,7 @@ fn shrink_inflight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Session;
     use crossbeam_utils::CachePadded;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -988,13 +987,13 @@ mod tests {
     #[test]
     fn test_transaction_system() {
         let trx_sys = TrxSysConfig::default().build_static();
-        let mut session = Session::new();
+        let session = Session::new();
         {
             let trx = session.begin_trx(trx_sys);
             let _ = smol::block_on(trx_sys.commit(trx));
         }
         std::thread::spawn(|| {
-            let mut session = Session::new();
+            let session = Session::new();
             let trx = session.begin_trx(trx_sys);
             let _ = smol::block_on(trx_sys.commit(trx));
         })
@@ -1147,7 +1146,9 @@ mod tests {
             let start = Instant::now();
             for _ in 0..COUNT {
                 let trx = session.begin_trx(trx_sys);
-                assert!(smol::block_on(trx_sys.commit(trx)).is_ok());
+                let res = smol::block_on(trx_sys.commit(trx));
+                assert!(res.is_ok());
+                session = res.unwrap();
             }
             let dur = start.elapsed();
             println!(

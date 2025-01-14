@@ -9,25 +9,49 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct Session {
+    inner: Option<Box<InternalSession>>,
+}
+
+impl Session {
+    #[inline]
+    pub fn new() -> Session {
+        Session {
+            inner: Some(Box::new(InternalSession::new())),
+        }
+    }
+
+    #[inline]
+    pub fn with_internal_session(inner: Box<InternalSession>) -> Self {
+        Session { inner: Some(inner) }
+    }
+
+    #[inline]
+    pub fn begin_trx(mut self, trx_sys: &TransactionSystem) -> ActiveTrx {
+        trx_sys.new_trx(self.inner.take())
+    }
+}
+
+pub trait IntoSession: Sized {
+    fn into_session(self) -> Session;
+
+    fn split_session(&mut self) -> Session;
+}
+
+pub struct InternalSession {
     active_insert_pages: HashMap<TableID, (PageID, RowID)>,
     abort_signal: Arc<Mutex<Option<Sender<()>>>>,
     abort_notifier: Receiver<()>,
 }
 
-impl Session {
+impl InternalSession {
     #[inline]
     pub fn new() -> Self {
         let (tx, rx) = flume::unbounded();
-        Session {
+        InternalSession {
             active_insert_pages: HashMap::new(),
             abort_signal: Arc::new(Mutex::new(Some(tx))),
             abort_notifier: rx,
         }
-    }
-
-    #[inline]
-    pub fn begin_trx(&mut self, trx_sys: &TransactionSystem) -> ActiveTrx {
-        trx_sys.new_trx(self)
     }
 
     #[inline]

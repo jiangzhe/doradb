@@ -91,7 +91,10 @@ async fn worker(trx_sys: &TransactionSystem, stop: Arc<AtomicBool>, wg: WaitGrou
     while !stop.load(Ordering::Relaxed) {
         let mut trx = session.begin_trx(trx_sys);
         trx.add_pseudo_redo_log_entry();
-        let _ = trx_sys.commit(trx).await;
+        match trx_sys.commit(trx).await {
+            Ok(s) => session = s,
+            Err(_) => return,
+        }
     }
     drop(wg);
 }
