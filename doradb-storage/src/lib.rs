@@ -7,6 +7,7 @@ pub mod index;
 pub mod latch;
 pub mod row;
 pub mod session;
+pub mod stmt;
 pub mod table;
 pub mod trx;
 pub mod value;

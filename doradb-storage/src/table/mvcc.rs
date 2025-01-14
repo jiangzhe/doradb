@@ -8,6 +8,7 @@ use crate::row::ops::{
     UpdateCol, UpdateMvccResult, UpdateRow,
 };
 use crate::row::{estimate_max_row_count, RowID, RowPage, RowRead};
+use crate::stmt::Statement;
 use crate::table::{Schema, Table};
 use crate::trx::redo::{RedoEntry, RedoKind};
 use crate::trx::row::{RowReadAccess, RowWriteAccess};
@@ -50,7 +51,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     pub async fn select_row(
         &self,
-        trx: &mut ActiveTrx<'_>,
+        stmt: &mut Statement,
         key: Val,
         user_read_set: &[usize],
     ) -> SelectMvccResult {
@@ -76,7 +77,7 @@ impl<'a> MvccTable<'a> {
                         }
                         let key = key.clone();
                         return self
-                            .select_row_in_page(trx, page_guard, key, row_id, user_read_set)
+                            .select_row_in_page(stmt, page_guard, key, row_id, user_read_set)
                             .await;
                     }
                 },
@@ -87,7 +88,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     async fn select_row_in_page(
         &self,
-        trx: &mut ActiveTrx<'_>,
+        stmt: &mut Statement,
         page_guard: PageSharedGuard<'_, RowPage>,
         key: Val,
         row_id: RowID,
@@ -100,13 +101,15 @@ impl<'a> MvccTable<'a> {
             return SelectMvccResult::RowNotFound;
         }
         let row_idx = (row_id - page.header.start_row_id) as usize;
-        let access = self.lock_row_for_read(trx, &page_guard, row_idx).await;
-        access.read_row_mvcc(trx, &self.schema, user_read_set, &key)
+        let access = self
+            .lock_row_for_read(&stmt.trx, &page_guard, row_idx)
+            .await;
+        access.read_row_mvcc(&stmt.trx, &self.schema, user_read_set, &key)
     }
 
     /// Insert row with MVCC.
     #[inline]
-    pub async fn insert_row(&self, trx: &mut ActiveTrx<'_>, cols: Vec<Val>) -> InsertMvccResult {
+    pub async fn insert_row(&self, stmt: &mut Statement, cols: Vec<Val>) -> InsertMvccResult {
         debug_assert!(cols.len() + 1 == self.schema.col_count());
         debug_assert!({
             cols.iter()
@@ -114,18 +117,18 @@ impl<'a> MvccTable<'a> {
                 .all(|(idx, val)| self.schema.user_col_type_match(idx, val))
         });
         let key = cols[self.schema.user_key_idx()].clone();
-        match self.insert_row_internal(trx, cols, UndoKind::Insert, None) {
+        match self.insert_row_internal(stmt, cols, UndoKind::Insert, None) {
             InsertMvccResult::Ok(row_id) => loop {
                 if let Some(old_row_id) = self.sec_idx.insert_if_not_exists(key.clone(), row_id) {
                     // we found there is already one existing row with same key.
                     // ref-count the INSERT undo entry because we treat it as newer version.
                     // and store in the MOVE entry's prev pointer.
-                    let new_entry = trx
-                        .last_undo_entry_of_curr_stmt()
+                    let new_entry = stmt
+                        .last_undo_entry()
                         .map(SharedUndoEntry::clone)
                         .expect("undo entry of insert statement");
                     match self
-                        .move_insert(trx, old_row_id, key.clone(), new_entry)
+                        .move_insert(stmt, old_row_id, key.clone(), new_entry)
                         .await
                     {
                         MoveInsertResult::DuplicateKey => return InsertMvccResult::DuplicateKey,
@@ -149,7 +152,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     pub async fn update_row(
         &self,
-        trx: &mut ActiveTrx<'_>,
+        stmt: &mut Statement,
         key: Val,
         mut update: Vec<UpdateCol>,
     ) -> UpdateMvccResult {
@@ -168,7 +171,7 @@ impl<'a> MvccTable<'a> {
                             }
                             let key = key.clone();
                             let res = self
-                                .update_row_inplace(trx, page_guard, key, row_id, update)
+                                .update_row_inplace(stmt, page_guard, key, row_id, update)
                                 .await;
 
                             return match res {
@@ -179,11 +182,11 @@ impl<'a> MvccTable<'a> {
                                 UpdateMvccResult::NoFreeSpace(old_row, update) => {
                                     // in-place update failed, we transfer update into
                                     // move+update.
-                                    let move_entry = trx
-                                        .last_undo_entry_of_curr_stmt()
+                                    let move_entry = stmt
+                                        .last_undo_entry()
                                         .map(|entry| entry.leak())
                                         .expect("move entry");
-                                    self.move_update(trx, old_row, update, move_entry)
+                                    self.move_update(stmt, old_row, update, move_entry)
                                 }
                                 UpdateMvccResult::Retry(upd) => {
                                     update = upd;
@@ -200,7 +203,7 @@ impl<'a> MvccTable<'a> {
     /// Delete row with MVCC.
     /// This method is for delete based on index lookup.
     #[inline]
-    pub async fn delete_row(&self, trx: &mut ActiveTrx<'_>, key: Val) -> DeleteMvccResult {
+    pub async fn delete_row(&self, stmt: &mut Statement, key: Val) -> DeleteMvccResult {
         loop {
             match self.sec_idx.lookup(&key) {
                 None => return DeleteMvccResult::RowNotFound,
@@ -214,7 +217,7 @@ impl<'a> MvccTable<'a> {
                             continue;
                         }
                         return self
-                            .delete_row_internal(trx, page_guard, row_id, &key)
+                            .delete_row_internal(stmt, page_guard, row_id, &key)
                             .await;
                     }
                 },
@@ -226,7 +229,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     fn move_update(
         &self,
-        trx: &mut ActiveTrx,
+        stmt: &mut Statement,
         mut old_row: Vec<Val>,
         update: Vec<UpdateCol>,
         move_entry: UndoEntryPtr,
@@ -245,7 +248,7 @@ impl<'a> MvccTable<'a> {
             (old_row, UndoKind::Update(undo_cols))
         };
 
-        match self.insert_row_internal(trx, new_row, undo_kind, Some(move_entry)) {
+        match self.insert_row_internal(stmt, new_row, undo_kind, Some(move_entry)) {
             InsertMvccResult::Ok(row_id) => UpdateMvccResult::Ok(row_id),
             InsertMvccResult::WriteConflict | InsertMvccResult::DuplicateKey => unreachable!(),
         }
@@ -258,7 +261,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     async fn move_insert(
         &self,
-        trx: &mut ActiveTrx<'_>,
+        stmt: &mut Statement,
         row_id: RowID,
         key: Val,
         new_entry: SharedUndoEntry,
@@ -284,7 +287,7 @@ impl<'a> MvccTable<'a> {
                     }
                     let row_idx = (row_id - page.header.start_row_id) as usize;
                     let mut lock_row = self
-                        .lock_row_for_write(trx, &page_guard, row_idx, &key)
+                        .lock_row_for_write(&stmt.trx, &page_guard, row_idx, &key)
                         .await;
                     match &mut lock_row {
                         LockRowForWrite::InvalidIndex => return MoveInsertResult::None, // key changed so we are fine.
@@ -301,12 +304,12 @@ impl<'a> MvccTable<'a> {
                                 row_id,
                                 UndoKind::Move(true),
                             );
-                            access.build_undo_chain(trx, &move_entry, old_cts);
+                            access.build_undo_chain(&stmt.trx, &move_entry, old_cts);
                             drop(access); // unlock the row.
                             drop(lock_row);
                             drop(page_guard); // unlock the page.
                             link_move_entry(new_entry, move_entry.leak());
-                            trx.stmt_undo.push(move_entry);
+                            stmt.undo.push(move_entry);
                             // no redo required, because no change on row data.
                             return MoveInsertResult::Ok;
                         }
@@ -319,7 +322,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     fn insert_row_internal(
         &self,
-        trx: &mut ActiveTrx,
+        stmt: &mut Statement,
         mut insert: Vec<Val>,
         mut undo_kind: UndoKind,
         mut move_entry: Option<UndoEntryPtr>,
@@ -327,12 +330,11 @@ impl<'a> MvccTable<'a> {
         let row_len = row_len(&self.schema, &insert);
         let row_count = estimate_max_row_count(row_len, self.schema.col_count());
         loop {
-            let page_guard = self.get_insert_page(trx, row_count);
+            let page_guard = self.get_insert_page(stmt, row_count);
             let page_id = page_guard.page_id();
-            match self.insert_row_to_page(trx, page_guard, insert, undo_kind, move_entry) {
+            match self.insert_row_to_page(stmt, page_guard, insert, undo_kind, move_entry) {
                 InsertInternalResult::Ok(row_id) => {
-                    trx.session
-                        .save_active_insert_page(self.table_id, page_id, row_id);
+                    stmt.save_active_insert_page(self.table_id, page_id, row_id);
                     return InsertMvccResult::Ok(row_id);
                 }
                 // this page cannot be inserted any more, just leave it and retry another page.
@@ -351,7 +353,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     fn insert_row_to_page(
         &self,
-        trx: &mut ActiveTrx,
+        stmt: &mut Statement,
         page_guard: PageSharedGuard<'_, RowPage>,
         insert: Vec<Val>,
         undo_kind: UndoKind,
@@ -366,10 +368,10 @@ impl<'a> MvccTable<'a> {
                 let new_entry = SharedUndoEntry::new(self.table_id, page_id, row_id, undo_kind);
                 debug_assert!(access.undo_mut().is_none());
                 *access.undo_mut() = Some(UndoHead {
-                    status: trx.status(),
+                    status: stmt.trx.status(),
                     entry: None,
                 });
-                access.build_undo_chain(trx, &new_entry, NextTrxCTS::None);
+                access.build_undo_chain(&stmt.trx, &new_entry, NextTrxCTS::None);
                 drop(access);
                 drop(page_guard);
                 // in case of move+insert and move+update, we need to link current undo entry to MOVE entry
@@ -378,7 +380,7 @@ impl<'a> MvccTable<'a> {
                     // ref-count this pointer.
                     link_move_entry(SharedUndoEntry::clone(&new_entry), move_entry);
                 }
-                trx.stmt_undo.push(new_entry);
+                stmt.undo.push(new_entry);
                 // create redo log.
                 // even if the operation is move+update, we still treat it as insert redo log.
                 // because redo is only useful when recovering and no version chain is required
@@ -389,7 +391,7 @@ impl<'a> MvccTable<'a> {
                     kind: RedoKind::Insert(insert),
                 };
                 // store redo log into transaction redo buffer.
-                trx.stmt_redo.push(redo_entry);
+                stmt.redo.push(redo_entry);
                 InsertInternalResult::Ok(row_id)
             }
             InsertResult::NoFreeSpaceOrRowID => {
@@ -401,7 +403,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     async fn update_row_inplace(
         &self,
-        trx: &mut ActiveTrx<'_>,
+        stmt: &mut Statement,
         page_guard: PageSharedGuard<'_, RowPage>,
         key: Val,
         row_id: RowID,
@@ -436,7 +438,7 @@ impl<'a> MvccTable<'a> {
         }
         let row_idx = (row_id - page.header.start_row_id) as usize;
         let mut lock_row = self
-            .lock_row_for_write(trx, &page_guard, row_idx, &key)
+            .lock_row_for_write(&stmt.trx, &page_guard, row_idx, &key)
             .await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => return UpdateMvccResult::RowNotFound,
@@ -459,18 +461,18 @@ impl<'a> MvccTable<'a> {
                             row_id,
                             UndoKind::Move(false),
                         );
-                        access.build_undo_chain(trx, &new_entry, old_cts);
+                        access.build_undo_chain(&stmt.trx, &new_entry, old_cts);
                         drop(access); // unlock row
                         drop(lock_row);
                         drop(page_guard); // unlock page
-                        trx.stmt_undo.push(new_entry);
+                        stmt.undo.push(new_entry);
                         let redo_entry = RedoEntry {
                             page_id,
                             row_id,
                             // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
                             kind: RedoKind::Delete,
                         };
-                        trx.stmt_redo.push(redo_entry);
+                        stmt.redo.push(redo_entry);
                         UpdateMvccResult::NoFreeSpace(old_row, update)
                     }
                     UpdateRow::Ok(mut row) => {
@@ -496,11 +498,11 @@ impl<'a> MvccTable<'a> {
                             row_id,
                             UndoKind::Update(undo_cols),
                         );
-                        access.build_undo_chain(trx, &new_entry, old_cts);
+                        access.build_undo_chain(&stmt.trx, &new_entry, old_cts);
                         drop(access); // unlock the row.
                         drop(lock_row);
                         drop(page_guard); // unlock the page, because we finish page update.
-                        trx.stmt_undo.push(new_entry);
+                        stmt.undo.push(new_entry);
                         if !redo_cols.is_empty() {
                             // there might be nothing to update, so we do not need to add redo log.
                             // but undo is required because we need to properly lock the row.
@@ -509,7 +511,7 @@ impl<'a> MvccTable<'a> {
                                 row_id,
                                 kind: RedoKind::Update(redo_cols),
                             };
-                            trx.stmt_redo.push(redo_entry);
+                            stmt.redo.push(redo_entry);
                         }
                         UpdateMvccResult::Ok(row_id)
                     }
@@ -521,7 +523,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     async fn delete_row_internal(
         &self,
-        trx: &mut ActiveTrx<'_>,
+        stmt: &mut Statement,
         page_guard: PageSharedGuard<'_, RowPage>,
         row_id: RowID,
         key: &Val,
@@ -535,7 +537,7 @@ impl<'a> MvccTable<'a> {
         }
         let row_idx = (row_id - page.header.start_row_id) as usize;
         let mut lock_row = self
-            .lock_row_for_write(trx, &page_guard, row_idx, key)
+            .lock_row_for_write(&stmt.trx, &page_guard, row_idx, key)
             .await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => return DeleteMvccResult::RowNotFound,
@@ -548,18 +550,18 @@ impl<'a> MvccTable<'a> {
                 access.delete_row();
                 let new_entry =
                     SharedUndoEntry::new(self.table_id, page_id, row_id, UndoKind::Delete);
-                access.build_undo_chain(trx, &new_entry, mem::take(old_cts));
+                access.build_undo_chain(&stmt.trx, &new_entry, mem::take(old_cts));
                 drop(access); // unlock row
                 drop(lock_row);
                 drop(page_guard); // unlock page
-                trx.stmt_undo.push(new_entry);
+                stmt.undo.push(new_entry);
                 // create redo log
                 let redo_entry = RedoEntry {
                     page_id,
                     row_id,
                     kind: RedoKind::Delete,
                 };
-                trx.stmt_redo.push(redo_entry);
+                stmt.redo.push(redo_entry);
                 DeleteMvccResult::Ok
             }
         }
@@ -568,10 +570,10 @@ impl<'a> MvccTable<'a> {
     #[inline]
     fn get_insert_page(
         &self,
-        trx: &mut ActiveTrx,
+        stmt: &mut Statement,
         row_count: usize,
     ) -> PageSharedGuard<'a, RowPage> {
-        if let Some((page_id, row_id)) = trx.session.load_active_insert_page(self.table_id) {
+        if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id) {
             let g = self.buf_pool.get_page(page_id, LatchFallbackMode::Shared);
             // because we save last insert page in session and meanwhile other thread may access this page
             // and do some modification, even worse, buffer pool may evict it and reload other data into
@@ -590,7 +592,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     async fn lock_row_for_write(
         &self,
-        trx: &mut ActiveTrx<'_>,
+        trx: &ActiveTrx,
         page_guard: &'a PageSharedGuard<'a, RowPage>,
         row_idx: usize,
         key: &Val,
@@ -671,7 +673,7 @@ impl<'a> MvccTable<'a> {
     #[inline]
     async fn lock_row_for_read(
         &self,
-        trx: &ActiveTrx<'_>,
+        trx: &ActiveTrx,
         page_guard: &'a PageSharedGuard<'a, RowPage>,
         row_idx: usize,
     ) -> RowReadAccess<'a> {
@@ -817,21 +819,21 @@ mod tests {
                 let mut trx = session.begin_trx(trx_sys);
                 for i in 0..SIZE {
                     let s = format!("{}", i);
-                    trx.start_stmt();
+                    let mut stmt = trx.start_stmt();
                     let res = table
-                        .insert_row(&mut trx, vec![Val::from(i), Val::from(&s[..])])
+                        .insert_row(&mut stmt, vec![Val::from(i), Val::from(&s[..])])
                         .await;
-                    trx.end_stmt();
+                    trx = stmt.commit();
                     assert!(res.is_ok());
                 }
-                trx_sys.commit(trx).await.unwrap();
+                session = trx_sys.commit(trx).await.unwrap();
             }
             {
                 let mut trx = session.begin_trx(trx_sys);
                 for i in 16..SIZE {
-                    trx.start_stmt();
+                    let mut stmt = trx.start_stmt();
                     let key = Val::from(i);
-                    let res = table.select_row(&mut trx, key, &[0, 1]).await;
+                    let res = table.select_row(&mut stmt, key, &[0, 1]).await;
                     match res {
                         SelectMvccResult::Ok(vals) => {
                             assert!(vals.len() == 2);
@@ -841,8 +843,9 @@ mod tests {
                         }
                         _ => panic!("select fail"),
                     }
+                    trx = stmt.commit();
                 }
-                trx_sys.commit(trx).await.unwrap();
+                let _ = trx_sys.commit(trx).await.unwrap();
             }
 
             unsafe {
@@ -868,14 +871,14 @@ mod tests {
                 let mut trx = session.begin_trx(trx_sys);
                 for i in 0..SIZE {
                     let s = format!("{}", i);
-                    trx.start_stmt();
+                    let mut stmt = trx.start_stmt();
                     let res = table
-                        .insert_row(&mut trx, vec![Val::from(i), Val::from(&s[..])])
+                        .insert_row(&mut stmt, vec![Val::from(i), Val::from(&s[..])])
                         .await;
-                    trx.end_stmt();
+                    trx = stmt.commit();
                     assert!(res.is_ok());
                 }
-                trx_sys.commit(trx).await.unwrap();
+                session = trx_sys.commit(trx).await.unwrap();
 
                 // update 1 row with short value
                 let mut trx = session.begin_trx(trx_sys);
@@ -885,11 +888,11 @@ mod tests {
                     idx: 1,
                     val: Val::from(s1),
                 }];
-                trx.start_stmt();
-                let res = table.update_row(&mut trx, k1, update1).await;
+                let mut stmt = trx.start_stmt();
+                let res = table.update_row(&mut stmt, k1, update1).await;
                 assert!(res.is_ok());
-                trx.end_stmt();
-                trx_sys.commit(trx).await.unwrap();
+                trx = stmt.commit();
+                session = trx_sys.commit(trx).await.unwrap();
 
                 // update 1 row with long value
                 let mut trx = session.begin_trx(trx_sys);
@@ -899,11 +902,11 @@ mod tests {
                     idx: 1,
                     val: Val::from(&s2[..]),
                 }];
-                trx.start_stmt();
-                let res = table.update_row(&mut trx, k2, update2).await;
+                let mut stmt = trx.start_stmt();
+                let res = table.update_row(&mut stmt, k2, update2).await;
                 assert!(res.is_ok());
-                trx.end_stmt();
-                trx_sys.commit(trx).await.unwrap();
+                trx = stmt.commit();
+                let _ = trx_sys.commit(trx).await.unwrap();
             }
             unsafe {
                 TransactionSystem::drop_static(trx_sys);
@@ -928,23 +931,23 @@ mod tests {
                 let mut trx = session.begin_trx(trx_sys);
                 for i in 0..SIZE {
                     let s = format!("{}", i);
-                    trx.start_stmt();
+                    let mut stmt = trx.start_stmt();
                     let res = table
-                        .insert_row(&mut trx, vec![Val::from(i), Val::from(&s[..])])
+                        .insert_row(&mut stmt, vec![Val::from(i), Val::from(&s[..])])
                         .await;
-                    trx.end_stmt();
+                    trx = stmt.commit();
                     assert!(res.is_ok());
                 }
-                trx_sys.commit(trx).await.unwrap();
+                session = trx_sys.commit(trx).await.unwrap();
 
                 // delete 1 row
                 let mut trx = session.begin_trx(trx_sys);
                 let k1 = Val::from(1i32);
-                trx.start_stmt();
-                let res = table.delete_row(&mut trx, k1).await;
+                let mut stmt = trx.start_stmt();
+                let res = table.delete_row(&mut stmt, k1).await;
                 assert!(res.is_ok());
-                trx.end_stmt();
-                trx_sys.commit(trx).await.unwrap();
+                trx = stmt.commit();
+                let _ = trx_sys.commit(trx).await.unwrap();
             }
             unsafe {
                 TransactionSystem::drop_static(trx_sys);
