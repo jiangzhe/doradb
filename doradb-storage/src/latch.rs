@@ -1,6 +1,7 @@
 use crate::error::{Error, Result, Validation, Validation::Invalid, Validation::Valid};
 use parking_lot::lock_api::RawRwLock as RawRwLockApi;
 use parking_lot::RawRwLock;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LATCH_EXCLUSIVE_BIT: u64 = 1;
@@ -10,6 +11,20 @@ pub enum LatchFallbackMode {
     Shared,
     Exclusive,
     Spin,
+}
+
+impl FromStr for LatchFallbackMode {
+    type Err = Error;
+    #[inline]
+    fn from_str(s: &str) -> Result<Self> {
+        let res = match s.to_lowercase().as_str() {
+            "spin" => LatchFallbackMode::Spin,
+            "shared" => LatchFallbackMode::Shared,
+            "exclusive" => LatchFallbackMode::Exclusive,
+            _ => return Err(Error::InvalidArgument),
+        };
+        Ok(res)
+    }
 }
 
 /// A HybridLatch combines optimisitic lock(version validation) and

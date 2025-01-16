@@ -31,6 +31,9 @@ smol = "2.0"
 easy-parallel = "3.3"
 async-executor = "1.13"
 humantime = "2.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+criterion-perf-events = "0.4"
+perfcnt = "0.8"
 
 [profile.release]
 debug = true
