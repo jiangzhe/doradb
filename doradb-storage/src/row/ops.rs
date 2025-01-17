@@ -2,68 +2,71 @@ use crate::row::{Row, RowID, RowMut};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
 
-pub enum SelectResult<'a> {
+pub enum Select<'a> {
     Ok(Row<'a>),
     RowDeleted(Row<'a>),
     RowNotFound,
 }
 
-impl SelectResult<'_> {
+impl Select<'_> {
     /// Returns if select succeeds.
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, SelectResult::Ok(_))
+        matches!(self, Select::Ok(_))
     }
 }
 
-pub enum SelectMvccResult {
+pub enum SelectMvcc {
     Ok(Vec<Val>),
     RowNotFound,
     InvalidIndex,
 }
 
-impl SelectMvccResult {
+impl SelectMvcc {
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, SelectMvccResult::Ok(_))
+        matches!(self, SelectMvcc::Ok(_))
     }
 }
 
-pub enum InsertResult {
+pub enum InsertRow {
     Ok(RowID),
     NoFreeSpaceOrRowID,
 }
 
-impl InsertResult {
+impl InsertRow {
     /// Returns if insert succeeds.
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, InsertResult::Ok(_))
+        matches!(self, InsertRow::Ok(_))
     }
 }
 
-pub enum InsertMvccResult {
+pub enum InsertMvcc {
+    // PageGuard is required if table has unique index and
+    // we may need to linke a deleted version to the new version.
+    // In such scenario, we should keep the page for shared mode
+    // and acquire row lock when we do the linking.
     Ok(RowID),
     WriteConflict,
     DuplicateKey,
 }
 
-impl InsertMvccResult {
+impl InsertMvcc {
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, InsertMvccResult::Ok(_))
+        matches!(self, InsertMvcc::Ok(_))
     }
 }
 
-pub enum MoveInsertResult {
+pub enum MoveInsert {
     Ok,
     None,
     WriteConflict,
     DuplicateKey,
-    Retry,
 }
 
-pub enum UpdateResult {
+pub enum Update {
     // RowID may change if the update is out-of-place.
     Ok(RowID),
     RowNotFound,
@@ -74,15 +77,15 @@ pub enum UpdateResult {
     NoFreeSpace(Vec<Val>),
 }
 
-impl UpdateResult {
+impl Update {
     /// Returns if update succeeds.
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, UpdateResult::Ok(..))
+        matches!(self, Update::Ok(..))
     }
 }
 
-pub enum UpdateMvccResult {
+pub enum UpdateMvcc {
     Ok(RowID),
     RowNotFound,
     RowDeleted,
@@ -91,11 +94,11 @@ pub enum UpdateMvccResult {
     Retry(Vec<UpdateCol>),
 }
 
-impl UpdateMvccResult {
+impl UpdateMvcc {
     /// Returns if update with undo succeeds.
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, UpdateMvccResult::Ok(_))
+        matches!(self, UpdateMvcc::Ok(_))
     }
 }
 
@@ -110,22 +113,22 @@ pub enum UpdateRow<'a> {
     NoFreeSpace(Vec<Val>),
 }
 
-pub enum DeleteResult {
+pub enum Delete {
     Ok,
     RowNotFound,
     RowAlreadyDeleted,
 }
 
-pub enum DeleteMvccResult {
+pub enum DeleteMvcc {
     Ok,
     RowNotFound,
     RowAlreadyDeleted,
     WriteConflict,
 }
 
-impl DeleteMvccResult {
+impl DeleteMvcc {
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, DeleteMvccResult::Ok)
+        matches!(self, DeleteMvcc::Ok)
     }
 }

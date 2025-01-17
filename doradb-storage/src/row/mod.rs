@@ -3,7 +3,7 @@ pub mod ops;
 use crate::buffer::frame::{BufferFrameAware, FrameHeader};
 use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::BufferPool;
-use crate::row::ops::{DeleteResult, InsertResult, SelectResult, UpdateCol, UpdateResult};
+use crate::row::ops::{Delete, InsertRow, Select, Update, UpdateCol};
 use crate::table::Schema;
 use crate::trx::undo::UndoMap;
 use crate::value::*;
@@ -126,6 +126,27 @@ impl RowPage {
         }
     }
 
+    /// Returns index of the row within page.
+    #[inline]
+    pub fn row_idx(&self, row_id: RowID) -> usize {
+        debug_assert!(self.row_id_in_valid_range(row_id));
+        (row_id - self.header.start_row_id) as usize
+    }
+
+    /// Returns row id for given index.
+    #[inline]
+    pub fn row_id(&self, row_idx: usize) -> RowID {
+        debug_assert!(row_idx < self.header.row_count());
+        self.header.start_row_id + row_idx as u64
+    }
+
+    /// Returns whether row id is in valid range.
+    #[inline]
+    pub fn row_id_in_valid_range(&self, row_id: RowID) -> bool {
+        row_id >= self.header.start_row_id
+            && row_id < self.header.start_row_id + self.header.row_count() as u64
+    }
+
     /// Returns row id list in this page.
     #[inline]
     pub fn row_ids(&self) -> &[RowID] {
@@ -134,12 +155,10 @@ impl RowPage {
 
     #[inline]
     pub fn row_by_id(&self, row_id: RowID) -> Option<Row> {
-        if row_id < self.header.start_row_id as RowID
-            || row_id >= self.header.start_row_id + self.header.row_count() as u64
-        {
+        if !self.row_id_in_valid_range(row_id) {
             return None;
         }
-        Some(self.row((row_id - self.header.start_row_id) as usize))
+        Some(self.row(self.row_idx(row_id)))
     }
 
     /// Returns free space of current page.
@@ -189,7 +208,7 @@ impl RowPage {
 
     /// Insert a new row in page.
     #[inline]
-    pub fn insert(&self, schema: &Schema, user_cols: &[Val]) -> InsertResult {
+    pub fn insert(&self, schema: &Schema, user_cols: &[Val]) -> InsertRow {
         debug_assert!(schema.col_count() == self.header.col_count as usize);
         // insert row does not include RowID, as RowID is auto-generated.
         debug_assert!(user_cols.len() + 1 == self.header.col_count as usize);
@@ -199,7 +218,7 @@ impl RowPage {
             if let Some((row_idx, var_offset)) = self.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
             } else {
-                return InsertResult::NoFreeSpaceOrRowID;
+                return InsertRow::NoFreeSpaceOrRowID;
             };
         let mut new_row = self.new_row(row_idx as usize, var_offset);
         for v in user_cols {
@@ -212,32 +231,27 @@ impl RowPage {
                 Val::VarByte(var) => new_row.add_var(var.as_bytes()),
             }
         }
-        InsertResult::Ok(new_row.finish())
+        InsertRow::Ok(new_row.finish())
     }
 
     /// delete row in page.
     /// This method will only mark the row as deleted.
     #[inline]
-    pub fn delete(&self, row_id: RowID) -> DeleteResult {
-        if row_id < self.header.start_row_id || row_id >= self.header.max_row_count as u64 {
-            return DeleteResult::RowNotFound;
+    pub fn delete(&self, row_id: RowID) -> Delete {
+        if !self.row_id_in_valid_range(row_id) {
+            return Delete::RowNotFound;
         }
-        let row_idx = (row_id - self.header.start_row_id) as usize;
+        let row_idx = self.row_idx(row_id);
         if self.is_deleted(row_idx) {
-            return DeleteResult::RowAlreadyDeleted;
+            return Delete::RowAlreadyDeleted;
         }
         self.set_deleted(row_idx, true);
-        DeleteResult::Ok
+        Delete::Ok
     }
 
     /// Update in-place in current page.
     #[inline]
-    pub fn update(
-        &mut self,
-        schema: &Schema,
-        row_id: RowID,
-        user_cols: &[UpdateCol],
-    ) -> UpdateResult {
+    pub fn update(&mut self, schema: &Schema, row_id: RowID, user_cols: &[UpdateCol]) -> Update {
         // column indexes must be in range
         debug_assert!(
             {
@@ -258,12 +272,12 @@ impl RowPage {
             },
             "update columns should be in order"
         );
-        if row_id < self.header.start_row_id || row_id >= self.header.max_row_count as u64 {
-            return UpdateResult::RowNotFound;
+        if !self.row_id_in_valid_range(row_id) {
+            return Update::RowNotFound;
         }
-        let row_idx = (row_id - self.header.start_row_id) as usize;
+        let row_idx = self.row_idx(row_id);
         if self.row(row_idx).is_deleted() {
-            return UpdateResult::RowDeleted;
+            return Update::RowDeleted;
         }
         let var_len = self.var_len_for_update(row_idx, user_cols);
         let var_offset = if let Some(var_offset) = self.request_free_space(var_len) {
@@ -271,28 +285,28 @@ impl RowPage {
         } else {
             let row = self.row(row_idx);
             let vals = row.clone_vals(schema, false);
-            return UpdateResult::NoFreeSpace(vals);
+            return Update::NoFreeSpace(vals);
         };
         let mut row = self.row_mut(row_idx, var_offset, var_offset + var_len);
         for uc in user_cols {
             row.update_user_col(uc.idx, &uc.val);
         }
         row.finish();
-        UpdateResult::Ok(row_id)
+        Update::Ok(row_id)
     }
 
     /// Select single row by row id.
     #[inline]
-    pub fn select(&self, row_id: RowID) -> SelectResult {
-        if row_id < self.header.start_row_id || row_id >= self.header.max_row_count as u64 {
-            return SelectResult::RowNotFound;
+    pub fn select(&self, row_id: RowID) -> Select {
+        if !self.row_id_in_valid_range(row_id) {
+            return Select::RowNotFound;
         }
-        let row_idx = (row_id - self.header.start_row_id) as usize;
+        let row_idx = self.row_idx(row_id);
         let row = self.row(row_idx);
         if row.is_deleted() {
-            return SelectResult::RowDeleted(row);
+            return Select::RowDeleted(row);
         }
-        SelectResult::Ok(row)
+        Select::Ok(row)
     }
 
     #[inline]
@@ -326,7 +340,7 @@ impl RowPage {
             var_offset,
         };
         // always add RowID as first column
-        row.add_val(self.header.start_row_id + row_idx as u64);
+        row.add_val(self.row_id(row_idx));
         row
     }
 
@@ -738,7 +752,7 @@ impl<'a> NewRow<'a> {
     pub fn finish(self) -> RowID {
         debug_assert!(self.col_idx == self.page.header.col_count as usize);
         self.page.set_deleted(self.row_idx, false);
-        self.page.header.start_row_id + self.row_idx as u64
+        self.page.row_id(self.row_idx)
     }
 }
 
@@ -1231,7 +1245,7 @@ mod tests {
             Val::from(&short[..]),
         ];
         let res = page.insert(&schema, &insert);
-        assert!(matches!(res, InsertResult::Ok(100)));
+        assert!(matches!(res, InsertRow::Ok(100)));
         assert!(!page.row(0).is_deleted());
 
         let row_id = 100;
@@ -1261,10 +1275,10 @@ mod tests {
         assert!(res.is_ok());
 
         let res = page.delete(row_id);
-        assert!(matches!(res, DeleteResult::Ok));
+        assert!(matches!(res, Delete::Ok));
 
         let select = page.select(row_id);
-        assert!(matches!(select, SelectResult::RowDeleted(_)));
+        assert!(matches!(select, Select::RowDeleted(_)));
     }
 
     fn create_row_page() -> RowPage {

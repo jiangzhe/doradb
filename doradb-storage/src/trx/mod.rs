@@ -23,7 +23,7 @@ pub mod undo;
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoBin, RedoEntry, RedoKind, RedoLog};
-use crate::trx::undo::SharedUndoEntry;
+use crate::trx::undo::OwnedUndoEntry;
 use crate::value::Val;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -118,7 +118,7 @@ pub struct ActiveTrx {
     // which log partition it belongs to.
     pub log_partition_idx: usize,
     // transaction-level undo logs.
-    pub(crate) undo: Vec<SharedUndoEntry>,
+    pub(crate) undo: Vec<OwnedUndoEntry>,
     // transaction-level redo logs.
     pub(crate) redo: Vec<RedoEntry>,
     // session of current transaction.
@@ -259,7 +259,7 @@ pub struct PreparedTrx {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
     redo_bin: Option<RedoBin>,
-    undo: Vec<SharedUndoEntry>,
+    undo: Vec<OwnedUndoEntry>,
     session: Option<Box<InternalSession>>,
 }
 
@@ -316,7 +316,7 @@ pub struct PrecommitTrx {
     pub sts: TrxID,
     pub cts: TrxID,
     pub redo_bin: Option<RedoBin>,
-    pub undo: Vec<SharedUndoEntry>,
+    pub undo: Vec<OwnedUndoEntry>,
     session: Option<Box<InternalSession>>,
 }
 
@@ -371,7 +371,7 @@ impl IntoSession for PrecommitTrx {
 pub struct CommittedTrx {
     pub sts: TrxID,
     pub cts: TrxID,
-    pub undo: Vec<SharedUndoEntry>,
+    pub undo: Vec<OwnedUndoEntry>,
     session: Option<Box<InternalSession>>,
 }
 
