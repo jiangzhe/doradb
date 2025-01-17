@@ -4,7 +4,6 @@ use crate::buffer::FixedBufferPool;
 use crate::index::{BlockIndex, SingleKeyIndex};
 use crate::table::mvcc::MvccTable;
 use crate::value::{Layout, Val};
-use std::ops::Deref;
 use std::sync::Arc;
 
 // todo: integrate with doradb_catalog::TableID.

@@ -1,11 +1,10 @@
 use crate::buffer::guard::PageSharedGuard;
-use crate::row::ops::{SelectMvccResult, UpdateCol, UpdateRow};
+use crate::row::ops::{SelectMvcc, UpdateCol, UpdateRow};
 use crate::row::{Row, RowMut, RowPage, RowRead};
 use crate::table::Schema;
 use crate::trx::undo::UndoKind;
 use crate::trx::undo::{
-    NextTrxCTS, NextUndoEntry, NextUndoStatus, PrevUndoEntry, SharedUndoEntry, UndoHead,
-    UndoHeadPtr,
+    NextTrxCTS, NextUndoEntry, NextUndoStatus, OwnedUndoEntry, UndoEntryPtr, UndoHead,
 };
 use crate::trx::{trx_is_committed, ActiveTrx};
 use crate::value::Val;
@@ -36,20 +35,20 @@ impl RowReadAccess<'_> {
         schema: &Schema,
         user_read_set: &[usize],
         key: &Val,
-    ) -> SelectMvccResult {
+    ) -> SelectMvcc {
         // let mut vals = BTreeMap::new();
         match &*self.undo {
             None => {
                 let row = self.row();
                 // latest version in row page.
                 if row.is_deleted() {
-                    return SelectMvccResult::RowNotFound;
+                    return SelectMvcc::RowNotFound;
                 }
                 if row.is_key_different(schema, key) {
-                    return SelectMvccResult::InvalidIndex;
+                    return SelectMvcc::InvalidIndex;
                 }
                 let vals = row.clone_vals_for_read_set(schema, user_read_set);
-                SelectMvccResult::Ok(vals)
+                SelectMvcc::Ok(vals)
             }
             Some(undo_head) => {
                 // At this point, we already wait for preparation of commit is done.
@@ -60,13 +59,13 @@ impl RowReadAccess<'_> {
                         let row = self.row();
                         // we can see this version
                         if row.is_deleted() {
-                            return SelectMvccResult::RowNotFound;
+                            return SelectMvcc::RowNotFound;
                         }
                         if row.is_key_different(schema, key) {
-                            return SelectMvccResult::InvalidIndex;
+                            return SelectMvcc::InvalidIndex;
                         }
                         let vals = row.clone_vals_for_read_set(schema, user_read_set);
-                        return SelectMvccResult::Ok(vals);
+                        return SelectMvcc::Ok(vals);
                     } // otherwise, go to next version
                 } else {
                     let trx_id = trx.trx_id();
@@ -74,20 +73,20 @@ impl RowReadAccess<'_> {
                         let row = self.row();
                         // self update, see the latest version
                         if row.is_deleted() {
-                            return SelectMvccResult::RowNotFound;
+                            return SelectMvcc::RowNotFound;
                         }
                         if row.is_key_different(schema, key) {
-                            return SelectMvccResult::InvalidIndex;
+                            return SelectMvcc::InvalidIndex;
                         }
                         let vals = row.clone_vals_for_read_set(schema, user_read_set);
-                        return SelectMvccResult::Ok(vals);
+                        return SelectMvcc::Ok(vals);
                     } // otherwise, go to next version
                 }
                 // page data is invisible, we have to backtrace version chain
                 match undo_head.entry.as_ref() {
                     None => {
                         // no next version, so nothing to be return.
-                        return SelectMvccResult::RowNotFound;
+                        return SelectMvcc::RowNotFound;
                     }
                     Some(entry) => {
                         let mut entry = entry.clone();
@@ -123,8 +122,7 @@ impl RowReadAccess<'_> {
                                     ver.deleted = *del; // recover moved status
                                 }
                             }
-                            let chain_g = entry.as_ref().chain.read();
-                            match chain_g.next.as_ref() {
+                            match entry.as_ref().next.as_ref() {
                                 None => {
                                     // No next version, we need to determine whether we should return row
                                     // by checking deleted flag.
@@ -133,9 +131,8 @@ impl RowReadAccess<'_> {
                                     // That means we should should return the row before deletion.
                                     // If undo kind is INSERT, and next version does not exist.
                                     // That means we should return no row.
-                                    drop(chain_g);
                                     if ver.deleted {
-                                        return SelectMvccResult::RowNotFound;
+                                        return SelectMvcc::RowNotFound;
                                     }
                                     // check if key match
                                     return ver.get_visible_vals(schema, self.row());
@@ -144,17 +141,17 @@ impl RowReadAccess<'_> {
                                     match next.status {
                                         NextUndoStatus::SameAsPrev => {
                                             let next_entry = next.entry.clone();
-                                            drop(chain_g);
                                             entry = next_entry; // still invisible.
                                         }
                                         NextUndoStatus::CTS(cts) => {
                                             if trx.sts > cts {
                                                 // current version is visible
                                                 if ver.deleted {
-                                                    return SelectMvccResult::RowNotFound;
+                                                    return SelectMvcc::RowNotFound;
                                                 }
                                                 return ver.get_visible_vals(schema, self.row());
                                             }
+                                            entry = next.entry.clone(); // still invisible
                                         }
                                     }
                                 }
@@ -195,7 +192,7 @@ impl RowVersion {
     }
 
     #[inline]
-    fn get_visible_vals(mut self, schema: &Schema, row: Row<'_>) -> SelectMvccResult {
+    fn get_visible_vals(mut self, schema: &Schema, row: Row<'_>) -> SelectMvcc {
         if self.read_set_contains_key {
             let key_different = self
                 .undo_vals
@@ -203,11 +200,11 @@ impl RowVersion {
                 .map(|v| v == &self.undo_key)
                 .unwrap_or_else(|| row.is_key_different(schema, &self.undo_key));
             if key_different {
-                return SelectMvccResult::InvalidIndex;
+                return SelectMvcc::InvalidIndex;
             }
         } else {
             if row.is_key_different(schema, &self.undo_key) {
-                return SelectMvccResult::InvalidIndex;
+                return SelectMvcc::InvalidIndex;
             }
         }
         let mut vals = Vec::with_capacity(self.read_set.len());
@@ -218,7 +215,7 @@ impl RowVersion {
                 vals.push(row.clone_user_val(schema, *user_col_idx))
             }
         }
-        SelectMvccResult::Ok(vals)
+        SelectMvcc::Ok(vals)
     }
 }
 
@@ -226,7 +223,6 @@ pub struct RowWriteAccess<'a> {
     page: &'a RowPage,
     row_idx: usize,
     undo: RwLockWriteGuard<'a, Option<UndoHead>>,
-    head_ptr: UndoHeadPtr,
 }
 
 impl<'a> RowWriteAccess<'a> {
@@ -267,45 +263,42 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn undo_mut(&mut self) -> &mut Option<UndoHead> {
-        &mut *self.undo
+    pub fn undo_head(&self) -> &Option<UndoHead> {
+        &*self.undo
+    }
+
+    #[inline]
+    pub fn first_undo_entry(&self) -> Option<UndoEntryPtr> {
+        self.undo.as_ref().and_then(|head| head.entry.clone())
     }
 
     /// Build undo chain.
-    /// This method locks undo head and new entry
+    /// This method locks undo head and add new entry
     #[inline]
     pub fn build_undo_chain(
         &mut self,
         trx: &ActiveTrx,
-        new_entry: &SharedUndoEntry,
+        new_entry: &mut OwnedUndoEntry,
         old_cts: NextTrxCTS,
     ) {
-        let head = self.undo.as_mut().expect("lock in undo head");
+        let head = self.undo.get_or_insert_with(|| UndoHead {
+            status: trx.status(),
+            entry: None,
+        });
         debug_assert!(head.status.ts() == trx.trx_id());
         // 1. Update head trx id.
         head.status = trx.status();
-        // 2. Link head and new entry bidirectionally.
-        let mut new_chain_g = new_entry.as_ref().chain.write();
-        debug_assert!(new_chain_g.prev.is_none());
-        new_chain_g.prev = Some(PrevUndoEntry::Head(self.head_ptr.clone()));
-        let new_entry_ptr = new_entry.leak();
-        let old_entry_ptr = head.entry.replace(new_entry_ptr);
-        // 3. Link new and old bidirectionally.
-        // To do so, we need to lock both new and old.
-        // The GC thread has to traverse from old to new, and lock both
-        // to cleanup.
-        // To avoid dead-lock, we let GC thread follow the lock order,
-        // first acquire new then old.
-        if let Some(old_entry_ptr) = old_entry_ptr {
-            debug_assert!(new_chain_g.next.is_none());
-            // link new to old.
-            new_chain_g.next = Some(NextUndoEntry {
+        // 2. Link new entry and head, or there might be case that
+        //    new entry has non-null next pointer, and head must not have
+        //    non-null next pointer.
+        let old_entry = head.entry.replace(new_entry.leak());
+        // 3. Link new and old.
+        if let Some(entry) = old_entry {
+            debug_assert!(new_entry.next.is_none());
+            new_entry.next = Some(NextUndoEntry {
                 status: old_cts.undo_status(),
-                entry: old_entry_ptr.clone(),
+                entry,
             });
-            // link old to new.
-            let mut old_chain_g = old_entry_ptr.as_ref().chain.write();
-            old_chain_g.prev = Some(PrevUndoEntry::Entry(SharedUndoEntry::clone(new_entry)));
         }
     }
 }
@@ -327,13 +320,11 @@ impl<'a> PageSharedGuard<'a, RowPage> {
     pub fn write_row(&self, row_idx: usize) -> RowWriteAccess<'_> {
         let (fh, page) = self.header_and_page();
         let undo_map = fh.undo_map.as_ref().unwrap();
-        let head_ptr = undo_map.ptr(row_idx);
         let undo = undo_map.write(row_idx);
         RowWriteAccess {
             page,
             row_idx,
             undo,
-            head_ptr,
         }
     }
 }

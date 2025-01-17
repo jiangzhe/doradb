@@ -3,13 +3,13 @@ use crate::buffer::BufferPool;
 use crate::row::RowID;
 use crate::table::TableID;
 use crate::trx::redo::RedoEntry;
-use crate::trx::undo::SharedUndoEntry;
+use crate::trx::undo::OwnedUndoEntry;
 use crate::trx::ActiveTrx;
 
 pub struct Statement {
     pub trx: ActiveTrx,
     // statement-level undo logs.
-    pub undo: Vec<SharedUndoEntry>,
+    pub undo: Vec<OwnedUndoEntry>,
     // statement-level redo logs.
     pub redo: Vec<RedoEntry>,
 }
@@ -34,11 +34,6 @@ impl Statement {
     #[inline]
     pub fn rollback<P: BufferPool>(self, buf_pool: &P) -> ActiveTrx {
         todo!();
-    }
-
-    #[inline]
-    pub fn last_undo_entry(&self) -> Option<&SharedUndoEntry> {
-        self.undo.last()
     }
 
     #[inline]
