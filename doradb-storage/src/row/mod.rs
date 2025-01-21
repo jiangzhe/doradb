@@ -239,11 +239,11 @@ impl RowPage {
     #[inline]
     pub fn delete(&self, row_id: RowID) -> Delete {
         if !self.row_id_in_valid_range(row_id) {
-            return Delete::RowNotFound;
+            return Delete::NotFound;
         }
         let row_idx = self.row_idx(row_id);
         if self.is_deleted(row_idx) {
-            return Delete::RowAlreadyDeleted;
+            return Delete::AlreadyDeleted;
         }
         self.set_deleted(row_idx, true);
         Delete::Ok
@@ -273,11 +273,11 @@ impl RowPage {
             "update columns should be in order"
         );
         if !self.row_id_in_valid_range(row_id) {
-            return Update::RowNotFound;
+            return Update::NotFound;
         }
         let row_idx = self.row_idx(row_id);
         if self.row(row_idx).is_deleted() {
-            return Update::RowDeleted;
+            return Update::Deleted;
         }
         let var_len = self.var_len_for_update(row_idx, user_cols);
         let var_offset = if let Some(var_offset) = self.request_free_space(var_len) {
@@ -299,7 +299,7 @@ impl RowPage {
     #[inline]
     pub fn select(&self, row_id: RowID) -> Select {
         if !self.row_id_in_valid_range(row_id) {
-            return Select::RowNotFound;
+            return Select::NotFound;
         }
         let row_idx = self.row_idx(row_id);
         let row = self.row(row_idx);
@@ -423,7 +423,7 @@ impl RowPage {
     }
 
     #[inline]
-    fn update_val<V: ToValue>(&self, row_idx: usize, col_idx: usize, val: &V) {
+    pub(crate) fn update_val<V: ToValue>(&self, row_idx: usize, col_idx: usize, val: &V) {
         unsafe {
             let val = val.to_val();
             let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
@@ -433,13 +433,13 @@ impl RowPage {
     }
 
     #[inline]
-    fn update_var(&self, row_idx: usize, col_idx: usize, var: PageVar) {
+    pub(crate) fn update_var(&self, row_idx: usize, col_idx: usize, var: PageVar) {
         debug_assert!(mem::size_of::<PageVar>() == mem::size_of::<u64>());
         self.update_val::<u64>(row_idx, col_idx, unsafe { mem::transmute(&var) });
     }
 
     #[inline]
-    fn add_var(&self, input: &[u8], var_offset: usize) -> (PageVar, usize) {
+    pub(crate) fn add_var(&self, input: &[u8], var_offset: usize) -> (PageVar, usize) {
         let len = input.len();
         if len <= PAGE_VAR_LEN_INLINE {
             return (PageVar::inline(input), var_offset);
@@ -498,7 +498,7 @@ impl RowPage {
 
     /// Mark given row as deleted.
     #[inline]
-    pub fn set_deleted(&self, row_idx: usize, deleted: bool) {
+    pub(crate) fn set_deleted(&self, row_idx: usize, deleted: bool) {
         unsafe {
             let offset = self.header.del_bit_offset(row_idx);
             let ptr = self.data_ptr().add(offset);
@@ -544,7 +544,7 @@ impl RowPage {
     }
 
     #[inline]
-    fn set_null(&self, row_idx: usize, col_idx: usize, null: bool) {
+    pub(crate) fn set_null(&self, row_idx: usize, col_idx: usize, null: bool) {
         unsafe {
             let offset = self.header.null_bit_offset(row_idx, col_idx);
             let ptr = self.data_ptr().add(offset);
@@ -828,6 +828,16 @@ pub trait RowRead {
         self.clone_val(schema, user_col_idx + 1)
     }
 
+    /// Clone single value and its var-len offset with given column index.
+    #[inline]
+    fn clone_user_val_with_var_offset(
+        &self,
+        schema: &Schema,
+        user_col_idx: usize,
+    ) -> (Val, Option<u16>) {
+        self.clone_val_with_var_offset(schema, user_col_idx + 1)
+    }
+
     /// Clone single value with given column index.
     /// NOTE: input column index includes RowID.
     #[inline]
@@ -859,6 +869,38 @@ pub trait RowRead {
         }
     }
 
+    #[inline]
+    fn clone_val_with_var_offset(&self, schema: &Schema, col_idx: usize) -> (Val, Option<u16>) {
+        if self.is_null(col_idx) {
+            return (Val::Null, None);
+        }
+        match schema.layout(col_idx) {
+            Layout::Byte1 => {
+                let v = self.val::<Byte1Val>(col_idx);
+                (Val::from(*v), None)
+            }
+            Layout::Byte2 => {
+                let v = self.val::<Byte2Val>(col_idx);
+                (Val::from(*v), None)
+            }
+            Layout::Byte4 => {
+                let v = self.val::<Byte4Val>(col_idx);
+                (Val::from(*v), None)
+            }
+            Layout::Byte8 => {
+                let v = self.val::<Byte8Val>(col_idx);
+                (Val::from(*v), None)
+            }
+            Layout::VarByte => {
+                // let v = self.var(col_idx);
+                let pv = unsafe { self.page().var_unchecked(self.row_idx(), col_idx) };
+                let v = pv.as_bytes(self.page().data_ptr());
+                let offset = pv.offset().map(|os| os as u16);
+                (Val::VarByte(MemVar::new(v)), offset)
+            }
+        }
+    }
+
     /// Clone all values.
     #[inline]
     fn clone_vals(&self, schema: &Schema, include_row_id: bool) -> Vec<Val> {
@@ -866,6 +908,21 @@ pub trait RowRead {
         let mut vals = Vec::with_capacity(schema.col_count() - skip);
         for (col_idx, _) in schema.cols().iter().enumerate().skip(skip) {
             vals.push(self.clone_val(schema, col_idx));
+        }
+        vals
+    }
+
+    /// Clone all values with var-len offset.
+    #[inline]
+    fn clone_vals_with_var_offsets(
+        &self,
+        schema: &Schema,
+        include_row_id: bool,
+    ) -> Vec<(Val, Option<u16>)> {
+        let skip = if include_row_id { 0 } else { 1 };
+        let mut vals = Vec::with_capacity(schema.col_count() - skip);
+        for (col_idx, _) in schema.cols().iter().enumerate().skip(skip) {
+            vals.push(self.clone_val_with_var_offset(schema, col_idx));
         }
         vals
     }
@@ -931,11 +988,16 @@ pub trait RowRead {
 
     /// Returns the old value if different from given index and new value.
     #[inline]
-    fn user_different(&self, schema: &Schema, user_col_idx: usize, value: &Val) -> Option<Val> {
+    fn user_different(
+        &self,
+        schema: &Schema,
+        user_col_idx: usize,
+        value: &Val,
+    ) -> Option<(Val, Option<u16>)> {
         if !self.is_user_different(schema, user_col_idx, value) {
             return None;
         }
-        Some(self.clone_user_val(schema, user_col_idx))
+        Some(self.clone_user_val_with_var_offset(schema, user_col_idx))
     }
 }
 
@@ -1149,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_row_page_init() {
-        let schema = Schema::new(vec![Layout::Byte8], 0);
+        let schema = Schema::new(vec![Layout::Byte4], 0);
         let mut page = create_row_page();
         page.init(100, 105, &schema);
         println!("page header={:?}", page.header);
@@ -1166,7 +1228,7 @@ mod tests {
 
     #[test]
     fn test_row_page_new_row() {
-        let schema = Schema::new(vec![Layout::Byte8], 0);
+        let schema = Schema::new(vec![Layout::Byte4], 0);
         let mut page = create_row_page();
         page.init(100, 200, &schema);
         assert!(page.header.row_count() == 0);

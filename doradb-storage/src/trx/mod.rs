@@ -23,7 +23,7 @@ pub mod undo;
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoBin, RedoEntry, RedoKind, RedoLog};
-use crate::trx::undo::OwnedUndoEntry;
+use crate::trx::undo::{IndexUndo, OwnedRowUndo};
 use crate::value::Val;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -38,7 +38,7 @@ pub const MAX_SNAPSHOT_TS: TrxID = 1 << 63;
 pub const SNAPSHOT_TS_MASK: TrxID = MAX_SNAPSHOT_TS - 1;
 pub const MAX_COMMIT_TS: TrxID = 1 << 63;
 // data without version chain will treated as its commit timestamp equals to 0
-pub const GLOBAL_VISIBLE_COMMIT_TS: TrxID = 1;
+pub const GLOBAL_VISIBLE_COMMIT_TS: TrxID = 0;
 // As active transaction id is always greater than STS, that means
 // visibility check can be simplified to "STS is larger".
 pub const MIN_ACTIVE_TRX_ID: TrxID = (1 << 63) + 1;
@@ -57,11 +57,22 @@ pub struct SharedTrxStatus {
 }
 
 impl SharedTrxStatus {
-    /// Create a new shared transaction status for uncommitted transaction.
+    /// Create a new shared transaction status for given transaction id.
     #[inline]
     pub fn new(trx_id: TrxID) -> Self {
         SharedTrxStatus {
             ts: AtomicU64::new(trx_id),
+            preparing: AtomicBool::new(false),
+            prepare_notify: Mutex::new(None),
+        }
+    }
+
+    /// Create a new transaction status that is globally visible for all
+    /// transactions. This is used for transaction rollback.
+    #[inline]
+    pub fn global_visible() -> Self {
+        SharedTrxStatus {
+            ts: AtomicU64::new(GLOBAL_VISIBLE_COMMIT_TS),
             preparing: AtomicBool::new(false),
             prepare_notify: Mutex::new(None),
         }
@@ -117,8 +128,10 @@ pub struct ActiveTrx {
     pub sts: TrxID,
     // which log partition it belongs to.
     pub log_partition_idx: usize,
-    // transaction-level undo logs.
-    pub(crate) undo: Vec<OwnedUndoEntry>,
+    // transaction-level undo logs of row data.
+    pub(crate) row_undo: Vec<OwnedRowUndo>,
+    // transaction-level index undo operations.
+    pub(crate) index_undo: Vec<IndexUndo>,
     // transaction-level redo logs.
     pub(crate) redo: Vec<RedoEntry>,
     // session of current transaction.
@@ -133,7 +146,8 @@ impl ActiveTrx {
             status: Arc::new(SharedTrxStatus::new(trx_id)),
             sts,
             log_partition_idx: 0,
-            undo: vec![],
+            row_undo: vec![],
+            index_undo: vec![],
             redo: vec![],
             session,
         }
@@ -168,7 +182,7 @@ impl ActiveTrx {
     /// Returns whether the transaction is readonly.
     #[inline]
     pub fn readonly(&self) -> bool {
-        self.redo.is_empty() && self.undo.is_empty()
+        self.redo.is_empty() && self.row_undo.is_empty()
     }
 
     /// Prepare current transaction for committing.
@@ -182,7 +196,7 @@ impl ActiveTrx {
                 status: Arc::clone(&self.status),
                 sts: self.sts,
                 redo_bin: None,
-                undo: vec![],
+                row_undo: vec![],
                 session: self.session.take(),
             };
         }
@@ -206,12 +220,15 @@ impl ActiveTrx {
                 .expect("redo serialization should not fail");
             Some(redo_bin)
         };
-        let undo = mem::take(&mut self.undo);
+        let row_undo = mem::take(&mut self.row_undo);
+        // Because we do not have rollback logic when transaction enters commit phase,
+        // so remove index undo here is safe.
+        self.index_undo.clear();
         PreparedTrx {
             status: self.status.clone(),
             sts: self.sts,
             redo_bin,
-            undo,
+            row_undo,
             session: self.session.take(),
         }
     }
@@ -246,7 +263,14 @@ impl ActiveTrx {
 impl Drop for ActiveTrx {
     #[inline]
     fn drop(&mut self) {
-        assert!(self.undo.is_empty(), "trx undo should be cleared");
+        assert!(
+            self.row_undo.is_empty(),
+            "trx row undo logs should be cleared"
+        );
+        assert!(
+            self.index_undo.is_empty(),
+            "trx index undo logs should be cleared"
+        );
         assert!(self.redo.is_empty(), "trx redo should be cleared");
     }
 }
@@ -259,7 +283,7 @@ pub struct PreparedTrx {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
     redo_bin: Option<RedoBin>,
-    undo: Vec<OwnedUndoEntry>,
+    row_undo: Vec<OwnedRowUndo>,
     session: Option<Box<InternalSession>>,
 }
 
@@ -272,13 +296,13 @@ impl PreparedTrx {
         } else {
             None
         };
-        let undo = mem::take(&mut self.undo);
+        let row_undo = mem::take(&mut self.row_undo);
         PrecommitTrx {
             status: Arc::clone(&self.status),
             sts: self.sts,
             cts,
             redo_bin,
-            undo,
+            row_undo,
             session: self.session.take(),
         }
     }
@@ -286,7 +310,7 @@ impl PreparedTrx {
     /// Returns whether the prepared transaction is readonly.
     #[inline]
     pub fn readonly(&self) -> bool {
-        self.redo_bin.is_none() && self.undo.is_empty()
+        self.redo_bin.is_none() && self.row_undo.is_empty()
     }
 }
 
@@ -306,7 +330,7 @@ impl Drop for PreparedTrx {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
-        assert!(self.undo.is_empty(), "undo should be cleared");
+        assert!(self.row_undo.is_empty(), "undo should be cleared");
     }
 }
 
@@ -316,7 +340,7 @@ pub struct PrecommitTrx {
     pub sts: TrxID,
     pub cts: TrxID,
     pub redo_bin: Option<RedoBin>,
-    pub undo: Vec<OwnedUndoEntry>,
+    pub row_undo: Vec<OwnedRowUndo>,
     session: Option<Box<InternalSession>>,
 }
 
@@ -338,11 +362,11 @@ impl PrecommitTrx {
             let mut g = self.status.prepare_notify.lock();
             drop(g.take());
         }
-        let undo = mem::take(&mut self.undo);
+        let row_undo = mem::take(&mut self.row_undo);
         CommittedTrx {
             sts: self.sts,
             cts: self.cts,
-            undo,
+            row_undo,
             session: self.session.take(),
         }
     }
@@ -352,7 +376,7 @@ impl Drop for PrecommitTrx {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
-        assert!(self.undo.is_empty(), "undo should be cleared");
+        assert!(self.row_undo.is_empty(), "undo should be cleared");
     }
 }
 
@@ -371,7 +395,7 @@ impl IntoSession for PrecommitTrx {
 pub struct CommittedTrx {
     pub sts: TrxID,
     pub cts: TrxID,
-    pub undo: Vec<OwnedUndoEntry>,
+    pub row_undo: Vec<OwnedRowUndo>,
     session: Option<Box<InternalSession>>,
 }
 

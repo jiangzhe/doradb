@@ -912,7 +912,7 @@ mod tests {
     fn test_block_index_free_list() {
         let buf_pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
         {
-            let schema = Schema::new(vec![Layout::Byte8], 0);
+            let schema = Schema::new(vec![Layout::Byte4], 0);
             let blk_idx = BlockIndex::new(buf_pool).unwrap();
             let p1 = blk_idx.get_insert_page(buf_pool, 100, &schema);
             let pid1 = p1.page_id();
@@ -932,7 +932,7 @@ mod tests {
     fn test_block_index_insert_row_page() {
         let buf_pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
         {
-            let schema = Schema::new(vec![Layout::Byte8], 0);
+            let schema = Schema::new(vec![Layout::Byte4], 0);
             let blk_idx = BlockIndex::new(buf_pool).unwrap();
             let p1 = blk_idx.get_insert_page(buf_pool, 100, &schema);
             let pid1 = p1.page_id();
@@ -954,7 +954,7 @@ mod tests {
         // allocate 1GB buffer pool is enough: 10240 pages ~= 640MB
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024 * 1024).unwrap();
         {
-            let schema = Schema::new(vec![Layout::Byte8], 0);
+            let schema = Schema::new(vec![Layout::Byte4], 0);
             let blk_idx = BlockIndex::new(buf_pool).unwrap();
             for _ in 0..row_pages {
                 let _ = blk_idx.get_insert_page(buf_pool, 100, &schema);
@@ -999,7 +999,7 @@ mod tests {
         let rows_per_page = 100usize;
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024 * 1024).unwrap();
         {
-            let schema = Schema::new(vec![Layout::Byte8], 0);
+            let schema = Schema::new(vec![Layout::Byte4], 0);
             let blk_idx = BlockIndex::new(buf_pool).unwrap();
             for _ in 0..row_pages {
                 let _ = blk_idx.get_insert_page(buf_pool, rows_per_page, &schema);
