@@ -130,7 +130,7 @@ impl TransactionSystem {
         let partition = &*self.log_partitions[trx.log_partition_idx];
         let prepared_trx = trx.prepare();
         if prepared_trx.redo_bin.is_none() {
-            if prepared_trx.undo.is_empty() {
+            if prepared_trx.row_undo.is_empty() {
                 // This is a read-only transaction, drop it is safe.
                 debug_assert!(prepared_trx.readonly());
                 return Ok(prepared_trx.into_session());

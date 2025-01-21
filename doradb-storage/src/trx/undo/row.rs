@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::row::ops::UpdateCol;
+use crate::row::ops::UndoCol;
 use crate::row::RowID;
 use crate::table::TableID;
 use crate::trx::{SharedTrxStatus, TrxID, GLOBAL_VISIBLE_COMMIT_TS};
@@ -9,7 +9,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 pub struct UndoMap {
-    entries: Box<[RwLock<Option<UndoHead>>]>,
+    entries: Box<[RwLock<Option<RowUndoHead>>]>,
     // occupied: usize,
 }
 
@@ -32,20 +32,20 @@ impl UndoMap {
     }
 
     #[inline]
-    pub fn read(&self, row_idx: usize) -> RwLockReadGuard<'_, Option<UndoHead>> {
+    pub fn read(&self, row_idx: usize) -> RwLockReadGuard<'_, Option<RowUndoHead>> {
         self.entries[row_idx].read()
     }
 
     #[inline]
-    pub fn write(&self, row_idx: usize) -> RwLockWriteGuard<'_, Option<UndoHead>> {
+    pub fn write(&self, row_idx: usize) -> RwLockWriteGuard<'_, Option<RowUndoHead>> {
         self.entries[row_idx].write()
     }
 }
 
-/// UndoKind represents the kind of original operation.
+/// RowUndoKind represents the kind of original operation.
 /// So the actual undo action should be opposite of the kind.
 /// There is one special UndoKind *Move*, due to the design of DoraDB.
-pub enum UndoKind {
+pub enum RowUndoKind {
     /// Insert a new row.
     /// Before-image is empty for insert, so we do not need to copy values.
     ///
@@ -161,75 +161,78 @@ pub enum UndoKind {
     /// Note: Update -> Delete is impossible. Even if we re-insert
     /// a deleted row, we will first *move* the deleted row to
     /// other place and then perform update.
-    Update(Vec<UpdateCol>),
+    Update(Vec<UndoCol>),
 }
 
-/// Owned undo entry is stored in transaction undo buffer.
+/// OwnedRowUndo is the old version of a row.
+/// It is stored in transaction undo buffer.
 /// Page level undo map will also hold pointers to the entries.
 /// We do not share ownership between them.
 /// Instead, we require the undo buffer owns all entries.
 /// Garbage collector will make sure the deletion of entries is
 /// safe, because no transaction will access entries that is
 /// supposed to be deleted.
-pub struct OwnedUndoEntry(Box<UndoEntry>);
+pub struct OwnedRowUndo(Box<RowUndo>);
 
-impl Deref for OwnedUndoEntry {
-    type Target = UndoEntry;
+impl Deref for OwnedRowUndo {
+    type Target = RowUndo;
     #[inline]
     fn deref(&self) -> &Self::Target {
         &*self.0
     }
 }
 
-impl DerefMut for OwnedUndoEntry {
+impl DerefMut for OwnedRowUndo {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut *self.0
     }
 }
 
-impl OwnedUndoEntry {
+impl OwnedRowUndo {
     #[inline]
-    pub fn new(table_id: TableID, page_id: PageID, row_id: RowID, kind: UndoKind) -> Self {
-        let entry = UndoEntry {
+    pub fn new(table_id: TableID, page_id: PageID, row_id: RowID, kind: RowUndoKind) -> Self {
+        let entry = RowUndo {
             table_id,
             page_id,
             row_id,
             kind,
             next: None,
         };
-        OwnedUndoEntry(Box::new(entry))
+        OwnedRowUndo(Box::new(entry))
     }
 
     #[inline]
-    pub fn leak(&self) -> UndoEntryPtr {
+    pub fn leak(&self) -> RowUndoRef {
         unsafe {
-            UndoEntryPtr(NonNull::new_unchecked(
-                self.0.as_ref() as *const _ as *mut UndoEntry
+            RowUndoRef(NonNull::new_unchecked(
+                self.0.as_ref() as *const _ as *mut RowUndo
             ))
         }
     }
 }
 
-/// UndoEntryPtr is an atomic pointer to UndoEntry.
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct UndoEntryPtr(NonNull<UndoEntry>);
-
+/// RowUndoRef is a reference to RowUndoEntry.
+/// It does not share ownership with RowUndoEntry.
+///
 /// The safety is guaranteed by MVCC design and GC logic.
 /// The modification of undo log is always guarded by row lock.
 /// And the non-locking consistent read will not access
 /// log entries that are deleted(GCed).
-unsafe impl Send for UndoEntryPtr {}
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct RowUndoRef(NonNull<RowUndo>);
 
-impl UndoEntryPtr {
+unsafe impl Send for RowUndoRef {}
+
+impl RowUndoRef {
     #[inline]
-    pub(crate) fn as_ref(&self) -> &UndoEntry {
+    pub(crate) fn as_ref(&self) -> &RowUndo {
         unsafe { self.0.as_ref() }
     }
 }
 
-pub struct UndoEntry {
+pub struct RowUndo {
     /// This field stores uncommitted TrxID, committed timestamp.
     /// Or preparing status, which may block read.
     /// It uses shared pointer and atomic variable to support
@@ -238,16 +241,16 @@ pub struct UndoEntry {
     pub table_id: TableID,
     pub page_id: PageID,
     pub row_id: RowID,
-    pub kind: UndoKind,
-    pub next: Option<NextUndoEntry>,
+    pub kind: RowUndoKind,
+    pub next: Option<NextRowUndo>,
 }
 
-pub struct NextUndoEntry {
-    pub status: NextUndoStatus,
-    pub entry: UndoEntryPtr,
+pub struct NextRowUndo {
+    pub status: NextRowUndoStatus,
+    pub entry: RowUndoRef,
 }
 
-pub enum NextUndoStatus {
+pub enum NextRowUndoStatus {
     // If transaction modify a row multiple times.
     // It will link multiple undo entries with the
     // same timestamp.
@@ -259,9 +262,9 @@ pub enum NextUndoStatus {
     CTS(TrxID),
 }
 
-pub struct UndoHead {
+pub struct RowUndoHead {
     pub status: Arc<SharedTrxStatus>,
-    pub entry: Option<UndoEntryPtr>,
+    pub entry: Option<RowUndoRef>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -274,11 +277,11 @@ pub enum NextTrxCTS {
 
 impl NextTrxCTS {
     #[inline]
-    pub fn undo_status(self) -> NextUndoStatus {
+    pub fn undo_status(self) -> NextRowUndoStatus {
         match self {
-            NextTrxCTS::None => NextUndoStatus::CTS(GLOBAL_VISIBLE_COMMIT_TS),
-            NextTrxCTS::Value(cts) => NextUndoStatus::CTS(cts),
-            NextTrxCTS::Myself => NextUndoStatus::SameAsPrev,
+            NextTrxCTS::None => NextRowUndoStatus::CTS(GLOBAL_VISIBLE_COMMIT_TS),
+            NextTrxCTS::Value(cts) => NextRowUndoStatus::CTS(cts),
+            NextTrxCTS::Myself => NextRowUndoStatus::SameAsPrev,
         }
     }
 }
@@ -291,7 +294,7 @@ mod tests {
     fn test_undo_head_size() {
         println!(
             "size of RwLock<Option<UndoHead>> is {}",
-            std::mem::size_of::<RwLock<Option<UndoHead>>>()
+            std::mem::size_of::<RwLock<Option<RowUndoHead>>>()
         );
     }
 }

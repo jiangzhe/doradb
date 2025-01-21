@@ -20,6 +20,8 @@ pub trait SingleKeyIndex {
 
     fn delete(&self, key: &Val) -> Option<RowID>;
 
+    fn compare_exchange(&self, key: &Val, old_row_id: RowID, new_row_id: RowID) -> bool;
+
     // todo: scan
 }
 
@@ -92,9 +94,27 @@ impl SingleKeyIndex for PartitionIntIndex {
 
     #[inline]
     fn delete(&self, key: &Val) -> Option<RowID> {
-        let key = self.key_to_int(&key);
+        let key = self.key_to_int(key);
         let tree = self.select(key);
         let mut g = tree.write();
         g.remove(&key)
+    }
+
+    #[inline]
+    fn compare_exchange(&self, key: &Val, old_row_id: RowID, new_row_id: RowID) -> bool {
+        let key = self.key_to_int(key);
+        let tree = self.select(key);
+        let mut g = tree.write();
+        match g.get_mut(&key) {
+            Some(row_id) => {
+                if *row_id == old_row_id {
+                    *row_id = new_row_id;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
     }
 }

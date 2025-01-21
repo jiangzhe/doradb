@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum Select<'a> {
     Ok(Row<'a>),
     RowDeleted(Row<'a>),
-    RowNotFound,
+    NotFound,
 }
 
 impl Select<'_> {
@@ -18,8 +18,7 @@ impl Select<'_> {
 
 pub enum SelectMvcc {
     Ok(Vec<Val>),
-    RowNotFound,
-    InvalidIndex,
+    NotFound,
 }
 
 impl SelectMvcc {
@@ -27,6 +26,25 @@ impl SelectMvcc {
     pub fn is_ok(&self) -> bool {
         matches!(self, SelectMvcc::Ok(_))
     }
+
+    #[inline]
+    pub fn not_found(&self) -> bool {
+        matches!(self, SelectMvcc::NotFound)
+    }
+
+    #[inline]
+    pub fn unwrap(self) -> Vec<Val> {
+        match self {
+            SelectMvcc::Ok(vals) => vals,
+            SelectMvcc::NotFound => panic!("empty select result"),
+        }
+    }
+}
+
+pub enum ReadRow {
+    Ok(Vec<Val>),
+    NotFound,
+    InvalidIndex,
 }
 
 pub enum InsertRow {
@@ -57,6 +75,14 @@ impl InsertMvcc {
     pub fn is_ok(&self) -> bool {
         matches!(self, InsertMvcc::Ok(_))
     }
+
+    #[inline]
+    pub fn unwrap(self) -> RowID {
+        match self {
+            InsertMvcc::Ok(row_id) => row_id,
+            _ => panic!("insert not ok"),
+        }
+    }
 }
 
 pub enum MoveInsert {
@@ -69,8 +95,8 @@ pub enum MoveInsert {
 pub enum Update {
     // RowID may change if the update is out-of-place.
     Ok(RowID),
-    RowNotFound,
-    RowDeleted,
+    NotFound,
+    Deleted,
     // if space is not enough, we perform a logical deletion+insert to
     // achieve the update sematics. The returned values are user columns
     // of original row.
@@ -87,11 +113,9 @@ impl Update {
 
 pub enum UpdateMvcc {
     Ok(RowID),
-    RowNotFound,
-    RowDeleted,
-    NoFreeSpace(Vec<Val>, Vec<UpdateCol>), // with user columns of original row returned for out-of-place update
+    NotFound,
     WriteConflict,
-    Retry(Vec<UpdateCol>),
+    DuplicateKey,
 }
 
 impl UpdateMvcc {
@@ -102,27 +126,47 @@ impl UpdateMvcc {
     }
 }
 
+pub enum UpdateIndex {
+    Ok,
+    WriteConflict,
+    DuplicateKey,
+}
+
+pub enum InsertIndex {
+    Ok,
+    WriteConflict,
+    DuplicateKey,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateCol {
     pub idx: usize,
     pub val: Val,
 }
 
+pub struct UndoCol {
+    pub idx: usize,
+    pub val: Val,
+    // If value is var-len field and not inlined,
+    // we need to record its original offset in page
+    // to support rollback without new allocation.
+    pub var_offset: Option<u16>,
+}
+
 pub enum UpdateRow<'a> {
     Ok(RowMut<'a>),
-    NoFreeSpace(Vec<Val>),
+    NoFreeSpace(Vec<(Val, Option<u16>)>),
 }
 
 pub enum Delete {
     Ok,
-    RowNotFound,
-    RowAlreadyDeleted,
+    NotFound,
+    AlreadyDeleted,
 }
 
 pub enum DeleteMvcc {
     Ok,
-    RowNotFound,
-    RowAlreadyDeleted,
+    NotFound,
     WriteConflict,
 }
 
@@ -130,5 +174,10 @@ impl DeleteMvcc {
     #[inline]
     pub fn is_ok(&self) -> bool {
         matches!(self, DeleteMvcc::Ok)
+    }
+
+    #[inline]
+    pub fn not_found(&self) -> bool {
+        matches!(self, DeleteMvcc::NotFound)
     }
 }

@@ -3,6 +3,7 @@ pub mod col;
 pub mod io;
 #[macro_use]
 pub mod error;
+pub mod catalog;
 pub mod index;
 pub mod latch;
 pub mod row;
