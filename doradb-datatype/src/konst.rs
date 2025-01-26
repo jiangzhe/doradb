@@ -218,6 +218,7 @@ pub const F64_ZERO: ValidF64 = ValidF64(0.0);
 pub const F64_ONE: ValidF64 = ValidF64(1.0);
 
 #[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
 pub struct ValidF64(f64);
 
 impl ValidF64 {
@@ -260,6 +261,7 @@ impl Ord for ValidF64 {
 }
 
 impl Hash for ValidF64 {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.0.to_bits())
     }
@@ -267,6 +269,66 @@ impl Hash for ValidF64 {
 
 impl Deref for ValidF64 {
     type Target = f64;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub const F32_ZERO: ValidF32 = ValidF32(0.0);
+pub const F32_ONE: ValidF32 = ValidF32(1.0);
+
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct ValidF32(f32);
+
+impl ValidF32 {
+    #[inline]
+    pub fn new(value: f32) -> Option<Self> {
+        if value.is_infinite() || value.is_nan() {
+            None
+        } else {
+            Some(ValidF32(value))
+        }
+    }
+
+    #[inline]
+    pub const fn value(&self) -> f32 {
+        self.0
+    }
+}
+
+impl PartialEq for ValidF32 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+
+impl Eq for ValidF32 {}
+
+impl PartialOrd for ValidF32 {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl Ord for ValidF32 {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.partial_cmp(&other.0).unwrap()
+    }
+}
+
+impl Hash for ValidF32 {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u32(self.0.to_bits())
+    }
+}
+
+impl Deref for ValidF32 {
+    type Target = f32;
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0

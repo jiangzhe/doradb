@@ -1,53 +1,76 @@
-use crate::value::{Layout, Val};
+use crate::row::ops::{SelectKey, UpdateCol};
+use crate::value::{Layout, Val, ValKind, ValType};
+use std::collections::HashSet;
 
-pub struct Schema {
-    cols: Vec<Layout>,
+pub struct TableSchema {
+    types: Vec<ValType>,
     // fix length is the total inline length of all columns.
     pub fix_len: usize,
     // index of var-length columns.
     pub var_cols: Vec<usize>,
     // index column id.
-    key_idx: usize,
+    pub indexes: Vec<IndexSchema>,
+    // columns that are included in any index.
+    pub user_index_cols: HashSet<usize>,
 }
 
-impl Schema {
+impl TableSchema {
     /// Create a new schema.
     /// RowID is not included in input, but will be created
     /// automatically.
     #[inline]
-    pub fn new(user_cols: Vec<Layout>, user_key_idx: usize) -> Self {
-        debug_assert!(!user_cols.is_empty());
-        debug_assert!(user_key_idx < user_cols.len());
-        debug_assert!(user_cols[user_key_idx] == Layout::Byte4);
-        let mut cols = Vec::with_capacity(user_cols.len() + 1);
-        cols.push(Layout::Byte8);
-        cols.extend(user_cols);
+    pub fn new(user_types: Vec<ValType>, indexes: Vec<IndexSchema>) -> Self {
+        debug_assert!(!user_types.is_empty());
+        debug_assert!(indexes.iter().all(|is| {
+            is.keys
+                .iter()
+                .all(|k| (k.user_col_idx as usize) < user_types.len())
+        }));
+
+        let mut types = Vec::with_capacity(user_types.len() + 1);
+        types.push(ValType {
+            kind: ValKind::U64,
+            nullable: false,
+        });
+        types.extend(user_types);
         let mut fix_len = 0;
         let mut var_cols = vec![];
-        for (idx, layout) in cols.iter().enumerate() {
-            fix_len += layout.inline_len();
-            if !layout.is_fixed() {
+        for (idx, ty) in types.iter().enumerate() {
+            fix_len += ty.kind.layout().inline_len();
+            if !ty.kind.layout().is_fixed() {
                 var_cols.push(idx);
             }
         }
-        Schema {
-            cols,
+        let mut user_index_cols = HashSet::new();
+        for index in &indexes {
+            for key in &index.keys {
+                user_index_cols.insert(key.user_col_idx as usize);
+            }
+        }
+        TableSchema {
+            types,
             fix_len,
             var_cols,
-            key_idx: user_key_idx + 1,
+            indexes,
+            user_index_cols,
         }
     }
 
     /// Returns column count of this schema, including row id.
     #[inline]
     pub fn col_count(&self) -> usize {
-        self.cols.len()
+        self.types.len()
     }
 
     /// Returns layouts of all columns, including row id.
     #[inline]
-    pub fn cols(&self) -> &[Layout] {
-        &self.cols
+    pub fn types(&self) -> &[ValType] {
+        &self.types
+    }
+
+    #[inline]
+    pub fn user_types(&self) -> &[ValType] {
+        &self.types[1..]
     }
 
     /// Returns whether the type is matched at given column index, row id is excluded.
@@ -59,44 +82,102 @@ impl Schema {
     /// Returns whether the type is matched at given column index.
     #[inline]
     pub fn col_type_match(&self, col_idx: usize, val: &Val) -> bool {
-        match (val, self.layout(col_idx)) {
-            (Val::Null, _) => true,
-            (Val::Byte1(_), Layout::Byte1)
-            | (Val::Byte2(_), Layout::Byte2)
-            | (Val::Byte4(_), Layout::Byte4)
-            | (Val::Byte8(_), Layout::Byte8)
-            | (Val::VarByte(_), Layout::VarByte) => true,
-            _ => false,
+        layout_match(val, self.layout(col_idx))
+    }
+
+    #[inline]
+    pub fn index_layout_match(&self, index_no: usize, vals: &[Val]) -> bool {
+        let index = &self.indexes[index_no];
+        if index.keys.len() != vals.len() {
+            return false;
         }
-    }
-
-    #[inline]
-    pub fn idx_type_match(&self, val: &Val) -> bool {
-        self.col_type_match(self.key_idx, val)
-    }
-
-    #[inline]
-    pub fn user_key_idx(&self) -> usize {
-        self.key_idx - 1
-    }
-
-    #[inline]
-    pub fn key_idx(&self) -> usize {
-        self.key_idx
+        index
+            .keys
+            .iter()
+            .map(|k| self.user_layout(k.user_col_idx as usize))
+            .zip(vals)
+            .all(|(layout, val)| layout_match(val, layout))
     }
 
     #[inline]
     pub fn user_layout(&self, user_col_idx: usize) -> Layout {
-        self.cols[user_col_idx + 1]
+        self.layout(user_col_idx + 1)
     }
 
     #[inline]
     pub fn layout(&self, col_idx: usize) -> Layout {
-        self.cols[col_idx]
+        self.types[col_idx].kind.layout()
     }
 
     #[inline]
-    pub fn key_layout(&self) -> Layout {
-        self.layout(self.key_idx)
+    pub fn keys_for_insert(&self, row: &[Val]) -> Vec<SelectKey> {
+        self.indexes
+            .iter()
+            .enumerate()
+            .map(|(index_no, is)| {
+                let vals: Vec<Val> = is
+                    .keys
+                    .iter()
+                    .map(|k| row[k.user_col_idx as usize].clone())
+                    .collect();
+                SelectKey { index_no, vals }
+            })
+            .collect()
     }
+
+    #[inline]
+    pub fn index_may_change(&self, update: &[UpdateCol]) -> bool {
+        update
+            .iter()
+            .any(|uc| self.user_index_cols.contains(&uc.idx))
+    }
+}
+
+#[inline]
+fn layout_match(val: &Val, layout: Layout) -> bool {
+    match (val, layout) {
+        (Val::Null, _) => true,
+        (Val::Byte1(_), Layout::Byte1)
+        | (Val::Byte2(_), Layout::Byte2)
+        | (Val::Byte4(_), Layout::Byte4)
+        | (Val::Byte8(_), Layout::Byte8)
+        | (Val::VarByte(_), Layout::VarByte) => true,
+        _ => false,
+    }
+}
+
+pub struct IndexSchema {
+    pub keys: Vec<IndexKey>,
+    pub unique: bool,
+}
+
+impl IndexSchema {
+    #[inline]
+    pub fn new(keys: Vec<IndexKey>, unique: bool) -> Self {
+        debug_assert!(!keys.is_empty());
+        IndexSchema { keys, unique }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexKey {
+    pub user_col_idx: u16,
+    pub order: IndexOrder,
+}
+
+impl IndexKey {
+    #[inline]
+    pub fn new(user_col_idx: u16) -> Self {
+        IndexKey {
+            user_col_idx,
+            order: IndexOrder::Asc,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IndexOrder {
+    Asc,
+    Desc,
 }

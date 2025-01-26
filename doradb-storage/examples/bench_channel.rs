@@ -18,6 +18,7 @@ fn channel_sync() {
             sum += data.len();
         }
         // println!("received sum={}", sum);
+        sum
     });
 
     let start = Instant::now();
@@ -77,6 +78,7 @@ fn mutex_deque() {
             sum += data.len();
         }
         // println!("received sum={}", sum);
+        sum
     });
 
     let start = Instant::now();
@@ -96,7 +98,7 @@ fn mutex_deque() {
 }
 
 #[inline]
-pub fn mutex_deque_unbounded<T>() -> (MutexDequeSender<T>, MutexDequeReceiver<T>) {
+fn mutex_deque_unbounded<T>() -> (MutexDequeSender<T>, MutexDequeReceiver<T>) {
     let inner = Arc::new(Inner::new());
     (MutexDequeSender(inner.clone()), MutexDequeReceiver(inner))
 }

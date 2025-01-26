@@ -3,8 +3,8 @@ pub mod ops;
 use crate::buffer::frame::{BufferFrameAware, FrameHeader};
 use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::BufferPool;
-use crate::row::ops::{Delete, InsertRow, Select, Update, UpdateCol};
-use crate::table::Schema;
+use crate::row::ops::{Delete, InsertRow, Select, SelectKey, Update, UpdateCol};
+use crate::table::TableSchema;
 use crate::trx::undo::UndoMap;
 use crate::value::*;
 use std::fmt;
@@ -62,7 +62,7 @@ pub struct RowPage {
 impl RowPage {
     /// Initialize row page.
     #[inline]
-    pub fn init(&mut self, start_row_id: u64, max_row_count: usize, schema: &Schema) {
+    pub fn init(&mut self, start_row_id: u64, max_row_count: usize, schema: &TableSchema) {
         debug_assert!(max_row_count <= 0xffff);
         self.header.start_row_id = start_row_id;
         self.header.max_row_count = max_row_count as u16;
@@ -89,15 +89,15 @@ impl RowPage {
     }
 
     #[inline]
-    fn init_col_offset_list_and_fix_field_end(&mut self, schema: &Schema, row_count: u16) {
+    fn init_col_offset_list_and_fix_field_end(&mut self, schema: &TableSchema, row_count: u16) {
         debug_assert!(schema.col_count() >= 2); // at least RowID and one user column.
         debug_assert!(schema.layout(0) == Layout::Byte8); // first column must be RowID, with 8-byte layout.
         debug_assert!(self.header.col_offset_list_offset != 0);
         debug_assert!(self.header.fix_field_offset != 0);
         let mut col_offset = self.header.fix_field_offset;
-        for (i, col) in schema.cols().iter().enumerate() {
+        for (i, ty) in schema.types().iter().enumerate() {
             *self.col_offset_mut(i) = col_offset;
-            col_offset += col_inline_len(col, row_count as usize) as u16;
+            col_offset += col_inline_len(&ty.kind.layout(), row_count as usize) as u16;
         }
         self.header.fix_field_end = col_offset;
     }
@@ -208,7 +208,7 @@ impl RowPage {
 
     /// Insert a new row in page.
     #[inline]
-    pub fn insert(&self, schema: &Schema, user_cols: &[Val]) -> InsertRow {
+    pub fn insert(&self, schema: &TableSchema, user_cols: &[Val]) -> InsertRow {
         debug_assert!(schema.col_count() == self.header.col_count as usize);
         // insert row does not include RowID, as RowID is auto-generated.
         debug_assert!(user_cols.len() + 1 == self.header.col_count as usize);
@@ -251,7 +251,12 @@ impl RowPage {
 
     /// Update in-place in current page.
     #[inline]
-    pub fn update(&mut self, schema: &Schema, row_id: RowID, user_cols: &[UpdateCol]) -> Update {
+    pub fn update(
+        &mut self,
+        schema: &TableSchema,
+        row_id: RowID,
+        user_cols: &[UpdateCol],
+    ) -> Update {
         // column indexes must be in range
         debug_assert!(
             {
@@ -824,15 +829,25 @@ pub trait RowRead {
 
     /// Clone single value with given column index.
     #[inline]
-    fn clone_user_val(&self, schema: &Schema, user_col_idx: usize) -> Val {
+    fn clone_user_val(&self, schema: &TableSchema, user_col_idx: usize) -> Val {
         self.clone_val(schema, user_col_idx + 1)
+    }
+
+    /// Clone index values.
+    #[inline]
+    fn clone_index_vals(&self, schema: &TableSchema, index_no: usize) -> Vec<Val> {
+        schema.indexes[index_no]
+            .keys
+            .iter()
+            .map(|key| self.clone_user_val(schema, key.user_col_idx as usize))
+            .collect()
     }
 
     /// Clone single value and its var-len offset with given column index.
     #[inline]
     fn clone_user_val_with_var_offset(
         &self,
-        schema: &Schema,
+        schema: &TableSchema,
         user_col_idx: usize,
     ) -> (Val, Option<u16>) {
         self.clone_val_with_var_offset(schema, user_col_idx + 1)
@@ -841,7 +856,7 @@ pub trait RowRead {
     /// Clone single value with given column index.
     /// NOTE: input column index includes RowID.
     #[inline]
-    fn clone_val(&self, schema: &Schema, col_idx: usize) -> Val {
+    fn clone_val(&self, schema: &TableSchema, col_idx: usize) -> Val {
         if self.is_null(col_idx) {
             return Val::Null;
         }
@@ -864,13 +879,17 @@ pub trait RowRead {
             }
             Layout::VarByte => {
                 let v = self.var(col_idx);
-                Val::VarByte(MemVar::new(v))
+                Val::VarByte(MemVar::from(v))
             }
         }
     }
 
     #[inline]
-    fn clone_val_with_var_offset(&self, schema: &Schema, col_idx: usize) -> (Val, Option<u16>) {
+    fn clone_val_with_var_offset(
+        &self,
+        schema: &TableSchema,
+        col_idx: usize,
+    ) -> (Val, Option<u16>) {
         if self.is_null(col_idx) {
             return (Val::Null, None);
         }
@@ -896,17 +915,17 @@ pub trait RowRead {
                 let pv = unsafe { self.page().var_unchecked(self.row_idx(), col_idx) };
                 let v = pv.as_bytes(self.page().data_ptr());
                 let offset = pv.offset().map(|os| os as u16);
-                (Val::VarByte(MemVar::new(v)), offset)
+                (Val::VarByte(MemVar::from(v)), offset)
             }
         }
     }
 
     /// Clone all values.
     #[inline]
-    fn clone_vals(&self, schema: &Schema, include_row_id: bool) -> Vec<Val> {
+    fn clone_vals(&self, schema: &TableSchema, include_row_id: bool) -> Vec<Val> {
         let skip = if include_row_id { 0 } else { 1 };
         let mut vals = Vec::with_capacity(schema.col_count() - skip);
-        for (col_idx, _) in schema.cols().iter().enumerate().skip(skip) {
+        for (col_idx, _) in schema.types().iter().enumerate().skip(skip) {
             vals.push(self.clone_val(schema, col_idx));
         }
         vals
@@ -916,12 +935,12 @@ pub trait RowRead {
     #[inline]
     fn clone_vals_with_var_offsets(
         &self,
-        schema: &Schema,
+        schema: &TableSchema,
         include_row_id: bool,
     ) -> Vec<(Val, Option<u16>)> {
         let skip = if include_row_id { 0 } else { 1 };
         let mut vals = Vec::with_capacity(schema.col_count() - skip);
-        for (col_idx, _) in schema.cols().iter().enumerate().skip(skip) {
+        for (col_idx, _) in schema.types().iter().enumerate().skip(skip) {
             vals.push(self.clone_val_with_var_offset(schema, col_idx));
         }
         vals
@@ -929,7 +948,7 @@ pub trait RowRead {
 
     /// Clone values for given read set. (row id is excluded)
     #[inline]
-    fn clone_vals_for_read_set(&self, schema: &Schema, user_read_set: &[usize]) -> Vec<Val> {
+    fn clone_vals_for_read_set(&self, schema: &TableSchema, user_read_set: &[usize]) -> Vec<Val> {
         let mut vals = Vec::with_capacity(user_read_set.len());
         for user_col_idx in user_read_set {
             vals.push(self.clone_user_val(schema, *user_col_idx))
@@ -939,14 +958,19 @@ pub trait RowRead {
 
     /// Returns whether the key of current row is different from given value.
     #[inline]
-    fn is_key_different(&self, schema: &Schema, key: &Val) -> bool {
-        let key_idx = schema.key_idx();
-        self.is_different(schema, key_idx, key)
+    fn is_key_different(&self, schema: &TableSchema, key: &SelectKey) -> bool {
+        debug_assert!(!key.vals.is_empty());
+        schema.indexes[key.index_no]
+            .keys
+            .iter()
+            .map(|k| k.user_col_idx as usize + 1)
+            .zip(&key.vals)
+            .any(|(col_idx, val)| self.is_different(schema, col_idx, val))
     }
 
     /// Returns whether the value of current row at given column index is different from given value.
     #[inline]
-    fn is_different(&self, schema: &Schema, col_idx: usize, value: &Val) -> bool {
+    fn is_different(&self, schema: &TableSchema, col_idx: usize, value: &Val) -> bool {
         match (value, self.is_null(col_idx), schema.layout(col_idx)) {
             (Val::Null, true, _) => false,
             (Val::Null, false, _) => true,
@@ -982,7 +1006,7 @@ pub trait RowRead {
     /// Returns whether the value of current row at given column index is different
     /// from given value. (row id is excluded)
     #[inline]
-    fn is_user_different(&self, schema: &Schema, user_col_idx: usize, value: &Val) -> bool {
+    fn is_user_different(&self, schema: &TableSchema, user_col_idx: usize, value: &Val) -> bool {
         self.is_different(schema, user_col_idx + 1, value)
     }
 
@@ -990,7 +1014,7 @@ pub trait RowRead {
     #[inline]
     fn user_different(
         &self,
-        schema: &Schema,
+        schema: &TableSchema,
         user_col_idx: usize,
         value: &Val,
     ) -> Option<(Val, Option<u16>)> {
@@ -1078,8 +1102,11 @@ impl<'a> RowMut<'a> {
     pub fn update_user_var(&mut self, user_col_idx: usize, input: &[u8]) {
         let col_idx = user_col_idx + 1;
         if input.len() <= PAGE_VAR_LEN_INLINE {
+            // inlined var can be directly updated,
+            // without overwriting original var-len data in page.
             let var = PageVar::inline(input);
             self.page.update_var(self.row_idx, col_idx, var);
+            return;
         }
         // todo: reuse released space by update.
         // if update value is longer than original value,
@@ -1171,7 +1198,7 @@ pub const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
 
 /// Returns additional space of var-len data of the new row to be inserted.
 #[inline]
-pub fn var_len_for_insert(schema: &Schema, user_cols: &[Val]) -> usize {
+pub fn var_len_for_insert(schema: &TableSchema, user_cols: &[Val]) -> usize {
     schema
         .var_cols
         .iter()
@@ -1192,6 +1219,7 @@ pub fn var_len_for_insert(schema: &Schema, user_cols: &[Val]) -> usize {
 mod tests {
     use core::str;
 
+    use crate::table::schema::{IndexKey, IndexSchema};
     use mem::MaybeUninit;
 
     use super::*;
@@ -1211,7 +1239,13 @@ mod tests {
 
     #[test]
     fn test_row_page_init() {
-        let schema = Schema::new(vec![Layout::Byte4], 0);
+        let schema = TableSchema::new(
+            vec![ValKind::I32.nullable(false)],
+            vec![IndexSchema {
+                keys: vec![IndexKey::new(0)],
+                unique: true,
+            }],
+        );
         let mut page = create_row_page();
         page.init(100, 105, &schema);
         println!("page header={:?}", page.header);
@@ -1228,7 +1262,13 @@ mod tests {
 
     #[test]
     fn test_row_page_new_row() {
-        let schema = Schema::new(vec![Layout::Byte4], 0);
+        let schema = TableSchema::new(
+            vec![ValKind::I32.nullable(false)],
+            vec![IndexSchema {
+                keys: vec![IndexKey::new(0)],
+                unique: true,
+            }],
+        );
         let mut page = create_row_page();
         page.init(100, 200, &schema);
         assert!(page.header.row_count() == 0);
@@ -1243,7 +1283,16 @@ mod tests {
 
     #[test]
     fn test_row_page_read_write_row() {
-        let schema = Schema::new(vec![Layout::Byte4, Layout::VarByte], 0);
+        let schema = TableSchema::new(
+            vec![
+                ValKind::I32.nullable(false),
+                ValKind::VarByte.nullable(false),
+            ],
+            vec![IndexSchema {
+                keys: vec![IndexKey::new(0)],
+                unique: true,
+            }],
+        );
         let mut page = create_row_page();
         page.init(100, 200, &schema);
 
@@ -1284,15 +1333,18 @@ mod tests {
 
     #[test]
     fn test_row_page_crud() {
-        let schema = Schema::new(
+        let schema = TableSchema::new(
             vec![
-                Layout::Byte1,
-                Layout::Byte2,
-                Layout::Byte4,
-                Layout::Byte8,
-                Layout::VarByte,
+                ValKind::I8.nullable(false),
+                ValKind::I16.nullable(false),
+                ValKind::I32.nullable(false),
+                ValKind::I64.nullable(false),
+                ValKind::VarByte.nullable(false),
             ],
-            2,
+            vec![IndexSchema {
+                keys: vec![IndexKey::new(2)],
+                unique: true,
+            }],
         );
         let mut page = create_row_page();
         page.init(100, 200, &schema);
@@ -1330,7 +1382,7 @@ mod tests {
             },
             UpdateCol {
                 idx: 4,
-                val: Val::VarByte(MemVar::new(long)),
+                val: Val::VarByte(MemVar::from(&long[..])),
             },
         ];
         let res = page.update(&schema, row_id, &update);
