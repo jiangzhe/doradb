@@ -1,6 +1,10 @@
+use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
+use crate::buffer::BufferPool;
+use crate::latch::LatchFallbackMode;
+use crate::row::ops::SelectKey;
 use crate::row::ops::UndoCol;
-use crate::row::RowID;
+use crate::row::{RowID, RowPage};
 use crate::table::TableID;
 use crate::trx::{SharedTrxStatus, TrxID, GLOBAL_VISIBLE_COMMIT_TS};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -164,6 +168,50 @@ pub enum RowUndoKind {
     Update(Vec<UndoCol>),
 }
 
+/// RowUndoLogs is a collection of row undo logs.
+/// It owns the logs until GC clean them all at transaction level.
+#[derive(Default)]
+pub struct RowUndoLogs(Vec<OwnedRowUndo>);
+
+impl RowUndoLogs {
+    #[inline]
+    pub fn empty() -> Self {
+        RowUndoLogs(vec![])
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn push(&mut self, value: OwnedRowUndo) {
+        self.0.push(value)
+    }
+
+    #[inline]
+    pub fn pop(&mut self) -> Option<OwnedRowUndo> {
+        self.0.pop()
+    }
+
+    #[inline]
+    pub fn merge(&mut self, other: &mut Self) {
+        self.0.extend(other.0.drain(..));
+    }
+
+    #[inline]
+    pub fn rollback<P: BufferPool>(&mut self, buf_pool: &P) {
+        while let Some(entry) = self.0.pop() {
+            let page_guard: PageGuard<'_, RowPage> =
+                buf_pool.get_page(entry.page_id, LatchFallbackMode::Shared);
+            let page_guard = page_guard.block_until_shared();
+            let row_idx = page_guard.page().row_idx(entry.row_id);
+            let mut access = page_guard.write_row(row_idx);
+            access.rollback_first_undo(entry);
+        }
+    }
+}
+
 /// OwnedRowUndo is the old version of a row.
 /// It is stored in transaction undo buffer.
 /// Page level undo map will also hold pointers to the entries.
@@ -197,7 +245,7 @@ impl OwnedRowUndo {
             page_id,
             row_id,
             kind,
-            next: None,
+            next: vec![],
         };
         OwnedRowUndo(Box::new(entry))
     }
@@ -233,21 +281,79 @@ impl RowUndoRef {
 }
 
 pub struct RowUndo {
-    /// This field stores uncommitted TrxID, committed timestamp.
-    /// Or preparing status, which may block read.
-    /// It uses shared pointer and atomic variable to support
-    /// fast backfill.
-    // pub status: Arc<SharedTrxStatus>,
     pub table_id: TableID,
     pub page_id: PageID,
     pub row_id: RowID,
     pub kind: RowUndoKind,
-    pub next: Option<NextRowUndo>,
+    pub next: Vec<NextRowUndo>,
+}
+
+impl RowUndo {
+    #[inline]
+    pub fn find_next_version(&self, search_key: &SelectKey) -> Option<&NextRowUndo> {
+        if self.next.is_empty() {
+            return None;
+        }
+        // prefer key match, otherwise, choose main
+        let mut main = None;
+        for next in &self.next {
+            match &next.branch {
+                RowUndoBranch::Main => {
+                    main = Some(next);
+                }
+                RowUndoBranch::Reborn(key) => {
+                    if key == search_key {
+                        return Some(next);
+                    }
+                }
+            }
+        }
+        main
+    }
+
+    #[inline]
+    pub fn remove_next_main_version(&mut self) -> Option<NextRowUndo> {
+        if let Some(pos) = self
+            .next
+            .iter()
+            .position(|next| matches!(next.branch, RowUndoBranch::Main))
+        {
+            return Some(self.next.swap_remove(pos));
+        }
+        None
+    }
 }
 
 pub struct NextRowUndo {
+    pub branch: RowUndoBranch,
     pub status: NextRowUndoStatus,
     pub entry: RowUndoRef,
+}
+
+#[derive(Clone)]
+pub enum RowUndoBranch {
+    /// Main branch starts from insertion and ends at deletion.
+    Main,
+    /// Reborn branch is created once an insertion with a key which
+    /// is shared by a deleted row on a unique index.
+    /// To make index uniqueness, we point the index entry to latest
+    /// insert version and link new version to deleted version.
+    /// That is the meaning of reborn(of the dead version).
+    ///
+    /// MVCC read can skip this branch if the index key provided for
+    /// search is not same as the reborn key.
+    /// Because only such key should be searched in the reborn branch.
+    Reborn(SelectKey),
+}
+
+impl From<Option<SelectKey>> for RowUndoBranch {
+    #[inline]
+    fn from(value: Option<SelectKey>) -> Self {
+        match value {
+            Some(key) => RowUndoBranch::Reborn(key),
+            None => RowUndoBranch::Main,
+        }
+    }
 }
 
 pub enum NextRowUndoStatus {

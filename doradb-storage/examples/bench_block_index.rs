@@ -1,7 +1,7 @@
 use clap::Parser;
 use doradb_storage::buffer::FixedBufferPool;
-use doradb_storage::table::Schema;
-use doradb_storage::value::Layout;
+use doradb_storage::table::{IndexKey, IndexSchema, TableSchema};
+use doradb_storage::value::ValKind;
 use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
 use perfcnt::{AbstractPerfCounter, PerfCounter};
 // use doradb_storage::latch::LatchFallbackMode;
@@ -13,14 +13,16 @@ use std::time::Instant;
 // use std::str::FromStr;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
-use std::ops::Bound;
 use std::time::Duration;
 
 fn main() {
     let args = Args::parse();
     let buf_pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
     {
-        let schema = Schema::new(vec![Layout::Byte8], 0);
+        let schema = TableSchema::new(
+            vec![ValKind::I64.nullable(false)],
+            vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
+        );
         let blk_idx = BlockIndex::new(buf_pool).unwrap();
         let blk_idx = Box::leak(Box::new(blk_idx));
 
@@ -71,7 +73,7 @@ fn main() {
 }
 
 fn bench_btreemap(args: Args) {
-    let mut btreemap = RwLock::new(BTreeMap::new());
+    let btreemap = RwLock::new(BTreeMap::new());
     let mut page_id = 0u64;
     {
         let mut g = btreemap.write();

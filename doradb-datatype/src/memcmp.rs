@@ -1,4 +1,4 @@
-use crate::konst::{ValidF64, F64_ZERO};
+use crate::konst::{ValidF32, ValidF64, F32_ZERO, F64_ZERO};
 use std::mem::size_of;
 
 /// Memory comparable format ensure sort result of encoded value is
@@ -22,7 +22,9 @@ pub trait MemCmpFormat {
 const NULL_FLAG: u8 = 0x01;
 const NON_NULL_FLAG: u8 = 0x02;
 const FIX_SEG_FLAG: u8 = 0xff;
-const SEG_LEN: usize = 32;
+const SEG_LEN: usize = 15;
+pub const MIN_VAR_MCF_LEN: usize = SEG_LEN + 1;
+pub const MIN_VAR_NMCF_LEN: usize = MIN_VAR_MCF_LEN + 1;
 
 /// Nullable memory comparable format.
 pub trait NullableMemCmpFormat: MemCmpFormat {
@@ -52,12 +54,11 @@ pub trait NullableMemCmpFormat: MemCmpFormat {
         buf.push(NON_NULL_FLAG);
         <Self as MemCmpFormat>::attach_mcf(value, buf);
     }
+}
 
-    /// Attach null to end of the buffer with the memory comparable format.
-    #[inline]
-    fn attach_null(buf: &mut Vec<u8>) {
-        buf.push(NULL_FLAG);
-    }
+#[inline]
+pub fn attach_null(buf: &mut Vec<u8>) {
+    buf.push(NULL_FLAG);
 }
 
 macro_rules! impl_mcf_for_int {
@@ -106,7 +107,7 @@ impl_mcf_for_int!(i32, true);
 impl_mcf_for_int!(i64, true);
 
 macro_rules! impl_mcf_for_float {
-    ($t1:ty) => {
+    ($t1:ty, $zero:ident) => {
         impl MemCmpFormat for $t1 {
             #[inline]
             fn est_mcf_len() -> Option<usize> {
@@ -121,7 +122,7 @@ macro_rules! impl_mcf_for_float {
             #[inline]
             fn attach_mcf(value: &Self, buf: &mut Vec<u8>) {
                 let mut bs = value.to_be_bytes();
-                if *value >= F64_ZERO {
+                if *value >= $zero {
                     bs[0] ^= 0x80;
                 } else {
                     bs.iter_mut().for_each(|b| *b = !*b);
@@ -132,7 +133,7 @@ macro_rules! impl_mcf_for_float {
             #[inline]
             fn write_mcf(value: &Self, buf: &mut [u8]) {
                 let mut bs = value.to_be_bytes();
-                if *value >= F64_ZERO {
+                if *value >= $zero {
                     bs[0] ^= 0x80;
                 } else {
                     bs.iter_mut().for_each(|b| *b = !*b);
@@ -145,7 +146,8 @@ macro_rules! impl_mcf_for_float {
     };
 }
 
-impl_mcf_for_float!(ValidF64);
+impl_mcf_for_float!(ValidF64, F64_ZERO);
+impl_mcf_for_float!(ValidF32, F32_ZERO);
 
 macro_rules! impl_mcf_for_varlen {
     ($t1:ty) => {

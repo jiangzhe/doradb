@@ -1,6 +1,28 @@
-use crate::row::{Row, RowID, RowMut};
+use crate::buffer::guard::PageSharedGuard;
+use crate::row::{Row, RowID, RowMut, RowPage};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectKey {
+    pub index_no: usize,
+    pub vals: Vec<Val>,
+}
+
+impl SelectKey {
+    #[inline]
+    pub fn new(index_no: usize, vals: Vec<Val>) -> Self {
+        SelectKey { index_no, vals }
+    }
+
+    #[inline]
+    pub fn null(index_no: usize, val_count: usize) -> Self {
+        SelectKey {
+            index_no,
+            vals: vec![Val::Null; val_count],
+        }
+    }
+}
 
 pub enum Select<'a> {
     Ok(Row<'a>),
@@ -85,7 +107,7 @@ impl InsertMvcc {
     }
 }
 
-pub enum MoveInsert {
+pub enum MoveLinkForIndex {
     Ok,
     None,
     WriteConflict,
@@ -127,6 +149,7 @@ impl UpdateMvcc {
 }
 
 pub enum UpdateIndex {
+    // sometimes we may get back page guard to update next index.
     Ok,
     WriteConflict,
     DuplicateKey,

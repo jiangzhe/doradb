@@ -1,3 +1,7 @@
+use doradb_datatype::konst::{ValidF32, ValidF64};
+use doradb_datatype::memcmp::{
+    attach_null, MemCmpFormat, NullableMemCmpFormat, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN,
+};
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
 use std::alloc::{alloc, dealloc, Layout as AllocLayout};
@@ -15,6 +19,88 @@ pub const MEM_VAR_HEADER: usize = 16;
 pub const MEM_VAR_LEN_INLINE: usize = 14;
 pub const MEM_VAR_LEN_PREFIX: usize = 6;
 const _: () = assert!(mem::size_of::<MemVar>() == 16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValType {
+    pub kind: ValKind,
+    pub nullable: bool,
+}
+
+impl ValType {
+    #[inline]
+    pub fn inline_len(self) -> usize {
+        self.kind.inline_len()
+    }
+
+    #[inline]
+    pub fn memcmp_encoded_len(self) -> Option<usize> {
+        if self.kind.is_fixed() {
+            let len = self.kind.inline_len() + if self.nullable { 1 } else { 0 };
+            return Some(len);
+        }
+        None
+    }
+
+    #[inline]
+    pub fn memcmp_encoded_len_maybe_var(self) -> usize {
+        if self.kind.is_fixed() {
+            return self.kind.inline_len() + if self.nullable { 1 } else { 0 };
+        }
+        if self.nullable {
+            MIN_VAR_NMCF_LEN
+        } else {
+            MIN_VAR_MCF_LEN
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ValKind {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+    VarByte,
+}
+
+impl ValKind {
+    #[inline]
+    pub fn layout(self) -> Layout {
+        match self {
+            ValKind::I8 | ValKind::U8 => Layout::Byte1,
+            ValKind::I16 | ValKind::U16 => Layout::Byte2,
+            ValKind::I32 | ValKind::U32 | ValKind::F32 => Layout::Byte4,
+            ValKind::I64 | ValKind::U64 | ValKind::F64 => Layout::Byte8,
+            ValKind::VarByte => Layout::VarByte,
+        }
+    }
+
+    #[inline]
+    pub fn inline_len(self) -> usize {
+        self.layout().inline_len()
+    }
+
+    #[inline]
+    pub fn is_fixed(self) -> bool {
+        self.layout().is_fixed()
+    }
+
+    /// Create a value type with nullable setting.
+    #[inline]
+    pub fn nullable(self, nullable: bool) -> ValType {
+        ValType {
+            kind: self,
+            nullable,
+        }
+    }
+}
 
 /// Layout defines the memory layout of columns
 /// stored in row page.
@@ -85,6 +171,148 @@ impl PartialEq for Val {
     }
 }
 
+impl Val {
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        matches!(self, Val::Null)
+    }
+
+    #[inline]
+    pub fn as_u8(&self) -> Option<u8> {
+        match self {
+            Val::Byte1(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_i8(&self) -> Option<i8> {
+        match self {
+            Val::Byte1(v) => Some(*v as i8),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_u16(&self) -> Option<u16> {
+        match self {
+            Val::Byte2(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_i16(&self) -> Option<i16> {
+        match self {
+            Val::Byte2(v) => Some(*v as i16),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Val::Byte4(v) => Some(*v as i32),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_u32(&self) -> Option<u32> {
+        match self {
+            Val::Byte4(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Val::Byte8(v) => Some(*v as i64),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Val::Byte8(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_f32(&self) -> Option<ValidF32> {
+        match self {
+            Val::Byte4(v) => ValidF32::new(f32::from_bits(*v)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_f64(&self) -> Option<ValidF64> {
+        match self {
+            Val::Byte8(v) => ValidF64::new(f64::from_bits(*v)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Val::VarByte(v) => Some(v.as_bytes()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn encode_memcmp(&self, ty: ValType, buf: &mut Vec<u8>) {
+        if ty.nullable {
+            self.encode_nmcf(ty.kind, buf);
+        } else {
+            self.encode_mcf(ty.kind, buf);
+        }
+    }
+
+    #[inline]
+    fn encode_mcf(&self, kind: ValKind, buf: &mut Vec<u8>) {
+        match kind {
+            ValKind::I8 => MemCmpFormat::attach_mcf(&self.as_i8().unwrap(), buf),
+            ValKind::U8 => MemCmpFormat::attach_mcf(&self.as_u8().unwrap(), buf),
+            ValKind::I16 => MemCmpFormat::attach_mcf(&self.as_i16().unwrap(), buf),
+            ValKind::U16 => MemCmpFormat::attach_mcf(&self.as_u16().unwrap(), buf),
+            ValKind::I32 => MemCmpFormat::attach_mcf(&self.as_i32().unwrap(), buf),
+            ValKind::U32 => MemCmpFormat::attach_mcf(&self.as_u32().unwrap(), buf),
+            ValKind::I64 => MemCmpFormat::attach_mcf(&self.as_i64().unwrap(), buf),
+            ValKind::U64 => MemCmpFormat::attach_mcf(&self.as_u64().unwrap(), buf),
+            ValKind::F32 => MemCmpFormat::attach_mcf(&self.as_f32().unwrap(), buf),
+            ValKind::F64 => MemCmpFormat::attach_mcf(&self.as_f64().unwrap(), buf),
+            ValKind::VarByte => MemCmpFormat::attach_mcf(self.as_bytes().unwrap(), buf),
+        }
+    }
+
+    #[inline]
+    fn encode_nmcf(&self, kind: ValKind, buf: &mut Vec<u8>) {
+        if self.is_null() {
+            attach_null(buf);
+            return;
+        }
+        match kind {
+            ValKind::I8 => NullableMemCmpFormat::attach_nmcf(&self.as_i8().unwrap(), buf),
+            ValKind::U8 => NullableMemCmpFormat::attach_nmcf(&self.as_u8().unwrap(), buf),
+            ValKind::I16 => NullableMemCmpFormat::attach_nmcf(&self.as_i16().unwrap(), buf),
+            ValKind::U16 => NullableMemCmpFormat::attach_nmcf(&self.as_u16().unwrap(), buf),
+            ValKind::I32 => NullableMemCmpFormat::attach_nmcf(&self.as_i32().unwrap(), buf),
+            ValKind::U32 => NullableMemCmpFormat::attach_nmcf(&self.as_u32().unwrap(), buf),
+            ValKind::I64 => NullableMemCmpFormat::attach_nmcf(&self.as_i64().unwrap(), buf),
+            ValKind::U64 => NullableMemCmpFormat::attach_nmcf(&self.as_u64().unwrap(), buf),
+            ValKind::F32 => NullableMemCmpFormat::attach_nmcf(&self.as_f32().unwrap(), buf),
+            ValKind::F64 => NullableMemCmpFormat::attach_nmcf(&self.as_f64().unwrap(), buf),
+            ValKind::VarByte => NullableMemCmpFormat::attach_nmcf(self.as_bytes().unwrap(), buf),
+        }
+    }
+}
+
 impl fmt::Debug for Val {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -151,14 +379,21 @@ impl From<i64> for Val {
 impl From<&[u8]> for Val {
     #[inline]
     fn from(value: &[u8]) -> Self {
-        Val::VarByte(MemVar::new(value))
+        Val::VarByte(MemVar::from(value))
     }
 }
 
 impl From<&str> for Val {
     #[inline]
     fn from(value: &str) -> Self {
-        Val::VarByte(MemVar::new(value.as_bytes()))
+        Val::VarByte(MemVar::from(value.as_bytes()))
+    }
+}
+
+impl From<Vec<u8>> for Val {
+    #[inline]
+    fn from(value: Vec<u8>) -> Self {
+        Val::VarByte(MemVar::from(value))
     }
 }
 
@@ -687,17 +922,6 @@ pub union MemVar {
 }
 
 impl MemVar {
-    /// Create a new MemVar.
-    #[inline]
-    pub fn new(data: &[u8]) -> Self {
-        debug_assert!(data.len() <= 0xffff);
-        if data.len() <= MEM_VAR_LEN_INLINE {
-            Self::inline(data)
-        } else {
-            Self::outline(data)
-        }
-    }
-
     /// Create a new MemVar with inline data.
     /// The data length must be no more than 14 bytes.
     #[inline]
@@ -727,6 +951,21 @@ impl MemVar {
             o.ptr = alloc(layout);
             let bs = std::slice::from_raw_parts_mut(o.ptr, data.len());
             bs.copy_from_slice(data);
+            MemVar {
+                o: ManuallyDrop::new(outline.assume_init()),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn outline_boxed_slice(data: Box<[u8]>) -> Self {
+        debug_assert!(data.len() <= 0xffff);
+        let mut outline = MaybeUninit::<MemVarOutline>::uninit();
+        unsafe {
+            let o = outline.assume_init_mut();
+            o.prefix.copy_from_slice(&data[..MEM_VAR_LEN_PREFIX]);
+            let ptr = Box::leak(data);
+            o.ptr = ptr as *mut [u8] as *mut u8;
             MemVar {
                 o: ManuallyDrop::new(outline.assume_init()),
             }
@@ -844,6 +1083,30 @@ impl<'de> Deserialize<'de> for MemVar {
     }
 }
 
+impl From<&[u8]> for MemVar {
+    #[inline]
+    fn from(value: &[u8]) -> Self {
+        debug_assert!(value.len() <= 0xffff);
+        if value.len() <= MEM_VAR_LEN_INLINE {
+            Self::inline(value)
+        } else {
+            Self::outline(value)
+        }
+    }
+}
+
+impl From<Vec<u8>> for MemVar {
+    #[inline]
+    fn from(value: Vec<u8>) -> Self {
+        debug_assert!(value.len() <= 0xffff);
+        if value.len() <= MEM_VAR_LEN_INLINE {
+            Self::inline(&value[..])
+        } else {
+            Self::outline_boxed_slice(value.into_boxed_slice())
+        }
+    }
+}
+
 struct MemVarVisitor;
 
 impl<'de> Visitor<'de> for MemVarVisitor {
@@ -860,7 +1123,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
         if v.len() >= 0xffff {
             return fail_long_bytes();
         }
-        Ok(MemVar::new(v))
+        Ok(MemVar::from(v))
     }
 
     fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
@@ -870,7 +1133,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
         if v.len() >= 0xffff {
             return fail_long_bytes();
         }
-        Ok(MemVar::new(&v))
+        Ok(MemVar::from(v))
     }
 
     fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
@@ -880,7 +1143,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
         if v.len() >= 0xffff {
             return fail_long_bytes();
         }
-        Ok(MemVar::new(v.as_bytes()))
+        Ok(MemVar::from(v.as_bytes()))
     }
 
     fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
@@ -890,7 +1153,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
         if v.len() >= 0xffff {
             return fail_long_bytes();
         }
-        Ok(MemVar::new(v.as_bytes()))
+        Ok(MemVar::from(v.as_bytes()))
     }
 }
 
@@ -951,14 +1214,14 @@ mod tests {
 
     #[test]
     fn test_mem_var() {
-        let var1 = MemVar::new(b"hello");
+        let var1 = MemVar::from(&b"hello"[..]);
         assert!(var1.is_inlined());
         assert!(var1.len() == 5);
         assert!(var1.as_bytes() == b"hello");
         assert!(var1.as_str() == "hello");
         assert!(MemVar::outline_len(b"hello") == 0);
 
-        let var2 = MemVar::new(b"a long value stored outline");
+        let var2 = MemVar::from(&b"a long value stored outline"[..]);
         assert!(!var2.is_inlined());
         assert!(var2.len() == 27);
         assert!(var2.as_bytes() == b"a long value stored outline");

@@ -8,7 +8,7 @@ use crate::error::{
 };
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage, INVALID_ROW_ID};
-use crate::table::Schema;
+use crate::table::TableSchema;
 use either::Either::{Left, Right};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
@@ -414,7 +414,7 @@ impl<P: BufferPool> BlockIndex<P> {
         &self,
         buf_pool: &'a P,
         count: usize,
-        schema: &Schema,
+        schema: &TableSchema,
     ) -> PageSharedGuard<'a, RowPage> {
         match self.get_insert_page_from_free_list(buf_pool) {
             Ok(free_page) => return free_page,
@@ -906,13 +906,17 @@ struct BranchLookup<'a> {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
-    use crate::value::Layout;
+    use crate::table::schema::{IndexKey, IndexSchema};
+    use crate::value::ValKind;
 
     #[test]
     fn test_block_index_free_list() {
         let buf_pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
         {
-            let schema = Schema::new(vec![Layout::Byte4], 0);
+            let schema = TableSchema::new(
+                vec![ValKind::I32.nullable(false)],
+                vec![first_i32_unique_index()],
+            );
             let blk_idx = BlockIndex::new(buf_pool).unwrap();
             let p1 = blk_idx.get_insert_page(buf_pool, 100, &schema);
             let pid1 = p1.page_id();
@@ -932,7 +936,10 @@ mod tests {
     fn test_block_index_insert_row_page() {
         let buf_pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
         {
-            let schema = Schema::new(vec![Layout::Byte4], 0);
+            let schema = TableSchema::new(
+                vec![ValKind::I32.nullable(false)],
+                vec![first_i32_unique_index()],
+            );
             let blk_idx = BlockIndex::new(buf_pool).unwrap();
             let p1 = blk_idx.get_insert_page(buf_pool, 100, &schema);
             let pid1 = p1.page_id();
@@ -954,7 +961,10 @@ mod tests {
         // allocate 1GB buffer pool is enough: 10240 pages ~= 640MB
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024 * 1024).unwrap();
         {
-            let schema = Schema::new(vec![Layout::Byte4], 0);
+            let schema = TableSchema::new(
+                vec![ValKind::I32.nullable(false)],
+                vec![first_i32_unique_index()],
+            );
             let blk_idx = BlockIndex::new(buf_pool).unwrap();
             for _ in 0..row_pages {
                 let _ = blk_idx.get_insert_page(buf_pool, 100, &schema);
@@ -993,13 +1003,20 @@ mod tests {
         }
     }
 
+    fn first_i32_unique_index() -> IndexSchema {
+        IndexSchema::new(vec![IndexKey::new(0)], true)
+    }
+
     #[test]
     fn test_block_index_search() {
         let row_pages = 10240usize;
         let rows_per_page = 100usize;
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024 * 1024).unwrap();
         {
-            let schema = Schema::new(vec![Layout::Byte4], 0);
+            let schema = TableSchema::new(
+                vec![ValKind::I32.nullable(false)],
+                vec![first_i32_unique_index()],
+            );
             let blk_idx = BlockIndex::new(buf_pool).unwrap();
             for _ in 0..row_pages {
                 let _ = blk_idx.get_insert_page(buf_pool, rows_per_page, &schema);
