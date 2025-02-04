@@ -2,13 +2,13 @@ use crate::buffer::frame::BufferFrameAware;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard};
 use crate::buffer::page::{PageID, LSN, PAGE_SIZE};
 use crate::buffer::BufferPool;
+use crate::catalog::TableSchema;
 use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
 };
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage, INVALID_ROW_ID};
-use crate::table::TableSchema;
 use either::Either::{Left, Right};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
@@ -770,6 +770,8 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 }
 
+unsafe impl<P> Send for BlockIndex<P> {}
+
 pub enum RowLocation {
     ColSegment(u64, u64),
     RowPage(PageID),
@@ -906,7 +908,7 @@ struct BranchLookup<'a> {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
-    use crate::table::schema::{IndexKey, IndexSchema};
+    use crate::catalog::{IndexKey, IndexSchema};
     use crate::value::ValKind;
 
     #[test]

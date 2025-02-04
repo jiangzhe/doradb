@@ -1,9 +1,8 @@
-use crate::buffer::FixedBufferPool;
-use crate::catalog::Catalog;
+use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::catalog::{Catalog, IndexKey, IndexSchema, TableSchema};
 use crate::row::ops::{SelectKey, SelectMvcc, UpdateCol};
 use crate::session::Session;
 use crate::table::TableID;
-use crate::table::{IndexKey, IndexSchema, TableSchema};
 use crate::trx::sys::{TransactionSystem, TrxSysConfig};
 use crate::value::{Val, ValKind};
 
@@ -13,9 +12,9 @@ fn test_mvcc_insert_normal() {
         const SIZE: i32 = 10000;
 
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
-        let trx_sys = TrxSysConfig::default().build_static();
-
-        let (catalog, table_id) = create_table(buf_pool);
+        let catalog = Catalog::empty_static();
+        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog);
         let table = catalog.get_table(table_id).unwrap();
         let mut session = Session::new();
         {
@@ -29,7 +28,7 @@ fn test_mvcc_insert_normal() {
                 trx = stmt.succeed();
                 assert!(res.is_ok());
             }
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         {
             let mut trx = session.begin_trx(trx_sys);
@@ -48,11 +47,12 @@ fn test_mvcc_insert_normal() {
                 }
                 trx = stmt.succeed();
             }
-            let _ = trx_sys.commit(trx).await.unwrap();
+            let _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
 
         unsafe {
             TransactionSystem::drop_static(trx_sys);
+            Catalog::drop_static(catalog);
             FixedBufferPool::drop_static(buf_pool);
         }
     });
@@ -64,9 +64,10 @@ fn test_mvcc_update_normal() {
         const SIZE: i32 = 1000;
 
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
-        let trx_sys = TrxSysConfig::default().build_static();
+        let catalog = Catalog::empty_static();
+        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog);
         {
-            let (catalog, table_id) = create_table(buf_pool);
             let table = catalog.get_table(table_id).unwrap();
 
             let mut session = Session::new();
@@ -81,7 +82,7 @@ fn test_mvcc_update_normal() {
                 trx = stmt.succeed();
                 assert!(res.is_ok());
             }
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // update 1 row with short value
             let mut trx = session.begin_trx(trx_sys);
@@ -95,7 +96,7 @@ fn test_mvcc_update_normal() {
             let res = table.update_row(buf_pool, &mut stmt, &k1, update1).await;
             assert!(res.is_ok());
             trx = stmt.succeed();
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // update 1 row with long value
             let mut trx = session.begin_trx(trx_sys);
@@ -120,7 +121,7 @@ fn test_mvcc_update_normal() {
             assert!(row[1] == Val::from(&s2[..]));
             trx = stmt.succeed();
 
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // lookup with a new transaction
             let mut trx = session.begin_trx(trx_sys);
@@ -133,10 +134,11 @@ fn test_mvcc_update_normal() {
             assert!(row[1] == Val::from(&s2[..]));
             trx = stmt.succeed();
 
-            let _ = trx_sys.commit(trx).await.unwrap();
+            let _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
             TransactionSystem::drop_static(trx_sys);
+            Catalog::drop_static(catalog);
             FixedBufferPool::drop_static(buf_pool);
         }
     });
@@ -148,9 +150,10 @@ fn test_mvcc_delete_normal() {
         const SIZE: i32 = 1000;
 
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
-        let trx_sys = TrxSysConfig::default().build_static();
+        let catalog = Catalog::empty_static();
+        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog);
         {
-            let (catalog, table_id) = create_table(buf_pool);
             let table = catalog.get_table(table_id).unwrap();
 
             let mut session = Session::new();
@@ -165,7 +168,7 @@ fn test_mvcc_delete_normal() {
                 trx = stmt.succeed();
                 assert!(res.is_ok());
             }
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // delete 1 row
             let mut trx = session.begin_trx(trx_sys);
@@ -180,7 +183,7 @@ fn test_mvcc_delete_normal() {
             let res = table.select_row(buf_pool, &stmt, &k1, &[0]).await;
             assert!(res.not_found());
             trx = stmt.succeed();
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // lookup row in new transaction
             let mut trx = session.begin_trx(trx_sys);
@@ -188,10 +191,11 @@ fn test_mvcc_delete_normal() {
             let res = table.select_row(buf_pool, &stmt, &k1, &[0]).await;
             assert!(res.not_found());
             trx = stmt.succeed();
-            let _ = trx_sys.commit(trx).await.unwrap();
+            let _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
             TransactionSystem::drop_static(trx_sys);
+            Catalog::drop_static(catalog);
             FixedBufferPool::drop_static(buf_pool);
         }
     });
@@ -201,9 +205,10 @@ fn test_mvcc_delete_normal() {
 fn test_mvcc_rollback_insert_normal() {
     smol::block_on(async {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
-        let trx_sys = TrxSysConfig::default().build_static();
+        let catalog = Catalog::empty_static();
+        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog);
         {
-            let (catalog, table_id) = create_table(buf_pool);
             let table = catalog.get_table(table_id).unwrap();
 
             let mut session = Session::new();
@@ -219,7 +224,7 @@ fn test_mvcc_rollback_insert_normal() {
                 .await;
             assert!(res.is_ok());
             trx = stmt.fail(buf_pool, &catalog);
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // select 1 row
             let mut trx = session.begin_trx(trx_sys);
@@ -228,10 +233,11 @@ fn test_mvcc_rollback_insert_normal() {
             let res = table.select_row(buf_pool, &stmt, &key, &[0, 1]).await;
             assert!(res.not_found());
             trx = stmt.succeed();
-            _ = trx_sys.commit(trx).await.unwrap();
+            _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
             TransactionSystem::drop_static(trx_sys);
+            Catalog::drop_static(catalog);
             FixedBufferPool::drop_static(buf_pool);
         }
     });
@@ -241,9 +247,10 @@ fn test_mvcc_rollback_insert_normal() {
 fn test_mvcc_move_insert() {
     smol::block_on(async {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
-        let trx_sys = TrxSysConfig::default().build_static();
+        let catalog = Catalog::empty_static();
+        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog);
         {
-            let (catalog, table_id) = create_table(buf_pool);
             let table = catalog.get_table(table_id).unwrap();
 
             let mut session = Session::new();
@@ -259,7 +266,7 @@ fn test_mvcc_move_insert() {
                 .await;
             assert!(res.is_ok());
             trx = stmt.succeed();
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // delete it
             let mut trx = session.begin_trx(trx_sys);
@@ -268,7 +275,7 @@ fn test_mvcc_move_insert() {
             let res = table.delete_row(buf_pool, &mut stmt, &key).await;
             assert!(res.is_ok());
             trx = stmt.succeed();
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // insert again, trigger move+insert
             let mut trx = session.begin_trx(trx_sys);
@@ -282,7 +289,7 @@ fn test_mvcc_move_insert() {
                 .await;
             assert!(res.is_ok());
             trx = stmt.succeed();
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // select 1 row
             let mut trx = session.begin_trx(trx_sys);
@@ -293,10 +300,11 @@ fn test_mvcc_move_insert() {
             let vals = res.unwrap();
             assert!(vals[1] == Val::from("world"));
             trx = stmt.succeed();
-            _ = trx_sys.commit(trx).await.unwrap();
+            _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
             TransactionSystem::drop_static(trx_sys);
+            Catalog::drop_static(catalog);
             FixedBufferPool::drop_static(buf_pool);
         }
     });
@@ -306,9 +314,10 @@ fn test_mvcc_move_insert() {
 fn test_mvcc_rollback_move_insert() {
     smol::block_on(async {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
-        let trx_sys = TrxSysConfig::default().build_static();
+        let catalog = Catalog::empty_static();
+        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog);
         {
-            let (catalog, table_id) = create_table(buf_pool);
             let table = catalog.get_table(table_id).unwrap();
 
             let mut session = Session::new();
@@ -325,7 +334,7 @@ fn test_mvcc_rollback_move_insert() {
             assert!(res.is_ok());
             println!("row_id={}", res.unwrap());
             trx = stmt.succeed();
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // delete it
             let mut trx = session.begin_trx(trx_sys);
@@ -334,7 +343,7 @@ fn test_mvcc_rollback_move_insert() {
             let res = table.delete_row(buf_pool, &mut stmt, &key).await;
             assert!(res.is_ok());
             trx = stmt.succeed();
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // insert again, trigger move+insert
             let mut trx = session.begin_trx(trx_sys);
@@ -349,7 +358,7 @@ fn test_mvcc_rollback_move_insert() {
             assert!(res.is_ok());
             println!("row_id={}", res.unwrap());
             trx = stmt.fail(buf_pool, &catalog);
-            session = trx_sys.commit(trx).await.unwrap();
+            session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // select 1 row
             let mut trx = session.begin_trx(trx_sys);
@@ -358,18 +367,18 @@ fn test_mvcc_rollback_move_insert() {
             let res = table.select_row(buf_pool, &stmt, &key, &[0, 1]).await;
             assert!(res.not_found());
             trx = stmt.succeed();
-            _ = trx_sys.commit(trx).await.unwrap();
+            _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
             TransactionSystem::drop_static(trx_sys);
+            Catalog::drop_static(catalog);
             FixedBufferPool::drop_static(buf_pool);
         }
     });
 }
 
-fn create_table(buf_pool: &'static FixedBufferPool) -> (Catalog<FixedBufferPool>, TableID) {
-    let catalog = Catalog::empty();
-    let table_id = catalog.create_table(
+fn create_table<P: BufferPool>(buf_pool: &P, catalog: &Catalog<P>) -> TableID {
+    catalog.create_table(
         buf_pool,
         TableSchema::new(
             vec![
@@ -378,8 +387,7 @@ fn create_table(buf_pool: &'static FixedBufferPool) -> (Catalog<FixedBufferPool>
             ],
             vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
         ),
-    );
-    (catalog, table_id)
+    )
 }
 
 fn single_key<V: Into<Val>>(value: V) -> SelectKey {

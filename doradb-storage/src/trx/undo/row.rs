@@ -185,6 +185,11 @@ impl RowUndoLogs {
     }
 
     #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
     pub fn push(&mut self, value: OwnedRowUndo) {
         self.0.push(value)
     }
@@ -272,6 +277,7 @@ impl OwnedRowUndo {
 pub struct RowUndoRef(NonNull<RowUndo>);
 
 unsafe impl Send for RowUndoRef {}
+unsafe impl Sync for RowUndoRef {}
 
 impl RowUndoRef {
     #[inline]
@@ -372,6 +378,8 @@ pub struct RowUndoHead {
     pub status: Arc<SharedTrxStatus>,
     pub entry: Option<RowUndoRef>,
 }
+
+unsafe impl Send for RowUndoHead {}
 
 #[derive(Default, Clone, Copy)]
 pub enum NextTrxCTS {

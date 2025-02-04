@@ -1,6 +1,6 @@
+use crate::catalog::IndexSchema;
 use crate::index::smart_key::SmartKey;
 use crate::row::RowID;
-use crate::table::schema::IndexSchema;
 use crate::value::{Val, ValKind, ValType};
 use doradb_datatype::konst::{ValidF32, ValidF64};
 use either::Either;
@@ -96,26 +96,26 @@ pub enum IndexKind {
 
 impl IndexKind {
     #[inline]
-    pub fn unique<T: UniqueIndex + 'static>(index: T) -> Self {
+    pub fn unique<T: UniqueIndex>(index: T) -> Self {
         IndexKind::Unique(Arc::new(index))
     }
 }
 
-pub trait UniqueIndex {
+pub trait UniqueIndex: Send + Sync + 'static {
     fn lookup(&self, key: &[Val]) -> Option<RowID>;
 
     fn insert(&self, key: &[Val], row_id: RowID) -> Option<RowID>;
 
     fn insert_if_not_exists(&self, key: &[Val], row_id: RowID) -> Option<RowID>;
 
-    fn delete(&self, key: &[Val]) -> Option<RowID>;
+    fn compare_delete(&self, key: &[Val], old_row_id: RowID) -> bool;
 
     fn compare_exchange(&self, key: &[Val], old_row_id: RowID, new_row_id: RowID) -> bool;
 
-    // todo: scan
+    fn scan_values(&self, values: &mut Vec<RowID>);
 }
 
-pub trait NonUniqueIndex {
+pub trait NonUniqueIndex: Send + Sync + 'static {
     fn lookup(&self, key: &[Val], res: &mut Vec<RowID>);
 
     fn insert(&self, key: &[Val], row_id: RowID);
@@ -287,7 +287,9 @@ impl<T: Hash> PartitionSingleKeyIndex<T> {
     }
 }
 
-impl<T: Hash + Ord + EncodeKeySelf> UniqueIndex for PartitionSingleKeyIndex<T> {
+impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
+    for PartitionSingleKeyIndex<T>
+{
     #[inline]
     fn lookup(&self, key: &[Val]) -> Option<RowID> {
         let key = T::encode(key);
@@ -319,11 +321,21 @@ impl<T: Hash + Ord + EncodeKeySelf> UniqueIndex for PartitionSingleKeyIndex<T> {
     }
 
     #[inline]
-    fn delete(&self, key: &[Val]) -> Option<RowID> {
+    fn compare_delete(&self, key: &[Val], old_row_id: RowID) -> bool {
         let key = T::encode(key);
         let tree = self.select(&key);
         let mut g = tree.write();
-        g.remove(&key)
+        match g.entry(key) {
+            Entry::Occupied(occ) => {
+                if occ.get() == &old_row_id {
+                    occ.remove();
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(_) => false,
+        }
     }
 
     #[inline]
@@ -341,6 +353,14 @@ impl<T: Hash + Ord + EncodeKeySelf> UniqueIndex for PartitionSingleKeyIndex<T> {
                 }
             }
             None => false,
+        }
+    }
+
+    #[inline]
+    fn scan_values(&self, values: &mut Vec<RowID>) {
+        for tree in &self.0 {
+            let g = tree.read();
+            values.extend(g.values());
         }
     }
 }
@@ -389,10 +409,10 @@ impl UniqueIndex for PartitionMultiKeyIndex {
     }
 
     #[inline]
-    fn delete(&self, key: &[Val]) -> Option<RowID> {
+    fn compare_delete(&self, key: &[Val], old_row_id: RowID) -> bool {
         let key = self.encode(key);
         let key = std::slice::from_ref(&key);
-        self.index.delete(key)
+        self.index.compare_delete(key, old_row_id)
     }
 
     #[inline]
@@ -400,5 +420,10 @@ impl UniqueIndex for PartitionMultiKeyIndex {
         let key = self.encode(key);
         let key = std::slice::from_ref(&key);
         self.index.compare_exchange(key, old_row_id, new_row_id)
+    }
+
+    #[inline]
+    fn scan_values(&self, values: &mut Vec<RowID>) {
+        self.index.scan_values(values);
     }
 }

@@ -3,8 +3,8 @@ pub mod ops;
 use crate::buffer::frame::{BufferFrameAware, FrameHeader};
 use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::BufferPool;
+use crate::catalog::TableSchema;
 use crate::row::ops::{Delete, InsertRow, Select, SelectKey, Update, UpdateCol};
-use crate::table::TableSchema;
 use crate::trx::undo::UndoMap;
 use crate::value::*;
 use std::fmt;
@@ -1219,7 +1219,7 @@ pub fn var_len_for_insert(schema: &TableSchema, user_cols: &[Val]) -> usize {
 mod tests {
     use core::str;
 
-    use crate::table::schema::{IndexKey, IndexSchema};
+    use crate::catalog::{IndexKey, IndexSchema};
     use mem::MaybeUninit;
 
     use super::*;

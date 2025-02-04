@@ -1,12 +1,12 @@
 use crate::buffer::guard::PageSharedGuard;
+use crate::catalog::TableSchema;
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UpdateCol, UpdateRow};
 use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
-use crate::table::TableSchema;
 use crate::trx::undo::{
     NextRowUndo, NextRowUndoStatus, NextTrxCTS, OwnedRowUndo, RowUndoBranch, RowUndoHead,
     RowUndoKind, RowUndoRef,
 };
-use crate::trx::{trx_is_committed, ActiveTrx, SharedTrxStatus};
+use crate::trx::{trx_is_committed, ActiveTrx, SharedTrxStatus, TrxID, GLOBAL_VISIBLE_COMMIT_TS};
 use crate::value::Val;
 use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -31,17 +31,17 @@ impl RowReadAccess<'_> {
 
     #[inline]
     pub fn latest_status(&self) -> RowLatestStatus {
-        if let Some(head) = &*self.undo {
+        let cts = if let Some(head) = &*self.undo {
             let ts = head.status.ts();
             if !trx_is_committed(ts) {
                 return RowLatestStatus::Uncommitted;
             }
-        }
+            ts
+        } else {
+            GLOBAL_VISIBLE_COMMIT_TS
+        };
         // the row is committed, check if it's deleted.
-        if self.row().is_deleted() {
-            return RowLatestStatus::Deleted;
-        }
-        RowLatestStatus::Committed
+        RowLatestStatus::Committed(cts, self.row().is_deleted())
     }
 
     #[inline]
@@ -196,6 +196,104 @@ impl RowReadAccess<'_> {
             }
         }
     }
+
+    /// Check whether a key same as input can be found in version chain.
+    /// This method is similar to read_row_mvcc() but only consider index key
+    /// match logic.
+    /// It is used by purge threads to correctly remove unused index entry.
+    #[inline]
+    pub fn is_any_version_matches_key(
+        &self,
+        schema: &TableSchema,
+        key: &SelectKey,
+        sts: TrxID,
+    ) -> bool {
+        match &*self.undo {
+            None => {
+                let row = self.row();
+                return !row.is_deleted() && !row.is_key_different(schema, key);
+            }
+            Some(undo_head) => {
+                let ts = undo_head.status.ts();
+                if trx_is_committed(ts) {
+                    if sts > ts {
+                        let row = self.row();
+                        return !row.is_deleted() && !row.is_key_different(schema, key);
+                    }
+                }
+                // page data is invisible, we have to backtrace version chain.
+                let row = self.row();
+                let vals = row.clone_index_vals(schema, key.index_no);
+                let mvcc_key = SelectKey::new(key.index_no, vals);
+                let deleted = row.is_deleted();
+                if !deleted && &mvcc_key == key {
+                    return true;
+                }
+                match undo_head.entry.as_ref() {
+                    None => unreachable!("next version is missing"),
+                    Some(entry) => {
+                        let mut entry = entry.clone();
+                        let mapping: HashMap<usize, usize> = schema.indexes[key.index_no]
+                            .keys
+                            .iter()
+                            .enumerate()
+                            .map(|(key_no, key)| (key.user_col_idx as usize, key_no))
+                            .collect();
+                        let mut ver = KeyVersion {
+                            deleted,
+                            mvcc_key,
+                            mapping,
+                        };
+                        // traverse version chain
+                        loop {
+                            match &entry.as_ref().kind {
+                                RowUndoKind::Insert => {
+                                    debug_assert!(!ver.deleted);
+                                    ver.deleted = true;
+                                }
+                                RowUndoKind::Update(undo_cols) => {
+                                    debug_assert!(!ver.deleted);
+                                    ver.undo_update(undo_cols);
+                                }
+                                RowUndoKind::Delete => {
+                                    debug_assert!(ver.deleted);
+                                    ver.deleted = false;
+                                }
+                                RowUndoKind::Move(del) => {
+                                    ver.deleted = *del;
+                                }
+                            }
+                            // here we check if current version matches input key
+                            if !ver.deleted && &ver.mvcc_key == key {
+                                return true;
+                            }
+                            // check whether we should go to next version
+                            match entry.as_ref().find_next_version(key) {
+                                None => {
+                                    return false;
+                                }
+                                Some(next) => {
+                                    match next.status {
+                                        NextRowUndoStatus::SameAsPrev => {
+                                            let next_entry = next.entry.clone();
+                                            entry = next_entry; // still invisible.
+                                        }
+                                        NextRowUndoStatus::CTS(cts) => {
+                                            if sts > cts {
+                                                // current version is visible
+                                                return false;
+                                            }
+                                            entry = next.entry.clone(); // still invisible
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Version of current row.
@@ -265,6 +363,24 @@ impl RowVersion {
             }
         }
         ReadRow::Ok(vals)
+    }
+}
+
+struct KeyVersion {
+    deleted: bool,
+    mvcc_key: SelectKey,
+    // mapping of column number to key number
+    mapping: HashMap<usize, usize>,
+}
+
+impl KeyVersion {
+    #[inline]
+    fn undo_update(&mut self, undo: &[UndoCol]) {
+        for u in undo {
+            if let Some(key_no) = self.mapping.get(&u.idx) {
+                self.mvcc_key.vals[*key_no] = u.val.clone();
+            }
+        }
     }
 }
 
@@ -462,9 +578,9 @@ impl<'a> PageSharedGuard<'a, RowPage> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum RowLatestStatus {
     NotFound,
-    Deleted,
-    Committed,
+    Committed(TrxID, bool),
     Uncommitted,
 }

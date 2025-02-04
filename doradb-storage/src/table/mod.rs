@@ -1,10 +1,11 @@
-pub mod schema;
+// pub mod schema;
 #[cfg(test)]
 mod tests;
 
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
+use crate::catalog::{IndexSchema, TableSchema};
 use crate::index::{BlockIndex, RowLocation, SecondaryIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
@@ -14,18 +15,16 @@ use crate::row::ops::{
 use crate::row::{estimate_max_row_count, RowID, RowPage, RowRead};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoEntry, RedoKind};
-use crate::trx::row::{RowReadAccess, RowWriteAccess};
+use crate::trx::row::{RowLatestStatus, RowReadAccess, RowWriteAccess};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, NextRowUndo, NextRowUndoStatus, NextTrxCTS, OwnedRowUndo,
     RowUndoBranch, RowUndoHead, RowUndoKind, RowUndoRef,
 };
-use crate::trx::{trx_is_committed, ActiveTrx};
+use crate::trx::{trx_is_committed, ActiveTrx, TrxID};
 use crate::value::{Val, PAGE_VAR_LEN_INLINE};
 use std::collections::HashSet;
 use std::mem;
 use std::sync::Arc;
-
-pub use schema::*;
 
 // todo: integrate with doradb_catalog::TableID.
 pub type TableID = u64;
@@ -322,6 +321,93 @@ impl<P: BufferPool> Table<P> {
                         };
                     }
                 },
+            }
+        }
+    }
+
+    /// Delete index by purge threads.
+    /// This method will be only called by internal threads and don't maintain
+    /// transaction properties.
+    ///
+    /// It checks whether the index entry still points to valid row, and if not,
+    /// remove the entry.
+    ///
+    /// The validation is based on MVCC with minimum active STS. If the input
+    /// key is not found on the path of undo chain, it means the index entry can be
+    /// removed.
+    #[inline]
+    pub fn delete_index(
+        &self,
+        buf_pool: &P,
+        key: &SelectKey,
+        row_id: RowID,
+        min_active_sts: TrxID,
+    ) -> bool {
+        // todo: consider index drop.
+        let index_schema = &self.schema.indexes[key.index_no];
+        if index_schema.unique {
+            let index = self.sec_idx[key.index_no].unique().unwrap();
+            return self.delete_unique_index(buf_pool, index, key, row_id, min_active_sts);
+        }
+        todo!()
+    }
+
+    #[inline]
+    fn delete_unique_index(
+        &self,
+        buf_pool: &P,
+        index: &dyn UniqueIndex,
+        key: &SelectKey,
+        row_id: RowID,
+        min_active_sts: TrxID,
+    ) -> bool {
+        loop {
+            match index.lookup(&key.vals) {
+                None => return false, // Another thread deleted this entry.
+                Some(index_row_id) => {
+                    if index_row_id != row_id {
+                        // Row id changed, means another transaction inserted
+                        // new row with same key and reused this index entry.
+                        // So we skip to delete it.
+                        return false;
+                    }
+                    match self.blk_idx.find_row_id(buf_pool, row_id) {
+                        RowLocation::NotFound => {
+                            return index.compare_delete(&key.vals, row_id);
+                        }
+                        RowLocation::ColSegment(..) => todo!(),
+                        RowLocation::RowPage(page_id) => {
+                            let page_guard = buf_pool
+                                .get_page(page_id, LatchFallbackMode::Shared)
+                                .block_until_shared();
+                            if !validate_page_row_range(&page_guard, page_id, row_id) {
+                                continue;
+                            }
+                            let access = page_guard.read_row_by_id(row_id);
+                            // check if row is invisible
+                            match access.latest_status() {
+                                RowLatestStatus::NotFound => {
+                                    return index.compare_delete(&key.vals, row_id);
+                                }
+                                RowLatestStatus::Uncommitted => {
+                                    // traverse version chain to see if any visible version matches
+                                    // the input key.
+                                    todo!()
+                                }
+                                RowLatestStatus::Committed(cts, deleted) => {
+                                    if cts < min_active_sts && deleted {
+                                        if deleted {
+                                            return index.compare_delete(&key.vals, row_id);
+                                        }
+                                    }
+                                    // traverse version chain to see if any visible version matches
+                                    // the input key.
+                                    todo!()
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1141,7 +1227,7 @@ impl<P: BufferPool> Table<P> {
                     row_id,
                     &mut access,
                 );
-                let index_undo = self.index_undo(row_id, IndexUndoKind::GC(key));
+                let index_undo = self.index_undo(row_id, IndexUndoKind::DeferDelete(key));
                 stmt.index_undo.push(index_undo);
             } else {
                 todo!();
