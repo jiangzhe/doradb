@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const SAFETY_PAGES: usize = 10;
 
 /// Abstraction of buffer pool.
-pub trait BufferPool {
+pub trait BufferPool: Sync {
     /// Allocate a new page.
     fn allocate_page<T: BufferFrameAware>(&self) -> PageExclusiveGuard<'_, T>;
 
@@ -99,6 +99,12 @@ impl FixedBufferPool {
         let boxed = Box::new(pool);
         let leak = Box::leak(boxed);
         Ok(leak)
+    }
+
+    /// Returns the maximum page number of this pool.
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
     }
 
     /// Drop static buffer pool.

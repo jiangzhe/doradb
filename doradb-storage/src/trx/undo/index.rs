@@ -20,6 +20,12 @@ impl IndexUndoLogs {
         self.0.is_empty()
     }
 
+    /// Returns count of index undo logs.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// Add a new index undo log at end of the buffer.
     #[inline]
     pub fn push(&mut self, value: IndexUndo) {
@@ -27,6 +33,10 @@ impl IndexUndoLogs {
     }
 
     /// Rollback all index changes.
+    ///
+    /// This method has strong assertion to make sure it will not fail,
+    /// because other transaction can not update the same index entry
+    /// concurrently.
     #[inline]
     pub fn rollback<P: BufferPool>(&mut self, catalog: &Catalog<P>) {
         while let Some(entry) = self.0.pop() {
@@ -36,8 +46,8 @@ impl IndexUndoLogs {
                     let res = table.sec_idx[key.index_no]
                         .unique()
                         .unwrap()
-                        .delete(&key.vals);
-                    assert!(res.unwrap() == entry.row_id);
+                        .compare_delete(&key.vals, entry.row_id);
+                    assert!(res);
                 }
                 IndexUndoKind::UpdateUnique(key, old_row_id) => {
                     let new_row_id = entry.row_id;
@@ -47,7 +57,7 @@ impl IndexUndoLogs {
                         .compare_exchange(&key.vals, new_row_id, old_row_id);
                     assert!(res);
                 }
-                IndexUndoKind::GC(_) => (), // do nothing.
+                IndexUndoKind::DeferDelete(_) => (), // do nothing.
             }
         }
     }
@@ -65,24 +75,18 @@ impl IndexUndoLogs {
     /// And to support MVCC, index deletion is delayed to GC phase.
     /// So here we should only keep potential index deletions.
     #[inline]
-    pub fn prepare_for_gc(&mut self) -> Self {
-        let logs_for_gc: Vec<_> = self
-            .0
+    pub fn commit_for_gc(&mut self) -> Vec<IndexPurge> {
+        self.0
             .drain(..)
             .filter_map(|entry| match entry.kind {
-                IndexUndoKind::InsertUnique(_) => None,
-                IndexUndoKind::UpdateUnique(key, old_row_id) => {
-                    let kind = IndexUndoKind::GC(key);
-                    Some(IndexUndo {
-                        table_id: entry.table_id,
-                        row_id: old_row_id,
-                        kind,
-                    })
-                }
-                IndexUndoKind::GC(_) => Some(entry),
+                IndexUndoKind::InsertUnique(_) | IndexUndoKind::UpdateUnique(..) => None,
+                IndexUndoKind::DeferDelete(key) => Some(IndexPurge {
+                    table_id: entry.table_id,
+                    row_id: entry.row_id,
+                    key,
+                }),
             })
-            .collect();
-        IndexUndoLogs(logs_for_gc)
+            .collect()
     }
 }
 
@@ -104,5 +108,11 @@ pub enum IndexUndoKind {
     /// in order to support MVCC.
     /// The actual deletion is performed solely by GC thread.
     /// This is what GC entry means.
-    GC(SelectKey),
+    DeferDelete(SelectKey),
+}
+
+pub struct IndexPurge {
+    pub table_id: TableID,
+    pub row_id: RowID,
+    pub key: SelectKey,
 }

@@ -1,6 +1,6 @@
 use clap::Parser;
 use doradb_storage::buffer::FixedBufferPool;
-use doradb_storage::table::{IndexKey, IndexSchema, TableSchema};
+use doradb_storage::catalog::{IndexKey, IndexSchema, TableSchema};
 use doradb_storage::value::ValKind;
 use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
 use perfcnt::{AbstractPerfCounter, PerfCounter};

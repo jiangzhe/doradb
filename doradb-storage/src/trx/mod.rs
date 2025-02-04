@@ -15,6 +15,9 @@
 //!    c) If exists, check the timestamp in entry head. If it's larger than current STS, means
 //!       it's invisible, undo change and go to next version in the chain...
 //!    d) If less than current STS, return current version.
+pub mod group;
+pub mod log;
+pub mod purge;
 pub mod redo;
 pub mod row;
 pub mod sys;
@@ -23,7 +26,7 @@ pub mod undo;
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoBin, RedoEntry, RedoKind, RedoLog};
-use crate::trx::undo::{IndexUndoLogs, RowUndoLogs};
+use crate::trx::undo::{IndexPurge, IndexUndoLogs, RowUndoLogs};
 use crate::value::Val;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -127,7 +130,9 @@ pub struct ActiveTrx {
     // Snapshot timestamp.
     pub sts: TrxID,
     // which log partition it belongs to.
-    pub log_partition_idx: usize,
+    pub log_no: usize,
+    // which GC bucket it belongs to.
+    pub gc_no: usize,
     // transaction-level undo logs of row data.
     pub(crate) row_undo: RowUndoLogs,
     // transaction-level index undo operations.
@@ -141,11 +146,18 @@ pub struct ActiveTrx {
 impl ActiveTrx {
     /// Create a new transaction.
     #[inline]
-    pub fn new(session: Option<Box<InternalSession>>, trx_id: TrxID, sts: TrxID) -> Self {
+    pub fn new(
+        session: Option<Box<InternalSession>>,
+        trx_id: TrxID,
+        sts: TrxID,
+        log_no: usize,
+        gc_no: usize,
+    ) -> Self {
         ActiveTrx {
             status: Arc::new(SharedTrxStatus::new(trx_id)),
             sts,
-            log_partition_idx: 0,
+            log_no,
+            gc_no,
             row_undo: RowUndoLogs::empty(),
             index_undo: IndexUndoLogs::empty(),
             redo: vec![],
@@ -166,11 +178,6 @@ impl ActiveTrx {
     #[inline]
     pub fn trx_id(&self) -> TrxID {
         self.status.ts()
-    }
-
-    #[inline]
-    pub fn set_log_partition(&mut self, log_partition_idx: usize) {
-        self.log_partition_idx = log_partition_idx;
     }
 
     /// Starts a statement.
@@ -196,6 +203,8 @@ impl ActiveTrx {
             return PreparedTrx {
                 status: Arc::clone(&self.status),
                 sts: self.sts,
+                log_no: self.log_no,
+                gc_no: self.gc_no,
                 redo_bin: None,
                 row_undo: RowUndoLogs::empty(),
                 index_undo: IndexUndoLogs::empty(),
@@ -223,23 +232,17 @@ impl ActiveTrx {
             Some(redo_bin)
         };
         let row_undo = mem::take(&mut self.row_undo);
+        let index_undo = mem::take(&mut self.index_undo);
         PreparedTrx {
             status: self.status.clone(),
             sts: self.sts,
+            log_no: self.log_no,
+            gc_no: self.gc_no,
             redo_bin,
             row_undo,
-            // We do not have rollback logic when transaction enters commit phase.
-            // Instead, we prepare them for GC because we assume the transaction should
-            // be successfully committed.
-            index_undo: self.index_undo.prepare_for_gc(),
+            index_undo,
             session: self.session.take(),
         }
-    }
-
-    /// Rollback current transaction.
-    #[inline]
-    pub fn rollback(self) {
-        todo!()
     }
 
     /// Add one redo log entry.
@@ -272,6 +275,18 @@ impl Drop for ActiveTrx {
     }
 }
 
+impl IntoSession for ActiveTrx {
+    #[inline]
+    fn into_session(mut self) -> Session {
+        Session::with_internal_session(self.session.take().unwrap())
+    }
+
+    #[inline]
+    fn split_session(&mut self) -> Session {
+        Session::with_internal_session(self.session.take().unwrap())
+    }
+}
+
 static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
 static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
@@ -279,6 +294,8 @@ static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 pub struct PreparedTrx {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
+    log_no: usize,
+    gc_no: usize,
     redo_bin: Option<RedoBin>,
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
@@ -295,14 +312,19 @@ impl PreparedTrx {
             None
         };
         let row_undo = mem::take(&mut self.row_undo);
-        let index_undo = mem::take(&mut self.index_undo);
+        // Once we get a concrete CTS, we won't rollback this transaction.
+        // So we convert IndexUndo to IndexGC, and let purge threads to
+        // remove unused index entries.
+        // let index_undo = mem::take(&mut self.index_undo);
+        let index_gc = self.index_undo.commit_for_gc();
         PrecommitTrx {
             status: Arc::clone(&self.status),
             sts: self.sts,
             cts,
+            gc_no: self.gc_no,
             redo_bin,
             row_undo,
-            index_undo,
+            index_gc,
             session: self.session.take(),
         }
     }
@@ -340,9 +362,10 @@ pub struct PrecommitTrx {
     status: Arc<SharedTrxStatus>,
     pub sts: TrxID,
     pub cts: TrxID,
+    pub gc_no: usize,
     pub redo_bin: Option<RedoBin>,
     pub row_undo: RowUndoLogs,
-    pub index_undo: IndexUndoLogs,
+    pub index_gc: Vec<IndexPurge>,
     session: Option<Box<InternalSession>>,
 }
 
@@ -365,12 +388,13 @@ impl PrecommitTrx {
             drop(g.take());
         }
         let row_undo = mem::take(&mut self.row_undo);
-        let index_undo = mem::take(&mut self.index_undo);
+        let index_gc = mem::take(&mut self.index_gc);
         CommittedTrx {
             sts: self.sts,
             cts: self.cts,
+            gc_no: self.gc_no,
             row_undo,
-            index_undo,
+            index_gc,
             session: self.session.take(),
         }
     }
@@ -381,7 +405,7 @@ impl Drop for PrecommitTrx {
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
         assert!(self.row_undo.is_empty(), "row undo should be cleared");
-        assert!(self.index_undo.is_empty(), "index undo should be cleared");
+        assert!(self.index_gc.is_empty(), "index gc should be cleared");
     }
 }
 
@@ -400,8 +424,9 @@ impl IntoSession for PrecommitTrx {
 pub struct CommittedTrx {
     pub sts: TrxID,
     pub cts: TrxID,
+    pub gc_no: usize,
     pub row_undo: RowUndoLogs,
-    pub index_undo: IndexUndoLogs,
+    pub index_gc: Vec<IndexPurge>,
     session: Option<Box<InternalSession>>,
 }
 

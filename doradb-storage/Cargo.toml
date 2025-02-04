@@ -34,6 +34,8 @@ humantime = "2.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 criterion-perf-events = "0.4"
 perfcnt = "0.8"
+byte-unit = "5"
+fastrand = "2"
 
 [profile.release]
 debug = true
