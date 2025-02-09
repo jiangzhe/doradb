@@ -6,13 +6,13 @@ use crate::io::{
 };
 use crate::session::{IntoSession, Session};
 use crate::trx::group::{Commit, CommitGroup, GroupCommit};
-use crate::trx::purge::{GCAnalyzer, GCBucket, Purge, GC};
+use crate::trx::purge::{GCBucket, Purge, GC};
 use crate::trx::sys::TrxSysConfig;
 use crate::trx::{CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
 use parking_lot::{Condvar, Mutex, MutexGuard};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
 use std::os::fd::AsRawFd;
 use std::str::FromStr;
@@ -249,10 +249,11 @@ impl LogPartition {
                 io_reqs.clear();
 
                 for mut sync_group in sync_groups.drain(..) {
-                    let committed_trx_list: Vec<_> = mem::take(&mut sync_group.trx_list)
-                        .into_iter()
-                        .map(|trx| trx.commit())
-                        .collect();
+                    let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
+                    for trx in mem::take(&mut sync_group.trx_list) {
+                        let trx = trx.commit();
+                        committed_trx_list.entry(trx.gc_no).or_default().push(trx);
+                    }
                     let _ = self.gc_chan.send(GC::Commit(committed_trx_list));
                 }
 
@@ -365,10 +366,11 @@ impl LogPartition {
                         self.buf_free_list.push_elem(elem); // return buf to free list for future reuse
                     }
                     // commit transactions to let waiting read operations to continue
-                    let committed_trx_list: Vec<_> = mem::take(&mut sync_group.trx_list)
-                        .into_iter()
-                        .map(|trx| trx.commit())
-                        .collect();
+                    let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
+                    for trx in mem::take(&mut sync_group.trx_list) {
+                        let trx = trx.commit();
+                        committed_trx_list.entry(trx.gc_no).or_default().push(trx);
+                    }
                     // send committed transaction list to GC thread
                     let _ = self.gc_chan.send(GC::Commit(committed_trx_list));
                     drop(sync_group); // notify transaction thread to continue.

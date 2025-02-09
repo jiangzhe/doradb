@@ -1,5 +1,6 @@
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::{Catalog, IndexKey, IndexSchema, TableSchema};
+use crate::lifetime::StaticLifetime;
 use crate::row::ops::{SelectKey, SelectMvcc, UpdateCol};
 use crate::session::Session;
 use crate::table::TableID;
@@ -51,9 +52,9 @@ fn test_mvcc_insert_normal() {
         }
 
         unsafe {
-            TransactionSystem::drop_static(trx_sys);
-            Catalog::drop_static(catalog);
-            FixedBufferPool::drop_static(buf_pool);
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
         }
     });
 }
@@ -137,9 +138,9 @@ fn test_mvcc_update_normal() {
             let _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
-            TransactionSystem::drop_static(trx_sys);
-            Catalog::drop_static(catalog);
-            FixedBufferPool::drop_static(buf_pool);
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
         }
     });
 }
@@ -194,9 +195,9 @@ fn test_mvcc_delete_normal() {
             let _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
-            TransactionSystem::drop_static(trx_sys);
-            Catalog::drop_static(catalog);
-            FixedBufferPool::drop_static(buf_pool);
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
         }
     });
 }
@@ -236,9 +237,9 @@ fn test_mvcc_rollback_insert_normal() {
             _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
-            TransactionSystem::drop_static(trx_sys);
-            Catalog::drop_static(catalog);
-            FixedBufferPool::drop_static(buf_pool);
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
         }
     });
 }
@@ -303,9 +304,9 @@ fn test_mvcc_move_insert() {
             _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
-            TransactionSystem::drop_static(trx_sys);
-            Catalog::drop_static(catalog);
-            FixedBufferPool::drop_static(buf_pool);
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
         }
     });
 }
@@ -370,9 +371,9 @@ fn test_mvcc_rollback_move_insert() {
             _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
         }
         unsafe {
-            TransactionSystem::drop_static(trx_sys);
-            Catalog::drop_static(catalog);
-            FixedBufferPool::drop_static(buf_pool);
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
         }
     });
 }

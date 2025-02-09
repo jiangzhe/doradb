@@ -6,7 +6,8 @@ use crate::trx::{CommittedTrx, TrxID, MAX_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
@@ -133,6 +134,93 @@ impl TransactionSystem {
     }
 }
 
+/// ActiveStsList maintains snapshot timestamps of active transactions
+/// in order.
+/// It is used to calculate min_active_sts for garbage collection.
+#[derive(Default)]
+pub(super) struct ActiveStsList {
+    // ordered snapshot timestamps.
+    pub(super) active: VecDeque<TrxID>,
+    // cached deleted snapshot timestamps if it's not smallest.
+    pub(super) deleted: HashSet<TrxID>,
+}
+
+impl ActiveStsList {
+    /// Insert a new snapshot timestamp.
+    /// The value should be larger than any one stored in the list.
+    #[inline]
+    pub fn insert(&mut self, value: TrxID) {
+        debug_assert!(self.active.is_empty() || self.active.back().unwrap() < &value);
+        self.active.push_back(value);
+    }
+
+    /// Returns length of this list.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.active.len()
+    }
+
+    /// Remove a snapshot timestamp from the list.
+    /// Returns the smallest snapshot timestamp in the list.
+    /// If list is empty, returns MAX_SNAPSHOT_TS.
+    /// If it's not the smallest one, cache it in deleted set.
+    /// This is an optimization to speed up retrieval of smallest snapshot timestamp.
+    #[inline]
+    pub fn remove(&mut self, value: TrxID) -> TrxID {
+        debug_assert!(!self.active.is_empty());
+        let first = self.active.front().cloned().unwrap();
+        if first == value {
+            let _ = self.active.pop_front();
+            while let Some(first) = self.active.front() {
+                if !self.deleted.remove(first) {
+                    return *first; // smallest STS not deleted.
+                }
+                self.active.pop_front();
+            }
+            debug_assert!(self.active.is_empty());
+            debug_assert!(self.deleted.is_empty());
+            return MAX_SNAPSHOT_TS;
+        }
+        // cache the deletion.
+        let res = self.deleted.insert(value);
+        debug_assert!(res);
+        first
+    }
+}
+
+impl LogPartition {
+    /// Execute GC analysis in loop.
+    /// This method is used for a separate GC analyzer thread for each log partition.
+    #[inline]
+    pub fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>, enabled: bool) {
+        while let Ok(msg) = gc_rx.recv() {
+            match msg {
+                GC::Stop => return,
+                GC::Commit(trx_list) => {
+                    if enabled {
+                        let min_active_sts_may_change = self.gc_analyze(trx_list);
+                        if min_active_sts_may_change {
+                            let _ = purge_chan.send(Purge::Next);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Analyze committed transaction and modify active sts list and committed transaction list.
+    /// Returns whether min_active_sts may change.
+    #[inline]
+    fn gc_analyze(&self, trx_list: HashMap<usize, Vec<CommittedTrx>>) -> bool {
+        let mut changed = false;
+        for (gc_no, trx_list) in trx_list {
+            let gc_bucket = &self.gc_buckets[gc_no];
+            changed |= gc_bucket.gc_analyze_commit(trx_list);
+        }
+        changed
+    }
+}
+
 /// GCBucket is used for GC analyzer to store and analyze GC related information,
 /// including committed transaction list, old transaction list, active snapshot timestamp
 /// list, etc.
@@ -143,7 +231,7 @@ pub(super) struct GCBucket {
     pub(super) committed_trx_list: CachePadded<Mutex<VecDeque<CommittedTrx>>>,
     /// Active snapshot timestamp list.
     /// The smallest value equals to min_active_sts.
-    pub(super) active_sts_list: CachePadded<Mutex<BTreeSet<TrxID>>>,
+    pub(super) active_sts_list: CachePadded<Mutex<ActiveStsList>>,
     /// Minimum active snapshot sts of this bucket.
     pub(super) min_active_sts: CachePadded<AtomicU64>,
 }
@@ -154,7 +242,7 @@ impl GCBucket {
     pub(super) fn new() -> Self {
         GCBucket {
             committed_trx_list: CachePadded::new(Mutex::new(VecDeque::new())),
-            active_sts_list: CachePadded::new(Mutex::new(BTreeSet::new())),
+            active_sts_list: CachePadded::new(Mutex::new(ActiveStsList::default())),
             min_active_sts: CachePadded::new(AtomicU64::new(MAX_SNAPSHOT_TS)),
         }
     }
@@ -176,93 +264,61 @@ impl GCBucket {
         }
     }
 
-    /// Remove active STS.
-    /// This method is used for transaction rollback and read-only transaction commit.
+    /// Analyze rollbacked transactions for GC.
     #[inline]
-    pub(super) fn remove_active_sts(&self, sts: TrxID) {
-        let mut g = self.active_sts_list.lock();
-        let res = g.remove(&sts);
-        debug_assert!(res);
+    pub fn gc_analyze_rollback(&self, sts: TrxID) -> bool {
+        debug_assert!(self.min_active_sts.load(Ordering::Relaxed) != MAX_SNAPSHOT_TS);
+        let mut active_sts_list = self.active_sts_list.lock();
+        let min_sts = active_sts_list.remove(sts);
+        self.update_min_active_sts(min_sts)
+    }
+
+    /// Analyze committed transactions for GC.
+    #[inline]
+    pub fn gc_analyze_commit(&self, trx_list: Vec<CommittedTrx>) -> bool {
+        // Update both active sts list and committed transaction list
+        let mut active_sts_list = self.active_sts_list.lock();
+        let mut min_sts = MAX_SNAPSHOT_TS;
+        {
+            let mut committed_trx_list = self.committed_trx_list.lock();
+            for trx in trx_list {
+                min_sts = active_sts_list.remove(trx.sts);
+                committed_trx_list.push_back(trx);
+            }
+        }
+        // Update minimum active STS
+        // separate load and store is safe because this update will only happen when lock of
+        // active_sts_list is acquired.
+        self.update_min_active_sts(min_sts)
+    }
+
+    #[inline]
+    fn update_min_active_sts(&self, min_sts: TrxID) -> bool {
+        // Because we just commit/rollback at least one transaction in this bucket, that means there must be
+        // some transaction in the list before, so current value of min_active_sts must not be MAX.
+        debug_assert!(self.min_active_sts.load(Ordering::Relaxed) != MAX_SNAPSHOT_TS);
+
+        // There is no active transaction. We should update min_active_sts.
+        if min_sts == MAX_SNAPSHOT_TS {
+            self.min_active_sts.store(min_sts, Ordering::Relaxed);
+            return true;
+        }
+
+        // There are active transactions. We should compare them and update only if
+        // latest value is larger.
+        let curr_sts = self.min_active_sts.load(Ordering::Relaxed);
+        if min_sts > curr_sts {
+            self.min_active_sts.store(min_sts, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 }
 
 pub(super) enum GC {
     Stop,
-    Commit(Vec<CommittedTrx>),
-}
-
-#[derive(Default)]
-pub(super) struct GCAnalyzer {
-    map: HashMap<usize, Vec<CommittedTrx>>,
-}
-
-impl GCAnalyzer {
-    #[inline]
-    pub fn gc_loop(
-        &mut self,
-        partition: &'static LogPartition,
-        gc_rx: Receiver<GC>,
-        purge_chan: Sender<Purge>,
-        enabled: bool,
-    ) {
-        while let Ok(msg) = gc_rx.recv() {
-            match msg {
-                GC::Stop => return,
-                GC::Commit(trx_list) => {
-                    if enabled {
-                        let min_active_sts_may_change = self.analyze_commit(partition, trx_list);
-                        if min_active_sts_may_change {
-                            let _ = purge_chan.send(Purge::Next);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Analyze committed transaction and modify active sts list and committed transaction list.
-    /// Returns whether min_active_sts may change.
-    #[inline]
-    fn analyze_commit(&mut self, partition: &LogPartition, trx_list: Vec<CommittedTrx>) -> bool {
-        self.map.clear();
-        for trx in trx_list {
-            let vec = self.map.entry(trx.gc_no).or_default();
-            vec.push(trx);
-        }
-        let mut changed = false;
-        for (gc_no, trx_list) in self.map.drain() {
-            let gc_bucket = &partition.gc_buckets[gc_no];
-            // update both active sts list and committed transaction list
-            let mut active_sts_list = gc_bucket.active_sts_list.lock();
-            {
-                let mut committed_trx_list = gc_bucket.committed_trx_list.lock();
-                for trx in trx_list {
-                    let res = active_sts_list.remove(&trx.sts);
-                    debug_assert!(res);
-                    committed_trx_list.push_back(trx);
-                }
-            }
-            // update minimum active STS
-            // separate load and store is safe because this update will only happen when lock of
-            // active_sts_list is acquired.
-            let min_active_sts = gc_bucket.min_active_sts.load(Ordering::Relaxed);
-            if let Some(sts) = active_sts_list.first().cloned() {
-                if sts > min_active_sts {
-                    gc_bucket.min_active_sts.store(sts, Ordering::Relaxed);
-                    changed = true;
-                }
-            } else {
-                // as we just commit at least one transaction in this bucket, the min_active_sts must not be MAX
-                debug_assert!(min_active_sts != MAX_SNAPSHOT_TS);
-                // mark as MAX_STS to indicate there is no active transaction.
-                gc_bucket
-                    .min_active_sts
-                    .store(MAX_SNAPSHOT_TS, Ordering::Relaxed);
-                changed = true;
-            }
-        }
-        changed
-    }
+    // transaction list per gc bucket.
+    Commit(HashMap<usize, Vec<CommittedTrx>>),
 }
 
 pub enum Purge {
@@ -423,12 +479,40 @@ mod tests {
     use crate::catalog::Catalog;
     use crate::index::RowLocation;
     use crate::latch::LatchFallbackMode;
+    use crate::lifetime::StaticLifetime;
     use crate::row::ops::SelectKey;
     use crate::row::RowPage;
     use crate::session::Session;
     use crate::trx::sys::TrxSysConfig;
     use crate::value::Val;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_active_sts_list() {
+        let mut active_sts_list = ActiveStsList::default();
+        for (val, expected, delete) in vec![
+            (1, 1, false),
+            (1, MAX_SNAPSHOT_TS, true),
+            (2, 2, false),
+            (3, 2, false),
+            (4, 2, false),
+            (3, 2, true),
+            (2, 4, true),
+            (5, 4, false),
+            (6, 4, false),
+            (6, 4, true),
+            (5, 4, true),
+            (4, MAX_SNAPSHOT_TS, true),
+        ] {
+            let res = if delete {
+                active_sts_list.remove(val)
+            } else {
+                active_sts_list.insert(val);
+                active_sts_list.active.front().cloned().unwrap()
+            };
+            assert!(res == expected)
+        }
+    }
 
     #[test]
     fn test_trx_purge_single_thread() {
@@ -494,9 +578,9 @@ mod tests {
             }
         }
         unsafe {
-            TransactionSystem::drop_static(trx_sys);
-            Catalog::drop_static(catalog);
-            FixedBufferPool::drop_static(buf_pool);
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
         }
     }
 

@@ -2,10 +2,11 @@ use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::io::{align_to_sector_size, AIOManagerConfig, FreeListWithFactory, PageBuf};
+use crate::lifetime::StaticLifetime;
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::trx::group::{Commit, GroupCommit};
 use crate::trx::log::{LogPartition, LogPartitionStats, LogSync};
-use crate::trx::purge::{GCAnalyzer, GCBucket, Purge, GC};
+use crate::trx::purge::{GCBucket, Purge, GC};
 use crate::trx::{
     ActiveTrx, PreparedTrx, TrxID, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
 };
@@ -82,45 +83,35 @@ pub struct TransactionSystem {
 }
 
 impl TransactionSystem {
-    /// Drop static transaction system.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure no further use on it.
-    pub unsafe fn drop_static(this: &'static Self) {
-        // notify and wait for group commit to quit.
-        // this.stop_group_committer_and_wait();
-        drop(Box::from_raw(this as *const Self as *mut Self));
-    }
-
     /// Create a new transaction.
     #[inline]
     pub fn new_trx<'a>(&self, session: Option<Box<InternalSession>>) -> ActiveTrx {
-        // active transaction list is calculated by group committer thread
+        // Active transaction list is calculated by group committer thread
         // so here we just generate STS and TrxID.
         let sts = self.ts.fetch_add(1, Ordering::SeqCst);
         let trx_id = sts | (1 << 63);
         debug_assert!(sts < MAX_SNAPSHOT_TS);
         debug_assert!(trx_id >= MIN_ACTIVE_TRX_ID);
-        // assign log partition index so current transaction will stick
+        // Assign log partition index so current transaction will stick
         // to certain log partititon for commit.
         let log_no = if self.config.log_partitions == 1 {
             0
         } else {
             self.partition_id.fetch_add(1, Ordering::Relaxed) % self.config.log_partitions
         };
-        // add to active sts list.
+        // Add to active sts list.
         let gc_no = gc_no(sts);
         {
             let gc_bucket = &self.log_partitions[log_no].gc_buckets[gc_no];
             let mut g = gc_bucket.active_sts_list.lock();
-            let res = g.insert(sts);
-            debug_assert!(res);
-            // here we should update min_active_sts of this bucket
-            let min_active_sts = g.first().cloned().unwrap();
-            gc_bucket
-                .min_active_sts
-                .store(min_active_sts, Ordering::Relaxed);
+            g.insert(sts);
+            if g.len() == 1 {
+                // Only when the previous list is empty, we should update min_active_sts
+                // as STS of current transaction.
+                // In this case, current value of min_active_sts should be MAX.
+                debug_assert!(gc_bucket.min_active_sts.load(Ordering::Relaxed) == MAX_SNAPSHOT_TS);
+                gc_bucket.min_active_sts.store(sts, Ordering::Relaxed);
+            }
         }
         ActiveTrx::new(session, trx_id, sts, log_no, gc_no)
     }
@@ -143,13 +134,6 @@ impl TransactionSystem {
         let partition = &*self.log_partitions[trx.log_no];
         let prepared_trx = trx.prepare();
         if prepared_trx.redo_bin.is_none() {
-            if prepared_trx.row_undo.is_empty() {
-                // This is a read-only transaction, drop it is safe.
-                debug_assert!(prepared_trx.readonly());
-                self.log_partitions[prepared_trx.log_no].gc_buckets[prepared_trx.gc_no]
-                    .remove_active_sts(prepared_trx.sts);
-                return Ok(prepared_trx.into_session());
-            }
             // There might be scenario that the transaction does not change anything
             // logically, but have undo logs.
             // For example, a transaction
@@ -178,7 +162,7 @@ impl TransactionSystem {
     ) -> Session {
         trx.row_undo.rollback(buf_pool);
         trx.index_undo.rollback(catalog);
-        self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].remove_active_sts(trx.sts);
+        self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session()
     }
 
@@ -196,7 +180,7 @@ impl TransactionSystem {
         debug_assert!(trx.redo_bin.is_none());
         trx.row_undo.rollback(buf_pool);
         trx.index_undo.rollback(catalog);
-        self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].remove_active_sts(trx.sts);
+        self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session()
     }
 
@@ -230,10 +214,7 @@ impl TransactionSystem {
             let purge_chan = self.purge_chan.clone();
             let handle = thread::Builder::new()
                 .name(thread_name)
-                .spawn(move || {
-                    let mut analyzer = GCAnalyzer::default();
-                    analyzer.gc_loop(partition, gc_rx, purge_chan, self.config.gc)
-                })
+                .spawn(move || partition.gc_loop(gc_rx, purge_chan, self.config.gc))
                 .unwrap();
             *partition.gc_thread.lock() = Some(handle);
         }
@@ -259,7 +240,7 @@ impl TransactionSystem {
     }
 }
 
-unsafe impl Sync for TransactionSystem {}
+unsafe impl StaticLifetime for TransactionSystem {}
 
 impl Drop for TransactionSystem {
     #[inline]
@@ -485,7 +466,7 @@ impl TrxSysConfig {
             purge_chan,
             purge_threads: Mutex::new(vec![]),
         };
-        let trx_sys = Box::leak(Box::new(trx_sys));
+        let trx_sys = StaticLifetime::new_static(trx_sys);
         trx_sys.start_sync_threads();
         trx_sys.start_gc_threads(gc_chans);
         trx_sys.start_purge_threads(buf_pool, catalog, purge_rx);
