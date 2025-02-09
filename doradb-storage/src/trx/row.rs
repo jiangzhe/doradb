@@ -158,7 +158,7 @@ impl RowReadAccess<'_> {
                                     // by checking deleted flag.
                                     // For example:
                                     // If undo kind is DELETE, and next version does not exist.
-                                    // That means we should should return the row before deletion.
+                                    // That means we should return the row before deletion.
                                     // If undo kind is INSERT, and next version does not exist.
                                     // That means we should return no row.
                                     if ver.deleted {

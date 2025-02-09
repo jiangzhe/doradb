@@ -6,6 +6,7 @@ use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
 use doradb_storage::buffer::FixedBufferPool;
 use doradb_storage::catalog::Catalog;
+use doradb_storage::lifetime::StaticLifetime;
 use doradb_storage::session::Session;
 use doradb_storage::trx::log::LogSync;
 use doradb_storage::trx::sys::{TransactionSystem, TrxSysConfig};
@@ -87,9 +88,9 @@ fn main() {
         );
     }
     unsafe {
-        TransactionSystem::drop_static(trx_sys);
-        Catalog::drop_static(catalog);
-        FixedBufferPool::drop_static(buf_pool);
+        StaticLifetime::drop_static(trx_sys);
+        StaticLifetime::drop_static(catalog);
+        StaticLifetime::drop_static(buf_pool);
     }
 }
 

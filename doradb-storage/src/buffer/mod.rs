@@ -8,6 +8,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
 use crate::buffer::page::{PageID, INVALID_PAGE_ID};
 use crate::error::{Error, Result, Validation, Validation::Valid};
 use crate::latch::LatchFallbackMode;
+use crate::lifetime::StaticLifetime;
 use crate::trx::undo::UndoMap;
 use libc::{
     c_void, madvise, mmap, munmap, MADV_DONTFORK, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED,
@@ -96,9 +97,7 @@ impl FixedBufferPool {
     #[inline]
     pub fn with_capacity_static(pool_size: usize) -> Result<&'static Self> {
         let pool = Self::with_capacity(pool_size)?;
-        let boxed = Box::new(pool);
-        let leak = Box::leak(boxed);
-        Ok(leak)
+        Ok(StaticLifetime::new_static(pool))
     }
 
     /// Returns the maximum page number of this pool.
@@ -242,6 +241,8 @@ impl Drop for FixedBufferPool {
 }
 
 unsafe impl Sync for FixedBufferPool {}
+
+unsafe impl StaticLifetime for FixedBufferPool {}
 
 #[inline]
 fn init_bf_exclusive_guard<T: BufferFrameAware>(

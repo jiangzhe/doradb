@@ -1,5 +1,6 @@
 use crate::buffer::BufferPool;
 use crate::index::{BlockIndex, SecondaryIndex};
+use crate::lifetime::StaticLifetime;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::table::{Table, TableID};
 use crate::value::{Layout, Val, ValKind, ValType};
@@ -11,7 +12,7 @@ use std::sync::Arc;
 
 /// Catalog contains metadata of user tables.
 /// Initial implementation would be a in-mem hash-table.
-pub struct Catalog<P> {
+pub struct Catalog<P: BufferPool> {
     table_id: AtomicU64,
     tables: Mutex<HashMap<TableID, TableMeta<P>>>,
 }
@@ -28,12 +29,7 @@ impl<P: BufferPool> Catalog<P> {
     #[inline]
     pub fn empty_static() -> &'static Self {
         let cat = Self::empty();
-        Box::leak(Box::new(cat))
-    }
-
-    #[inline]
-    pub unsafe fn drop_static(this: &'static Self) {
-        drop(Box::from_raw(this as *const Self as *mut Self))
+        StaticLifetime::new_static(cat)
     }
 
     #[inline]
@@ -73,6 +69,8 @@ impl<P: BufferPool> Catalog<P> {
         })
     }
 }
+
+unsafe impl<P: BufferPool> StaticLifetime for Catalog<P> {}
 
 pub struct TableMeta<P> {
     pub schema: Arc<TableSchema>,
@@ -260,7 +258,7 @@ pub enum IndexOrder {
     Desc,
 }
 
-pub struct TableCache<'a, P> {
+pub struct TableCache<'a, P: BufferPool> {
     catalog: &'a Catalog<P>,
     map: HashMap<TableID, Option<Table<P>>>,
 }

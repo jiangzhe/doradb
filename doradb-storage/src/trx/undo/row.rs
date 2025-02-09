@@ -367,7 +367,7 @@ pub enum NextRowUndoStatus {
     // It will link multiple undo entries with the
     // same timestamp.
     // One optimization is to compact such entries.
-    // In another way, we only keep the timestmap
+    // In another way, we only keep the timestamp
     // on top of the entry, and mark other entries
     // as SameAsPrev.
     SameAsPrev,
