@@ -1,4 +1,4 @@
-use crate::buffer::frame::{BufferFrame, FrameHeader};
+use crate::buffer::frame::BufferFrame;
 use crate::buffer::page::PageID;
 use crate::error::{
     Validation,
@@ -6,6 +6,7 @@ use crate::error::{
 };
 use crate::latch::GuardState;
 use crate::latch::HybridGuard;
+use crate::trx::undo::UndoMap;
 use either::Either;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
@@ -176,7 +177,8 @@ impl<'a, T> PageGuard<'a, T> {
     #[inline]
     pub unsafe fn page_unchecked(&self) -> &T {
         let bf = self.bf.get();
-        mem::transmute(&(*bf).page)
+        let page = (*bf).page;
+        &*(page as *mut T)
     }
 
     #[inline]
@@ -198,7 +200,7 @@ pub struct PageOptimisticGuard<'a, T> {
 impl<'a, T> PageOptimisticGuard<'a, T> {
     #[inline]
     pub unsafe fn page_id(&self) -> PageID {
-        (*self.bf.get()).header.page_id
+        (*self.bf.get()).page_id
     }
 
     #[inline]
@@ -244,7 +246,8 @@ impl<'a, T> PageOptimisticGuard<'a, T> {
     #[inline]
     pub unsafe fn page_unchecked(&self) -> &T {
         let bf = self.bf.get();
-        mem::transmute(&(*bf).page)
+        let page = (*bf).page;
+        &*(page as *mut T)
     }
 
     /// Validates version not change.
@@ -312,21 +315,23 @@ impl<'a, T> PageSharedGuard<'a, T> {
     /// Returns current page id.
     #[inline]
     pub fn page_id(&self) -> PageID {
-        self.bf.header.page_id
+        self.bf.page_id
     }
 
     /// Returns shared page.
     #[inline]
     pub fn page(&self) -> &T {
-        unsafe { mem::transmute(&self.bf.page) }
+        let page = self.bf.page;
+        unsafe { &*(page as *mut T) }
     }
 
     #[inline]
-    pub fn header_and_page(&self) -> (&FrameHeader, &T) {
+    pub fn undo_map_and_page(&self) -> (&UndoMap, &T) {
         let bf = self.bf();
-        let header = &bf.header;
-        let page = unsafe { mem::transmute(&bf.page) };
-        (header, page)
+        let undo_map = bf.undo_map.as_ref().unwrap();
+        let page = bf.page;
+        let page = unsafe { &*(page as *mut T) };
+        (undo_map, page)
     }
 
     /// Returns facade guard.
@@ -361,19 +366,21 @@ impl<'a, T> PageExclusiveGuard<'a, T> {
     /// Returns current page id.
     #[inline]
     pub fn page_id(&self) -> PageID {
-        self.bf.header.page_id
+        self.bf.page_id
     }
 
     /// Returns current page.
     #[inline]
     pub fn page(&self) -> &T {
-        unsafe { mem::transmute(&self.bf.page) }
+        let page = self.bf.page;
+        unsafe { &*(page as *mut T) }
     }
 
     /// Returns mutable page.
     #[inline]
     pub fn page_mut(&mut self) -> &mut T {
-        unsafe { mem::transmute(&mut self.bf.page) }
+        let page = self.bf.page;
+        unsafe { &mut *(page as *mut T) }
     }
 
     /// Returns current buffer frame.
@@ -383,19 +390,12 @@ impl<'a, T> PageExclusiveGuard<'a, T> {
     }
 
     #[inline]
-    pub fn header_and_page(&self) -> (&FrameHeader, &T) {
+    pub fn undo_map_and_page(&self) -> (&UndoMap, &T) {
         let bf = self.bf();
-        let header = &bf.header;
-        let page = unsafe { mem::transmute(&bf.page) };
-        (header, page)
-    }
-
-    #[inline]
-    pub fn header_and_page_mut(&mut self) -> (&mut FrameHeader, &mut T) {
-        let bf = self.bf_mut();
-        let header = &mut bf.header;
-        let page = unsafe { mem::transmute(&mut bf.page) };
-        (header, page)
+        let undo_map = bf.undo_map.as_ref().unwrap();
+        let page = bf.page;
+        let page = unsafe { &*(page as *mut T) };
+        (undo_map, page)
     }
 
     /// Returns mutable buffer frame.
@@ -407,7 +407,7 @@ impl<'a, T> PageExclusiveGuard<'a, T> {
     /// Set next free page.
     #[inline]
     pub fn set_next_free(&mut self, next_free: PageID) {
-        self.bf.header.next_free = next_free;
+        self.bf.next_free = next_free;
     }
 
     /// Returns facade guard.

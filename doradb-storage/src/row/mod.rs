@@ -1,6 +1,6 @@
 pub mod ops;
 
-use crate::buffer::frame::{BufferFrameAware, FrameHeader};
+use crate::buffer::frame::{BufferFrame, BufferFrameAware};
 use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::BufferPool;
 use crate::catalog::TableSchema;
@@ -593,29 +593,29 @@ impl RowPage {
 
 impl BufferFrameAware for RowPage {
     #[inline]
-    fn on_alloc<P: BufferPool>(pool: &P, fh: &mut FrameHeader) {
-        let page_id = fh.page_id;
+    fn on_alloc<P: BufferPool>(pool: &P, frame: &mut BufferFrame) {
+        let page_id = frame.page_id;
         if let Some(undo_map) = pool.load_orphan_undo_map(page_id) {
-            let res = fh.undo_map.replace(undo_map);
+            let res = frame.undo_map.replace(undo_map);
             debug_assert!(res.is_none());
         }
     }
 
     #[inline]
-    fn on_dealloc<P: BufferPool>(pool: &P, fh: &mut FrameHeader) {
-        if let Some(undo_map) = fh.undo_map.take() {
+    fn on_dealloc<P: BufferPool>(pool: &P, frame: &mut BufferFrame) {
+        if let Some(undo_map) = frame.undo_map.take() {
             if undo_map.occupied() > 0 {
-                let page_id = fh.page_id;
+                let page_id = frame.page_id;
                 pool.save_orphan_undo_map(page_id, undo_map);
             }
         }
     }
 
     #[inline]
-    fn after_init<P: BufferPool>(&mut self, _pool: &P, fh: &mut FrameHeader) {
-        if fh.undo_map.is_none() {
-            let len = self.header.max_row_count as usize;
-            fh.undo_map = Some(UndoMap::new(len));
+    fn after_init<P: BufferPool>(_pool: &P, frame: &mut BufferFrame) {
+        if frame.undo_map.is_none() {
+            let len = unsafe { Self::get(frame) }.header.max_row_count as usize;
+            frame.undo_map = Some(UndoMap::new(len));
         }
     }
 }

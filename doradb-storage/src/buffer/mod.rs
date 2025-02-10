@@ -5,6 +5,7 @@ pub mod ptr;
 
 use crate::buffer::frame::{BufferFrame, BufferFrameAware};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
+use crate::buffer::page::Page;
 use crate::buffer::page::{PageID, INVALID_PAGE_ID};
 use crate::error::{Error, Result, Validation, Validation::Valid};
 use crate::latch::LatchFallbackMode;
@@ -54,7 +55,8 @@ pub trait BufferPool: Sync {
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
 /// does not support swap/evict.
 pub struct FixedBufferPool {
-    bfs: *mut BufferFrame,
+    frames: *mut BufferFrame,
+    pages: *mut Page,
     size: usize,
     allocated: AtomicU64,
     free_list: Mutex<PageID>,
@@ -63,28 +65,31 @@ pub struct FixedBufferPool {
 
 impl FixedBufferPool {
     /// Create a buffer pool with given capacity.
+    ///
+    /// Pool size if total available bytes of this buffer pool.
+    /// We will determine the number of pages accordingly.
+    /// We separate pages and frames so that pages are always aligned
+    /// to the unit of direct IO and can be flushed via libaio.
     #[inline]
     pub fn with_capacity(pool_size: usize) -> Result<Self> {
-        let size = pool_size / mem::size_of::<BufferFrame>();
-        let dram_total_size = mem::size_of::<BufferFrame>() * (size + SAFETY_PAGES);
-        let bfs = unsafe {
-            let big_memory_chunk = mmap(
-                std::ptr::null_mut(),
-                dram_total_size,
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-            if big_memory_chunk == MAP_FAILED {
-                return Err(Error::InsufficientMemory(dram_total_size));
+        let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
+        let frame_total_bytes = mem::size_of::<BufferFrame>() * (size + SAFETY_PAGES);
+        let page_total_bytes = mem::size_of::<Page>() * (size + SAFETY_PAGES);
+        // let dram_total_size = mem::size_of::<BufferFrame>() * (size + SAFETY_PAGES);
+        let frames = unsafe { mmap_allocate(frame_total_bytes)? } as *mut BufferFrame;
+        let pages = unsafe {
+            match mmap_allocate(page_total_bytes) {
+                Ok(ptr) => ptr,
+                Err(e) => {
+                    // cleanup previous allocated memory
+                    munmap(frames as *mut c_void, frame_total_bytes);
+                    return Err(e);
+                }
             }
-            madvise(big_memory_chunk, dram_total_size, MADV_HUGEPAGE);
-            madvise(big_memory_chunk, dram_total_size, MADV_DONTFORK);
-            big_memory_chunk
-        } as *mut BufferFrame;
+        } as *mut Page;
         Ok(FixedBufferPool {
-            bfs,
+            frames,
+            pages,
             size,
             allocated: AtomicU64::new(0),
             free_list: Mutex::new(INVALID_PAGE_ID),
@@ -125,12 +130,12 @@ impl FixedBufferPool {
                 if *page_id == INVALID_PAGE_ID {
                     return None;
                 }
-                let bf = self.get_bf(*page_id);
-                *page_id = (*bf.get()).header.next_free;
+                let bf = self.get_frame(*page_id);
+                *page_id = (*bf.get()).next_free;
                 bf
             };
-            (*bf.get()).header.next_free = INVALID_PAGE_ID;
-            T::on_alloc(self, &mut (*bf.get()).header);
+            (*bf.get()).next_free = INVALID_PAGE_ID;
+            T::on_alloc(self, &mut *bf.get());
             let g = init_bf_exclusive_guard(bf);
             Some(g)
         }
@@ -139,15 +144,24 @@ impl FixedBufferPool {
     #[inline]
     fn get_page_internal<T>(&self, page_id: PageID, mode: LatchFallbackMode) -> PageGuard<'_, T> {
         unsafe {
-            let bf = self.get_bf(page_id);
-            let g = (*bf.get()).header.latch.optimistic_fallback(mode);
+            let bf = self.get_frame(page_id);
+            let g = (*bf.get()).latch.optimistic_fallback(mode);
             PageGuard::new(bf, g)
         }
     }
 
     #[inline]
-    unsafe fn get_bf(&self, page_id: PageID) -> &UnsafeCell<BufferFrame> {
-        let bf_ptr = self.bfs.offset(page_id as isize);
+    unsafe fn get_new_frame(&self, page_id: PageID) -> &UnsafeCell<BufferFrame> {
+        let bf_ptr = self.frames.offset(page_id as isize);
+        std::ptr::write(bf_ptr, BufferFrame::default());
+        // assign page pointer.
+        (*bf_ptr).page = self.pages.offset(page_id as isize);
+        &*(bf_ptr as *mut UnsafeCell<BufferFrame>)
+    }
+
+    #[inline]
+    unsafe fn get_frame(&self, page_id: PageID) -> &UnsafeCell<BufferFrame> {
+        let bf_ptr = self.frames.offset(page_id as isize);
         &*(bf_ptr as *mut UnsafeCell<BufferFrame>)
     }
 }
@@ -166,10 +180,10 @@ impl BufferPool for FixedBufferPool {
             panic!("buffer pool full");
         }
         unsafe {
-            let bf = self.get_bf(page_id);
-            (*bf.get()).header.page_id = page_id;
-            (*bf.get()).header.next_free = INVALID_PAGE_ID;
-            T::on_alloc(self, &mut (*bf.get()).header);
+            let bf = self.get_new_frame(page_id);
+            (*bf.get()).page_id = page_id;
+            (*bf.get()).next_free = INVALID_PAGE_ID;
+            T::on_alloc(self, &mut *bf.get());
             let g = init_bf_exclusive_guard(bf);
             g
         }
@@ -189,9 +203,9 @@ impl BufferPool for FixedBufferPool {
     /// Deallocate page.
     #[inline]
     fn deallocate_page<T: BufferFrameAware>(&self, mut g: PageExclusiveGuard<'_, T>) {
-        T::on_dealloc(self, &mut g.bf_mut().header);
+        T::on_dealloc(self, &mut g.bf_mut());
         let mut page_id = self.free_list.lock();
-        g.bf_mut().header.next_free = *page_id;
+        g.bf_mut().next_free = *page_id;
         *page_id = g.page_id();
     }
 
@@ -233,9 +247,11 @@ impl BufferPool for FixedBufferPool {
 
 impl Drop for FixedBufferPool {
     fn drop(&mut self) {
-        let dram_total_size = mem::size_of::<BufferFrame>() * (self.size + SAFETY_PAGES);
         unsafe {
-            munmap(self.bfs as *mut c_void, dram_total_size);
+            let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.size + SAFETY_PAGES);
+            munmap(self.frames as *mut c_void, frame_total_bytes);
+            let page_total_bytes = mem::size_of::<Page>() * (self.size + SAFETY_PAGES);
+            munmap(self.pages as *mut c_void, page_total_bytes);
         }
     }
 }
@@ -249,9 +265,27 @@ fn init_bf_exclusive_guard<T: BufferFrameAware>(
     bf: &UnsafeCell<BufferFrame>,
 ) -> PageExclusiveGuard<'_, T> {
     unsafe {
-        let g = (*bf.get()).header.latch.exclusive();
+        let g = (*bf.get()).latch.exclusive();
         PageGuard::new(bf, g).block_until_exclusive()
     }
+}
+
+#[inline]
+unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
+    let memory_chunk = mmap(
+        std::ptr::null_mut(),
+        total_bytes,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if memory_chunk == MAP_FAILED {
+        return Err(Error::InsufficientMemory(total_bytes));
+    }
+    madvise(memory_chunk, total_bytes, MADV_HUGEPAGE);
+    madvise(memory_chunk, total_bytes, MADV_DONTFORK);
+    Ok(memory_chunk as *mut u8)
 }
 
 #[cfg(test)]
