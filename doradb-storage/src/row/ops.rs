@@ -1,5 +1,4 @@
-use crate::buffer::guard::PageSharedGuard;
-use crate::row::{Row, RowID, RowMut, RowPage};
+use crate::row::{Row, RowID, RowMut};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
 

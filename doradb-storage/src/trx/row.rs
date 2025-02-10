@@ -549,8 +549,7 @@ impl<'a> RowWriteAccess<'a> {
 impl<'a> PageSharedGuard<'a, RowPage> {
     #[inline]
     pub fn read_row(&self, row_idx: usize) -> RowReadAccess<'_> {
-        let (fh, page) = self.header_and_page();
-        let undo_map = fh.undo_map.as_ref().unwrap();
+        let (undo_map, page) = self.undo_map_and_page();
         let undo = undo_map.read(row_idx);
         RowReadAccess {
             page,
@@ -567,8 +566,7 @@ impl<'a> PageSharedGuard<'a, RowPage> {
 
     #[inline]
     pub fn write_row(&self, row_idx: usize) -> RowWriteAccess<'_> {
-        let (fh, page) = self.header_and_page();
-        let undo_map = fh.undo_map.as_ref().unwrap();
+        let (undo_map, page) = self.undo_map_and_page();
         let undo = undo_map.write(row_idx);
         RowWriteAccess {
             page,

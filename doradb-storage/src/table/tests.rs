@@ -4,7 +4,7 @@ use crate::lifetime::StaticLifetime;
 use crate::row::ops::{SelectKey, SelectMvcc, UpdateCol};
 use crate::session::Session;
 use crate::table::TableID;
-use crate::trx::sys::{TransactionSystem, TrxSysConfig};
+use crate::trx::sys::TrxSysConfig;
 use crate::value::{Val, ValKind};
 
 #[test]

@@ -1,4 +1,4 @@
-use crate::buffer::frame::BufferFrameAware;
+use crate::buffer::frame::{BufferFrame, BufferFrameAware};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard};
 use crate::buffer::page::{PageID, LSN, PAGE_SIZE};
 use crate::buffer::BufferPool;
@@ -217,7 +217,16 @@ impl BlockNode {
     }
 }
 
-impl BufferFrameAware for BlockNode {}
+impl BufferFrameAware for BlockNode {
+    #[inline]
+    fn on_alloc<P: BufferPool>(_pool: &P, _frame: &mut BufferFrame) {}
+
+    #[inline]
+    fn on_dealloc<P: BufferPool>(_pool: &P, _frame: &mut BufferFrame) {}
+
+    #[inline]
+    fn after_init<P: BufferPool>(_pool: &P, _frame: &mut BufferFrame) {}
+}
 
 #[repr(C)]
 #[derive(Clone)]
@@ -428,9 +437,10 @@ impl<P: BufferPool> BlockIndex<P> {
                 Valid((start_row_id, end_row_id)) => {
                     // initialize row page.
                     debug_assert!(end_row_id == start_row_id + count as u64);
-                    let (fh, p) = new_page.header_and_page_mut();
-                    p.init(start_row_id, count as usize, schema);
-                    p.after_init(buf_pool, fh);
+                    new_page
+                        .page_mut()
+                        .init(start_row_id, count as usize, schema);
+                    RowPage::after_init(buf_pool, new_page.bf_mut());
                     // finally, we unlock and re-lock the page for shared mode.
                     return new_page.downgrade().block_until_shared();
                 }
