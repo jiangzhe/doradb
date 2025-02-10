@@ -1,8 +1,8 @@
 use crate::io::{pwrite, Buf, IocbRawPtr, SparseFile};
+use crate::notify::{Notify, Signal};
 use crate::session::{IntoSession, Session};
 use crate::trx::log::SyncGroup;
 use crate::trx::{PrecommitTrx, TrxID};
-use flume::{Receiver, Sender};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
@@ -36,8 +36,7 @@ pub(super) struct CommitGroup {
     pub(super) fd: RawFd,
     pub(super) offset: usize,
     pub(super) log_buf: Buf,
-    pub(super) sync_signal: Sender<()>,
-    pub(super) sync_notifier: Receiver<()>,
+    pub(super) sync_signal: Signal,
 }
 
 impl CommitGroup {
@@ -50,7 +49,7 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn join(&mut self, mut trx: PrecommitTrx) -> (Session, Receiver<()>) {
+    pub(super) fn join(&mut self, mut trx: PrecommitTrx) -> (Session, Notify) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
             self.log_buf.clone_from_slice(&redo_bin);
@@ -58,7 +57,7 @@ impl CommitGroup {
         self.max_cts = trx.cts;
         let session = trx.split_session();
         self.trx_list.push(trx);
-        (session, self.sync_notifier.clone())
+        (session, self.sync_signal.new_notify())
     }
 
     #[inline]

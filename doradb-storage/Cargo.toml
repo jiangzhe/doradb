@@ -22,6 +22,7 @@ serde = { version = "1.0.216", features = ["derive"] }
 bincode = { version = "2.0.0-rc", features = ["serde"] }
 flume = { version = "0.11", features = ["select"] }
 either = "1.13"
+event-listener = "5.4"
 
 [dev-dependencies]
 rand = "0.8"
