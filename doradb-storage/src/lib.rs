@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod index;
 pub mod latch;
 pub mod lifetime;
+pub mod notify;
 pub mod row;
 pub mod session;
 pub mod stmt;

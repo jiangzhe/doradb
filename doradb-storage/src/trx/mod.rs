@@ -23,6 +23,7 @@ pub mod row;
 pub mod sys;
 pub mod undo;
 
+use crate::notify::{Notify, Signal};
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoBin, RedoEntry, RedoKind, RedoLog};
@@ -56,7 +57,7 @@ pub enum TrxStatus {
 pub struct SharedTrxStatus {
     ts: AtomicU64,
     preparing: AtomicBool,
-    prepare_notify: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    prepare_signal: Mutex<Option<Signal>>,
 }
 
 impl SharedTrxStatus {
@@ -66,7 +67,7 @@ impl SharedTrxStatus {
         SharedTrxStatus {
             ts: AtomicU64::new(trx_id),
             preparing: AtomicBool::new(false),
-            prepare_notify: Mutex::new(None),
+            prepare_signal: Mutex::new(None),
         }
     }
 
@@ -77,7 +78,7 @@ impl SharedTrxStatus {
         SharedTrxStatus {
             ts: AtomicU64::new(GLOBAL_VISIBLE_COMMIT_TS),
             preparing: AtomicBool::new(false),
-            prepare_notify: Mutex::new(None),
+            prepare_signal: Mutex::new(None),
         }
     }
 
@@ -99,9 +100,9 @@ impl SharedTrxStatus {
     /// To avoid partial read, other transaction read the data modified by
     /// this transaction should wait for
     #[inline]
-    pub fn prepare_notifier(&self) -> Option<Receiver<()>> {
-        let g = self.prepare_notify.lock();
-        g.as_ref().map(|(_, rx)| rx.clone())
+    pub fn prepare_notify(&self) -> Option<Notify> {
+        let g = self.prepare_signal.lock();
+        g.as_ref().map(|signal| signal.new_notify())
     }
 }
 
@@ -214,8 +215,8 @@ impl ActiveTrx {
 
         // change transaction status
         {
-            let mut g = self.status.prepare_notify.lock();
-            *g = Some(flume::unbounded());
+            let mut g = self.status.prepare_signal.lock();
+            *g = Some(Signal::default());
             self.status.preparing.store(true, Ordering::SeqCst);
         }
         // use bincode to serialize redo log
@@ -384,7 +385,7 @@ impl PrecommitTrx {
         {
             self.status.ts.store(self.cts, Ordering::SeqCst);
             self.status.preparing.store(false, Ordering::SeqCst);
-            let mut g = self.status.prepare_notify.lock();
+            let mut g = self.status.prepare_signal.lock();
             drop(g.take());
         }
         let row_undo = mem::take(&mut self.row_undo);

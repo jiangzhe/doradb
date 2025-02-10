@@ -932,7 +932,7 @@ impl<P: BufferPool> Table<P> {
                         // uncommitted, write-write conflict.
                         return LockRowForWrite::WriteConflict;
                     }
-                    if let Some(commit_notifier) = head.status.prepare_notifier() {
+                    if let Some(notify) = head.status.prepare_notify() {
                         // unlock row(but logical row lock is still held)
                         drop(access);
 
@@ -942,7 +942,7 @@ impl<P: BufferPool> Table<P> {
                         // disk.
                         // Other transactions can still access this page and modify other rows.
 
-                        let _ = commit_notifier.recv_async().await; // wait for that transaction to be committed.
+                        let _ = notify.wait_async().await; // wait for that transaction to be committed.
 
                         // now we get back on current page.
                         // maybe another thread modify our row before the lock acquisition,
@@ -979,7 +979,7 @@ impl<P: BufferPool> Table<P> {
                         // uncommitted, write-write conflict.
                         return access;
                     }
-                    if let Some(commit_notifier) = head.status.prepare_notifier() {
+                    if let Some(notify) = head.status.prepare_notify() {
                         // unlock row
                         drop(access);
                         // Even if it's non-locking read, we still need to wait for the preparation to avoid partial read.
@@ -989,7 +989,7 @@ impl<P: BufferPool> Table<P> {
                         // If we do not block on waiting for T1, we may read one row of old version, and another
                         // row with new version. This breaks ACID properties.
 
-                        let _ = commit_notifier.recv_async().await; // wait for that transaction to be committed.
+                        let _ = notify.wait_async().await; // wait for that transaction to be committed.
 
                         // now we get back on current page.
                         // maybe another thread modify our row before the lock acquisition,

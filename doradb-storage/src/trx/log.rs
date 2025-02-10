@@ -1,16 +1,15 @@
-use crate::buffer::BufferPool;
-use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::io::{
     AIOError, AIOManager, Buf, DirectBuf, FreeListWithFactory, IocbRawPtr, PageBuf, AIO,
 };
+use crate::notify::{Notify, Signal};
 use crate::session::{IntoSession, Session};
 use crate::trx::group::{Commit, CommitGroup, GroupCommit};
-use crate::trx::purge::{GCBucket, Purge, GC};
+use crate::trx::purge::{GCBucket, GC};
 use crate::trx::sys::TrxSysConfig;
 use crate::trx::{CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
-use flume::{Receiver, Sender};
+use flume::Sender;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
@@ -83,7 +82,7 @@ impl LogPartition {
         &self,
         mut trx: PrecommitTrx,
         mut group_commit_g: MutexGuard<'_, GroupCommit>,
-    ) -> (Session, Receiver<()>) {
+    ) -> (Session, Notify) {
         let cts = trx.cts;
         let redo_bin = trx.redo_bin.take().unwrap();
         // inside the lock, we only need to determine which range of the log file this transaction
@@ -99,8 +98,9 @@ impl LogPartition {
         };
         let fd = log_file.as_raw_fd();
         let log_buf = self.buf(&redo_bin);
-        let (sync_signal, sync_notifier) = flume::unbounded();
         let session = trx.split_session();
+        let sync_signal = Signal::default();
+        let sync_notify = sync_signal.new_notify();
         let new_group = CommitGroup {
             trx_list: vec![trx],
             max_cts: cts,
@@ -108,12 +108,11 @@ impl LogPartition {
             offset,
             log_buf,
             sync_signal,
-            sync_notifier: sync_notifier.clone(),
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
         drop(group_commit_g);
 
-        (session, sync_notifier)
+        (session, sync_notify)
     }
 
     #[inline]
@@ -123,10 +122,10 @@ impl LogPartition {
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
-            let (session, sync_notifier) = self.create_new_group(precommit_trx, group_commit_g);
+            let (session, sync_notify) = self.create_new_group(precommit_trx, group_commit_g);
             self.group_commit.1.notify_one(); // notify sync thread to work.
 
-            let _ = sync_notifier.recv_async().await; // wait for fsync
+            let _ = sync_notify.wait_async().await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
@@ -135,17 +134,17 @@ impl LogPartition {
             Commit::Group(group) => group,
         };
         if last_group.can_join(&precommit_trx) {
-            let (session, sync_notifier) = last_group.join(precommit_trx);
+            let (session, sync_notify) = last_group.join(precommit_trx);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
 
-            let _ = sync_notifier.recv_async().await; // wait for fsync
+            let _ = sync_notify.wait_async().await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
 
-        let (session, sync_notifier) = self.create_new_group(precommit_trx, group_commit_g);
+        let (session, sync_notify) = self.create_new_group(precommit_trx, group_commit_g);
 
-        let _ = sync_notifier.recv_async().await; // wait for fsync
+        let _ = sync_notify.wait_async().await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
         Ok(session)
     }
@@ -416,7 +415,7 @@ pub(super) struct SyncGroup {
     // Signal to notify transaction threads.
     // This field won't be used, until the group is dropped.
     #[allow(dead_code)]
-    pub(super) sync_signal: Sender<()>,
+    pub(super) sync_signal: Signal,
     pub(super) finished: bool,
 }
 
