@@ -10,8 +10,10 @@ use crate::index::{BlockIndex, RowLocation, SecondaryIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, InsertRow, MoveLinkForIndex, ReadRow, SelectKey,
-    SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
+    SelectMvcc, SelectResult, SelectUncommitted, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc,
+    UpdateRow,
 };
+use crate::row::Row;
 use crate::row::{estimate_max_row_count, RowID, RowPage, RowRead};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoEntry, RedoKind};
@@ -68,6 +70,26 @@ pub struct Table<P> {
 }
 
 impl<P: BufferPool> Table<P> {
+    /// Create a new table.
+    #[inline]
+    pub fn new(buf_pool: &P, table_id: TableID, schema: TableSchema) -> Self {
+        let blk_idx = BlockIndex::new(buf_pool).unwrap();
+        let sec_idx: Vec<_> = schema
+            .indexes
+            .iter()
+            .enumerate()
+            .map(|(index_no, index_schema)| {
+                SecondaryIndex::new(index_no, index_schema, schema.user_types())
+            })
+            .collect();
+        Table {
+            table_id,
+            schema: Arc::new(schema),
+            blk_idx: Arc::new(blk_idx),
+            sec_idx: Arc::from(sec_idx.into_boxed_slice()),
+        }
+    }
+
     #[inline]
     pub async fn scan_rows(&self) {
         todo!()
@@ -76,7 +98,7 @@ impl<P: BufferPool> Table<P> {
     /// Select row with unique index with MVCC.
     /// Result should be no more than one row.
     #[inline]
-    pub async fn select_row(
+    pub async fn select_row_mvcc(
         &self,
         buf_pool: &P,
         stmt: &Statement,
@@ -104,40 +126,81 @@ impl<P: BufferPool> Table<P> {
                     RowLocation::NotFound => return SelectMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
-                        let page = buf_pool.get_page(page_id, LatchFallbackMode::Shared);
-                        let page_guard = page.block_until_shared();
+                        let page_guard = buf_pool.get_page(page_id, LatchFallbackMode::Shared);
+                        let page_guard = page_guard.block_until_shared();
                         if !validate_page_id(&page_guard, page_id) {
                             continue;
                         }
-                        return self
-                            .select_row_in_page(stmt, page_guard, key, row_id, user_read_set)
+                        let page = page_guard.page();
+                        if !page.row_id_in_valid_range(row_id) {
+                            return SelectMvcc::NotFound;
+                        }
+                        let row_idx = page.row_idx(row_id);
+                        let access = self
+                            .lock_row_for_read(&stmt.trx, &page_guard, row_idx)
                             .await;
+                        return match access.read_row_mvcc(
+                            &stmt.trx,
+                            &self.schema,
+                            user_read_set,
+                            key,
+                        ) {
+                            ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
+                            ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
+                        };
                     }
                 },
             }
         }
     }
 
+    /// Select row with unique index in uncommitted mode.
     #[inline]
-    async fn select_row_in_page(
+    pub fn select_row_uncommitted<R, F>(
         &self,
-        stmt: &Statement,
-        page_guard: PageSharedGuard<'_, RowPage>,
+        buf_pool: &P,
         key: &SelectKey,
-        row_id: RowID,
-        user_read_set: &[usize],
-    ) -> SelectMvcc {
-        let page = page_guard.page();
-        if !page.row_id_in_valid_range(row_id) {
-            return SelectMvcc::NotFound;
-        }
-        let row_idx = page.row_idx(row_id);
-        let access = self
-            .lock_row_for_read(&stmt.trx, &page_guard, row_idx)
-            .await;
-        match access.read_row_mvcc(&stmt.trx, &self.schema, user_read_set, key) {
-            ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
-            ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
+        row_action: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(Row) -> R,
+    {
+        debug_assert!(key.index_no < self.sec_idx.len());
+        debug_assert!(self.schema.indexes[key.index_no].unique);
+        debug_assert!(self.schema.index_layout_match(key.index_no, &key.vals));
+        loop {
+            match self.sec_idx[key.index_no]
+                .unique()
+                .unwrap()
+                .lookup(&key.vals)
+            {
+                None => return None,
+                Some(row_id) => match self.blk_idx.find_row_id(buf_pool, row_id) {
+                    RowLocation::NotFound => return None,
+                    RowLocation::ColSegment(..) => todo!(),
+                    RowLocation::RowPage(page_id) => {
+                        let page_guard = buf_pool.get_page(page_id, LatchFallbackMode::Shared);
+                        let page_guard = page_guard.block_until_shared();
+                        if !validate_page_id(&page_guard, page_id) {
+                            continue;
+                        }
+                        let page = page_guard.page();
+                        if !page.row_id_in_valid_range(row_id) {
+                            return None;
+                        }
+                        let access = page_guard.read_row_by_id(row_id);
+                        let row = access.row();
+                        // latest version in row page.
+                        if row.is_deleted() {
+                            return None;
+                        }
+                        if row.is_key_different(&self.schema, key) {
+                            return None;
+                        }
+                        return Some(row_action(row));
+                    }
+                },
+            }
         }
     }
 

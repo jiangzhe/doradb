@@ -266,6 +266,14 @@ impl Val {
     }
 
     #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Val::VarByte(v) => Some(v.as_str()),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn encode_memcmp(&self, ty: ValType, buf: &mut Vec<u8>) {
         if ty.nullable {
             self.encode_nmcf(ty.kind, buf);

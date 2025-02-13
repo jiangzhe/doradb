@@ -37,6 +37,39 @@ impl Select<'_> {
     }
 }
 
+pub trait SelectResult {
+    const NotFound: Self;
+}
+
+pub enum SelectUncommitted {
+    Ok(Vec<Val>),
+    NotFound,
+}
+
+impl SelectUncommitted {
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        matches!(self, SelectUncommitted::Ok(_))
+    }
+
+    #[inline]
+    pub fn not_found(&self) -> bool {
+        matches!(self, SelectUncommitted::NotFound)
+    }
+
+    #[inline]
+    pub fn unwrap(self) -> Vec<Val> {
+        match self {
+            SelectUncommitted::Ok(vals) => vals,
+            SelectUncommitted::NotFound => panic!("empty select result"),
+        }
+    }
+}
+
+impl SelectResult for SelectUncommitted {
+    const NotFound: SelectUncommitted = SelectUncommitted::NotFound;
+}
+
 pub enum SelectMvcc {
     Ok(Vec<Val>),
     NotFound,
@@ -60,6 +93,10 @@ impl SelectMvcc {
             SelectMvcc::NotFound => panic!("empty select result"),
         }
     }
+}
+
+impl SelectResult for SelectMvcc {
+    const NotFound: SelectMvcc = SelectMvcc::NotFound;
 }
 
 pub enum ReadRow {

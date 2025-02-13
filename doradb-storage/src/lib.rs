@@ -14,11 +14,3 @@ pub mod stmt;
 pub mod table;
 pub mod trx;
 pub mod value;
-
-pub mod prelude {
-    pub use crate::error::*;
-    pub use crate::table::*;
-    pub use crate::trx::sys::*;
-    pub use crate::trx::*;
-    pub use crate::value::*;
-}
