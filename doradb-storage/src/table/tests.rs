@@ -36,7 +36,9 @@ fn test_mvcc_insert_normal() {
             for i in 16..SIZE {
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i)]);
-                let res = table.select_row(buf_pool, &mut stmt, &key, &[0, 1]).await;
+                let res = table
+                    .select_row_mvcc(buf_pool, &mut stmt, &key, &[0, 1])
+                    .await;
                 match res {
                     SelectMvcc::Ok(vals) => {
                         assert!(vals.len() == 2);
@@ -114,7 +116,7 @@ fn test_mvcc_update_normal() {
 
             // lookup this updated value inside same transaction
             let stmt = trx.start_stmt();
-            let res = table.select_row(buf_pool, &stmt, &k2, &[0, 1]).await;
+            let res = table.select_row_mvcc(buf_pool, &stmt, &k2, &[0, 1]).await;
             assert!(res.is_ok());
             let row = res.unwrap();
             assert!(row.len() == 2);
@@ -127,7 +129,7 @@ fn test_mvcc_update_normal() {
             // lookup with a new transaction
             let mut trx = session.begin_trx(trx_sys);
             let stmt = trx.start_stmt();
-            let res = table.select_row(buf_pool, &stmt, &k2, &[0, 1]).await;
+            let res = table.select_row_mvcc(buf_pool, &stmt, &k2, &[0, 1]).await;
             assert!(res.is_ok());
             let row = res.unwrap();
             assert!(row.len() == 2);
@@ -181,7 +183,7 @@ fn test_mvcc_delete_normal() {
 
             // lookup row in same transaction
             let stmt = trx.start_stmt();
-            let res = table.select_row(buf_pool, &stmt, &k1, &[0]).await;
+            let res = table.select_row_mvcc(buf_pool, &stmt, &k1, &[0]).await;
             assert!(res.not_found());
             trx = stmt.succeed();
             session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
@@ -189,7 +191,7 @@ fn test_mvcc_delete_normal() {
             // lookup row in new transaction
             let mut trx = session.begin_trx(trx_sys);
             let stmt = trx.start_stmt();
-            let res = table.select_row(buf_pool, &stmt, &k1, &[0]).await;
+            let res = table.select_row_mvcc(buf_pool, &stmt, &k1, &[0]).await;
             assert!(res.not_found());
             trx = stmt.succeed();
             let _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
@@ -231,7 +233,7 @@ fn test_mvcc_rollback_insert_normal() {
             let mut trx = session.begin_trx(trx_sys);
             let stmt = trx.start_stmt();
             let key = single_key(1i32);
-            let res = table.select_row(buf_pool, &stmt, &key, &[0, 1]).await;
+            let res = table.select_row_mvcc(buf_pool, &stmt, &key, &[0, 1]).await;
             assert!(res.not_found());
             trx = stmt.succeed();
             _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
@@ -296,7 +298,7 @@ fn test_mvcc_move_insert() {
             let mut trx = session.begin_trx(trx_sys);
             let stmt = trx.start_stmt();
             let key = single_key(1i32);
-            let res = table.select_row(buf_pool, &stmt, &key, &[0, 1]).await;
+            let res = table.select_row_mvcc(buf_pool, &stmt, &key, &[0, 1]).await;
             assert!(res.is_ok());
             let vals = res.unwrap();
             assert!(vals[1] == Val::from("world"));
@@ -365,7 +367,7 @@ fn test_mvcc_rollback_move_insert() {
             let mut trx = session.begin_trx(trx_sys);
             let stmt = trx.start_stmt();
             let key = single_key(1i32);
-            let res = table.select_row(buf_pool, &stmt, &key, &[0, 1]).await;
+            let res = table.select_row_mvcc(buf_pool, &stmt, &key, &[0, 1]).await;
             assert!(res.not_found());
             trx = stmt.succeed();
             _ = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();

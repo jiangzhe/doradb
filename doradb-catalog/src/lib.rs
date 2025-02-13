@@ -1,14 +1,14 @@
 pub mod error;
 pub mod mem_impl;
+pub mod object;
+
+pub use object::*;
 
 use crate::error::Result;
 use bitflags::bitflags;
 use doradb_datatype::PreciseType;
 use semistr::SemiStr;
-use std::fmt;
 use std::hash::Hash;
-use std::marker::PhantomData;
-
 /// Catalog maintains metadata of all database objects.
 /// It could be shared between threads.
 pub trait Catalog: Send + Sync {
@@ -44,11 +44,6 @@ pub trait Catalog: Send + Sync {
 
     fn find_keys(&self, table_id: &TableID) -> Vec<Key>;
 }
-
-pub type ObjID = u64;
-pub type TableID = ObjID;
-pub type SchemaID = ObjID;
-pub type ColumnID = ObjID;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {

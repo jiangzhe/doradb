@@ -791,12 +791,29 @@ pub trait RowRead {
     }
 
     /// Returns variable-length value by given column index.(row id is excluded)
+    #[inline]
     fn user_var(&self, user_col_idx: usize) -> &[u8] {
         self.var(user_col_idx + 1)
     }
 
+    /// Returns string.
+    #[inline]
+    fn user_str(&self, user_col_idx: usize) -> &str {
+        self.str(user_col_idx + 1)
+    }
+
+    /// Returns string.
+    #[inline]
+    fn str(&self, col_idx: usize) -> &str {
+        unsafe {
+            let var = self.page().var_unchecked(self.row_idx(), col_idx);
+            std::str::from_utf8_unchecked(var.as_bytes(self.page().data_ptr()))
+        }
+    }
+
     /// Returns RowID of current row.
     /// Row id is always the first column of a row, with 8-byte width.
+    #[inline]
     fn row_id(&self) -> RowID {
         *self.val::<RowID>(0)
     }
