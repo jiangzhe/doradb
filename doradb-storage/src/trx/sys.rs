@@ -146,7 +146,10 @@ impl TransactionSystem {
             // page-level undo maps.
             // In such case, we can just rollback this transaction because it actually
             // do nothing.
-            return Ok(self.rollback_prepared(prepared_trx, buf_pool, catalog));
+            let session = self
+                .rollback_prepared(prepared_trx, buf_pool, catalog)
+                .await;
+            return Ok(session);
         }
         // start group commit
         partition.commit(prepared_trx, &self.ts).await
@@ -154,13 +157,13 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub fn rollback<P: BufferPool>(
+    pub async fn rollback<P: BufferPool>(
         &self,
         mut trx: ActiveTrx,
         buf_pool: P,
         catalog: &Catalog<P>,
     ) -> Session {
-        trx.row_undo.rollback(buf_pool);
+        trx.row_undo.rollback(buf_pool).await;
         trx.index_undo.rollback(catalog);
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session()
@@ -171,14 +174,14 @@ impl TransactionSystem {
     /// In such case, we do not need to go through entire commit process but just
     /// rollback the transaction, because it actually do nothing.
     #[inline]
-    fn rollback_prepared<P: BufferPool>(
+    async fn rollback_prepared<P: BufferPool>(
         &self,
         mut trx: PreparedTrx,
         buf_pool: P,
         catalog: &Catalog<P>,
     ) -> Session {
         debug_assert!(trx.redo_bin.is_none());
-        trx.row_undo.rollback(buf_pool);
+        trx.row_undo.rollback(buf_pool).await;
         trx.index_undo.rollback(catalog);
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session()

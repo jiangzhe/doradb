@@ -17,59 +17,66 @@ use std::time::Duration;
 
 fn main() {
     let args = Args::parse();
-    let buf_pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
-    {
-        let schema = TableSchema::new(
-            vec![ValKind::I64.nullable(false)],
-            vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
-        );
-        let blk_idx = BlockIndex::new(buf_pool).unwrap();
-        let blk_idx = Box::leak(Box::new(blk_idx));
+    smol::block_on(async {
+        let args = args.clone();
+        let buf_pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+        {
+            let schema = TableSchema::new(
+                vec![ValKind::I64.nullable(false)],
+                vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
+            );
+            let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
+            let blk_idx = Box::leak(Box::new(blk_idx));
 
-        for _ in 0..args.pages {
-            let _ = blk_idx.get_insert_page(buf_pool, args.rows_per_page, &schema);
+            for _ in 0..args.pages {
+                let _ = blk_idx.get_insert_page(buf_pool, args.rows_per_page, &schema);
+            }
+            let mut perf_monitor = PerfMonitor::new();
+            perf_monitor.start();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut handles = vec![];
+            for _ in 0..args.threads {
+                let args = args.clone();
+                let stop = Arc::clone(&stop);
+                let handle = std::thread::spawn(|| {
+                    let ex = smol::LocalExecutor::new();
+                    smol::block_on(ex.run(worker(args, buf_pool, blk_idx, stop)))
+                });
+                handles.push(handle);
+            }
+            let mut total_count = 0;
+            let mut total_sum_page_id = 0;
+            for h in handles {
+                let (count, sum_page_id) = h.join().unwrap();
+                total_count += count;
+                total_sum_page_id += sum_page_id;
+            }
+            let perf_stats = perf_monitor.stop();
+
+            let qps = total_count as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
+            let op_nanos =
+                perf_stats.dur.as_nanos() as f64 * args.threads as f64 / total_count as f64;
+            println!("block_index: threads={}, dur={}ms, total_count={}, sum_page_id={}, qps={:.2}, op={:.2}ns", args.threads, perf_stats.dur.as_millis(), total_count, total_sum_page_id, qps, op_nanos);
+            println!("block_index: cache_refs={:.2}, cache_misses={:.2}, cycles={:.2}, instructions={:.2}, branch_misses={:.2}", 
+                perf_stats.cache_refs as f64,
+                perf_stats.cache_misses as f64,
+                perf_stats.cycles as f64,
+                perf_stats.instructions as f64,
+                perf_stats.branch_misses as f64);
+
+            unsafe {
+                drop(Box::from_raw(
+                    blk_idx as *const _ as *mut BlockIndex<&'static FixedBufferPool>,
+                ));
+            }
         }
-        let mut perf_monitor = PerfMonitor::new();
-        perf_monitor.start();
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut handles = vec![];
-        for _ in 0..args.threads {
-            let args = args.clone();
-            let stop = Arc::clone(&stop);
-            let handle = std::thread::spawn(|| worker(args, buf_pool, blk_idx, stop));
-            handles.push(handle);
-        }
-        let mut total_count = 0;
-        let mut total_sum_page_id = 0;
-        for h in handles {
-            let (count, sum_page_id) = h.join().unwrap();
-            total_count += count;
-            total_sum_page_id += sum_page_id;
-        }
-        let perf_stats = perf_monitor.stop();
-
-        let qps = total_count as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-        let op_nanos = perf_stats.dur.as_nanos() as f64 * args.threads as f64 / total_count as f64;
-        println!("block_index: threads={}, dur={}ms, total_count={}, sum_page_id={}, qps={:.2}, op={:.2}ns", args.threads, perf_stats.dur.as_millis(), total_count, total_sum_page_id, qps, op_nanos);
-        println!("block_index: cache_refs={:.2}, cache_misses={:.2}, cycles={:.2}, instructions={:.2}, branch_misses={:.2}", 
-            perf_stats.cache_refs as f64,
-            perf_stats.cache_misses as f64,
-            perf_stats.cycles as f64,
-            perf_stats.instructions as f64,
-            perf_stats.branch_misses as f64);
-
         unsafe {
-            drop(Box::from_raw(
-                blk_idx as *const _ as *mut BlockIndex<&'static FixedBufferPool>,
-            ));
+            FixedBufferPool::drop_static(buf_pool);
         }
-    }
-    unsafe {
-        FixedBufferPool::drop_static(buf_pool);
-    }
+    });
 
-    bench_btreemap(args.clone());
+    bench_btreemap(args);
 }
 
 fn bench_btreemap(args: Args) {
@@ -129,7 +136,7 @@ fn bench_btreemap(args: Args) {
     }
 }
 
-fn worker(
+async fn worker(
     args: Args,
     buf_pool: &'static FixedBufferPool,
     blk_idx: &'static BlockIndex<&'static FixedBufferPool>,
@@ -142,7 +149,7 @@ fn worker(
     let mut sum_page_id = 0u64;
     for _ in 0..args.count {
         let row_id = rng.next_u64() % max_row_id;
-        let res = blk_idx.find_row_id(buf_pool, row_id);
+        let res = blk_idx.find_row_id(buf_pool, row_id).await;
         match res {
             RowLocation::RowPage(page_id) => {
                 count += 1;

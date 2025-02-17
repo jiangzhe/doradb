@@ -38,9 +38,9 @@ impl<P: BufferPool> Catalog<P> {
     }
 
     #[inline]
-    pub fn create_table(&self, buf_pool: P, schema: TableSchema) -> TableID {
+    pub async fn create_table(&self, buf_pool: P, schema: TableSchema) -> TableID {
         let table_id = self.table_id.fetch_add(1, Ordering::SeqCst);
-        let blk_idx = BlockIndex::new(buf_pool).unwrap();
+        let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
         let sec_idx: Vec<_> = schema
             .indexes
             .iter()
@@ -110,13 +110,15 @@ pub(crate) mod tests {
 
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
-    pub(crate) fn table1<P: BufferPool>(buf_pool: P, catalog: &Catalog<P>) -> TableID {
-        catalog.create_table(
-            buf_pool,
-            TableSchema::new(
-                vec![ValKind::I32.nullable(false)],
-                vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
-            ),
-        )
+    pub(crate) async fn table1<P: BufferPool>(buf_pool: P, catalog: &Catalog<P>) -> TableID {
+        catalog
+            .create_table(
+                buf_pool,
+                TableSchema::new(
+                    vec![ValKind::I32.nullable(false)],
+                    vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
+                ),
+            )
+            .await
     }
 }

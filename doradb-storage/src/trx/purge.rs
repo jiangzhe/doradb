@@ -3,6 +3,7 @@ use crate::catalog::{Catalog, TableCache};
 use crate::trx::log::LogPartition;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, TrxID, MAX_SNAPSHOT_TS};
+use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -24,8 +25,9 @@ impl TransactionSystem {
             let handle = thread::Builder::new()
                 .name(String::from("Purge-Thread"))
                 .spawn(move || {
+                    let ex = LocalExecutor::new();
                     let mut purger = PurgeSingleThreaded::default();
-                    purger.purge_loop(buf_pool, catalog, self, purge_chan);
+                    smol::block_on(ex.run(purger.purge_loop(buf_pool, catalog, self, purge_chan)))
                 })
                 .unwrap();
             let mut g = self.purge_threads.lock();
@@ -36,7 +38,10 @@ impl TransactionSystem {
             let handle = thread::Builder::new()
                 .name(String::from("Purge-Dispatcher"))
                 .spawn(move || {
-                    dispatcher.purge_loop(buf_pool, catalog, self, purge_chan);
+                    let ex = LocalExecutor::new();
+                    smol::block_on(
+                        ex.run(dispatcher.purge_loop(buf_pool, catalog, self, purge_chan)),
+                    );
                 })
                 .unwrap();
             let mut g = self.purge_threads.lock();
@@ -87,7 +92,8 @@ impl TransactionSystem {
                 .name(format!("Purge-Executor-{}", i))
                 .spawn(move || {
                     let mut purger = PurgeExecutor::default();
-                    purger.purge_task_loop(buf_pool, catalog, self, rx);
+                    let ex = LocalExecutor::new();
+                    smol::block_on(ex.run(purger.purge_task_loop(buf_pool, catalog, self, rx)));
                 })
                 .unwrap();
             handles.push(handle);
@@ -96,7 +102,7 @@ impl TransactionSystem {
     }
 
     #[inline]
-    pub(super) fn purge_trx_list<P: BufferPool>(
+    pub(super) async fn purge_trx_list<P: BufferPool>(
         &self,
         buf_pool: P,
         catalog: &Catalog<P>,
@@ -113,7 +119,10 @@ impl TransactionSystem {
             purge_row_count += trx.row_undo.len();
             for ip in &trx.index_gc {
                 if let Some(table) = table_cache.get_table(ip.table_id) {
-                    if table.delete_index(buf_pool, &ip.key, ip.row_id, min_active_sts) {
+                    if table
+                        .delete_index(buf_pool, &ip.key, ip.row_id, min_active_sts)
+                        .await
+                    {
                         purge_index_count += 1;
                     }
                 }
@@ -333,8 +342,8 @@ struct PurgeTask {
     signal: Sender<()>,
 }
 
-pub trait PurgeLoop {
-    fn purge_loop<P: BufferPool>(
+trait PurgeLoop {
+    async fn purge_loop<P: BufferPool>(
         &mut self,
         buf_pool: P,
         catalog: &Catalog<P>,
@@ -348,7 +357,7 @@ pub struct PurgeSingleThreaded;
 
 impl PurgeLoop for PurgeSingleThreaded {
     #[inline]
-    fn purge_loop<P: BufferPool>(
+    async fn purge_loop<P: BufferPool>(
         &mut self,
         buf_pool: P,
         catalog: &Catalog<P>,
@@ -373,13 +382,9 @@ impl PurgeLoop for PurgeSingleThreaded {
                                 gc_bucket.get_purge_list(min_active_sts, &mut trx_list);
                             }
                             let log_no = partition.log_no;
-                            trx_sys.purge_trx_list(
-                                buf_pool,
-                                catalog,
-                                log_no,
-                                trx_list,
-                                min_active_sts,
-                            );
+                            trx_sys
+                                .purge_trx_list(buf_pool, catalog, log_no, trx_list, min_active_sts)
+                                .await;
                         }
                     }
                 }
@@ -392,7 +397,7 @@ pub struct PurgeDispatcher(Vec<Sender<PurgeTask>>);
 
 impl PurgeLoop for PurgeDispatcher {
     #[inline]
-    fn purge_loop<P: BufferPool>(
+    async fn purge_loop<P: BufferPool>(
         &mut self,
         _buf_pool: P,
         _catalog: &Catalog<P>,
@@ -401,7 +406,7 @@ impl PurgeLoop for PurgeDispatcher {
     ) {
         // let chans = self.init(trx_sys);
         let mut dispatch_no: usize = 0;
-        'DISPATCH_LOOP: while let Ok(purge) = purge_chan.recv() {
+        'DISPATCH_LOOP: while let Ok(purge) = purge_chan.recv_async().await {
             match purge {
                 Purge::Stop => break 'DISPATCH_LOOP,
                 Purge::Next => {
@@ -430,7 +435,7 @@ impl PurgeLoop for PurgeDispatcher {
                         }
                         drop(signal);
                         // wait for all executors finish their tasks.
-                        let _ = notify.recv();
+                        let _ = notify.recv_async().await;
                     }
                 }
             }
@@ -446,7 +451,7 @@ pub struct PurgeExecutor;
 
 impl PurgeExecutor {
     #[inline]
-    fn purge_task_loop<P: BufferPool>(
+    async fn purge_task_loop<P: BufferPool>(
         &mut self,
         buf_pool: P,
         catalog: &Catalog<P>,
@@ -464,7 +469,9 @@ impl PurgeExecutor {
             let partition = &trx_sys.log_partitions[log_no];
             partition.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
             // actual purge here
-            trx_sys.purge_trx_list(buf_pool, catalog, log_no, trx_list, min_active_sts);
+            trx_sys
+                .purge_trx_list(buf_pool, catalog, log_no, trx_list, min_active_sts)
+                .await;
             drop(signal); // notify dispatcher
         }
     }
@@ -525,7 +532,7 @@ mod tests {
             .build_static(buf_pool, catalog);
 
         smol::block_on(async {
-            let table_id = table1(buf_pool, catalog);
+            let table_id = table1(buf_pool, catalog).await;
             let table = catalog.get_table(table_id).unwrap();
             let mut session = Session::new();
             // insert
@@ -595,7 +602,7 @@ mod tests {
                 .purge_threads(2)
                 .build_static(buf_pool, catalog);
 
-            let table_id = table1(buf_pool, catalog);
+            let table_id = table1(buf_pool, catalog).await;
             let table = catalog.get_table(table_id).unwrap();
             let mut session = Session::new();
             // insert
@@ -657,13 +664,14 @@ mod tests {
                 index.scan_values(&mut remained_row_ids);
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
-                let location = table.blk_idx.find_row_id(buf_pool, row_id);
+                let location = table.blk_idx.find_row_id(buf_pool, row_id).await;
                 let page_id = match location {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
                 };
                 let page_guard: PageSharedGuard<'_, RowPage> = buf_pool
                     .get_page(page_id, LatchFallbackMode::Shared)
+                    .await
                     .block_until_shared();
                 let access = page_guard.read_row_by_id(row_id);
                 let status = access.latest_status();

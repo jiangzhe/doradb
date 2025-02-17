@@ -42,6 +42,8 @@ impl Default for BufferFrame {
     }
 }
 
+unsafe impl Send for BufferFrame {}
+
 unsafe impl Sync for BufferFrame {}
 
 /// BufferFrameAware defines callbacks on lifecycle of buffer frame
