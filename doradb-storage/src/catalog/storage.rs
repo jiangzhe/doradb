@@ -21,19 +21,19 @@ pub trait MetadataStorage<P: BufferPool>: Sized {
     type ObjID;
 
     /// Create a new metadata persitence instance.
-    fn new(buf_pool: &P) -> Self;
+    fn new(buf_pool: P) -> Self;
 
     /// Find object by name.
-    fn find(&self, buf_pool: &P, name: &str) -> Option<Self::Object>;
+    fn find(&self, buf_pool: P, name: &str) -> Option<Self::Object>;
 
     /// Find object by id.
-    fn find_by_id(&self, buf_pool: &P, id: Self::ObjID) -> Option<Self::Object>;
+    fn find_by_id(&self, buf_pool: P, id: Self::ObjID) -> Option<Self::Object>;
 
     /// Insert object.
-    fn insert(&self, buf_pool: &P, obj: Self::Object) -> bool;
+    fn insert(&self, buf_pool: P, obj: Self::Object) -> bool;
 
     /// Delete object by id.
-    fn delete_by_id(&self, buf_pool: &P, id: Self::ObjID) -> bool;
+    fn delete_by_id(&self, buf_pool: P, id: Self::ObjID) -> bool;
 }
 
 #[inline]
@@ -59,7 +59,7 @@ const COL_NO_SCHEMAS_SCHEMA_NAME: usize = 1;
 const INDEX_NO_SCHEMAS_SCHEMA_ID: usize = 0;
 const INDEX_NO_SCHEMAS_SCHEMA_NAME: usize = 1;
 
-pub struct Schemas<P> {
+pub struct Schemas<P: BufferPool> {
     table: Table<P>,
 }
 
@@ -68,13 +68,13 @@ impl<P: BufferPool> MetadataStorage<P> for Schemas<P> {
     type ObjID = SchemaID;
 
     #[inline]
-    fn new(buf_pool: &P) -> Self {
+    fn new(buf_pool: P) -> Self {
         let table = Table::new(buf_pool, TABLE_ID_SCHEMAS, schema_of_schemas());
         Schemas { table }
     }
 
     #[inline]
-    fn find(&self, buf_pool: &P, name: &str) -> Option<SchemaObject> {
+    fn find(&self, buf_pool: P, name: &str) -> Option<SchemaObject> {
         let name = Val::from(name);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_NAME, vec![name]);
         self.table.select_row_uncommitted(buf_pool, &key, |row| {
@@ -88,7 +88,7 @@ impl<P: BufferPool> MetadataStorage<P> for Schemas<P> {
     }
 
     #[inline]
-    fn find_by_id(&self, buf_pool: &P, id: SchemaID) -> Option<Self::Object> {
+    fn find_by_id(&self, buf_pool: P, id: SchemaID) -> Option<Self::Object> {
         let id = Val::from(id);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![id]);
         self.table.select_row_uncommitted(buf_pool, &key, |row| {
@@ -102,12 +102,12 @@ impl<P: BufferPool> MetadataStorage<P> for Schemas<P> {
     }
 
     #[inline]
-    fn insert(&self, buf_pool: &P, obj: Self::Object) -> bool {
+    fn insert(&self, buf_pool: P, obj: Self::Object) -> bool {
         todo!()
     }
 
     #[inline]
-    fn delete_by_id(&self, buf_pool: &P, id: Self::ObjID) -> bool {
+    fn delete_by_id(&self, buf_pool: P, id: Self::ObjID) -> bool {
         todo!()
     }
 }

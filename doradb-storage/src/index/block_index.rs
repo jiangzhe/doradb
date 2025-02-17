@@ -1,6 +1,6 @@
 use crate::buffer::frame::{BufferFrame, BufferFrameAware};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard};
-use crate::buffer::page::{PageID, LSN, PAGE_SIZE};
+use crate::buffer::page::{PageID, PAGE_SIZE};
 use crate::buffer::BufferPool;
 use crate::catalog::TableSchema;
 use crate::error::{
@@ -219,13 +219,13 @@ impl BlockNode {
 
 impl BufferFrameAware for BlockNode {
     #[inline]
-    fn on_alloc<P: BufferPool>(_pool: &P, _frame: &mut BufferFrame) {}
+    fn on_alloc<P: BufferPool>(_pool: P, _frame: &mut BufferFrame) {}
 
     #[inline]
-    fn on_dealloc<P: BufferPool>(_pool: &P, _frame: &mut BufferFrame) {}
+    fn on_dealloc<P: BufferPool>(_pool: P, _frame: &mut BufferFrame) {}
 
     #[inline]
-    fn after_init<P: BufferPool>(_pool: &P, _frame: &mut BufferFrame) {}
+    fn after_init<P: BufferPool>(_pool: P, _frame: &mut BufferFrame) {}
 }
 
 #[repr(C)]
@@ -235,8 +235,6 @@ pub struct BlockNodeHeader {
     pub height: u32,
     // count of entry.
     pub count: u32,
-    // log sequence number
-    pub lsn: LSN,
     // start row id of the node.
     pub start_row_id: RowID,
     // end row id of the node.
@@ -391,7 +389,7 @@ pub struct ColSegmentMeta {
 /// 2. table scan: traverse all column files and row pages to perform
 ///    full table scan.
 ///
-pub struct BlockIndex<P> {
+pub struct BlockIndex<P: BufferPool> {
     root: PageID,
     insert_free_list: Mutex<Vec<PageID>>,
     _marker: PhantomData<P>,
@@ -400,13 +398,12 @@ pub struct BlockIndex<P> {
 impl<P: BufferPool> BlockIndex<P> {
     /// Create a new block index backed by buffer pool.
     #[inline]
-    pub fn new(buf_pool: &P) -> Result<Self> {
+    pub fn new(buf_pool: P) -> Result<Self> {
         let mut g: PageExclusiveGuard<'_, BlockNode> = buf_pool.allocate_page();
         let page_id = g.page_id();
         let page = g.page_mut();
         page.header.height = 0;
         page.header.count = 0;
-        page.header.lsn = 0;
         page.header.start_row_id = 0;
         page.header.end_row_id = INVALID_ROW_ID;
         Ok(BlockIndex {
@@ -419,17 +416,17 @@ impl<P: BufferPool> BlockIndex<P> {
     /// Get row page for insertion.
     /// Caller should cache insert page id to avoid invoking this method frequently.
     #[inline]
-    pub fn get_insert_page<'a>(
+    pub fn get_insert_page(
         &self,
-        buf_pool: &'a P,
+        buf_pool: P,
         count: usize,
         schema: &TableSchema,
-    ) -> PageSharedGuard<'a, RowPage> {
+    ) -> PageSharedGuard<'static, RowPage> {
         match self.get_insert_page_from_free_list(buf_pool) {
             Ok(free_page) => return free_page,
             _ => (), // we just ignore the free list error and latch error, and continue to get new page.
         }
-        let mut new_page: PageExclusiveGuard<'a, RowPage> = buf_pool.allocate_page();
+        let mut new_page: PageExclusiveGuard<RowPage> = buf_pool.allocate_page();
         let new_page_id = new_page.page_id();
         loop {
             match self.insert_row_page(buf_pool, count as u64, new_page_id) {
@@ -450,7 +447,7 @@ impl<P: BufferPool> BlockIndex<P> {
 
     /// Find location of given row id, maybe in column file or row page.
     #[inline]
-    pub fn find_row_id(&self, buf_pool: &P, row_id: RowID) -> RowLocation {
+    pub fn find_row_id(&self, buf_pool: P, row_id: RowID) -> RowLocation {
         loop {
             let res = self.try_find_row_id(buf_pool, row_id);
             let res = verify_continue!(res);
@@ -469,7 +466,7 @@ impl<P: BufferPool> BlockIndex<P> {
 
     /// Returns the cursor for range scan.
     #[inline]
-    pub fn cursor<'a, 'b>(&'b self, buf_pool: &'a P) -> Cursor<'a, 'b, P> {
+    pub fn cursor(&self, buf_pool: P) -> Cursor<P> {
         Cursor {
             buf_pool,
             blk_idx: self,
@@ -479,10 +476,10 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 
     #[inline]
-    fn get_insert_page_from_free_list<'a>(
+    fn get_insert_page_from_free_list(
         &self,
-        buf_pool: &'a P,
-    ) -> Result<PageSharedGuard<'a, RowPage>> {
+        buf_pool: P,
+    ) -> Result<PageSharedGuard<'static, RowPage>> {
         let page_id = {
             let mut g = self.insert_free_list.lock();
             if g.is_empty() {
@@ -490,15 +487,15 @@ impl<P: BufferPool> BlockIndex<P> {
             }
             g.pop().unwrap()
         };
-        let page: PageGuard<'a, RowPage> = buf_pool.get_page(page_id, LatchFallbackMode::Shared);
+        let page: PageGuard<RowPage> = buf_pool.get_page(page_id, LatchFallbackMode::Shared);
         Ok(page.block_until_shared())
     }
 
     #[inline]
     fn insert_row_page_split_root(
         &self,
-        buf_pool: &P,
-        mut p_guard: PageExclusiveGuard<'_, BlockNode>,
+        buf_pool: P,
+        mut p_guard: PageExclusiveGuard<'static, BlockNode>,
         row_id: RowID,
         count: u64,
         insert_page_id: PageID,
@@ -557,9 +554,9 @@ impl<P: BufferPool> BlockIndex<P> {
     #[inline]
     fn insert_row_page_to_new_leaf(
         &self,
-        buf_pool: &P,
-        stack: &mut Vec<PageOptimisticGuard<'_, BlockNode>>,
-        c_guard: PageExclusiveGuard<'_, BlockNode>,
+        buf_pool: P,
+        stack: &mut Vec<PageOptimisticGuard<'static, BlockNode>>,
+        c_guard: PageExclusiveGuard<'static, BlockNode>,
         row_id: RowID,
         count: u64,
         insert_page_id: PageID,
@@ -603,7 +600,7 @@ impl<P: BufferPool> BlockIndex<P> {
     #[inline]
     fn insert_row_page(
         &self,
-        buf_pool: &P,
+        buf_pool: P,
         count: u64,
         insert_page_id: PageID,
     ) -> Validation<(u64, u64)> {
@@ -673,13 +670,13 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 
     #[inline]
-    fn find_right_most_leaf<'a>(
+    fn find_right_most_leaf(
         &self,
-        buf_pool: &'a P,
-        stack: &mut Vec<PageOptimisticGuard<'a, BlockNode>>,
+        buf_pool: P,
+        stack: &mut Vec<PageOptimisticGuard<'static, BlockNode>>,
         mode: LatchFallbackMode,
-    ) -> Validation<PageGuard<'a, BlockNode>> {
-        let mut p_guard: PageGuard<'a, BlockNode> =
+    ) -> Validation<PageGuard<'static, BlockNode>> {
+        let mut p_guard: PageGuard<BlockNode> =
             buf_pool.get_page(self.root, LatchFallbackMode::Spin);
         // optimistic mode, should always check version after use protected data.
         let mut pu = unsafe { p_guard.page_unchecked() };
@@ -706,8 +703,8 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 
     #[inline]
-    fn try_find_row_id<'a>(&self, buf_pool: &'a P, row_id: RowID) -> Validation<RowLocation> {
-        let mut g: PageGuard<'a, BlockNode> = buf_pool.get_page(self.root, LatchFallbackMode::Spin);
+    fn try_find_row_id(&self, buf_pool: P, row_id: RowID) -> Validation<RowLocation> {
+        let mut g: PageGuard<BlockNode> = buf_pool.get_page(self.root, LatchFallbackMode::Spin);
         loop {
             let pu = unsafe { g.page_unchecked() };
             if pu.is_leaf() {
@@ -780,7 +777,7 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 }
 
-unsafe impl<P> Send for BlockIndex<P> {}
+unsafe impl<P: BufferPool> Send for BlockIndex<P> {}
 
 pub enum RowLocation {
     ColSegment(u64, u64),
@@ -794,15 +791,15 @@ pub enum CursorState {
 }
 
 /// A cursor to read all leaf values.
-pub struct Cursor<'a, 'b, P> {
-    buf_pool: &'a P,
-    blk_idx: &'b BlockIndex<P>,
+pub struct Cursor<'a, P: BufferPool> {
+    buf_pool: P,
+    blk_idx: &'a BlockIndex<P>,
     // The parent node of current located
     parent: Option<BranchLookup<'a>>,
     child: Option<PageGuard<'a, BlockNode>>,
 }
 
-impl<'a, 'b, P: BufferPool> Cursor<'a, 'b, P> {
+impl<'a, P: BufferPool> Cursor<'a, P> {
     #[inline]
     pub fn seek(mut self, row_id: RowID) -> Self {
         self.clear();
@@ -821,7 +818,7 @@ impl<'a, 'b, P: BufferPool> Cursor<'a, 'b, P> {
     #[inline]
     fn try_find_leaf_with_parent(&mut self, row_id: RowID) -> Validation<()> {
         debug_assert!(row_id != INVALID_ROW_ID); // every row id other than MAX_ROW_ID can find a leaf.
-        let mut g: PageGuard<'a, BlockNode> = self
+        let mut g: PageGuard<BlockNode> = self
             .buf_pool
             .get_page(self.blk_idx.root, LatchFallbackMode::Shared);
         'SEARCH: loop {
@@ -869,7 +866,7 @@ impl<'a, 'b, P: BufferPool> Cursor<'a, 'b, P> {
     }
 }
 
-impl<'a, 'b, P: BufferPool> Iterator for Cursor<'a, 'b, P> {
+impl<'a, P: BufferPool> Iterator for Cursor<'a, P> {
     type Item = PageGuard<'a, BlockNode>;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {

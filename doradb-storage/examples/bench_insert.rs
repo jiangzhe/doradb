@@ -4,6 +4,7 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
+use doradb_storage::buffer::BufferPool;
 use doradb_storage::buffer::FixedBufferPool;
 use doradb_storage::catalog::{Catalog, IndexKey, IndexSchema, TableSchema};
 use doradb_storage::lifetime::StaticLifetime;
@@ -148,10 +149,10 @@ fn main() {
 }
 
 #[inline]
-async fn worker(
-    buf_pool: &FixedBufferPool,
+async fn worker<P: BufferPool>(
+    buf_pool: P,
     trx_sys: &TransactionSystem,
-    catalog: &'static Catalog<FixedBufferPool>,
+    catalog: &'static Catalog<P>,
     table_id: TableID,
     id_start: i32,
     id_step: i32,

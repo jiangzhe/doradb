@@ -15,7 +15,7 @@ impl TransactionSystem {
     #[inline]
     pub(super) fn start_purge_threads<P: BufferPool>(
         &'static self,
-        buf_pool: &'static P,
+        buf_pool: P,
         catalog: &'static Catalog<P>,
         purge_chan: Receiver<Purge>,
     ) {
@@ -75,7 +75,7 @@ impl TransactionSystem {
     #[inline]
     pub(super) fn dispatch_purge<P: BufferPool>(
         &'static self,
-        buf_pool: &'static P,
+        buf_pool: P,
         catalog: &'static Catalog<P>,
     ) -> (PurgeDispatcher, Vec<JoinHandle<()>>) {
         let mut handles = vec![];
@@ -98,7 +98,7 @@ impl TransactionSystem {
     #[inline]
     pub(super) fn purge_trx_list<P: BufferPool>(
         &self,
-        buf_pool: &P,
+        buf_pool: P,
         catalog: &Catalog<P>,
         log_no: usize,
         trx_list: Vec<CommittedTrx>,
@@ -336,7 +336,7 @@ struct PurgeTask {
 pub trait PurgeLoop {
     fn purge_loop<P: BufferPool>(
         &mut self,
-        buf_pool: &P,
+        buf_pool: P,
         catalog: &Catalog<P>,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -350,7 +350,7 @@ impl PurgeLoop for PurgeSingleThreaded {
     #[inline]
     fn purge_loop<P: BufferPool>(
         &mut self,
-        buf_pool: &P,
+        buf_pool: P,
         catalog: &Catalog<P>,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -394,7 +394,7 @@ impl PurgeLoop for PurgeDispatcher {
     #[inline]
     fn purge_loop<P: BufferPool>(
         &mut self,
-        _buf_pool: &P,
+        _buf_pool: P,
         _catalog: &Catalog<P>,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -448,7 +448,7 @@ impl PurgeExecutor {
     #[inline]
     fn purge_task_loop<P: BufferPool>(
         &mut self,
-        buf_pool: &P,
+        buf_pool: P,
         catalog: &Catalog<P>,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<PurgeTask>,

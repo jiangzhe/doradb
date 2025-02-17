@@ -38,7 +38,7 @@ impl<P: BufferPool> Catalog<P> {
     }
 
     #[inline]
-    pub fn create_table(&self, buf_pool: &P, schema: TableSchema) -> TableID {
+    pub fn create_table(&self, buf_pool: P, schema: TableSchema) -> TableID {
         let table_id = self.table_id.fetch_add(1, Ordering::SeqCst);
         let blk_idx = BlockIndex::new(buf_pool).unwrap();
         let sec_idx: Vec<_> = schema
@@ -75,6 +75,8 @@ impl<P: BufferPool> Catalog<P> {
     }
 }
 
+unsafe impl<P: BufferPool> Send for Catalog<P> {}
+unsafe impl<P: BufferPool> Sync for Catalog<P> {}
 unsafe impl<P: BufferPool> StaticLifetime for Catalog<P> {}
 
 pub struct TableCache<'a, P: BufferPool> {
@@ -108,7 +110,7 @@ pub(crate) mod tests {
 
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
-    pub(crate) fn table1<P: BufferPool>(buf_pool: &P, catalog: &Catalog<P>) -> TableID {
+    pub(crate) fn table1<P: BufferPool>(buf_pool: P, catalog: &Catalog<P>) -> TableID {
         catalog.create_table(
             buf_pool,
             TableSchema::new(

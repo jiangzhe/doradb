@@ -46,15 +46,15 @@ unsafe impl Sync for BufferFrame {}
 
 /// BufferFrameAware defines callbacks on lifecycle of buffer frame
 /// for initialization and de-initialization.
-pub trait BufferFrameAware: Sized {
+pub trait BufferFrameAware: Sized + 'static {
     /// This callback is called when a page is just loaded into BufferFrame.
-    fn on_alloc<P: BufferPool>(pool: &P, frame: &mut BufferFrame);
+    fn on_alloc<P: BufferPool>(pool: P, frame: &mut BufferFrame);
 
     /// This callback is called when a page is cleaned and return to BufferPool.
-    fn on_dealloc<P: BufferPool>(pool: &P, frame: &mut BufferFrame);
+    fn on_dealloc<P: BufferPool>(pool: P, frame: &mut BufferFrame);
 
     /// This callback is called after a page is initialized.
-    fn after_init<P: BufferPool>(pool: &P, frame: &mut BufferFrame);
+    fn after_init<P: BufferPool>(pool: P, frame: &mut BufferFrame);
 
     /// Caller must guarantee Self has same size as Page.
     #[inline]

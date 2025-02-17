@@ -1,3 +1,4 @@
+use crate::buffer::BufferPool;
 use crate::catalog::index::IndexSchema;
 use crate::index::{BlockIndex, SecondaryIndex};
 use crate::row::ops::{SelectKey, UpdateCol};
@@ -6,7 +7,7 @@ use crate::value::{Layout, Val, ValKind, ValType};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub struct TableMeta<P> {
+pub struct TableMeta<P: BufferPool> {
     pub schema: Arc<TableSchema>,
     pub blk_idx: Arc<BlockIndex<P>>,
     pub sec_idx: Arc<[SecondaryIndex]>,

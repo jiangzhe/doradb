@@ -593,7 +593,7 @@ impl RowPage {
 
 impl BufferFrameAware for RowPage {
     #[inline]
-    fn on_alloc<P: BufferPool>(pool: &P, frame: &mut BufferFrame) {
+    fn on_alloc<P: BufferPool>(pool: P, frame: &mut BufferFrame) {
         let page_id = frame.page_id;
         if let Some(undo_map) = pool.load_orphan_undo_map(page_id) {
             let res = frame.undo_map.replace(undo_map);
@@ -602,7 +602,7 @@ impl BufferFrameAware for RowPage {
     }
 
     #[inline]
-    fn on_dealloc<P: BufferPool>(pool: &P, frame: &mut BufferFrame) {
+    fn on_dealloc<P: BufferPool>(pool: P, frame: &mut BufferFrame) {
         if let Some(undo_map) = frame.undo_map.take() {
             if undo_map.occupied() > 0 {
                 let page_id = frame.page_id;
@@ -612,7 +612,7 @@ impl BufferFrameAware for RowPage {
     }
 
     #[inline]
-    fn after_init<P: BufferPool>(_pool: &P, frame: &mut BufferFrame) {
+    fn after_init<P: BufferPool>(_pool: P, frame: &mut BufferFrame) {
         if frame.undo_map.is_none() {
             let len = unsafe { Self::get(frame) }.header.max_row_count as usize;
             frame.undo_map = Some(UndoMap::new(len));
