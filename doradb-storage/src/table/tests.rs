@@ -15,7 +15,7 @@ fn test_mvcc_insert_normal() {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
         let catalog = Catalog::empty_static();
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = create_table(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog).await;
         let table = catalog.get_table(table_id).unwrap();
         let mut session = Session::new();
         {
@@ -69,7 +69,7 @@ fn test_mvcc_update_normal() {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
         let catalog = Catalog::empty_static();
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = create_table(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog).await;
         {
             let table = catalog.get_table(table_id).unwrap();
 
@@ -155,7 +155,7 @@ fn test_mvcc_delete_normal() {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
         let catalog = Catalog::empty_static();
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = create_table(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog).await;
         {
             let table = catalog.get_table(table_id).unwrap();
 
@@ -210,7 +210,7 @@ fn test_mvcc_rollback_insert_normal() {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
         let catalog = Catalog::empty_static();
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = create_table(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog).await;
         {
             let table = catalog.get_table(table_id).unwrap();
 
@@ -226,7 +226,7 @@ fn test_mvcc_rollback_insert_normal() {
                 )
                 .await;
             assert!(res.is_ok());
-            trx = stmt.fail(buf_pool, &catalog);
+            trx = stmt.fail(buf_pool, &catalog).await;
             session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // select 1 row
@@ -252,7 +252,7 @@ fn test_mvcc_move_insert() {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
         let catalog = Catalog::empty_static();
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = create_table(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog).await;
         {
             let table = catalog.get_table(table_id).unwrap();
 
@@ -319,7 +319,7 @@ fn test_mvcc_rollback_move_insert() {
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
         let catalog = Catalog::empty_static();
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = create_table(buf_pool, catalog);
+        let table_id = create_table(buf_pool, catalog).await;
         {
             let table = catalog.get_table(table_id).unwrap();
 
@@ -360,7 +360,7 @@ fn test_mvcc_rollback_move_insert() {
                 .await;
             assert!(res.is_ok());
             println!("row_id={}", res.unwrap());
-            trx = stmt.fail(buf_pool, &catalog);
+            trx = stmt.fail(buf_pool, &catalog).await;
             session = trx_sys.commit(trx, buf_pool, &catalog).await.unwrap();
 
             // select 1 row
@@ -380,17 +380,19 @@ fn test_mvcc_rollback_move_insert() {
     });
 }
 
-fn create_table<P: BufferPool>(buf_pool: P, catalog: &Catalog<P>) -> TableID {
-    catalog.create_table(
-        buf_pool,
-        TableSchema::new(
-            vec![
-                ValKind::I32.nullable(false),
-                ValKind::VarByte.nullable(false),
-            ],
-            vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
-        ),
-    )
+async fn create_table<P: BufferPool>(buf_pool: P, catalog: &Catalog<P>) -> TableID {
+    catalog
+        .create_table(
+            buf_pool,
+            TableSchema::new(
+                vec![
+                    ValKind::I32.nullable(false),
+                    ValKind::VarByte.nullable(false),
+                ],
+                vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
+            ),
+        )
+        .await
 }
 
 fn single_key<V: Into<Val>>(value: V) -> SelectKey {

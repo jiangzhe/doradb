@@ -109,7 +109,11 @@ impl FixedBufferPool {
     }
 
     #[inline]
-    fn get_page_internal<T>(&self, page_id: PageID, mode: LatchFallbackMode) -> PageGuard<T> {
+    fn get_page_internal<T: 'static>(
+        &self,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> PageGuard<'static, T> {
         unsafe {
             let bf = self.get_frame(page_id);
             let g = (*bf.get()).latch.optimistic_fallback(mode);
@@ -136,7 +140,7 @@ impl FixedBufferPool {
 impl BufferPool for &'static FixedBufferPool {
     // allocate a new page with exclusive lock.
     #[inline]
-    fn allocate_page<T: BufferFrameAware>(self) -> PageExclusiveGuard<'static, T> {
+    async fn allocate_page<T: BufferFrameAware>(self) -> PageExclusiveGuard<'static, T> {
         // try get from free list.
         if let Some(g) = self.try_get_page_from_free_list() {
             return g;
@@ -159,7 +163,11 @@ impl BufferPool for &'static FixedBufferPool {
     /// Returns the page guard with given page id.
     /// Caller should make sure page id is valid.
     #[inline]
-    fn get_page<T>(self, page_id: PageID, mode: LatchFallbackMode) -> PageGuard<'static, T> {
+    async fn get_page<T: BufferFrameAware>(
+        self,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> PageGuard<'static, T> {
         debug_assert!(
             page_id < self.allocated.load(Ordering::Relaxed),
             "page id out of bound"
@@ -169,7 +177,7 @@ impl BufferPool for &'static FixedBufferPool {
 
     /// Deallocate page.
     #[inline]
-    fn deallocate_page<T: BufferFrameAware>(self, mut g: PageExclusiveGuard<'static, T>) {
+    async fn deallocate_page<T: BufferFrameAware>(self, mut g: PageExclusiveGuard<'static, T>) {
         T::on_dealloc(self, &mut g.bf_mut());
         let mut page_id = self.free_list.lock();
         g.bf_mut().next_free = *page_id;
@@ -181,7 +189,7 @@ impl BufferPool for &'static FixedBufferPool {
     /// id concurrently, and the input page id may not be valid through the function
     /// call. So version must be validated before returning the buffer frame.
     #[inline]
-    fn get_child_page<T>(
+    async fn get_child_page<T>(
         self,
         p_guard: &PageGuard<'static, T>,
         page_id: PageID,
@@ -263,25 +271,27 @@ mod tests {
 
     #[test]
     fn test_fixed_buffer_pool() {
-        let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
-        {
-            let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page();
-            assert_eq!(g.page_id(), 0);
-        }
-        {
-            let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page();
-            assert_eq!(g.page_id(), 1);
-            pool.deallocate_page(g);
-            let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page();
-            assert_eq!(g.page_id(), 1);
-        }
-        {
-            let g: PageOptimisticGuard<'_, BlockNode> =
-                pool.get_page(0, LatchFallbackMode::Spin).downgrade();
-            assert_eq!(unsafe { g.page_id() }, 0);
-        }
-        unsafe {
-            FixedBufferPool::drop_static(pool);
-        }
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            {
+                let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page().await;
+                assert_eq!(g.page_id(), 0);
+            }
+            {
+                let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page().await;
+                assert_eq!(g.page_id(), 1);
+                pool.deallocate_page(g).await;
+                let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page().await;
+                assert_eq!(g.page_id(), 1);
+            }
+            {
+                let g: PageOptimisticGuard<'_, BlockNode> =
+                    pool.get_page(0, LatchFallbackMode::Spin).await.downgrade();
+                assert_eq!(unsafe { g.page_id() }, 0);
+            }
+            unsafe {
+                FixedBufferPool::drop_static(pool);
+            }
+        })
     }
 }

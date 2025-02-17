@@ -25,14 +25,14 @@ flume = { version = "0.11", features = ["select"] }
 either = "1.13"
 event-listener = "5.4"
 semistr = "0.1"
+async-executor = "1.13"
+smol = "2.0"
 
 [dev-dependencies]
 rand = "0.8"
 bitcode = { version = "0.6.3", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
-smol = "2.0"
 easy-parallel = "3.3"
-async-executor = "1.13"
 humantime = "2.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 criterion-perf-events = "0.4"

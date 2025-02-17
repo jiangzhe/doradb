@@ -191,6 +191,9 @@ impl<'a, T> PageGuard<'a, T> {
     }
 }
 
+unsafe impl<'a, T> Send for PageGuard<'a, T> {}
+unsafe impl<'a, T> Sync for PageGuard<'a, T> {}
+
 pub struct PageOptimisticGuard<'a, T> {
     bf: &'a UnsafeCell<BufferFrame>,
     guard: HybridGuard<'a>,
@@ -288,6 +291,9 @@ impl<'a, T> PageOptimisticGuard<'a, T> {
     }
 }
 
+unsafe impl<'a, T> Send for PageOptimisticGuard<'a, T> {}
+unsafe impl<'a, T> Sync for PageOptimisticGuard<'a, T> {}
+
 pub struct PageSharedGuard<'a, T> {
     bf: &'a BufferFrame,
     guard: HybridGuard<'a>,
@@ -344,6 +350,9 @@ impl<'a, T> PageSharedGuard<'a, T> {
         }
     }
 }
+
+unsafe impl<'a, T> Send for PageSharedGuard<'a, T> {}
+unsafe impl<'a, T> Sync for PageSharedGuard<'a, T> {}
 
 pub struct PageExclusiveGuard<'a, T> {
     bf: &'a mut BufferFrame,
@@ -420,3 +429,6 @@ impl<'a, T> PageExclusiveGuard<'a, T> {
         }
     }
 }
+
+unsafe impl<'a, T> Send for PageExclusiveGuard<'a, T> {}
+unsafe impl<'a, T> Sync for PageExclusiveGuard<'a, T> {}

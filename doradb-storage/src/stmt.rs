@@ -44,10 +44,10 @@ impl Statement {
     /// This will trigger statement-level rollback based on its undo.
     /// Redo logs will be discarded.
     #[inline]
-    pub fn fail<P: BufferPool>(mut self, buf_pool: P, catalog: &Catalog<P>) -> ActiveTrx {
+    pub async fn fail<P: BufferPool>(mut self, buf_pool: P, catalog: &Catalog<P>) -> ActiveTrx {
         // rollback row data.
         // todo: group by page level may be better.
-        self.row_undo.rollback(buf_pool);
+        self.row_undo.rollback(buf_pool).await;
         // rollback index data.
         self.index_undo.rollback(catalog);
         // clear redo logs.

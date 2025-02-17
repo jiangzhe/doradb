@@ -16,24 +16,24 @@ pub const TABLE_ID_COLUMNS: TableID = 2;
 pub const TABLEID_INDEXES: TableID = 3;
 
 /// Metadata storage interface
-pub trait MetadataStorage<P: BufferPool>: Sized {
+pub(crate) trait MetadataStorage<P: BufferPool>: Sized {
     type Object;
     type ObjID;
 
     /// Create a new metadata persitence instance.
-    fn new(buf_pool: P) -> Self;
+    async fn new(buf_pool: P) -> Self;
 
     /// Find object by name.
-    fn find(&self, buf_pool: P, name: &str) -> Option<Self::Object>;
+    async fn find(&self, buf_pool: P, name: &str) -> Option<Self::Object>;
 
     /// Find object by id.
-    fn find_by_id(&self, buf_pool: P, id: Self::ObjID) -> Option<Self::Object>;
+    async fn find_by_id(&self, buf_pool: P, id: Self::ObjID) -> Option<Self::Object>;
 
     /// Insert object.
-    fn insert(&self, buf_pool: P, obj: Self::Object) -> bool;
+    async fn insert(&self, buf_pool: P, obj: Self::Object) -> bool;
 
     /// Delete object by id.
-    fn delete_by_id(&self, buf_pool: P, id: Self::ObjID) -> bool;
+    async fn delete_by_id(&self, buf_pool: P, id: Self::ObjID) -> bool;
 }
 
 #[inline]
@@ -68,46 +68,50 @@ impl<P: BufferPool> MetadataStorage<P> for Schemas<P> {
     type ObjID = SchemaID;
 
     #[inline]
-    fn new(buf_pool: P) -> Self {
-        let table = Table::new(buf_pool, TABLE_ID_SCHEMAS, schema_of_schemas());
+    async fn new(buf_pool: P) -> Self {
+        let table = Table::new(buf_pool, TABLE_ID_SCHEMAS, schema_of_schemas()).await;
         Schemas { table }
     }
 
     #[inline]
-    fn find(&self, buf_pool: P, name: &str) -> Option<SchemaObject> {
+    async fn find(&self, buf_pool: P, name: &str) -> Option<SchemaObject> {
         let name = Val::from(name);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_NAME, vec![name]);
-        self.table.select_row_uncommitted(buf_pool, &key, |row| {
-            let schema_id = row.user_val::<u64>(COL_NO_SCHEMAS_SCHEMA_ID);
-            let schema_name = row.user_str(COL_NO_SCHEMAS_SCHEMA_NAME);
-            SchemaObject {
-                schema_id: *schema_id,
-                schema_name: SemiStr::new(schema_name),
-            }
-        })
+        self.table
+            .select_row_uncommitted(buf_pool, &key, |row| {
+                let schema_id = row.user_val::<u64>(COL_NO_SCHEMAS_SCHEMA_ID);
+                let schema_name = row.user_str(COL_NO_SCHEMAS_SCHEMA_NAME);
+                SchemaObject {
+                    schema_id: *schema_id,
+                    schema_name: SemiStr::new(schema_name),
+                }
+            })
+            .await
     }
 
     #[inline]
-    fn find_by_id(&self, buf_pool: P, id: SchemaID) -> Option<Self::Object> {
+    async fn find_by_id(&self, buf_pool: P, id: SchemaID) -> Option<Self::Object> {
         let id = Val::from(id);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![id]);
-        self.table.select_row_uncommitted(buf_pool, &key, |row| {
-            let schema_id = row.user_val::<u64>(COL_NO_SCHEMAS_SCHEMA_ID);
-            let schema_name = row.user_str(COL_NO_SCHEMAS_SCHEMA_NAME);
-            SchemaObject {
-                schema_id: *schema_id,
-                schema_name: SemiStr::new(schema_name),
-            }
-        })
+        self.table
+            .select_row_uncommitted(buf_pool, &key, |row| {
+                let schema_id = row.user_val::<u64>(COL_NO_SCHEMAS_SCHEMA_ID);
+                let schema_name = row.user_str(COL_NO_SCHEMAS_SCHEMA_NAME);
+                SchemaObject {
+                    schema_id: *schema_id,
+                    schema_name: SemiStr::new(schema_name),
+                }
+            })
+            .await
     }
 
     #[inline]
-    fn insert(&self, buf_pool: P, obj: Self::Object) -> bool {
+    async fn insert(&self, buf_pool: P, obj: Self::Object) -> bool {
         todo!()
     }
 
     #[inline]
-    fn delete_by_id(&self, buf_pool: P, id: Self::ObjID) -> bool {
+    async fn delete_by_id(&self, buf_pool: P, id: Self::ObjID) -> bool {
         todo!()
     }
 }

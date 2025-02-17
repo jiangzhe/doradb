@@ -38,114 +38,118 @@ fn main() {
         .purge_threads(args.purge_threads)
         .build_static(buf_pool, catalog);
     // create empty table
-    let table_id = catalog.create_table(
-        buf_pool,
-        TableSchema::new(
-            vec![
-                ValKind::I32.nullable(false),
-                ValKind::I32.nullable(false),
-                ValKind::VarByte.nullable(false),
-                ValKind::VarByte.nullable(false),
-            ],
-            vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
-        ),
-    );
-    // start benchmark
-    {
-        let start = Instant::now();
-        let wg = WaitGroup::new();
-        let stop = Arc::new(AtomicBool::new(false));
-        let ex = smol::Executor::new();
-        let (notify, shutdown) = flume::unbounded::<()>();
-        // start transaction sessions.
-        for sess_id in 0..args.sessions {
-            let wg = wg.clone();
-            let stop = Arc::clone(&stop);
-            ex.spawn(worker(
+    smol::block_on(async {
+        let table_id = catalog
+            .create_table(
                 buf_pool,
-                trx_sys,
-                catalog,
-                table_id,
-                sess_id as i32,
-                args.sessions as i32,
-                stop,
-                wg,
-            ))
-            .detach();
-        }
-        // start system threads.
-        let _ = Parallel::new()
-            .each(0..args.threads, |_| {
-                smol::block_on(ex.run(shutdown.recv_async()))
-            })
-            .finish({
+                TableSchema::new(
+                    vec![
+                        ValKind::I32.nullable(false),
+                        ValKind::I32.nullable(false),
+                        ValKind::VarByte.nullable(false),
+                        ValKind::VarByte.nullable(false),
+                    ],
+                    vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
+                ),
+            )
+            .await;
+        // start benchmark
+        {
+            let start = Instant::now();
+            let wg = WaitGroup::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            let ex = smol::Executor::new();
+            let (notify, shutdown) = flume::unbounded::<()>();
+            // start transaction sessions.
+            for sess_id in 0..args.sessions {
+                let wg = wg.clone();
                 let stop = Arc::clone(&stop);
-                move || {
-                    std::thread::sleep(args.duration);
-                    stop.store(true, Ordering::SeqCst);
-                    wg.wait();
-                    drop(notify)
-                }
-            });
-        let dur = start.elapsed();
-        let stats = trx_sys.trx_sys_stats();
-        let total_trx_count = stats.trx_count;
-        let commit_count = stats.commit_count;
-        let log_bytes = stats.log_bytes;
-        let sync_count = stats.sync_count;
-        let sync_nanos = stats.sync_nanos;
-        let sync_latency = if sync_count == 0 {
-            0f64
-        } else {
-            sync_nanos as f64 / 1000f64 / sync_count as f64
-        };
-        let io_submit_count = stats.io_submit_count;
-        let io_submit_nanos = stats.io_submit_nanos;
-        let io_submit_latency = if io_submit_count == 0 {
-            0f64
-        } else {
-            io_submit_nanos as f64 / 1000f64 / io_submit_count as f64
-        };
-        let io_wait_count = stats.io_wait_count;
-        let io_wait_nanos = stats.io_wait_nanos;
-        let io_wait_latency = if io_wait_count == 0 {
-            0f64
-        } else {
-            io_wait_nanos as f64 / 1000f64 / io_wait_count as f64
-        };
-        let trx_per_group = if commit_count == 0 {
-            0f64
-        } else {
-            total_trx_count as f64 / commit_count as f64
-        };
-        let tps = total_trx_count as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
-        println!(
-            "threads={},dur={},total_trx={},groups={},sync={},sync_dur={:.2}us,\
-            io_submit={},io_submit_dur={:.2}us,io_wait={},io_wait_dur={:.2}us,\
-            trx/grp={:.2},trx/s={:.0},log/s={:.2}MB,purge_trx={},purge_row={},purge_index={}",
-            args.threads,
-            dur.as_micros(),
-            total_trx_count,
-            commit_count,
-            sync_count,
-            sync_latency,
-            io_submit_count,
-            io_submit_latency,
-            io_wait_count,
-            io_wait_latency,
-            trx_per_group,
-            tps,
-            log_bytes as f64 / dur.as_micros() as f64,
-            stats.purge_trx_count,
-            stats.purge_row_count,
-            stats.purge_index_count,
-        );
-    }
-    unsafe {
-        StaticLifetime::drop_static(trx_sys);
-        StaticLifetime::drop_static(catalog);
-        StaticLifetime::drop_static(buf_pool);
-    }
+                ex.spawn(worker(
+                    buf_pool,
+                    trx_sys,
+                    catalog,
+                    table_id,
+                    sess_id as i32,
+                    args.sessions as i32,
+                    stop,
+                    wg,
+                ))
+                .detach();
+            }
+            // start system threads.
+            let _ = Parallel::new()
+                .each(0..args.threads, |_| {
+                    smol::block_on(ex.run(shutdown.recv_async()))
+                })
+                .finish({
+                    let stop = Arc::clone(&stop);
+                    move || {
+                        std::thread::sleep(args.duration);
+                        stop.store(true, Ordering::SeqCst);
+                        wg.wait();
+                        drop(notify)
+                    }
+                });
+            let dur = start.elapsed();
+            let stats = trx_sys.trx_sys_stats();
+            let total_trx_count = stats.trx_count;
+            let commit_count = stats.commit_count;
+            let log_bytes = stats.log_bytes;
+            let sync_count = stats.sync_count;
+            let sync_nanos = stats.sync_nanos;
+            let sync_latency = if sync_count == 0 {
+                0f64
+            } else {
+                sync_nanos as f64 / 1000f64 / sync_count as f64
+            };
+            let io_submit_count = stats.io_submit_count;
+            let io_submit_nanos = stats.io_submit_nanos;
+            let io_submit_latency = if io_submit_count == 0 {
+                0f64
+            } else {
+                io_submit_nanos as f64 / 1000f64 / io_submit_count as f64
+            };
+            let io_wait_count = stats.io_wait_count;
+            let io_wait_nanos = stats.io_wait_nanos;
+            let io_wait_latency = if io_wait_count == 0 {
+                0f64
+            } else {
+                io_wait_nanos as f64 / 1000f64 / io_wait_count as f64
+            };
+            let trx_per_group = if commit_count == 0 {
+                0f64
+            } else {
+                total_trx_count as f64 / commit_count as f64
+            };
+            let tps = total_trx_count as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+            println!(
+                "threads={},dur={},total_trx={},groups={},sync={},sync_dur={:.2}us,\
+                io_submit={},io_submit_dur={:.2}us,io_wait={},io_wait_dur={:.2}us,\
+                trx/grp={:.2},trx/s={:.0},log/s={:.2}MB,purge_trx={},purge_row={},purge_index={}",
+                args.threads,
+                dur.as_micros(),
+                total_trx_count,
+                commit_count,
+                sync_count,
+                sync_latency,
+                io_submit_count,
+                io_submit_latency,
+                io_wait_count,
+                io_wait_latency,
+                trx_per_group,
+                tps,
+                log_bytes as f64 / dur.as_micros() as f64,
+                stats.purge_trx_count,
+                stats.purge_row_count,
+                stats.purge_index_count,
+            );
+        }
+        unsafe {
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
+        }
+    })
 }
 
 #[inline]

@@ -38,7 +38,7 @@ impl Select<'_> {
 }
 
 pub trait SelectResult {
-    const NotFound: Self;
+    const NOT_FOUND: Self;
 }
 
 pub enum SelectUncommitted {
@@ -67,7 +67,7 @@ impl SelectUncommitted {
 }
 
 impl SelectResult for SelectUncommitted {
-    const NotFound: SelectUncommitted = SelectUncommitted::NotFound;
+    const NOT_FOUND: SelectUncommitted = SelectUncommitted::NotFound;
 }
 
 pub enum SelectMvcc {
@@ -96,7 +96,7 @@ impl SelectMvcc {
 }
 
 impl SelectResult for SelectMvcc {
-    const NotFound: SelectMvcc = SelectMvcc::NotFound;
+    const NOT_FOUND: SelectMvcc = SelectMvcc::NotFound;
 }
 
 pub enum ReadRow {
