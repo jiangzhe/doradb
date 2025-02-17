@@ -380,7 +380,7 @@ fn test_mvcc_rollback_move_insert() {
     });
 }
 
-fn create_table<P: BufferPool>(buf_pool: &P, catalog: &Catalog<P>) -> TableID {
+fn create_table<P: BufferPool>(buf_pool: P, catalog: &Catalog<P>) -> TableID {
     catalog.create_table(
         buf_pool,
         TableSchema::new(

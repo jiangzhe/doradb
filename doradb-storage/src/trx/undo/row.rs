@@ -97,9 +97,12 @@ pub enum RowUndoKind {
     /// two key index entries pointing to the same new version. MVCC visible check must
     /// ensure key column matches the visible version built from version chain.
     ///
-    /// If we scan the table(skipping secondary index), we may find deleted rows in
-    /// data page with undo header of MOVE entry. We just eliminate such rows, because
-    /// we can always find it again from other page through the complete undo chain.
+    /// If we scan the table(skipping secondary index), we can find deleted row before
+    /// MOVE and new row after MOVE. In case of visiting MOVE entry on old page,
+    /// if current transaction is newer, we do not undo MOVE, and deleted flag on page
+    /// is true - as it's *moved*, so we don't see the data. In case of visiting MOVE
+    /// entry in version chain from new page. we have to stop the version traversal,
+    /// in order to avoid double read(see the old version twice).
     ///  
     /// 2. fail to in-place update.
     ///
@@ -205,7 +208,7 @@ impl RowUndoLogs {
     }
 
     #[inline]
-    pub fn rollback<P: BufferPool>(&mut self, buf_pool: &P) {
+    pub fn rollback<P: BufferPool>(&mut self, buf_pool: P) {
         while let Some(entry) = self.0.pop() {
             let page_guard: PageGuard<'_, RowPage> =
                 buf_pool.get_page(entry.page_id, LatchFallbackMode::Shared);

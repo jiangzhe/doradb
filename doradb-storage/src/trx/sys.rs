@@ -126,7 +126,7 @@ impl TransactionSystem {
     pub async fn commit<P: BufferPool>(
         &self,
         trx: ActiveTrx,
-        buf_pool: &P,
+        buf_pool: P,
         catalog: &Catalog<P>,
     ) -> Result<Session> {
         // Prepare redo log first, this may take some time,
@@ -157,7 +157,7 @@ impl TransactionSystem {
     pub fn rollback<P: BufferPool>(
         &self,
         mut trx: ActiveTrx,
-        buf_pool: &P,
+        buf_pool: P,
         catalog: &Catalog<P>,
     ) -> Session {
         trx.row_undo.rollback(buf_pool);
@@ -174,7 +174,7 @@ impl TransactionSystem {
     fn rollback_prepared<P: BufferPool>(
         &self,
         mut trx: PreparedTrx,
-        buf_pool: &P,
+        buf_pool: P,
         catalog: &Catalog<P>,
     ) -> Session {
         debug_assert!(trx.redo_bin.is_none());
@@ -446,7 +446,7 @@ impl TrxSysConfig {
     #[inline]
     pub fn build_static<P: BufferPool>(
         self,
-        buf_pool: &'static P,
+        buf_pool: P,
         catalog: &'static Catalog<P>,
     ) -> &'static TransactionSystem {
         let mut log_partitions = Vec::with_capacity(self.log_partitions);
@@ -532,14 +532,14 @@ mod tests {
     #[test]
     fn test_transaction_system() {
         let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-        let catalog = Catalog::<FixedBufferPool>::empty_static();
+        let catalog = Catalog::empty_static();
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
         let session = Session::new();
         {
             let trx = session.begin_trx(trx_sys);
             let _ = smol::block_on(trx_sys.commit(trx, buf_pool, catalog));
         }
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             let session = Session::new();
             let trx = session.begin_trx(trx_sys);
             let _ = smol::block_on(trx_sys.commit(trx, buf_pool, catalog));
@@ -686,7 +686,7 @@ mod tests {
         const COUNT: usize = 1000000;
         smol::block_on(async {
             let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-            let catalog = Catalog::<FixedBufferPool>::empty_static();
+            let catalog = Catalog::empty_static();
             let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
             let mut session = Session::new();
             let start = Instant::now();

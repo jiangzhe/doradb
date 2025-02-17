@@ -61,7 +61,7 @@ fn main() {
 
         unsafe {
             drop(Box::from_raw(
-                blk_idx as *const _ as *mut BlockIndex<FixedBufferPool>,
+                blk_idx as *const _ as *mut BlockIndex<&'static FixedBufferPool>,
             ));
         }
     }
@@ -132,7 +132,7 @@ fn bench_btreemap(args: Args) {
 fn worker(
     args: Args,
     buf_pool: &'static FixedBufferPool,
-    blk_idx: &'static BlockIndex<FixedBufferPool>,
+    blk_idx: &'static BlockIndex<&'static FixedBufferPool>,
     stop: Arc<AtomicBool>,
 ) -> (usize, u64) {
     let max_row_id = (args.pages * args.rows_per_page) as u64;

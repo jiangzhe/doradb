@@ -4,6 +4,7 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
+use doradb_storage::buffer::BufferPool;
 use doradb_storage::buffer::FixedBufferPool;
 use doradb_storage::catalog::Catalog;
 use doradb_storage::lifetime::StaticLifetime;
@@ -21,7 +22,7 @@ fn main() {
     let args = Args::parse();
 
     let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-    let catalog = Catalog::<FixedBufferPool>::empty_static();
+    let catalog = Catalog::<&'static FixedBufferPool>::empty_static();
     let trx_sys = TrxSysConfig::default()
         .log_file_prefix(args.log_file_prefix.to_string())
         .log_partitions(args.log_partitions)
@@ -95,9 +96,9 @@ fn main() {
 }
 
 #[inline]
-async fn worker(
-    buf_pool: &FixedBufferPool,
-    catalog: &Catalog<FixedBufferPool>,
+async fn worker<P: BufferPool>(
+    buf_pool: P,
+    catalog: &Catalog<P>,
     trx_sys: &TransactionSystem,
     stop: Arc<AtomicBool>,
     wg: WaitGroup,
