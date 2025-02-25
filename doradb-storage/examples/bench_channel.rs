@@ -17,7 +17,6 @@ fn channel_sync() {
         while let Ok(data) = rx.recv() {
             sum += data.len();
         }
-        // println!("received sum={}", sum);
         sum
     });
 
@@ -77,7 +76,6 @@ fn mutex_deque() {
         while let Ok(data) = rx.recv() {
             sum += data.len();
         }
-        // println!("received sum={}", sum);
         sum
     });
 

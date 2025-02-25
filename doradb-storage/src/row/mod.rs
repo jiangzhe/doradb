@@ -337,7 +337,7 @@ impl RowPage {
 
     /// Creates a new row in page.
     #[inline]
-    fn new_row(&self, row_idx: usize, var_offset: usize) -> NewRow {
+    pub(crate) fn new_row(&self, row_idx: usize, var_offset: usize) -> NewRow {
         let mut row = NewRow {
             page: self,
             row_idx,
@@ -1039,6 +1039,27 @@ pub trait RowRead {
             return None;
         }
         Some(self.clone_user_val_with_var_offset(schema, user_col_idx))
+    }
+
+    /// Calculate delta between given values and current row.
+    #[inline]
+    fn calc_delta(&self, schema: &TableSchema, user_vals: &[Val]) -> Vec<UpdateCol> {
+        let user_types = schema.user_types();
+        debug_assert!(user_types.len() == user_vals.len());
+        user_vals
+            .iter()
+            .enumerate()
+            .filter_map(|(user_col_idx, val)| {
+                if self.is_user_different(schema, user_col_idx, val) {
+                    Some(UpdateCol {
+                        idx: user_col_idx,
+                        val: val.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 

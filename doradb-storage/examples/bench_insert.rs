@@ -34,7 +34,6 @@ fn main() {
         .log_sync(args.log_sync)
         .log_drop(args.log_drop)
         .max_io_size(args.max_io_size)
-        .gc(args.gc_enabled)
         .purge_threads(args.purge_threads)
         .build_static(buf_pool, catalog);
     // create empty table

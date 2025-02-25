@@ -70,6 +70,7 @@ impl SelectResult for SelectUncommitted {
     const NOT_FOUND: SelectUncommitted = SelectUncommitted::NotFound;
 }
 
+#[derive(Debug)]
 pub enum SelectMvcc {
     Ok(Vec<Val>),
     NotFound,
@@ -118,6 +119,7 @@ impl InsertRow {
     }
 }
 
+#[derive(Debug)]
 pub enum InsertMvcc {
     // PageGuard is required if table has unique index and
     // we may need to linke a deleted version to the new version.
@@ -143,7 +145,7 @@ impl InsertMvcc {
     }
 }
 
-pub enum MoveLinkForIndex {
+pub enum LinkForUniqueIndex {
     Ok,
     None,
     WriteConflict,
@@ -169,6 +171,7 @@ impl Update {
     }
 }
 
+#[derive(Debug)]
 pub enum UpdateMvcc {
     Ok(RowID),
     NotFound,
@@ -197,10 +200,30 @@ pub enum InsertIndex {
     DuplicateKey,
 }
 
+pub trait UndoVal {
+    /// Returns column index.
+    fn idx(&self) -> usize;
+
+    /// Returns column value.
+    fn val(&self) -> &Val;
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateCol {
     pub idx: usize,
     pub val: Val,
+}
+
+impl UndoVal for UpdateCol {
+    #[inline]
+    fn idx(&self) -> usize {
+        self.idx
+    }
+
+    #[inline]
+    fn val(&self) -> &Val {
+        &self.val
+    }
 }
 
 pub struct UndoCol {
@@ -210,6 +233,18 @@ pub struct UndoCol {
     // we need to record its original offset in page
     // to support rollback without new allocation.
     pub var_offset: Option<u16>,
+}
+
+impl UndoVal for UndoCol {
+    #[inline]
+    fn idx(&self) -> usize {
+        self.idx
+    }
+
+    #[inline]
+    fn val(&self) -> &Val {
+        &self.val
+    }
 }
 
 pub enum UpdateRow<'a> {
@@ -223,6 +258,7 @@ pub enum Delete {
     AlreadyDeleted,
 }
 
+#[derive(Debug)]
 pub enum DeleteMvcc {
     Ok,
     NotFound,

@@ -165,6 +165,7 @@ impl TransactionSystem {
     ) -> Session {
         trx.row_undo.rollback(buf_pool).await;
         trx.index_undo.rollback(catalog);
+        trx.redo.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session()
     }
@@ -183,6 +184,7 @@ impl TransactionSystem {
         debug_assert!(trx.redo_bin.is_none());
         trx.row_undo.rollback(buf_pool).await;
         trx.index_undo.rollback(catalog);
+        trx.redo_bin.take();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session()
     }
@@ -217,7 +219,7 @@ impl TransactionSystem {
             let purge_chan = self.purge_chan.clone();
             let handle = thread::Builder::new()
                 .name(thread_name)
-                .spawn(move || partition.gc_loop(gc_rx, purge_chan, self.config.gc))
+                .spawn(move || partition.gc_loop(gc_rx, purge_chan))
                 .unwrap();
             *partition.gc_thread.lock() = Some(handle);
         }
@@ -301,7 +303,6 @@ pub const MAX_LOG_PARTITIONS: usize = 99; // big enough for log partitions, so f
 pub const DEFAULT_LOG_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GB, sparse file will not occupy space until actual write.
 pub const DEFAULT_LOG_SYNC: LogSync = LogSync::Fsync;
 pub const DEFAULT_LOG_DROP: bool = false;
-pub const DEFAULT_GC: bool = false;
 pub const DEFAULT_PURGE_THREADS: usize = 2;
 
 pub struct TrxSysConfig {
@@ -331,8 +332,6 @@ pub struct TrxSysConfig {
     // Drop log directly. If this parameter is set to true,
     // log_sync parameter will be discarded.
     pub log_drop: bool,
-    // Whether enable GC or not.
-    pub gc: bool,
     // Threads for purging undo logs.
     pub purge_threads: usize,
 }
@@ -349,14 +348,6 @@ impl TrxSysConfig {
     #[inline]
     pub fn max_io_size(mut self, max_io_size: usize) -> Self {
         self.max_io_size = max_io_size;
-        self
-    }
-
-    /// Whether to enable GC.
-    /// Note:
-    #[inline]
-    pub fn gc(mut self, gc: bool) -> Self {
-        self.gc = gc;
         self
     }
 
@@ -488,7 +479,6 @@ impl Default for TrxSysConfig {
             log_partitions: DEFAULT_LOG_PARTITIONS,
             log_sync: DEFAULT_LOG_SYNC,
             log_drop: DEFAULT_LOG_DROP,
-            gc: DEFAULT_GC,
             purge_threads: DEFAULT_PURGE_THREADS,
         }
     }
