@@ -4,7 +4,7 @@ use crate::catalog::Catalog;
 use crate::row::RowID;
 use crate::table::TableID;
 use crate::trx::redo::RedoEntry;
-use crate::trx::undo::{IndexUndoLogs, RowUndoLogs};
+use crate::trx::undo::{IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs};
 use crate::trx::ActiveTrx;
 
 pub struct Statement {
@@ -18,6 +18,7 @@ pub struct Statement {
 }
 
 impl Statement {
+    /// Create a new statement.
     #[inline]
     pub fn new(trx: ActiveTrx) -> Self {
         Statement {
@@ -27,9 +28,15 @@ impl Statement {
             redo: vec![],
         }
     }
-}
 
-impl Statement {
+    #[inline]
+    pub fn update_last_undo(&mut self, kind: RowUndoKind) {
+        let last_undo = self.row_undo.last_mut().unwrap();
+        // Currently the update can only be applied on LOCK entry.
+        debug_assert!(matches!(last_undo.kind, RowUndoKind::Lock));
+        last_undo.kind = kind;
+    }
+
     /// Succeed current statement and return transaction it belongs to.
     /// All undo and redo logs it holds will be merged into transaction buffer.
     #[inline]

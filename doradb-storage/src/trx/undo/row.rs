@@ -2,19 +2,27 @@ use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::latch::LatchFallbackMode;
-use crate::row::ops::SelectKey;
-use crate::row::ops::UndoCol;
+use crate::notify::Notify;
+use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
 use crate::table::TableID;
-use crate::trx::{SharedTrxStatus, TrxID, GLOBAL_VISIBLE_COMMIT_TS};
+use crate::trx::{trx_is_committed, SharedTrxStatus, TrxID, MIN_SNAPSHOT_TS};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 pub struct UndoMap {
-    entries: Box<[RwLock<Option<RowUndoHead>>]>,
-    // occupied: usize,
+    entries: Box<[RwLock<Option<Box<RowUndoHead>>>]>,
+    // Monotonically increasing version number.
+    // indicates whether the undo map is changed.
+    pub version: AtomicU64,
+    // How many entries may be invisible.
+    // This is optimization for analytical query which may skip
+    // entire version chain and directly query page data.
+    pub maybe_invisible: AtomicUsize,
 }
 
 impl UndoMap {
@@ -23,7 +31,8 @@ impl UndoMap {
         let vec: Vec<_> = (0..len).map(|_| RwLock::new(None)).collect();
         UndoMap {
             entries: vec.into_boxed_slice(),
-            // occupied: 0,
+            version: AtomicU64::new(0),
+            maybe_invisible: AtomicUsize::new(0),
         }
     }
 
@@ -36,12 +45,12 @@ impl UndoMap {
     }
 
     #[inline]
-    pub fn read(&self, row_idx: usize) -> RwLockReadGuard<'_, Option<RowUndoHead>> {
+    pub fn read(&self, row_idx: usize) -> RwLockReadGuard<'_, Option<Box<RowUndoHead>>> {
         self.entries[row_idx].read()
     }
 
     #[inline]
-    pub fn write(&self, row_idx: usize) -> RwLockWriteGuard<'_, Option<RowUndoHead>> {
+    pub fn write(&self, row_idx: usize) -> RwLockWriteGuard<'_, Option<Box<RowUndoHead>>> {
         self.entries[row_idx].write()
     }
 }
@@ -50,6 +59,11 @@ impl UndoMap {
 /// So the actual undo action should be opposite of the kind.
 /// There is one special UndoKind *Move*, due to the design of DoraDB.
 pub enum RowUndoKind {
+    /// Lock a row.
+    /// Before insert/delete/update, we add a lock record to version chain
+    /// to indicate other transactions that the row is locked by someone.
+    /// After done the change, update the LOCK kind to specific kind.
+    Lock,
     /// Insert a new row.
     /// Before-image is empty for insert, so we do not need to copy values.
     ///
@@ -171,6 +185,19 @@ pub enum RowUndoKind {
     Update(Vec<UndoCol>),
 }
 
+impl fmt::Debug for RowUndoKind {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RowUndoKind::Delete => f.pad("Delete"),
+            RowUndoKind::Insert => f.pad("Insert"),
+            RowUndoKind::Lock => f.pad("Lock"),
+            RowUndoKind::Move(..) => f.pad("Move"),
+            RowUndoKind::Update(_) => f.pad("Update"),
+        }
+    }
+}
+
 /// RowUndoLogs is a collection of row undo logs.
 /// It owns the logs until GC clean them all at transaction level.
 #[derive(Default)]
@@ -180,16 +207,6 @@ impl RowUndoLogs {
     #[inline]
     pub fn empty() -> Self {
         RowUndoLogs(vec![])
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.0.len()
     }
 
     #[inline]
@@ -221,6 +238,20 @@ impl RowUndoLogs {
     }
 }
 
+impl Deref for RowUndoLogs {
+    type Target = [OwnedRowUndo];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for RowUndoLogs {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 /// OwnedRowUndo is the old version of a row.
 /// It is stored in transaction undo buffer.
 /// Page level undo map will also hold pointers to the entries.
@@ -254,7 +285,7 @@ impl OwnedRowUndo {
             page_id,
             row_id,
             kind,
-            next: vec![],
+            next: None,
         };
         OwnedRowUndo(Box::new(entry))
     }
@@ -273,20 +304,43 @@ impl OwnedRowUndo {
 /// It does not share ownership with RowUndoEntry.
 ///
 /// The safety is guaranteed by MVCC design and GC logic.
-/// The modification of undo log is always guarded by row lock.
+/// The modification of undo log is always guarded by row lock,
+/// including GC operation.
 /// And the non-locking consistent read will not access
 /// log entries that are deleted(GCed).
 #[repr(transparent)]
-#[derive(Clone)]
 pub struct RowUndoRef(NonNull<RowUndo>);
 
 unsafe impl Send for RowUndoRef {}
 unsafe impl Sync for RowUndoRef {}
 
 impl RowUndoRef {
+    /// Returns reference of underlying undo log.
+    /// This method is safe because GC operation always clear this reference
+    /// from next undo list.
+    /// So we won't have chance to access a deleted undo log.
     #[inline]
     pub(crate) fn as_ref(&self) -> &RowUndo {
         unsafe { self.0.as_ref() }
+    }
+
+    /// Returns mutable reference of underlying undo log.
+    ///
+    /// The caller must guarantee there is no other thread to modify it
+    /// concurrently.
+    /// The current design is to only allow calling this method in GC process.
+    /// And only one thread can write because row lock is required before
+    /// access the version chain.
+    #[inline]
+    pub(crate) fn as_mut(&mut self) -> &mut RowUndo {
+        unsafe { self.0.as_mut() }
+    }
+}
+
+impl Clone for RowUndoRef {
+    #[inline]
+    fn clone(&self) -> Self {
+        RowUndoRef(unsafe { NonNull::new_unchecked(self.0.as_ptr()) })
     }
 }
 
@@ -295,114 +349,215 @@ pub struct RowUndo {
     pub page_id: PageID,
     pub row_id: RowID,
     pub kind: RowUndoKind,
-    pub next: Vec<NextRowUndo>,
+    pub next: Option<NextRowUndo>,
 }
 
-impl RowUndo {
+/// NextRowUndo stores status and reference of next undo log.
+/// main branch is its own lifecycle.
+/// index branches contains links to versions of another row
+/// with same unique key.
+///
+/// Timestamp of Main branch is always larger than those of indexes,
+/// because the link is generated when main is uncommitted but
+/// index is committed.
+pub struct NextRowUndo {
+    pub main: MainBranch,
+    pub indexes: Vec<IndexBranch>,
+}
+
+impl NextRowUndo {
+    /// Create a new next undo with only main branch.
     #[inline]
-    pub fn find_next_version(&self, search_key: &SelectKey) -> Option<&NextRowUndo> {
-        if self.next.is_empty() {
-            return None;
+    pub fn new(main: MainBranch) -> Self {
+        NextRowUndo {
+            main,
+            indexes: vec![],
         }
-        // prefer key match, otherwise, choose main
-        let mut main = None;
-        for next in &self.next {
-            match &next.branch {
-                RowUndoBranch::Main => {
-                    main = Some(next);
-                }
-                RowUndoBranch::Reborn(key) => {
-                    if key == search_key {
-                        return Some(next);
-                    }
-                }
-            }
-        }
-        main
     }
 
+    /// Returns next index branch.
     #[inline]
-    pub fn remove_next_main_version(&mut self) -> Option<NextRowUndo> {
-        if let Some(pos) = self
-            .next
-            .iter()
-            .position(|next| matches!(next.branch, RowUndoBranch::Main))
-        {
-            return Some(self.next.swap_remove(pos));
+    pub fn index_branch(&self, key: &SelectKey) -> Option<&IndexBranch> {
+        for ib in &self.indexes {
+            if &ib.key == key {
+                return Some(ib);
+            }
         }
         None
     }
 }
 
-pub struct NextRowUndo {
-    pub branch: RowUndoBranch,
-    pub status: NextRowUndoStatus,
+/// Main branch starts from insertion and ends at deletion.
+pub struct MainBranch {
     pub entry: RowUndoRef,
+    pub status: UndoStatus,
 }
 
-#[derive(Clone)]
-pub enum RowUndoBranch {
-    /// Main branch starts from insertion and ends at deletion.
-    Main,
-    /// Reborn branch is created once an insertion with a key which
-    /// is shared by a deleted row on a unique index.
-    /// To make index uniqueness, we point the index entry to latest
-    /// insert version and link new version to deleted version.
-    /// That is the meaning of reborn(of the dead version).
-    ///
-    /// MVCC read can skip this branch if the index key provided for
-    /// search is not same as the reborn key.
-    /// Because only such key should be searched in the reborn branch.
-    Reborn(SelectKey),
-}
-
-impl From<Option<SelectKey>> for RowUndoBranch {
-    #[inline]
-    fn from(value: Option<SelectKey>) -> Self {
-        match value {
-            Some(key) => RowUndoBranch::Reborn(key),
-            None => RowUndoBranch::Main,
-        }
-    }
-}
-
-pub enum NextRowUndoStatus {
-    // If transaction modify a row multiple times.
-    // It will link multiple undo entries with the
-    // same timestamp.
-    // One optimization is to compact such entries.
-    // In another way, we only keep the timestamp
-    // on top of the entry, and mark other entries
-    // as SameAsPrev.
-    SameAsPrev,
+/// UndoStatus represents status of any undo log,
+/// including uncommitted transactions.
+pub enum UndoStatus {
+    Ref(Arc<SharedTrxStatus>),
     CTS(TrxID),
 }
 
-pub struct RowUndoHead {
-    pub status: Arc<SharedTrxStatus>,
-    pub entry: Option<RowUndoRef>,
-}
-
-unsafe impl Send for RowUndoHead {}
-
-#[derive(Default, Clone, Copy)]
-pub enum NextTrxCTS {
-    #[default]
-    None,
-    Value(TrxID),
-    Myself,
-}
-
-impl NextTrxCTS {
+impl UndoStatus {
     #[inline]
-    pub fn undo_status(self) -> NextRowUndoStatus {
+    pub fn ts(&self) -> TrxID {
         match self {
-            NextTrxCTS::None => NextRowUndoStatus::CTS(GLOBAL_VISIBLE_COMMIT_TS),
-            NextTrxCTS::Value(cts) => NextRowUndoStatus::CTS(cts),
-            NextTrxCTS::Myself => NextRowUndoStatus::SameAsPrev,
+            UndoStatus::Ref(status) => status.ts(),
+            UndoStatus::CTS(cts) => *cts,
+        }
+    }
+
+    #[inline]
+    pub fn can_purge(&mut self, min_active_sts: TrxID) -> bool {
+        match self {
+            UndoStatus::Ref(status) => {
+                let ts = status.ts();
+                if ts < min_active_sts {
+                    return true;
+                }
+                if trx_is_committed(ts) {
+                    // convert from reference to integer.
+                    *self = UndoStatus::CTS(ts);
+                    return false;
+                }
+                false
+            }
+            UndoStatus::CTS(ts) => *ts < min_active_sts,
         }
     }
 }
+
+/// Index branch is created if new version conflicts with old
+/// version on same key of unique index.
+/// In our design, we point the index entry to latest version
+/// and link new version to old(deleted or updated) version.
+/// The advantage is making index concise, especially for unique
+/// index.
+/// The disadvantage is making version chain complicated.
+/// But in our assumption, most transactions are short and in-memory
+/// version chain can be easily purged than out-of-memory index
+/// maintainance.
+///
+/// MVCC read can skip this branch if the index key provided for
+/// search is not same as the reborn key.
+/// Because only such key should be searched in the Index branch.
+/// Table scan should skip such branch.
+///
+/// Below is a sample data flow of the undo branch maintainance.
+///
+///  ┌──────────────────────────────────────────────────────────┐                     
+///  │t1: insert {rowid=100,k=1,v=1}                            │                     
+///  └──────────────────────────────────────────────────────────┘                     
+///   unique index            row page                                                
+///   ┌───────────┐          ┌─────────────────┐                                      
+///   │k=1────►100├─────────►│rowid=100,k=1,v=1│                                      
+///   └───────────┘          └─────────────────┘                                      
+///                                                                                   
+///  ┌──────────────────────────────────────────────────────────┐                     
+///  │t2: update {k=1,v=1} to {k=9,v=9}                         │                     
+///  └──────────────────────────────────────────────────────────┘                     
+///   unique index            row page              version chain                     
+///   ┌───────────┐          ┌─────────────────┐   ┌───────┐                          
+///   │k=1────►100├─────┬───►│rowid=100,k=9,v=9├──►│k=1,v=1│                          
+///   │           │     │    └─────────────────┘   └───────┘                          
+///   │k=9────►100├─────┘                                                             
+///   └───────────┘                                                                   
+///                                                                                   
+///  ┌──────────────────────────────────────────────────────────┐                     
+///  │t3: insert {rowid=200,k=1,v=2}                            │                     
+///  └──────────────────────────────────────────────────────────┘                     
+///   unique index            row page              version chain                     
+///   ┌───────────┐          ┌─────────────────┐   ┌───────┐                          
+///   │k=1────►100├───┐  ┌──►│rowid=100,k=9,v=9├──►│k=1,v=1│                          
+///   │           │   │  │   └─────────────────┘   └─▲─────┘                          
+///   │k=9────►100├───┼──┘                           │                                
+///   └───────────┘   │                              │Index(k=1)(delta)                      
+///                   │      ┌─────────────────┐     │                                
+///                   └─────►│rowid=200,k=1,v=2├─────┘                                
+///                          └─────────────────┘                                      
+/// ┌───────────────────────────────────────────────────────────┐                     
+/// │t4: update {k=1,v=2} to {k=3,v=4}                          │                     
+/// └───────────────────────────────────────────────────────────┘                     
+///   unique index            row page              version chain                     
+///   ┌───────────┐          ┌─────────────────┐                ┌───────┐             
+///   │k=1────►200├──┐  ┌───►│rowid=100,k=9,v=9├───────────────►│k=1,v=1│             
+///   │           │  │  │    └─────────────────┘                └─▲─────┘             
+///   │k=9────►100├──┼──┘                                         │                   
+///   │           │  │                                            │Index(k=1)(delta)         
+///   │k=3────►200├──┤       ┌─────────────────┐   ┌───────┐      │                   
+///   └───────────┘  └──────►│rowid=200,k=3,v=4├──►│k=1,v=2├──────┘                   
+///                          └─────────────────┘   └───────┘                          
+///                                                                                   
+/// ┌───────────────────────────────────────────────────────────┐                     
+/// │t5: update {k=9,v=9} to {k=1,v=5}                          │                     
+/// └───────────────────────────────────────────────────────────┘                     
+///   unique index            row page              version chain                     
+///   ┌───────────┐          ┌──────────────────┐            ┌───────┐   ┌───────┐    
+///   │k=1────►100├───┬─────►│rowid=100,k=1,v=5 ├───────────►│k=9,v=9├──►│k=1,v=1│    
+///   │           │   │      └─────────────┬────┘            └───────┘   └─▲─────┘    
+///   │k=9────►100├───┘                    └─────────┐                     │          
+///   │           │                 Index(k=1)(delta)│                     │Index(k=1)(delta)
+///   │k=3────►200├───┐      ┌─────────────────┐   ┌─▼─────┐               │          
+///   └───────────┘   └─────►│rowid=200,k=3,v=4├──►│k=1,v=2├───────────────┘          
+///                          └─────────────────┘   └───────┘                          
+pub struct IndexBranch {
+    pub key: SelectKey,
+    pub cts: TrxID,
+    pub entry: RowUndoRef,
+    pub undo_vals: Vec<UpdateCol>,
+}
+
+pub struct RowUndoHead {
+    pub next: NextRowUndo,
+    // If a purge thread purge some logs from this chain,
+    // it will increase this field, so another thread may
+    // skip if it has been already processed.
+    pub purge_ts: TrxID,
+}
+
+impl RowUndoHead {
+    /// Returns timestamp of undo head.
+    #[inline]
+    pub fn ts(&self) -> TrxID {
+        self.next.main.status.ts()
+    }
+
+    #[inline]
+    pub fn preparing(&self) -> bool {
+        match &self.next.main.status {
+            UndoStatus::Ref(status) => status.preparing(),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    pub fn prepare_notify(&self) -> Option<Notify> {
+        match &self.next.main.status {
+            UndoStatus::Ref(status) => status.prepare_notify(),
+            _ => None,
+        }
+    }
+}
+
+impl RowUndoHead {
+    #[inline]
+    pub fn new(status: Arc<SharedTrxStatus>, entry: RowUndoRef) -> Self {
+        RowUndoHead {
+            next: NextRowUndo {
+                main: MainBranch {
+                    entry,
+                    status: UndoStatus::Ref(status),
+                },
+                indexes: vec![],
+            },
+            purge_ts: MIN_SNAPSHOT_TS,
+        }
+    }
+}
+
+unsafe impl Send for RowUndoHead {}
 
 #[cfg(test)]
 mod tests {

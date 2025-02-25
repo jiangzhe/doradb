@@ -142,6 +142,15 @@ impl TableSchema {
             .iter()
             .any(|uc| self.user_index_cols.contains(&uc.idx))
     }
+
+    #[inline]
+    pub fn match_key(&self, key: &SelectKey, row: &[Val]) -> bool {
+        let keys = &self.indexes[key.index_no].keys;
+        debug_assert!(keys.len() == key.vals.len());
+        keys.iter()
+            .zip(&key.vals)
+            .all(|(key, val)| &row[key.user_col_idx as usize] == val)
+    }
 }
 
 #[inline]

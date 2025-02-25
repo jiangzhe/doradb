@@ -27,7 +27,7 @@ use crate::notify::{Notify, Signal};
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoBin, RedoEntry, RedoKind, RedoLog};
-use crate::trx::undo::{IndexPurge, IndexUndoLogs, RowUndoLogs};
+use crate::trx::undo::{IndexPurge, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -172,8 +172,11 @@ impl ActiveTrx {
     }
 
     #[inline]
-    pub fn is_same_trx(&self, other: &SharedTrxStatus) -> bool {
-        std::ptr::addr_eq(self.status.as_ref(), other)
+    pub fn is_same_trx(&self, undo_head: &RowUndoHead) -> bool {
+        match &undo_head.next.main.status {
+            UndoStatus::Ref(arc) => std::ptr::addr_eq(self.status.as_ref(), arc.as_ref()),
+            _ => false,
+        }
     }
 
     #[inline]

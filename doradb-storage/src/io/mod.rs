@@ -495,5 +495,7 @@ mod tests {
             println!("key={}, res={:?}", key, res);
         });
         aio_mgr.drop_sparse_file(file);
+        // for test, we just remove this file
+        let _ = std::fs::remove_file("test.txt");
     }
 }

@@ -9,20 +9,16 @@ use crate::catalog::{IndexSchema, TableSchema};
 use crate::index::{BlockIndex, RowLocation, SecondaryIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, InsertMvcc, InsertRow, MoveLinkForIndex, ReadRow, SelectKey,
-    SelectMvcc, SelectResult, SelectUncommitted, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc,
-    UpdateRow,
+    DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, SelectKey, SelectMvcc,
+    UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
 };
-use crate::row::Row;
-use crate::row::{estimate_max_row_count, RowID, RowPage, RowRead};
+use crate::row::{estimate_max_row_count, var_len_for_insert, Row, RowID, RowPage, RowRead};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoEntry, RedoKind};
-use crate::trx::row::{RowLatestStatus, RowReadAccess, RowWriteAccess};
+use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
 use crate::trx::undo::{
-    IndexUndo, IndexUndoKind, NextRowUndo, NextRowUndoStatus, NextTrxCTS, OwnedRowUndo,
-    RowUndoBranch, RowUndoHead, RowUndoKind, RowUndoRef,
+    IndexUndo, IndexUndoKind, MainBranch, NextRowUndo, RowUndoKind, UndoStatus,
 };
-use crate::trx::{trx_is_committed, ActiveTrx, TrxID};
 use crate::value::{Val, PAGE_VAR_LEN_INLINE};
 use std::collections::HashSet;
 use std::mem;
@@ -43,15 +39,19 @@ pub type TableID = u64;
 ///
 /// 2. block index stores mapping from row id to page.
 ///
-/// 3. Buffer pool take care of creating and fetching pages.
+/// 3. Buffer pool takes care of creating and fetching pages.
 ///
 /// 4. Row page stores latest version fo row data.
 ///
 /// 5. Undo map stores old versions of row data.
 ///
 /// We have a separate undo array associated to each row in row page.
-/// The undo head also acts as the (logical) row lock, so that transactions
-/// can abort/wait if write conflict is found on acquire lock of undo head.
+///
+/// The undo head also acts as *physical* row lock, so that threads need to
+/// synchronize the row access.
+///
+/// Undo entry with uncommitted timestamp represents *logical* row lock and
+/// only released once transaction commits.
 ///
 /// Insert/update/delete operation will add one or more undo entry to the
 /// chain linked to undo head.
@@ -115,7 +115,7 @@ impl<P: BufferPool> Table<P> {
                     .zip(user_read_set.iter().skip(1))
                     .all(|(l, r)| l < r)
         });
-        loop {
+        let (page_guard, row_id) = loop {
             match self.sec_idx[key.index_no]
                 .unique()
                 .unwrap()
@@ -129,29 +129,22 @@ impl<P: BufferPool> Table<P> {
                         let page_guard =
                             buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
                         let page_guard = page_guard.block_until_shared();
-                        if !validate_page_id(&page_guard, page_id) {
-                            continue;
+                        if validate_page_id(&page_guard, page_id) {
+                            break (page_guard, row_id);
                         }
-                        let page = page_guard.page();
-                        if !page.row_id_in_valid_range(row_id) {
-                            return SelectMvcc::NotFound;
-                        }
-                        let row_idx = page.row_idx(row_id);
-                        let access = self
-                            .lock_row_for_read(&stmt.trx, &page_guard, row_idx)
-                            .await;
-                        return match access.read_row_mvcc(
-                            &stmt.trx,
-                            &self.schema,
-                            user_read_set,
-                            key,
-                        ) {
-                            ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
-                            ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
-                        };
                     }
                 },
             }
+        };
+        let page = page_guard.page();
+        if !page.row_id_in_valid_range(row_id) {
+            return SelectMvcc::NotFound;
+        }
+        // MVCC read does not require row lock.
+        let access = page_guard.read_row_by_id(row_id);
+        match access.read_row_mvcc(&stmt.trx, &self.schema, user_read_set, key) {
+            ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
+            ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
         }
     }
 
@@ -169,7 +162,7 @@ impl<P: BufferPool> Table<P> {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.schema.indexes[key.index_no].unique);
         debug_assert!(self.schema.index_layout_match(key.index_no, &key.vals));
-        loop {
+        let (page_guard, row_id) = loop {
             match self.sec_idx[key.index_no]
                 .unique()
                 .unwrap()
@@ -183,27 +176,27 @@ impl<P: BufferPool> Table<P> {
                         let page_guard =
                             buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
                         let page_guard = page_guard.block_until_shared();
-                        if !validate_page_id(&page_guard, page_id) {
-                            continue;
+                        if validate_page_id(&page_guard, page_id) {
+                            break (page_guard, row_id);
                         }
-                        let page = page_guard.page();
-                        if !page.row_id_in_valid_range(row_id) {
-                            return None;
-                        }
-                        let access = page_guard.read_row_by_id(row_id);
-                        let row = access.row();
-                        // latest version in row page.
-                        if row.is_deleted() {
-                            return None;
-                        }
-                        if row.is_key_different(&self.schema, key) {
-                            return None;
-                        }
-                        return Some(row_action(row));
                     }
                 },
             }
+        };
+        let page = page_guard.page();
+        if !page.row_id_in_valid_range(row_id) {
+            return None;
         }
+        let access = page_guard.read_row_by_id(row_id);
+        let row = access.row();
+        // latest version in row page.
+        if row.is_deleted() {
+            return None;
+        }
+        if row.is_key_different(&self.schema, key) {
+            return None;
+        }
+        Some(row_action(row))
     }
 
     /// Insert row with MVCC.
@@ -221,7 +214,6 @@ impl<P: BufferPool> Table<P> {
                 .enumerate()
                 .all(|(idx, val)| self.schema.user_col_type_match(idx, val))
         });
-        // let key = cols[self.schema.user_key_idx()].clone();
         let keys = self.schema.keys_for_insert(&cols);
         // insert row into page with undo log linked.
         let (row_id, page_guard) = self
@@ -230,13 +222,17 @@ impl<P: BufferPool> Table<P> {
         // insert index
         for key in keys {
             if self.schema.indexes[key.index_no].unique {
-                match self
+                let res = self
                     .insert_unique_index(buf_pool, stmt, key, row_id, &page_guard)
-                    .await
-                {
+                    .await;
+                match res {
                     InsertIndex::Ok => (),
-                    InsertIndex::DuplicateKey => return InsertMvcc::DuplicateKey,
-                    InsertIndex::WriteConflict => return InsertMvcc::WriteConflict,
+                    InsertIndex::DuplicateKey => {
+                        return InsertMvcc::DuplicateKey;
+                    }
+                    InsertIndex::WriteConflict => {
+                        return InsertMvcc::WriteConflict;
+                    }
                 }
             } else {
                 todo!()
@@ -260,89 +256,79 @@ impl<P: BufferPool> Table<P> {
         debug_assert!(self.schema.indexes[key.index_no].unique);
         debug_assert!(self.schema.index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
-        loop {
+        let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
                 None => return UpdateMvcc::NotFound,
-                Some(row_id) => {
-                    match self.blk_idx.find_row_id(buf_pool, row_id).await {
-                        RowLocation::NotFound => return UpdateMvcc::NotFound,
-                        RowLocation::ColSegment(..) => todo!(),
-                        RowLocation::RowPage(page_id) => {
-                            let page = buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
-                            let page_guard = page.block_until_shared();
-                            if !validate_page_id(&page_guard, page_id) {
-                                continue;
-                            }
-                            let res = self
-                                .update_row_inplace(stmt, page_guard, key, row_id, update)
-                                .await;
-                            return match res {
-                                UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
-                                    debug_assert!(row_id == new_row_id);
-                                    if !index_change_cols.is_empty() {
-                                        // index may change, we should check whether each index key change and update correspondingly.
-                                        return match self
-                                            .update_indexes_only_key_change(
-                                                buf_pool,
-                                                stmt,
-                                                row_id,
-                                                &page_guard,
-                                                &index_change_cols,
-                                            )
-                                            .await
-                                        {
-                                            UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                                            UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                                            UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
-                                        };
-                                    } // otherwise, do nothing
-                                    UpdateMvcc::Ok(row_id)
-                                }
-                                UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => {
-                                    UpdateMvcc::NotFound
-                                }
-                                UpdateRowInplace::WriteConflict => UpdateMvcc::WriteConflict,
-                                UpdateRowInplace::NoFreeSpace(
-                                    old_row_id,
-                                    old_row,
-                                    update,
-                                    old_guard,
-                                ) => {
-                                    // in-place update failed, we transfer update into
-                                    // move+update.
-                                    let (new_row_id, index_change_cols, new_guard) = self
-                                        .move_update_for_space(
-                                            buf_pool, stmt, old_row, update, old_row_id, old_guard,
-                                        )
-                                        .await;
-                                    if !index_change_cols.is_empty() {
-                                        match self
-                                            .update_indexes_may_both_change(
-                                                buf_pool,
-                                                stmt,
-                                                old_row_id,
-                                                new_row_id,
-                                                &index_change_cols,
-                                                &new_guard,
-                                            )
-                                            .await
-                                        {
-                                            UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                                            UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                                            UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
-                                        }
-                                    } else {
-                                        match self.update_indexes_only_row_id_change(
-                                            stmt, old_row_id, new_row_id, &new_guard,
-                                        ) {
-                                            UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                                            UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                                            UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
-                                        }
-                                    }
-                                }
-                            };
+                Some(row_id) => match self.blk_idx.find_row_id(buf_pool, row_id).await {
+                    RowLocation::NotFound => return UpdateMvcc::NotFound,
+                    RowLocation::ColSegment(..) => todo!(),
+                    RowLocation::RowPage(page_id) => {
+                        let page = buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
+                        let page_guard = page.block_until_shared();
+                        if validate_page_id(&page_guard, page_id) {
+                            break (page_guard, row_id);
                         }
+                    }
+                },
+            }
+        };
+        let res = self
+            .update_row_inplace(stmt, page_guard, key, row_id, update)
+            .await;
+        match res {
+            UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
+                debug_assert!(row_id == new_row_id);
+                if !index_change_cols.is_empty() {
+                    // Index may change, we should check whether each index key change and update correspondingly.
+                    let res = self
+                        .update_indexes_only_key_change(
+                            buf_pool,
+                            stmt,
+                            row_id,
+                            &page_guard,
+                            &index_change_cols,
+                        )
+                        .await;
+                    return match res {
+                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
+                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
+                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                    };
+                } // otherwise, do nothing
+                UpdateMvcc::Ok(row_id)
+            }
+            UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => UpdateMvcc::NotFound,
+            UpdateRowInplace::WriteConflict => UpdateMvcc::WriteConflict,
+            UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
+                // in-place update failed, we transfer update into
+                // move+update.
+                let (new_row_id, index_change_cols, new_guard) = self
+                    .move_update_for_space(buf_pool, stmt, old_row, update, old_row_id, old_guard)
+                    .await;
+                if !index_change_cols.is_empty() {
+                    let res = self
+                        .update_indexes_may_both_change(
+                            buf_pool,
+                            stmt,
+                            old_row_id,
+                            new_row_id,
+                            &index_change_cols,
+                            &new_guard,
+                        )
+                        .await;
+                    match res {
+                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
+                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
+                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                    }
+                } else {
+                    let res = self.update_indexes_only_row_id_change(
+                        stmt, old_row_id, new_row_id, &new_guard,
+                    );
+                    match res {
+                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
+                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
+                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
                     }
                 }
             }
@@ -362,7 +348,7 @@ impl<P: BufferPool> Table<P> {
         debug_assert!(self.schema.indexes[key.index_no].unique);
         debug_assert!(self.schema.index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
-        loop {
+        let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
                 None => return DeleteMvcc::NotFound,
                 Some(row_id) => match self.blk_idx.find_row_id(buf_pool, row_id).await {
@@ -371,23 +357,23 @@ impl<P: BufferPool> Table<P> {
                     RowLocation::RowPage(page_id) => {
                         let page = buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
                         let page_guard = page.block_until_shared();
-                        if !validate_page_id(&page_guard, page_id) {
-                            continue;
+                        if validate_page_id(&page_guard, page_id) {
+                            break (page_guard, row_id);
                         }
-                        return match self
-                            .delete_row_internal(stmt, page_guard, row_id, key)
-                            .await
-                        {
-                            DeleteInternal::NotFound => DeleteMvcc::NotFound,
-                            DeleteInternal::WriteConflict => DeleteMvcc::WriteConflict,
-                            DeleteInternal::Ok(page_guard) => {
-                                // defer index deletion with index undo log.
-                                self.defer_delete_indexes(stmt, row_id, page_guard);
-                                DeleteMvcc::Ok
-                            }
-                        };
                     }
                 },
+            }
+        };
+        match self
+            .delete_row_internal(stmt, page_guard, row_id, key)
+            .await
+        {
+            DeleteInternal::NotFound => DeleteMvcc::NotFound,
+            DeleteInternal::WriteConflict => DeleteMvcc::WriteConflict,
+            DeleteInternal::Ok(page_guard) => {
+                // defer index deletion with index undo log.
+                self.defer_delete_indexes(stmt, row_id, page_guard);
+                DeleteMvcc::Ok
             }
         }
     }
@@ -403,20 +389,12 @@ impl<P: BufferPool> Table<P> {
     /// key is not found on the path of undo chain, it means the index entry can be
     /// removed.
     #[inline]
-    pub async fn delete_index(
-        &self,
-        buf_pool: P,
-        key: &SelectKey,
-        row_id: RowID,
-        min_active_sts: TrxID,
-    ) -> bool {
+    pub async fn delete_index(&self, buf_pool: P, key: &SelectKey, row_id: RowID) -> bool {
         // todo: consider index drop.
         let index_schema = &self.schema.indexes[key.index_no];
         if index_schema.unique {
             let index = self.sec_idx[key.index_no].unique().unwrap();
-            return self
-                .delete_unique_index(buf_pool, index, key, row_id, min_active_sts)
-                .await;
+            return self.delete_unique_index(buf_pool, index, key, row_id).await;
         }
         todo!()
     }
@@ -428,9 +406,8 @@ impl<P: BufferPool> Table<P> {
         index: &dyn UniqueIndex,
         key: &SelectKey,
         row_id: RowID,
-        min_active_sts: TrxID,
     ) -> bool {
-        loop {
+        let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
                 None => return false, // Another thread deleted this entry.
                 Some(index_row_id) => {
@@ -450,36 +427,22 @@ impl<P: BufferPool> Table<P> {
                                 .get_page(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .block_until_shared();
-                            if !validate_page_row_range(&page_guard, page_id, row_id) {
-                                continue;
-                            }
-                            let access = page_guard.read_row_by_id(row_id);
-                            // check if row is invisible
-                            match access.latest_status() {
-                                RowLatestStatus::NotFound => {
-                                    return index.compare_delete(&key.vals, row_id);
-                                }
-                                RowLatestStatus::Uncommitted => {
-                                    // traverse version chain to see if any visible version matches
-                                    // the input key.
-                                    todo!()
-                                }
-                                RowLatestStatus::Committed(cts, deleted) => {
-                                    if cts < min_active_sts && deleted {
-                                        if deleted {
-                                            return index.compare_delete(&key.vals, row_id);
-                                        }
-                                    }
-                                    // traverse version chain to see if any visible version matches
-                                    // the input key.
-                                    todo!()
-                                }
+                            if validate_page_row_range(&page_guard, page_id, row_id) {
+                                break (page_guard, row_id);
                             }
                         }
                     }
                 }
             }
+        };
+        let access = page_guard.read_row_by_id(row_id);
+        // To safely delete an index entry, we need to make sure
+        // no version with matched keys can be found in either page
+        // data or version chain.
+        if !access.any_version_matches_key(&self.schema, key) {
+            return index.compare_delete(&key.vals, row_id);
         }
+        false
     }
 
     /// Move update is similar to a delete+insert.
@@ -534,86 +497,61 @@ impl<P: BufferPool> Table<P> {
         (new_row_id, index_change_cols, new_guard)
     }
 
-    /// Move insert is similar to a delete+insert.
-    /// But it triggered by duplicate key finding when updating index.
-    /// The insert is already done and we additionally add a move entry to the
-    /// already deleted version.
-    /// Note: key of old row and new row must be identical, so we can directly
-    /// use new key to build reborn branch in undo chain.
+    /// Link old version for index.
+    /// This is a special operation for unique index maintainance.
+    /// It's triggered by duplicate key finding when updating index.
+    ///
+    /// There are two cases:
+    /// 1. The old row is deleted.
+    /// In this case, the old row must be committed and the DELETE undo
+    /// entry is not purged so some other transaction is still able to
+    /// see a non-deleted version.
+    /// We need to link new row(via undo head) to the DELETE entry.
+    ///
+    /// 2. The old row is updated with another key but one of its
+    /// old versions matches the key.
+    /// In this case, the old row must be committed.
+    /// We need to find the key-match version, and can link new row
+    /// to it.
     #[inline]
-    async fn move_link_for_index(
+    async fn link_for_unique_index(
         &self,
         buf_pool: P,
-        stmt: &mut Statement,
-        row_id: RowID,
+        stmt: &Statement,
+        old_id: RowID,
         key: &SelectKey,
         new_id: RowID,
         new_guard: &PageSharedGuard<'static, RowPage>,
-    ) -> MoveLinkForIndex {
-        loop {
-            match self.blk_idx.find_row_id(buf_pool, row_id).await {
-                RowLocation::NotFound => return MoveLinkForIndex::None,
+    ) -> LinkForUniqueIndex {
+        debug_assert!(old_id != new_id);
+        let (old_guard, old_id) = loop {
+            match self.blk_idx.find_row_id(buf_pool, old_id).await {
+                RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::ColSegment(..) => todo!(),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = buf_pool
+                    let old_guard = buf_pool
                         .get_page(page_id, LatchFallbackMode::Shared)
                         .await
                         .block_until_shared();
-                    if !validate_page_row_range(&page_guard, page_id, row_id) {
-                        continue;
-                    }
-                    let row_idx = page_guard.page().row_idx(row_id);
-                    let mut lock_row = self
-                        .lock_row_for_write(&stmt.trx, &page_guard, row_idx, &key, false)
-                        .await;
-                    match &mut lock_row {
-                        LockRowForWrite::InvalidIndex => {
-                            unreachable!("move link operation does not validate index");
-                        }
-                        LockRowForWrite::WriteConflict => return MoveLinkForIndex::WriteConflict,
-                        LockRowForWrite::Ok(access, old_cts) => {
-                            let mut access = access.take().unwrap();
-                            // Move for index requires old row has been deleted.
-                            if !access.row().is_deleted() {
-                                return MoveLinkForIndex::DuplicateKey;
-                            }
-                            debug_assert!(!access.row().is_key_different(&self.schema, key));
-                            let old_cts = mem::take(old_cts);
-                            let mut move_entry = OwnedRowUndo::new(
-                                self.table_id,
-                                page_id,
-                                row_id,
-                                RowUndoKind::Move(true),
-                            );
-                            access.build_undo_chain(&stmt.trx, &mut move_entry, old_cts);
-                            drop(access); // unlock the row.
-                            drop(lock_row);
-                            drop(page_guard); // unlock the page.
-
-                            // Here we re-lock new row and link new entry to move entry.
-                            // In this way, we can make sure no other thread can access new entry pointer
-                            // so the update of next pointer is safe.
-                            //
-                            // key validation is unneccessary because they must match.
-                            let new_idx = new_guard.page().row_idx(new_id);
-                            let lock_new = self
-                                .lock_row_for_write(&stmt.trx, &new_guard, new_idx, &key, false)
-                                .await;
-                            let (new_access, _) =
-                                lock_new.ok().expect("lock new row to link move entry");
-                            debug_assert!(new_access.is_some());
-                            let mut new_entry = stmt.row_undo.pop().expect("new entry to link");
-                            link_move_entry(&mut new_entry, move_entry.leak(), Some(key.clone()));
-
-                            drop(new_access); // unlock new row
-
-                            stmt.row_undo.push(move_entry);
-                            stmt.row_undo.push(new_entry);
-                            // no redo required, because no change on row data.
-                            return MoveLinkForIndex::Ok;
-                        }
+                    if validate_page_row_range(&old_guard, page_id, old_id) {
+                        break (old_guard, old_id);
                     }
                 }
+            }
+        };
+        // The link process is to find one version of the old row that matches
+        // given key and then link new row to it.
+        let old_access = old_guard.write_row_by_id(old_id);
+        match old_access.find_old_version_for_unique_key(&self.schema, key, &stmt.trx) {
+            FindOldVersion::None => LinkForUniqueIndex::Ok,
+            FindOldVersion::DuplicateKey => LinkForUniqueIndex::DuplicateKey,
+            FindOldVersion::WriteConflict => LinkForUniqueIndex::WriteConflict,
+            FindOldVersion::Ok(old_row, cts, old_entry) => {
+                // row latch is enough, because row lock is already acquired.
+                let mut new_access = new_guard.write_row_by_id(new_id);
+                let undo_vals = new_access.row().calc_delta(&self.schema, &old_row);
+                new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
+                LinkForUniqueIndex::Ok
             }
         }
     }
@@ -665,59 +603,81 @@ impl<P: BufferPool> Table<P> {
         });
 
         let page_id = page_guard.page_id();
-        match page_guard.page().insert(&self.schema, &insert) {
-            InsertRow::Ok(row_id) => {
-                let row_idx = page_guard.page().row_idx(row_id);
-                let mut access = page_guard.write_row(row_idx);
-                // create undo log.
-                let mut new_entry = OwnedRowUndo::new(self.table_id, page_id, row_id, undo_kind);
-                // The MOVE undo entry is for MOVE+UPDATE.
-                // Once update in-place fails, we convert the update operation to insert.
-                // and link them together.
-                if let Some((old_id, old_guard)) = move_entry {
-                    let old_row_idx = old_guard.page().row_idx(old_id);
-                    // Here we actually lock both new row and old row,
-                    // not very sure if this will cause dead-lock.
-                    //
-                    let access = old_guard.write_row(old_row_idx);
-                    debug_assert!({
-                        access.undo_head().is_some()
-                            && stmt
-                                .trx
-                                .is_same_trx(&access.undo_head().as_ref().unwrap().status)
-                    });
+        let page = page_guard.page();
+        debug_assert!(self.schema.col_count() == page.header.col_count as usize);
+        // insert row does not include RowID, as RowID is auto-generated.
+        debug_assert!(insert.len() + 1 == page.header.col_count as usize);
 
-                    // re-lock moved row and link new entry to it.
-                    let move_entry = access.first_undo_entry().unwrap();
-                    link_move_entry(&mut new_entry, move_entry, None);
-                }
-
-                debug_assert!(access.undo_head().is_none());
-                access.build_undo_chain(&stmt.trx, &mut new_entry, NextTrxCTS::None);
-                drop(access);
-                // Here we do not unlock the page because we need to verify validity of unique index update
-                // according to this insert.
-                // There might be scenario that a deleted row shares the same key with this insert.
-                // Then we have to mark it as MOVE and point insert undo's next version to it.
-                // So hold the page guard in order to re-lock the insert undo fast.
-                stmt.row_undo.push(new_entry);
-                // create redo log.
-                // even if the operation is move+update, we still treat it as insert redo log.
-                // because redo is only useful when recovering and no version chain is required
-                // during recovery.
-                let redo_entry = RedoEntry {
-                    page_id,
-                    row_id,
-                    kind: RedoKind::Insert(insert),
-                };
-                // store redo log into transaction redo buffer.
-                stmt.redo.push(redo_entry);
-                InsertRowIntoPage::Ok(row_id, page_guard)
-            }
-            InsertRow::NoFreeSpaceOrRowID => {
-                InsertRowIntoPage::NoSpaceOrRowID(insert, undo_kind, move_entry)
+        let var_len = var_len_for_insert(&self.schema, &insert);
+        let (row_idx, var_offset) =
+            if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
+                (row_idx, var_offset)
+            } else {
+                return InsertRowIntoPage::NoSpaceOrRowID(insert, undo_kind, move_entry);
+            };
+        // Before real insert, we need to lock the row.
+        let row_id = page.header.start_row_id + row_idx as u64;
+        let mut access = page_guard.write_row(row_idx);
+        access.lock_undo(stmt, &self.schema, self.table_id, page_id, row_id, None);
+        // Apply insert
+        let mut new_row = page.new_row(row_idx as usize, var_offset);
+        for v in &insert {
+            match v {
+                Val::Null => new_row.add_null(),
+                Val::Byte1(v1) => new_row.add_val(*v1),
+                Val::Byte2(v2) => new_row.add_val(*v2),
+                Val::Byte4(v4) => new_row.add_val(*v4),
+                Val::Byte8(v8) => new_row.add_val(*v8),
+                Val::VarByte(var) => new_row.add_var(var.as_bytes()),
             }
         }
+        let new_row_id = new_row.finish();
+        debug_assert!(new_row_id == row_id);
+        stmt.update_last_undo(undo_kind);
+        // Here we do not release row latch because we may need to link MOVE entry.
+
+        // The MOVE undo entry is for MOVE+UPDATE.
+        // Once update in-place fails, we convert the update operation to insert.
+        // and link them together.
+        if let Some((old_id, old_guard)) = move_entry {
+            // Here we actually lock both new row and old row,
+            // not very sure if this will cause dead-lock.
+            let old_access = old_guard.write_row_by_id(old_id);
+            debug_assert!({ old_access.undo_head().is_some() });
+            debug_assert!(stmt
+                .trx
+                .is_same_trx(&old_access.undo_head().as_ref().unwrap()));
+            // re-lock moved row and link new entry to it.
+            let move_entry = old_access.first_undo_entry().unwrap();
+            let new_entry = stmt.row_undo.last_mut().unwrap();
+            debug_assert!(matches!(move_entry.as_ref().kind, RowUndoKind::Move(_)));
+            debug_assert!(matches!(new_entry.kind, RowUndoKind::Update(_)));
+            debug_assert!(new_entry.next.is_none());
+            new_entry.next.replace(NextRowUndo::new(MainBranch {
+                entry: move_entry,
+                status: UndoStatus::Ref(stmt.trx.status()),
+            }));
+        }
+        drop(access);
+        // Here we do not unlock the page because we need to verify validity of unique index update
+        // according to this insert.
+        // There might be scenario that a deleted row or old version of updated row shares the same
+        // key with this insert.
+        // Then we have to link insert's undo head to that version via *INDEX* branch.
+        // Hold the page guard in order to re-lock the undo head fast.
+        //
+        // create redo log.
+        // even if the operation is move+update, we still treat it as insert redo log.
+        // because redo is only useful when recovering and no version chain is required
+        // during recovery.
+        let redo_entry = RedoEntry {
+            page_id,
+            row_id,
+            kind: RedoKind::Insert(insert),
+        };
+        // store redo log into transaction redo buffer.
+        stmt.redo.push(redo_entry);
+        InsertRowIntoPage::Ok(row_id, page_guard)
     }
 
     #[inline]
@@ -756,38 +716,33 @@ impl<P: BufferPool> Table<P> {
         {
             return UpdateRowInplace::RowNotFound;
         }
-        let row_idx = (row_id - page.header.start_row_id) as usize;
         let mut lock_row = self
-            .lock_row_for_write(&stmt.trx, &page_guard, row_idx, key, true)
+            .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => return UpdateRowInplace::RowNotFound,
             LockRowForWrite::WriteConflict => return UpdateRowInplace::WriteConflict,
-            LockRowForWrite::Ok(access, old_cts) => {
+            LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }
-                let old_cts = mem::take(old_cts);
                 match access.update_row(&self.schema, &update) {
                     UpdateRow::NoFreeSpace(old_row) => {
-                        // page does not have enough space for update, we need to switch
+                        // Page does not have enough space for update, we need to switch
                         // to out-of-place update mode, which will add a MOVE undo entry
                         // to end original row and perform a INSERT into new page, and
                         // link the two versions.
-                        let mut new_entry = OwnedRowUndo::new(
-                            self.table_id,
-                            page_id,
-                            row_id,
-                            RowUndoKind::Move(false),
-                        );
-                        access.build_undo_chain(&stmt.trx, &mut new_entry, old_cts);
+                        //
+                        // Mark page data as deleted
+                        access.delete_row();
+                        // Update LOCK entry to MOVE entry.
+                        stmt.update_last_undo(RowUndoKind::Move(false));
                         drop(access); // unlock row
                         drop(lock_row);
                         // Here we do not unlock page because we need to perform MOVE+UPDATE
                         // and link undo entries of two rows.
                         // The re-lock of current undo is required.
-                        stmt.row_undo.push(new_entry);
                         let redo_entry = RedoEntry {
                             page_id,
                             row_id,
@@ -827,17 +782,11 @@ impl<P: BufferPool> Table<P> {
                                 });
                             }
                         }
-                        let mut new_entry = OwnedRowUndo::new(
-                            self.table_id,
-                            page_id,
-                            row_id,
-                            RowUndoKind::Update(undo_cols),
-                        );
-                        access.build_undo_chain(&stmt.trx, &mut new_entry, old_cts);
+                        // Update LOCK entry to UPDATE entry.
+                        stmt.update_last_undo(RowUndoKind::Update(undo_cols));
                         drop(access); // unlock the row.
                         drop(lock_row);
                         // we may still need this page if we'd like to update index.
-                        stmt.row_undo.push(new_entry);
                         if !redo_cols.is_empty() {
                             // there might be nothing to update, so we do not need to add redo log.
                             // but undo is required because we need to properly lock the row.
@@ -868,26 +817,23 @@ impl<P: BufferPool> Table<P> {
         if !page.row_id_in_valid_range(row_id) {
             return DeleteInternal::NotFound;
         }
-        let row_idx = page.row_idx(row_id);
         let mut lock_row = self
-            .lock_row_for_write(&stmt.trx, &page_guard, row_idx, key, true)
+            .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => return DeleteInternal::NotFound,
             LockRowForWrite::WriteConflict => return DeleteInternal::WriteConflict,
-            LockRowForWrite::Ok(access, old_cts) => {
+            LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
                 if access.row().is_deleted() {
                     return DeleteInternal::NotFound;
                 }
                 access.delete_row();
-                let mut new_entry =
-                    OwnedRowUndo::new(self.table_id, page_id, row_id, RowUndoKind::Delete);
-                access.build_undo_chain(&stmt.trx, &mut new_entry, mem::take(old_cts));
+                // update LOCK entry to DELETE entry.
+                stmt.update_last_undo(RowUndoKind::Delete);
                 drop(access); // unlock row
                 drop(lock_row);
                 // hold page lock in order to update index later.
-                stmt.row_undo.push(new_entry);
                 // create redo log
                 let redo_entry = RedoEntry {
                     page_id,
@@ -927,87 +873,33 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn lock_row_for_write<'a>(
         &self,
-        trx: &ActiveTrx,
+        stmt: &mut Statement,
         page_guard: &'a PageSharedGuard<'static, RowPage>,
-        row_idx: usize,
-        key: &SelectKey,
-        validate_key: bool,
+        row_id: RowID,
+        key: Option<&SelectKey>,
     ) -> LockRowForWrite<'a> {
         loop {
-            let mut access = page_guard.write_row(row_idx);
-            let (row, undo_head) = access.row_and_undo_mut();
-            match undo_head {
-                None => {
-                    let head = RowUndoHead {
-                        status: trx.status(),
-                        entry: None, // currently we don't have undo entry to insert.
-                    };
-                    *undo_head = Some(head); // lock the row.
-                    return LockRowForWrite::Ok(Some(access), NextTrxCTS::None);
+            let mut access = page_guard.write_row_by_id(row_id);
+            let lock_undo = access.lock_undo(
+                stmt,
+                &self.schema,
+                self.table_id,
+                page_guard.page_id(),
+                row_id,
+                key,
+            );
+            match lock_undo {
+                LockUndo::Ok => {
+                    return LockRowForWrite::Ok(Some(access));
                 }
-                Some(head) => {
-                    if trx.is_same_trx(head.status.as_ref()) {
-                        // Locked by itself
-                        return LockRowForWrite::Ok(Some(access), NextTrxCTS::Myself);
-                    }
-                    let ts = head.status.ts();
-                    if trx_is_committed(ts) {
-                        // This row is committed, no lock conflict.
-                        // Check whether the row is valid through index lookup.
-                        // There might be case an out-of-date index entry pointing to the
-                        // latest version of the row which has different key other than index.
-                        //
-                        // For example, assume:
-                        //
-                        // 1. one row with row_id=100, k=200 is inserted.
-                        //    Then index has entry k(200) -> row_id(100).
-                        //
-                        // 2. update row set k=300.
-                        //    If in-place update is available, we will reuse row_id=100, and
-                        //    just update its key to 300.
-                        //    So in index, we have two entries: k(200) -> row_id(100),
-                        //    k(300) -> row_id(100).
-                        //    The first entry is supposed to be linked to the old version, and
-                        //    second entry to new version.
-                        //    But in our design, both of them point to latest version and
-                        //    we need to traverse the version chain to find correct(visible)
-                        //    version.
-                        //
-                        // 3. insert one row with row_id=101, k=200.
-                        //    Now we need to identify k=200 is actually out-of-date index entry,
-                        //    and just skip it.
-                        //
-                        // argument validate_key indicates whether we should perform the validation.
-                        // When we chain deleted row and new row with same key, we may need to
-                        // skip the validation.
-                        //
-                        // For example:
-                        //
-                        // 1. One row[row_id=100, k=1] inserted.
-                        //
-                        // 2. Update k to 2. so row becomes [row_id=100, k=2].
-                        //
-                        // 3. Delete it. [row_id=100, k=2, deleted].
-                        //
-                        // 4. Insert k=1 again. We will find index entry k=1 already
-                        //    pointed to deleted row [row_id=100, k=2].
-                        //    Now we should not validate the key.
-                        //
-                        // todo: A further optimization for this scenario is to traverse through
-                        // undo chain and check whether the same key exists in any old versions.
-                        // If not exists, we do not need to build the version chain.
-                        if validate_key && row.is_key_different(&self.schema, key) {
-                            return LockRowForWrite::InvalidIndex;
-                        }
-                        head.status = trx.status(); // lock the row.
-                        return LockRowForWrite::Ok(Some(access), NextTrxCTS::Value(ts));
-                    }
-                    if !head.status.preparing() {
-                        // uncommitted, write-write conflict.
-                        return LockRowForWrite::WriteConflict;
-                    }
-                    if let Some(notify) = head.status.prepare_notify() {
-                        // unlock row(but logical row lock is still held)
+                LockUndo::InvalidIndex => {
+                    return LockRowForWrite::InvalidIndex;
+                }
+                LockUndo::WriteConflict => {
+                    return LockRowForWrite::WriteConflict;
+                }
+                LockUndo::Preparing(notify) => {
+                    if let Some(notify) = notify {
                         drop(access);
 
                         // Here we do not unlock the page, because the preparation time of commit is supposed
@@ -1015,53 +907,6 @@ impl<P: BufferPool> Table<P> {
                         // And as active transaction is using this page, we don't want page evictor swap it onto
                         // disk.
                         // Other transactions can still access this page and modify other rows.
-
-                        let _ = notify.wait_async().await; // wait for that transaction to be committed.
-
-                        // now we get back on current page.
-                        // maybe another thread modify our row before the lock acquisition,
-                        // so we need to recheck.
-                    } // there might be progress on preparation, so recheck.
-                }
-            }
-        }
-    }
-
-    // perform non-locking read on row.
-    #[inline]
-    async fn lock_row_for_read<'a>(
-        &self,
-        trx: &ActiveTrx,
-        page_guard: &'a PageSharedGuard<'a, RowPage>,
-        row_idx: usize,
-    ) -> RowReadAccess<'a> {
-        loop {
-            let access = page_guard.read_row(row_idx);
-            match access.undo() {
-                None => return access,
-                Some(head) => {
-                    if trx.is_same_trx(head.status.as_ref()) {
-                        // Locked by itself
-                        return access;
-                    }
-                    let ts = head.status.ts();
-                    if trx_is_committed(ts) {
-                        // Because MVCC will backtrace to visible version, we do not need to check if index lookup is out-of-date here.
-                        return access;
-                    }
-                    if !head.status.preparing() {
-                        // uncommitted, write-write conflict.
-                        return access;
-                    }
-                    if let Some(notify) = head.status.prepare_notify() {
-                        // unlock row
-                        drop(access);
-                        // Even if it's non-locking read, we still need to wait for the preparation to avoid partial read.
-                        // For example:
-                        // Suppose transaction T1 is committing with CTS 100,
-                        // Transaction T2 starts with STS 101 and reads rows that are modified by T1.
-                        // If we do not block on waiting for T1, we may read one row of old version, and another
-                        // row with new version. This breaks ACID properties.
 
                         let _ = notify.wait_async().await; // wait for that transaction to be committed.
 
@@ -1104,15 +949,16 @@ impl<P: BufferPool> Table<P> {
                 // we found there is already one existing row with same key.
                 // so perform move+link.
                 debug_assert!(old_row_id != row_id);
-                return match self
-                    .move_link_for_index(buf_pool, stmt, old_row_id, &key, row_id, page_guard)
+                match self
+                    .link_for_unique_index(buf_pool, stmt, old_row_id, &key, row_id, page_guard)
                     .await
                 {
-                    MoveLinkForIndex::DuplicateKey => InsertIndex::DuplicateKey,
-                    MoveLinkForIndex::WriteConflict => InsertIndex::WriteConflict,
-                    MoveLinkForIndex::None => {
-                        // move+insert does not find old row.
-                        // so we can update index to point to self
+                    LinkForUniqueIndex::DuplicateKey => InsertIndex::DuplicateKey,
+                    LinkForUniqueIndex::WriteConflict => InsertIndex::WriteConflict,
+                    LinkForUniqueIndex::None => {
+                        // No old row found, so we can update index to point to self.
+                        // This case can happen if purge thread removed row data,
+                        // but index is not purged.
                         if !index.compare_exchange(&key.vals, old_row_id, row_id) {
                             // there is another transaction update the unique index concurrently,
                             // we can directly fail.
@@ -1123,19 +969,20 @@ impl<P: BufferPool> Table<P> {
                         stmt.index_undo.push(index_undo);
                         InsertIndex::Ok
                     }
-                    MoveLinkForIndex::Ok => {
-                        // Once move+insert is done,
-                        // we already locked both old and new row, and make undo chain linked.
-                        // So any other transaction that want to modify the index with same key
-                        // should fail because lock can not be acquired by them.
-                        let res = index.compare_exchange(&key.vals, old_row_id, row_id);
-                        assert!(res);
+                    LinkForUniqueIndex::Ok => {
+                        // There is scenario that two transactions update different rows to the same
+                        // key. Because we only search the matched version of old row but not add
+                        // logical lock on it, it's possible that both transactions are trying to
+                        // update the index. Only one should succeed and the other will fail.
+                        if !index.compare_exchange(&key.vals, old_row_id, row_id) {
+                            return InsertIndex::WriteConflict;
+                        }
                         let index_undo =
                             self.index_undo(row_id, IndexUndoKind::UpdateUnique(key, old_row_id));
                         stmt.index_undo.push(index_undo);
                         InsertIndex::Ok
                     }
-                };
+                }
             }
         }
     }
@@ -1149,18 +996,12 @@ impl<P: BufferPool> Table<P> {
         page_guard: &PageSharedGuard<'static, RowPage>,
         index_change_cols: &HashSet<usize>,
     ) -> UpdateIndex {
-        let mut access = None;
         for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
             debug_assert!(index.is_unique() == index_schema.unique);
             if index_schema.unique {
                 if index_key_is_changed(index_schema, index_change_cols) {
-                    let new_key = read_latest_index_key(
-                        &self.schema,
-                        index.index_no,
-                        page_guard,
-                        row_id,
-                        &mut access,
-                    );
+                    let new_key =
+                        read_latest_index_key(&self.schema, index.index_no, page_guard, row_id);
                     match self
                         .update_unique_index_only_key_change(
                             buf_pool,
@@ -1193,17 +1034,11 @@ impl<P: BufferPool> Table<P> {
         page_guard: &PageSharedGuard<'a, RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        let mut access = None;
         for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
             debug_assert!(index.is_unique() == index_schema.unique);
             if index_schema.unique {
-                let key = read_latest_index_key(
-                    &self.schema,
-                    index.index_no,
-                    page_guard,
-                    new_row_id,
-                    &mut access,
-                );
+                let key =
+                    read_latest_index_key(&self.schema, index.index_no, page_guard, new_row_id);
                 match self.update_unique_index_only_row_id_change(
                     stmt,
                     index.unique().unwrap(),
@@ -1233,17 +1068,11 @@ impl<P: BufferPool> Table<P> {
         page_guard: &PageSharedGuard<'static, RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        let mut access = None;
         for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
             debug_assert!(index.is_unique() == index_schema.unique);
             if index_schema.unique {
-                let key = read_latest_index_key(
-                    &self.schema,
-                    index.index_no,
-                    &page_guard,
-                    new_row_id,
-                    &mut access,
-                );
+                let key =
+                    read_latest_index_key(&self.schema, index.index_no, &page_guard, new_row_id);
                 if index_key_is_changed(index_schema, index_change_cols) {
                     // key change and row id change.
                     match self
@@ -1290,17 +1119,10 @@ impl<P: BufferPool> Table<P> {
         row_id: RowID,
         page_guard: PageSharedGuard<'a, RowPage>,
     ) {
-        let mut access = None;
         for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
             debug_assert!(index.is_unique() == index_schema.unique);
             if index_schema.unique {
-                let key = read_latest_index_key(
-                    &self.schema,
-                    index.index_no,
-                    &page_guard,
-                    row_id,
-                    &mut access,
-                );
+                let key = read_latest_index_key(&self.schema, index.index_no, &page_guard, row_id);
                 let index_undo = self.index_undo(row_id, IndexUndoKind::DeferDelete(key));
                 stmt.index_undo.push(index_undo);
             } else {
@@ -1351,13 +1173,20 @@ impl<P: BufferPool> Table<P> {
                     stmt.index_undo.push(index_undo);
                     return UpdateIndex::Ok;
                 }
-                return match self
-                    .move_link_for_index(buf_pool, stmt, index_row_id, &key, new_row_id, new_guard)
+                match self
+                    .link_for_unique_index(
+                        buf_pool,
+                        stmt,
+                        index_row_id,
+                        &key,
+                        new_row_id,
+                        new_guard,
+                    )
                     .await
                 {
-                    MoveLinkForIndex::DuplicateKey => UpdateIndex::DuplicateKey,
-                    MoveLinkForIndex::WriteConflict => UpdateIndex::WriteConflict,
-                    MoveLinkForIndex::None => {
+                    LinkForUniqueIndex::DuplicateKey => UpdateIndex::DuplicateKey,
+                    LinkForUniqueIndex::WriteConflict => UpdateIndex::WriteConflict,
+                    LinkForUniqueIndex::None => {
                         // move+insert does not find old row.
                         // so we can update index to point to self
                         if !index.compare_exchange(&key.vals, index_row_id, new_row_id) {
@@ -1370,7 +1199,7 @@ impl<P: BufferPool> Table<P> {
                         stmt.index_undo.push(index_undo);
                         UpdateIndex::Ok
                     }
-                    MoveLinkForIndex::Ok => {
+                    LinkForUniqueIndex::Ok => {
                         // Once move+insert is done,
                         // we already locked both old and new row, and make undo chain linked.
                         // So any other transaction that want to modify the index with same key
@@ -1382,7 +1211,7 @@ impl<P: BufferPool> Table<P> {
                         stmt.index_undo.push(index_undo);
                         UpdateIndex::Ok
                     }
-                };
+                }
             }
         }
     }
@@ -1443,15 +1272,22 @@ impl<P: BufferPool> Table<P> {
                     return UpdateIndex::Ok;
                 }
                 match self
-                    .move_link_for_index(buf_pool, stmt, index_row_id, &new_key, row_id, page_guard)
+                    .link_for_unique_index(
+                        buf_pool,
+                        stmt,
+                        index_row_id,
+                        &new_key,
+                        row_id,
+                        page_guard,
+                    )
                     .await
                 {
-                    MoveLinkForIndex::DuplicateKey => UpdateIndex::DuplicateKey,
-                    MoveLinkForIndex::WriteConflict => UpdateIndex::WriteConflict,
-                    MoveLinkForIndex::None => {
+                    LinkForUniqueIndex::DuplicateKey => UpdateIndex::DuplicateKey,
+                    LinkForUniqueIndex::WriteConflict => UpdateIndex::WriteConflict,
+                    LinkForUniqueIndex::None => {
                         // no old row found.
                         if !index.compare_exchange(&new_key.vals, index_row_id, row_id) {
-                            // there is another transaction update the unique index concurrently,
+                            // there is another transaction updating the unique index concurrently,
                             // we can directly fail.
                             return UpdateIndex::WriteConflict;
                         }
@@ -1460,7 +1296,7 @@ impl<P: BufferPool> Table<P> {
                         stmt.index_undo.push(index_undo);
                         UpdateIndex::Ok
                     }
-                    MoveLinkForIndex::Ok => {
+                    LinkForUniqueIndex::Ok => {
                         // Both old row(index points to) and new row are locked.
                         // we must succeed on updateing index.
                         let res = index.compare_exchange(&new_key.vals, index_row_id, row_id);
@@ -1519,38 +1355,6 @@ fn row_len(schema: &TableSchema, user_cols: &[Val]) -> usize {
     schema.fix_len + var_len
 }
 
-#[inline]
-fn link_move_entry(new_entry: &mut OwnedRowUndo, move_entry: RowUndoRef, key: Option<SelectKey>) {
-    // Here we setup reborn branch of a new inserted row to a deleted row,
-    // since they share same key and we keep index single entry pointing to new row.
-    new_entry.next.push(NextRowUndo {
-        status: NextRowUndoStatus::SameAsPrev,
-        entry: move_entry,
-        branch: RowUndoBranch::from(key),
-    });
-}
-
-enum LockRowForWrite<'a> {
-    // lock success, returns optional last commit timestamp.
-    Ok(Option<RowWriteAccess<'a>>, NextTrxCTS),
-    // lock fail, there is another transaction modifying this row.
-    WriteConflict,
-    // row is invalid through index lookup.
-    // this can happen when index entry is not garbage collected,
-    // so some old key points to new version.
-    InvalidIndex,
-}
-
-impl<'a> LockRowForWrite<'a> {
-    #[inline]
-    pub fn ok(self) -> Option<(Option<RowWriteAccess<'a>>, NextTrxCTS)> {
-        match self {
-            LockRowForWrite::Ok(access, next_cts) => Some((access, next_cts)),
-            _ => None,
-        }
-    }
-}
-
 enum InsertRowIntoPage<'a> {
     Ok(RowID, PageSharedGuard<'a, RowPage>),
     NoSpaceOrRowID(
@@ -1595,15 +1399,14 @@ fn read_latest_index_key<'a>(
     index_no: usize,
     page_guard: &'a PageSharedGuard<'a, RowPage>,
     row_id: RowID,
-    access: &mut Option<RowReadAccess<'a>>,
 ) -> SelectKey {
     let index_schema = &schema.indexes[index_no];
     let mut new_key = SelectKey::null(index_no, index_schema.keys.len());
     for (pos, key) in index_schema.keys.iter().enumerate() {
-        let row = access
-            .get_or_insert_with(|| page_guard.read_row_by_id(row_id))
-            .row();
-        let val = row.clone_user_val(schema, key.user_col_idx as usize);
+        let access = page_guard.read_row_by_id(row_id);
+        let val = access
+            .row()
+            .clone_user_val(schema, key.user_col_idx as usize);
         new_key.vals[pos] = val;
     }
     new_key

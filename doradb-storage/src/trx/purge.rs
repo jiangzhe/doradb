@@ -1,5 +1,8 @@
+use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::{Catalog, TableCache};
+use crate::latch::LatchFallbackMode;
+use crate::row::{RowID, RowPage};
 use crate::trx::log::LogPartition;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, TrxID, MAX_SNAPSHOT_TS};
@@ -101,6 +104,8 @@ impl TransactionSystem {
         (PurgeDispatcher(chans), handles)
     }
 
+    /// Purge row undo logs and index entries according to given transaction
+    /// list and minimum active STS.
     #[inline]
     pub(super) async fn purge_trx_list<P: BufferPool>(
         &self,
@@ -115,19 +120,38 @@ impl TransactionSystem {
         let purge_trx_count = trx_list.len();
         let mut purge_row_count = 0;
         let mut purge_index_count = 0;
-        for trx in trx_list {
+        // First, we collect pages and row ids to purge row undo.
+        let mut target: HashMap<PageID, HashSet<RowID>> = HashMap::new();
+        for trx in &trx_list {
             purge_row_count += trx.row_undo.len();
+            for undo in &*trx.row_undo {
+                target.entry(undo.page_id).or_default().insert(undo.row_id);
+            }
+        }
+        for (page_id, row_ids) in target {
+            let page_guard = buf_pool
+                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                .await
+                .block_until_shared();
+            for row_id in row_ids {
+                let mut access = page_guard.write_row_by_id(row_id);
+                access.purge_undo_chain(min_active_sts);
+            }
+        }
+
+        // Second, we purge index.
+        for trx in &trx_list {
             for ip in &trx.index_gc {
                 if let Some(table) = table_cache.get_table(ip.table_id) {
-                    if table
-                        .delete_index(buf_pool, &ip.key, ip.row_id, min_active_sts)
-                        .await
-                    {
+                    if table.delete_index(buf_pool, &ip.key, ip.row_id).await {
                         purge_index_count += 1;
                     }
                 }
             }
         }
+        // Finally, delete all transactions
+        drop(trx_list);
+
         partition
             .stats
             .purge_trx_count
@@ -201,16 +225,14 @@ impl LogPartition {
     /// Execute GC analysis in loop.
     /// This method is used for a separate GC analyzer thread for each log partition.
     #[inline]
-    pub fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>, enabled: bool) {
+    pub fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>) {
         while let Ok(msg) = gc_rx.recv() {
             match msg {
                 GC::Stop => return,
                 GC::Commit(trx_list) => {
-                    if enabled {
-                        let min_active_sts_may_change = self.gc_analyze(trx_list);
-                        if min_active_sts_may_change {
-                            let _ = purge_chan.send(Purge::Next);
-                        }
+                    let min_active_sts_may_change = self.gc_analyze(trx_list);
+                    if min_active_sts_may_change {
+                        let _ = purge_chan.send(Purge::Next);
                     }
                 }
             }
@@ -527,7 +549,6 @@ mod tests {
         let buf_pool = FixedBufferPool::with_capacity_static(16 * 1024 * 1024).unwrap();
         let catalog = Catalog::empty_static();
         let trx_sys = TrxSysConfig::default()
-            .gc(true)
             .purge_threads(1)
             .build_static(buf_pool, catalog);
 
@@ -598,7 +619,6 @@ mod tests {
             let buf_pool = FixedBufferPool::with_capacity_static(16 * 1024 * 1024).unwrap();
             let catalog = Catalog::empty_static();
             let trx_sys = TrxSysConfig::default()
-                .gc(true)
                 .purge_threads(2)
                 .build_static(buf_pool, catalog);
 
