@@ -10,10 +10,12 @@ use crate::trx::sys::TrxSysConfig;
 use crate::trx::{CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
 use flume::Sender;
-use parking_lot::{Condvar, Mutex, MutexGuard};
+// use parking_lot::{Condvar, Mutex, MutexGuard};
+use crate::latch::{Mutex, MutexGuard};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
 use std::os::fd::AsRawFd;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 
 pub(super) struct LogPartition {
     /// Group commit of this partition.
-    pub(super) group_commit: CachePadded<(Mutex<GroupCommit>, Condvar)>,
+    pub(super) group_commit: CachePadded<(Mutex<GroupCommit>, Signal)>,
     /// Maximum persisted CTS of this partition.
     pub(super) persisted_cts: CachePadded<AtomicU64>,
     /// Stats of transaction system.
@@ -100,7 +102,7 @@ impl LogPartition {
         let log_buf = self.buf(&redo_bin);
         let session = trx.split_session();
         let sync_signal = Signal::default();
-        let sync_notify = sync_signal.new_notify();
+        let sync_notify = sync_signal.new_notify(false);
         let new_group = CommitGroup {
             trx_list: vec![trx],
             max_cts: cts,
@@ -117,15 +119,15 @@ impl LogPartition {
 
     #[inline]
     pub(super) async fn commit(&self, trx: PreparedTrx, ts: &AtomicU64) -> Result<Session> {
-        let mut group_commit_g = self.group_commit.0.lock();
+        let mut group_commit_g = self.group_commit.0.lock_async().await;
         let cts = ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
             let (session, sync_notify) = self.create_new_group(precommit_trx, group_commit_g);
-            self.group_commit.1.notify_one(); // notify sync thread to work.
+            Signal::set_and_notify(&self.group_commit.1, 1); // notify sync thread to work.
 
-            let _ = sync_notify.wait_async().await; // wait for fsync
+            let _ = sync_notify.wait_async(false).await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
@@ -137,14 +139,14 @@ impl LogPartition {
             let (session, sync_notify) = last_group.join(precommit_trx);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
 
-            let _ = sync_notify.wait_async().await; // wait for fsync
+            let _ = sync_notify.wait_async(false).await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
 
         let (session, sync_notify) = self.create_new_group(precommit_trx, group_commit_g);
 
-        let _ = sync_notify.wait_async().await; // wait for fsync
+        let _ = sync_notify.wait_async(false).await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
         Ok(session)
     }
@@ -177,6 +179,7 @@ impl LogPartition {
         io_reqs: &mut Vec<IocbRawPtr>,
         sync_groups: &mut VecDeque<SyncGroup>,
     ) -> bool {
+        // Single thread perform IO so here we only need to use sync mutex.
         let mut group_commit_g = self.group_commit.0.lock();
         loop {
             match group_commit_g.queue.pop_front() {
@@ -197,8 +200,8 @@ impl LogPartition {
         io_reqs: &mut Vec<IocbRawPtr>,
         sync_groups: &mut VecDeque<SyncGroup>,
     ) -> bool {
-        let mut group_commit_g = self.group_commit.0.lock();
         loop {
+            let mut group_commit_g = self.group_commit.0.lock();
             loop {
                 match group_commit_g.queue.pop_front() {
                     None => break,
@@ -215,9 +218,9 @@ impl LogPartition {
             if !io_reqs.is_empty() {
                 return false;
             }
-            self.group_commit
-                .1
-                .wait_for(&mut group_commit_g, Duration::from_secs(1));
+            let notify = self.group_commit.1.new_notify(true);
+            drop(group_commit_g);
+            notify.wait_timeout(true, Duration::from_secs(1));
         }
     }
 
@@ -323,7 +326,7 @@ impl LogPartition {
                         .wait_at_least(&mut events, 1, |cts, res| match res {
                             Ok(len) => {
                                 let sg = inflight.get_mut(&cts).expect("finish inflight IO");
-                                debug_assert!(sg.aio.buf.as_ref().unwrap().aligned_len() == len);
+                                debug_assert!(sg.aio.buf().unwrap().aligned_len() == len);
                                 sg.finished = true;
                             }
                             Err(err) => {
@@ -406,6 +409,9 @@ impl LogPartition {
         }
     }
 }
+
+impl UnwindSafe for LogPartition {}
+impl RefUnwindSafe for LogPartition {}
 
 pub(super) struct SyncGroup {
     pub(super) trx_list: Vec<PrecommitTrx>,

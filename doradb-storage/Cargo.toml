@@ -28,6 +28,10 @@ semistr = "0.1"
 async-executor = "1.13"
 smol = "2.0"
 
+[features]
+default = []
+mlock = []
+
 [dev-dependencies]
 rand = "0.8"
 bitcode = { version = "0.6.3", features = ["serde"] }

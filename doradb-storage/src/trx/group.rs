@@ -57,14 +57,14 @@ impl CommitGroup {
         self.max_cts = trx.cts;
         let session = trx.split_session();
         self.trx_list.push(trx);
-        (session, self.sync_signal.new_notify())
+        (session, self.sync_signal.new_notify(false))
     }
 
     #[inline]
     pub(super) fn split(self) -> (IocbRawPtr, SyncGroup) {
         let log_bytes = self.log_buf.aligned_len();
         let aio = pwrite(self.max_cts, self.fd, self.offset, self.log_buf);
-        let iocb_ptr = aio.iocb.load(Ordering::Relaxed);
+        let iocb_ptr = aio.iocb().load(Ordering::Relaxed);
         let sync_group = SyncGroup {
             trx_list: self.trx_list,
             max_cts: self.max_cts,

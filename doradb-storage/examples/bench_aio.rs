@@ -63,7 +63,7 @@ fn worker(id: usize, aio_mgr: &'static AIOManager, args: Args, stop: Arc<AtomicB
             let buf = DirectBuf::uninit(args.max_io_size);
             let (offset, _) = file.alloc(buf.capacity()).unwrap();
             let aio = file.pwrite_direct(id, offset, buf);
-            reqs.push(aio.iocb.load(Ordering::Relaxed));
+            reqs.push(aio.iocb().load(Ordering::Relaxed));
             inflight.insert(aio.key, aio);
         }
         aio_mgr.submit(&mut reqs);

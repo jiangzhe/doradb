@@ -21,19 +21,19 @@ pub(crate) trait MetadataStorage<P: BufferPool>: Sized {
     type ObjID;
 
     /// Create a new metadata persitence instance.
-    async fn new(buf_pool: P) -> Self;
+    async fn new(buf_pool: &'static P) -> Self;
 
     /// Find object by name.
-    async fn find(&self, buf_pool: P, name: &str) -> Option<Self::Object>;
+    async fn find(&self, buf_pool: &'static P, name: &str) -> Option<Self::Object>;
 
     /// Find object by id.
-    async fn find_by_id(&self, buf_pool: P, id: Self::ObjID) -> Option<Self::Object>;
+    async fn find_by_id(&self, buf_pool: &'static P, id: Self::ObjID) -> Option<Self::Object>;
 
     /// Insert object.
-    async fn insert(&self, buf_pool: P, obj: Self::Object) -> bool;
+    async fn insert(&self, buf_pool: &'static P, obj: Self::Object) -> bool;
 
     /// Delete object by id.
-    async fn delete_by_id(&self, buf_pool: P, id: Self::ObjID) -> bool;
+    async fn delete_by_id(&self, buf_pool: &'static P, id: Self::ObjID) -> bool;
 }
 
 #[inline]
@@ -68,13 +68,13 @@ impl<P: BufferPool> MetadataStorage<P> for Schemas<P> {
     type ObjID = SchemaID;
 
     #[inline]
-    async fn new(buf_pool: P) -> Self {
+    async fn new(buf_pool: &'static P) -> Self {
         let table = Table::new(buf_pool, TABLE_ID_SCHEMAS, schema_of_schemas()).await;
         Schemas { table }
     }
 
     #[inline]
-    async fn find(&self, buf_pool: P, name: &str) -> Option<SchemaObject> {
+    async fn find(&self, buf_pool: &'static P, name: &str) -> Option<SchemaObject> {
         let name = Val::from(name);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_NAME, vec![name]);
         self.table
@@ -90,7 +90,7 @@ impl<P: BufferPool> MetadataStorage<P> for Schemas<P> {
     }
 
     #[inline]
-    async fn find_by_id(&self, buf_pool: P, id: SchemaID) -> Option<Self::Object> {
+    async fn find_by_id(&self, buf_pool: &'static P, id: SchemaID) -> Option<Self::Object> {
         let id = Val::from(id);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![id]);
         self.table
@@ -106,12 +106,12 @@ impl<P: BufferPool> MetadataStorage<P> for Schemas<P> {
     }
 
     #[inline]
-    async fn insert(&self, buf_pool: P, obj: Self::Object) -> bool {
+    async fn insert(&self, buf_pool: &'static P, obj: Self::Object) -> bool {
         todo!()
     }
 
     #[inline]
-    async fn delete_by_id(&self, buf_pool: P, id: Self::ObjID) -> bool {
+    async fn delete_by_id(&self, buf_pool: &'static P, id: Self::ObjID) -> bool {
         todo!()
     }
 }

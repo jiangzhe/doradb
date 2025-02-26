@@ -12,6 +12,7 @@ use crate::lifetime::StaticLifetime;
 use crate::table::{Table, TableID};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -38,7 +39,7 @@ impl<P: BufferPool> Catalog<P> {
     }
 
     #[inline]
-    pub async fn create_table(&self, buf_pool: P, schema: TableSchema) -> TableID {
+    pub async fn create_table(&self, buf_pool: &'static P, schema: TableSchema) -> TableID {
         let table_id = self.table_id.fetch_add(1, Ordering::SeqCst);
         let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
         let sec_idx: Vec<_> = schema
@@ -78,6 +79,8 @@ impl<P: BufferPool> Catalog<P> {
 unsafe impl<P: BufferPool> Send for Catalog<P> {}
 unsafe impl<P: BufferPool> Sync for Catalog<P> {}
 unsafe impl<P: BufferPool> StaticLifetime for Catalog<P> {}
+impl<P: BufferPool> UnwindSafe for Catalog<P> {}
+impl<P: BufferPool> RefUnwindSafe for Catalog<P> {}
 
 pub struct TableCache<'a, P: BufferPool> {
     catalog: &'a Catalog<P>,
@@ -110,7 +113,10 @@ pub(crate) mod tests {
 
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
-    pub(crate) async fn table1<P: BufferPool>(buf_pool: P, catalog: &Catalog<P>) -> TableID {
+    pub(crate) async fn table1<P: BufferPool>(
+        buf_pool: &'static P,
+        catalog: &Catalog<P>,
+    ) -> TableID {
         catalog
             .create_table(
                 buf_pool,

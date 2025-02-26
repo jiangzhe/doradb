@@ -1,6 +1,9 @@
 use crate::error::{Error, Result, Validation, Validation::Invalid, Validation::Valid};
-use parking_lot::lock_api::RawRwLock as RawRwLockApi;
-use parking_lot::RawRwLock;
+use parking_lot::lock_api::{
+    RawRwLock as RawRwLockApi, RawRwLockDowngrade as RawRwLockDowngradeAPI,
+};
+// use parking_lot::RawRwLock;
+use crate::latch::rwlock::RawRwLock;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -85,11 +88,11 @@ impl HybridLatch {
     }
 
     #[inline]
-    pub fn optimistic_fallback(&self, mode: LatchFallbackMode) -> HybridGuard<'_> {
+    pub async fn optimistic_fallback(&self, mode: LatchFallbackMode) -> HybridGuard<'_> {
         match mode {
             LatchFallbackMode::Spin => self.optimistic_spin(),
-            LatchFallbackMode::Shared => self.optimistic_or_shared(),
-            LatchFallbackMode::Exclusive => self.optimistic_or_exclusive(),
+            LatchFallbackMode::Shared => self.optimistic_or_shared().await,
+            LatchFallbackMode::Exclusive => self.optimistic_or_exclusive().await,
         }
     }
 
@@ -123,10 +126,10 @@ impl HybridLatch {
     /// Get a read lock if lock is exclusive locked(blocking wait).
     /// Otherwise get an optimistic lock.
     #[inline]
-    pub fn optimistic_or_shared(&self) -> HybridGuard<'_> {
+    pub async fn optimistic_or_shared(&self) -> HybridGuard<'_> {
         let ver = self.version_acq();
         if (ver & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT {
-            self.lock.lock_shared();
+            self.lock.lock_shared_async().await;
             let ver = self.version_acq();
             HybridGuard::new(self, GuardState::Shared, ver)
         } else {
@@ -138,10 +141,10 @@ impl HybridLatch {
     /// Otherwise get an optimistic lock.
     /// This use case is rare.
     #[inline]
-    pub fn optimistic_or_exclusive(&self) -> HybridGuard<'_> {
+    pub async fn optimistic_or_exclusive(&self) -> HybridGuard<'_> {
         let ver = self.version_acq();
         if (ver & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT {
-            self.lock.lock_exclusive();
+            self.lock.lock_exclusive_async().await;
             let ver = self.version_acq() + LATCH_EXCLUSIVE_BIT;
             self.version.store(ver, Ordering::Release);
             HybridGuard::new(self, GuardState::Exclusive, ver)
@@ -151,9 +154,17 @@ impl HybridLatch {
     }
 
     /// Get a write lock.
+    pub fn exclusive_blocking(&self) -> HybridGuard<'_> {
+        self.lock.lock_exclusive();
+        let ver = self.version_acq() + LATCH_EXCLUSIVE_BIT;
+        self.version.store(ver, Ordering::Release);
+        HybridGuard::new(self, GuardState::Exclusive, ver)
+    }
+
+    /// Get a write lock in async way.
     #[inline]
-    pub fn exclusive(&self) -> HybridGuard<'_> {
-        self.lock.lock_exclusive(); // may block
+    pub async fn exclusive_async(&self) -> HybridGuard<'_> {
+        self.lock.lock_exclusive_async().await;
         let ver = self.version_acq() + LATCH_EXCLUSIVE_BIT;
         self.version.store(ver, Ordering::Release);
         HybridGuard::new(self, GuardState::Exclusive, ver)
@@ -161,8 +172,16 @@ impl HybridLatch {
 
     /// Get a shared lock.
     #[inline]
-    pub fn shared(&self) -> HybridGuard<'_> {
-        self.lock.lock_shared(); // may block
+    pub fn shared_blocking(&self) -> HybridGuard<'_> {
+        self.lock.lock_shared();
+        let ver = self.version_acq();
+        HybridGuard::new(self, GuardState::Shared, ver)
+    }
+
+    /// Get a shared lock in async way.
+    #[inline]
+    pub async fn shared_async(&self) -> HybridGuard<'_> {
+        self.lock.lock_shared_async().await;
         let ver = self.version_acq();
         HybridGuard::new(self, GuardState::Shared, ver)
     }
@@ -258,25 +277,31 @@ impl<'a> HybridGuard<'a> {
                 }
                 self.version = ver;
                 self.state = GuardState::Optimistic;
-                HybridGuard {
-                    lock: self.lock,
-                    version: self.version,
-                    state: self.state,
-                }
+                self
             }
             GuardState::Shared => {
                 unsafe {
                     self.lock.lock.unlock_shared();
                 }
                 self.state = GuardState::Optimistic;
-                HybridGuard {
-                    lock: self.lock,
-                    version: self.version,
-                    state: self.state,
-                }
+                self
             }
             GuardState::Optimistic => self,
         }
+    }
+
+    /// Downgrade lock mode from exclusive to shared.
+    #[inline]
+    pub fn downgrade_exclusive_to_shared(mut self) -> Self {
+        debug_assert!(self.state == GuardState::Exclusive);
+        let ver = self.version + LATCH_EXCLUSIVE_BIT;
+        self.lock.version.store(ver, Ordering::Release);
+        unsafe {
+            self.lock.lock.downgrade();
+        }
+        self.version = ver;
+        self.state = GuardState::Shared;
+        self
     }
 
     /// Try to convert a guard to shared mode.
@@ -304,9 +329,15 @@ impl<'a> HybridGuard<'a> {
     }
 
     #[inline]
-    pub fn block_until_shared(self) -> Self {
+    pub fn shared_blocking(self) -> Self {
         debug_assert!(self.state == GuardState::Optimistic);
-        self.lock.shared()
+        self.lock.shared_blocking()
+    }
+
+    #[inline]
+    pub async fn shared_async(self) -> Self {
+        debug_assert!(self.state == GuardState::Optimistic);
+        self.lock.shared_async().await
     }
 
     /// Convert a guard to exclusive mode.
@@ -330,9 +361,15 @@ impl<'a> HybridGuard<'a> {
     }
 
     #[inline]
-    pub fn block_until_exclusive(self) -> Self {
+    pub fn exclusive_blocking(self) -> Self {
         debug_assert!(self.state == GuardState::Optimistic);
-        self.lock.exclusive()
+        self.lock.exclusive_blocking()
+    }
+
+    #[inline]
+    pub async fn exclusive_async(self) -> Self {
+        debug_assert!(self.state == GuardState::Optimistic);
+        self.lock.exclusive_async().await
     }
 
     #[inline]
@@ -378,37 +415,39 @@ mod tests {
     use super::*;
     #[test]
     fn test_hybrid_lock() {
-        let boxed = Box::new(HybridLatch::new());
-        let latch: &'static mut HybridLatch = Box::leak(boxed);
-        assert!(!latch.is_exclusive_latched());
-        let ver = latch.version_seqcst();
-        assert!(latch.version_match(ver));
-        // optimistic guard
-        let opt_g1 = latch.optimistic_spin();
-        assert!(opt_g1.validate());
-        drop(opt_g1);
-        // optimistic or shared
-        let opt_g2 = latch.optimistic_or_shared();
-        assert!(opt_g2.validate());
-        drop(opt_g2);
-        let opt_g3 = latch.optimistic_or_exclusive();
-        assert!(opt_g3.validate());
-        drop(opt_g3);
-        let shared_g1 = latch.shared();
-        assert!(shared_g1.state == GuardState::Shared);
-        drop(shared_g1);
-        let shared_g2 = latch.try_shared().unwrap();
-        assert!(shared_g2.state == GuardState::Shared);
-        drop(shared_g2);
-        let exclusive_g1 = latch.exclusive();
-        assert!(exclusive_g1.state == GuardState::Exclusive);
-        let ver2 = latch.version_seqcst();
-        assert!(ver2 == ver + 1);
-        drop(exclusive_g1);
-        let ver3 = latch.version_seqcst();
-        assert!(ver3 == ver2 + 1);
-        let exclusive_g2 = latch.try_exclusive().unwrap();
-        assert!(exclusive_g2.state == GuardState::Exclusive);
-        drop(exclusive_g2);
+        smol::block_on(async {
+            let boxed = Box::new(HybridLatch::new());
+            let latch: &'static mut HybridLatch = Box::leak(boxed);
+            assert!(!latch.is_exclusive_latched());
+            let ver = latch.version_seqcst();
+            assert!(latch.version_match(ver));
+            // optimistic guard
+            let opt_g1 = latch.optimistic_spin();
+            assert!(opt_g1.validate());
+            drop(opt_g1);
+            // optimistic or shared
+            let opt_g2 = latch.optimistic_or_shared().await;
+            assert!(opt_g2.validate());
+            drop(opt_g2);
+            let opt_g3 = latch.optimistic_or_exclusive().await;
+            assert!(opt_g3.validate());
+            drop(opt_g3);
+            let shared_g1 = latch.shared_async().await;
+            assert!(shared_g1.state == GuardState::Shared);
+            drop(shared_g1);
+            let shared_g2 = latch.try_shared().unwrap();
+            assert!(shared_g2.state == GuardState::Shared);
+            drop(shared_g2);
+            let exclusive_g1 = latch.exclusive_async().await;
+            assert!(exclusive_g1.state == GuardState::Exclusive);
+            let ver2 = latch.version_seqcst();
+            assert!(ver2 == ver + 1);
+            drop(exclusive_g1);
+            let ver3 = latch.version_seqcst();
+            assert!(ver3 == ver2 + 1);
+            let exclusive_g2 = latch.try_exclusive().unwrap();
+            assert!(exclusive_g2.state == GuardState::Exclusive);
+            drop(exclusive_g2);
+        })
     }
 }

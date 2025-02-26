@@ -3,6 +3,7 @@ use crate::buffer::BufferPool;
 use crate::catalog::{Catalog, TableCache};
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
+use crate::thread;
 use crate::trx::log::LogPartition;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, TrxID, MAX_SNAPSHOT_TS};
@@ -13,40 +14,32 @@ use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 
 impl TransactionSystem {
     #[inline]
     pub(super) fn start_purge_threads<P: BufferPool>(
         &'static self,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &'static Catalog<P>,
         purge_chan: Receiver<Purge>,
     ) {
         if self.config.purge_threads == 1 {
             // single-threaded purger
-            let handle = thread::Builder::new()
-                .name(String::from("Purge-Thread"))
-                .spawn(move || {
-                    let ex = LocalExecutor::new();
-                    let mut purger = PurgeSingleThreaded::default();
-                    smol::block_on(ex.run(purger.purge_loop(buf_pool, catalog, self, purge_chan)))
-                })
-                .unwrap();
+            let handle = thread::spawn_named("Purge-Thread", move || {
+                let ex = LocalExecutor::new();
+                let mut purger = PurgeSingleThreaded::default();
+                smol::block_on(ex.run(purger.purge_loop(buf_pool, catalog, self, purge_chan)))
+            });
             let mut g = self.purge_threads.lock();
             g.push(handle);
         } else {
             // multi-threaded purger
             let (mut dispatcher, executors) = self.dispatch_purge(buf_pool, catalog);
-            let handle = thread::Builder::new()
-                .name(String::from("Purge-Dispatcher"))
-                .spawn(move || {
-                    let ex = LocalExecutor::new();
-                    smol::block_on(
-                        ex.run(dispatcher.purge_loop(buf_pool, catalog, self, purge_chan)),
-                    );
-                })
-                .unwrap();
+            let handle = thread::spawn_named("Purge-Dispatcher", move || {
+                let ex = LocalExecutor::new();
+                smol::block_on(ex.run(dispatcher.purge_loop(buf_pool, catalog, self, purge_chan)));
+            });
             let mut g = self.purge_threads.lock();
             g.push(handle);
             g.extend(executors);
@@ -83,7 +76,7 @@ impl TransactionSystem {
     #[inline]
     pub(super) fn dispatch_purge<P: BufferPool>(
         &'static self,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &'static Catalog<P>,
     ) -> (PurgeDispatcher, Vec<JoinHandle<()>>) {
         let mut handles = vec![];
@@ -91,14 +84,12 @@ impl TransactionSystem {
         for i in 0..self.config.purge_threads {
             let (tx, rx) = flume::unbounded();
             chans.push(tx);
-            let handle = thread::Builder::new()
-                .name(format!("Purge-Executor-{}", i))
-                .spawn(move || {
-                    let mut purger = PurgeExecutor::default();
-                    let ex = LocalExecutor::new();
-                    smol::block_on(ex.run(purger.purge_task_loop(buf_pool, catalog, self, rx)));
-                })
-                .unwrap();
+            let thread_name = format!("Purge-Executor-{}", i);
+            let handle = thread::spawn_named(thread_name, move || {
+                let mut purger = PurgeExecutor::default();
+                let ex = LocalExecutor::new();
+                smol::block_on(ex.run(purger.purge_task_loop(buf_pool, catalog, self, rx)));
+            });
             handles.push(handle);
         }
         (PurgeDispatcher(chans), handles)
@@ -109,7 +100,7 @@ impl TransactionSystem {
     #[inline]
     pub(super) async fn purge_trx_list<P: BufferPool>(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &Catalog<P>,
         log_no: usize,
         trx_list: Vec<CommittedTrx>,
@@ -132,7 +123,8 @@ impl TransactionSystem {
             let page_guard = buf_pool
                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                 .await
-                .block_until_shared();
+                .shared_async()
+                .await;
             for row_id in row_ids {
                 let mut access = page_guard.write_row_by_id(row_id);
                 access.purge_undo_chain(min_active_sts);
@@ -367,7 +359,7 @@ struct PurgeTask {
 trait PurgeLoop {
     async fn purge_loop<P: BufferPool>(
         &mut self,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &Catalog<P>,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -381,7 +373,7 @@ impl PurgeLoop for PurgeSingleThreaded {
     #[inline]
     async fn purge_loop<P: BufferPool>(
         &mut self,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &Catalog<P>,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -421,7 +413,7 @@ impl PurgeLoop for PurgeDispatcher {
     #[inline]
     async fn purge_loop<P: BufferPool>(
         &mut self,
-        _buf_pool: P,
+        _buf_pool: &'static P,
         _catalog: &Catalog<P>,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -475,7 +467,7 @@ impl PurgeExecutor {
     #[inline]
     async fn purge_task_loop<P: BufferPool>(
         &mut self,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &Catalog<P>,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<PurgeTask>,
@@ -689,10 +681,11 @@ mod tests {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
                 };
-                let page_guard: PageSharedGuard<'_, RowPage> = buf_pool
+                let page_guard: PageSharedGuard<RowPage> = buf_pool
                     .get_page(page_id, LatchFallbackMode::Shared)
                     .await
-                    .block_until_shared();
+                    .shared_async()
+                    .await;
                 let access = page_guard.read_row_by_id(row_id);
                 let status = access.latest_status();
                 println!("row status={:?}", status);
