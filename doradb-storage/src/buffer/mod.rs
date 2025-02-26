@@ -1,55 +1,54 @@
+mod evict;
 mod fixed;
 pub mod frame;
 pub mod guard;
 pub mod page;
 pub mod ptr;
+mod util;
 
+pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use fixed::FixedBufferPool;
 
-use crate::buffer::frame::BufferFrameAware;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
-use crate::buffer::page::PageID;
+use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::error::Validation;
 use crate::latch::LatchFallbackMode;
-use crate::trx::undo::UndoMap;
 use std::future::Future;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 
 /// Abstraction of buffer pool.
 /// The implementation should be a static pointer providing
 /// pooling functionality.
-pub trait BufferPool: Send + Copy {
+pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + 'static {
     /// Allocate a new page.
-    fn allocate_page<T: BufferFrameAware>(
-        self,
-    ) -> impl Future<Output = PageExclusiveGuard<'static, T>> + Send;
+    fn allocate_page<T: BufferPage>(
+        &'static self,
+    ) -> impl Future<Output = PageExclusiveGuard<T>> + Send;
 
     /// Get page.
-    fn get_page<T: BufferFrameAware>(
-        self,
+    fn get_page<T: BufferPage>(
+        &'static self,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = PageGuard<'static, T>> + Send;
+    ) -> impl Future<Output = PageGuard<T>> + Send;
 
     /// Deallocate page.
-    fn deallocate_page<T: BufferFrameAware>(
-        self,
-        g: PageExclusiveGuard<'static, T>,
-    ) -> impl Future<Output = ()> + Send;
+    fn deallocate_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>);
 
     /// Get child page.
     /// This method is used for tree-like data structure with lock coupling support.
     /// The implementation has to validate the parent page when child page is returned,
     /// to ensure no change happens in-between.
     fn get_child_page<T>(
-        self,
-        p_guard: &PageGuard<'static, T>,
+        &'static self,
+        p_guard: &PageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = Validation<PageGuard<'static, T>>> + Send;
+    ) -> impl Future<Output = Validation<PageGuard<T>>> + Send;
+}
 
-    // load undo map for a data page with MVCC capability.
-    fn load_orphan_undo_map(self, page_id: PageID) -> Option<UndoMap>;
-
-    // save undo map of a data page with MVCC capability.
-    fn save_orphan_undo_map(self, page_id: PageID, undo_map: UndoMap);
+pub enum BufferRequest {
+    Read(PageExclusiveGuard<Page>),
+    BatchWrite(Vec<PageExclusiveGuard<Page>>),
+    Shutdown,
 }

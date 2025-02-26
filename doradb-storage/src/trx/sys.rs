@@ -3,6 +3,7 @@ use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::io::{align_to_sector_size, AIOManagerConfig, FreeListWithFactory, PageBuf};
 use crate::lifetime::StaticLifetime;
+use crate::notify::Signal;
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::trx::group::{Commit, GroupCommit};
 use crate::trx::log::{LogPartition, LogPartitionStats, LogSync};
@@ -12,12 +13,15 @@ use crate::trx::{
 };
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
-use parking_lot::{Condvar, Mutex};
+// use parking_lot::{Condvar, Mutex};
+use crate::latch::Mutex;
+use crate::thread;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 
 pub const GC_BUCKETS: usize = 64;
 
@@ -126,7 +130,7 @@ impl TransactionSystem {
     pub async fn commit<P: BufferPool>(
         &self,
         trx: ActiveTrx,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &Catalog<P>,
     ) -> Result<Session> {
         // Prepare redo log first, this may take some time,
@@ -160,7 +164,7 @@ impl TransactionSystem {
     pub async fn rollback<P: BufferPool>(
         &self,
         mut trx: ActiveTrx,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &Catalog<P>,
     ) -> Session {
         trx.row_undo.rollback(buf_pool).await;
@@ -178,7 +182,7 @@ impl TransactionSystem {
     async fn rollback_prepared<P: BufferPool>(
         &self,
         mut trx: PreparedTrx,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &Catalog<P>,
     ) -> Session {
         debug_assert!(trx.redo_bin.is_none());
@@ -217,10 +221,8 @@ impl TransactionSystem {
             let thread_name = format!("GC-Thread-{}", idx);
             let partition = &**partition;
             let purge_chan = self.purge_chan.clone();
-            let handle = thread::Builder::new()
-                .name(thread_name)
-                .spawn(move || partition.gc_loop(gc_rx, purge_chan))
-                .unwrap();
+            let handle =
+                thread::spawn_named(thread_name, move || partition.gc_loop(gc_rx, purge_chan));
             *partition.gc_thread.lock() = Some(handle);
         }
     }
@@ -232,20 +234,21 @@ impl TransactionSystem {
         for (idx, partition) in self.log_partitions.iter().enumerate() {
             let thread_name = format!("Sync-Thread-{}", idx);
             let partition = &**partition;
-
-            let builder = thread::Builder::new().name(thread_name);
             let handle = if self.config.log_drop {
-                builder.spawn(move || partition.io_loop_noop(&self.config))
+                thread::spawn_named(thread_name, move || partition.io_loop_noop(&self.config))
             } else {
-                builder.spawn(move || partition.io_loop(&self.config))
-            }
-            .unwrap();
+                thread::spawn_named(thread_name, move || partition.io_loop(&self.config))
+            };
             *partition.sync_thread.lock() = Some(handle);
         }
     }
 }
 
 unsafe impl StaticLifetime for TransactionSystem {}
+
+impl UnwindSafe for TransactionSystem {}
+
+impl RefUnwindSafe for TransactionSystem {}
 
 impl Drop for TransactionSystem {
     #[inline]
@@ -257,7 +260,7 @@ impl Drop for TransactionSystem {
                 let mut group_commit_g = partition.group_commit.0.lock();
                 group_commit_g.queue.push_back(Commit::Shutdown);
                 if group_commit_g.queue.len() == 1 {
-                    partition.group_commit.1.notify_one(); // notify sync thread to quit.
+                    Signal::set_and_notify(&partition.group_commit.1, 1); // notify sync thread to quit.
                 }
             }
             // notify gc thread to quit.
@@ -416,7 +419,7 @@ impl TrxSysConfig {
         let (gc_chan, gc_rx) = flume::unbounded();
         (
             LogPartition {
-                group_commit: CachePadded::new((Mutex::new(group_commit), Condvar::new())),
+                group_commit: CachePadded::new((Mutex::new(group_commit), Signal::default())),
                 persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
                 stats: CachePadded::new(LogPartitionStats::default()),
                 gc_chan,
@@ -440,7 +443,7 @@ impl TrxSysConfig {
     #[inline]
     pub fn build_static<P: BufferPool>(
         self,
-        buf_pool: P,
+        buf_pool: &'static P,
         catalog: &'static Catalog<P>,
     ) -> &'static TransactionSystem {
         let mut log_partitions = Vec::with_capacity(self.log_partitions);

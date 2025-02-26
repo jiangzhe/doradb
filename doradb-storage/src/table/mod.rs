@@ -15,7 +15,7 @@ use crate::row::ops::{
 use crate::row::{estimate_max_row_count, var_len_for_insert, Row, RowID, RowPage, RowRead};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoEntry, RedoKind};
-use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
+use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, MainBranch, NextRowUndo, RowUndoKind, UndoStatus,
 };
@@ -72,7 +72,7 @@ pub struct Table<P: BufferPool> {
 impl<P: BufferPool> Table<P> {
     /// Create a new table.
     #[inline]
-    pub async fn new(buf_pool: P, table_id: TableID, schema: TableSchema) -> Self {
+    pub async fn new(buf_pool: &'static P, table_id: TableID, schema: TableSchema) -> Self {
         let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
         let sec_idx: Vec<_> = schema
             .indexes
@@ -100,7 +100,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     pub async fn select_row_mvcc(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &Statement,
         key: &SelectKey,
         user_read_set: &[usize],
@@ -126,9 +126,11 @@ impl<P: BufferPool> Table<P> {
                     RowLocation::NotFound => return SelectMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
-                        let page_guard =
-                            buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
-                        let page_guard = page_guard.block_until_shared();
+                        let page_guard = buf_pool
+                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                            .await
+                            .shared_async()
+                            .await;
                         if validate_page_id(&page_guard, page_id) {
                             break (page_guard, row_id);
                         }
@@ -152,7 +154,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     pub async fn select_row_uncommitted<R, F>(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         key: &SelectKey,
         row_action: F,
     ) -> Option<R>
@@ -173,9 +175,11 @@ impl<P: BufferPool> Table<P> {
                     RowLocation::NotFound => return None,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
-                        let page_guard =
-                            buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
-                        let page_guard = page_guard.block_until_shared();
+                        let page_guard = buf_pool
+                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                            .await
+                            .shared_async()
+                            .await;
                         if validate_page_id(&page_guard, page_id) {
                             break (page_guard, row_id);
                         }
@@ -204,7 +208,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     pub async fn insert_row(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         cols: Vec<Val>,
     ) -> InsertMvcc {
@@ -238,6 +242,7 @@ impl<P: BufferPool> Table<P> {
                 todo!()
             }
         }
+        page_guard.set_dirty(); // mark as dirty page.
         InsertMvcc::Ok(row_id)
     }
 
@@ -247,7 +252,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     pub async fn update_row(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         key: &SelectKey,
         update: Vec<UpdateCol>,
@@ -263,8 +268,11 @@ impl<P: BufferPool> Table<P> {
                     RowLocation::NotFound => return UpdateMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
-                        let page = buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
-                        let page_guard = page.block_until_shared();
+                        let page_guard = buf_pool
+                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                            .await
+                            .shared_async()
+                            .await;
                         if validate_page_id(&page_guard, page_id) {
                             break (page_guard, row_id);
                         }
@@ -289,12 +297,14 @@ impl<P: BufferPool> Table<P> {
                             &index_change_cols,
                         )
                         .await;
+                    page_guard.set_dirty(); // mark as dirty page.
                     return match res {
                         UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
                         UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
                         UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
                     };
                 } // otherwise, do nothing
+                page_guard.set_dirty(); // mark as dirty page.
                 UpdateMvcc::Ok(row_id)
             }
             UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => UpdateMvcc::NotFound,
@@ -316,6 +326,8 @@ impl<P: BufferPool> Table<P> {
                             &new_guard,
                         )
                         .await;
+                    // old guard is already marked inside.
+                    new_guard.set_dirty(); // mark as dirty page.
                     match res {
                         UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
                         UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
@@ -325,6 +337,7 @@ impl<P: BufferPool> Table<P> {
                     let res = self.update_indexes_only_row_id_change(
                         stmt, old_row_id, new_row_id, &new_guard,
                     );
+                    new_guard.set_dirty(); // mark as dirty page.
                     match res {
                         UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
                         UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
@@ -340,7 +353,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     pub async fn delete_row(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         key: &SelectKey,
     ) -> DeleteMvcc {
@@ -355,8 +368,11 @@ impl<P: BufferPool> Table<P> {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
-                        let page = buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
-                        let page_guard = page.block_until_shared();
+                        let page_guard = buf_pool
+                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                            .await
+                            .shared_async()
+                            .await;
                         if validate_page_id(&page_guard, page_id) {
                             break (page_guard, row_id);
                         }
@@ -372,7 +388,8 @@ impl<P: BufferPool> Table<P> {
             DeleteInternal::WriteConflict => DeleteMvcc::WriteConflict,
             DeleteInternal::Ok(page_guard) => {
                 // defer index deletion with index undo log.
-                self.defer_delete_indexes(stmt, row_id, page_guard);
+                self.defer_delete_indexes(stmt, row_id, &page_guard);
+                page_guard.set_dirty(); // mark as dirty.
                 DeleteMvcc::Ok
             }
         }
@@ -389,7 +406,7 @@ impl<P: BufferPool> Table<P> {
     /// key is not found on the path of undo chain, it means the index entry can be
     /// removed.
     #[inline]
-    pub async fn delete_index(&self, buf_pool: P, key: &SelectKey, row_id: RowID) -> bool {
+    pub async fn delete_index(&self, buf_pool: &'static P, key: &SelectKey, row_id: RowID) -> bool {
         // todo: consider index drop.
         let index_schema = &self.schema.indexes[key.index_no];
         if index_schema.unique {
@@ -402,7 +419,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn delete_unique_index(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         index: &dyn UniqueIndex,
         key: &SelectKey,
         row_id: RowID,
@@ -424,9 +441,10 @@ impl<P: BufferPool> Table<P> {
                         RowLocation::ColSegment(..) => todo!(),
                         RowLocation::RowPage(page_id) => {
                             let page_guard = buf_pool
-                                .get_page(page_id, LatchFallbackMode::Shared)
+                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
-                                .block_until_shared();
+                                .shared_async()
+                                .await;
                             if validate_page_row_range(&page_guard, page_id, row_id) {
                                 break (page_guard, row_id);
                             }
@@ -450,13 +468,13 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn move_update_for_space(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         old_row: Vec<(Val, Option<u16>)>,
         update: Vec<UpdateCol>,
         old_id: RowID,
-        old_guard: PageSharedGuard<'static, RowPage>,
-    ) -> (RowID, HashSet<usize>, PageSharedGuard<'static, RowPage>) {
+        old_guard: PageSharedGuard<RowPage>,
+    ) -> (RowID, HashSet<usize>, PageSharedGuard<RowPage>) {
         // calculate new row and undo entry.
         let (new_row, undo_kind, index_change_cols) = {
             let mut index_change_cols = HashSet::new();
@@ -516,12 +534,12 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn link_for_unique_index(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &Statement,
         old_id: RowID,
         key: &SelectKey,
         new_id: RowID,
-        new_guard: &PageSharedGuard<'static, RowPage>,
+        new_guard: &PageSharedGuard<RowPage>,
     ) -> LinkForUniqueIndex {
         debug_assert!(old_id != new_id);
         let (old_guard, old_id) = loop {
@@ -530,9 +548,10 @@ impl<P: BufferPool> Table<P> {
                 RowLocation::ColSegment(..) => todo!(),
                 RowLocation::RowPage(page_id) => {
                     let old_guard = buf_pool
-                        .get_page(page_id, LatchFallbackMode::Shared)
+                        .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
-                        .block_until_shared();
+                        .shared_async()
+                        .await;
                     if validate_page_row_range(&old_guard, page_id, old_id) {
                         break (old_guard, old_id);
                     }
@@ -559,12 +578,12 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn insert_row_internal(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
-        mut move_entry: Option<(RowID, PageSharedGuard<'static, RowPage>)>,
-    ) -> (RowID, PageSharedGuard<'static, RowPage>) {
+        mut move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
+    ) -> (RowID, PageSharedGuard<RowPage>) {
         let row_len = row_len(&self.schema, &insert);
         let row_count = estimate_max_row_count(row_len, self.schema.col_count());
         loop {
@@ -589,14 +608,14 @@ impl<P: BufferPool> Table<P> {
     /// There might be move+update call this method, in such case, undo_kind will be
     /// set to UndoKind::Update.
     #[inline]
-    fn insert_row_to_page<'a>(
+    fn insert_row_to_page(
         &self,
         stmt: &mut Statement,
-        page_guard: PageSharedGuard<'a, RowPage>,
+        page_guard: PageSharedGuard<RowPage>,
         insert: Vec<Val>,
         undo_kind: RowUndoKind,
-        move_entry: Option<(RowID, PageSharedGuard<'a, RowPage>)>,
-    ) -> InsertRowIntoPage<'a> {
+        move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
+    ) -> InsertRowIntoPage {
         debug_assert!({
             (matches!(undo_kind, RowUndoKind::Insert) && move_entry.is_none())
                 || (matches!(undo_kind, RowUndoKind::Update(_)) && move_entry.is_some())
@@ -657,6 +676,8 @@ impl<P: BufferPool> Table<P> {
                 entry: move_entry,
                 status: UndoStatus::Ref(stmt.trx.status()),
             }));
+            drop(old_access);
+            old_guard.set_dirty(); // mark as dirty page.
         }
         drop(access);
         // Here we do not unlock the page because we need to verify validity of unique index update
@@ -684,7 +705,7 @@ impl<P: BufferPool> Table<P> {
     async fn update_row_inplace(
         &self,
         stmt: &mut Statement,
-        page_guard: PageSharedGuard<'static, RowPage>,
+        page_guard: PageSharedGuard<RowPage>,
         key: &SelectKey,
         row_id: RowID,
         mut update: Vec<UpdateCol>,
@@ -734,7 +755,7 @@ impl<P: BufferPool> Table<P> {
                         // to end original row and perform a INSERT into new page, and
                         // link the two versions.
                         //
-                        // Mark page data as deleted
+                        // Mark page data as deleted.
                         access.delete_row();
                         // Update LOCK entry to MOVE entry.
                         stmt.update_last_undo(RowUndoKind::Move(false));
@@ -808,7 +829,7 @@ impl<P: BufferPool> Table<P> {
     async fn delete_row_internal(
         &self,
         stmt: &mut Statement,
-        page_guard: PageSharedGuard<'static, RowPage>,
+        page_guard: PageSharedGuard<RowPage>,
         row_id: RowID,
         key: &SelectKey,
     ) -> DeleteInternal {
@@ -849,19 +870,22 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn get_insert_page(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         row_count: usize,
-    ) -> PageSharedGuard<'static, RowPage> {
+    ) -> PageSharedGuard<RowPage> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id) {
-            let g = buf_pool.get_page(page_id, LatchFallbackMode::Shared).await;
+            let page_guard = buf_pool
+                .get_page(page_id, LatchFallbackMode::Shared)
+                .await
+                .shared_async()
+                .await;
             // because we save last insert page in session and meanwhile other thread may access this page
             // and do some modification, even worse, buffer pool may evict it and reload other data into
             // this page. so here, we do not require that no change should happen, but if something change,
             // we validate that page id and row id range is still valid.
-            let g = g.block_until_shared();
-            if validate_page_row_range(&g, page_id, row_id) {
-                return g;
+            if validate_page_row_range(&page_guard, page_id, row_id) {
+                return page_guard;
             }
         }
         self.blk_idx
@@ -874,7 +898,7 @@ impl<P: BufferPool> Table<P> {
     async fn lock_row_for_write<'a>(
         &self,
         stmt: &mut Statement,
-        page_guard: &'a PageSharedGuard<'static, RowPage>,
+        page_guard: &'a PageSharedGuard<RowPage>,
         row_id: RowID,
         key: Option<&SelectKey>,
     ) -> LockRowForWrite<'a> {
@@ -908,7 +932,7 @@ impl<P: BufferPool> Table<P> {
                         // disk.
                         // Other transactions can still access this page and modify other rows.
 
-                        let _ = notify.wait_async().await; // wait for that transaction to be committed.
+                        let _ = notify.wait_async(false).await; // wait for that transaction to be committed.
 
                         // now we get back on current page.
                         // maybe another thread modify our row before the lock acquisition,
@@ -931,11 +955,11 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn insert_unique_index(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         key: SelectKey,
         row_id: RowID,
-        page_guard: &PageSharedGuard<'static, RowPage>,
+        page_guard: &PageSharedGuard<RowPage>,
     ) -> InsertIndex {
         let index = self.sec_idx[key.index_no].unique().unwrap();
         match index.insert_if_not_exists(&key.vals, row_id) {
@@ -990,10 +1014,10 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn update_indexes_only_key_change(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         row_id: RowID,
-        page_guard: &PageSharedGuard<'static, RowPage>,
+        page_guard: &PageSharedGuard<RowPage>,
         index_change_cols: &HashSet<usize>,
     ) -> UpdateIndex {
         for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
@@ -1031,7 +1055,7 @@ impl<P: BufferPool> Table<P> {
         stmt: &mut Statement,
         old_row_id: RowID,
         new_row_id: RowID,
-        page_guard: &PageSharedGuard<'a, RowPage>,
+        page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
         for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
@@ -1060,12 +1084,12 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn update_indexes_may_both_change(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         old_row_id: RowID,
         new_row_id: RowID,
         index_change_cols: &HashSet<usize>,
-        page_guard: &PageSharedGuard<'static, RowPage>,
+        page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
         for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
@@ -1117,12 +1141,12 @@ impl<P: BufferPool> Table<P> {
         &self,
         stmt: &mut Statement,
         row_id: RowID,
-        page_guard: PageSharedGuard<'a, RowPage>,
+        page_guard: &PageSharedGuard<RowPage>,
     ) {
         for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
             debug_assert!(index.is_unique() == index_schema.unique);
             if index_schema.unique {
-                let key = read_latest_index_key(&self.schema, index.index_no, &page_guard, row_id);
+                let key = read_latest_index_key(&self.schema, index.index_no, page_guard, row_id);
                 let index_undo = self.index_undo(row_id, IndexUndoKind::DeferDelete(key));
                 stmt.index_undo.push(index_undo);
             } else {
@@ -1133,13 +1157,13 @@ impl<P: BufferPool> Table<P> {
 
     async fn update_unique_index_key_and_row_id_change(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         index: &dyn UniqueIndex,
         key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
-        new_guard: &PageSharedGuard<'static, RowPage>,
+        new_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
         match index.insert_if_not_exists(&key.vals, new_row_id) {
@@ -1239,12 +1263,12 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn update_unique_index_only_key_change(
         &self,
-        buf_pool: P,
+        buf_pool: &'static P,
         stmt: &mut Statement,
         index: &dyn UniqueIndex,
         new_key: SelectKey,
         row_id: RowID,
-        page_guard: &PageSharedGuard<'static, RowPage>,
+        page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         match index.insert_if_not_exists(&new_key.vals, row_id) {
             None => {
@@ -1313,7 +1337,7 @@ impl<P: BufferPool> Table<P> {
 }
 
 #[inline]
-fn validate_page_id(page_guard: &PageSharedGuard<'_, RowPage>, page_id: PageID) -> bool {
+fn validate_page_id(page_guard: &PageSharedGuard<RowPage>, page_id: PageID) -> bool {
     if page_guard.page_id() != page_id {
         return false;
     }
@@ -1322,7 +1346,7 @@ fn validate_page_id(page_guard: &PageSharedGuard<'_, RowPage>, page_id: PageID) 
 
 #[inline]
 fn validate_page_row_range(
-    page_guard: &PageSharedGuard<'_, RowPage>,
+    page_guard: &PageSharedGuard<RowPage>,
     page_id: PageID,
     row_id: RowID,
 ) -> bool {
@@ -1355,19 +1379,19 @@ fn row_len(schema: &TableSchema, user_cols: &[Val]) -> usize {
     schema.fix_len + var_len
 }
 
-enum InsertRowIntoPage<'a> {
-    Ok(RowID, PageSharedGuard<'a, RowPage>),
+enum InsertRowIntoPage {
+    Ok(RowID, PageSharedGuard<RowPage>),
     NoSpaceOrRowID(
         Vec<Val>,
         RowUndoKind,
-        Option<(RowID, PageSharedGuard<'a, RowPage>)>,
+        Option<(RowID, PageSharedGuard<RowPage>)>,
     ),
 }
 
 enum UpdateRowInplace {
     // We keep row page lock if there is any index change,
     // so we can read latest values from page.
-    Ok(RowID, HashSet<usize>, PageSharedGuard<'static, RowPage>),
+    Ok(RowID, HashSet<usize>, PageSharedGuard<RowPage>),
     RowNotFound,
     RowDeleted,
     WriteConflict,
@@ -1375,12 +1399,12 @@ enum UpdateRowInplace {
         RowID,
         Vec<(Val, Option<u16>)>,
         Vec<UpdateCol>,
-        PageSharedGuard<'static, RowPage>,
+        PageSharedGuard<RowPage>,
     ),
 }
 
 enum DeleteInternal {
-    Ok(PageSharedGuard<'static, RowPage>),
+    Ok(PageSharedGuard<RowPage>),
     NotFound,
     WriteConflict,
 }
@@ -1394,10 +1418,10 @@ fn index_key_is_changed(index_schema: &IndexSchema, index_change_cols: &HashSet<
 }
 
 #[inline]
-fn read_latest_index_key<'a>(
+fn read_latest_index_key(
     schema: &TableSchema,
     index_no: usize,
-    page_guard: &'a PageSharedGuard<'a, RowPage>,
+    page_guard: &PageSharedGuard<RowPage>,
     row_id: RowID,
 ) -> SelectKey {
     let index_schema = &schema.indexes[index_no];

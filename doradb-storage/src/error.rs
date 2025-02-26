@@ -1,3 +1,4 @@
+use crate::io::AIOError;
 use doradb_datatype::error::Error as DataTypeError;
 use std::array::TryFromSliceError;
 use std::ops::ControlFlow;
@@ -44,6 +45,8 @@ pub enum Error {
     InsufficientFreeSpaceForInplaceUpdate,
     #[error("Transaction system shutdown")]
     TransactionSystemShutdown,
+    #[error("{0}")]
+    AIOError(#[from] AIOError),
 }
 
 impl From<TryFromSliceError> for Error {

@@ -1,27 +1,35 @@
+use crate::buffer::guard::PageExclusiveGuard;
+
 pub const PAGE_SIZE: usize = 64 * 1024;
 pub type Page = [u8; PAGE_SIZE];
 pub type PageID = u64;
 pub const INVALID_PAGE_ID: PageID = !0;
 
-/// PageStatus indicates the status of page.
-/// In our design, a page is mapped to a frame through its entire lifetime.
-/// So page status is also frame status.
-pub enum PageStatus {
-    /// Page is in memory.
-    Hot,
-    /// Page is marked and will be evicted soon.
-    Cool,
-    /// Page is evicted(on-disk)
-    Cold,
-    /// Page is loading from disk to memory
-    Loading,
+/// BufferPage is a trait for types that can be treated
+/// as a fixed-length page, and maintained by buffer pool.
+/// Note the page-like type should contain only plain data which
+/// can be copied to disk and loaded to memory.
+/// Any tree-like or pointer-based data structure should not
+/// exist.
+/// Additionally, this type should not impl Drop because we
+/// don't expect to drop it when it is swapped to disk.
+pub trait BufferPage: Sized + 'static {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IOKind {
+    Read,
+    Write,
+    // Because we gather write requests into batch.
+    // There can be short period the read requests runs
+    // concurrently while write requests are not submmitted.
+    // We let read wait for write, and let write overwrite
+    // this value.
+    ReadWaitForWrite,
 }
 
-pub const PAGE_STATUS_MASK: u64 = 0b11 << 62;
-pub const PAGE_STATUS_HOT: u64 = 0b00 << 62;
-pub const PAGE_STATUS_COOL: u64 = 0b01 << 62;
-pub const PAGE_STATUS_COLD: u64 = 0b10 << 62;
-pub const PAGE_STATUS_LOADING: u64 = 0b11 << 62;
+pub struct PageIO {
+    pub page_guard: PageExclusiveGuard<Page>,
+    pub kind: IOKind,
+}
 
-pub const PAGE_NO_MASK: u64 = !0;
-pub const PAGE_VERSION_MASK: u64 = !PAGE_STATUS_MASK;
+impl BufferPage for Page {}

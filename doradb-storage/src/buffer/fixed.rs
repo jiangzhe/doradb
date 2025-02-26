@@ -1,20 +1,16 @@
-use crate::buffer::frame::{BufferFrame, BufferFrameAware};
+use crate::buffer::frame::BufferFrame;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
-use crate::buffer::page::{Page, PageID, INVALID_PAGE_ID};
+use crate::buffer::page::{BufferPage, Page, PageID, INVALID_PAGE_ID};
+use crate::buffer::util::{init_bf_exclusive_guard, mmap_allocate, mmap_deallocate};
 use crate::buffer::BufferPool;
 use crate::error::Validation::Valid;
-use crate::error::{Error, Result, Validation};
+use crate::error::{Result, Validation};
 use crate::latch::LatchFallbackMode;
+use crate::latch::Mutex;
 use crate::lifetime::StaticLifetime;
-use crate::trx::undo::UndoMap;
-use libc::{
-    c_void, madvise, mmap, munmap, MADV_DONTFORK, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED,
-    MAP_PRIVATE, PROT_READ, PROT_WRITE,
-};
-use parking_lot::Mutex;
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use crate::ptr::UnsafePtr;
 use std::mem;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const SAFETY_PAGES: usize = 10;
@@ -27,7 +23,6 @@ pub struct FixedBufferPool {
     size: usize,
     allocated: AtomicU64,
     free_list: Mutex<PageID>,
-    orphan_undo_maps: Mutex<HashMap<PageID, UndoMap>>,
 }
 
 impl FixedBufferPool {
@@ -49,7 +44,7 @@ impl FixedBufferPool {
                 Ok(ptr) => ptr,
                 Err(e) => {
                     // cleanup previous allocated memory
-                    munmap(frames as *mut c_void, frame_total_bytes);
+                    mmap_deallocate(frames as *mut u8, frame_total_bytes);
                     return Err(e);
                 }
             }
@@ -60,7 +55,6 @@ impl FixedBufferPool {
             size,
             allocated: AtomicU64::new(0),
             free_list: Mutex::new(INVALID_PAGE_ID),
-            orphan_undo_maps: Mutex::new(HashMap::new()),
         })
     }
 
@@ -78,19 +72,8 @@ impl FixedBufferPool {
         self.size
     }
 
-    /// Drop static buffer pool.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure no further use on the deallocated pool.
-    pub unsafe fn drop_static(this: &'static Self) {
-        drop(Box::from_raw(this as *const Self as *mut Self));
-    }
-
     #[inline]
-    fn try_get_page_from_free_list<T: BufferFrameAware>(
-        &'static self,
-    ) -> Option<PageExclusiveGuard<T>> {
+    fn try_get_page_from_free_list<T: BufferPage>(&'static self) -> Option<PageExclusiveGuard<T>> {
         unsafe {
             let bf = {
                 let mut page_id = self.free_list.lock();
@@ -98,49 +81,48 @@ impl FixedBufferPool {
                     return None;
                 }
                 let bf = self.get_frame(*page_id);
-                *page_id = (*bf.get()).next_free;
+                *page_id = (*bf.0).next_free;
                 bf
             };
-            (*bf.get()).next_free = INVALID_PAGE_ID;
-            T::on_alloc(self, &mut *bf.get());
+            (*bf.0).next_free = INVALID_PAGE_ID;
             let g = init_bf_exclusive_guard(bf);
             Some(g)
         }
     }
 
     #[inline]
-    fn get_page_internal<T: 'static>(
-        &self,
+    async fn get_page_internal<T: 'static>(
+        &'static self,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> PageGuard<'static, T> {
+    ) -> PageGuard<T> {
         unsafe {
             let bf = self.get_frame(page_id);
-            let g = (*bf.get()).latch.optimistic_fallback(mode);
+            let g = (*bf.0).latch.optimistic_fallback(mode).await;
             PageGuard::new(bf, g)
         }
     }
 
     #[inline]
-    unsafe fn get_new_frame(&self, page_id: PageID) -> &UnsafeCell<BufferFrame> {
+    unsafe fn get_new_frame(&'static self, page_id: PageID) -> UnsafePtr<BufferFrame> {
         let bf_ptr = self.frames.offset(page_id as isize);
         std::ptr::write(bf_ptr, BufferFrame::default());
         // assign page pointer.
         (*bf_ptr).page = self.pages.offset(page_id as isize);
-        &*(bf_ptr as *mut UnsafeCell<BufferFrame>)
+        UnsafePtr(bf_ptr)
     }
 
     #[inline]
-    unsafe fn get_frame(&self, page_id: PageID) -> &'static UnsafeCell<BufferFrame> {
+    unsafe fn get_frame(&'static self, page_id: PageID) -> UnsafePtr<BufferFrame> {
         let bf_ptr = self.frames.offset(page_id as isize);
-        &*(bf_ptr as *mut UnsafeCell<BufferFrame>)
+        UnsafePtr(bf_ptr)
     }
 }
 
-impl BufferPool for &'static FixedBufferPool {
+impl BufferPool for FixedBufferPool {
     // allocate a new page with exclusive lock.
     #[inline]
-    async fn allocate_page<T: BufferFrameAware>(self) -> PageExclusiveGuard<'static, T> {
+    async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
         // try get from free list.
         if let Some(g) = self.try_get_page_from_free_list() {
             return g;
@@ -152,9 +134,8 @@ impl BufferPool for &'static FixedBufferPool {
         }
         unsafe {
             let bf = self.get_new_frame(page_id);
-            (*bf.get()).page_id = page_id;
-            (*bf.get()).next_free = INVALID_PAGE_ID;
-            T::on_alloc(self, &mut *bf.get());
+            (*bf.0).page_id = page_id;
+            (*bf.0).next_free = INVALID_PAGE_ID;
             let g = init_bf_exclusive_guard(bf);
             g
         }
@@ -163,22 +144,21 @@ impl BufferPool for &'static FixedBufferPool {
     /// Returns the page guard with given page id.
     /// Caller should make sure page id is valid.
     #[inline]
-    async fn get_page<T: BufferFrameAware>(
-        self,
+    async fn get_page<T: BufferPage>(
+        &'static self,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> PageGuard<'static, T> {
+    ) -> PageGuard<T> {
         debug_assert!(
             page_id < self.allocated.load(Ordering::Relaxed),
             "page id out of bound"
         );
-        self.get_page_internal(page_id, mode)
+        self.get_page_internal(page_id, mode).await
     }
 
     /// Deallocate page.
     #[inline]
-    async fn deallocate_page<T: BufferFrameAware>(self, mut g: PageExclusiveGuard<'static, T>) {
-        T::on_dealloc(self, &mut g.bf_mut());
+    fn deallocate_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
         let mut page_id = self.free_list.lock();
         g.bf_mut().next_free = *page_id;
         *page_id = g.page_id();
@@ -190,33 +170,19 @@ impl BufferPool for &'static FixedBufferPool {
     /// call. So version must be validated before returning the buffer frame.
     #[inline]
     async fn get_child_page<T>(
-        self,
-        p_guard: &PageGuard<'static, T>,
+        &'static self,
+        p_guard: &PageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Validation<PageGuard<'static, T>> {
+    ) -> Validation<PageGuard<T>> {
         if page_id >= self.allocated.load(Ordering::Relaxed) {
             panic!("page id out of bound");
         }
-        let g = self.get_page_internal(page_id, mode);
+        let g = self.get_page_internal(page_id, mode).await;
         // apply lock coupling.
         // the validation make sure parent page does not change until child
         // page is acquired.
         p_guard.validate().and_then(|_| Valid(g))
-    }
-
-    #[inline]
-    fn load_orphan_undo_map(self, page_id: PageID) -> Option<UndoMap> {
-        let mut g = self.orphan_undo_maps.lock();
-        g.remove(&page_id)
-    }
-
-    #[inline]
-    fn save_orphan_undo_map(self, page_id: PageID, undo_map: UndoMap) {
-        debug_assert!(undo_map.occupied() > 0);
-        let mut g = self.orphan_undo_maps.lock();
-        let res = g.insert(page_id, undo_map);
-        debug_assert!(res.is_none());
     }
 }
 
@@ -224,44 +190,22 @@ impl Drop for FixedBufferPool {
     fn drop(&mut self) {
         unsafe {
             let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.size + SAFETY_PAGES);
-            munmap(self.frames as *mut c_void, frame_total_bytes);
+            mmap_deallocate(self.frames as *mut u8, frame_total_bytes);
             let page_total_bytes = mem::size_of::<Page>() * (self.size + SAFETY_PAGES);
-            munmap(self.pages as *mut c_void, page_total_bytes);
+            mmap_deallocate(self.pages as *mut u8, page_total_bytes);
         }
     }
 }
+
+unsafe impl Send for FixedBufferPool {}
 
 unsafe impl Sync for FixedBufferPool {}
 
 unsafe impl StaticLifetime for FixedBufferPool {}
 
-#[inline]
-fn init_bf_exclusive_guard<T: BufferFrameAware>(
-    bf: &UnsafeCell<BufferFrame>,
-) -> PageExclusiveGuard<'_, T> {
-    unsafe {
-        let g = (*bf.get()).latch.exclusive();
-        PageGuard::new(bf, g).block_until_exclusive()
-    }
-}
+impl UnwindSafe for FixedBufferPool {}
 
-#[inline]
-unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
-    let memory_chunk = mmap(
-        std::ptr::null_mut(),
-        total_bytes,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
-        0,
-    );
-    if memory_chunk == MAP_FAILED {
-        return Err(Error::InsufficientMemory(total_bytes));
-    }
-    madvise(memory_chunk, total_bytes, MADV_HUGEPAGE);
-    madvise(memory_chunk, total_bytes, MADV_DONTFORK);
-    Ok(memory_chunk as *mut u8)
-}
+impl RefUnwindSafe for FixedBufferPool {}
 
 #[cfg(test)]
 mod tests {
@@ -274,23 +218,23 @@ mod tests {
         smol::block_on(async {
             let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
             {
-                let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page().await;
+                let g: PageExclusiveGuard<BlockNode> = pool.allocate_page().await;
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page().await;
+                let g: PageExclusiveGuard<BlockNode> = pool.allocate_page().await;
                 assert_eq!(g.page_id(), 1);
-                pool.deallocate_page(g).await;
-                let g: PageExclusiveGuard<'_, BlockNode> = pool.allocate_page().await;
+                pool.deallocate_page(g);
+                let g: PageExclusiveGuard<BlockNode> = pool.allocate_page().await;
                 assert_eq!(g.page_id(), 1);
             }
             {
-                let g: PageOptimisticGuard<'_, BlockNode> =
+                let g: PageOptimisticGuard<BlockNode> =
                     pool.get_page(0, LatchFallbackMode::Spin).await.downgrade();
                 assert_eq!(unsafe { g.page_id() }, 0);
             }
             unsafe {
-                FixedBufferPool::drop_static(pool);
+                StaticLifetime::drop_static(pool);
             }
         })
     }

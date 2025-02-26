@@ -5,12 +5,14 @@ mod ringbuffer;
 
 use libaio_abi::*;
 use libc::{
-    c_long, close, fdatasync, fsync, ftruncate, open, EAGAIN, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC,
+    c_long, c_void, close, fdatasync, fsync, ftruncate, open, EAGAIN, O_CREAT, O_DIRECT, O_RDWR,
+    O_TRUNC,
 };
 use std::ffi::CString;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use thiserror::Error;
 
 pub use buf::*;
 pub use free_list::*;
@@ -26,10 +28,13 @@ pub fn align_to_sector_size(len: usize) -> usize {
 
 const DEFAULT_AIO_MAX_EVENTS: usize = 32;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Error)]
 pub enum AIOError {
+    #[error("AIO setup error")]
     SetupError,
+    #[error("AIO open file error")]
     OpenFileError,
+    #[error("AIO out of range")]
     OutOfRange,
 }
 
@@ -71,11 +76,12 @@ impl Drop for AIOContext {
 pub type IocbPtr = AtomicPtr<iocb>;
 pub type IocbRawPtr = *mut iocb;
 
+/// AIO backed by an owned aligned buffer.
 pub struct AIO {
-    pub iocb: IocbPtr,
+    iocb: IocbPtr,
     // this is essential because libaio requires the pointer
     // to buffer keep valid during async processing.
-    pub buf: Option<Buf>,
+    buf: Option<Buf>,
     pub key: AIOKey,
 }
 
@@ -90,7 +96,7 @@ impl AIO {
         flags: u32,
         opcode: io_iocb_cmd,
     ) -> Self {
-        let mut iocb = Box::new(iocb::default());
+        let iocb = unsafe { iocb::alloc() };
         iocb.aio_fildes = fd as u32;
         iocb.aio_lio_opcode = opcode as u16;
         iocb.aio_reqprio = priority;
@@ -102,13 +108,23 @@ impl AIO {
         AIO {
             key,
             buf: Some(buf),
-            iocb: AtomicPtr::new(Box::into_raw(iocb)),
+            iocb: AtomicPtr::new(iocb),
         }
+    }
+
+    #[inline]
+    pub fn iocb(&self) -> &IocbPtr {
+        &self.iocb
     }
 
     #[inline]
     pub fn take_buf(&mut self) -> Option<Buf> {
         self.buf.take()
+    }
+
+    #[inline]
+    pub fn buf(&self) -> Option<&Buf> {
+        self.buf.as_ref()
     }
 }
 
@@ -118,6 +134,47 @@ impl Drop for AIO {
         unsafe {
             drop(Box::from_raw(self.iocb.load(Ordering::Relaxed)));
         }
+    }
+}
+
+/// AIO backed by a raw pointer.
+/// The raw pointer must be aigned to page and
+/// has outlive the async IO call.
+pub struct UnsafeAIO {
+    iocb: IocbPtr,
+    pub key: AIOKey,
+}
+
+impl UnsafeAIO {
+    #[inline]
+    pub unsafe fn new(
+        key: AIOKey,
+        fd: RawFd,
+        offset: usize,
+        ptr: *mut u8,
+        len: usize,
+        priority: u16,
+        flags: u32,
+        opcode: io_iocb_cmd,
+    ) -> Self {
+        let iocb = unsafe { iocb::alloc() };
+        iocb.aio_fildes = fd as u32;
+        iocb.aio_lio_opcode = opcode as u16;
+        iocb.aio_reqprio = priority;
+        iocb.buf = ptr;
+        iocb.count = len as u64;
+        iocb.offset = offset as u64;
+        iocb.flags = flags;
+        iocb.data = key; // store and send back via io_event
+        UnsafeAIO {
+            iocb: AtomicPtr::new(iocb),
+            key,
+        }
+    }
+
+    #[inline]
+    pub fn iocb(&self) -> &IocbPtr {
+        &self.iocb
     }
 }
 
@@ -180,7 +237,7 @@ impl AIOManager {
     }
 
     #[inline]
-    pub fn max_events(&mut self) -> usize {
+    pub fn max_events(&self) -> usize {
         self.max_events
     }
 
@@ -212,7 +269,7 @@ impl AIOManager {
 
     #[inline]
     pub fn submit_limit(&self, reqs: &mut Vec<*mut iocb>, limit: usize) -> usize {
-        if reqs.is_empty() {
+        if reqs.is_empty() || limit == 0 {
             return 0;
         }
         let batch_size = limit.min(reqs.len());
@@ -263,7 +320,8 @@ impl AIOManager {
             let res = if ev.res >= 0 {
                 Ok(ev.res as usize)
             } else {
-                Err(std::io::Error::from_raw_os_error(-ev.res as i32))
+                let err = std::io::Error::from_raw_os_error(-ev.res as i32);
+                Err(err)
             };
             callback(key, res);
         }
@@ -371,11 +429,38 @@ impl SparseFile {
         pread_direct(key, self.fd, offset, len)
     }
 
+    /// Returns a pread IO request.
+    /// User must guarantee the pointed memory is valid during IO processing.
+    #[inline]
+    pub unsafe fn pread_unchecked(
+        &self,
+        key: AIOKey,
+        offset: usize,
+        ptr: *mut u8,
+        len: usize,
+    ) -> UnsafeAIO {
+        pread_unchecked(key, self.fd, offset, ptr, len)
+    }
+
     /// Returns a pwrite IO request.
     /// User should make sure key is unique.
     #[inline]
     pub fn pwrite_direct(&self, key: AIOKey, offset: usize, buf: DirectBuf) -> AIO {
         pwrite_direct(key, self.fd, offset, buf)
+    }
+
+    /// Returns a pwrite IO request.
+    /// User must guarantee the pointed memory is valid during IO processing.
+    /// After the write is done, user may want to re
+    #[inline]
+    pub unsafe fn pwrite_unchecked(
+        &self,
+        key: AIOKey,
+        offset: usize,
+        ptr: *mut u8,
+        len: usize,
+    ) -> UnsafeAIO {
+        pwrite_unchecked(key, self.fd, offset, ptr, len)
     }
 
     /// Returns the file syncer.
@@ -431,6 +516,28 @@ pub fn pread_direct(key: AIOKey, fd: RawFd, offset: usize, len: usize) -> AIO {
 }
 
 #[inline]
+pub unsafe fn pread_unchecked(
+    key: AIOKey,
+    fd: RawFd,
+    offset: usize,
+    ptr: *mut u8,
+    len: usize,
+) -> UnsafeAIO {
+    const PRIORITY: u16 = 0;
+    const FLAGS: u32 = 0;
+    UnsafeAIO::new(
+        key,
+        fd,
+        offset,
+        ptr,
+        len,
+        PRIORITY,
+        FLAGS,
+        io_iocb_cmd::IO_CMD_PREAD,
+    )
+}
+
+#[inline]
 pub fn pwrite_direct(key: AIOKey, fd: RawFd, offset: usize, buf: DirectBuf) -> AIO {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
@@ -443,6 +550,54 @@ pub fn pwrite_direct(key: AIOKey, fd: RawFd, offset: usize, buf: DirectBuf) -> A
         FLAGS,
         io_iocb_cmd::IO_CMD_PWRITE,
     )
+}
+
+#[inline]
+pub unsafe fn pwrite_unchecked(
+    key: AIOKey,
+    fd: RawFd,
+    offset: usize,
+    ptr: *mut u8,
+    len: usize,
+) -> UnsafeAIO {
+    const PRIORITY: u16 = 0;
+    const FLAGS: u32 = 0;
+    UnsafeAIO::new(
+        key,
+        fd,
+        offset,
+        ptr,
+        len,
+        PRIORITY,
+        FLAGS,
+        io_iocb_cmd::IO_CMD_PWRITE,
+    )
+}
+
+#[cfg(feature = "mlock")]
+#[inline]
+pub unsafe fn mlock(ptr: *mut u8, len: usize) -> bool {
+    let res = libc::mlock(ptr as *const c_void, len);
+    res == 0
+}
+
+#[cfg(not(feature = "mlock"))]
+#[inline]
+pub unsafe fn mlock(_ptr: *mut u8, _len: usize) -> bool {
+    true
+}
+
+#[cfg(feature = "mlock")]
+#[inline]
+pub unsafe fn munlock(ptr: *mut u8, len: usize) -> bool {
+    let res = libc::munlock(ptr as *const c_void, len);
+    res == 0
+}
+
+#[cfg(not(feature = "mlock"))]
+#[inline]
+pub unsafe fn munlock(_ptr: *mut u8, _len: usize) -> bool {
+    true
 }
 
 #[inline]

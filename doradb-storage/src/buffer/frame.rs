@@ -1,7 +1,7 @@
 use crate::buffer::page::{Page, PageID, INVALID_PAGE_ID};
-use crate::buffer::BufferPool;
 use crate::latch::HybridLatch;
 use crate::trx::undo::UndoMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 const _: () = assert!(
     { std::mem::size_of::<BufferFrame>() % 64 == 0 },
@@ -22,11 +22,48 @@ pub struct BufferFrame {
     pub latch: HybridLatch, // lock proctects free list and page.
     pub page_id: PageID,
     pub next_free: PageID,
-    /// Undo Map is only maintained by RowPage.
-    /// Once a RowPage is eliminated, the UndoMap is retained by BufferPool
-    /// and when the page is reloaded, UndoMap is reattached to page.
-    pub undo_map: Option<UndoMap>,
+    frame_kind: AtomicU8,
+    dirty: AtomicBool,
+    /// Context of this buffer frame. It can store additinal contextual information
+    /// about the page, e.g. undo map of row page.
+    pub ctx: Option<Box<FrameContext>>,
     pub page: *mut Page,
+}
+
+impl BufferFrame {
+    #[inline]
+    pub fn kind(&self) -> FrameKind {
+        let value = self.frame_kind.load(Ordering::Acquire);
+        FrameKind::from(value)
+    }
+
+    #[inline]
+    pub fn set_kind(&self, kind: FrameKind) {
+        self.frame_kind.store(kind as u8, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn compare_exchange_kind(&self, old_kind: FrameKind, new_kind: FrameKind) -> FrameKind {
+        match self.frame_kind.compare_exchange(
+            old_kind as u8,
+            new_kind as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(val) => FrameKind::from(val),
+            Err(val) => FrameKind::from(val),
+        }
+    }
+
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_dirty(&self, dirty: bool) {
+        self.dirty.store(dirty, Ordering::Release);
+    }
 }
 
 impl Default for BufferFrame {
@@ -36,7 +73,10 @@ impl Default for BufferFrame {
             latch: HybridLatch::new(),
             page_id: 0,
             next_free: INVALID_PAGE_ID,
-            undo_map: None,
+            frame_kind: AtomicU8::new(FrameKind::Hot as u8),
+            // by default the page is dirty because no copy on disk.
+            dirty: AtomicBool::new(true),
+            ctx: None,
             page: std::ptr::null_mut(),
         }
     }
@@ -46,21 +86,41 @@ unsafe impl Send for BufferFrame {}
 
 unsafe impl Sync for BufferFrame {}
 
-/// BufferFrameAware defines callbacks on lifecycle of buffer frame
-/// for initialization and de-initialization.
-pub trait BufferFrameAware: Sized + 'static {
-    /// This callback is called when a page is just loaded into BufferFrame.
-    fn on_alloc<P: BufferPool>(pool: P, frame: &mut BufferFrame);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameKind {
+    /// HOT means this page is in memory.
+    Hot = 0,
+    /// COOL means this page is selected as candidate to be spilled to disk.
+    Cool = 1,
+    /// EVICTING means this page is being evicted.
+    Evicting = 2,
+    /// EVICTING means this page is spilled to disk.
+    Evicted = 3,
+}
 
-    /// This callback is called when a page is cleaned and return to BufferPool.
-    fn on_dealloc<P: BufferPool>(pool: P, frame: &mut BufferFrame);
-
-    /// This callback is called after a page is initialized.
-    fn after_init<P: BufferPool>(pool: P, frame: &mut BufferFrame);
-
-    /// Caller must guarantee Self has same size as Page.
+impl From<u8> for FrameKind {
     #[inline]
-    unsafe fn get(frame: &BufferFrame) -> &Self {
-        &*(frame.page as *const Self)
+    fn from(value: u8) -> Self {
+        match value {
+            0 => FrameKind::Hot,
+            1 => FrameKind::Cool,
+            2 => FrameKind::Evicting,
+            3 => FrameKind::Evicted,
+            _ => unreachable!("invalid frame kind"),
+        }
+    }
+}
+
+pub enum FrameContext {
+    UndoMap(UndoMap),
+}
+
+impl FrameContext {
+    #[inline]
+    pub fn undo(&self) -> &UndoMap {
+        match self {
+            FrameContext::UndoMap(undo) => undo,
+        }
     }
 }

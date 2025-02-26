@@ -3,10 +3,7 @@ use crate::row::RowID;
 use crate::table::TableID;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::ActiveTrx;
-use flume::{Receiver, Sender};
-use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 pub struct Session {
     inner: Option<Box<InternalSession>>,
@@ -39,18 +36,13 @@ pub trait IntoSession: Sized {
 
 pub struct InternalSession {
     active_insert_pages: HashMap<TableID, (PageID, RowID)>,
-    abort_signal: Arc<Mutex<Option<Sender<()>>>>,
-    abort_notifier: Receiver<()>,
 }
 
 impl InternalSession {
     #[inline]
     pub fn new() -> Self {
-        let (tx, rx) = flume::unbounded();
         InternalSession {
             active_insert_pages: HashMap::new(),
-            abort_signal: Arc::new(Mutex::new(Some(tx))),
-            abort_notifier: rx,
         }
     }
 

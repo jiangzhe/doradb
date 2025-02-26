@@ -1,4 +1,4 @@
-use crate::buffer::frame::BufferFrame;
+use crate::buffer::frame::{BufferFrame, FrameContext};
 use crate::buffer::page::PageID;
 use crate::error::{
     Validation,
@@ -6,22 +6,21 @@ use crate::error::{
 };
 use crate::latch::GuardState;
 use crate::latch::HybridGuard;
-use crate::trx::undo::UndoMap;
+use crate::ptr::UnsafePtr;
 use either::Either;
-use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem;
 
 // facade of lock guard, which encapsulate all three lock modes.
-pub struct PageGuard<'a, T> {
-    bf: &'a UnsafeCell<BufferFrame>,
-    guard: HybridGuard<'a>,
-    _marker: PhantomData<&'a T>,
+pub struct PageGuard<T: 'static> {
+    bf: UnsafePtr<BufferFrame>,
+    guard: HybridGuard<'static>,
+    _marker: PhantomData<&'static T>,
 }
 
-impl<'a, T> PageGuard<'a, T> {
+impl<T: 'static> PageGuard<T> {
     #[inline]
-    pub fn new(bf: &'a UnsafeCell<BufferFrame>, guard: HybridGuard<'a>) -> Self {
+    pub fn new(bf: UnsafePtr<BufferFrame>, guard: HybridGuard<'static>) -> Self {
         PageGuard {
             bf,
             guard,
@@ -34,12 +33,10 @@ impl<'a, T> PageGuard<'a, T> {
     /// If lock acquisition fails, refresh version of the optimistic lock, so next acquisition
     /// may succeed.
     #[inline]
-    pub fn try_exclusive_either(
-        mut self,
-    ) -> Either<PageExclusiveGuard<'a, T>, PageOptimisticGuard<'a, T>> {
+    pub fn try_exclusive_either(mut self) -> Either<PageExclusiveGuard<T>, PageOptimisticGuard<T>> {
         match self.try_exclusive() {
             Valid(()) => Either::Left(PageExclusiveGuard {
-                bf: unsafe { &mut *self.bf.get() },
+                bf: unsafe { &mut *self.bf.0 },
                 guard: self.guard,
                 _marker: PhantomData,
             }),
@@ -63,19 +60,39 @@ impl<'a, T> PageGuard<'a, T> {
     }
 
     #[inline]
-    pub fn block_until_exclusive(self) -> PageExclusiveGuard<'a, T> {
+    pub fn exclusive_blocking(self) -> PageExclusiveGuard<T> {
         match self.guard.state {
             GuardState::Optimistic => {
-                let guard = self.guard.block_until_exclusive();
+                let guard = self.guard.exclusive_blocking();
                 PageExclusiveGuard {
-                    bf: unsafe { &mut *self.bf.get() },
+                    bf: unsafe { &mut *self.bf.0 },
                     guard,
                     _marker: PhantomData,
                 }
             }
             GuardState::Shared => panic!("block until exclusive by shared lock is not allowed"),
             GuardState::Exclusive => PageExclusiveGuard {
-                bf: unsafe { &mut *self.bf.get() },
+                bf: unsafe { &mut *self.bf.0 },
+                guard: self.guard,
+                _marker: PhantomData,
+            },
+        }
+    }
+
+    #[inline]
+    pub async fn exclusive_async(self) -> PageExclusiveGuard<T> {
+        match self.guard.state {
+            GuardState::Optimistic => {
+                let guard = self.guard.exclusive_async().await;
+                PageExclusiveGuard {
+                    bf: unsafe { &mut *self.bf.0 },
+                    guard,
+                    _marker: PhantomData,
+                }
+            }
+            GuardState::Shared => panic!("block until exclusive by shared lock is not allowed"),
+            GuardState::Exclusive => PageExclusiveGuard {
+                bf: unsafe { &mut *self.bf.0 },
                 guard: self.guard,
                 _marker: PhantomData,
             },
@@ -87,9 +104,7 @@ impl<'a, T> PageGuard<'a, T> {
     /// If lock acquisition fails, refresh version of the optimistic lock, so next acquisition
     /// may succeed.
     #[inline]
-    pub fn try_shared_either(
-        mut self,
-    ) -> Either<PageSharedGuard<'a, T>, PageOptimisticGuard<'a, T>> {
+    pub fn try_shared_either(mut self) -> Either<PageSharedGuard<T>, PageOptimisticGuard<T>> {
         match self.try_shared() {
             Valid(()) => Either::Left(PageSharedGuard {
                 bf: unsafe { mem::transmute(self.bf) },
@@ -116,18 +131,18 @@ impl<'a, T> PageGuard<'a, T> {
     }
 
     #[inline]
-    pub fn block_until_shared(self) -> PageSharedGuard<'a, T> {
+    pub fn shared_blocking(self) -> PageSharedGuard<T> {
         match self.guard.state {
             GuardState::Optimistic => {
-                let guard = self.guard.block_until_shared();
+                let guard = self.guard.shared_blocking();
                 PageSharedGuard {
-                    bf: unsafe { &*self.bf.get() },
+                    bf: unsafe { &*self.bf.0 },
                     guard,
                     _marker: PhantomData,
                 }
             }
             GuardState::Shared => PageSharedGuard {
-                bf: unsafe { &*self.bf.get() },
+                bf: unsafe { &*self.bf.0 },
                 guard: self.guard,
                 _marker: PhantomData,
             },
@@ -136,7 +151,27 @@ impl<'a, T> PageGuard<'a, T> {
     }
 
     #[inline]
-    pub fn downgrade(self) -> PageOptimisticGuard<'a, T> {
+    pub async fn shared_async(self) -> PageSharedGuard<T> {
+        match self.guard.state {
+            GuardState::Optimistic => {
+                let guard = self.guard.shared_async().await;
+                PageSharedGuard {
+                    bf: unsafe { &*self.bf.0 },
+                    guard,
+                    _marker: PhantomData,
+                }
+            }
+            GuardState::Shared => PageSharedGuard {
+                bf: unsafe { &*self.bf.0 },
+                guard: self.guard,
+                _marker: PhantomData,
+            },
+            GuardState::Exclusive => panic!("block until exclusive by shared lock is not allowed"),
+        }
+    }
+
+    #[inline]
+    pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
             bf: self.bf,
             guard: self.guard.downgrade(),
@@ -163,12 +198,12 @@ impl<'a, T> PageGuard<'a, T> {
     }
 
     #[inline]
-    pub unsafe fn as_shared(&self) -> &PageSharedGuard<'a, T> {
+    pub unsafe fn as_shared(&self) -> &PageSharedGuard<T> {
         mem::transmute(self)
     }
 
     #[inline]
-    pub unsafe fn as_exclusive(&mut self) -> &mut PageExclusiveGuard<'a, T> {
+    pub unsafe fn as_exclusive(&mut self) -> &mut PageExclusiveGuard<T> {
         mem::transmute(self)
     }
 
@@ -176,8 +211,7 @@ impl<'a, T> PageGuard<'a, T> {
     /// All values must be validated before use.
     #[inline]
     pub unsafe fn page_unchecked(&self) -> &T {
-        let bf = self.bf.get();
-        let page = (*bf).page;
+        let page = (*self.bf.0).page;
         &*(page as *mut T)
     }
 
@@ -191,54 +225,74 @@ impl<'a, T> PageGuard<'a, T> {
     }
 }
 
-unsafe impl<'a, T> Send for PageGuard<'a, T> {}
-unsafe impl<'a, T> Sync for PageGuard<'a, T> {}
+unsafe impl<T: 'static> Send for PageGuard<T> {}
+unsafe impl<T: 'static> Sync for PageGuard<T> {}
 
-pub struct PageOptimisticGuard<'a, T> {
-    bf: &'a UnsafeCell<BufferFrame>,
-    guard: HybridGuard<'a>,
-    _marker: PhantomData<&'a T>,
+pub struct PageOptimisticGuard<T: 'static> {
+    bf: UnsafePtr<BufferFrame>,
+    guard: HybridGuard<'static>,
+    _marker: PhantomData<&'static T>,
 }
 
-impl<'a, T> PageOptimisticGuard<'a, T> {
+impl<T> PageOptimisticGuard<T> {
     #[inline]
     pub unsafe fn page_id(&self) -> PageID {
-        (*self.bf.get()).page_id
+        (*self.bf.0).page_id
     }
 
     #[inline]
-    pub fn try_shared(mut self) -> Validation<PageSharedGuard<'a, T>> {
+    pub fn try_shared(mut self) -> Validation<PageSharedGuard<T>> {
         self.guard.try_shared().map(|_| PageSharedGuard {
-            bf: unsafe { &*self.bf.get() },
+            bf: unsafe { &*self.bf.0 },
             guard: self.guard,
             _marker: PhantomData,
         })
     }
 
     #[inline]
-    pub fn block_until_shared(self) -> PageSharedGuard<'a, T> {
-        let guard = self.guard.block_until_shared();
+    pub fn shared_blocking(self) -> PageSharedGuard<T> {
+        let guard = self.guard.shared_blocking();
         PageSharedGuard {
-            bf: unsafe { &*self.bf.get() },
+            bf: unsafe { &*self.bf.0 },
             guard,
             _marker: PhantomData,
         }
     }
 
     #[inline]
-    pub fn try_exclusive(mut self) -> Validation<PageExclusiveGuard<'a, T>> {
+    pub async fn shared_async(self) -> PageSharedGuard<T> {
+        let guard = self.guard.shared_async().await;
+        PageSharedGuard {
+            bf: unsafe { &*self.bf.0 },
+            guard,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn try_exclusive(mut self) -> Validation<PageExclusiveGuard<T>> {
         self.guard.try_exclusive().map(|_| PageExclusiveGuard {
-            bf: unsafe { &mut *self.bf.get() },
+            bf: unsafe { &mut *self.bf.0 },
             guard: self.guard,
             _marker: PhantomData,
         })
     }
 
     #[inline]
-    pub fn block_until_exclusive(self) -> PageExclusiveGuard<'a, T> {
-        let guard = self.guard.block_until_exclusive();
+    pub fn exclusive_blocking(self) -> PageExclusiveGuard<T> {
+        let guard = self.guard.exclusive_blocking();
         PageExclusiveGuard {
-            bf: unsafe { &mut *self.bf.get() },
+            bf: unsafe { &mut *self.bf.0 },
+            guard,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub async fn exclusive_async(self) -> PageExclusiveGuard<T> {
+        let guard = self.guard.exclusive_async().await;
+        PageExclusiveGuard {
+            bf: unsafe { &mut *self.bf.0 },
             guard,
             _marker: PhantomData,
         }
@@ -248,8 +302,7 @@ impl<'a, T> PageOptimisticGuard<'a, T> {
     /// All values must be validated before use.
     #[inline]
     pub unsafe fn page_unchecked(&self) -> &T {
-        let bf = self.bf.get();
-        let page = (*bf).page;
+        let page = (*self.bf.0).page;
         &*(page as *mut T)
     }
 
@@ -271,10 +324,10 @@ impl<'a, T> PageOptimisticGuard<'a, T> {
     /// Returns a copy of optimistic guard.
     /// Otherwise fail.
     #[inline]
-    pub fn copy_keepalive(&self) -> PageGuard<'a, T> {
+    pub fn copy_keepalive(&self) -> PageGuard<T> {
         let guard = self.guard.optimistic_clone().expect("copy optimistic lock");
         PageGuard {
-            bf: self.bf,
+            bf: self.bf.clone(),
             guard,
             _marker: PhantomData,
         }
@@ -282,7 +335,7 @@ impl<'a, T> PageOptimisticGuard<'a, T> {
 
     /// Returns facade guard.
     #[inline]
-    pub fn facade(self) -> PageGuard<'a, T> {
+    pub fn facade(self) -> PageGuard<T> {
         PageGuard {
             bf: self.bf,
             guard: self.guard,
@@ -291,20 +344,20 @@ impl<'a, T> PageOptimisticGuard<'a, T> {
     }
 }
 
-unsafe impl<'a, T> Send for PageOptimisticGuard<'a, T> {}
-unsafe impl<'a, T> Sync for PageOptimisticGuard<'a, T> {}
+unsafe impl<T: 'static> Send for PageOptimisticGuard<T> {}
+unsafe impl<T: 'static> Sync for PageOptimisticGuard<T> {}
 
-pub struct PageSharedGuard<'a, T> {
-    bf: &'a BufferFrame,
-    guard: HybridGuard<'a>,
-    _marker: PhantomData<&'a T>,
+pub struct PageSharedGuard<T: 'static> {
+    bf: &'static BufferFrame,
+    guard: HybridGuard<'static>,
+    _marker: PhantomData<&'static T>,
 }
 
-impl<'a, T> PageSharedGuard<'a, T> {
+impl<T: 'static> PageSharedGuard<T> {
     /// Convert a page shared guard to optimistic guard
     /// with long lifetime.
     #[inline]
-    pub fn downgrade(self) -> PageOptimisticGuard<'a, T> {
+    pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
             bf: unsafe { mem::transmute(self.bf) },
             guard: self.guard.downgrade(),
@@ -332,9 +385,9 @@ impl<'a, T> PageSharedGuard<'a, T> {
     }
 
     #[inline]
-    pub fn undo_map_and_page(&self) -> (&UndoMap, &T) {
+    pub fn ctx_and_page(&self) -> (&FrameContext, &T) {
         let bf = self.bf();
-        let undo_map = bf.undo_map.as_ref().unwrap();
+        let undo_map = bf.ctx.as_ref().unwrap();
         let page = bf.page;
         let page = unsafe { &*(page as *mut T) };
         (undo_map, page)
@@ -342,32 +395,51 @@ impl<'a, T> PageSharedGuard<'a, T> {
 
     /// Returns facade guard.
     #[inline]
-    pub fn facade(self) -> PageGuard<'a, T> {
+    pub fn facade(self, dirty: bool) -> PageGuard<T> {
+        if dirty && !self.bf.is_dirty() {
+            self.bf.set_dirty(true);
+        }
         PageGuard {
             bf: unsafe { mem::transmute(self.bf) },
             guard: self.guard,
             _marker: PhantomData,
         }
     }
+
+    #[inline]
+    pub fn set_dirty(self) {
+        if !self.bf.is_dirty() {
+            self.bf.set_dirty(true);
+        }
+    }
 }
 
-unsafe impl<'a, T> Send for PageSharedGuard<'a, T> {}
-unsafe impl<'a, T> Sync for PageSharedGuard<'a, T> {}
+unsafe impl<T: 'static> Send for PageSharedGuard<T> {}
+unsafe impl<T: 'static> Sync for PageSharedGuard<T> {}
 
-pub struct PageExclusiveGuard<'a, T> {
-    bf: &'a mut BufferFrame,
-    guard: HybridGuard<'a>,
-    _marker: PhantomData<&'a mut T>,
+pub struct PageExclusiveGuard<T: 'static> {
+    bf: &'static mut BufferFrame,
+    guard: HybridGuard<'static>,
+    _marker: PhantomData<&'static mut T>,
 }
 
-impl<'a, T> PageExclusiveGuard<'a, T> {
+impl<T: 'static> PageExclusiveGuard<T> {
     /// Convert a page exclusive guard to optimistic guard
     /// with long lifetime.
     #[inline]
-    pub fn downgrade(self) -> PageOptimisticGuard<'a, T> {
+    pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
             bf: unsafe { mem::transmute(self.bf) },
             guard: self.guard.downgrade(),
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn downgrade_shared(self) -> PageSharedGuard<T> {
+        PageSharedGuard {
+            bf: unsafe { mem::transmute(self.bf) },
+            guard: self.guard.downgrade_exclusive_to_shared(),
             _marker: PhantomData,
         }
     }
@@ -398,15 +470,6 @@ impl<'a, T> PageExclusiveGuard<'a, T> {
         &self.bf
     }
 
-    #[inline]
-    pub fn undo_map_and_page(&self) -> (&UndoMap, &T) {
-        let bf = self.bf();
-        let undo_map = bf.undo_map.as_ref().unwrap();
-        let page = bf.page;
-        let page = unsafe { &*(page as *mut T) };
-        (undo_map, page)
-    }
-
     /// Returns mutable buffer frame.
     #[inline]
     pub fn bf_mut(&mut self) -> &mut BufferFrame {
@@ -421,14 +484,29 @@ impl<'a, T> PageExclusiveGuard<'a, T> {
 
     /// Returns facade guard.
     #[inline]
-    pub fn facade(self) -> PageGuard<'a, T> {
+    pub fn facade(self, dirty: bool) -> PageGuard<T> {
+        if dirty && !self.bf.is_dirty() {
+            self.bf.set_dirty(true);
+        }
         PageGuard {
             bf: unsafe { mem::transmute(self.bf) },
             guard: self.guard,
             _marker: PhantomData,
         }
     }
+
+    #[inline]
+    pub fn set_dirty(self) {
+        if !self.bf.is_dirty() {
+            self.bf.set_dirty(true);
+        }
+    }
+
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        self.bf.is_dirty()
+    }
 }
 
-unsafe impl<'a, T> Send for PageExclusiveGuard<'a, T> {}
-unsafe impl<'a, T> Sync for PageExclusiveGuard<'a, T> {}
+unsafe impl<T: 'static> Send for PageExclusiveGuard<T> {}
+unsafe impl<T: 'static> Sync for PageExclusiveGuard<T> {}

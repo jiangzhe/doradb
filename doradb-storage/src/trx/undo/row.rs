@@ -1,4 +1,3 @@
-use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::latch::LatchFallbackMode;
@@ -225,12 +224,13 @@ impl RowUndoLogs {
     }
 
     #[inline]
-    pub async fn rollback<P: BufferPool>(&mut self, buf_pool: P) {
+    pub async fn rollback<P: BufferPool>(&mut self, buf_pool: &'static P) {
         while let Some(entry) = self.0.pop() {
-            let page_guard: PageGuard<'_, RowPage> = buf_pool
-                .get_page(entry.page_id, LatchFallbackMode::Shared)
+            let page_guard = buf_pool
+                .get_page::<RowPage>(entry.page_id, LatchFallbackMode::Shared)
+                .await
+                .shared_async()
                 .await;
-            let page_guard = page_guard.block_until_shared();
             let row_idx = page_guard.page().row_idx(entry.row_id);
             let mut access = page_guard.write_row(row_idx);
             access.rollback_first_undo(entry);

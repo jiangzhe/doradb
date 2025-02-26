@@ -840,12 +840,12 @@ impl<'a> Drop for RowWriteAccess<'a> {
     }
 }
 
-impl<'a> PageSharedGuard<'a, RowPage> {
+impl PageSharedGuard<RowPage> {
     /// Acquire read latch for single row with offset.
     #[inline]
     pub fn read_row(&self, row_idx: usize) -> RowReadAccess<'_> {
-        let (undo_map, page) = self.undo_map_and_page();
-        let undo = undo_map.read(row_idx);
+        let (ctx, page) = self.ctx_and_page();
+        let undo = ctx.undo().read(row_idx);
         RowReadAccess::new(page, row_idx, undo)
     }
 
@@ -859,7 +859,8 @@ impl<'a> PageSharedGuard<'a, RowPage> {
     /// Acquire write latch for single row with offset.
     #[inline]
     pub fn write_row(&self, row_idx: usize) -> RowWriteAccess<'_> {
-        let (undo_map, page) = self.undo_map_and_page();
+        let (ctx, page) = self.ctx_and_page();
+        let undo_map = ctx.undo();
         let undo = undo_map.write(row_idx);
         RowWriteAccess::new(page, undo_map, row_idx, undo)
     }

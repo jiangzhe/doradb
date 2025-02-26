@@ -4,7 +4,7 @@ use crate::catalog::Catalog;
 use crate::row::RowID;
 use crate::table::TableID;
 use crate::trx::redo::RedoEntry;
-use crate::trx::undo::{IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs};
+use crate::trx::undo::{IndexUndoLogs, RowUndoKind, RowUndoLogs};
 use crate::trx::ActiveTrx;
 
 pub struct Statement {
@@ -51,7 +51,11 @@ impl Statement {
     /// This will trigger statement-level rollback based on its undo.
     /// Redo logs will be discarded.
     #[inline]
-    pub async fn fail<P: BufferPool>(mut self, buf_pool: P, catalog: &Catalog<P>) -> ActiveTrx {
+    pub async fn fail<P: BufferPool>(
+        mut self,
+        buf_pool: &'static P,
+        catalog: &Catalog<P>,
+    ) -> ActiveTrx {
         // rollback row data.
         // todo: group by page level may be better.
         self.row_undo.rollback(buf_pool).await;

@@ -1,19 +1,18 @@
 use clap::Parser;
 use doradb_storage::buffer::FixedBufferPool;
 use doradb_storage::catalog::{IndexKey, IndexSchema, TableSchema};
+use doradb_storage::index::{BlockIndex, RowLocation};
+use doradb_storage::lifetime::StaticLifetime;
 use doradb_storage::value::ValKind;
+use parking_lot::RwLock;
 use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
 use perfcnt::{AbstractPerfCounter, PerfCounter};
-// use doradb_storage::latch::LatchFallbackMode;
-use doradb_storage::index::{BlockIndex, RowLocation};
 use rand::RngCore;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-// use std::str::FromStr;
-use parking_lot::RwLock;
-use std::collections::BTreeMap;
 use std::time::Duration;
+use std::time::Instant;
 
 fn main() {
     let args = Args::parse();
@@ -67,12 +66,12 @@ fn main() {
 
             unsafe {
                 drop(Box::from_raw(
-                    blk_idx as *const _ as *mut BlockIndex<&'static FixedBufferPool>,
+                    blk_idx as *const _ as *mut BlockIndex<FixedBufferPool>,
                 ));
             }
         }
         unsafe {
-            FixedBufferPool::drop_static(buf_pool);
+            StaticLifetime::drop_static(buf_pool);
         }
     });
 
@@ -139,7 +138,7 @@ fn bench_btreemap(args: Args) {
 async fn worker(
     args: Args,
     buf_pool: &'static FixedBufferPool,
-    blk_idx: &'static BlockIndex<&'static FixedBufferPool>,
+    blk_idx: &'static BlockIndex<FixedBufferPool>,
     stop: Arc<AtomicBool>,
 ) -> (usize, u64) {
     let max_row_id = (args.pages * args.rows_per_page) as u64;

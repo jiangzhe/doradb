@@ -1,11 +1,8 @@
 pub mod ops;
 
-use crate::buffer::frame::{BufferFrame, BufferFrameAware};
-use crate::buffer::page::PAGE_SIZE;
-use crate::buffer::BufferPool;
+use crate::buffer::page::{BufferPage, PAGE_SIZE};
 use crate::catalog::TableSchema;
 use crate::row::ops::{Delete, InsertRow, Select, SelectKey, Update, UpdateCol};
-use crate::trx::undo::UndoMap;
 use crate::value::*;
 use std::fmt;
 use std::mem;
@@ -21,11 +18,12 @@ const _: () = assert!(
 );
 
 /// RowPage is the core data structure of row-store.
-/// It is designed to be fast in both TP and AP scenarios.
-/// It follows design of PAX format.
+/// Uses PAX format in order to be fast in both TP and
+/// AP scenarios.
 ///
 /// Header:
 ///
+/// |-------------------------|-----------|
 /// | field                   | length(B) |
 /// |-------------------------|-----------|
 /// | start_row_id            | 8         |
@@ -39,9 +37,11 @@ const _: () = assert!(
 /// | fix_field_offset        | 2         |
 /// | fix_field_end           | 2         |
 /// | padding                 | 6         |
+/// |-------------------------|-----------|
 ///
 /// Data:
 ///
+/// |------------------|-----------------------------------------------|
 /// | field            | length(B)                                     |
 /// |------------------|-----------------------------------------------|
 /// | del_bitset       | (count + 63) / 64 * 8                         |
@@ -53,7 +53,7 @@ const _: () = assert!(
 /// | c_n              | same as above                                 |
 /// | free_space       | free space                                    |
 /// | var_len_data     | data of var-len column                        |
-///
+/// |------------------|-----------------------------------------------|
 pub struct RowPage {
     pub header: RowPageHeader,
     pub data: [u8; PAGE_SIZE - mem::size_of::<RowPageHeader>()],
@@ -591,34 +591,7 @@ impl RowPage {
     }
 }
 
-impl BufferFrameAware for RowPage {
-    #[inline]
-    fn on_alloc<P: BufferPool>(pool: P, frame: &mut BufferFrame) {
-        let page_id = frame.page_id;
-        if let Some(undo_map) = pool.load_orphan_undo_map(page_id) {
-            let res = frame.undo_map.replace(undo_map);
-            debug_assert!(res.is_none());
-        }
-    }
-
-    #[inline]
-    fn on_dealloc<P: BufferPool>(pool: P, frame: &mut BufferFrame) {
-        if let Some(undo_map) = frame.undo_map.take() {
-            if undo_map.occupied() > 0 {
-                let page_id = frame.page_id;
-                pool.save_orphan_undo_map(page_id, undo_map);
-            }
-        }
-    }
-
-    #[inline]
-    fn after_init<P: BufferPool>(_pool: P, frame: &mut BufferFrame) {
-        if frame.undo_map.is_none() {
-            let len = unsafe { Self::get(frame) }.header.max_row_count as usize;
-            frame.undo_map = Some(UndoMap::new(len));
-        }
-    }
-}
+impl BufferPage for RowPage {}
 
 #[repr(C)]
 pub struct RowPageHeader {

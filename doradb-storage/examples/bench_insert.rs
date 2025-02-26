@@ -153,7 +153,7 @@ fn main() {
 
 #[inline]
 async fn worker<P: BufferPool>(
-    buf_pool: P,
+    buf_pool: &'static P,
     trx_sys: &TransactionSystem,
     catalog: &'static Catalog<P>,
     table_id: TableID,
