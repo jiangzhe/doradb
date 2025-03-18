@@ -24,9 +24,10 @@ pub mod sys;
 pub mod undo;
 
 use crate::notify::{Notify, Signal};
+use crate::serde::{LenPrefixStruct, SerdeCtx};
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::stmt::Statement;
-use crate::trx::redo::{RedoBin, RedoEntry, RedoKind, RedoLog};
+use crate::trx::redo::{RedoLogs, RowRedo, RowRedoKind};
 use crate::trx::undo::{IndexPurge, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
 use flume::{Receiver, Sender};
@@ -139,7 +140,7 @@ pub struct ActiveTrx {
     // transaction-level index undo operations.
     pub(crate) index_undo: IndexUndoLogs,
     // transaction-level redo logs.
-    pub(crate) redo: Vec<RedoEntry>,
+    pub(crate) redo: RedoLogs,
     // session of current transaction.
     pub session: Option<Box<InternalSession>>,
 }
@@ -161,7 +162,7 @@ impl ActiveTrx {
             gc_no,
             row_undo: RowUndoLogs::empty(),
             index_undo: IndexUndoLogs::empty(),
-            redo: vec![],
+            redo: RedoLogs::default(),
             session,
         }
     }
@@ -226,14 +227,10 @@ impl ActiveTrx {
         let redo_bin = if self.redo.is_empty() {
             None
         } else {
-            // todo: use customized serialization method, and keep CTS placeholder.
-            let redo_log = RedoLog {
-                cts: INVALID_TRX_ID,
-                data: mem::take(&mut self.redo),
-            };
-            let redo_bin = bincode::serde::encode_to_vec(&redo_log, bincode::config::standard())
-                .expect("redo serialization should not fail");
-            Some(redo_bin)
+            Some(LenPrefixStruct::new(
+                mem::take(&mut self.redo),
+                &SerdeCtx::default(),
+            ))
         };
         let row_undo = mem::take(&mut self.row_undo);
         let index_undo = mem::take(&mut self.index_undo);
@@ -256,17 +253,20 @@ impl ActiveTrx {
         // self.trx_redo.push(RedoEntry{page_id: 0, row_id: 0, kind: RedoKind::Delete})
         // simulate sysbench record
         // uint64 + int32 + int32 + char(60) + char(120)
-        self.redo.push(RedoEntry {
-            page_id: 0,
-            row_id: 0,
-            kind: RedoKind::Insert(vec![
-                Val::Byte8(123),
-                Val::Byte4(1),
-                Val::Byte4(2),
-                Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
-                Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
-            ]),
-        })
+        self.redo.insert(
+            0,
+            RowRedo {
+                page_id: 0,
+                row_id: 0,
+                kind: RowRedoKind::Insert(vec![
+                    Val::Byte8(123),
+                    Val::Byte4(1),
+                    Val::Byte4(2),
+                    Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
+                    Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
+                ]),
+            },
+        )
     }
 }
 
@@ -300,7 +300,7 @@ pub struct PreparedTrx {
     sts: TrxID,
     log_no: usize,
     gc_no: usize,
-    redo_bin: Option<RedoBin>,
+    redo_bin: Option<LenPrefixStruct<'static, RedoLogs>>,
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
     session: Option<Box<InternalSession>>,
@@ -367,18 +367,13 @@ pub struct PrecommitTrx {
     pub sts: TrxID,
     pub cts: TrxID,
     pub gc_no: usize,
-    pub redo_bin: Option<RedoBin>,
+    pub redo_bin: Option<LenPrefixStruct<'static, RedoLogs>>,
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurge>,
     session: Option<Box<InternalSession>>,
 }
 
 impl PrecommitTrx {
-    #[inline]
-    pub fn redo_bin_len(&self) -> usize {
-        self.redo_bin.as_ref().map(|bin| bin.len()).unwrap_or(0)
-    }
-
     /// Commit this transaction, the only thing to do is replace ongoing transaction ids
     /// in undo log with cts, and this is atomic operation.
     #[inline]

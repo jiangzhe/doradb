@@ -27,6 +27,7 @@ event-listener = "5.4"
 semistr = "0.1"
 async-executor = "1.13"
 smol = "2.0"
+crc32fast = "1.4"
 
 [features]
 default = []
@@ -43,6 +44,7 @@ criterion-perf-events = "0.4"
 perfcnt = "0.8"
 byte-unit = "5"
 fastrand = "2"
+tikv-jemallocator = "0.6"
 
 [profile.release]
 debug = true

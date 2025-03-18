@@ -1,5 +1,6 @@
 use crate::io::{pwrite, Buf, IocbRawPtr, SparseFile};
 use crate::notify::{Notify, Signal};
+use crate::serde::{Ser, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::trx::log::SyncGroup;
 use crate::trx::{PrecommitTrx, TrxID};
@@ -16,12 +17,12 @@ pub(super) struct GroupCommit {
     pub(super) queue: VecDeque<Commit>,
     // Current log file.
     pub(super) log_file: Option<SparseFile>,
-    // sequence of current file in this partition, starts from 0.
-    pub(super) file_seq: u32,
 }
 
 pub(super) enum Commit {
     Group(CommitGroup),
+    // switch from old log file to new log file.
+    Switch(SparseFile),
     Shutdown,
 }
 
@@ -37,13 +38,14 @@ pub(super) struct CommitGroup {
     pub(super) offset: usize,
     pub(super) log_buf: Buf,
     pub(super) sync_signal: Signal,
+    pub(super) serde_ctx: SerdeCtx,
 }
 
 impl CommitGroup {
     #[inline]
     pub(super) fn can_join(&self, trx: &PrecommitTrx) -> bool {
         if let Some(redo_bin) = trx.redo_bin.as_ref() {
-            return redo_bin.len() <= self.log_buf.remaining_capacity();
+            return redo_bin.ser_len(&self.serde_ctx) <= self.log_buf.remaining_capacity();
         }
         true
     }
@@ -52,7 +54,7 @@ impl CommitGroup {
     pub(super) fn join(&mut self, mut trx: PrecommitTrx) -> (Session, Notify) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
-            self.log_buf.clone_from_slice(&redo_bin);
+            self.log_buf.extend_ser(&self.serde_ctx, &redo_bin);
         }
         self.max_cts = trx.cts;
         let session = trx.split_session();

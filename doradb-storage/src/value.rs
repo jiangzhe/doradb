@@ -1,3 +1,5 @@
+use crate::error::Result;
+use crate::serde::{Deser, Ser, SerdeCtx};
 use doradb_datatype::konst::{ValidF32, ValidF64};
 use doradb_datatype::memcmp::{
     attach_null, MemCmpFormat, NullableMemCmpFormat, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN,
@@ -8,6 +10,7 @@ use std::alloc::{alloc, dealloc, Layout as AllocLayout};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
+use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 pub const PAGE_VAR_HEADER: usize = 8;
@@ -54,20 +57,49 @@ impl ValType {
     }
 }
 
+impl Ser<'_> for ValType {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u8>() + mem::size_of::<u8>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let mut idx = start_idx;
+        idx = ctx.ser_u8(out, idx, self.kind as u8);
+        ctx.ser_u8(out, idx, self.nullable as u8)
+    }
+}
+
+impl Deser for ValType {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let idx = start_idx;
+        let (idx, kind) = ctx.deser_u8(data, idx)?;
+        let (idx, nullable) = ctx.deser_u8(data, idx)?;
+        Ok((
+            idx,
+            ValType {
+                kind: ValKind::from(kind),
+                nullable: nullable != 0,
+            },
+        ))
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ValKind {
-    I8,
-    U8,
-    I16,
-    U16,
-    I32,
-    U32,
-    I64,
-    U64,
-    F32,
-    F64,
-    VarByte,
+    I8 = 1,
+    U8 = 2,
+    I16 = 3,
+    U16 = 4,
+    I32 = 5,
+    U32 = 6,
+    I64 = 7,
+    U64 = 8,
+    F32 = 9,
+    F64 = 10,
+    VarByte = 11,
 }
 
 impl ValKind {
@@ -99,6 +131,13 @@ impl ValKind {
             kind: self,
             nullable,
         }
+    }
+}
+
+impl From<u8> for ValKind {
+    #[inline]
+    fn from(value: u8) -> Self {
+        unsafe { mem::transmute(value) }
     }
 }
 
@@ -136,6 +175,24 @@ impl Layout {
             Layout::VarByte => false,
             _ => true,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ValCode {
+    Null = 0,
+    Byte1 = 1,
+    Byte2 = 2,
+    Byte4 = 3,
+    Byte8 = 4,
+    VarByte = 5,
+}
+
+impl From<u8> for ValCode {
+    #[inline]
+    fn from(value: u8) -> Self {
+        unsafe { mem::transmute(value) }
     }
 }
 
@@ -402,6 +459,93 @@ impl From<Vec<u8>> for Val {
     #[inline]
     fn from(value: Vec<u8>) -> Self {
         Val::VarByte(MemVar::from(value))
+    }
+}
+
+impl Ser<'_> for Val {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<ValCode>()
+            + match self {
+                Val::Null => 0, // null is encoded with code only.
+                Val::Byte1(_) => 1,
+                Val::Byte2(_) => 2,
+                Val::Byte4(_) => 4,
+                Val::Byte8(_) => 8,
+                Val::VarByte(v) => mem::size_of::<u16>() + v.len(),
+            }
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        debug_assert!(start_idx + self.ser_len(ctx) <= out.len());
+        let mut idx = start_idx;
+        match self {
+            Val::Null => {
+                out[idx] = ValCode::Null as u8;
+                idx += 1;
+            }
+            Val::Byte1(v) => {
+                out[idx] = ValCode::Byte1 as u8;
+                out[idx + 1] = *v;
+                idx += 2;
+            }
+            Val::Byte2(v) => {
+                out[idx] = ValCode::Byte2 as u8;
+                out[idx + 1..idx + 3].copy_from_slice(&v.to_le_bytes());
+                idx += 3;
+            }
+            Val::Byte4(v) => {
+                out[idx] = ValCode::Byte4 as u8;
+                out[idx + 1..idx + 5].copy_from_slice(&v.to_le_bytes());
+                idx += 5;
+            }
+            Val::Byte8(v) => {
+                out[idx] = ValCode::Byte8 as u8;
+                out[idx + 1..idx + 9].copy_from_slice(&v.to_le_bytes());
+                idx += 9;
+            }
+            Val::VarByte(v) => {
+                out[idx] = ValCode::VarByte as u8;
+                out[idx + 1..idx + 3].copy_from_slice(&(v.len() as u16).to_le_bytes());
+                out[idx + 3..idx + 3 + v.len()].copy_from_slice(v.as_bytes());
+                idx += 3 + v.len();
+            }
+        }
+        idx
+    }
+}
+
+impl Deser for Val {
+    #[inline]
+    fn deser<'a>(_ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+        let mut idx = start_idx;
+        let code = ValCode::from(input[idx]);
+        idx += 1;
+        match code {
+            ValCode::Null => Ok((idx, Val::Null)),
+            ValCode::Byte1 => {
+                let v = Byte1Val::from(input[idx]);
+                Ok((idx + 1, Val::Byte1(v)))
+            }
+            ValCode::Byte2 => {
+                let v = Byte2Val::from_le_bytes(input[idx..idx + 2].try_into()?);
+                Ok((idx + 2, Val::Byte2(v)))
+            }
+            ValCode::Byte4 => {
+                let v = Byte4Val::from_le_bytes(input[idx..idx + 4].try_into()?);
+                Ok((idx + 4, Val::Byte4(v)))
+            }
+            ValCode::Byte8 => {
+                let v = Byte8Val::from_le_bytes(input[idx..idx + 8].try_into()?);
+                Ok((idx + 8, Val::Byte8(v)))
+            }
+            ValCode::VarByte => {
+                let len = u16::from_le_bytes(input[idx..idx + 2].try_into()?);
+                let v = MemVar::from(&input[idx + 2..idx + 2 + len as usize]);
+                Ok((idx + 2 + len as usize, Val::VarByte(v)))
+            }
+        }
     }
 }
 
@@ -1073,7 +1217,7 @@ impl Drop for MemVar {
 
 impl Serialize for MemVar {
     #[inline]
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -1083,7 +1227,7 @@ impl Serialize for MemVar {
 
 impl<'de> Deserialize<'de> for MemVar {
     #[inline]
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -1124,7 +1268,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
         formatter.write_str("byte array")
     }
 
-    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+    fn visit_bytes<E>(self, v: &[u8]) -> StdResult<Self::Value, E>
     where
         E: serde::de::Error,
     {
@@ -1134,7 +1278,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
         Ok(MemVar::from(v))
     }
 
-    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+    fn visit_byte_buf<E>(self, v: Vec<u8>) -> StdResult<Self::Value, E>
     where
         E: serde::de::Error,
     {
@@ -1144,7 +1288,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
         Ok(MemVar::from(v))
     }
 
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    fn visit_str<E>(self, v: &str) -> StdResult<Self::Value, E>
     where
         E: serde::de::Error,
     {
@@ -1154,7 +1298,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
         Ok(MemVar::from(v.as_bytes()))
     }
 
-    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    fn visit_string<E>(self, v: String) -> StdResult<Self::Value, E>
     where
         E: serde::de::Error,
     {
@@ -1166,7 +1310,7 @@ impl<'de> Visitor<'de> for MemVarVisitor {
 }
 
 #[inline]
-fn fail_long_bytes<T, E: serde::de::Error>() -> Result<T, E> {
+fn fail_long_bytes<T, E: serde::de::Error>() -> StdResult<T, E> {
     Err(serde::de::Error::custom(
         "MemVar does not support bytes longer than u16:MAX",
     ))
@@ -1235,5 +1379,162 @@ mod tests {
         assert!(var2.as_bytes() == b"a long value stored outline");
         assert!(var2.as_str() == "a long value stored outline");
         assert!(MemVar::outline_len(b"a long value stored outline") == 27);
+    }
+
+    #[test]
+    fn test_val_serde() {
+        // serialize and deserialize null
+        let ctx = &mut SerdeCtx;
+        let val = Val::Null;
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        assert!(buf == b"\x00");
+
+        let ctx = &mut SerdeCtx;
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::Null);
+
+        // serialize and deserialize u8
+        let ctx = &mut SerdeCtx;
+        let val = Val::from(42u8);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        assert!(buf == b"\x01\x2a");
+
+        let ctx = &mut SerdeCtx;
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(42u8));
+
+        // serialize and deserialize u16
+        let ctx = &mut SerdeCtx;
+        let val = Val::from(1200u16);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        assert!(buf == b"\x02\xb0\x04");
+
+        let ctx = &mut SerdeCtx;
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(1200u16));
+
+        // serialize and deserialize u32
+        let ctx = &mut SerdeCtx;
+        let val = Val::from(0xdefcab12u32);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        assert!(buf == b"\x03\x12\xab\xfc\xde");
+
+        let ctx = &mut SerdeCtx;
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(0xdefcab12u32));
+
+        // serialize and deserialize u64
+        let ctx = &mut SerdeCtx;
+        let val = Val::from(0x1234567890abcdefu64);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        assert!(buf == b"\x04\xef\xcd\xab\x90\x78\x56\x34\x12");
+
+        let ctx = &mut SerdeCtx;
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(0x1234567890abcdefu64));
+
+        // serialize and deserialize bytes
+        let ctx = &mut SerdeCtx;
+        let val = Val::from(&b"hello"[..]);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        assert!(buf == b"\x05\x05\x00\x68\x65\x6c\x6c\x6f");
+
+        let ctx = &mut SerdeCtx;
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(&b"hello"[..]));
+    }
+
+    #[test]
+    fn test_valtype_serde() {
+        let ctx = &SerdeCtx;
+        let mut ctx_deser = SerdeCtx;
+
+        // 测试用例1：非空的固定长度类型
+        let val_type = ValType {
+            kind: ValKind::I32,
+            nullable: false,
+        };
+        let mut buf = vec![0; val_type.ser_len(ctx)];
+        val_type.ser(ctx, &mut buf, 0);
+
+        // 验证序列化结果
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], ValKind::I32 as u8);
+        assert_eq!(buf[1], 0); // false
+
+        // 验证反序列化结果
+        let (_, deserialized) = ValType::deser(&mut ctx_deser, &buf, 0).unwrap();
+        assert_eq!(deserialized.kind, ValKind::I32);
+        assert_eq!(deserialized.nullable, false);
+
+        // 测试用例2：可空的变长类型
+        let val_type = ValType {
+            kind: ValKind::VarByte,
+            nullable: true,
+        };
+        let mut buf = vec![0; val_type.ser_len(ctx)];
+        val_type.ser(ctx, &mut buf, 0);
+
+        // 验证序列化结果
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], ValKind::VarByte as u8);
+        assert_eq!(buf[1], 1); // true
+
+        // 验证反序列化结果
+        let (_, deserialized) = ValType::deser(&mut ctx_deser, &buf, 0).unwrap();
+        assert_eq!(deserialized.kind, ValKind::VarByte);
+        assert_eq!(deserialized.nullable, true);
+
+        // 测试用例3：测试所有ValKind类型
+        let kinds = vec![
+            ValKind::I8,
+            ValKind::U8,
+            ValKind::I16,
+            ValKind::U16,
+            ValKind::I32,
+            ValKind::U32,
+            ValKind::I64,
+            ValKind::U64,
+            ValKind::F32,
+            ValKind::F64,
+            ValKind::VarByte,
+        ];
+
+        for kind in kinds {
+            let val_type = ValType {
+                kind,
+                nullable: true,
+            };
+            let mut buf = vec![0; val_type.ser_len(ctx)];
+            val_type.ser(ctx, &mut buf, 0);
+
+            let (_, deserialized) = ValType::deser(&mut ctx_deser, &buf, 0).unwrap();
+            assert_eq!(deserialized.kind, kind);
+            assert_eq!(deserialized.nullable, true);
+        }
+
+        // 测试用例4：测试序列化位置偏移
+        let val_type = ValType {
+            kind: ValKind::I64,
+            nullable: true,
+        };
+        let mut buf = vec![0; 4 + val_type.ser_len(ctx)]; // 添加4字节前缀
+        val_type.ser(ctx, &mut buf, 4); // 从位置4开始序列化
+
+        // 验证序列化结果
+        assert_eq!(buf[4], ValKind::I64 as u8);
+        assert_eq!(buf[5], 1); // true
+
+        // 验证反序列化结果
+        let (next_pos, deserialized) = ValType::deser(&mut ctx_deser, &buf, 4).unwrap();
+        assert_eq!(next_pos, 6); // 应该前进2个字节
+        assert_eq!(deserialized.kind, ValKind::I64);
+        assert_eq!(deserialized.nullable, true);
     }
 }

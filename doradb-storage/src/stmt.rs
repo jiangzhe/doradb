@@ -3,9 +3,10 @@ use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
 use crate::row::RowID;
 use crate::table::TableID;
-use crate::trx::redo::RedoEntry;
+use crate::trx::redo::RedoLogs;
 use crate::trx::undo::{IndexUndoLogs, RowUndoKind, RowUndoLogs};
 use crate::trx::ActiveTrx;
+use std::mem;
 
 pub struct Statement {
     pub trx: ActiveTrx,
@@ -14,7 +15,7 @@ pub struct Statement {
     // statement-level index undo operations.
     pub index_undo: IndexUndoLogs,
     // statement-level redo logs.
-    pub redo: Vec<RedoEntry>,
+    pub redo: RedoLogs,
 }
 
 impl Statement {
@@ -25,7 +26,7 @@ impl Statement {
             trx,
             row_undo: RowUndoLogs::empty(),
             index_undo: IndexUndoLogs::empty(),
-            redo: vec![],
+            redo: RedoLogs::default(),
         }
     }
 
@@ -43,7 +44,7 @@ impl Statement {
     pub fn succeed(mut self) -> ActiveTrx {
         self.trx.row_undo.merge(&mut self.row_undo);
         self.trx.index_undo.merge(&mut self.index_undo);
-        self.trx.redo.extend(self.redo.drain(..));
+        self.trx.redo.merge(mem::take(&mut self.redo));
         self.trx
     }
 

@@ -1,11 +1,14 @@
 use crate::error::{Error, Result};
 use crate::io::{
-    AIOError, AIOManager, Buf, DirectBuf, FreeListWithFactory, IocbRawPtr, PageBuf, AIO,
+    io_event, AIOError, AIOManager, Buf, DirectBuf, FileSyncer, FreeListWithFactory, IocbRawPtr,
+    PageBuf, SparseFile, AIO,
 };
 use crate::notify::{Notify, Signal};
+use crate::serde::{LenPrefixStruct, Ser, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::trx::group::{Commit, CommitGroup, GroupCommit};
 use crate::trx::purge::{GCBucket, GC};
+use crate::trx::redo::RedoLogs;
 use crate::trx::sys::TrxSysConfig;
 use crate::trx::{CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
@@ -17,7 +20,7 @@ use std::mem;
 use std::os::fd::AsRawFd;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -36,18 +39,22 @@ pub(super) struct LogPartition {
     pub(super) gc_buckets: Box<[GCBucket]>,
     /// AIO manager to handle async IO with libaio.
     pub(super) aio_mgr: AIOManager,
-    // Index of log partition in total partitions, starts from 0.
+    /// Index of log partition in total partitions, starts from 0.
     pub(super) log_no: usize,
-    // Maximum IO size of each group.
+    /// Maximum IO size of each group.
     pub(super) max_io_size: usize,
-    // Log file prefix, including partition number.
+    /// Log file prefix, including partition number.
     pub(super) file_prefix: String,
-    // Free list of page buffer, which is used by commit group to concat
-    // redo logs.
+    /// sequence of current file in this partition, starts from 0.
+    pub(super) file_seq: AtomicU32,
+    /// Maximum size of single log file.
+    pub(super) file_max_size: usize,
+    /// Free list of page buffer, which is used by commit group to concat
+    /// redo logs.
     pub(super) buf_free_list: FreeListWithFactory<PageBuf>,
-    // Standalone thread to handle transaction commit.
-    // Including submit IO requests, wait IO responses
-    // and do fsync().
+    /// Standalone thread to handle transaction commit.
+    /// Including submit IO requests, wait IO responses
+    /// and do fsync().
     pub(super) sync_thread: Mutex<Option<JoinHandle<()>>>,
     /// Standalone thread for GC info analysis.
     pub(super) gc_thread: Mutex<Option<JoinHandle<()>>>,
@@ -55,14 +62,16 @@ pub(super) struct LogPartition {
 
 impl LogPartition {
     #[inline]
-    fn buf(&self, data: &[u8]) -> Buf {
-        if data.len() > self.max_io_size {
-            let buf = DirectBuf::uninit(data.len());
+    fn buf(&self, serde_ctx: &SerdeCtx, data: &LenPrefixStruct<'static, RedoLogs>) -> Buf {
+        let len = data.ser_len(serde_ctx);
+        if len > self.max_io_size {
+            let mut buf = DirectBuf::uninit(len);
+            data.ser(serde_ctx, buf.as_mut(), 0);
             Buf::Direct(buf)
         } else {
             let mut buf = self.buf_free_list.pop_elem_or_new();
-            buf.set_len(data.len());
-            buf.clone_from_slice(0, data);
+            buf.set_len(len);
+            data.ser(serde_ctx, buf.data_mut(), 0);
             Buf::Reuse(buf)
         }
     }
@@ -80,26 +89,49 @@ impl LogPartition {
     }
 
     #[inline]
+    fn rotate_log_file(&self, group_commit_g: &mut MutexGuard<'_, GroupCommit>) -> Result<()> {
+        let file_seq = self.file_seq.fetch_add(1, Ordering::SeqCst);
+        let new_log_file = create_log_file(
+            &self.aio_mgr,
+            &self.file_prefix,
+            self.log_no,
+            file_seq,
+            self.file_max_size,
+        )?;
+        let old_log_file = group_commit_g.log_file.replace(new_log_file).unwrap();
+        group_commit_g.queue.push_back(Commit::Switch(old_log_file));
+        Ok(())
+    }
+
+    #[inline]
     fn create_new_group(
         &self,
         mut trx: PrecommitTrx,
         mut group_commit_g: MutexGuard<'_, GroupCommit>,
     ) -> (Session, Notify) {
         let cts = trx.cts;
+        let serde_ctx = SerdeCtx::default();
         let redo_bin = trx.redo_bin.take().unwrap();
         // inside the lock, we only need to determine which range of the log file this transaction
         // should write to.
         let log_file = group_commit_g.log_file.as_ref().unwrap();
-        let offset = match log_file.alloc(redo_bin.len()) {
-            Ok((offset, _)) => offset,
+        let (fd, offset) = match log_file.alloc(redo_bin.ser_len(&serde_ctx)) {
+            Ok((offset, _)) => (log_file.as_raw_fd(), offset),
             Err(AIOError::OutOfRange) => {
-                // todo: rotate if log file is full.
-                todo!();
+                // rotate log file and try again.
+                self.rotate_log_file(&mut group_commit_g)
+                    .expect("rotate log file");
+
+                let new_log_file = group_commit_g.log_file.as_ref().unwrap();
+                let (offset, _) = new_log_file
+                    .alloc(redo_bin.ser_len(&serde_ctx))
+                    .expect("alloc on new log file");
+                (new_log_file.as_raw_fd(), offset)
             }
             Err(_) => unreachable!(),
         };
-        let fd = log_file.as_raw_fd();
-        let log_buf = self.buf(&redo_bin);
+        // let fd = log_file.as_raw_fd();
+        let log_buf = self.buf(&serde_ctx, &redo_bin);
         let session = trx.split_session();
         let sync_signal = Signal::default();
         let sync_notify = sync_signal.new_notify(false);
@@ -110,6 +142,7 @@ impl LogPartition {
             offset,
             log_buf,
             sync_signal,
+            serde_ctx,
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
         drop(group_commit_g);
@@ -134,6 +167,10 @@ impl LogPartition {
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
             Commit::Shutdown => return Err(Error::TransactionSystemShutdown),
             Commit::Group(group) => group,
+            Commit::Switch(_) => {
+                // Impossible, switch always has one group followed.
+                unreachable!()
+            }
         };
         if last_group.can_join(&precommit_trx) {
             let (session, sync_notify) = last_group.join(precommit_trx);
@@ -174,101 +211,7 @@ impl LogPartition {
     }
 
     #[inline]
-    fn try_fetch_io_reqs(
-        &self,
-        io_reqs: &mut Vec<IocbRawPtr>,
-        sync_groups: &mut VecDeque<SyncGroup>,
-    ) -> bool {
-        // Single thread perform IO so here we only need to use sync mutex.
-        let mut group_commit_g = self.group_commit.0.lock();
-        loop {
-            match group_commit_g.queue.pop_front() {
-                None => return false,
-                Some(Commit::Shutdown) => return true,
-                Some(Commit::Group(cg)) => {
-                    let (iocb_ptr, sg) = cg.split();
-                    io_reqs.push(iocb_ptr);
-                    sync_groups.push_back(sg);
-                }
-            }
-        }
-    }
-
-    #[inline]
-    fn fetch_io_reqs(
-        &self,
-        io_reqs: &mut Vec<IocbRawPtr>,
-        sync_groups: &mut VecDeque<SyncGroup>,
-    ) -> bool {
-        loop {
-            let mut group_commit_g = self.group_commit.0.lock();
-            loop {
-                match group_commit_g.queue.pop_front() {
-                    None => break,
-                    Some(Commit::Shutdown) => {
-                        return true;
-                    }
-                    Some(Commit::Group(cg)) => {
-                        let (iocb_ptr, sg) = cg.split();
-                        io_reqs.push(iocb_ptr);
-                        sync_groups.push_back(sg);
-                    }
-                }
-            }
-            if !io_reqs.is_empty() {
-                return false;
-            }
-            let notify = self.group_commit.1.new_notify(true);
-            drop(group_commit_g);
-            notify.wait_timeout(true, Duration::from_secs(1));
-        }
-    }
-
-    #[inline]
-    pub(super) fn io_loop_noop(&self, config: &TrxSysConfig) {
-        let io_depth = config.io_depth_per_log;
-        let mut io_reqs = Vec::with_capacity(io_depth * 2);
-        let mut sync_groups = VecDeque::with_capacity(io_depth * 2);
-        let mut shutdown = false;
-        loop {
-            if !shutdown {
-                shutdown |= self.fetch_io_reqs(&mut io_reqs, &mut sync_groups);
-            }
-            if !io_reqs.is_empty() {
-                let mut trx_count = 0;
-                let mut commit_count = 0;
-                let mut log_bytes = 0;
-                for sg in &sync_groups {
-                    trx_count += sg.trx_list.len();
-                    commit_count += 1;
-                    log_bytes += sg.log_bytes;
-                }
-
-                let max_cts = sync_groups.back().as_ref().unwrap().max_cts;
-
-                self.persisted_cts.store(max_cts, Ordering::SeqCst);
-
-                io_reqs.clear();
-
-                for mut sync_group in sync_groups.drain(..) {
-                    let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
-                    for trx in mem::take(&mut sync_group.trx_list) {
-                        let trx = trx.commit();
-                        committed_trx_list.entry(trx.gc_no).or_default().push(trx);
-                    }
-                    let _ = self.gc_chan.send(GC::Commit(committed_trx_list));
-                }
-
-                self.update_stats(trx_count, commit_count, log_bytes, 1, 0);
-            }
-            if shutdown {
-                return;
-            }
-        }
-    }
-
-    #[inline]
-    pub(super) fn io_loop(&self, config: &TrxSysConfig) {
+    fn file_processor(&self, config: &TrxSysConfig) -> FileProcessor<'_> {
         let syncer = {
             self.group_commit
                 .0
@@ -278,132 +221,28 @@ impl LogPartition {
                 .unwrap()
                 .syncer()
         };
-        let io_depth = config.io_depth_per_log;
-        let mut inflight = BTreeMap::new();
-        let mut in_progress = 0;
-        let mut io_reqs = Vec::with_capacity(io_depth * 2);
-        let mut sync_groups = VecDeque::with_capacity(io_depth * 2);
-        let mut events = self.aio_mgr.events();
-        let mut written = vec![];
-        let mut shutdown = false;
+
+        FileProcessor::new(self, config, syncer)
+    }
+
+    #[inline]
+    pub(super) fn io_loop(&self, config: &TrxSysConfig) {
         loop {
-            debug_assert!(
-                io_reqs.len() == sync_groups.len(),
-                "pending IO number equals to pending group number"
-            );
-            if !shutdown {
-                if in_progress == 0 {
-                    // there is no processing AIO, so we can block on waiting for next request.
-                    shutdown |= self.fetch_io_reqs(&mut io_reqs, &mut sync_groups);
-                } else {
-                    // only try non-blocking way to fetch incoming requests, because we also
-                    // need to finish previous IO.
-                    shutdown |= self.try_fetch_io_reqs(&mut io_reqs, &mut sync_groups);
-                }
+            let mut fp = self.file_processor(config);
+            if let Some(ended_log_file) = fp.process_single_file() {
+                fp.finish_pending_io();
+
+                debug_assert!(fp.in_progress == 0);
+                debug_assert!(fp.inflight.is_empty());
+                debug_assert!(fp.io_reqs.is_empty());
+                debug_assert!(fp.sync_groups.is_empty());
+
+                // todo: update file header.
+
+                // Close file explicitly.
+                self.aio_mgr.drop_sparse_file(ended_log_file);
             }
-            let (io_submit_count, io_submit_nanos) = if !io_reqs.is_empty() {
-                let start = Instant::now();
-                // try to submit as many IO requests as possible
-                let limit = io_depth - in_progress;
-                let submit_count = self.aio_mgr.submit_limit(&mut io_reqs, limit);
-                // add sync groups to inflight tree.
-                for sync_group in sync_groups.drain(..submit_count) {
-                    let res = inflight.insert(sync_group.max_cts, sync_group);
-                    debug_assert!(res.is_none());
-                }
-                in_progress += submit_count;
-                debug_assert!(in_progress <= io_depth);
-                (1, start.elapsed().as_nanos() as usize)
-            } else {
-                (0, 0)
-            };
-
-            // wait for any request to be done.
-            let (io_wait_count, io_wait_nanos) = if in_progress != 0 {
-                let start = Instant::now();
-                let finish_count =
-                    self.aio_mgr
-                        .wait_at_least(&mut events, 1, |cts, res| match res {
-                            Ok(len) => {
-                                let sg = inflight.get_mut(&cts).expect("finish inflight IO");
-                                debug_assert!(sg.aio.buf().unwrap().aligned_len() == len);
-                                sg.finished = true;
-                            }
-                            Err(err) => {
-                                let sg = inflight.remove(&cts).unwrap();
-                                unimplemented!(
-                                    "AIO error: task.cts={}, task.log_bytes={}, {}",
-                                    sg.max_cts,
-                                    sg.log_bytes,
-                                    err
-                                )
-                            }
-                        });
-                in_progress -= finish_count;
-                (1, start.elapsed().as_nanos() as usize)
-            } else {
-                (0, 0)
-            };
-
-            // after logs are written to disk, we need to do fsync to make sure its durablity.
-            // Also, we need to check if any previous transaction is also done and notify them.
-            written.clear();
-            let (trx_count, commit_count, log_bytes) = shrink_inflight(&mut inflight, &mut written);
-            if !written.is_empty() {
-                let max_cts = written.last().unwrap().max_cts;
-
-                let start = Instant::now();
-                match config.log_sync {
-                    LogSync::Fsync => syncer.fsync(),
-                    LogSync::Fdatasync => syncer.fdatasync(),
-                    LogSync::None => (),
-                }
-                let sync_dur = start.elapsed();
-
-                self.persisted_cts.store(max_cts, Ordering::SeqCst);
-
-                // put IO buffer back into free list.
-                for mut sync_group in written.drain(..) {
-                    if let Some(Buf::Reuse(elem)) = sync_group.aio.take_buf() {
-                        self.buf_free_list.push_elem(elem); // return buf to free list for future reuse
-                    }
-                    // commit transactions to let waiting read operations to continue
-                    let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
-                    for trx in mem::take(&mut sync_group.trx_list) {
-                        let trx = trx.commit();
-                        committed_trx_list.entry(trx.gc_no).or_default().push(trx);
-                    }
-                    // send committed transaction list to GC thread
-                    let _ = self.gc_chan.send(GC::Commit(committed_trx_list));
-                    drop(sync_group); // notify transaction thread to continue.
-                }
-
-                self.update_stats(
-                    trx_count,
-                    commit_count,
-                    log_bytes,
-                    1,
-                    sync_dur.as_nanos() as usize,
-                );
-            }
-            if io_submit_count != 0 {
-                self.stats
-                    .io_submit_count
-                    .fetch_add(io_submit_count, Ordering::Relaxed);
-                self.stats
-                    .io_submit_nanos
-                    .fetch_add(io_submit_nanos, Ordering::Relaxed);
-            }
-            if io_wait_count != 0 {
-                self.stats
-                    .io_wait_count
-                    .fetch_add(io_wait_count, Ordering::Relaxed);
-                self.stats
-                    .io_wait_nanos
-                    .fetch_add(io_wait_nanos, Ordering::Relaxed);
-            }
-
-            if shutdown && inflight.is_empty() {
+            if fp.shutdown {
                 return;
             }
         }
@@ -465,6 +304,296 @@ impl FromStr for LogSync {
     }
 }
 
+struct FileProcessor<'a> {
+    partition: &'a LogPartition,
+    io_depth: usize,
+    inflight: BTreeMap<TrxID, SyncGroup>,
+    in_progress: usize,
+    io_reqs: Vec<IocbRawPtr>,
+    sync_groups: VecDeque<SyncGroup>,
+    events: Box<[io_event]>,
+    written: Vec<SyncGroup>,
+    syncer: FileSyncer,
+    log_sync: LogSync,
+    shutdown: bool,
+    io_submit_count: usize,
+    io_submit_nanos: usize,
+    io_wait_count: usize,
+    io_wait_nanos: usize,
+}
+
+impl<'a> FileProcessor<'a> {
+    #[inline]
+    fn new(partition: &'a LogPartition, config: &TrxSysConfig, syncer: FileSyncer) -> Self {
+        FileProcessor {
+            partition,
+            io_depth: config.io_depth_per_log,
+            inflight: BTreeMap::new(),
+            in_progress: 0,
+            io_reqs: vec![],
+            sync_groups: VecDeque::new(),
+            events: partition.aio_mgr.events(),
+            written: vec![],
+            syncer,
+            log_sync: config.log_sync,
+            shutdown: false,
+            io_submit_count: 0,
+            io_submit_nanos: 0,
+            io_wait_count: 0,
+            io_wait_nanos: 0,
+        }
+    }
+
+    /// Process single log file until it is full or shutdown.
+    #[inline]
+    fn process_single_file(&mut self) -> Option<SparseFile> {
+        loop {
+            debug_assert!(
+                self.io_reqs.len() == self.sync_groups.len(),
+                "pending IO number equals to pending group number"
+            );
+            // If shutdown flag is set, we still submit and finish all pending IOs,
+            // but do not accept any new IO requests.
+            if !self.shutdown {
+                let ended_log_file = self.fetch_io_reqs();
+                // End this loop if log file is full.
+                if ended_log_file.is_some() {
+                    return ended_log_file;
+                }
+            }
+            self.reset_stats();
+
+            // submit IO requests if any.
+            self.submit_io();
+
+            // wait for any request to be done.
+            self.wait_io(false);
+
+            // Sync IO.
+            self.sync_io();
+
+            // update stats.
+            self.update_stats();
+
+            if self.shutdown && self.inflight.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    /// Finish pending IOs.
+    #[inline]
+    fn finish_pending_io(&mut self) {
+        self.submit_io();
+
+        self.wait_io(true);
+
+        self.sync_io();
+
+        self.update_stats();
+    }
+
+    /// Fetch IO requests, returns ended log file if any.
+    #[inline]
+    fn fetch_io_reqs(&mut self) -> Option<SparseFile> {
+        if self.in_progress == 0 {
+            // there is no processing AIO, so we can block on waiting for next request.
+            self.fetch_io_reqs_internal()
+        } else {
+            // only try non-blocking way to fetch incoming requests, because we also
+            // need to finish previous IO.
+            self.try_fetch_io_reqs_internal()
+        }
+    }
+
+    #[inline]
+    fn fetch_io_reqs_internal(&mut self) -> Option<SparseFile> {
+        loop {
+            let mut group_commit_g = self.partition.group_commit.0.lock();
+            loop {
+                match group_commit_g.queue.pop_front() {
+                    None => break,
+                    Some(Commit::Shutdown) => {
+                        self.shutdown = true;
+                        return None;
+                    }
+                    Some(Commit::Switch(log_file)) => {
+                        return Some(log_file);
+                    }
+                    Some(Commit::Group(cg)) => {
+                        let (iocb_ptr, sg) = cg.split();
+                        self.io_reqs.push(iocb_ptr);
+                        self.sync_groups.push_back(sg);
+                    }
+                }
+            }
+            if !self.io_reqs.is_empty() {
+                return None;
+            }
+            let notify = self.partition.group_commit.1.new_notify(true);
+            drop(group_commit_g);
+            notify.wait_timeout(true, Duration::from_secs(1));
+        }
+    }
+
+    #[inline]
+    fn try_fetch_io_reqs_internal(&mut self) -> Option<SparseFile> {
+        // Single thread perform IO so here we only need to use sync mutex.
+        let mut group_commit_g = self.partition.group_commit.0.lock();
+        loop {
+            match group_commit_g.queue.pop_front() {
+                None => return None,
+                Some(Commit::Shutdown) => {
+                    self.shutdown = true;
+                    return None;
+                }
+                Some(Commit::Switch(log_file)) => {
+                    return Some(log_file);
+                }
+                Some(Commit::Group(cg)) => {
+                    let (iocb_ptr, sg) = cg.split();
+                    self.io_reqs.push(iocb_ptr);
+                    self.sync_groups.push_back(sg);
+                }
+            }
+        }
+    }
+
+    /// After logs are written to disk, we need to do fsync to make sure its durability.
+    /// Also, we need to check if any previous transaction is also done and notify them.
+    #[inline]
+    fn sync_io(&mut self) {
+        self.written.clear();
+        let (trx_count, commit_count, log_bytes) =
+            shrink_inflight(&mut self.inflight, &mut self.written);
+        if !self.written.is_empty() {
+            let max_cts = self.written.last().unwrap().max_cts;
+
+            let start = Instant::now();
+            match self.log_sync {
+                LogSync::Fsync => self.syncer.fsync(),
+                LogSync::Fdatasync => self.syncer.fdatasync(),
+                LogSync::None => (),
+            }
+            let sync_dur = start.elapsed();
+
+            self.partition
+                .persisted_cts
+                .store(max_cts, Ordering::SeqCst);
+
+            // Put IO buffer back into free list.
+            for mut sync_group in self.written.drain(..) {
+                if let Some(Buf::Reuse(elem)) = sync_group.aio.take_buf() {
+                    self.partition.buf_free_list.push_elem(elem); // return buf to free list for future reuse
+                }
+                // commit transactions to let waiting read operations to continue
+                let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
+                for trx in mem::take(&mut sync_group.trx_list) {
+                    let trx = trx.commit();
+                    committed_trx_list.entry(trx.gc_no).or_default().push(trx);
+                }
+                // send committed transaction list to GC thread
+                let _ = self.partition.gc_chan.send(GC::Commit(committed_trx_list));
+                drop(sync_group); // notify transaction thread to continue.
+            }
+
+            self.partition.update_stats(
+                trx_count,
+                commit_count,
+                log_bytes,
+                1,
+                sync_dur.as_nanos() as usize,
+            );
+        }
+    }
+
+    #[inline]
+    fn reset_stats(&mut self) {
+        self.io_submit_count = 0;
+        self.io_submit_nanos = 0;
+        self.io_wait_count = 0;
+        self.io_wait_nanos = 0;
+    }
+
+    #[inline]
+    fn update_stats(&mut self) {
+        if self.io_submit_count != 0 {
+            self.partition
+                .stats
+                .io_submit_count
+                .fetch_add(self.io_submit_count, Ordering::Relaxed);
+            self.partition
+                .stats
+                .io_submit_nanos
+                .fetch_add(self.io_submit_nanos, Ordering::Relaxed);
+        }
+        if self.io_wait_count != 0 {
+            self.partition
+                .stats
+                .io_wait_count
+                .fetch_add(self.io_wait_count, Ordering::Relaxed);
+            self.partition
+                .stats
+                .io_wait_nanos
+                .fetch_add(self.io_wait_nanos, Ordering::Relaxed);
+        }
+    }
+
+    /// Submit IO requests, returns submitted count and elapsed time.
+    #[inline]
+    fn submit_io(&mut self) {
+        if !self.io_reqs.is_empty() {
+            let start = Instant::now();
+            // try to submit as many IO requests as possible
+            let limit = self.io_depth - self.in_progress;
+            let submit_count = self
+                .partition
+                .aio_mgr
+                .submit_limit(&mut self.io_reqs, limit);
+            // add sync groups to inflight tree.
+            for sync_group in self.sync_groups.drain(..submit_count) {
+                let res = self.inflight.insert(sync_group.max_cts, sync_group);
+                debug_assert!(res.is_none());
+            }
+            self.in_progress += submit_count;
+            debug_assert!(self.in_progress <= self.io_depth);
+            self.io_submit_count = 1;
+            self.io_submit_nanos = start.elapsed().as_nanos() as usize;
+        }
+    }
+
+    /// Wait for any IO request to be done, returns finished count and elapsed time.
+    #[inline]
+    fn wait_io(&mut self, all: bool) {
+        if self.in_progress != 0 {
+            let start = Instant::now();
+            let wait_count = if all { self.in_progress } else { 1 };
+            let finish_count =
+                self.partition
+                    .aio_mgr
+                    .wait_at_least(&mut self.events, wait_count, |cts, res| match res {
+                        Ok(len) => {
+                            let sg = self.inflight.get_mut(&cts).expect("finish inflight IO");
+                            debug_assert!(sg.aio.buf().unwrap().aligned_len() == len);
+                            sg.finished = true;
+                        }
+                        Err(err) => {
+                            let sg = self.inflight.remove(&cts).unwrap();
+                            unimplemented!(
+                                "AIO error: task.cts={}, task.log_bytes={}, {}",
+                                sg.max_cts,
+                                sg.log_bytes,
+                                err
+                            )
+                        }
+                    });
+            self.in_progress -= finish_count;
+            self.io_wait_count = 1;
+            self.io_wait_nanos = start.elapsed().as_nanos() as usize;
+        }
+    }
+}
+
 #[inline]
 fn shrink_inflight(
     tree: &mut BTreeMap<TrxID, SyncGroup>,
@@ -485,4 +614,24 @@ fn shrink_inflight(
         }
     }
     (trx_count, commit_count, log_bytes)
+}
+
+#[inline]
+fn log_file_name(file_prefix: &str, log_no: usize, file_seq: u32) -> String {
+    format!("{}.{}.{:08x}", file_prefix, log_no, file_seq)
+}
+
+/// Create a new log file.
+#[inline]
+pub(super) fn create_log_file(
+    aio_mgr: &AIOManager,
+    file_prefix: &str,
+    log_no: usize,
+    file_seq: u32,
+    file_max_size: usize,
+) -> Result<SparseFile> {
+    // todo: Add two pages as file header.
+    let file_name = log_file_name(file_prefix, log_no, file_seq);
+    let log_file = aio_mgr.create_sparse_file(&file_name, file_max_size)?;
+    Ok(log_file)
 }

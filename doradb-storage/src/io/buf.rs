@@ -1,5 +1,7 @@
 use crate::io::free_list::FreeElem;
 use crate::io::{align_to_sector_size, MIN_PAGE_SIZE, STORAGE_SECTOR_SIZE};
+use crate::serde::{LenPrefixStruct, Ser, SerdeCtx};
+use crate::trx::redo::RedoLogs;
 use std::alloc::{alloc, Layout};
 use std::ops::{Deref, DerefMut};
 
@@ -36,6 +38,24 @@ impl Buf {
                 let new_len = offset + data.len();
                 buf.set_len(new_len);
                 buf[offset..new_len].clone_from_slice(data);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn extend_ser(&mut self, serde_ctx: &SerdeCtx, data: &LenPrefixStruct<'static, RedoLogs>) {
+        match self {
+            Buf::Reuse(buf) => {
+                let offset = buf.data_len();
+                let ser_len = data.ser_len(serde_ctx);
+                buf.set_len(offset + ser_len);
+                data.ser(serde_ctx, buf.data_mut(), offset);
+            }
+            Buf::Direct(buf) => {
+                let offset = buf.len();
+                let ser_len = data.ser_len(serde_ctx);
+                buf.set_len(offset + ser_len);
+                data.ser(serde_ctx, buf.as_mut(), offset);
             }
         }
     }
@@ -200,6 +220,11 @@ impl PageBuf {
     #[inline]
     pub fn data(&self) -> &[u8] {
         &self.page[..self.data_len]
+    }
+
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.page[..self.data_len]
     }
 
     #[inline]
