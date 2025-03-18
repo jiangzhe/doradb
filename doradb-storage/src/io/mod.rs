@@ -3,7 +3,6 @@ mod free_list;
 mod libaio_abi;
 mod ringbuffer;
 
-use libaio_abi::*;
 use libc::{
     c_long, c_void, close, fdatasync, fsync, ftruncate, open, EAGAIN, O_CREAT, O_DIRECT, O_RDWR,
     O_TRUNC,
@@ -16,6 +15,7 @@ use thiserror::Error;
 
 pub use buf::*;
 pub use free_list::*;
+pub use libaio_abi::*;
 
 pub const MIN_PAGE_SIZE: usize = 4096;
 pub const STORAGE_SECTOR_SIZE: usize = 4096;

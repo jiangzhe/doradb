@@ -6,7 +6,7 @@ use crate::lifetime::StaticLifetime;
 use crate::notify::Signal;
 use crate::session::{InternalSession, IntoSession, Session};
 use crate::trx::group::{Commit, GroupCommit};
-use crate::trx::log::{LogPartition, LogPartitionStats, LogSync};
+use crate::trx::log::{create_log_file, LogPartition, LogPartitionStats, LogSync};
 use crate::trx::purge::{GCBucket, Purge, GC};
 use crate::trx::{
     ActiveTrx, PreparedTrx, TrxID, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 pub const GC_BUCKETS: usize = 64;
@@ -234,11 +234,7 @@ impl TransactionSystem {
         for (idx, partition) in self.log_partitions.iter().enumerate() {
             let thread_name = format!("Sync-Thread-{}", idx);
             let partition = &**partition;
-            let handle = if self.config.log_drop {
-                thread::spawn_named(thread_name, move || partition.io_loop_noop(&self.config))
-            } else {
-                thread::spawn_named(thread_name, move || partition.io_loop(&self.config))
-            };
+            let handle = thread::spawn_named(thread_name, move || partition.io_loop(&self.config));
             *partition.sync_thread.lock() = Some(handle);
         }
     }
@@ -305,7 +301,6 @@ pub const DEFAULT_LOG_PARTITIONS: usize = 1;
 pub const MAX_LOG_PARTITIONS: usize = 99; // big enough for log partitions, so fix two digits in file name.
 pub const DEFAULT_LOG_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GB, sparse file will not occupy space until actual write.
 pub const DEFAULT_LOG_SYNC: LogSync = LogSync::Fsync;
-pub const DEFAULT_LOG_DROP: bool = false;
 pub const DEFAULT_PURGE_THREADS: usize = 2;
 
 pub struct TrxSysConfig {
@@ -332,9 +327,6 @@ pub struct TrxSysConfig {
     // By default, use fsync(),
     // Can be switched to fdatasync() or not sync.
     pub log_sync: LogSync,
-    // Drop log directly. If this parameter is set to true,
-    // log_sync parameter will be discarded.
-    pub log_drop: bool,
     // Threads for purging undo logs.
     pub purge_threads: usize,
 }
@@ -391,28 +383,27 @@ impl TrxSysConfig {
         self
     }
 
-    #[inline]
-    pub fn log_drop(mut self, log_drop: bool) -> Self {
-        self.log_drop = log_drop;
-        self
-    }
-
-    fn setup_log_partition(&self, idx: usize) -> (LogPartition, Receiver<GC>) {
+    fn setup_log_partition(&self, log_no: usize) -> (LogPartition, Receiver<GC>) {
         let aio_mgr = AIOManagerConfig::default()
             .max_events(self.io_depth_per_log)
             .build()
             .expect("create AIO manager");
 
-        let file_seq = 0;
-        let file_name = log_file_name(&self.log_file_prefix, idx, file_seq);
-        let log_file = aio_mgr
-            .create_sparse_file(&file_name, self.log_file_max_size)
-            .expect("create log file");
+        // todo: handle recovery from previous log file.
+        let mut file_seq = 0;
+        let log_file = create_log_file(
+            &aio_mgr,
+            &self.log_file_prefix,
+            log_no,
+            file_seq,
+            self.log_file_max_size,
+        )
+        .expect("create log file");
+        file_seq += 1;
 
         let group_commit = GroupCommit {
             queue: VecDeque::new(),
             log_file: Some(log_file),
-            file_seq,
         };
         let max_io_size = self.max_io_size;
         let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
@@ -425,9 +416,11 @@ impl TrxSysConfig {
                 gc_chan,
                 gc_buckets: gc_info.into_boxed_slice(),
                 aio_mgr,
-                log_no: idx,
+                log_no,
                 max_io_size,
-                file_prefix: log_file_prefix(&self.log_file_prefix, idx),
+                file_prefix: self.log_file_prefix.clone(),
+                file_seq: AtomicU32::new(file_seq),
+                file_max_size: self.log_file_max_size,
                 buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
                     PageBuf::uninit(max_io_size)
                 }),
@@ -481,7 +474,6 @@ impl Default for TrxSysConfig {
             log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,
             log_partitions: DEFAULT_LOG_PARTITIONS,
             log_sync: DEFAULT_LOG_SYNC,
-            log_drop: DEFAULT_LOG_DROP,
             purge_threads: DEFAULT_PURGE_THREADS,
         }
     }
@@ -503,22 +495,13 @@ pub struct TrxSysStats {
     pub purge_index_count: usize,
 }
 
-#[inline]
-fn log_file_name(file_prefix: &str, idx: usize, file_seq: u32) -> String {
-    format!("{}.{}.{:08x}", file_prefix, idx, file_seq)
-}
-
-#[inline]
-fn log_file_prefix(file_prefix: &str, idx: usize) -> String {
-    format!("{}.{}", file_prefix, idx)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
-    use crate::catalog::Catalog;
+    use crate::catalog::{Catalog, IndexKey, IndexSchema, TableSchema};
     use crate::session::Session;
+    use crate::value::{Val, ValKind};
     use crossbeam_utils::CachePadded;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -700,9 +683,57 @@ mod tests {
                 COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
             );
             unsafe {
-                TransactionSystem::drop_static(trx_sys);
-                Catalog::drop_static(catalog);
-                FixedBufferPool::drop_static(buf_pool);
+                StaticLifetime::drop_static(trx_sys);
+                StaticLifetime::drop_static(catalog);
+                StaticLifetime::drop_static(buf_pool);
+            }
+        });
+    }
+
+    #[test]
+    fn test_log_rotate() {
+        // 10000 rows, 200 bytes each row, 20M log file size.
+        // log file is 5MB, so it will rotate at least 4 times.
+        // Due to alignment of direct IO, the write amplification might
+        // be higher and produce more files.
+        const COUNT: usize = 10000;
+        smol::block_on(async {
+            let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
+            let catalog = Catalog::empty_static();
+            let trx_sys = TrxSysConfig::default()
+                .log_partitions(1)
+                .log_file_max_size(1024 * 1024 * 5)
+                .build_static(buf_pool, catalog);
+            let table_id = catalog
+                .create_table(
+                    buf_pool,
+                    TableSchema::new(
+                        vec![
+                            ValKind::I32.nullable(false),
+                            ValKind::VarByte.nullable(false),
+                        ],
+                        vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
+                    ),
+                )
+                .await;
+            let table = catalog.get_table(table_id).unwrap();
+
+            let mut session = Session::new();
+            let s = vec![1u8; 200];
+            for i in 0..COUNT {
+                let trx = session.begin_trx(trx_sys);
+                let mut stmt = trx.start_stmt();
+                let insert = vec![Val::from(i as i32), Val::from(&s[..])];
+                let res = table.insert_row(buf_pool, &mut stmt, insert).await;
+                assert!(res.is_ok());
+                let trx = stmt.succeed();
+                session = trx_sys.commit(trx, buf_pool, catalog).await.unwrap();
+            }
+
+            unsafe {
+                StaticLifetime::drop_static(trx_sys);
+                StaticLifetime::drop_static(catalog);
+                StaticLifetime::drop_static(buf_pool);
             }
         });
     }

@@ -14,7 +14,7 @@ use crate::row::ops::{
 };
 use crate::row::{estimate_max_row_count, var_len_for_insert, Row, RowID, RowPage, RowRead};
 use crate::stmt::Statement;
-use crate::trx::redo::{RedoEntry, RedoKind};
+use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, MainBranch, NextRowUndo, RowUndoKind, UndoStatus,
@@ -691,13 +691,13 @@ impl<P: BufferPool> Table<P> {
         // even if the operation is move+update, we still treat it as insert redo log.
         // because redo is only useful when recovering and no version chain is required
         // during recovery.
-        let redo_entry = RedoEntry {
+        let redo_entry = RowRedo {
             page_id,
             row_id,
-            kind: RedoKind::Insert(insert),
+            kind: RowRedoKind::Insert(insert),
         };
         // store redo log into transaction redo buffer.
-        stmt.redo.push(redo_entry);
+        stmt.redo.insert(self.table_id, redo_entry);
         InsertRowIntoPage::Ok(row_id, page_guard)
     }
 
@@ -764,13 +764,13 @@ impl<P: BufferPool> Table<P> {
                         // Here we do not unlock page because we need to perform MOVE+UPDATE
                         // and link undo entries of two rows.
                         // The re-lock of current undo is required.
-                        let redo_entry = RedoEntry {
+                        let redo_entry = RowRedo {
                             page_id,
                             row_id,
                             // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
-                            kind: RedoKind::Delete,
+                            kind: RowRedoKind::Delete,
                         };
-                        stmt.redo.push(redo_entry);
+                        stmt.redo.insert(self.table_id, redo_entry);
                         UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
                     }
                     UpdateRow::Ok(mut row) => {
@@ -811,12 +811,12 @@ impl<P: BufferPool> Table<P> {
                         if !redo_cols.is_empty() {
                             // there might be nothing to update, so we do not need to add redo log.
                             // but undo is required because we need to properly lock the row.
-                            let redo_entry = RedoEntry {
+                            let redo_entry = RowRedo {
                                 page_id,
                                 row_id,
-                                kind: RedoKind::Update(redo_cols),
+                                kind: RowRedoKind::Update(redo_cols),
                             };
-                            stmt.redo.push(redo_entry);
+                            stmt.redo.insert(self.table_id, redo_entry);
                         }
                         UpdateRowInplace::Ok(row_id, index_change_cols, page_guard)
                     }
@@ -856,12 +856,12 @@ impl<P: BufferPool> Table<P> {
                 drop(lock_row);
                 // hold page lock in order to update index later.
                 // create redo log
-                let redo_entry = RedoEntry {
+                let redo_entry = RowRedo {
                     page_id,
                     row_id,
-                    kind: RedoKind::Delete,
+                    kind: RowRedoKind::Delete,
                 };
-                stmt.redo.push(redo_entry);
+                stmt.redo.insert(self.table_id, redo_entry);
                 DeleteInternal::Ok(page_guard)
             }
         }

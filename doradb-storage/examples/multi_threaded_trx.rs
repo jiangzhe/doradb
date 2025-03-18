@@ -29,7 +29,6 @@ fn main() {
         .io_depth_per_log(args.io_depth_per_log)
         .log_file_max_size(args.log_file_max_size)
         .log_sync(args.log_sync)
-        .log_drop(args.log_drop)
         .max_io_size(args.max_io_size)
         .build_static(buf_pool, catalog);
     {
@@ -138,9 +137,6 @@ struct Args {
 
     #[arg(long, default_value = "fsync", value_parser = LogSync::from_str)]
     log_sync: LogSync,
-
-    #[arg(long, default_value = "false")]
-    log_drop: bool,
 
     /// size of log file
     #[arg(long, default_value = "1GiB", value_parser = parse_byte_size)]

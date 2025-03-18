@@ -10,6 +10,7 @@ pub mod lifetime;
 pub mod notify;
 pub mod ptr;
 pub mod row;
+pub mod serde;
 pub mod session;
 pub mod stmt;
 pub mod table;
