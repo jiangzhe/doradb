@@ -27,7 +27,10 @@ pub struct OkPacket<'a> {
 }
 
 impl<'a> NewMySer for OkPacket<'a> {
-    type Ser<'s> = MySerPackets<'s, 7> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 7>
+    where
+        Self: 's;
 
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
@@ -150,7 +153,10 @@ pub struct ErrPacket<'a> {
 }
 
 impl<'a> NewMySer for ErrPacket<'a> {
-    type Ser<'s> = MySerPackets<'s, 3> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 3>
+    where
+        Self: 's;
 
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
@@ -232,7 +238,10 @@ impl EofPacket {
 }
 
 impl NewMySer for EofPacket {
-    type Ser<'s> = MySerPackets<'s, 1> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 1>
+    where
+        Self: 's;
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
         let mut b = [0u8; 5];

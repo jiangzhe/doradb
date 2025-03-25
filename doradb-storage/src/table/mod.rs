@@ -5,7 +5,7 @@ mod tests;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
-use crate::catalog::{IndexSchema, TableSchema};
+use crate::catalog::TableMetadata;
 use crate::index::{BlockIndex, RowLocation, SecondaryIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
@@ -20,6 +20,7 @@ use crate::trx::undo::{
     IndexUndo, IndexUndoKind, MainBranch, NextRowUndo, RowUndoKind, UndoStatus,
 };
 use crate::value::{Val, PAGE_VAR_LEN_INLINE};
+use doradb_catalog::IndexSpec;
 use std::collections::HashSet;
 use std::mem;
 use std::sync::Arc;
@@ -62,32 +63,37 @@ pub type TableID = u64;
 /// index does not contain version information, and out-of-date index entry
 /// should ignored if visible data version does not match index key.
 pub struct Table<P: BufferPool> {
-    pub table_id: TableID,
-    pub schema: Arc<TableSchema>,
+    table_id: TableID,
+    pub metadata: Arc<TableMetadata>,
     pub blk_idx: Arc<BlockIndex<P>>,
-    // todo: secondary indexes.
     pub sec_idx: Arc<[SecondaryIndex]>,
 }
 
 impl<P: BufferPool> Table<P> {
     /// Create a new table.
     #[inline]
-    pub async fn new(buf_pool: &'static P, table_id: TableID, schema: TableSchema) -> Self {
-        let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
-        let sec_idx: Vec<_> = schema
-            .indexes
+    pub async fn new(buf_pool: &'static P, table_id: TableID, metadata: TableMetadata) -> Self {
+        let blk_idx = BlockIndex::new(buf_pool).await;
+        let sec_idx: Vec<_> = metadata
+            .index_specs
             .iter()
             .enumerate()
-            .map(|(index_no, index_schema)| {
-                SecondaryIndex::new(index_no, index_schema, schema.user_types())
+            .map(|(index_no, index_spec)| {
+                let ty_infer = |col_no: usize| metadata.user_col_type(col_no);
+                SecondaryIndex::new(index_no, index_spec, ty_infer)
             })
             .collect();
         Table {
             table_id,
-            schema: Arc::new(schema),
+            metadata: Arc::new(metadata),
             blk_idx: Arc::new(blk_idx),
             sec_idx: Arc::from(sec_idx.into_boxed_slice()),
         }
+    }
+
+    #[inline]
+    pub fn table_id(&self) -> TableID {
+        self.table_id
     }
 
     #[inline]
@@ -106,8 +112,8 @@ impl<P: BufferPool> Table<P> {
         user_read_set: &[usize],
     ) -> SelectMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.schema.indexes[key.index_no].unique);
-        debug_assert!(self.schema.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata.index_specs[key.index_no].unique());
+        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
         debug_assert!({
             !user_read_set.is_empty()
                 && user_read_set
@@ -144,7 +150,7 @@ impl<P: BufferPool> Table<P> {
         }
         // MVCC read does not require row lock.
         let access = page_guard.read_row_by_id(row_id);
-        match access.read_row_mvcc(&stmt.trx, &self.schema, user_read_set, key) {
+        match access.read_row_mvcc(&stmt.trx, &self.metadata, user_read_set, key) {
             ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
             ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
         }
@@ -159,11 +165,11 @@ impl<P: BufferPool> Table<P> {
         row_action: F,
     ) -> Option<R>
     where
-        F: FnOnce(Row) -> R,
+        for<'a> F: FnOnce(Row<'a>) -> R,
     {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.schema.indexes[key.index_no].unique);
-        debug_assert!(self.schema.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata.index_specs[key.index_no].unique());
+        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
         let (page_guard, row_id) = loop {
             match self.sec_idx[key.index_no]
                 .unique()
@@ -197,7 +203,7 @@ impl<P: BufferPool> Table<P> {
         if row.is_deleted() {
             return None;
         }
-        if row.is_key_different(&self.schema, key) {
+        if row.is_key_different(&self.metadata, key) {
             return None;
         }
         Some(row_action(row))
@@ -212,20 +218,20 @@ impl<P: BufferPool> Table<P> {
         stmt: &mut Statement,
         cols: Vec<Val>,
     ) -> InsertMvcc {
-        debug_assert!(cols.len() + 1 == self.schema.col_count());
+        debug_assert!(cols.len() + 1 == self.metadata.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.schema.user_col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata.user_col_type_match(idx, val))
         });
-        let keys = self.schema.keys_for_insert(&cols);
+        let keys = self.metadata.keys_for_insert(&cols);
         // insert row into page with undo log linked.
         let (row_id, page_guard) = self
             .insert_row_internal(buf_pool, stmt, cols, RowUndoKind::Insert, None)
             .await;
         // insert index
         for key in keys {
-            if self.schema.indexes[key.index_no].unique {
+            if self.metadata.index_specs[key.index_no].unique() {
                 let res = self
                     .insert_unique_index(buf_pool, stmt, key, row_id, &page_guard)
                     .await;
@@ -258,8 +264,8 @@ impl<P: BufferPool> Table<P> {
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.schema.indexes[key.index_no].unique);
-        debug_assert!(self.schema.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata.index_specs[key.index_no].unique());
+        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
@@ -358,8 +364,8 @@ impl<P: BufferPool> Table<P> {
         key: &SelectKey,
     ) -> DeleteMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.schema.indexes[key.index_no].unique);
-        debug_assert!(self.schema.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata.index_specs[key.index_no].unique());
+        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
@@ -408,8 +414,8 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     pub async fn delete_index(&self, buf_pool: &'static P, key: &SelectKey, row_id: RowID) -> bool {
         // todo: consider index drop.
-        let index_schema = &self.schema.indexes[key.index_no];
-        if index_schema.unique {
+        let index_schema = &self.metadata.index_specs[key.index_no];
+        if index_schema.unique() {
             let index = self.sec_idx[key.index_no].unique().unwrap();
             return self.delete_unique_index(buf_pool, index, key, row_id).await;
         }
@@ -457,7 +463,7 @@ impl<P: BufferPool> Table<P> {
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
         // data or version chain.
-        if !access.any_version_matches_key(&self.schema, key) {
+        if !access.any_version_matches_key(&self.metadata, key) {
             return index.compare_delete(&key.vals, row_id);
         }
         false
@@ -488,7 +494,7 @@ impl<P: BufferPool> Table<P> {
             for mut uc in update {
                 let old_val = &mut row[uc.idx];
                 if old_val != &uc.val {
-                    if self.schema.user_index_cols.contains(&uc.idx) {
+                    if self.metadata.user_index_cols.contains(&uc.idx) {
                         index_change_cols.insert(uc.idx);
                     }
                     // swap old value and new value, then put into undo columns
@@ -561,14 +567,14 @@ impl<P: BufferPool> Table<P> {
         // The link process is to find one version of the old row that matches
         // given key and then link new row to it.
         let old_access = old_guard.write_row_by_id(old_id);
-        match old_access.find_old_version_for_unique_key(&self.schema, key, &stmt.trx) {
+        match old_access.find_old_version_for_unique_key(&self.metadata, key, &stmt.trx) {
             FindOldVersion::None => LinkForUniqueIndex::Ok,
             FindOldVersion::DuplicateKey => LinkForUniqueIndex::DuplicateKey,
             FindOldVersion::WriteConflict => LinkForUniqueIndex::WriteConflict,
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
                 let mut new_access = new_guard.write_row_by_id(new_id);
-                let undo_vals = new_access.row().calc_delta(&self.schema, &old_row);
+                let undo_vals = new_access.row().calc_delta(&self.metadata, &old_row);
                 new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
                 LinkForUniqueIndex::Ok
             }
@@ -584,8 +590,8 @@ impl<P: BufferPool> Table<P> {
         mut undo_kind: RowUndoKind,
         mut move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
     ) -> (RowID, PageSharedGuard<RowPage>) {
-        let row_len = row_len(&self.schema, &insert);
-        let row_count = estimate_max_row_count(row_len, self.schema.col_count());
+        let row_len = row_len(&self.metadata, &insert);
+        let row_count = estimate_max_row_count(row_len, self.metadata.col_count());
         loop {
             let page_guard = self.get_insert_page(buf_pool, stmt, row_count).await;
             let page_id = page_guard.page_id();
@@ -623,11 +629,11 @@ impl<P: BufferPool> Table<P> {
 
         let page_id = page_guard.page_id();
         let page = page_guard.page();
-        debug_assert!(self.schema.col_count() == page.header.col_count as usize);
+        debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
         // insert row does not include RowID, as RowID is auto-generated.
         debug_assert!(insert.len() + 1 == page.header.col_count as usize);
 
-        let var_len = var_len_for_insert(&self.schema, &insert);
+        let var_len = var_len_for_insert(&self.metadata, &insert);
         let (row_idx, var_offset) =
             if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
@@ -637,7 +643,7 @@ impl<P: BufferPool> Table<P> {
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
         let mut access = page_guard.write_row(row_idx);
-        access.lock_undo(stmt, &self.schema, self.table_id, page_id, row_id, None);
+        access.lock_undo(stmt, &self.metadata, self.table_id, page_id, row_id, None);
         // Apply insert
         let mut new_row = page.new_row(row_idx as usize, var_offset);
         for v in &insert {
@@ -748,7 +754,7 @@ impl<P: BufferPool> Table<P> {
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }
-                match access.update_row(&self.schema, &update) {
+                match access.update_row(&self.metadata, &update) {
                     UpdateRow::NoFreeSpace(old_row) => {
                         // Page does not have enough space for update, we need to switch
                         // to out-of-place update mode, which will add a MOVE undo entry
@@ -779,13 +785,13 @@ impl<P: BufferPool> Table<P> {
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
                         for uc in &mut update {
                             if let Some((old, var_offset)) =
-                                row.user_different(&self.schema, uc.idx, &uc.val)
+                                row.user_different(&self.metadata, uc.idx, &uc.val)
                             {
                                 let old_val = Val::from(old);
                                 let new_val = mem::take(&mut uc.val);
                                 // we also check whether the value change is related to any index,
                                 // so we can update index later.
-                                if self.schema.user_index_cols.contains(&uc.idx) {
+                                if self.metadata.user_index_cols.contains(&uc.idx) {
                                     index_change_cols.insert(uc.idx);
                                 }
                                 // actual update
@@ -889,7 +895,7 @@ impl<P: BufferPool> Table<P> {
             }
         }
         self.blk_idx
-            .get_insert_page(buf_pool, row_count, &self.schema)
+            .get_insert_page(buf_pool, row_count, &self.metadata)
             .await
     }
 
@@ -906,7 +912,7 @@ impl<P: BufferPool> Table<P> {
             let mut access = page_guard.write_row_by_id(row_id);
             let lock_undo = access.lock_undo(
                 stmt,
-                &self.schema,
+                &self.metadata,
                 self.table_id,
                 page_guard.page_id(),
                 row_id,
@@ -1020,12 +1026,12 @@ impl<P: BufferPool> Table<P> {
         page_guard: &PageSharedGuard<RowPage>,
         index_change_cols: &HashSet<usize>,
     ) -> UpdateIndex {
-        for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
-            debug_assert!(index.is_unique() == index_schema.unique);
-            if index_schema.unique {
+        for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+            debug_assert!(index.is_unique() == index_schema.unique());
+            if index_schema.unique() {
                 if index_key_is_changed(index_schema, index_change_cols) {
                     let new_key =
-                        read_latest_index_key(&self.schema, index.index_no, page_guard, row_id);
+                        read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
                     match self
                         .update_unique_index_only_key_change(
                             buf_pool,
@@ -1058,11 +1064,11 @@ impl<P: BufferPool> Table<P> {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
-            debug_assert!(index.is_unique() == index_schema.unique);
-            if index_schema.unique {
+        for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+            debug_assert!(index.is_unique() == index_schema.unique());
+            if index_schema.unique() {
                 let key =
-                    read_latest_index_key(&self.schema, index.index_no, page_guard, new_row_id);
+                    read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
                 match self.update_unique_index_only_row_id_change(
                     stmt,
                     index.unique().unwrap(),
@@ -1092,11 +1098,11 @@ impl<P: BufferPool> Table<P> {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
-            debug_assert!(index.is_unique() == index_schema.unique);
-            if index_schema.unique {
+        for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+            debug_assert!(index.is_unique() == index_schema.unique());
+            if index_schema.unique() {
                 let key =
-                    read_latest_index_key(&self.schema, index.index_no, &page_guard, new_row_id);
+                    read_latest_index_key(&self.metadata, index.index_no, &page_guard, new_row_id);
                 if index_key_is_changed(index_schema, index_change_cols) {
                     // key change and row id change.
                     match self
@@ -1143,10 +1149,10 @@ impl<P: BufferPool> Table<P> {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) {
-        for (index, index_schema) in self.sec_idx.iter().zip(&self.schema.indexes) {
-            debug_assert!(index.is_unique() == index_schema.unique);
-            if index_schema.unique {
-                let key = read_latest_index_key(&self.schema, index.index_no, page_guard, row_id);
+        for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+            debug_assert!(index.is_unique() == index_schema.unique());
+            if index_schema.unique() {
+                let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
                 let index_undo = self.index_undo(row_id, IndexUndoKind::DeferDelete(key));
                 stmt.index_undo.push(index_undo);
             } else {
@@ -1336,6 +1342,18 @@ impl<P: BufferPool> Table<P> {
     }
 }
 
+impl<P: BufferPool> Clone for Table<P> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Table {
+            table_id: self.table_id,
+            metadata: Arc::clone(&self.metadata),
+            blk_idx: Arc::clone(&self.blk_idx),
+            sec_idx: Arc::clone(&self.sec_idx),
+        }
+    }
+}
+
 #[inline]
 fn validate_page_id(page_guard: &PageSharedGuard<RowPage>, page_id: PageID) -> bool {
     if page_guard.page_id() != page_id {
@@ -1357,7 +1375,7 @@ fn validate_page_row_range(
 }
 
 #[inline]
-fn row_len(schema: &TableSchema, user_cols: &[Val]) -> usize {
+fn row_len(schema: &TableMetadata, user_cols: &[Val]) -> usize {
     let var_len = schema
         .var_cols
         .iter()
@@ -1410,27 +1428,25 @@ enum DeleteInternal {
 }
 
 #[inline]
-fn index_key_is_changed(index_schema: &IndexSchema, index_change_cols: &HashSet<usize>) -> bool {
+fn index_key_is_changed(index_schema: &IndexSpec, index_change_cols: &HashSet<usize>) -> bool {
     index_schema
-        .keys
+        .index_cols
         .iter()
-        .any(|key| index_change_cols.contains(&(key.user_col_idx as usize)))
+        .any(|key| index_change_cols.contains(&(key.col_no as usize)))
 }
 
 #[inline]
 fn read_latest_index_key(
-    schema: &TableSchema,
+    schema: &TableMetadata,
     index_no: usize,
     page_guard: &PageSharedGuard<RowPage>,
     row_id: RowID,
 ) -> SelectKey {
-    let index_schema = &schema.indexes[index_no];
-    let mut new_key = SelectKey::null(index_no, index_schema.keys.len());
-    for (pos, key) in index_schema.keys.iter().enumerate() {
+    let index_spec = &schema.index_specs[index_no];
+    let mut new_key = SelectKey::null(index_no, index_spec.index_cols.len());
+    for (pos, key) in index_spec.index_cols.iter().enumerate() {
         let access = page_guard.read_row_by_id(row_id);
-        let val = access
-            .row()
-            .clone_user_val(schema, key.user_col_idx as usize);
+        let val = access.row().clone_user_val(schema, key.col_no as usize);
         new_key.vals[pos] = val;
     }
     new_key

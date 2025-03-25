@@ -1,11 +1,11 @@
 use crate::buffer::page::PageID;
-use crate::catalog::{IndexID, IndexKey, IndexOrder};
 use crate::error::Result;
 use crate::row::ops::UpdateCol;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::table::TableID;
-use crate::value::{Val, ValType};
+use crate::value::Val;
+use doradb_catalog::IndexID;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::mem;
@@ -148,18 +148,12 @@ impl From<u8> for DDLRedoCode {
 
 /// Represents a redo record of any DDL operation.
 pub enum DDLRedo {
-    CreateTable {
-        table_id: TableID,
-        cols: Vec<ValType>,
-    },
+    // Create a new table with given table id.
+    // Actual metadata change is recorded in DML logs.
+    CreateTable(TableID),
     DropTable(TableID),
-    CreateIndex {
-        table_id: TableID,
-        index_id: IndexID,
-        keys: Vec<IndexKey>,
-        unique: bool,
-    },
-    DropIndex(TableID, IndexID),
+    CreateIndex(IndexID),
+    DropIndex(IndexID),
 }
 
 impl DDLRedo {
@@ -180,15 +174,10 @@ impl Ser<'_> for DDLRedo {
     fn ser_len(&self, ctx: &SerdeCtx) -> usize {
         mem::size_of::<u8>()
             + match self {
-                DDLRedo::CreateTable { cols, .. } => mem::size_of::<u64>() + cols.ser_len(ctx),
-                DDLRedo::DropTable { .. } => mem::size_of::<u64>(),
-                DDLRedo::CreateIndex { keys, .. } => {
-                    mem::size_of::<u64>()
-                        + mem::size_of::<u64>()
-                        + keys.ser_len(ctx)
-                        + mem::size_of::<u8>()
-                }
-                DDLRedo::DropIndex { .. } => mem::size_of::<u64>() + mem::size_of::<u64>(),
+                DDLRedo::CreateTable(_) => mem::size_of::<u64>(),
+                DDLRedo::DropTable(_) => mem::size_of::<u64>(),
+                DDLRedo::CreateIndex(_) => mem::size_of::<u64>(),
+                DDLRedo::DropIndex(_) => mem::size_of::<u64>(),
             }
     }
 
@@ -197,26 +186,16 @@ impl Ser<'_> for DDLRedo {
         let mut idx = start_idx;
         idx = ctx.ser_u8(out, idx, self.code() as u8);
         match self {
-            DDLRedo::CreateTable { table_id, cols } => {
+            DDLRedo::CreateTable(table_id) => {
                 idx = ctx.ser_u64(out, idx, *table_id);
-                idx = ctx.ser_slice(out, idx, cols);
             }
             DDLRedo::DropTable(table_id) => {
                 idx = ctx.ser_u64(out, idx, *table_id);
             }
-            DDLRedo::CreateIndex {
-                table_id,
-                index_id,
-                keys,
-                unique,
-            } => {
-                idx = ctx.ser_u64(out, idx, *table_id);
+            DDLRedo::CreateIndex(index_id) => {
                 idx = ctx.ser_u64(out, idx, *index_id);
-                idx = ctx.ser_slice(out, idx, keys);
-                idx = ctx.ser_u8(out, idx, *unique as u8);
             }
-            DDLRedo::DropIndex(table_id, index_id) => {
-                idx = ctx.ser_u64(out, idx, *table_id);
+            DDLRedo::DropIndex(index_id) => {
                 idx = ctx.ser_u64(out, idx, *index_id);
             }
         }
@@ -231,32 +210,19 @@ impl Deser for DDLRedo {
         match DDLRedoCode::from(code) {
             DDLRedoCode::CreateTable => {
                 let (idx, table_id) = ctx.deser_u64(data, idx)?;
-                let (idx, cols) = Vec::<ValType>::deser(ctx, data, idx)?;
-                Ok((idx, DDLRedo::CreateTable { table_id, cols }))
+                Ok((idx, DDLRedo::CreateTable(table_id)))
             }
             DDLRedoCode::DropTable => {
                 let (idx, table_id) = ctx.deser_u64(data, idx)?;
                 Ok((idx, DDLRedo::DropTable(table_id)))
             }
             DDLRedoCode::CreateIndex => {
-                let (idx, table_id) = ctx.deser_u64(data, idx)?;
                 let (idx, index_id) = ctx.deser_u64(data, idx)?;
-                let (idx, keys) = Vec::<IndexKey>::deser(ctx, data, idx)?;
-                let (idx, unique) = ctx.deser_u8(data, idx)?;
-                Ok((
-                    idx,
-                    DDLRedo::CreateIndex {
-                        table_id,
-                        index_id,
-                        keys,
-                        unique: unique != 0,
-                    },
-                ))
+                Ok((idx, DDLRedo::CreateIndex(index_id)))
             }
             DDLRedoCode::DropIndex => {
-                let (idx, table_id) = ctx.deser_u64(data, idx)?;
                 let (idx, index_id) = ctx.deser_u64(data, idx)?;
-                Ok((idx, DDLRedo::DropIndex(table_id, index_id)))
+                Ok((idx, DDLRedo::DropIndex(index_id)))
             }
         }
     }
@@ -435,7 +401,6 @@ impl Deser for TableDML {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::ValKind;
 
     #[test]
     fn test_redo_log_insert_update_delete() {
@@ -707,53 +672,35 @@ mod tests {
 
     #[test]
     fn test_ddl_redo_serde() {
-        let ctx = &SerdeCtx;
-        let mut ctx_deser = SerdeCtx;
+        let mut ctx = SerdeCtx::default();
 
         // 测试用例1：CreateTable
-        let create_table = DDLRedo::CreateTable {
-            table_id: 1,
-            cols: vec![
-                ValType {
-                    kind: ValKind::I32,
-                    nullable: false,
-                },
-                ValType {
-                    kind: ValKind::VarByte,
-                    nullable: true,
-                },
-            ],
-        };
-        let mut buf = vec![0; create_table.ser_len(ctx)];
-        create_table.ser(ctx, &mut buf, 0);
+        let create_table = DDLRedo::CreateTable(1);
+        let mut buf = vec![0; create_table.ser_len(&ctx)];
+        create_table.ser(&ctx, &mut buf, 0);
 
         // 验证序列化结果
         assert_eq!(buf[0], DDLRedoCode::CreateTable as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx_deser, &buf, 0).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 0).unwrap();
         match deserialized {
-            DDLRedo::CreateTable { table_id, cols } => {
+            DDLRedo::CreateTable(table_id) => {
                 assert_eq!(table_id, 1);
-                assert_eq!(cols.len(), 2);
-                assert_eq!(cols[0].kind, ValKind::I32);
-                assert_eq!(cols[0].nullable, false);
-                assert_eq!(cols[1].kind, ValKind::VarByte);
-                assert_eq!(cols[1].nullable, true);
             }
             _ => panic!("Expected CreateTable"),
         }
 
         // 测试用例2：DropTable
         let drop_table = DDLRedo::DropTable(2);
-        let mut buf = vec![0; drop_table.ser_len(ctx)];
-        drop_table.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; drop_table.ser_len(&ctx)];
+        drop_table.ser(&ctx, &mut buf, 0);
 
         // 验证序列化结果
         assert_eq!(buf[0], DDLRedoCode::DropTable as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx_deser, &buf, 0).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 0).unwrap();
         match deserialized {
             DDLRedo::DropTable(table_id) => {
                 assert_eq!(table_id, 2);
@@ -762,61 +709,34 @@ mod tests {
         }
 
         // 测试用例3：CreateIndex
-        let create_index = DDLRedo::CreateIndex {
-            table_id: 3,
-            index_id: 1,
-            keys: vec![
-                IndexKey {
-                    user_col_idx: 0,
-                    order: IndexOrder::Asc,
-                },
-                IndexKey {
-                    user_col_idx: 1,
-                    order: IndexOrder::Desc,
-                },
-            ],
-            unique: true,
-        };
-        let mut buf = vec![0; create_index.ser_len(ctx)];
-        create_index.ser(ctx, &mut buf, 0);
+        let create_index = DDLRedo::CreateIndex(1);
+        let mut buf = vec![0; create_index.ser_len(&ctx)];
+        create_index.ser(&ctx, &mut buf, 0);
 
         // 验证序列化结果
         assert_eq!(buf[0], DDLRedoCode::CreateIndex as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx_deser, &buf, 0).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 0).unwrap();
         match deserialized {
-            DDLRedo::CreateIndex {
-                table_id,
-                index_id,
-                keys,
-                unique,
-            } => {
-                assert_eq!(table_id, 3);
+            DDLRedo::CreateIndex(index_id) => {
                 assert_eq!(index_id, 1);
-                assert_eq!(keys.len(), 2);
-                assert_eq!(keys[0].user_col_idx, 0);
-                assert_eq!(keys[0].order, IndexOrder::Asc);
-                assert_eq!(keys[1].user_col_idx, 1);
-                assert_eq!(keys[1].order, IndexOrder::Desc);
-                assert_eq!(unique, true);
             }
             _ => panic!("Expected CreateIndex"),
         }
 
         // 测试用例4：DropIndex
-        let drop_index = DDLRedo::DropIndex(4, 2);
-        let mut buf = vec![0; drop_index.ser_len(ctx)];
-        drop_index.ser(ctx, &mut buf, 0);
+        let drop_index = DDLRedo::DropIndex(2);
+        let mut buf = vec![0; drop_index.ser_len(&ctx)];
+        drop_index.ser(&ctx, &mut buf, 0);
 
         // 验证序列化结果
         assert_eq!(buf[0], DDLRedoCode::DropIndex as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx_deser, &buf, 0).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 0).unwrap();
         match deserialized {
-            DDLRedo::DropIndex(table_id, index_id) => {
-                assert_eq!(table_id, 4);
+            DDLRedo::DropIndex(index_id) => {
                 assert_eq!(index_id, 2);
             }
             _ => panic!("Expected DropIndex"),
@@ -824,14 +744,14 @@ mod tests {
 
         // 测试用例5：测试序列化位置偏移
         let drop_table = DDLRedo::DropTable(5);
-        let mut buf = vec![0; 4 + drop_table.ser_len(ctx)]; // 添加4字节前缀
-        drop_table.ser(ctx, &mut buf, 4); // 从位置4开始序列化
+        let mut buf = vec![0; 4 + drop_table.ser_len(&ctx)]; // 添加4字节前缀
+        drop_table.ser(&ctx, &mut buf, 4); // 从位置4开始序列化
 
         // 验证序列化结果
         assert_eq!(buf[4], DDLRedoCode::DropTable as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx_deser, &buf, 4).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 4).unwrap();
         match deserialized {
             DDLRedo::DropTable(table_id) => {
                 assert_eq!(table_id, 5);

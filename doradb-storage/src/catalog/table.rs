@@ -1,68 +1,69 @@
-use crate::buffer::BufferPool;
-use crate::catalog::index::IndexSchema;
-use crate::index::{BlockIndex, SecondaryIndex};
+use crate::catalog::ROW_ID_COL_NAME;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::value::{Layout, Val, ValKind, ValType};
-
+use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexSpec};
+use semistr::SemiStr;
 use std::collections::HashSet;
-use std::sync::Arc;
 
-pub struct TableMeta<P: BufferPool> {
-    pub schema: Arc<TableSchema>,
-    pub blk_idx: Arc<BlockIndex<P>>,
-    pub sec_idx: Arc<[SecondaryIndex]>,
-}
-
-pub struct TableSchema {
-    types: Vec<ValType>,
+pub struct TableMetadata {
+    pub(crate) col_names: Vec<SemiStr>,
+    pub(crate) col_types: Vec<ValType>,
     // fix length is the total inline length of all columns.
     pub fix_len: usize,
     // index of var-length columns.
     pub var_cols: Vec<usize>,
     // index column id.
-    pub indexes: Vec<IndexSchema>,
+    pub index_specs: Vec<IndexSpec>,
     // columns that are included in any index.
     pub user_index_cols: HashSet<usize>,
 }
 
-impl TableSchema {
+impl TableMetadata {
     /// Create a new schema.
     /// RowID is not included in input, but will be created
     /// automatically.
     #[inline]
-    pub fn new(user_types: Vec<ValType>, indexes: Vec<IndexSchema>) -> Self {
-        debug_assert!(!user_types.is_empty());
-        debug_assert!(indexes.iter().all(|is| {
-            is.keys
+    pub fn new(column_specs: Vec<ColumnSpec>, index_specs: Vec<IndexSpec>) -> Self {
+        debug_assert!(!column_specs.is_empty());
+        debug_assert!(index_specs.iter().all(|is| {
+            is.index_cols
                 .iter()
-                .all(|k| (k.user_col_idx as usize) < user_types.len())
+                .all(|k| (k.col_no as usize) < column_specs.len())
         }));
 
-        let mut types = Vec::with_capacity(user_types.len() + 1);
-        types.push(ValType {
+        let mut col_names = Vec::with_capacity(column_specs.len() + 1);
+        col_names.push(SemiStr::new(ROW_ID_COL_NAME));
+        col_names.extend(column_specs.iter().map(|c| c.column_name.clone()));
+        let mut col_types = Vec::with_capacity(column_specs.len() + 1);
+        col_types.push(ValType {
             kind: ValKind::U64,
             nullable: false,
         });
-        types.extend(user_types);
+        col_types.extend(column_specs.iter().map(|c| {
+            let kind = ValKind::from(c.column_type);
+            let nullable = c.column_attributes.contains(ColumnAttributes::NULLABLE);
+            ValType { kind, nullable }
+        }));
         let mut fix_len = 0;
         let mut var_cols = vec![];
-        for (idx, ty) in types.iter().enumerate() {
+        for (idx, ty) in col_types.iter().enumerate() {
             fix_len += ty.kind.layout().inline_len();
             if !ty.kind.layout().is_fixed() {
                 var_cols.push(idx);
             }
         }
         let mut user_index_cols = HashSet::new();
-        for index in &indexes {
-            for key in &index.keys {
-                user_index_cols.insert(key.user_col_idx as usize);
+        for index_spec in &index_specs {
+            for key in &index_spec.index_cols {
+                user_index_cols.insert(key.col_no as usize);
             }
         }
-        TableSchema {
-            types,
+        TableMetadata {
+            col_names,
+            col_types,
             fix_len,
             var_cols,
-            indexes,
+            index_specs,
             user_index_cols,
         }
     }
@@ -70,18 +71,23 @@ impl TableSchema {
     /// Returns column count of this schema, including row id.
     #[inline]
     pub fn col_count(&self) -> usize {
-        self.types.len()
+        self.col_types.len()
     }
 
     /// Returns layouts of all columns, including row id.
     #[inline]
     pub fn types(&self) -> &[ValType] {
-        &self.types
+        &self.col_types
     }
 
     #[inline]
     pub fn user_types(&self) -> &[ValType] {
-        &self.types[1..]
+        &self.col_types[1..]
+    }
+
+    #[inline]
+    pub fn user_col_type(&self, user_col_idx: usize) -> ValType {
+        self.col_types[user_col_idx + 1]
     }
 
     /// Returns whether the type is matched at given column index, row id is excluded.
@@ -98,14 +104,14 @@ impl TableSchema {
 
     #[inline]
     pub fn index_layout_match(&self, index_no: usize, vals: &[Val]) -> bool {
-        let index = &self.indexes[index_no];
-        if index.keys.len() != vals.len() {
+        let index = &self.index_specs[index_no];
+        if index.index_cols.len() != vals.len() {
             return false;
         }
         index
-            .keys
+            .index_cols
             .iter()
-            .map(|k| self.user_layout(k.user_col_idx as usize))
+            .map(|k| self.user_layout(k.col_no as usize))
             .zip(vals)
             .all(|(layout, val)| layout_match(val, layout))
     }
@@ -117,19 +123,19 @@ impl TableSchema {
 
     #[inline]
     pub fn layout(&self, col_idx: usize) -> Layout {
-        self.types[col_idx].kind.layout()
+        self.col_types[col_idx].kind.layout()
     }
 
     #[inline]
     pub fn keys_for_insert(&self, row: &[Val]) -> Vec<SelectKey> {
-        self.indexes
+        self.index_specs
             .iter()
             .enumerate()
             .map(|(index_no, is)| {
                 let vals: Vec<Val> = is
-                    .keys
+                    .index_cols
                     .iter()
-                    .map(|k| row[k.user_col_idx as usize].clone())
+                    .map(|k| row[k.col_no as usize].clone())
                     .collect();
                 SelectKey { index_no, vals }
             })
@@ -145,11 +151,11 @@ impl TableSchema {
 
     #[inline]
     pub fn match_key(&self, key: &SelectKey, row: &[Val]) -> bool {
-        let keys = &self.indexes[key.index_no].keys;
+        let keys = &self.index_specs[key.index_no].index_cols;
         debug_assert!(keys.len() == key.vals.len());
         keys.iter()
             .zip(&key.vals)
-            .all(|(key, val)| &row[key.user_col_idx as usize] == val)
+            .all(|(key, val)| &row[key.col_no as usize] == val)
     }
 }
 

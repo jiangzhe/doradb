@@ -1,10 +1,8 @@
-use crate::controlflow::ControlFlow;
 use crate::func::FuncKind;
 use crate::id::{GlobalID, QueryID};
 use crate::pred::{Pred, PredFuncKind};
 use semistr::SemiStr;
 use smallvec::{smallvec, SmallVec};
-use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 

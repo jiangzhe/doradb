@@ -332,6 +332,14 @@ impl<'a> TryFrom<&'a [u8]> for PreciseType {
     }
 }
 
+impl From<PreciseType> for u32 {
+    #[inline]
+    fn from(src: PreciseType) -> Self {
+        let buf: [u8; 4] = src.into();
+        u32::from_le_bytes(buf)
+    }
+}
+
 impl From<PreciseType> for [u8; 4] {
     #[inline]
     fn from(src: PreciseType) -> Self {
@@ -381,6 +389,21 @@ impl From<PreciseType> for [u8; 4] {
             PreciseType::Compound => tgt[0] = 12,
         }
         tgt
+    }
+}
+
+impl From<[u8; 4]> for PreciseType {
+    #[inline]
+    fn from(src: [u8; 4]) -> Self {
+        PreciseType::try_from(&src[..]).unwrap()
+    }
+}
+
+impl From<u32> for PreciseType {
+    #[inline]
+    fn from(src: u32) -> Self {
+        let buf: [u8; 4] = src.to_le_bytes();
+        PreciseType::try_from(&buf[..]).unwrap()
     }
 }
 

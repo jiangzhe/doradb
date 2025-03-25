@@ -16,14 +16,15 @@ use flume::{Receiver, Sender};
 // use parking_lot::{Condvar, Mutex};
 use crate::latch::Mutex;
 use crate::thread;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-
 pub const GC_BUCKETS: usize = 64;
+use byte_unit::Byte;
 
 /// TransactionSystem controls lifecycle of all transactions.
 ///
@@ -295,14 +296,15 @@ fn gc_no(sts: TrxID) -> usize {
 }
 
 pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
-pub const DEFAULT_LOG_IO_MAX_SIZE: usize = 8192;
+pub const DEFAULT_LOG_IO_MAX_SIZE: Byte = Byte::from_u64(8192);
 pub const DEFAULT_LOG_FILE_PREFIX: &'static str = "redo.log";
 pub const DEFAULT_LOG_PARTITIONS: usize = 1;
 pub const MAX_LOG_PARTITIONS: usize = 99; // big enough for log partitions, so fix two digits in file name.
-pub const DEFAULT_LOG_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GB, sparse file will not occupy space until actual write.
+pub const DEFAULT_LOG_FILE_MAX_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // 1GB, sparse file will not occupy space until actual write.
 pub const DEFAULT_LOG_SYNC: LogSync = LogSync::Fsync;
 pub const DEFAULT_PURGE_THREADS: usize = 2;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrxSysConfig {
     // Controls infight IO request number of each log file.
     pub io_depth_per_log: usize,
@@ -310,7 +312,7 @@ pub struct TrxSysConfig {
     // This only limit the combination of multiple transactions.
     // If single transaction has very large redo log. It is kept
     // what it is and send to AIO manager as one IO request.
-    pub max_io_size: usize,
+    pub max_io_size: Byte,
     // Prefix of log file.
     // the complete file name pattern is:
     // <file-prefix>.<partition_idx>.<file-sequence>
@@ -322,7 +324,7 @@ pub struct TrxSysConfig {
     // Log file will be rotated once the size limit is reached.
     // a u32 suffix is appended at end of the file name in
     // hexdigit format.
-    pub log_file_max_size: usize,
+    pub log_file_max_size: Byte,
     // Controls which method to sync data on disk.
     // By default, use fsync(),
     // Can be switched to fdatasync() or not sync.
@@ -341,8 +343,11 @@ impl TrxSysConfig {
 
     /// How large single IO operation can be.
     #[inline]
-    pub fn max_io_size(mut self, max_io_size: usize) -> Self {
-        self.max_io_size = max_io_size;
+    pub fn max_io_size<T>(mut self, max_io_size: T) -> Self
+    where
+        Byte: From<T>,
+    {
+        self.max_io_size = Byte::from(max_io_size);
         self
     }
 
@@ -363,8 +368,13 @@ impl TrxSysConfig {
 
     /// Maximum size of single log file.
     #[inline]
-    pub fn log_file_max_size(mut self, log_file_max_size: usize) -> Self {
-        self.log_file_max_size = align_to_sector_size(log_file_max_size);
+    pub fn log_file_max_size<T>(mut self, log_file_max_size: T) -> Self
+    where
+        Byte: From<T>,
+    {
+        let size = Byte::from(log_file_max_size);
+        let aligned_size = align_to_sector_size(size.as_u64() as usize);
+        self.log_file_max_size = <Byte as From<usize>>::from(aligned_size);
         self
     }
 
@@ -396,7 +406,7 @@ impl TrxSysConfig {
             &self.log_file_prefix,
             log_no,
             file_seq,
-            self.log_file_max_size,
+            self.log_file_max_size.as_u64() as usize,
         )
         .expect("create log file");
         file_seq += 1;
@@ -405,7 +415,7 @@ impl TrxSysConfig {
             queue: VecDeque::new(),
             log_file: Some(log_file),
         };
-        let max_io_size = self.max_io_size;
+        let max_io_size = self.max_io_size.as_u64() as usize;
         let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
         let (gc_chan, gc_rx) = flume::unbounded();
         (
@@ -420,7 +430,7 @@ impl TrxSysConfig {
                 max_io_size,
                 file_prefix: self.log_file_prefix.clone(),
                 file_seq: AtomicU32::new(file_seq),
-                file_max_size: self.log_file_max_size,
+                file_max_size: self.log_file_max_size.as_u64() as usize,
                 buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
                     PageBuf::uninit(max_io_size)
                 }),
@@ -499,9 +509,9 @@ pub struct TrxSysStats {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
-    use crate::catalog::{Catalog, IndexKey, IndexSchema, TableSchema};
+    use crate::catalog::Catalog;
     use crate::session::Session;
-    use crate::value::{Val, ValKind};
+    use crate::value::Val;
     use crossbeam_utils::CachePadded;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -510,26 +520,28 @@ mod tests {
 
     #[test]
     fn test_transaction_system() {
-        let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-        let catalog = Catalog::empty_static();
-        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let session = Session::new();
-        {
-            let trx = session.begin_trx(trx_sys);
-            let _ = smol::block_on(trx_sys.commit(trx, buf_pool, catalog));
-        }
-        std::thread::spawn(move || {
+        smol::block_on(async {
+            let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
+            let catalog = Catalog::empty_static(buf_pool).await;
+            let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
             let session = Session::new();
-            let trx = session.begin_trx(trx_sys);
-            let _ = smol::block_on(trx_sys.commit(trx, buf_pool, catalog));
+            {
+                let trx = session.begin_trx(trx_sys);
+                let _ = smol::block_on(trx_sys.commit(trx, buf_pool, catalog));
+            }
+            std::thread::spawn(move || {
+                let session = Session::new();
+                let trx = session.begin_trx(trx_sys);
+                let _ = smol::block_on(trx_sys.commit(trx, buf_pool, catalog));
+            })
+            .join()
+            .unwrap();
+            unsafe {
+                StaticLifetime::drop_static(trx_sys);
+                StaticLifetime::drop_static(catalog);
+                StaticLifetime::drop_static(buf_pool);
+            }
         })
-        .join()
-        .unwrap();
-        unsafe {
-            TransactionSystem::drop_static(trx_sys);
-            Catalog::drop_static(catalog);
-            FixedBufferPool::drop_static(buf_pool);
-        }
     }
 
     #[test]
@@ -665,7 +677,7 @@ mod tests {
         const COUNT: usize = 1000000;
         smol::block_on(async {
             let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-            let catalog = Catalog::empty_static();
+            let catalog = Catalog::empty_static(buf_pool).await;
             let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
             let mut session = Session::new();
             let start = Instant::now();
@@ -692,6 +704,7 @@ mod tests {
 
     #[test]
     fn test_log_rotate() {
+        use crate::catalog::tests::table2;
         // 10000 rows, 200 bytes each row, 20M log file size.
         // log file is 5MB, so it will rotate at least 4 times.
         // Due to alignment of direct IO, the write amplification might
@@ -699,23 +712,12 @@ mod tests {
         const COUNT: usize = 10000;
         smol::block_on(async {
             let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-            let catalog = Catalog::empty_static();
+            let catalog = Catalog::empty_static(buf_pool).await;
             let trx_sys = TrxSysConfig::default()
                 .log_partitions(1)
-                .log_file_max_size(1024 * 1024 * 5)
+                .log_file_max_size(1024u64 * 1024 * 5)
                 .build_static(buf_pool, catalog);
-            let table_id = catalog
-                .create_table(
-                    buf_pool,
-                    TableSchema::new(
-                        vec![
-                            ValKind::I32.nullable(false),
-                            ValKind::VarByte.nullable(false),
-                        ],
-                        vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
-                    ),
-                )
-                .await;
+            let table_id = table2(buf_pool, trx_sys, catalog).await;
             let table = catalog.get_table(table_id).unwrap();
 
             let mut session = Session::new();

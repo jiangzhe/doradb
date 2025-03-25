@@ -36,7 +36,10 @@ impl<'a> ComQuery<'a> {
 impl_from_ref!(ComQuery: ; query);
 
 impl<'a> NewMySer for ComQuery<'a> {
-    type Ser<'s> = MySerPackets<'s, 2> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 2>
+    where
+        Self: 's;
 
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {

@@ -145,7 +145,10 @@ impl<'a> ComFieldList<'a> {
 }
 
 impl<'a> NewMySer for ComFieldList<'a> {
-    type Ser<'s> = MySerPackets<'s, 3> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 3>
+    where
+        Self: 's;
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
         MySerPackets::new(

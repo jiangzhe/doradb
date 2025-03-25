@@ -1,6 +1,6 @@
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::PageID;
-use crate::catalog::TableSchema;
+use crate::catalog::TableMetadata;
 use crate::notify::Notify;
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
@@ -66,7 +66,7 @@ impl<'a> RowReadAccess<'a> {
     #[inline]
     pub fn read_row_latest(
         &self,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         user_read_set: &[usize],
         key: &SelectKey,
     ) -> ReadRow {
@@ -86,7 +86,7 @@ impl<'a> RowReadAccess<'a> {
     pub fn read_row_mvcc(
         &self,
         trx: &ActiveTrx,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         user_read_set: &[usize],
         key: &SelectKey,
     ) -> ReadRow {
@@ -112,12 +112,12 @@ impl<'a> RowReadAccess<'a> {
                 // Prepare visitor of version chain.
                 let mut next = &undo_head.next;
                 let read_set: BTreeSet<usize> = user_read_set.iter().cloned().collect();
-                let index_schema = &schema.indexes[key.index_no];
-                let user_key_idx_map: HashMap<usize, usize> = index_schema
-                    .keys
+                let index_spec = &schema.index_specs[key.index_no];
+                let user_key_idx_map: HashMap<usize, usize> = index_spec
+                    .index_cols
                     .iter()
                     .enumerate()
-                    .map(|(key_pos, key)| (key.user_col_idx as usize, key_pos))
+                    .map(|(key_pos, key)| (key.col_no as usize, key_pos))
                     .collect();
                 let read_set_contains_key = user_key_idx_map
                     .keys()
@@ -222,7 +222,7 @@ impl<'a> RowReadAccess<'a> {
     ///
     /// This method is used by purge threads to correctly remove unnecessary index entry.
     #[inline]
-    pub fn any_version_matches_key(&self, schema: &TableSchema, key: &SelectKey) -> bool {
+    pub fn any_version_matches_key(&self, schema: &TableMetadata, key: &SelectKey) -> bool {
         // Check page data first.
         let row = self.row();
         let deleted = row.is_deleted();
@@ -238,11 +238,11 @@ impl<'a> RowReadAccess<'a> {
                 let mut entry = undo_head.next.main.entry.as_ref();
                 let vals = row.clone_index_vals(schema, key.index_no);
                 let mvcc_key = SelectKey::new(key.index_no, vals);
-                let mapping: HashMap<usize, usize> = schema.indexes[key.index_no]
-                    .keys
+                let mapping: HashMap<usize, usize> = schema.index_specs[key.index_no]
+                    .index_cols
                     .iter()
                     .enumerate()
-                    .map(|(key_no, key)| (key.user_col_idx as usize, key_no))
+                    .map(|(key_no, key)| (key.col_no as usize, key_no))
                     .collect();
                 let mut ver = KeyVersion {
                     deleted,
@@ -319,7 +319,7 @@ impl RowVersion {
     #[inline]
     fn get_visible_vals(
         mut self,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         row: Row<'_>,
         search_key: &SelectKey,
     ) -> ReadRow {
@@ -335,9 +335,9 @@ impl RowVersion {
             }
         } else {
             // compare key using read set and latest row page
-            let index_schema = &schema.indexes[search_key.index_no];
+            let index_spec = &schema.index_specs[search_key.index_no];
             let key_different = search_key.vals.iter().enumerate().any(|(pos, search_val)| {
-                let user_col_idx = index_schema.keys[pos].user_col_idx as usize;
+                let user_col_idx = index_spec.index_cols[pos].col_no as usize;
                 if let Some(undo_val) = self.undo_vals.get(&user_col_idx) {
                     search_val != undo_val
                 } else {
@@ -424,7 +424,7 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn update_row(&self, schema: &TableSchema, user_cols: &[UpdateCol]) -> UpdateRow {
+    pub fn update_row(&self, schema: &TableMetadata, user_cols: &[UpdateCol]) -> UpdateRow {
         let var_len = self.row().var_len_for_update(user_cols);
         match self.page.request_free_space(var_len) {
             None => {
@@ -472,7 +472,7 @@ impl<'a> RowWriteAccess<'a> {
     pub fn lock_undo(
         &mut self,
         stmt: &mut Statement,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         table_id: TableID,
         page_id: PageID,
         row_id: RowID,
@@ -589,7 +589,7 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub fn find_old_version_for_unique_key(
         &self,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         key: &SelectKey,
         trx: &ActiveTrx,
     ) -> FindOldVersion {

@@ -4,6 +4,7 @@ use doradb_datatype::konst::{ValidF32, ValidF64};
 use doradb_datatype::memcmp::{
     attach_null, MemCmpFormat, NullableMemCmpFormat, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN,
 };
+use doradb_datatype::PreciseType;
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
 use std::alloc::{alloc, dealloc, Layout as AllocLayout};
@@ -138,6 +139,34 @@ impl From<u8> for ValKind {
     #[inline]
     fn from(value: u8) -> Self {
         unsafe { mem::transmute(value) }
+    }
+}
+
+impl From<PreciseType> for ValKind {
+    #[inline]
+    fn from(value: PreciseType) -> Self {
+        match value {
+            PreciseType::Int(1, false) => ValKind::U8,
+            PreciseType::Int(1, true) => ValKind::I8,
+            PreciseType::Int(2, false) => ValKind::U16,
+            PreciseType::Int(2, true) => ValKind::I16,
+            PreciseType::Int(4, false) => ValKind::U32,
+            PreciseType::Int(4, true) => ValKind::I32,
+            PreciseType::Int(8, false) => ValKind::U64,
+            PreciseType::Int(8, true) => ValKind::I64,
+            PreciseType::Int(_, _) => unreachable!(),
+            PreciseType::Float(4) => ValKind::F32,
+            PreciseType::Float(8) => ValKind::F64,
+            PreciseType::Bool => ValKind::U8,
+            PreciseType::Decimal(_, _)
+            | PreciseType::Date
+            | PreciseType::Time(..)
+            | PreciseType::Datetime(..)
+            | PreciseType::Interval => todo!(),
+            PreciseType::Char(_, _) | PreciseType::Varchar(_, _) => ValKind::VarByte,
+            PreciseType::Compound => todo!(),
+            _ => todo!(),
+        }
     }
 }
 
@@ -1384,84 +1413,83 @@ mod tests {
     #[test]
     fn test_val_serde() {
         // serialize and deserialize null
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let val = Val::Null;
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
         assert!(buf == b"\x00");
 
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::Null);
 
         // serialize and deserialize u8
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let val = Val::from(42u8);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
         assert!(buf == b"\x01\x2a");
 
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(42u8));
 
         // serialize and deserialize u16
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let val = Val::from(1200u16);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
         assert!(buf == b"\x02\xb0\x04");
 
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(1200u16));
 
         // serialize and deserialize u32
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let val = Val::from(0xdefcab12u32);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
         assert!(buf == b"\x03\x12\xab\xfc\xde");
 
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(0xdefcab12u32));
 
         // serialize and deserialize u64
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let val = Val::from(0x1234567890abcdefu64);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
         assert!(buf == b"\x04\xef\xcd\xab\x90\x78\x56\x34\x12");
 
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(0x1234567890abcdefu64));
 
         // serialize and deserialize bytes
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let val = Val::from(&b"hello"[..]);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
         assert!(buf == b"\x05\x05\x00\x68\x65\x6c\x6c\x6f");
 
-        let ctx = &mut SerdeCtx;
+        let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(&b"hello"[..]));
     }
 
     #[test]
     fn test_valtype_serde() {
-        let ctx = &SerdeCtx;
-        let mut ctx_deser = SerdeCtx;
+        let mut ctx = SerdeCtx::default();
 
         // 测试用例1：非空的固定长度类型
         let val_type = ValType {
             kind: ValKind::I32,
             nullable: false,
         };
-        let mut buf = vec![0; val_type.ser_len(ctx)];
-        val_type.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val_type.ser_len(&ctx)];
+        val_type.ser(&ctx, &mut buf, 0);
 
         // 验证序列化结果
         assert_eq!(buf.len(), 2);
@@ -1469,7 +1497,7 @@ mod tests {
         assert_eq!(buf[1], 0); // false
 
         // 验证反序列化结果
-        let (_, deserialized) = ValType::deser(&mut ctx_deser, &buf, 0).unwrap();
+        let (_, deserialized) = ValType::deser(&mut ctx, &buf, 0).unwrap();
         assert_eq!(deserialized.kind, ValKind::I32);
         assert_eq!(deserialized.nullable, false);
 
@@ -1478,8 +1506,8 @@ mod tests {
             kind: ValKind::VarByte,
             nullable: true,
         };
-        let mut buf = vec![0; val_type.ser_len(ctx)];
-        val_type.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val_type.ser_len(&ctx)];
+        val_type.ser(&ctx, &mut buf, 0);
 
         // 验证序列化结果
         assert_eq!(buf.len(), 2);
@@ -1487,7 +1515,7 @@ mod tests {
         assert_eq!(buf[1], 1); // true
 
         // 验证反序列化结果
-        let (_, deserialized) = ValType::deser(&mut ctx_deser, &buf, 0).unwrap();
+        let (_, deserialized) = ValType::deser(&mut ctx, &buf, 0).unwrap();
         assert_eq!(deserialized.kind, ValKind::VarByte);
         assert_eq!(deserialized.nullable, true);
 
@@ -1511,10 +1539,10 @@ mod tests {
                 kind,
                 nullable: true,
             };
-            let mut buf = vec![0; val_type.ser_len(ctx)];
-            val_type.ser(ctx, &mut buf, 0);
+            let mut buf = vec![0; val_type.ser_len(&ctx)];
+            val_type.ser(&ctx, &mut buf, 0);
 
-            let (_, deserialized) = ValType::deser(&mut ctx_deser, &buf, 0).unwrap();
+            let (_, deserialized) = ValType::deser(&mut ctx, &buf, 0).unwrap();
             assert_eq!(deserialized.kind, kind);
             assert_eq!(deserialized.nullable, true);
         }
@@ -1524,15 +1552,15 @@ mod tests {
             kind: ValKind::I64,
             nullable: true,
         };
-        let mut buf = vec![0; 4 + val_type.ser_len(ctx)]; // 添加4字节前缀
-        val_type.ser(ctx, &mut buf, 4); // 从位置4开始序列化
+        let mut buf = vec![0; 4 + val_type.ser_len(&ctx)]; // 添加4字节前缀
+        val_type.ser(&ctx, &mut buf, 4); // 从位置4开始序列化
 
         // 验证序列化结果
         assert_eq!(buf[4], ValKind::I64 as u8);
         assert_eq!(buf[5], 1); // true
 
         // 验证反序列化结果
-        let (next_pos, deserialized) = ValType::deser(&mut ctx_deser, &buf, 4).unwrap();
+        let (next_pos, deserialized) = ValType::deser(&mut ctx, &buf, 4).unwrap();
         assert_eq!(next_pos, 6); // 应该前进2个字节
         assert_eq!(deserialized.kind, ValKind::I64);
         assert_eq!(deserialized.nullable, true);

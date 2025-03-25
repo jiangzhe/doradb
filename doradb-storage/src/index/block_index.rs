@@ -2,7 +2,7 @@ use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
 use crate::buffer::BufferPool;
-use crate::catalog::TableSchema;
+use crate::catalog::TableMetadata;
 use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
@@ -389,7 +389,7 @@ pub struct BlockIndex<P: BufferPool> {
 impl<P: BufferPool> BlockIndex<P> {
     /// Create a new block index backed by buffer pool.
     #[inline]
-    pub async fn new(buf_pool: &'static P) -> Result<Self> {
+    pub async fn new(buf_pool: &'static P) -> Self {
         let mut g: PageExclusiveGuard<BlockNode> = buf_pool.allocate_page().await;
         let page_id = g.page_id();
         let page = g.page_mut();
@@ -397,11 +397,11 @@ impl<P: BufferPool> BlockIndex<P> {
         page.header.count = 0;
         page.header.start_row_id = 0;
         page.header.end_row_id = INVALID_ROW_ID;
-        Ok(BlockIndex {
+        BlockIndex {
             root: page_id,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
             _marker: PhantomData,
-        })
+        }
     }
 
     /// Get row page for insertion.
@@ -411,7 +411,7 @@ impl<P: BufferPool> BlockIndex<P> {
         &self,
         buf_pool: &'static P,
         count: usize,
-        schema: &TableSchema,
+        schema: &TableMetadata,
     ) -> PageSharedGuard<RowPage> {
         match self.get_insert_page_from_free_list(buf_pool).await {
             Ok(free_page) => return free_page,
@@ -928,26 +928,31 @@ struct BranchLookup {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
-    use crate::catalog::{IndexKey, IndexSchema};
     use crate::lifetime::StaticLifetime;
-    use crate::value::ValKind;
+    use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use doradb_datatype::PreciseType;
+    use semistr::SemiStr;
 
     #[test]
     fn test_block_index_free_list() {
         smol::block_on(async {
             let buf_pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
             {
-                let schema = TableSchema::new(
-                    vec![ValKind::I32.nullable(false)],
+                let metadata = TableMetadata::new(
+                    vec![ColumnSpec {
+                        column_name: SemiStr::new("id"),
+                        column_type: PreciseType::Int(4, false),
+                        column_attributes: ColumnAttributes::empty(),
+                    }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
-                let p1 = blk_idx.get_insert_page(buf_pool, 100, &schema).await;
+                let blk_idx = BlockIndex::new(buf_pool).await;
+                let p1 = blk_idx.get_insert_page(buf_pool, 100, &metadata).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.free_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
-                let p2 = blk_idx.get_insert_page(buf_pool, 100, &schema).await;
+                let p2 = blk_idx.get_insert_page(buf_pool, 100, &metadata).await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
@@ -962,17 +967,21 @@ mod tests {
         smol::block_on(async {
             let buf_pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
             {
-                let schema = TableSchema::new(
-                    vec![ValKind::I32.nullable(false)],
+                let metadata = TableMetadata::new(
+                    vec![ColumnSpec {
+                        column_name: SemiStr::new("id"),
+                        column_type: PreciseType::Int(4, false),
+                        column_attributes: ColumnAttributes::empty(),
+                    }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
-                let p1 = blk_idx.get_insert_page(buf_pool, 100, &schema).await;
+                let blk_idx = BlockIndex::new(buf_pool).await;
+                let p1 = blk_idx.get_insert_page(buf_pool, 100, &metadata).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.free_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
-                let p2 = blk_idx.get_insert_page(buf_pool, 100, &schema).await;
+                let p2 = blk_idx.get_insert_page(buf_pool, 100, &metadata).await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
@@ -989,13 +998,17 @@ mod tests {
             // allocate 1GB buffer pool is enough: 10240 pages ~= 640MB
             let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024 * 1024).unwrap();
             {
-                let schema = TableSchema::new(
-                    vec![ValKind::I32.nullable(false)],
+                let metadata = TableMetadata::new(
+                    vec![ColumnSpec {
+                        column_name: SemiStr::new("id"),
+                        column_type: PreciseType::Int(4, false),
+                        column_attributes: ColumnAttributes::empty(),
+                    }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
+                let blk_idx = BlockIndex::new(buf_pool).await;
                 for _ in 0..row_pages {
-                    let _ = blk_idx.get_insert_page(buf_pool, 100, &schema).await;
+                    let _ = blk_idx.get_insert_page(buf_pool, 100, &metadata).await;
                 }
                 let mut count = 0usize;
                 let mut cursor = blk_idx.cursor(buf_pool).seek(0).await;
@@ -1035,8 +1048,8 @@ mod tests {
         })
     }
 
-    fn first_i32_unique_index() -> IndexSchema {
-        IndexSchema::new(vec![IndexKey::new(0)], true)
+    fn first_i32_unique_index() -> IndexSpec {
+        IndexSpec::new("idx_id", vec![IndexKey::new(0)], IndexAttributes::UK)
     }
 
     #[test]
@@ -1046,14 +1059,18 @@ mod tests {
             let rows_per_page = 100usize;
             let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024 * 1024).unwrap();
             {
-                let schema = TableSchema::new(
-                    vec![ValKind::I32.nullable(false)],
+                let metadata = TableMetadata::new(
+                    vec![ColumnSpec {
+                        column_name: SemiStr::new("id"),
+                        column_type: PreciseType::Int(4, false),
+                        column_attributes: ColumnAttributes::empty(),
+                    }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
+                let blk_idx = BlockIndex::new(buf_pool).await;
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(buf_pool, rows_per_page, &schema)
+                        .get_insert_page(buf_pool, rows_per_page, &metadata)
                         .await;
                 }
                 {

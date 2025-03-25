@@ -868,7 +868,7 @@ impl<'c, C: Catalog> LgcBuilder<'c, C> {
                         return Err(Error::SchemaNotExists(schema_name.to_string()));
                     };
                     let table_id =
-                        if let Some(t) = self.catalog.find_table_by_name(&schema_id, &tbl_name) {
+                        if let Some(t) = self.catalog.find_table_by_name(schema_id, &tbl_name) {
                             t.id
                         } else {
                             return Err(Error::TableNotExists(format!(
@@ -887,7 +887,7 @@ impl<'c, C: Catalog> LgcBuilder<'c, C> {
                     self.qs.copy_query(&query_id)?
                 } else if let Some(t) = self
                     .catalog
-                    .find_table_by_name(&self.default_schema_id, &tbl_name)
+                    .find_table_by_name(self.default_schema_id, &tbl_name)
                 {
                     self.table_to_subquery(
                         t.schema_id,
@@ -954,7 +954,7 @@ impl<'c, C: Catalog> LgcBuilder<'c, C> {
         table_name: SemiStr,
         colgen: &mut ColGen,
     ) -> Result<QueryID> {
-        let all_cols = self.catalog.all_columns_in_table(&table_id);
+        let all_cols = self.catalog.all_columns_in_table(table_id);
         let mut proj_cols = Vec::with_capacity(all_cols.len());
         // placeholder for table query.
         let (qry_id, subquery) = self.qs.insert_empty();

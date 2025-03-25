@@ -132,7 +132,10 @@ impl ColumnDefinition {
 }
 
 impl NewMySer for ColumnDefinition {
-    type Ser<'s> = MySerPackets<'s, 8> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 8>
+    where
+        Self: 's;
 
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {

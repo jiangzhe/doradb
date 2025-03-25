@@ -1,7 +1,7 @@
-use crate::catalog::IndexSchema;
 use crate::index::smart_key::SmartKey;
 use crate::row::RowID;
 use crate::value::{Val, ValKind, ValType};
+use doradb_catalog::IndexSpec;
 use doradb_datatype::konst::{ValidF32, ValidF64};
 use either::Either;
 use parking_lot::RwLock;
@@ -21,49 +21,74 @@ pub struct SecondaryIndex {
 
 impl SecondaryIndex {
     #[inline]
-    pub fn new(index_no: usize, index_schema: &IndexSchema, user_col_types: &[ValType]) -> Self {
-        debug_assert!(!index_schema.keys.is_empty());
-        if index_schema.unique {
+    pub fn new<F: Fn(usize) -> ValType>(
+        index_no: usize,
+        index_spec: &IndexSpec,
+        ty_infer: F,
+    ) -> Self {
+        debug_assert!(!index_spec.index_cols.is_empty());
+        if index_spec.unique() {
             // create unique index
-            let kind = match &index_schema.keys[..] {
+            let kind = match &index_spec.index_cols[..] {
                 [] => unreachable!(),
                 [key] => {
                     // single-key index
-                    let key_ty = user_col_types[key.user_col_idx as usize];
-                    match key_ty.kind {
-                        ValKind::I8 => IndexKind::unique(PartitionSingleKeyIndex::<i8>::empty()),
-                        ValKind::U8 => IndexKind::unique(PartitionSingleKeyIndex::<u8>::empty()),
-                        ValKind::I16 => IndexKind::unique(PartitionSingleKeyIndex::<i16>::empty()),
-                        ValKind::U16 => IndexKind::unique(PartitionSingleKeyIndex::<u16>::empty()),
-                        ValKind::I32 => IndexKind::unique(PartitionSingleKeyIndex::<i32>::empty()),
-                        ValKind::U32 => IndexKind::unique(PartitionSingleKeyIndex::<u32>::empty()),
-                        ValKind::I64 => IndexKind::unique(PartitionSingleKeyIndex::<i64>::empty()),
-                        ValKind::U64 => IndexKind::unique(PartitionSingleKeyIndex::<u64>::empty()),
-                        ValKind::F32 => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<ValidF32>::empty())
+                    let key_ty = ty_infer(key.col_no as usize);
+                    match (key_ty.kind, key_ty.nullable) {
+                        (ValKind::I8, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<i8, false>::empty())
                         }
-                        ValKind::F64 => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<ValidF64>::empty())
+                        (ValKind::U8, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<u8, false>::empty())
                         }
-                        ValKind::VarByte => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<SmartKey>::empty())
+                        (ValKind::I16, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<i16, false>::empty())
                         }
+                        (ValKind::U16, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<u16, false>::empty())
+                        }
+                        (ValKind::I32, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<i32, false>::empty())
+                        }
+                        (ValKind::U32, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<u32, false>::empty())
+                        }
+                        (ValKind::I64, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<i64, false>::empty())
+                        }
+                        (ValKind::U64, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<u64, false>::empty())
+                        }
+                        (ValKind::F32, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<ValidF32, false>::empty())
+                        }
+                        (ValKind::F64, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<ValidF64, false>::empty())
+                        }
+                        (ValKind::VarByte, false) => {
+                            IndexKind::unique(PartitionSingleKeyIndex::<SmartKey, false>::empty())
+                        }
+                        _ => todo!("nullable index not supported"),
                     }
                 }
                 keys => {
                     // multi-key index
                     let types: Vec<_> = keys
                         .iter()
-                        .map(|key| user_col_types[key.user_col_idx as usize])
+                        .map(|key| ty_infer(key.col_no as usize))
                         .collect();
                     let encoder = multi_key_encoder(types);
                     IndexKind::unique(PartitionMultiKeyIndex::empty(encoder))
                 }
             };
-            return SecondaryIndex { index_no, kind };
+            SecondaryIndex { index_no, kind }
+        } else {
+            // create non-unique index
+            SecondaryIndex {
+                index_no,
+                kind: IndexKind::non_unique(PartitionNonUniqueIndex {}),
+            }
         }
-        // create non-unique index
-        todo!()
     }
 
     #[inline]
@@ -98,6 +123,11 @@ impl IndexKind {
     #[inline]
     pub fn unique<T: UniqueIndex>(index: T) -> Self {
         IndexKind::Unique(Arc::new(index))
+    }
+
+    #[inline]
+    pub fn non_unique<T: NonUniqueIndex>(index: T) -> Self {
+        IndexKind::NonUnique(Arc::new(index))
     }
 }
 
@@ -262,9 +292,11 @@ impl VarLenEncoder {
 pub const INDEX_PARTITIONS: usize = 64;
 
 // Simple partitioned index implementation backed by BTreeMap in standard library.
-pub struct PartitionSingleKeyIndex<T>([RwLock<BTreeMap<T, RowID>>; INDEX_PARTITIONS]);
+pub struct PartitionSingleKeyIndex<T, const NULLABLE: bool>(
+    [RwLock<BTreeMap<T, RowID>>; INDEX_PARTITIONS],
+);
 
-impl<T: Hash> PartitionSingleKeyIndex<T> {
+impl<T: Hash> PartitionSingleKeyIndex<T, false> {
     #[inline]
     pub fn empty() -> Self {
         let mut init: MaybeUninit<[RwLock<BTreeMap<T, RowID>>; INDEX_PARTITIONS]> =
@@ -288,7 +320,7 @@ impl<T: Hash> PartitionSingleKeyIndex<T> {
 }
 
 impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
-    for PartitionSingleKeyIndex<T>
+    for PartitionSingleKeyIndex<T, false>
 {
     #[inline]
     fn lookup(&self, key: &[Val]) -> Option<RowID> {
@@ -367,7 +399,7 @@ impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
 
 pub struct PartitionMultiKeyIndex {
     encoder: Either<FixLenEncoder, VarLenEncoder>,
-    index: PartitionSingleKeyIndex<SmartKey>,
+    index: PartitionSingleKeyIndex<SmartKey, false>,
 }
 
 impl PartitionMultiKeyIndex {
@@ -425,5 +457,29 @@ impl UniqueIndex for PartitionMultiKeyIndex {
     #[inline]
     fn scan_values(&self, values: &mut Vec<RowID>) {
         self.index.scan_values(values);
+    }
+}
+
+pub struct PartitionNonUniqueIndex {}
+
+impl NonUniqueIndex for PartitionNonUniqueIndex {
+    #[inline]
+    fn lookup(&self, _key: &[Val], _res: &mut Vec<RowID>) {
+        todo!()
+    }
+
+    #[inline]
+    fn insert(&self, _key: &[Val], _row_id: RowID) {
+        todo!()
+    }
+
+    #[inline]
+    fn delete(&self, _key: &[Val], _row_id: RowID) -> bool {
+        todo!()
+    }
+
+    #[inline]
+    fn update(&self, _key: &[Val], _old_row_id: RowID, _new_row_id: RowID) -> bool {
+        todo!()
     }
 }

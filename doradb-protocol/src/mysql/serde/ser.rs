@@ -46,7 +46,10 @@ pub trait NewMySer {
 }
 
 impl NewMySer for [u8] {
-    type Ser<'s> = MySerPackets<'s, 1> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 1>
+    where
+        Self: 's;
 
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
