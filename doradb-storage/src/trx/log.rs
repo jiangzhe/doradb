@@ -15,6 +15,7 @@ use crossbeam_utils::CachePadded;
 use flume::Sender;
 // use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::latch::{Mutex, MutexGuard};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
 use std::os::fd::AsRawFd;
@@ -280,10 +281,14 @@ pub struct LogPartitionStats {
     pub purge_index_count: AtomicUsize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LogSync {
+    #[default]
+    #[serde(rename = "none")]
     None,
+    #[serde(rename = "fsync")]
     Fsync,
+    #[serde(rename = "fdatasync")]
     Fdatasync,
 }
 

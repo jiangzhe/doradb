@@ -31,7 +31,10 @@ pub struct InitialHandshake<'a> {
 }
 
 impl<'a> NewMySer for InitialHandshake<'a> {
-    type Ser<'s> = MySerPackets<'s, 8> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 8>
+    where
+        Self: 's;
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
         let mut elem4 = [0u8; 9]; // 1B filler + 2B cap flags lower + 1B charset + 2B status flags + 2B cap flags upper + 1B auth plugin data len
@@ -188,7 +191,10 @@ pub struct HandshakeCliResp41<'a> {
 }
 
 impl<'a> NewMySer for HandshakeCliResp41<'a> {
-    type Ser<'s> = MySerPackets<'s, 7> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 7>
+    where
+        Self: 's;
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
         // combine cap_flags, max_packet_size and charset
@@ -353,7 +359,10 @@ pub struct AuthSwitchRequest<'a> {
 }
 
 impl<'a> NewMySer for AuthSwitchRequest<'a> {
-    type Ser<'s> = MySerPackets<'s, 3> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 3>
+    where
+        Self: 's;
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
         assert_eq!(self.header, 0xfe);
@@ -398,7 +407,10 @@ pub struct AuthMoreData<'a> {
 }
 
 impl<'a> NewMySer for AuthMoreData<'a> {
-    type Ser<'s> = MySerPackets<'s, 2> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 2>
+    where
+        Self: 's;
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {
         assert_eq!(self.header, 0x01);

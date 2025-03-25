@@ -4,16 +4,22 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
+use doradb_catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableSpec,
+};
+use doradb_datatype::{Collation, PreciseType};
 use doradb_storage::buffer::BufferPool;
 use doradb_storage::buffer::FixedBufferPool;
-use doradb_storage::catalog::{Catalog, IndexKey, IndexSchema, TableSchema};
+use doradb_storage::catalog::Catalog;
 use doradb_storage::lifetime::StaticLifetime;
 use doradb_storage::session::Session;
+use doradb_storage::stmt::Statement;
 use doradb_storage::table::TableID;
 use doradb_storage::trx::log::LogSync;
 use doradb_storage::trx::sys::{TransactionSystem, TrxSysConfig};
-use doradb_storage::value::{Val, ValKind};
+use doradb_storage::value::Val;
 use easy_parallel::Parallel;
+use semistr::SemiStr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,36 +32,24 @@ use tikv_jemallocator::Jemalloc;
 static ALLOCATOR: Jemalloc = Jemalloc;
 
 fn main() {
-    let args = Args::parse();
-
-    let buf_pool = FixedBufferPool::with_capacity_static(args.buffer_pool_size).unwrap();
-    println!("buffer pool size is {}", buf_pool.size());
-    let catalog = Catalog::empty_static();
-    let trx_sys = TrxSysConfig::default()
-        .log_file_prefix(args.log_file_prefix.to_string())
-        .log_partitions(args.log_partitions)
-        .io_depth_per_log(args.io_depth_per_log)
-        .log_file_max_size(args.log_file_max_size)
-        .log_sync(args.log_sync)
-        .max_io_size(args.max_io_size)
-        .purge_threads(args.purge_threads)
-        .build_static(buf_pool, catalog);
-    // create empty table
     smol::block_on(async {
-        let table_id = catalog
-            .create_table(
-                buf_pool,
-                TableSchema::new(
-                    vec![
-                        ValKind::I32.nullable(false),
-                        ValKind::I32.nullable(false),
-                        ValKind::VarByte.nullable(false),
-                        ValKind::VarByte.nullable(false),
-                    ],
-                    vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
-                ),
-            )
-            .await;
+        let args = Args::parse();
+
+        let buf_pool = FixedBufferPool::with_capacity_static(args.buffer_pool_size).unwrap();
+        println!("buffer pool size is {}", buf_pool.size());
+        let catalog = Catalog::empty_static(buf_pool).await;
+        let trx_sys = TrxSysConfig::default()
+            .log_file_prefix(args.log_file_prefix.to_string())
+            .log_partitions(args.log_partitions)
+            .io_depth_per_log(args.io_depth_per_log)
+            .log_file_max_size(args.log_file_max_size)
+            .log_sync(args.log_sync)
+            .max_io_size(args.max_io_size)
+            .purge_threads(args.purge_threads)
+            .build_static(buf_pool, catalog);
+        // create empty table
+
+        let table_id = sbtest(buf_pool, trx_sys, catalog).await;
         // start benchmark
         {
             let start = Instant::now();
@@ -253,4 +247,86 @@ struct Args {
 #[inline]
 fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
     Byte::parse_str(input, true).map(|b| b.as_u64() as usize)
+}
+
+#[inline]
+pub(crate) async fn db1<P: BufferPool>(
+    buf_pool: &'static P,
+    trx_sys: &'static TransactionSystem,
+    catalog: &Catalog<P>,
+) -> SchemaID {
+    let session = Session::new();
+    let trx = session.begin_trx(trx_sys);
+    let mut stmt = Statement::new(trx);
+
+    let schema_id = catalog
+        .create_schema(buf_pool, &mut stmt, "db1")
+        .await
+        .unwrap();
+
+    let trx = stmt.succeed();
+    let session = trx_sys.commit(trx, buf_pool, catalog).await.unwrap();
+    drop(session);
+    schema_id
+}
+
+/// Sbtest is target table of sysbench.
+#[inline]
+pub async fn sbtest<P: BufferPool>(
+    buf_pool: &'static P,
+    trx_sys: &'static TransactionSystem,
+    catalog: &Catalog<P>,
+) -> TableID {
+    let schema_id = db1(buf_pool, trx_sys, catalog).await;
+
+    let session = Session::new();
+    let trx = session.begin_trx(trx_sys);
+    let mut stmt = Statement::new(trx);
+
+    let table_id = catalog
+        .create_table(
+            buf_pool,
+            &mut stmt,
+            schema_id,
+            TableSpec {
+                table_name: SemiStr::new("sbtest"),
+                columns: vec![
+                    ColumnSpec {
+                        column_name: SemiStr::new("id"),
+                        column_type: PreciseType::Int(4, false),
+                        column_attributes: ColumnAttributes::INDEX,
+                    },
+                    ColumnSpec {
+                        column_name: SemiStr::new("k"),
+                        column_type: PreciseType::Int(4, false),
+                        column_attributes: ColumnAttributes::INDEX,
+                    },
+                    ColumnSpec {
+                        column_name: SemiStr::new("c"),
+                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                    ColumnSpec {
+                        column_name: SemiStr::new("pad"),
+                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                ],
+            },
+            vec![
+                IndexSpec::new("idx_sbtest_id", vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(
+                    "idx_sbtest_k",
+                    vec![IndexKey::new(1)],
+                    IndexAttributes::empty(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let trx = stmt.succeed();
+    let session = trx_sys.commit(trx, buf_pool, catalog).await.unwrap();
+    drop(session);
+    table_id
 }

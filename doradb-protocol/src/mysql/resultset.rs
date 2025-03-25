@@ -45,7 +45,10 @@ impl<'a> TryFrom<&'a [u8]> for TextRow<'a> {
 }
 
 impl<'a> NewMySer for TextRow<'a> {
-    type Ser<'s> = MySerPackets<'s, 1> where Self: 's;
+    type Ser<'s>
+        = MySerPackets<'s, 1>
+    where
+        Self: 's;
 
     #[inline]
     fn new_my_ser(&self, ctx: &SerdeCtx) -> Self::Ser<'_> {

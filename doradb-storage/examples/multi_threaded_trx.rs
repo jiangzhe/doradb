@@ -19,57 +19,58 @@ use std::time::Duration;
 use std::time::Instant;
 
 fn main() {
-    let args = Args::parse();
+    smol::block_on(async {
+        let args = Args::parse();
 
-    let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-    let catalog = Catalog::<FixedBufferPool>::empty_static();
-    let trx_sys = TrxSysConfig::default()
-        .log_file_prefix(args.log_file_prefix.to_string())
-        .log_partitions(args.log_partitions)
-        .io_depth_per_log(args.io_depth_per_log)
-        .log_file_max_size(args.log_file_max_size)
-        .log_sync(args.log_sync)
-        .max_io_size(args.max_io_size)
-        .build_static(buf_pool, catalog);
-    {
-        let start = Instant::now();
-        let wg = WaitGroup::new();
-        let stop = Arc::new(AtomicBool::new(false));
-        let ex = smol::Executor::new();
-        let (notify, shutdown) = flume::unbounded::<()>();
-        // start transaction sessions.
-        for _ in 0..args.sessions {
-            let wg = wg.clone();
-            let stop = Arc::clone(&stop);
-            ex.spawn(worker(buf_pool, catalog, trx_sys, stop, wg))
-                .detach();
-        }
-        // start system threads.
-        let _ = Parallel::new()
-            .each(0..args.threads, |_| {
-                smol::block_on(ex.run(shutdown.recv_async()))
-            })
-            .finish({
+        let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
+        let catalog = Catalog::empty_static(buf_pool).await;
+        let trx_sys = TrxSysConfig::default()
+            .log_file_prefix(args.log_file_prefix.to_string())
+            .log_partitions(args.log_partitions)
+            .io_depth_per_log(args.io_depth_per_log)
+            .log_file_max_size(args.log_file_max_size)
+            .log_sync(args.log_sync)
+            .max_io_size(args.max_io_size)
+            .build_static(buf_pool, catalog);
+        {
+            let start = Instant::now();
+            let wg = WaitGroup::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            let ex = smol::Executor::new();
+            let (notify, shutdown) = flume::unbounded::<()>();
+            // start transaction sessions.
+            for _ in 0..args.sessions {
+                let wg = wg.clone();
                 let stop = Arc::clone(&stop);
-                move || {
-                    std::thread::sleep(args.duration);
-                    stop.store(true, Ordering::SeqCst);
-                    wg.wait();
-                    drop(notify)
-                }
-            });
-        let dur = start.elapsed();
-        let stats = trx_sys.trx_sys_stats();
-        let total_trx_count = stats.trx_count;
-        let commit_count = stats.commit_count;
-        let log_bytes = stats.log_bytes;
-        let sync_count = stats.sync_count;
-        let sync_nanos = stats.sync_nanos;
-        let io_submit_count = stats.io_submit_count;
-        let io_submit_nanos = stats.io_submit_nanos;
-        let io_wait_count = stats.io_wait_count;
-        let io_wait_nanos = stats.io_wait_nanos;
-        println!(
+                ex.spawn(worker(buf_pool, catalog, trx_sys, stop, wg))
+                    .detach();
+            }
+            // start system threads.
+            let _ = Parallel::new()
+                .each(0..args.threads, |_| {
+                    smol::block_on(ex.run(shutdown.recv_async()))
+                })
+                .finish({
+                    let stop = Arc::clone(&stop);
+                    move || {
+                        std::thread::sleep(args.duration);
+                        stop.store(true, Ordering::SeqCst);
+                        wg.wait();
+                        drop(notify)
+                    }
+                });
+            let dur = start.elapsed();
+            let stats = trx_sys.trx_sys_stats();
+            let total_trx_count = stats.trx_count;
+            let commit_count = stats.commit_count;
+            let log_bytes = stats.log_bytes;
+            let sync_count = stats.sync_count;
+            let sync_nanos = stats.sync_nanos;
+            let io_submit_count = stats.io_submit_count;
+            let io_submit_nanos = stats.io_submit_nanos;
+            let io_wait_count = stats.io_wait_count;
+            let io_wait_nanos = stats.io_wait_nanos;
+            println!(
             "threads={},dur={},total_trx={},groups={},sync={},sync_dur={:.2}us,io_submit={},io_submit_dur={:.2}us,io_wait={},io_wait_dur={:.2}us,trx/grp={:.2},trx/s={:.0},log/s={:.2}MB",
             args.threads,
             dur.as_micros(),
@@ -85,12 +86,13 @@ fn main() {
             total_trx_count as f64 * 1_000_000_000f64 / dur.as_nanos() as f64,
             log_bytes as f64 / dur.as_micros() as f64,
         );
-    }
-    unsafe {
-        StaticLifetime::drop_static(trx_sys);
-        StaticLifetime::drop_static(catalog);
-        StaticLifetime::drop_static(buf_pool);
-    }
+        }
+        unsafe {
+            StaticLifetime::drop_static(trx_sys);
+            StaticLifetime::drop_static(catalog);
+            StaticLifetime::drop_static(buf_pool);
+        }
+    })
 }
 
 #[inline]

@@ -14,8 +14,10 @@ use crate::lifetime::StaticLifetime;
 use crate::notify::Signal;
 use crate::ptr::UnsafePtr;
 use crate::thread;
+use byte_unit::Byte;
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender, TryRecvError};
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::mem;
@@ -1191,15 +1193,16 @@ impl SingleFileIO {
 }
 
 const DEFAULT_FILE_PATH: &'static str = "buffer_pool.bin";
-const DEFAULT_MAX_FILE_SIZE: usize = 2 * 1024 * 1024 * 1024; // by default 2GB
-const DEFAULT_MAX_MEM_SIZE: usize = 1 * 1024 * 1024 * 1024; // by default 1GB
+const DEFAULT_MAX_FILE_SIZE: Byte = Byte::from_u64(2 * 1024 * 1024 * 1024); // by default 2GB
+const DEFAULT_MAX_MEM_SIZE: Byte = Byte::from_u64(1 * 1024 * 1024 * 1024); // by default 1GB
 const DEFAULT_MAX_IO_READS: usize = 64;
 const DEFAULT_MAX_IO_WRITES: usize = 64;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvictableBufferPoolConfig {
     file_path: String,
-    max_file_size: usize,
-    max_mem_size: usize,
+    max_file_size: Byte,
+    max_mem_size: Byte,
     max_io_reads: usize,
     max_io_writes: usize,
 }
@@ -1225,14 +1228,20 @@ impl EvictableBufferPoolConfig {
     }
 
     #[inline]
-    pub fn max_file_size(mut self, max_file_size: usize) -> Self {
-        self.max_file_size = max_file_size;
+    pub fn max_file_size<T>(mut self, max_file_size: T) -> Self
+    where
+        Byte: From<T>,
+    {
+        self.max_file_size = Byte::from(max_file_size);
         self
     }
 
     #[inline]
-    pub fn max_mem_size(mut self, max_mem_size: usize) -> Self {
-        self.max_mem_size = max_mem_size;
+    pub fn max_mem_size<T>(mut self, max_mem_size: T) -> Self
+    where
+        Byte: From<T>,
+    {
+        self.max_mem_size = Byte::from(max_mem_size);
         self
     }
 
@@ -1252,19 +1261,21 @@ impl EvictableBufferPoolConfig {
     #[inline]
     pub fn build_static(self) -> Result<&'static EvictableBufferPool> {
         // 1. Calculate memory usage.
-        let max_nbr = self.max_file_size / mem::size_of::<Page>();
+        let max_file_size = self.max_file_size.as_u64() as usize;
+        let max_mem_size = self.max_mem_size.as_u64() as usize;
+        let max_nbr = max_file_size / mem::size_of::<Page>();
         // We need to hold all frames in-memory, even if many pages
         // can not be loaded into memory at the same time.
         let frame_total_bytes = mem::size_of::<BufferFrame>() * (max_nbr + SAFETY_PAGES);
         assert!(
-            self.max_mem_size <= self.max_file_size,
+            max_mem_size <= max_file_size,
             "max mem size of buffer pool should be no more than max file size"
         );
         assert!(
-            self.max_mem_size > frame_total_bytes,
+            max_mem_size > frame_total_bytes,
             "max mem size of buffer pool can not hold all buffer frames"
         );
-        let max_nbr_in_mem = (self.max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
+        let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
         // We allocate a much larger memory area to support 1:1 file page mapping.
         // And buffer pool will control memory usage within limit.
         let page_total_bytes = mem::size_of::<Page>() * (max_nbr + SAFETY_PAGES);
@@ -1289,7 +1300,7 @@ impl EvictableBufferPoolConfig {
         let aio_reader = AIOManagerConfig::default()
             .max_events(self.max_io_reads)
             .build()?;
-        let file = aio_writer.create_sparse_file(&self.file_path, self.max_file_size)?;
+        let file = aio_writer.create_sparse_file(&self.file_path, max_file_size)?;
 
         // 4. Initialize frames.
         // NOTE: we need to initialize all frames, not only maximum number that can be held in memory.
@@ -1480,8 +1491,8 @@ mod tests {
     fn test_evict_buffer_pool_simple() {
         smol::block_on(async {
             let pool = EvictableBufferPoolConfig::default()
-                .max_mem_size(1024 * 1024 * 128)
-                .max_file_size(1024 * 1024 * 256)
+                .max_mem_size(1024u64 * 1024 * 128)
+                .max_file_size(1024u64 * 1024 * 256)
                 .file_path(String::from("buffer_pool.bin"))
                 .build_static()
                 .unwrap();
@@ -1511,8 +1522,8 @@ mod tests {
     #[test]
     fn test_evict_buffer_pool_full() {
         let pool: &EvictableBufferPool = EvictableBufferPoolConfig::default()
-            .max_mem_size(1024 * 1024)
-            .max_file_size(1024 * 1024 * 2)
+            .max_mem_size(1024u64 * 1024)
+            .max_file_size(1024u64 * 1024 * 2)
             .build_static()
             .unwrap();
 
@@ -1556,8 +1567,8 @@ mod tests {
     fn test_evict_buffer_pool_alloc() {
         // max pages 16k, max in-mem 1k
         let pool = EvictableBufferPoolConfig::default()
-            .max_mem_size(1024 * 1024 * 64)
-            .max_file_size(1024 * 1024 * 64 * 16)
+            .max_mem_size(1024u64 * 1024 * 64)
+            .max_file_size(1024u64 * 1024 * 64 * 16)
             .build_static()
             .unwrap();
 
@@ -1580,8 +1591,8 @@ mod tests {
         use rand::{prelude::SliceRandom, Rng};
         // max pages 16k, max in-mem 1k
         let pool = EvictableBufferPoolConfig::default()
-            .max_mem_size(1024 * 1024 * 64)
-            .max_file_size(1024 * 1024 * 64 * 16)
+            .max_mem_size(1024u64 * 1024 * 64)
+            .max_file_size(1024u64 * 1024 * 64 * 16)
             .build_static()
             .unwrap();
 

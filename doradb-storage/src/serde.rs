@@ -1,12 +1,25 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
+use doradb_catalog::{IndexKey, IndexOrder};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::mem;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Default)]
-pub struct SerdeCtx;
+pub struct SerdeCtx {
+    /// Whether to validate checksum when deserializing
+    /// an object when checksum is present.
+    validate_checksum: bool,
+}
 
 impl SerdeCtx {
+    /// Set whether to validate checksum.
+    #[inline]
+    pub fn validate_checksum(mut self, validate_checksum: bool) -> Self {
+        self.validate_checksum = validate_checksum;
+        self
+    }
+
     /// Serialize a u64 value to a byte slice.
     #[inline]
     pub fn ser_u64(&self, out: &mut [u8], idx: usize, val: u64) -> usize {
@@ -353,7 +366,8 @@ impl<K: Ord + Deser, V: Deser> Deser for BTreeMap<K, V> {
 /// The length is serialized as a u64 value.
 /// The data is serialized using the Ser trait.
 pub struct LenPrefixStruct<'a, T> {
-    data_len: u64,
+    data_len: u32,
+    checksum: AtomicU32,
     data: T,
     _marker: PhantomData<&'a T>,
 }
@@ -362,8 +376,11 @@ impl<'a, T: Ser<'a>> LenPrefixStruct<'a, T> {
     /// Create a new LenPrefixStruct.
     #[inline]
     pub fn new(data: T, ctx: &SerdeCtx) -> Self {
+        let data_len = data.ser_len(ctx);
+        assert!(data_len <= u32::MAX as usize);
         Self {
-            data_len: data.ser_len(ctx) as u64,
+            data_len: data_len as u32,
+            checksum: AtomicU32::new(0),
             data,
             _marker: PhantomData,
         }
@@ -387,7 +404,7 @@ impl<'a, T> LenPrefixStruct<'a, T> {
 impl<'a, T: Ser<'a>> Ser<'a> for LenPrefixStruct<'a, T> {
     #[inline]
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
-        mem::size_of::<u64>() + self.data_len as usize
+        mem::size_of::<u32>() + mem::size_of::<u32>() + self.data_len as usize
     }
 
     #[inline]
@@ -395,33 +412,84 @@ impl<'a, T: Ser<'a>> Ser<'a> for LenPrefixStruct<'a, T> {
         debug_assert!(self.data_len as usize == self.data.ser_len(ctx));
         debug_assert!(start_idx + self.ser_len(ctx) <= out.len());
         let mut idx = start_idx;
-        idx = ctx.ser_u64(out, idx, self.data_len);
-        self.data.ser(ctx, out, idx)
+        idx = ctx.ser_u32(out, idx, self.data_len);
+        // Leave space for checksum
+        let checksum_start_idx = idx;
+        let checksum_end_idx = idx + mem::size_of::<u32>();
+        idx = self.data.ser(ctx, out, checksum_end_idx);
+        // Calculate and store checksum
+        let checksum = crc32fast::hash(&out[checksum_end_idx..idx]);
+        self.checksum.store(checksum, Ordering::Relaxed);
+        let c_idx = ctx.ser_u32(out, checksum_start_idx, checksum);
+        debug_assert!(c_idx == checksum_end_idx);
+        idx
     }
 }
 
 impl<T: Deser> Deser for LenPrefixStruct<'_, T> {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, len) = ctx.deser_u64(input, start_idx)?;
-        let (idx, data) = T::deser(ctx, input, idx)?;
+        let (idx, len) = ctx.deser_u32(input, start_idx)?;
+        let (idx, checksum) = ctx.deser_u32(input, idx)?;
+        let (idx, data) = if ctx.validate_checksum {
+            let start_idx = idx;
+            let (idx, data) = T::deser(ctx, input, idx)?;
+            let calculated_checksum = crc32fast::hash(&input[start_idx..idx]);
+            if calculated_checksum != checksum {
+                return Err(Error::ChecksumMismatch);
+            }
+            (idx, data)
+        } else {
+            T::deser(ctx, input, idx)?
+        };
         Ok((
             idx,
             LenPrefixStruct {
-                data_len: len as u64,
+                data_len: len,
+                checksum: AtomicU32::new(checksum),
                 data,
                 _marker: PhantomData,
             },
         ))
     }
 }
+
+impl Ser<'_> for IndexKey {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u16>() + mem::size_of::<u8>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let mut idx = start_idx;
+        idx = ctx.ser_u16(out, idx, self.col_no);
+        ctx.ser_u8(out, idx, self.order as u8)
+    }
+}
+
+impl Deser for IndexKey {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, col_no) = ctx.deser_u16(input, start_idx)?;
+        let (idx, order) = ctx.deser_u8(input, idx)?;
+        Ok((
+            idx,
+            IndexKey {
+                col_no,
+                order: IndexOrder::from(order),
+            },
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_len_prefix_struct_serde() {
-        let mut ctx = SerdeCtx;
+        let mut ctx = SerdeCtx::default().validate_checksum(true);
         let len_prefix_struct = LenPrefixStruct::new(
             TestStruct {
                 a: 1,
@@ -445,11 +513,20 @@ mod tests {
                 d: 4
             }
         );
+
+        // overwrite checksum so that checksum mismatch
+        out[4..8].fill(0);
+        let res = LenPrefixStruct::<TestStruct>::deser(&mut ctx, &out, 0);
+        if let Err(Error::ChecksumMismatch) = res {
+            println!("expected checksum mismatch");
+        } else {
+            panic!("unexpected checksum match");
+        }
     }
 
     #[test]
     fn test_vec_serde() {
-        let mut ctx = SerdeCtx;
+        let mut ctx = SerdeCtx::default();
         let vec = vec![TestStruct {
             a: 1,
             b: 2,
@@ -473,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_btree_map_serde() {
-        let mut ctx = SerdeCtx;
+        let mut ctx = SerdeCtx::default();
         let map = BTreeMap::from([(
             1,
             TestStruct {

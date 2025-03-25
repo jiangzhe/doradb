@@ -1,13 +1,15 @@
 use clap::Parser;
+use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+use doradb_datatype::PreciseType;
 use doradb_storage::buffer::FixedBufferPool;
-use doradb_storage::catalog::{IndexKey, IndexSchema, TableSchema};
+use doradb_storage::catalog::TableMetadata;
 use doradb_storage::index::{BlockIndex, RowLocation};
 use doradb_storage::lifetime::StaticLifetime;
-use doradb_storage::value::ValKind;
 use parking_lot::RwLock;
 use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
 use perfcnt::{AbstractPerfCounter, PerfCounter};
 use rand::RngCore;
+use semistr::SemiStr;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,15 +22,23 @@ fn main() {
         let args = args.clone();
         let buf_pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
         {
-            let schema = TableSchema::new(
-                vec![ValKind::I64.nullable(false)],
-                vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
+            let metadata = TableMetadata::new(
+                vec![ColumnSpec {
+                    column_name: SemiStr::new("id"),
+                    column_type: PreciseType::Int(4, false),
+                    column_attributes: ColumnAttributes::INDEX,
+                }],
+                vec![IndexSpec::new(
+                    "idx_tb1_id",
+                    vec![IndexKey::new(0)],
+                    IndexAttributes::PK,
+                )],
             );
-            let blk_idx = BlockIndex::new(buf_pool).await.unwrap();
+            let blk_idx = BlockIndex::new(buf_pool).await;
             let blk_idx = Box::leak(Box::new(blk_idx));
 
             for _ in 0..args.pages {
-                let _ = blk_idx.get_insert_page(buf_pool, args.rows_per_page, &schema);
+                let _ = blk_idx.get_insert_page(buf_pool, args.rows_per_page, &metadata);
             }
             let mut perf_monitor = PerfMonitor::new();
             perf_monitor.start();

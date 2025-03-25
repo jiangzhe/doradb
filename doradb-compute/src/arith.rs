@@ -362,7 +362,7 @@ mod tests {
             .unwrap();
         assert!(!res.is_valid(5).unwrap());
         let res = res.codec.as_single().unwrap();
-        assert_eq!(2i64, res.view());
+        assert_eq!(2i64, res.view::<i64>());
         // single + array
         let res = add
             .binary_eval(PreciseType::i64(), &c1, &c2, Some(&sel))

@@ -47,6 +47,12 @@ pub enum Error {
     TransactionSystemShutdown,
     #[error("{0}")]
     AIOError(#[from] AIOError),
+    #[error("schema not found")]
+    SchemaNotFound,
+    #[error("schema already exists")]
+    SchemaAlreadyExists,
+    #[error("table already exists")]
+    TableAlreadyExists,
 }
 
 impl From<TryFromSliceError> for Error {

@@ -1,7 +1,7 @@
 pub mod ops;
 
 use crate::buffer::page::{BufferPage, PAGE_SIZE};
-use crate::catalog::TableSchema;
+use crate::catalog::TableMetadata;
 use crate::row::ops::{Delete, InsertRow, Select, SelectKey, Update, UpdateCol};
 use crate::value::*;
 use std::fmt;
@@ -62,22 +62,22 @@ pub struct RowPage {
 impl RowPage {
     /// Initialize row page.
     #[inline]
-    pub fn init(&mut self, start_row_id: u64, max_row_count: usize, schema: &TableSchema) {
+    pub fn init(&mut self, start_row_id: u64, max_row_count: usize, metadata: &TableMetadata) {
         debug_assert!(max_row_count <= 0xffff);
         self.header.start_row_id = start_row_id;
         self.header.max_row_count = max_row_count as u16;
         self.header
             .store_row_count_and_var_field_offset(0, PAGE_SIZE - mem::size_of::<RowPageHeader>());
-        self.header.col_count = schema.col_count() as u16;
+        self.header.col_count = metadata.col_count() as u16;
         // initialize offset fields.
         self.header.del_bitset_offset = 0; // always starts at data_ptr().
         self.header.null_bitset_list_offset =
             self.header.del_bitset_offset + del_bitset_len(max_row_count) as u16;
         self.header.col_offset_list_offset = self.header.null_bitset_list_offset
-            + null_bitset_list_len(max_row_count, schema.col_count()) as u16;
+            + null_bitset_list_len(max_row_count, metadata.col_count()) as u16;
         self.header.fix_field_offset =
-            self.header.col_offset_list_offset + col_offset_list_len(schema.col_count()) as u16;
-        self.init_col_offset_list_and_fix_field_end(schema, max_row_count as u16);
+            self.header.col_offset_list_offset + col_offset_list_len(metadata.col_count()) as u16;
+        self.init_col_offset_list_and_fix_field_end(metadata, max_row_count as u16);
         self.init_bitsets_and_row_ids();
         debug_assert!({
             (self.header.row_count_and_var_field_offset().0..self.header.max_row_count as usize)
@@ -89,7 +89,7 @@ impl RowPage {
     }
 
     #[inline]
-    fn init_col_offset_list_and_fix_field_end(&mut self, schema: &TableSchema, row_count: u16) {
+    fn init_col_offset_list_and_fix_field_end(&mut self, schema: &TableMetadata, row_count: u16) {
         debug_assert!(schema.col_count() >= 2); // at least RowID and one user column.
         debug_assert!(schema.layout(0) == Layout::Byte8); // first column must be RowID, with 8-byte layout.
         debug_assert!(self.header.col_offset_list_offset != 0);
@@ -208,7 +208,7 @@ impl RowPage {
 
     /// Insert a new row in page.
     #[inline]
-    pub fn insert(&self, schema: &TableSchema, user_cols: &[Val]) -> InsertRow {
+    pub fn insert(&self, schema: &TableMetadata, user_cols: &[Val]) -> InsertRow {
         debug_assert!(schema.col_count() == self.header.col_count as usize);
         // insert row does not include RowID, as RowID is auto-generated.
         debug_assert!(user_cols.len() + 1 == self.header.col_count as usize);
@@ -253,7 +253,7 @@ impl RowPage {
     #[inline]
     pub fn update(
         &mut self,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         row_id: RowID,
         user_cols: &[UpdateCol],
     ) -> Update {
@@ -819,17 +819,17 @@ pub trait RowRead {
 
     /// Clone single value with given column index.
     #[inline]
-    fn clone_user_val(&self, schema: &TableSchema, user_col_idx: usize) -> Val {
+    fn clone_user_val(&self, schema: &TableMetadata, user_col_idx: usize) -> Val {
         self.clone_val(schema, user_col_idx + 1)
     }
 
     /// Clone index values.
     #[inline]
-    fn clone_index_vals(&self, schema: &TableSchema, index_no: usize) -> Vec<Val> {
-        schema.indexes[index_no]
-            .keys
+    fn clone_index_vals(&self, schema: &TableMetadata, index_no: usize) -> Vec<Val> {
+        schema.index_specs[index_no]
+            .index_cols
             .iter()
-            .map(|key| self.clone_user_val(schema, key.user_col_idx as usize))
+            .map(|key| self.clone_user_val(schema, key.col_no as usize))
             .collect()
     }
 
@@ -837,7 +837,7 @@ pub trait RowRead {
     #[inline]
     fn clone_user_val_with_var_offset(
         &self,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         user_col_idx: usize,
     ) -> (Val, Option<u16>) {
         self.clone_val_with_var_offset(schema, user_col_idx + 1)
@@ -846,7 +846,7 @@ pub trait RowRead {
     /// Clone single value with given column index.
     /// NOTE: input column index includes RowID.
     #[inline]
-    fn clone_val(&self, schema: &TableSchema, col_idx: usize) -> Val {
+    fn clone_val(&self, schema: &TableMetadata, col_idx: usize) -> Val {
         if self.is_null(col_idx) {
             return Val::Null;
         }
@@ -877,7 +877,7 @@ pub trait RowRead {
     #[inline]
     fn clone_val_with_var_offset(
         &self,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         col_idx: usize,
     ) -> (Val, Option<u16>) {
         if self.is_null(col_idx) {
@@ -912,7 +912,7 @@ pub trait RowRead {
 
     /// Clone all values.
     #[inline]
-    fn clone_vals(&self, schema: &TableSchema, include_row_id: bool) -> Vec<Val> {
+    fn clone_vals(&self, schema: &TableMetadata, include_row_id: bool) -> Vec<Val> {
         let skip = if include_row_id { 0 } else { 1 };
         let mut vals = Vec::with_capacity(schema.col_count() - skip);
         for (col_idx, _) in schema.types().iter().enumerate().skip(skip) {
@@ -925,7 +925,7 @@ pub trait RowRead {
     #[inline]
     fn clone_vals_with_var_offsets(
         &self,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         include_row_id: bool,
     ) -> Vec<(Val, Option<u16>)> {
         let skip = if include_row_id { 0 } else { 1 };
@@ -938,7 +938,7 @@ pub trait RowRead {
 
     /// Clone values for given read set. (row id is excluded)
     #[inline]
-    fn clone_vals_for_read_set(&self, schema: &TableSchema, user_read_set: &[usize]) -> Vec<Val> {
+    fn clone_vals_for_read_set(&self, schema: &TableMetadata, user_read_set: &[usize]) -> Vec<Val> {
         let mut vals = Vec::with_capacity(user_read_set.len());
         for user_col_idx in user_read_set {
             vals.push(self.clone_user_val(schema, *user_col_idx))
@@ -948,19 +948,19 @@ pub trait RowRead {
 
     /// Returns whether the key of current row is different from given value.
     #[inline]
-    fn is_key_different(&self, schema: &TableSchema, key: &SelectKey) -> bool {
+    fn is_key_different(&self, schema: &TableMetadata, key: &SelectKey) -> bool {
         debug_assert!(!key.vals.is_empty());
-        schema.indexes[key.index_no]
-            .keys
+        schema.index_specs[key.index_no]
+            .index_cols
             .iter()
-            .map(|k| k.user_col_idx as usize + 1)
+            .map(|k| k.col_no as usize + 1)
             .zip(&key.vals)
             .any(|(col_idx, val)| self.is_different(schema, col_idx, val))
     }
 
     /// Returns whether the value of current row at given column index is different from given value.
     #[inline]
-    fn is_different(&self, schema: &TableSchema, col_idx: usize, value: &Val) -> bool {
+    fn is_different(&self, schema: &TableMetadata, col_idx: usize, value: &Val) -> bool {
         match (value, self.is_null(col_idx), schema.layout(col_idx)) {
             (Val::Null, true, _) => false,
             (Val::Null, false, _) => true,
@@ -996,7 +996,7 @@ pub trait RowRead {
     /// Returns whether the value of current row at given column index is different
     /// from given value. (row id is excluded)
     #[inline]
-    fn is_user_different(&self, schema: &TableSchema, user_col_idx: usize, value: &Val) -> bool {
+    fn is_user_different(&self, schema: &TableMetadata, user_col_idx: usize, value: &Val) -> bool {
         self.is_different(schema, user_col_idx + 1, value)
     }
 
@@ -1004,7 +1004,7 @@ pub trait RowRead {
     #[inline]
     fn user_different(
         &self,
-        schema: &TableSchema,
+        schema: &TableMetadata,
         user_col_idx: usize,
         value: &Val,
     ) -> Option<(Val, Option<u16>)> {
@@ -1016,7 +1016,7 @@ pub trait RowRead {
 
     /// Calculate delta between given values and current row.
     #[inline]
-    fn calc_delta(&self, schema: &TableSchema, user_vals: &[Val]) -> Vec<UpdateCol> {
+    fn calc_delta(&self, schema: &TableMetadata, user_vals: &[Val]) -> Vec<UpdateCol> {
         let user_types = schema.user_types();
         debug_assert!(user_types.len() == user_vals.len());
         user_vals
@@ -1209,7 +1209,7 @@ pub const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
 
 /// Returns additional space of var-len data of the new row to be inserted.
 #[inline]
-pub fn var_len_for_insert(schema: &TableSchema, user_cols: &[Val]) -> usize {
+pub fn var_len_for_insert(schema: &TableMetadata, user_cols: &[Val]) -> usize {
     schema
         .var_cols
         .iter()
@@ -1230,8 +1230,12 @@ pub fn var_len_for_insert(schema: &TableSchema, user_cols: &[Val]) -> usize {
 mod tests {
     use core::str;
 
-    use crate::catalog::{IndexKey, IndexSchema};
+    use doradb_catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
+    };
+    use doradb_datatype::{Collation, PreciseType};
     use mem::MaybeUninit;
+    use semistr::SemiStr;
 
     use super::*;
 
@@ -1250,15 +1254,23 @@ mod tests {
 
     #[test]
     fn test_row_page_init() {
-        let schema = TableSchema::new(
-            vec![ValKind::I32.nullable(false)],
-            vec![IndexSchema {
-                keys: vec![IndexKey::new(0)],
-                unique: true,
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("id"),
+                column_type: PreciseType::Int(4, false),
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![IndexSpec {
+                index_name: SemiStr::new("idx_tb1_id"),
+                index_cols: vec![IndexKey {
+                    col_no: 0,
+                    order: IndexOrder::Asc,
+                }],
+                index_attributes: IndexAttributes::PK,
             }],
         );
         let mut page = create_row_page();
-        page.init(100, 105, &schema);
+        page.init(100, 105, &metadata);
         println!("page header={:?}", page.header);
         assert!(page.header.start_row_id == 100);
         assert!(page.header.max_row_count == 105);
@@ -1273,42 +1285,56 @@ mod tests {
 
     #[test]
     fn test_row_page_new_row() {
-        let schema = TableSchema::new(
-            vec![ValKind::I32.nullable(false)],
-            vec![IndexSchema {
-                keys: vec![IndexKey::new(0)],
-                unique: true,
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("id"),
+                column_type: PreciseType::Int(4, false),
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![IndexSpec {
+                index_name: SemiStr::new("idx_tb1_id"),
+                index_cols: vec![IndexKey::new(0)],
+                index_attributes: IndexAttributes::PK,
             }],
         );
         let mut page = create_row_page();
-        page.init(100, 200, &schema);
+        page.init(100, 200, &metadata);
         assert!(page.header.row_count() == 0);
         assert!(page.header.col_count == 2);
         let insert = vec![Val::Byte8(1u64)];
-        assert!(page.insert(&schema, &insert).is_ok());
+        assert!(page.insert(&metadata, &insert).is_ok());
         assert!(page.header.row_count() == 1);
         let insert = vec![Val::Byte8(2u64)];
-        assert!(page.insert(&schema, &insert).is_ok());
+        assert!(page.insert(&metadata, &insert).is_ok());
         assert!(page.header.row_count() == 2);
     }
 
     #[test]
     fn test_row_page_read_write_row() {
-        let schema = TableSchema::new(
+        let metadata = TableMetadata::new(
             vec![
-                ValKind::I32.nullable(false),
-                ValKind::VarByte.nullable(false),
+                ColumnSpec {
+                    column_name: SemiStr::new("id"),
+                    column_type: PreciseType::Int(4, false),
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("name"),
+                    column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                    column_attributes: ColumnAttributes::empty(),
+                },
             ],
-            vec![IndexSchema {
-                keys: vec![IndexKey::new(0)],
-                unique: true,
+            vec![IndexSpec {
+                index_name: SemiStr::new("idx_tb1_id"),
+                index_cols: vec![IndexKey::new(0)],
+                index_attributes: IndexAttributes::PK,
             }],
         );
         let mut page = create_row_page();
-        page.init(100, 200, &schema);
+        page.init(100, 200, &metadata);
 
         let insert = vec![Val::from(1_000_000i32), Val::from("hello")];
-        assert!(page.insert(&schema, &insert).is_ok());
+        assert!(page.insert(&metadata, &insert).is_ok());
 
         let row1 = page.row(0);
         assert!(row1.row_id() == 100);
@@ -1319,7 +1345,7 @@ mod tests {
             Val::from(2_000_000i32),
             Val::from("this value is not inline"),
         ];
-        assert!(page.insert(&schema, &insert).is_ok());
+        assert!(page.insert(&metadata, &insert).is_ok());
 
         let row2 = page.row(1);
         assert!(row2.row_id() == 101);
@@ -1339,22 +1365,43 @@ mod tests {
                 val: Val::from("update to non-inline value"),
             },
         ];
-        assert!(page.update(&schema, row_id, &update).is_ok());
+        assert!(page.update(&metadata, row_id, &update).is_ok());
     }
 
     #[test]
     fn test_row_page_crud() {
-        let schema = TableSchema::new(
+        let schema = TableMetadata::new(
             vec![
-                ValKind::I8.nullable(false),
-                ValKind::I16.nullable(false),
-                ValKind::I32.nullable(false),
-                ValKind::I64.nullable(false),
-                ValKind::VarByte.nullable(false),
+                ColumnSpec {
+                    column_name: SemiStr::new("col1"),
+                    column_type: PreciseType::Int(1, true),
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("col2"),
+                    column_type: PreciseType::Int(2, true),
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("col3"),
+                    column_type: PreciseType::Int(4, true),
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("col4"),
+                    column_type: PreciseType::Int(8, true),
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("col5"),
+                    column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                    column_attributes: ColumnAttributes::empty(),
+                },
             ],
-            vec![IndexSchema {
-                keys: vec![IndexKey::new(2)],
-                unique: true,
+            vec![IndexSpec {
+                index_name: SemiStr::new("idx_tb1_col3"),
+                index_cols: vec![IndexKey::new(2)],
+                index_attributes: IndexAttributes::PK,
             }],
         );
         let mut page = create_row_page();

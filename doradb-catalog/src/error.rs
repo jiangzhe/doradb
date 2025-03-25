@@ -13,6 +13,8 @@ pub enum Error {
     TableAlreadyExists(SemiStr),
     #[error("Table '{0}' not exists")]
     TableNotExists(SemiStr),
+    #[error("Index '{0}' not exists")]
+    IndexNotExists(SemiStr),
     #[error("Column name '{0}' is not unique")]
     ColumnNameNotUnique(SemiStr),
 }

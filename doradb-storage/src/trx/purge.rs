@@ -496,7 +496,6 @@ mod tests {
     use super::*;
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::FixedBufferPool;
-    use crate::catalog::tests::table1;
     use crate::catalog::Catalog;
     use crate::index::RowLocation;
     use crate::latch::LatchFallbackMode;
@@ -537,16 +536,24 @@ mod tests {
 
     #[test]
     fn test_trx_purge_single_thread() {
-        const PURGE_SIZE: usize = 1000;
-        let buf_pool = FixedBufferPool::with_capacity_static(16 * 1024 * 1024).unwrap();
-        let catalog = Catalog::empty_static();
-        let trx_sys = TrxSysConfig::default()
-            .purge_threads(1)
-            .build_static(buf_pool, catalog);
+        use crate::catalog::tests::table1;
 
+        const PURGE_SIZE: usize = 1000;
         smol::block_on(async {
-            let table_id = table1(buf_pool, catalog).await;
+            let buf_pool = FixedBufferPool::with_capacity_static(16 * 1024 * 1024).unwrap();
+            let catalog = Catalog::empty_static(buf_pool).await;
+            let trx_sys = TrxSysConfig::default()
+                .purge_threads(1)
+                .build_static(buf_pool, catalog);
+
+            let table_id = table1(buf_pool, trx_sys, catalog).await;
             let table = catalog.get_table(table_id).unwrap();
+
+            // Since we populate metadata table, we need to count those purge transactions and rows.
+            // 100ms should be enough.
+            smol::Timer::after(Duration::from_millis(100)).await;
+            let init_stats = trx_sys.trx_sys_stats();
+
             let mut session = Session::new();
             // insert
             for i in 0..PURGE_SIZE {
@@ -573,49 +580,58 @@ mod tests {
                 assert!(res.is_ok());
                 session = res.unwrap();
             }
+
+            // wait for GC.
+            let start = Instant::now();
+            loop {
+                let stats = trx_sys.trx_sys_stats();
+                assert!(stats.purge_trx_count <= init_stats.purge_trx_count + PURGE_SIZE * 2);
+                assert!(stats.purge_row_count <= init_stats.purge_row_count + PURGE_SIZE * 2);
+                assert!(stats.purge_index_count <= init_stats.purge_index_count + PURGE_SIZE);
+                println!(
+                    "purge_trx={},purge_row={},purge_index={}",
+                    stats.purge_trx_count, stats.purge_row_count, stats.purge_index_count
+                );
+                if stats.purge_trx_count == init_stats.purge_trx_count + PURGE_SIZE * 2
+                    && stats.purge_row_count == init_stats.purge_row_count + PURGE_SIZE * 2
+                    && stats.purge_index_count == init_stats.purge_index_count + PURGE_SIZE
+                {
+                    break;
+                }
+                if start.elapsed() >= Duration::from_secs(3) {
+                    panic!("gc timeout");
+                } else {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            unsafe {
+                StaticLifetime::drop_static(trx_sys);
+                StaticLifetime::drop_static(catalog);
+                StaticLifetime::drop_static(buf_pool);
+            }
         });
-        // wait for GC.
-        let start = Instant::now();
-        loop {
-            let stats = trx_sys.trx_sys_stats();
-            assert!(stats.purge_trx_count <= PURGE_SIZE * 2);
-            assert!(stats.purge_row_count <= PURGE_SIZE * 2);
-            assert!(stats.purge_index_count <= PURGE_SIZE);
-            println!(
-                "purge_trx={},purge_row={},purge_index={}",
-                stats.purge_trx_count, stats.purge_row_count, stats.purge_index_count
-            );
-            if stats.purge_trx_count == PURGE_SIZE * 2
-                && stats.purge_row_count == PURGE_SIZE * 2
-                && stats.purge_index_count == PURGE_SIZE
-            {
-                break;
-            }
-            if start.elapsed() >= Duration::from_secs(3) {
-                panic!("gc timeout");
-            } else {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        unsafe {
-            StaticLifetime::drop_static(trx_sys);
-            StaticLifetime::drop_static(catalog);
-            StaticLifetime::drop_static(buf_pool);
-        }
     }
 
     #[test]
     fn test_trx_purge_multi_threads() {
+        use crate::catalog::tests::table1;
+
         smol::block_on(async {
             const PURGE_SIZE: usize = 1000;
             let buf_pool = FixedBufferPool::with_capacity_static(16 * 1024 * 1024).unwrap();
-            let catalog = Catalog::empty_static();
+            let catalog = Catalog::empty_static(buf_pool).await;
             let trx_sys = TrxSysConfig::default()
                 .purge_threads(2)
                 .build_static(buf_pool, catalog);
 
-            let table_id = table1(buf_pool, catalog).await;
+            let table_id = table1(buf_pool, trx_sys, catalog).await;
             let table = catalog.get_table(table_id).unwrap();
+
+            // Since we populate metadata table, we need to count those purge transactions and rows.
+            // 100ms should be enough.
+            smol::Timer::after(Duration::from_millis(100)).await;
+            let init_stats = trx_sys.trx_sys_stats();
+
             let mut session = Session::new();
             // insert
             for i in 0..PURGE_SIZE {
@@ -648,16 +664,16 @@ mod tests {
             let mut gc_timeout = false;
             loop {
                 let stats = trx_sys.trx_sys_stats();
-                assert!(stats.purge_trx_count <= PURGE_SIZE * 2);
-                assert!(stats.purge_row_count <= PURGE_SIZE * 2);
-                assert!(stats.purge_index_count <= PURGE_SIZE);
+                assert!(stats.purge_trx_count <= init_stats.purge_trx_count + PURGE_SIZE * 2);
+                assert!(stats.purge_row_count <= init_stats.purge_row_count + PURGE_SIZE * 2);
+                assert!(stats.purge_index_count <= init_stats.purge_index_count + PURGE_SIZE);
                 println!(
                     "purge_trx={},purge_row={},purge_index={}",
                     stats.purge_trx_count, stats.purge_row_count, stats.purge_index_count
                 );
-                if stats.purge_trx_count == PURGE_SIZE * 2
-                    && stats.purge_row_count == PURGE_SIZE * 2
-                    && stats.purge_index_count == PURGE_SIZE
+                if stats.purge_trx_count == init_stats.purge_trx_count + PURGE_SIZE * 2
+                    && stats.purge_row_count == init_stats.purge_row_count + PURGE_SIZE * 2
+                    && stats.purge_index_count == init_stats.purge_index_count + PURGE_SIZE
                 {
                     break;
                 }

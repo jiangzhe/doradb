@@ -96,7 +96,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::join::{Join, JoinGraph, QualifiedJoin};
     use doradb_catalog::mem_impl::MemCatalog;
-    use doradb_catalog::{Catalog, ColumnAttr, ColumnSpec, TableID, TableSpec};
+    use doradb_catalog::{
+        Catalog, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaSpec,
+        TableID, TableSpec,
+    };
     use doradb_datatype::{Collation, PreciseType};
     use doradb_sql::parser::dialect::MySQL;
     use doradb_sql::parser::parse_query;
@@ -565,67 +568,133 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn j_catalog() -> MemCatalog {
         let cat = MemCatalog::default();
-        cat.create_schema("j").unwrap();
-        cat.create_table(TableSpec::new(
-            "j",
-            "t0",
-            vec![ColumnSpec::new("c0", PreciseType::i32(), ColumnAttr::PK)],
-        ))
+        let schema_id = cat.create_schema(SchemaSpec::new("j")).unwrap();
+        let table_id = cat
+            .create_table(
+                schema_id,
+                TableSpec::new(
+                    "t0",
+                    vec![ColumnSpec::new(
+                        "c0",
+                        PreciseType::i32(),
+                        ColumnAttributes::INDEX,
+                    )],
+                ),
+            )
+            .unwrap();
+
+        cat.create_index(
+            table_id,
+            IndexSpec::new("idx_t0_c0", vec![IndexKey::new(0)], IndexAttributes::PK),
+        )
         .unwrap();
-        cat.create_table(TableSpec::new(
-            "j",
-            "t1",
-            vec![
-                ColumnSpec::new("c0", PreciseType::i32(), ColumnAttr::PK),
-                ColumnSpec::new("c1", PreciseType::i32(), ColumnAttr::empty()),
-            ],
-        ))
+
+        let table_id = cat
+            .create_table(
+                schema_id,
+                TableSpec::new(
+                    "t1",
+                    vec![
+                        ColumnSpec::new("c0", PreciseType::i32(), ColumnAttributes::INDEX),
+                        ColumnSpec::new("c1", PreciseType::i32(), ColumnAttributes::empty()),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        cat.create_index(
+            table_id,
+            IndexSpec::new("idx_t1_c0", vec![IndexKey::new(0)], IndexAttributes::PK),
+        )
         .unwrap();
-        cat.create_table(TableSpec::new(
-            "j",
-            "t2",
-            vec![
-                ColumnSpec::new("c0", PreciseType::i32(), ColumnAttr::PK),
-                ColumnSpec::new("c1", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c2", PreciseType::i32(), ColumnAttr::empty()),
-            ],
-        ))
+
+        let table_id = cat
+            .create_table(
+                schema_id,
+                TableSpec::new(
+                    "t2",
+                    vec![
+                        ColumnSpec::new("c0", PreciseType::i32(), ColumnAttributes::INDEX),
+                        ColumnSpec::new("c1", PreciseType::i32(), ColumnAttributes::empty()),
+                        ColumnSpec::new("c2", PreciseType::i32(), ColumnAttributes::empty()),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        cat.create_index(
+            table_id,
+            IndexSpec::new("idx_t2_c0", vec![IndexKey::new(0)], IndexAttributes::PK),
+        )
         .unwrap();
-        cat.create_table(TableSpec::new(
-            "j",
-            "t3",
-            vec![
-                ColumnSpec::new("c0", PreciseType::i32(), ColumnAttr::PK),
-                ColumnSpec::new("c1", PreciseType::i32(), ColumnAttr::PK),
-                ColumnSpec::new("c2", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c3", PreciseType::i32(), ColumnAttr::empty()),
-            ],
-        ))
+
+        let table_id = cat
+            .create_table(
+                schema_id,
+                TableSpec::new(
+                    "t3",
+                    vec![
+                        ColumnSpec::new("c0", PreciseType::i32(), ColumnAttributes::INDEX),
+                        ColumnSpec::new("c1", PreciseType::i32(), ColumnAttributes::INDEX),
+                        ColumnSpec::new("c2", PreciseType::i32(), ColumnAttributes::empty()),
+                        ColumnSpec::new("c3", PreciseType::i32(), ColumnAttributes::empty()),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        cat.create_index(
+            table_id,
+            IndexSpec::new(
+                "idx_t3_c0_c1",
+                vec![IndexKey::new(0), IndexKey::new(1)],
+                IndexAttributes::PK,
+            ),
+        )
         .unwrap();
-        cat.create_table(TableSpec::new(
-            "j",
-            "t4",
-            vec![
-                ColumnSpec::new("c0", PreciseType::i32(), ColumnAttr::PK),
-                ColumnSpec::new("c1", PreciseType::i32(), ColumnAttr::UK),
-                ColumnSpec::new("c2", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c3", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c4", PreciseType::i32(), ColumnAttr::empty()),
-            ],
-        ))
+
+        let table_id = cat
+            .create_table(
+                schema_id,
+                TableSpec::new(
+                    "t4",
+                    vec![
+                        ColumnSpec::new("c0", PreciseType::i32(), ColumnAttributes::INDEX),
+                        ColumnSpec::new("c1", PreciseType::i32(), ColumnAttributes::INDEX),
+                        ColumnSpec::new("c2", PreciseType::i32(), ColumnAttributes::empty()),
+                        ColumnSpec::new("c3", PreciseType::i32(), ColumnAttributes::empty()),
+                        ColumnSpec::new("c4", PreciseType::i32(), ColumnAttributes::empty()),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        cat.create_index(
+            table_id,
+            IndexSpec::new("idx_t4_c0", vec![IndexKey::new(0)], IndexAttributes::PK),
+        )
         .unwrap();
-        cat.create_table(TableSpec::new(
-            "j",
-            "t5",
-            vec![
-                ColumnSpec::new("c0", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c1", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c2", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c3", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c4", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("c5", PreciseType::i32(), ColumnAttr::empty()),
-            ],
-        ))
+
+        cat.create_index(
+            table_id,
+            IndexSpec::new("idx_t4_c1", vec![IndexKey::new(1)], IndexAttributes::UK),
+        )
+        .unwrap();
+
+        cat.create_table(
+            schema_id,
+            TableSpec::new(
+                "t5",
+                vec![
+                    ColumnSpec::new("c0", PreciseType::i32(), ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", PreciseType::i32(), ColumnAttributes::empty()),
+                    ColumnSpec::new("c2", PreciseType::i32(), ColumnAttributes::empty()),
+                    ColumnSpec::new("c3", PreciseType::i32(), ColumnAttributes::empty()),
+                    ColumnSpec::new("c4", PreciseType::i32(), ColumnAttributes::empty()),
+                    ColumnSpec::new("c5", PreciseType::i32(), ColumnAttributes::empty()),
+                ],
+            ),
+        )
         .unwrap();
         cat
     }
@@ -639,7 +708,7 @@ pub(crate) mod tests {
         let schema = cat.find_schema_by_name(schema_name).unwrap();
         let mut m = HashMap::with_capacity(tbl_names.len());
         for tn in tbl_names {
-            let tbl = cat.find_table_by_name(&schema.id, tn).unwrap();
+            let tbl = cat.find_table_by_name(schema.id, tn).unwrap();
             m.insert(tn, tbl.id);
         }
         m
@@ -877,69 +946,103 @@ pub(crate) mod tests {
     #[inline]
     fn empty_catalog() -> MemCatalog {
         let cat = MemCatalog::default();
-        cat.create_schema("default").unwrap();
+        cat.create_schema(SchemaSpec::new("default")).unwrap();
         cat
     }
 
     #[inline]
     pub(crate) fn tpch_catalog() -> MemCatalog {
         let cat = MemCatalog::default();
-        cat.create_schema("tpch").unwrap();
-        cat.create_table(TableSpec::new(
-            "tpch",
-            "lineitem",
-            vec![
-                ColumnSpec::new("l_orderkey", PreciseType::i32(), ColumnAttr::PK),
-                ColumnSpec::new("l_partkey", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("l_suppkey", PreciseType::i32(), ColumnAttr::empty()),
-                ColumnSpec::new("l_linenumber", PreciseType::i32(), ColumnAttr::PK),
-                ColumnSpec::new(
-                    "l_quantity",
-                    PreciseType::decimal(18, 2),
-                    ColumnAttr::empty(),
+        let schema_id = cat.create_schema(SchemaSpec::new("tpch")).unwrap();
+        let table_id = cat
+            .create_table(
+                schema_id,
+                TableSpec::new(
+                    "lineitem",
+                    vec![
+                        ColumnSpec::new("l_orderkey", PreciseType::i32(), ColumnAttributes::INDEX),
+                        ColumnSpec::new("l_partkey", PreciseType::i32(), ColumnAttributes::empty()),
+                        ColumnSpec::new("l_suppkey", PreciseType::i32(), ColumnAttributes::empty()),
+                        ColumnSpec::new(
+                            "l_linenumber",
+                            PreciseType::i32(),
+                            ColumnAttributes::INDEX,
+                        ),
+                        ColumnSpec::new(
+                            "l_quantity",
+                            PreciseType::decimal(18, 2),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_extendedprice",
+                            PreciseType::decimal(18, 2),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_discount",
+                            PreciseType::decimal(18, 2),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_tax",
+                            PreciseType::decimal(18, 2),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_returnflag",
+                            PreciseType::char(1, Collation::Ascii),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_linestatus",
+                            PreciseType::char(1, Collation::Ascii),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_shipdate",
+                            PreciseType::date(),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_commitdate",
+                            PreciseType::date(),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_receiptdate",
+                            PreciseType::date(),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_shipinstruct",
+                            PreciseType::varchar(25, Collation::Ascii),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_shipmode",
+                            PreciseType::varchar(10, Collation::Ascii),
+                            ColumnAttributes::empty(),
+                        ),
+                        ColumnSpec::new(
+                            "l_comment",
+                            PreciseType::varchar(44, Collation::Ascii),
+                            ColumnAttributes::empty(),
+                        ),
+                    ],
                 ),
-                ColumnSpec::new(
-                    "l_extendedprice",
-                    PreciseType::decimal(18, 2),
-                    ColumnAttr::empty(),
-                ),
-                ColumnSpec::new(
-                    "l_discount",
-                    PreciseType::decimal(18, 2),
-                    ColumnAttr::empty(),
-                ),
-                ColumnSpec::new("l_tax", PreciseType::decimal(18, 2), ColumnAttr::empty()),
-                ColumnSpec::new(
-                    "l_returnflag",
-                    PreciseType::char(1, Collation::Ascii),
-                    ColumnAttr::empty(),
-                ),
-                ColumnSpec::new(
-                    "l_linestatus",
-                    PreciseType::char(1, Collation::Ascii),
-                    ColumnAttr::empty(),
-                ),
-                ColumnSpec::new("l_shipdate", PreciseType::date(), ColumnAttr::empty()),
-                ColumnSpec::new("l_commitdate", PreciseType::date(), ColumnAttr::empty()),
-                ColumnSpec::new("l_receiptdate", PreciseType::date(), ColumnAttr::empty()),
-                ColumnSpec::new(
-                    "l_shipinstruct",
-                    PreciseType::varchar(25, Collation::Ascii),
-                    ColumnAttr::empty(),
-                ),
-                ColumnSpec::new(
-                    "l_shipmode",
-                    PreciseType::varchar(10, Collation::Ascii),
-                    ColumnAttr::empty(),
-                ),
-                ColumnSpec::new(
-                    "l_comment",
-                    PreciseType::varchar(44, Collation::Ascii),
-                    ColumnAttr::empty(),
-                ),
-            ],
-        ))
+            )
+            .unwrap();
+
+        cat.create_index(
+            table_id,
+            IndexSpec::new(
+                "idx_lineitem_l_orderkey_l_linenumber",
+                vec![IndexKey::new(0), IndexKey::new(3)],
+                IndexAttributes::PK,
+            ),
+        )
         .unwrap();
+
         cat
     }
 

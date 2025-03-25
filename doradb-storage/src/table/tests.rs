@@ -1,12 +1,12 @@
 use crate::buffer::{BufferPool, EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
-use crate::catalog::{Catalog, IndexKey, IndexSchema, TableSchema};
+use crate::catalog::Catalog;
 use crate::lifetime::{StaticLifetime, StaticLifetimeRef};
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::session::Session;
-use crate::table::{Table, TableID};
+use crate::table::Table;
 use crate::trx::sys::{TransactionSystem, TrxSysConfig};
 use crate::trx::ActiveTrx;
-use crate::value::{Val, ValKind};
+use crate::value::Val;
 
 #[test]
 fn test_mvcc_insert_normal() {
@@ -455,21 +455,6 @@ fn test_evict_pool_insert_full() {
     });
 }
 
-async fn create_table<P: BufferPool>(buf_pool: &'static P, catalog: &Catalog<P>) -> TableID {
-    catalog
-        .create_table(
-            buf_pool,
-            TableSchema::new(
-                vec![
-                    ValKind::I32.nullable(false),
-                    ValKind::VarByte.nullable(false),
-                ],
-                vec![IndexSchema::new(vec![IndexKey::new(0)], true)],
-            ),
-        )
-        .await
-}
-
 struct TestSys<P: BufferPool> {
     buf_pool: &'static P,
     catalog: &'static Catalog<P>,
@@ -480,12 +465,13 @@ struct TestSys<P: BufferPool> {
 impl TestSys<FixedBufferPool> {
     #[inline]
     async fn new_fixed() -> Self {
+        use crate::catalog::tests::table2;
         // 64KB * 16
         let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
-        let catalog = Catalog::empty_static();
+        let catalog = Catalog::empty_static(buf_pool).await;
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = create_table(buf_pool, catalog).await;
-        let table = catalog.get_table(table_id).unwrap();
+        let table_id = table2(buf_pool, trx_sys, catalog).await;
+        let table: Table<FixedBufferPool> = catalog.get_table(table_id).unwrap();
         TestSys {
             buf_pool,
             catalog,
@@ -498,15 +484,16 @@ impl TestSys<FixedBufferPool> {
 impl TestSys<EvictableBufferPool> {
     #[inline]
     async fn new_evictable() -> Self {
+        use crate::catalog::tests::table2;
         // 64KB * 16
         let buf_pool = EvictableBufferPoolConfig::default()
-            .max_mem_size(1024 * 1024)
-            .max_file_size(1024 * 1024 * 32)
+            .max_mem_size(1024u64 * 1024)
+            .max_file_size(1024u64 * 1024 * 32)
             .build_static()
             .unwrap();
-        let catalog = Catalog::empty_static();
+        let catalog = Catalog::empty_static(buf_pool).await;
         let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = create_table(buf_pool, catalog).await;
+        let table_id = table2(buf_pool, trx_sys, catalog).await;
         let table = catalog.get_table(table_id).unwrap();
         TestSys {
             buf_pool,

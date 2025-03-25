@@ -1267,7 +1267,7 @@ impl<C: Catalog> PredPullup<'_, C> {
         // note: table may be referred multiple times in one query,
         // so we remove the table from dep_tbl_cols map when collecting its dependencies.
         if let Some(col_indexes) = self.dep_cols.tbl.remove(&table_id) {
-            let keys = self.catalog.find_keys(&table_id);
+            let keys = self.catalog.find_keys(table_id);
             if keys.is_empty() {
                 return; // no key in current table
             }

@@ -1,4 +1,4 @@
-use bitflags::bitflags;
+use crate::{ColumnAttributes, IndexAttributes, IndexOrder};
 use doradb_datatype::PreciseType;
 use semistr::SemiStr;
 
@@ -25,6 +25,8 @@ pub struct TableObject {
 pub struct ColumnObject {
     pub column_id: ColumnID,
     pub table_id: TableID,
+    pub column_name: SemiStr,
+    pub column_no: u16,
     pub column_type: PreciseType,
     pub column_attributes: ColumnAttributes,
 }
@@ -32,8 +34,8 @@ pub struct ColumnObject {
 #[derive(Debug)]
 pub struct IndexObject {
     pub index_id: IndexID,
-    pub index_name: SemiStr,
     pub table_id: TableID,
+    pub index_name: SemiStr,
     pub index_attributes: IndexAttributes,
 }
 
@@ -41,21 +43,5 @@ pub struct IndexObject {
 pub struct IndexColumnObject {
     pub column_id: ColumnID,
     pub index_id: IndexID,
-    pub descending: bool,
-}
-
-bitflags! {
-    pub struct ColumnAttributes: u32 {
-        // whether value can be null.
-        const NULLABLE = 0x01;
-        // whether it belongs to any index.
-        const INDEX = 0x02;
-    }
-}
-
-bitflags! {
-    pub struct IndexAttributes: u32 {
-        const PK = 0x01;
-        const UK = 0x02;
-    }
+    pub index_order: IndexOrder,
 }

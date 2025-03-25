@@ -3,8 +3,10 @@
 ![build](https://github.com/jiangzhe/doradb/actions/workflows/build.yml/badge.svg)
 ![codecov](https://codecov.io/gh/jiangzhe/doradb/branch/main/graph/badge.svg?token=T3RMZE2998)
 
-DoraDB is a experimental project to memory-optimized disk-based database from scratch.
+DoraDB is an attempt to build a fast database in Rust from scratch.
 It is work in progress.
+Early development focus on SQL layer and optimizer techniques.
+Current development focus on storage engine.
 
 ## Goal
 
