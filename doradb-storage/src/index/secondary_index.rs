@@ -203,6 +203,8 @@ impl EncodeKeySelf for SmartKey {
 
 pub trait EncodeMultiKeys {
     fn encode(&self, key: &[Val]) -> Val;
+
+    fn encode_pair(&self, prefix_key: &[Val], end_key: &Val) -> Val;
 }
 
 #[inline]
@@ -258,6 +260,17 @@ impl EncodeMultiKeys for FixLenEncoder {
         }
         Val::from(buf)
     }
+
+    #[inline]
+    fn encode_pair(&self, prefix_key: &[Val], end_key: &Val) -> Val {
+        debug_assert!(prefix_key.len() + 1 == self.types.len());
+        let mut buf = Vec::with_capacity(self.len);
+        for (ty, val) in self.types.iter().zip(prefix_key) {
+            val.encode_memcmp(*ty, &mut buf);
+        }
+        end_key.encode_memcmp(self.types.last().cloned().unwrap(), &mut buf);
+        Val::from(buf)
+    }
 }
 
 pub struct VarLenEncoder {
@@ -285,6 +298,17 @@ impl VarLenEncoder {
         for (ty, val) in self.types.iter().zip(key) {
             val.encode_memcmp(*ty, &mut buf);
         }
+        Val::from(buf)
+    }
+
+    #[inline]
+    fn encode_pair(&self, prefix_key: &[Val], end_key: &Val) -> Val {
+        debug_assert!(prefix_key.len() + 1 == self.types.len());
+        let mut buf = Vec::with_capacity(self.min_len);
+        for (ty, val) in self.types.iter().zip(prefix_key) {
+            val.encode_memcmp(*ty, &mut buf);
+        }
+        end_key.encode_memcmp(self.types.last().cloned().unwrap(), &mut buf);
         Val::from(buf)
     }
 }
@@ -481,5 +505,86 @@ impl NonUniqueIndex for PartitionNonUniqueIndex {
     #[inline]
     fn update(&self, _key: &[Val], _old_row_id: RowID, _new_row_id: RowID) -> bool {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unique_index() {
+        // 测试用例1：基本插入和查找操作
+        let index = PartitionSingleKeyIndex::<i32, false>::empty();
+        let key = vec![Val::from(42i32)];
+        let row_id = 100u64;
+
+        // 测试插入
+        assert_eq!(index.insert(&key, row_id), None);
+
+        // 测试查找
+        assert_eq!(index.lookup(&key), Some(row_id));
+
+        // 测试不存在的键
+        let non_existent_key = vec![Val::from(43i32)];
+        assert_eq!(index.lookup(&non_existent_key), None);
+
+        // 测试用例2：重复插入
+        let new_row_id = 200u64;
+        let old_row_id = index.insert(&key, new_row_id);
+        assert_eq!(old_row_id, Some(row_id));
+        assert_eq!(index.lookup(&key), Some(new_row_id));
+
+        // 测试用例3：删除操作
+        assert!(index.compare_delete(&key, new_row_id));
+        assert_eq!(index.lookup(&key), None);
+
+        // 测试删除不存在的键
+        assert!(!index.compare_delete(&key, new_row_id));
+
+        // 测试用例4：compare_exchange 操作
+        let key = vec![Val::from(100i32)];
+        let row_id1 = 300u64;
+        let row_id2 = 400u64;
+
+        // 先插入一个值
+        assert_eq!(index.insert(&key, row_id1), None);
+
+        // 测试成功的 compare_exchange
+        assert!(index.compare_exchange(&key, row_id1, row_id2));
+        assert_eq!(index.lookup(&key), Some(row_id2));
+
+        // 测试失败的 compare_exchange
+        assert!(!index.compare_exchange(&key, row_id1, row_id2));
+
+        // 测试用例5：scan_values 操作
+        let mut values = Vec::new();
+        index.scan_values(&mut values);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], row_id2);
+
+        // 测试用例6：多分区操作
+        let key1 = vec![Val::from(1i32)];
+        let key2 = vec![Val::from(2i32)];
+        let key3 = vec![Val::from(3i32)];
+
+        let row_id1 = 500u64;
+        let row_id2 = 600u64;
+        let row_id3 = 700u64;
+
+        // 插入多个键值对
+        assert_eq!(index.insert(&key1, row_id1), None);
+        assert_eq!(index.insert(&key2, row_id2), None);
+        assert_eq!(index.insert(&key3, row_id3), None);
+
+        // 验证所有键都能正确查找
+        assert_eq!(index.lookup(&key1), Some(row_id1));
+        assert_eq!(index.lookup(&key2), Some(row_id2));
+        assert_eq!(index.lookup(&key3), Some(row_id3));
+
+        // 验证 scan_values 包含所有值
+        let mut values = Vec::new();
+        index.scan_values(&mut values);
+        assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
     }
 }

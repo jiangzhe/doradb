@@ -25,8 +25,7 @@ use std::collections::HashSet;
 use std::mem;
 use std::sync::Arc;
 
-// todo: integrate with doradb_catalog::TableID.
-pub type TableID = u64;
+pub use doradb_catalog::TableID;
 
 /// Table is a logical data set of rows.
 /// It combines components such as row page, undo map, block index, secondary
@@ -107,7 +106,7 @@ impl<P: BufferPool> Table<P> {
     pub async fn select_row_mvcc(
         &self,
         buf_pool: &'static P,
-        stmt: &Statement,
+        stmt: &Statement<P>,
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> SelectMvcc {
@@ -215,7 +214,7 @@ impl<P: BufferPool> Table<P> {
     pub async fn insert_row(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         cols: Vec<Val>,
     ) -> InsertMvcc {
         debug_assert!(cols.len() + 1 == self.metadata.col_count());
@@ -259,7 +258,7 @@ impl<P: BufferPool> Table<P> {
     pub async fn update_row(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
@@ -360,7 +359,7 @@ impl<P: BufferPool> Table<P> {
     pub async fn delete_row(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         key: &SelectKey,
     ) -> DeleteMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
@@ -475,7 +474,7 @@ impl<P: BufferPool> Table<P> {
     async fn move_update_for_space(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         old_row: Vec<(Val, Option<u16>)>,
         update: Vec<UpdateCol>,
         old_id: RowID,
@@ -541,7 +540,7 @@ impl<P: BufferPool> Table<P> {
     async fn link_for_unique_index(
         &self,
         buf_pool: &'static P,
-        stmt: &Statement,
+        stmt: &Statement<P>,
         old_id: RowID,
         key: &SelectKey,
         new_id: RowID,
@@ -585,7 +584,7 @@ impl<P: BufferPool> Table<P> {
     async fn insert_row_internal(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
         mut move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
@@ -616,7 +615,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     fn insert_row_to_page(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         page_guard: PageSharedGuard<RowPage>,
         insert: Vec<Val>,
         undo_kind: RowUndoKind,
@@ -710,7 +709,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn update_row_inplace(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         page_guard: PageSharedGuard<RowPage>,
         key: &SelectKey,
         row_id: RowID,
@@ -834,7 +833,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn delete_row_internal(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         page_guard: PageSharedGuard<RowPage>,
         row_id: RowID,
         key: &SelectKey,
@@ -877,7 +876,7 @@ impl<P: BufferPool> Table<P> {
     async fn get_insert_page(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         row_count: usize,
     ) -> PageSharedGuard<RowPage> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id) {
@@ -903,7 +902,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn lock_row_for_write<'a>(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         page_guard: &'a PageSharedGuard<RowPage>,
         row_id: RowID,
         key: Option<&SelectKey>,
@@ -962,7 +961,7 @@ impl<P: BufferPool> Table<P> {
     async fn insert_unique_index(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
@@ -1021,7 +1020,7 @@ impl<P: BufferPool> Table<P> {
     async fn update_indexes_only_key_change(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
         index_change_cols: &HashSet<usize>,
@@ -1058,7 +1057,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     fn update_indexes_only_row_id_change<'a>(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         old_row_id: RowID,
         new_row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
@@ -1091,7 +1090,7 @@ impl<P: BufferPool> Table<P> {
     async fn update_indexes_may_both_change(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         old_row_id: RowID,
         new_row_id: RowID,
         index_change_cols: &HashSet<usize>,
@@ -1145,7 +1144,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     fn defer_delete_indexes<'a>(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) {
@@ -1164,7 +1163,7 @@ impl<P: BufferPool> Table<P> {
     async fn update_unique_index_key_and_row_id_change(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         index: &dyn UniqueIndex,
         key: SelectKey,
         old_row_id: RowID,
@@ -1249,7 +1248,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     fn update_unique_index_only_row_id_change<'a>(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         index: &dyn UniqueIndex,
         key: SelectKey,
         old_row_id: RowID,
@@ -1270,7 +1269,7 @@ impl<P: BufferPool> Table<P> {
     async fn update_unique_index_only_key_change(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         index: &dyn UniqueIndex,
         new_key: SelectKey,
         row_id: RowID,

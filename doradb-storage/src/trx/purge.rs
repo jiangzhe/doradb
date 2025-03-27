@@ -16,9 +16,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-impl TransactionSystem {
+impl<P: BufferPool> TransactionSystem<P> {
     #[inline]
-    pub(super) fn start_purge_threads<P: BufferPool>(
+    pub(super) fn start_purge_threads(
         &'static self,
         buf_pool: &'static P,
         catalog: &'static Catalog<P>,
@@ -74,7 +74,7 @@ impl TransactionSystem {
     }
 
     #[inline]
-    pub(super) fn dispatch_purge<P: BufferPool>(
+    pub(super) fn dispatch_purge(
         &'static self,
         buf_pool: &'static P,
         catalog: &'static Catalog<P>,
@@ -98,12 +98,12 @@ impl TransactionSystem {
     /// Purge row undo logs and index entries according to given transaction
     /// list and minimum active STS.
     #[inline]
-    pub(super) async fn purge_trx_list<P: BufferPool>(
+    pub(super) async fn purge_trx_list(
         &self,
         buf_pool: &'static P,
         catalog: &Catalog<P>,
         log_no: usize,
-        trx_list: Vec<CommittedTrx>,
+        trx_list: Vec<CommittedTrx<P>>,
         min_active_sts: TrxID,
     ) {
         let partition = &self.log_partitions[log_no];
@@ -213,11 +213,11 @@ impl ActiveStsList {
     }
 }
 
-impl LogPartition {
+impl<P: BufferPool> LogPartition<P> {
     /// Execute GC analysis in loop.
     /// This method is used for a separate GC analyzer thread for each log partition.
     #[inline]
-    pub fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>) {
+    pub fn gc_loop(&self, gc_rx: Receiver<GC<P>>, purge_chan: Sender<Purge>) {
         while let Ok(msg) = gc_rx.recv() {
             match msg {
                 GC::Stop => return,
@@ -234,7 +234,7 @@ impl LogPartition {
     /// Analyze committed transaction and modify active sts list and committed transaction list.
     /// Returns whether min_active_sts may change.
     #[inline]
-    fn gc_analyze(&self, trx_list: HashMap<usize, Vec<CommittedTrx>>) -> bool {
+    fn gc_analyze(&self, trx_list: HashMap<usize, Vec<CommittedTrx<P>>>) -> bool {
         let mut changed = false;
         for (gc_no, trx_list) in trx_list {
             let gc_bucket = &self.gc_buckets[gc_no];
@@ -247,11 +247,11 @@ impl LogPartition {
 /// GCBucket is used for GC analyzer to store and analyze GC related information,
 /// including committed transaction list, old transaction list, active snapshot timestamp
 /// list, etc.
-pub(super) struct GCBucket {
+pub(super) struct GCBucket<P: BufferPool> {
     /// Committed transaction list.
     /// When a transaction is committed, it will be put into this queue in sequence.
     /// Head is always oldest and tail is newest.
-    pub(super) committed_trx_list: CachePadded<Mutex<VecDeque<CommittedTrx>>>,
+    pub(super) committed_trx_list: CachePadded<Mutex<VecDeque<CommittedTrx<P>>>>,
     /// Active snapshot timestamp list.
     /// The smallest value equals to min_active_sts.
     pub(super) active_sts_list: CachePadded<Mutex<ActiveStsList>>,
@@ -259,7 +259,7 @@ pub(super) struct GCBucket {
     pub(super) min_active_sts: CachePadded<AtomicU64>,
 }
 
-impl GCBucket {
+impl<P: BufferPool> GCBucket<P> {
     /// Create a new GC bucket.
     #[inline]
     pub(super) fn new() -> Self {
@@ -272,7 +272,11 @@ impl GCBucket {
 
     /// Get committed transaction list to purge.
     #[inline]
-    pub(super) fn get_purge_list(&self, min_active_sts: TrxID, trx_list: &mut Vec<CommittedTrx>) {
+    pub(super) fn get_purge_list(
+        &self,
+        min_active_sts: TrxID,
+        trx_list: &mut Vec<CommittedTrx<P>>,
+    ) {
         // If a transaction's committed timestamp is less than the smallest
         // snapshot timestamp of all active transactions, it means this transction's
         // data vesion is latest and all its undo log can be purged.
@@ -298,7 +302,7 @@ impl GCBucket {
 
     /// Analyze committed transactions for GC.
     #[inline]
-    pub fn gc_analyze_commit(&self, trx_list: Vec<CommittedTrx>) -> bool {
+    pub fn gc_analyze_commit(&self, trx_list: Vec<CommittedTrx<P>>) -> bool {
         // Update both active sts list and committed transaction list
         let mut active_sts_list = self.active_sts_list.lock();
         let mut min_sts = MAX_SNAPSHOT_TS;
@@ -338,10 +342,10 @@ impl GCBucket {
     }
 }
 
-pub(super) enum GC {
+pub enum GC<P: BufferPool> {
     Stop,
     // transaction list per gc bucket.
-    Commit(HashMap<usize, Vec<CommittedTrx>>),
+    Commit(HashMap<usize, Vec<CommittedTrx<P>>>),
 }
 
 pub enum Purge {
@@ -361,7 +365,7 @@ trait PurgeLoop {
         &mut self,
         buf_pool: &'static P,
         catalog: &Catalog<P>,
-        trx_sys: &TransactionSystem,
+        trx_sys: &TransactionSystem<P>,
         purge_chan: Receiver<Purge>,
     );
 }
@@ -375,7 +379,7 @@ impl PurgeLoop for PurgeSingleThreaded {
         &mut self,
         buf_pool: &'static P,
         catalog: &Catalog<P>,
-        trx_sys: &TransactionSystem,
+        trx_sys: &TransactionSystem<P>,
         purge_chan: Receiver<Purge>,
     ) {
         while let Ok(purge) = purge_chan.recv() {
@@ -415,7 +419,7 @@ impl PurgeLoop for PurgeDispatcher {
         &mut self,
         _buf_pool: &'static P,
         _catalog: &Catalog<P>,
-        trx_sys: &TransactionSystem,
+        trx_sys: &TransactionSystem<P>,
         purge_chan: Receiver<Purge>,
     ) {
         // let chans = self.init(trx_sys);
@@ -469,7 +473,7 @@ impl PurgeExecutor {
         &mut self,
         buf_pool: &'static P,
         catalog: &Catalog<P>,
-        trx_sys: &TransactionSystem,
+        trx_sys: &TransactionSystem<P>,
         purge_chan: Receiver<PurgeTask>,
     ) {
         while let Ok(PurgeTask {
@@ -495,14 +499,12 @@ impl PurgeExecutor {
 mod tests {
     use super::*;
     use crate::buffer::guard::PageSharedGuard;
-    use crate::buffer::FixedBufferPool;
-    use crate::catalog::Catalog;
+    use crate::engine::Engine;
     use crate::index::RowLocation;
     use crate::latch::LatchFallbackMode;
     use crate::lifetime::StaticLifetime;
     use crate::row::ops::SelectKey;
     use crate::row::RowPage;
-    use crate::session::Session;
     use crate::trx::sys::TrxSysConfig;
     use crate::value::Val;
     use std::time::{Duration, Instant};
@@ -540,43 +542,40 @@ mod tests {
 
         const PURGE_SIZE: usize = 1000;
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(16 * 1024 * 1024).unwrap();
-            let catalog = Catalog::empty_static(buf_pool).await;
-            let trx_sys = TrxSysConfig::default()
-                .purge_threads(1)
-                .build_static(buf_pool, catalog);
+            let engine =
+                Engine::new_fixed(16 * 1024 * 1024, TrxSysConfig::default().purge_threads(1))
+                    .await
+                    .unwrap();
 
-            let table_id = table1(buf_pool, trx_sys, catalog).await;
-            let table = catalog.get_table(table_id).unwrap();
+            let table_id = table1(engine).await;
+            let table = engine.catalog.get_table(table_id).unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
             smol::Timer::after(Duration::from_millis(100)).await;
-            let init_stats = trx_sys.trx_sys_stats();
+            let init_stats = engine.trx_sys.trx_sys_stats();
 
-            let mut session = Session::new();
+            let mut session = engine.new_session();
             // insert
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx(trx_sys);
+                let mut trx = session.begin_trx();
                 let mut stmt = trx.start_stmt();
-                let res = table
-                    .insert_row(buf_pool, &mut stmt, vec![Val::from(i as i32)])
-                    .await;
+                let res = stmt.insert_row(&table, vec![Val::from(i as i32)]).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
-                let res = trx_sys.commit(trx, buf_pool, catalog).await;
+                let res = trx.commit().await;
                 assert!(res.is_ok());
                 session = res.unwrap();
             }
             // delete
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx(trx_sys);
+                let mut trx = session.begin_trx();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
-                let res = table.delete_row(buf_pool, &mut stmt, &key).await;
+                let res = stmt.delete_row(&table, &key).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
-                let res = trx_sys.commit(trx, buf_pool, catalog).await;
+                let res = trx.commit().await;
                 assert!(res.is_ok());
                 session = res.unwrap();
             }
@@ -584,7 +583,7 @@ mod tests {
             // wait for GC.
             let start = Instant::now();
             loop {
-                let stats = trx_sys.trx_sys_stats();
+                let stats = engine.trx_sys.trx_sys_stats();
                 assert!(stats.purge_trx_count <= init_stats.purge_trx_count + PURGE_SIZE * 2);
                 assert!(stats.purge_row_count <= init_stats.purge_row_count + PURGE_SIZE * 2);
                 assert!(stats.purge_index_count <= init_stats.purge_index_count + PURGE_SIZE);
@@ -605,9 +604,7 @@ mod tests {
                 }
             }
             unsafe {
-                StaticLifetime::drop_static(trx_sys);
-                StaticLifetime::drop_static(catalog);
-                StaticLifetime::drop_static(buf_pool);
+                StaticLifetime::drop_static(engine);
             }
         });
     }
@@ -618,43 +615,40 @@ mod tests {
 
         smol::block_on(async {
             const PURGE_SIZE: usize = 1000;
-            let buf_pool = FixedBufferPool::with_capacity_static(16 * 1024 * 1024).unwrap();
-            let catalog = Catalog::empty_static(buf_pool).await;
-            let trx_sys = TrxSysConfig::default()
-                .purge_threads(2)
-                .build_static(buf_pool, catalog);
+            let engine =
+                Engine::new_fixed(16 * 1024 * 1024, TrxSysConfig::default().purge_threads(2))
+                    .await
+                    .unwrap();
 
-            let table_id = table1(buf_pool, trx_sys, catalog).await;
-            let table = catalog.get_table(table_id).unwrap();
+            let table_id = table1(engine).await;
+            let table = engine.catalog.get_table(table_id).unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
             smol::Timer::after(Duration::from_millis(100)).await;
-            let init_stats = trx_sys.trx_sys_stats();
+            let init_stats = engine.trx_sys.trx_sys_stats();
 
-            let mut session = Session::new();
+            let mut session = engine.new_session();
             // insert
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx(trx_sys);
+                let mut trx = session.begin_trx();
                 let mut stmt = trx.start_stmt();
-                let res = table
-                    .insert_row(buf_pool, &mut stmt, vec![Val::from(i as i32)])
-                    .await;
+                let res = stmt.insert_row(&table, vec![Val::from(i as i32)]).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
-                let res = trx_sys.commit(trx, buf_pool, catalog).await;
+                let res = trx.commit().await;
                 assert!(res.is_ok());
                 session = res.unwrap();
             }
             // delete
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx(trx_sys);
+                let mut trx = session.begin_trx();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
-                let res = table.delete_row(buf_pool, &mut stmt, &key).await;
+                let res = stmt.delete_row(&table, &key).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
-                let res = trx_sys.commit(trx, buf_pool, catalog).await;
+                let res = trx.commit().await;
                 assert!(res.is_ok());
                 session = res.unwrap();
             }
@@ -663,7 +657,7 @@ mod tests {
             let start = Instant::now();
             let mut gc_timeout = false;
             loop {
-                let stats = trx_sys.trx_sys_stats();
+                let stats = engine.trx_sys.trx_sys_stats();
                 assert!(stats.purge_trx_count <= init_stats.purge_trx_count + PURGE_SIZE * 2);
                 assert!(stats.purge_row_count <= init_stats.purge_row_count + PURGE_SIZE * 2);
                 assert!(stats.purge_index_count <= init_stats.purge_index_count + PURGE_SIZE);
@@ -692,12 +686,13 @@ mod tests {
                 index.scan_values(&mut remained_row_ids);
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
-                let location = table.blk_idx.find_row_id(buf_pool, row_id).await;
+                let location = table.blk_idx.find_row_id(&engine.buf_pool, row_id).await;
                 let page_id = match location {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
                 };
-                let page_guard: PageSharedGuard<RowPage> = buf_pool
+                let page_guard: PageSharedGuard<RowPage> = engine
+                    .buf_pool
                     .get_page(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -708,12 +703,10 @@ mod tests {
             }
             println!(
                 "final min_active_sts={}",
-                trx_sys.min_active_sts.load(Ordering::Relaxed)
+                engine.trx_sys.min_active_sts.load(Ordering::Relaxed)
             );
             unsafe {
-                TransactionSystem::drop_static(trx_sys);
-                Catalog::drop_static(catalog);
-                FixedBufferPool::drop_static(buf_pool);
+                StaticLifetime::drop_static(engine);
             }
         });
     }

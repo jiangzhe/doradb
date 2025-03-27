@@ -1,10 +1,10 @@
 use crate::buffer::{BufferPool, EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
-use crate::catalog::Catalog;
-use crate::lifetime::{StaticLifetime, StaticLifetimeRef};
+use crate::engine::{Engine, EngineConfig};
+use crate::lifetime::StaticLifetime;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::session::Session;
 use crate::table::Table;
-use crate::trx::sys::{TransactionSystem, TrxSysConfig};
+use crate::trx::sys::TrxSysConfig;
 use crate::trx::ActiveTrx;
 use crate::value::Val;
 
@@ -15,18 +15,18 @@ fn test_mvcc_insert_normal() {
 
         let sys = TestSys::new_fixed().await;
 
-        let mut session = Session::new();
+        let mut session = sys.new_session();
         {
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
             }
-            session = sys.commit(trx).await;
+            session = trx.commit().await.unwrap();
         }
         {
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             for i in 16..SIZE {
                 let key = SelectKey::new(0, vec![Val::from(i)]);
                 trx = sys
@@ -38,7 +38,7 @@ fn test_mvcc_insert_normal() {
                     })
                     .await;
             }
-            let _ = sys.commit(trx).await;
+            let _ = trx.commit().await.unwrap();
         }
     });
 }
@@ -50,18 +50,18 @@ fn test_mvcc_update_normal() {
 
         let sys = TestSys::new_fixed().await;
         {
-            let mut session = Session::new();
+            let mut session = sys.new_session();
             // insert 1000 rows
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
             }
-            session = sys.commit(trx).await;
+            session = trx.commit().await.unwrap();
 
             // update 1 row with short value
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             let k1 = single_key(1i32);
             let s1 = "hello";
             let update1 = vec![UpdateCol {
@@ -69,10 +69,10 @@ fn test_mvcc_update_normal() {
                 val: Val::from(s1),
             }];
             trx = sys.trx_update(trx, &k1, update1).await;
-            session = sys.commit(trx).await;
+            session = trx.commit().await.unwrap();
 
             // update 1 row with long value
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             let k2 = single_key(100i32);
             let s2: String = (0..50_000).map(|_| '1').collect();
             let update2 = vec![UpdateCol {
@@ -90,10 +90,10 @@ fn test_mvcc_update_normal() {
                 })
                 .await;
 
-            session = sys.commit(trx).await;
+            session = trx.commit().await.unwrap();
 
             // lookup with a new transaction
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             trx = sys
                 .trx_select(trx, &k2, |row| {
                     assert!(row.len() == 2);
@@ -102,7 +102,7 @@ fn test_mvcc_update_normal() {
                 })
                 .await;
 
-            let _ = sys.commit(trx).await;
+            let _ = trx.commit().await.unwrap();
         }
     });
 }
@@ -114,31 +114,31 @@ fn test_mvcc_delete_normal() {
 
         let sys = TestSys::new_fixed().await;
         {
-            let mut session = Session::new();
+            let mut session = sys.new_session();
             // insert 1000 rows
             // let mut trx = session.begin_trx(trx_sys);
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
             }
-            session = sys.commit(trx).await;
+            session = trx.commit().await.unwrap();
 
             // delete 1 row
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             let k1 = single_key(1i32);
             trx = sys.trx_delete(trx, &k1).await;
 
             // lookup row in same transaction
             trx = sys.trx_select_not_found(trx, &k1).await;
-            session = sys.commit(trx).await;
+            session = trx.commit().await.unwrap();
 
             // lookup row in new transaction
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             let k1 = single_key(1i32);
             trx = sys.trx_select_not_found(trx, &k1).await;
-            let _ = sys.commit(trx).await;
+            let _ = trx.commit().await.unwrap();
         }
     });
 }
@@ -148,13 +148,13 @@ fn test_mvcc_rollback_insert_normal() {
     smol::block_on(async {
         let sys = TestSys::new_fixed().await;
         {
-            let mut session = Session::new();
+            let mut session = sys.new_session();
             // insert 1 row
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             let insert = vec![Val::from(1i32), Val::from("hello")];
             trx = sys.trx_insert(trx, insert).await;
             // explicit rollback
-            session = sys.rollback(trx).await;
+            session = trx.rollback().await;
 
             // select 1 row
             let key = single_key(1i32);
@@ -168,7 +168,7 @@ fn test_mvcc_insert_link_unique_index() {
     smol::block_on(async {
         let sys = TestSys::new_fixed().await;
         {
-            let mut session = Session::new();
+            let mut session = sys.new_session();
             // insert 1 row
             let insert = vec![Val::from(1i32), Val::from("hello")];
             session = sys.new_trx_insert(session, insert).await;
@@ -198,7 +198,7 @@ fn test_mvcc_rollback_insert_link_unique_index() {
     smol::block_on(async {
         let sys = TestSys::new_fixed().await;
         {
-            let mut session = Session::new();
+            let mut session = sys.new_session();
             // insert 1 row
             let insert = vec![Val::from(1i32), Val::from("hello")];
             session = sys.new_trx_insert(session, insert).await;
@@ -209,10 +209,10 @@ fn test_mvcc_rollback_insert_link_unique_index() {
 
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("world")];
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             trx = sys.trx_insert(trx, insert).await;
             // explicit rollback
-            session = sys.rollback(trx).await;
+            session = trx.rollback().await;
 
             // select 1 row
             let key = single_key(1i32);
@@ -226,14 +226,14 @@ fn test_mvcc_insert_link_update() {
     smol::block_on(async {
         let sys = TestSys::new_fixed().await;
         {
-            let mut session = Session::new();
+            let mut session = sys.new_session();
             // insert 1 row: v1=1, v2=hello
             let insert = vec![Val::from(1i32), Val::from("hello")];
             session = sys.new_trx_insert(session, insert).await;
 
             // open one session and trnasaction to see this row
-            let sess1 = Session::new();
-            let mut trx1 = sys.new_trx(sess1);
+            let sess1 = sys.new_session();
+            let mut trx1 = sess1.begin_trx();
 
             // update it: v1=2, v2=world
             let key = single_key(1i32);
@@ -250,8 +250,8 @@ fn test_mvcc_insert_link_update() {
             session = sys.new_trx_update(session, &key, update).await;
 
             // open session and transaction to see row 2
-            let sess2 = Session::new();
-            let mut trx2 = sys.new_trx(sess2);
+            let sess2 = sys.new_session();
+            let mut trx2 = sess2.begin_trx();
 
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("rust")];
@@ -265,7 +265,7 @@ fn test_mvcc_insert_link_update() {
                     assert!(vals[1] == Val::from("hello"));
                 })
                 .await;
-            _ = sys.commit(trx1).await;
+            _ = trx1.commit().await.unwrap();
 
             // use transaction 2 to see version 2.
             let key = single_key(2i32);
@@ -275,7 +275,7 @@ fn test_mvcc_insert_link_update() {
                     assert!(vals[1] == Val::from("world"));
                 })
                 .await;
-            _ = sys.commit(trx2).await;
+            _ = trx2.commit().await.unwrap();
 
             // use new transaction to see version 3.
             let key = single_key(1i32);
@@ -294,14 +294,14 @@ fn test_mvcc_update_link_insert() {
     smol::block_on(async {
         let sys = TestSys::new_fixed().await;
         {
-            let mut session = Session::new();
+            let mut session = sys.new_session();
             // insert 1 row: v1=1, v2=hello
             let insert = vec![Val::from(1i32), Val::from("hello")];
             session = sys.new_trx_insert(session, insert).await;
 
             // open one session and trnasaction to see this row
-            let sess1 = Session::new();
-            let mut trx1 = sys.new_trx(sess1);
+            let sess1 = sys.new_session();
+            let mut trx1 = sess1.begin_trx();
 
             // update it: v1=2, v2=world
             let key = single_key(1i32);
@@ -318,8 +318,8 @@ fn test_mvcc_update_link_insert() {
             session = sys.new_trx_update(session, &key, update).await;
 
             // open session and transaction to see row 2
-            let sess2 = Session::new();
-            let mut trx2 = sys.new_trx(sess2);
+            let sess2 = sys.new_session();
+            let mut trx2 = sess2.begin_trx();
 
             // insert v1=5, v2=rust
             let insert = vec![Val::from(5i32), Val::from("rust")];
@@ -347,7 +347,7 @@ fn test_mvcc_update_link_insert() {
                     assert!(vals[1] == Val::from("hello"));
                 })
                 .await;
-            _ = sys.commit(trx1).await;
+            _ = trx1.commit().await;
 
             // use transaction 2 to see version 2.
             let key = single_key(2i32);
@@ -357,7 +357,7 @@ fn test_mvcc_update_link_insert() {
                     assert!(vals[1] == Val::from("world"));
                 })
                 .await;
-            _ = sys.commit(trx2).await;
+            _ = trx2.commit().await;
 
             // use new transaction to see version 3.
             let key = single_key(1i32);
@@ -375,16 +375,16 @@ fn test_mvcc_multi_update() {
     smol::block_on(async {
         let sys = TestSys::new_fixed().await;
         {
-            let mut session = Session::new();
+            let mut session = sys.new_session();
             // insert: v1
             let insert = vec![Val::from(1i32), Val::from("hello")];
             session = sys.new_trx_insert(session, insert).await;
 
             // transaction to see version 1
-            let sess1 = Session::new();
-            let mut trx1 = sys.new_trx(sess1);
+            let sess1 = sys.new_session();
+            let mut trx1 = sess1.begin_trx();
 
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             // update 1: v2
             let key = single_key(1i32);
             let update = vec![UpdateCol {
@@ -417,7 +417,7 @@ fn test_mvcc_multi_update() {
                     assert!(vals[1] == Val::from("world"));
                 })
                 .await;
-            sys.commit(trx).await;
+            trx.commit().await.unwrap();
 
             //v1 found
             let key = single_key(1i32);
@@ -427,7 +427,7 @@ fn test_mvcc_multi_update() {
                     assert!(vals[1] == Val::from("hello"));
                 })
                 .await;
-            sys.commit(trx1).await;
+            trx1.commit().await.unwrap();
         }
     });
 }
@@ -439,9 +439,9 @@ fn test_evict_pool_insert_full() {
 
         let sys = TestSys::new_evictable().await;
         {
-            let session = Session::new();
+            let session = sys.new_session();
             // insert 1000 rows
-            let mut trx = sys.new_trx(session);
+            let mut trx = session.begin_trx();
             for i in 0..SIZE {
                 // make string 1KB long, so a page can only hold about 60 rows.
                 let s: String = (0..1000).map(|_| 'a').collect();
@@ -449,16 +449,17 @@ fn test_evict_pool_insert_full() {
                 trx = sys.trx_insert(trx, insert).await;
                 println!("trx {}", i);
             }
-            let _ = sys.commit(trx).await;
+            let _ = trx.commit().await.unwrap();
             println!("commit end");
         }
     });
 }
 
 struct TestSys<P: BufferPool> {
-    buf_pool: &'static P,
-    catalog: &'static Catalog<P>,
-    trx_sys: &'static TransactionSystem,
+    // buf_pool: &'static P,
+    // catalog: &'static Catalog<P>,
+    // trx_sys: &'static TransactionSystem,
+    engine: &'static Engine<P>,
     table: Table<P>,
 }
 
@@ -467,17 +468,12 @@ impl TestSys<FixedBufferPool> {
     async fn new_fixed() -> Self {
         use crate::catalog::tests::table2;
         // 64KB * 16
-        let buf_pool = FixedBufferPool::with_capacity_static(1024 * 1024).unwrap();
-        let catalog = Catalog::empty_static(buf_pool).await;
-        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = table2(buf_pool, trx_sys, catalog).await;
-        let table: Table<FixedBufferPool> = catalog.get_table(table_id).unwrap();
-        TestSys {
-            buf_pool,
-            catalog,
-            trx_sys,
-            table,
-        }
+        let engine = Engine::new_fixed(1024 * 1024, TrxSysConfig::default())
+            .await
+            .unwrap();
+        let table_id = table2(engine).await;
+        let table = engine.catalog.get_table(table_id).unwrap();
+        TestSys { engine, table }
     }
 }
 
@@ -486,39 +482,33 @@ impl TestSys<EvictableBufferPool> {
     async fn new_evictable() -> Self {
         use crate::catalog::tests::table2;
         // 64KB * 16
-        let buf_pool = EvictableBufferPoolConfig::default()
-            .max_mem_size(1024u64 * 1024)
-            .max_file_size(1024u64 * 1024 * 32)
+        let engine = EngineConfig::default()
+            .buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(1024u64 * 1024)
+                    .max_file_size(1024u64 * 1024 * 32),
+            )
             .build_static()
+            .await
             .unwrap();
-        let catalog = Catalog::empty_static(buf_pool).await;
-        let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-        let table_id = table2(buf_pool, trx_sys, catalog).await;
-        let table = catalog.get_table(table_id).unwrap();
-        TestSys {
-            buf_pool,
-            catalog,
-            trx_sys,
-            table,
-        }
+        let table_id = table2(engine).await;
+        let table = engine.catalog.get_table(table_id).unwrap();
+        TestSys { engine, table }
     }
 }
 
 impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
-    async fn new_trx_insert(&self, session: Session, insert: Vec<Val>) -> Session {
-        let mut trx = session.begin_trx(self.trx_sys);
+    async fn new_trx_insert(&self, session: Session<P>, insert: Vec<Val>) -> Session<P> {
+        let mut trx = session.begin_trx();
         trx = self.trx_insert(trx, insert).await;
-        self.commit(trx).await
+        trx.commit().await.unwrap()
     }
 
     #[inline]
-    async fn trx_insert(&self, trx: ActiveTrx, insert: Vec<Val>) -> ActiveTrx {
+    async fn trx_insert(&self, trx: ActiveTrx<P>, insert: Vec<Val>) -> ActiveTrx<P> {
         let mut stmt = trx.start_stmt();
-        let res = self
-            .table
-            .insert_row(self.buf_pool, &mut stmt, insert)
-            .await;
+        let res = stmt.insert_row(&self.table, insert).await;
         if !res.is_ok() {
             panic!("res={:?}", res);
         }
@@ -527,16 +517,16 @@ impl<P: BufferPool + 'static> TestSys<P> {
     }
 
     #[inline]
-    async fn new_trx_delete(&self, session: Session, key: &SelectKey) -> Session {
-        let mut trx = session.begin_trx(self.trx_sys);
+    async fn new_trx_delete(&self, session: Session<P>, key: &SelectKey) -> Session<P> {
+        let mut trx = session.begin_trx();
         trx = self.trx_delete(trx, key).await;
-        self.commit(trx).await
+        trx.commit().await.unwrap()
     }
 
     #[inline]
-    async fn trx_delete(&self, trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
+    async fn trx_delete(&self, trx: ActiveTrx<P>, key: &SelectKey) -> ActiveTrx<P> {
         let mut stmt = trx.start_stmt();
-        let res = self.table.delete_row(self.buf_pool, &mut stmt, key).await;
+        let res = stmt.delete_row(&self.table, key).await;
         if !res.is_ok() {
             panic!("res={:?}", res);
         }
@@ -547,27 +537,24 @@ impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
     async fn new_trx_update(
         &self,
-        session: Session,
+        session: Session<P>,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> Session {
-        let mut trx = session.begin_trx(self.trx_sys);
+    ) -> Session<P> {
+        let mut trx = session.begin_trx();
         trx = self.trx_update(trx, key, update).await;
-        self.commit(trx).await
+        trx.commit().await.unwrap()
     }
 
     #[inline]
     async fn trx_update(
         &self,
-        trx: ActiveTrx,
+        trx: ActiveTrx<P>,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> ActiveTrx {
+    ) -> ActiveTrx<P> {
         let mut stmt = trx.start_stmt();
-        let res = self
-            .table
-            .update_row(self.buf_pool, &mut stmt, key, update)
-            .await;
+        let res = stmt.update_row(&self.table, key, update).await;
         if !res.is_ok() {
             panic!("res={:?}", res);
         }
@@ -578,29 +565,26 @@ impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
     async fn new_trx_select<F: FnOnce(Vec<Val>)>(
         &self,
-        session: Session,
+        session: Session<P>,
         key: &SelectKey,
         action: F,
-    ) -> Session {
-        let mut trx = session.begin_trx(self.trx_sys);
+    ) -> Session<P> {
+        let mut trx = session.begin_trx();
         trx = self.trx_select(trx, key, action).await;
-        self.commit(trx).await
+        trx.commit().await.unwrap()
     }
 
     #[inline]
-    async fn new_trx_select_not_found(&self, session: Session, key: &SelectKey) -> Session {
-        let mut trx = session.begin_trx(self.trx_sys);
+    async fn new_trx_select_not_found(&self, session: Session<P>, key: &SelectKey) -> Session<P> {
+        let mut trx = session.begin_trx();
         trx = self.trx_select_not_found(trx, key).await;
-        self.commit(trx).await
+        trx.commit().await.unwrap()
     }
 
     #[inline]
-    async fn trx_select_not_found(&self, trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
+    async fn trx_select_not_found(&self, trx: ActiveTrx<P>, key: &SelectKey) -> ActiveTrx<P> {
         let stmt = trx.start_stmt();
-        let res = self
-            .table
-            .select_row_mvcc(self.buf_pool, &stmt, key, &[0, 1])
-            .await;
+        let res = stmt.select_row_mvcc(&self.table, key, &[0, 1]).await;
         assert!(res.not_found());
         stmt.succeed()
     }
@@ -608,15 +592,12 @@ impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
     async fn trx_select<F: FnOnce(Vec<Val>)>(
         &self,
-        trx: ActiveTrx,
+        trx: ActiveTrx<P>,
         key: &SelectKey,
         action: F,
-    ) -> ActiveTrx {
+    ) -> ActiveTrx<P> {
         let stmt = trx.start_stmt();
-        let res = self
-            .table
-            .select_row_mvcc(self.buf_pool, &stmt, key, &[0, 1])
-            .await;
+        let res = stmt.select_row_mvcc(&self.table, key, &[0, 1]).await;
         if !res.is_ok() {
             panic!("res={:?}", res);
         }
@@ -626,23 +607,8 @@ impl<P: BufferPool + 'static> TestSys<P> {
     }
 
     #[inline]
-    async fn commit(&self, trx: ActiveTrx) -> Session {
-        self.trx_sys
-            .commit(trx, self.buf_pool, self.catalog)
-            .await
-            .unwrap()
-    }
-
-    #[inline]
-    async fn rollback(&self, trx: ActiveTrx) -> Session {
-        self.trx_sys
-            .rollback(trx, self.buf_pool, self.catalog)
-            .await
-    }
-
-    #[inline]
-    fn new_trx(&self, session: Session) -> ActiveTrx {
-        session.begin_trx(self.trx_sys)
+    fn new_session(&self) -> Session<P> {
+        self.engine.new_session()
     }
 }
 
@@ -650,9 +616,7 @@ impl<P: BufferPool + 'static> Drop for TestSys<P> {
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            StaticLifetime::drop_static(self.trx_sys);
-            StaticLifetime::drop_static(self.catalog);
-            StaticLifetimeRef::drop_static(self.buf_pool);
+            StaticLifetime::drop_static(self.engine);
         }
     }
 }

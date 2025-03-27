@@ -58,6 +58,13 @@ pub struct EvictableBufferPool {
 
 impl EvictableBufferPool {
     #[inline]
+    pub fn start(&'static self, start_ctx: EvictableBufferPoolStartContext) {
+        self.start_io_read_thread(start_ctx.io_read_rx);
+        self.start_io_write_thread(start_ctx.io_write_rx);
+        self.start_evict_thread();
+    }
+
+    #[inline]
     pub fn stats(&self) -> &EvictableBufferPoolStats {
         &self.stats
     }
@@ -1257,9 +1264,11 @@ impl EvictableBufferPoolConfig {
         self
     }
 
-    /// Create a new evictable buffer pool with given capacity.
     #[inline]
-    pub fn build_static(self) -> Result<&'static EvictableBufferPool> {
+    pub fn build(self) -> Result<(EvictableBufferPool, EvictableBufferPoolStartContext)> {
+        let (io_read_tx, io_read_rx) = flume::unbounded();
+        let (io_write_tx, io_write_rx) = flume::unbounded();
+
         // 1. Calculate memory usage.
         let max_file_size = self.max_file_size.as_u64() as usize;
         let max_mem_size = self.max_mem_size.as_u64() as usize;
@@ -1317,9 +1326,6 @@ impl EvictableBufferPoolConfig {
             (*frames.add(max_nbr - 1)).next_free = INVALID_PAGE_ID;
         }
 
-        let (io_read_tx, io_read_rx) = flume::unbounded();
-        let (io_write_tx, io_write_rx) = flume::unbounded();
-
         let pool = EvictableBufferPool {
             frames,
             pages,
@@ -1331,10 +1337,21 @@ impl EvictableBufferPoolConfig {
             inflight_io: CachePadded::new(InflightIO::default()),
             stats: CachePadded::new(EvictableBufferPoolStats::default()),
         };
+        Ok((
+            pool,
+            EvictableBufferPoolStartContext {
+                io_read_rx,
+                io_write_rx,
+            },
+        ))
+    }
+
+    /// Create a new evictable buffer pool with given capacity.
+    #[inline]
+    pub fn build_static(self) -> Result<&'static EvictableBufferPool> {
+        let (pool, start_ctx) = self.build()?;
         let pool = StaticLifetime::new_static(pool);
-        pool.start_io_read_thread(io_read_rx);
-        pool.start_io_write_thread(io_write_rx);
-        pool.start_evict_thread();
+        pool.start(start_ctx);
         Ok(pool)
     }
 }
@@ -1478,6 +1495,13 @@ impl ClockHand {
             *self = ClockHand::FromTo(start.., ..start)
         }
     }
+}
+
+pub struct EvictableBufferPoolStartContext {
+    // Receiver side of IO read requests, used by IO read thread.
+    pub io_read_rx: Receiver<BufferRequest>,
+    // Receiver side of IO write requests, used by IO write thread.
+    pub io_write_rx: Receiver<BufferRequest>,
 }
 
 #[cfg(test)]

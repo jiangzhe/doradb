@@ -5,12 +5,10 @@ use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
 use doradb_storage::buffer::BufferPool;
-use doradb_storage::buffer::FixedBufferPool;
-use doradb_storage::catalog::Catalog;
+use doradb_storage::engine::Engine;
 use doradb_storage::lifetime::StaticLifetime;
-use doradb_storage::session::Session;
 use doradb_storage::trx::log::LogSync;
-use doradb_storage::trx::sys::{TransactionSystem, TrxSysConfig};
+use doradb_storage::trx::sys::TrxSysConfig;
 use easy_parallel::Parallel;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,16 +20,18 @@ fn main() {
     smol::block_on(async {
         let args = Args::parse();
 
-        let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-        let catalog = Catalog::empty_static(buf_pool).await;
-        let trx_sys = TrxSysConfig::default()
-            .log_file_prefix(args.log_file_prefix.to_string())
-            .log_partitions(args.log_partitions)
-            .io_depth_per_log(args.io_depth_per_log)
-            .log_file_max_size(args.log_file_max_size)
-            .log_sync(args.log_sync)
-            .max_io_size(args.max_io_size)
-            .build_static(buf_pool, catalog);
+        let engine = Engine::new_fixed(
+            128 * 1024 * 1024,
+            TrxSysConfig::default()
+                .log_file_prefix(args.log_file_prefix.to_string())
+                .log_partitions(args.log_partitions)
+                .io_depth_per_log(args.io_depth_per_log)
+                .log_file_max_size(args.log_file_max_size)
+                .log_sync(args.log_sync)
+                .max_io_size(args.max_io_size),
+        )
+        .await
+        .unwrap();
         {
             let start = Instant::now();
             let wg = WaitGroup::new();
@@ -42,8 +42,7 @@ fn main() {
             for _ in 0..args.sessions {
                 let wg = wg.clone();
                 let stop = Arc::clone(&stop);
-                ex.spawn(worker(buf_pool, catalog, trx_sys, stop, wg))
-                    .detach();
+                ex.spawn(worker(engine, stop, wg)).detach();
             }
             // start system threads.
             let _ = Parallel::new()
@@ -60,7 +59,7 @@ fn main() {
                     }
                 });
             let dur = start.elapsed();
-            let stats = trx_sys.trx_sys_stats();
+            let stats = engine.trx_sys.trx_sys_stats();
             let total_trx_count = stats.trx_count;
             let commit_count = stats.commit_count;
             let log_bytes = stats.log_bytes;
@@ -88,27 +87,19 @@ fn main() {
         );
         }
         unsafe {
-            StaticLifetime::drop_static(trx_sys);
-            StaticLifetime::drop_static(catalog);
-            StaticLifetime::drop_static(buf_pool);
+            StaticLifetime::drop_static(engine);
         }
     })
 }
 
 #[inline]
-async fn worker<P: BufferPool>(
-    buf_pool: &'static P,
-    catalog: &Catalog<P>,
-    trx_sys: &TransactionSystem,
-    stop: Arc<AtomicBool>,
-    wg: WaitGroup,
-) {
-    let mut session = Session::new();
+async fn worker<P: BufferPool>(engine: &'static Engine<P>, stop: Arc<AtomicBool>, wg: WaitGroup) {
+    let mut session = engine.new_session();
     let stop = &*stop;
     while !stop.load(Ordering::Relaxed) {
-        let mut trx = session.begin_trx(trx_sys);
+        let mut trx = session.begin_trx();
         trx.add_pseudo_redo_log_entry();
-        match trx_sys.commit(trx, buf_pool, &catalog).await {
+        match trx.commit().await {
             Ok(s) => session = s,
             Err(_) => return,
         }

@@ -14,6 +14,32 @@ use doradb_catalog::{
 use doradb_datatype::{Collation, PreciseType};
 use semistr::SemiStr;
 
+pub struct CatalogStorage<P: BufferPool> {
+    pub schemas: Schemas<P>,
+    pub tables: Tables<P>,
+    pub columns: Columns<P>,
+    pub indexes: Indexes<P>,
+    pub index_columns: IndexColumns<P>,
+}
+
+impl<P: BufferPool> CatalogStorage<P> {
+    #[inline]
+    pub async fn new(buf_pool: &'static P) -> Self {
+        let schemas = Schemas::new(buf_pool).await;
+        let tables = Tables::new(buf_pool).await;
+        let columns = Columns::new(buf_pool).await;
+        let indexes = Indexes::new(buf_pool).await;
+        let index_columns = IndexColumns::new(buf_pool).await;
+        CatalogStorage {
+            schemas,
+            tables,
+            columns,
+            indexes,
+            index_columns,
+        }
+    }
+}
+
 /* Schemas table */
 
 pub const TABLE_ID_SCHEMAS: TableID = 0;
@@ -407,7 +433,7 @@ impl<P: BufferPool> Schemas<P> {
     pub async fn insert(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         obj: &SchemaObject,
     ) -> bool {
         let cols = vec![
@@ -422,7 +448,7 @@ impl<P: BufferPool> Schemas<P> {
     pub async fn delete_by_id(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         id: SchemaID,
     ) -> bool {
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![Val::from(id)]);
@@ -460,7 +486,7 @@ impl<P: BufferPool> Tables<P> {
     pub async fn insert(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         obj: &TableObject,
     ) -> bool {
         let cols = vec![
@@ -475,7 +501,7 @@ impl<P: BufferPool> Tables<P> {
     pub async fn delete_by_id(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         id: TableID,
     ) -> bool {
         let key = SelectKey::new(INDEX_NO_TABLES_TABLE_ID, vec![Val::from(id)]);
@@ -495,7 +521,7 @@ impl<P: BufferPool> Columns<P> {
     pub async fn insert(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         obj: &ColumnObject,
     ) -> bool {
         let cols = vec![
@@ -513,7 +539,7 @@ impl<P: BufferPool> Columns<P> {
     pub async fn delete_by_id(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         id: ColumnID,
     ) -> bool {
         let key = SelectKey::new(INDEX_NO_COLUMNS_COLUMN_ID, vec![Val::from(id)]);
@@ -533,7 +559,7 @@ impl<P: BufferPool> Indexes<P> {
     pub async fn insert(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         obj: &IndexObject,
     ) -> bool {
         let cols = vec![
@@ -549,7 +575,7 @@ impl<P: BufferPool> Indexes<P> {
     pub async fn delete_by_id(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         id: IndexID,
     ) -> bool {
         let key = SelectKey::new(INDEX_NO_INDEXES_INDEX_ID, vec![Val::from(id)]);
@@ -573,7 +599,7 @@ impl<P: BufferPool> IndexColumns<P> {
     pub async fn insert(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         obj: &IndexColumnObject,
     ) -> bool {
         let cols = vec![
@@ -587,7 +613,7 @@ impl<P: BufferPool> IndexColumns<P> {
     pub async fn delete_by_index(
         &self,
         _buf_pool: &'static P,
-        _stmt: &mut Statement,
+        _stmt: &mut Statement<P>,
         _index_id: IndexID,
     ) -> bool {
         todo!()

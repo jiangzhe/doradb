@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::io::{align_to_sector_size, AIOManagerConfig, FreeListWithFactory, PageBuf};
 use crate::lifetime::StaticLifetime;
 use crate::notify::Signal;
-use crate::session::{InternalSession, IntoSession, Session};
+use crate::session::{IntoSession, Session};
 use crate::trx::group::{Commit, GroupCommit};
 use crate::trx::log::{create_log_file, LogPartition, LogPartitionStats, LogSync};
 use crate::trx::purge::{GCBucket, Purge, GC};
@@ -59,7 +59,7 @@ use byte_unit::Byte;
 /// is persisted.
 /// As undo logs are maintained purely in memory, we can use shared pointer with atomic variable
 /// to perform very fast CTS backfill.
-pub struct TransactionSystem {
+pub struct TransactionSystem<P: BufferPool> {
     /// A sequence to generate snapshot timestamp(abbr. sts) and commit timestamp(abbr. cts).
     /// They share the same sequence and start from 1.
     /// The two timestamps are used to identify which version of data a transaction should see.
@@ -78,7 +78,7 @@ pub struct TransactionSystem {
     /// Round-robin partition id generator.
     partition_id: CachePadded<AtomicUsize>,
     /// Multiple log partitions.
-    pub(super) log_partitions: CachePadded<Box<[CachePadded<LogPartition>]>>,
+    pub(super) log_partitions: CachePadded<Box<[CachePadded<LogPartition<P>>]>>,
     /// Transaction system configuration.
     pub(super) config: CachePadded<TrxSysConfig>,
     /// Channel to send message to purge threads.
@@ -87,10 +87,24 @@ pub struct TransactionSystem {
     pub(super) purge_threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl TransactionSystem {
+impl<P: BufferPool> TransactionSystem<P> {
+    #[inline]
+    pub fn start(
+        &'static self,
+        buf_pool: &'static P,
+        catalog: &'static Catalog<P>,
+        start_ctx: TrxSysStartContext<P>,
+    ) {
+        self.start_sync_threads();
+        self.start_gc_threads(start_ctx.gc_chans);
+        self.start_purge_threads(buf_pool, catalog, start_ctx.purge_rx);
+
+        // todo: recover from log file.
+    }
+
     /// Create a new transaction.
     #[inline]
-    pub fn new_trx<'a>(&self, session: Option<Box<InternalSession>>) -> ActiveTrx {
+    pub fn begin_trx(&self, session: Session<P>) -> ActiveTrx<P> {
         // Active transaction list is calculated by group committer thread
         // so here we just generate STS and TrxID.
         let sts = self.ts.fetch_add(1, Ordering::SeqCst);
@@ -128,12 +142,7 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub async fn commit<P: BufferPool>(
-        &self,
-        trx: ActiveTrx,
-        buf_pool: &'static P,
-        catalog: &Catalog<P>,
-    ) -> Result<Session> {
+    pub async fn commit(&self, trx: ActiveTrx<P>) -> Result<Session<P>> {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_no];
@@ -151,9 +160,7 @@ impl TransactionSystem {
             // page-level undo maps.
             // In such case, we can just rollback this transaction because it actually
             // do nothing.
-            let session = self
-                .rollback_prepared(prepared_trx, buf_pool, catalog)
-                .await;
+            let session = self.rollback_prepared(prepared_trx).await;
             return Ok(session);
         }
         // start group commit
@@ -162,14 +169,10 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub async fn rollback<P: BufferPool>(
-        &self,
-        mut trx: ActiveTrx,
-        buf_pool: &'static P,
-        catalog: &Catalog<P>,
-    ) -> Session {
-        trx.row_undo.rollback(buf_pool).await;
-        trx.index_undo.rollback(catalog);
+    pub async fn rollback(&self, mut trx: ActiveTrx<P>) -> Session<P> {
+        let engine = trx.engine().unwrap();
+        trx.row_undo.rollback(&engine.buf_pool).await;
+        trx.index_undo.rollback(&engine.catalog);
         trx.redo.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session()
@@ -180,15 +183,11 @@ impl TransactionSystem {
     /// In such case, we do not need to go through entire commit process but just
     /// rollback the transaction, because it actually do nothing.
     #[inline]
-    async fn rollback_prepared<P: BufferPool>(
-        &self,
-        mut trx: PreparedTrx,
-        buf_pool: &'static P,
-        catalog: &Catalog<P>,
-    ) -> Session {
+    async fn rollback_prepared(&self, mut trx: PreparedTrx<P>) -> Session<P> {
         debug_assert!(trx.redo_bin.is_none());
-        trx.row_undo.rollback(buf_pool).await;
-        trx.index_undo.rollback(catalog);
+        let engine = trx.engine().unwrap();
+        trx.row_undo.rollback(&engine.buf_pool).await;
+        trx.index_undo.rollback(&engine.catalog);
         trx.redo_bin.take();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session()
@@ -217,7 +216,7 @@ impl TransactionSystem {
 
     /// Start background GC threads.
     #[inline]
-    fn start_gc_threads(&'static self, gc_chans: Vec<Receiver<GC>>) {
+    fn start_gc_threads(&'static self, gc_chans: Vec<Receiver<GC<P>>>) {
         for ((idx, partition), gc_rx) in self.log_partitions.iter().enumerate().zip(gc_chans) {
             let thread_name = format!("GC-Thread-{}", idx);
             let partition = &**partition;
@@ -241,13 +240,13 @@ impl TransactionSystem {
     }
 }
 
-unsafe impl StaticLifetime for TransactionSystem {}
+unsafe impl<P: BufferPool> StaticLifetime for TransactionSystem<P> {}
 
-impl UnwindSafe for TransactionSystem {}
+impl<P: BufferPool> UnwindSafe for TransactionSystem<P> {}
 
-impl RefUnwindSafe for TransactionSystem {}
+impl<P: BufferPool> RefUnwindSafe for TransactionSystem<P> {}
 
-impl Drop for TransactionSystem {
+impl<P: BufferPool> Drop for TransactionSystem<P> {
     #[inline]
     fn drop(&mut self) {
         let log_partitions = &*self.log_partitions;
@@ -393,7 +392,10 @@ impl TrxSysConfig {
         self
     }
 
-    fn setup_log_partition(&self, log_no: usize) -> (LogPartition, Receiver<GC>) {
+    fn setup_log_partition<P: BufferPool>(
+        &self,
+        log_no: usize,
+    ) -> (LogPartition<P>, Receiver<GC<P>>) {
         let aio_mgr = AIOManagerConfig::default()
             .max_events(self.io_depth_per_log)
             .build()
@@ -441,14 +443,10 @@ impl TrxSysConfig {
         )
     }
 
-    /// Build transaction system with logging and GC, leak it to heap
-    /// for the convenience to share the singleton among multiple threads.
     #[inline]
-    pub fn build_static<P: BufferPool>(
-        self,
-        buf_pool: &'static P,
-        catalog: &'static Catalog<P>,
-    ) -> &'static TransactionSystem {
+    pub fn build<P: BufferPool>(self) -> (TransactionSystem<P>, TrxSysStartContext<P>) {
+        let (purge_chan, purge_rx) = flume::unbounded();
+
         let mut log_partitions = Vec::with_capacity(self.log_partitions);
         let mut gc_chans = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
@@ -456,7 +454,6 @@ impl TrxSysConfig {
             log_partitions.push(CachePadded::new(partition));
             gc_chans.push(gc_rx);
         }
-        let (purge_chan, purge_rx) = flume::unbounded();
         let trx_sys = TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
             min_active_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
@@ -466,10 +463,20 @@ impl TrxSysConfig {
             purge_chan,
             purge_threads: Mutex::new(vec![]),
         };
+        (trx_sys, TrxSysStartContext { purge_rx, gc_chans })
+    }
+
+    /// Build transaction system with logging and GC, leak it to heap
+    /// for the convenience to share the singleton among multiple threads.
+    #[inline]
+    pub fn build_static<P: BufferPool>(
+        self,
+        buf_pool: &'static P,
+        catalog: &'static Catalog<P>,
+    ) -> &'static TransactionSystem<P> {
+        let (trx_sys, start_ctx) = self.build();
         let trx_sys = StaticLifetime::new_static(trx_sys);
-        trx_sys.start_sync_threads();
-        trx_sys.start_gc_threads(gc_chans);
-        trx_sys.start_purge_threads(buf_pool, catalog, purge_rx);
+        trx_sys.start(buf_pool, catalog, start_ctx);
         trx_sys
     }
 }
@@ -505,12 +512,17 @@ pub struct TrxSysStats {
     pub purge_index_count: usize,
 }
 
+pub struct TrxSysStartContext<P: BufferPool> {
+    // Receiver side of purge requests, used by dispatcher/purge thread.
+    pub purge_rx: Receiver<Purge>,
+    // Receiver side of GC requests, used by purge thread.
+    pub gc_chans: Vec<Receiver<GC<P>>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::FixedBufferPool;
-    use crate::catalog::Catalog;
-    use crate::session::Session;
+    use crate::engine::Engine;
     use crate::value::Val;
     use crossbeam_utils::CachePadded;
     use parking_lot::Mutex;
@@ -521,25 +533,23 @@ mod tests {
     #[test]
     fn test_transaction_system() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-            let catalog = Catalog::empty_static(buf_pool).await;
-            let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-            let session = Session::new();
+            let engine = Engine::new_fixed(128 * 1024 * 1024, TrxSysConfig::default())
+                .await
+                .unwrap();
+            let session = engine.new_session();
             {
-                let trx = session.begin_trx(trx_sys);
-                let _ = smol::block_on(trx_sys.commit(trx, buf_pool, catalog));
+                let trx = session.begin_trx();
+                let _ = smol::block_on(trx.commit());
             }
             std::thread::spawn(move || {
-                let session = Session::new();
-                let trx = session.begin_trx(trx_sys);
-                let _ = smol::block_on(trx_sys.commit(trx, buf_pool, catalog));
+                let session = engine.new_session();
+                let trx = session.begin_trx();
+                let _ = smol::block_on(trx.commit());
             })
             .join()
             .unwrap();
             unsafe {
-                StaticLifetime::drop_static(trx_sys);
-                StaticLifetime::drop_static(catalog);
-                StaticLifetime::drop_static(buf_pool);
+                StaticLifetime::drop_static(engine);
             }
         })
     }
@@ -676,14 +686,14 @@ mod tests {
     fn test_single_thread_trx_begin_and_commit() {
         const COUNT: usize = 1000000;
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-            let catalog = Catalog::empty_static(buf_pool).await;
-            let trx_sys = TrxSysConfig::default().build_static(buf_pool, catalog);
-            let mut session = Session::new();
+            let engine = Engine::new_fixed(128 * 1024 * 1024, TrxSysConfig::default())
+                .await
+                .unwrap();
+            let mut session = engine.new_session();
             let start = Instant::now();
             for _ in 0..COUNT {
-                let trx = session.begin_trx(trx_sys);
-                let res = trx_sys.commit(trx, buf_pool, catalog).await;
+                let trx = session.begin_trx();
+                let res = trx.commit().await;
                 assert!(res.is_ok());
                 session = res.unwrap();
             }
@@ -695,9 +705,7 @@ mod tests {
                 COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
             );
             unsafe {
-                StaticLifetime::drop_static(trx_sys);
-                StaticLifetime::drop_static(catalog);
-                StaticLifetime::drop_static(buf_pool);
+                StaticLifetime::drop_static(engine);
             }
         });
     }
@@ -711,31 +719,31 @@ mod tests {
         // be higher and produce more files.
         const COUNT: usize = 10000;
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
-            let catalog = Catalog::empty_static(buf_pool).await;
-            let trx_sys = TrxSysConfig::default()
-                .log_partitions(1)
-                .log_file_max_size(1024u64 * 1024 * 5)
-                .build_static(buf_pool, catalog);
-            let table_id = table2(buf_pool, trx_sys, catalog).await;
-            let table = catalog.get_table(table_id).unwrap();
+            let engine = Engine::new_fixed(
+                128 * 1024 * 1024,
+                TrxSysConfig::default()
+                    .log_partitions(1)
+                    .log_file_max_size(1024u64 * 1024 * 5),
+            )
+            .await
+            .unwrap();
+            let table_id = table2(engine).await;
+            let table = engine.catalog.get_table(table_id).unwrap();
 
-            let mut session = Session::new();
+            let mut session = engine.new_session();
             let s = vec![1u8; 200];
             for i in 0..COUNT {
-                let trx = session.begin_trx(trx_sys);
+                let trx = session.begin_trx();
                 let mut stmt = trx.start_stmt();
                 let insert = vec![Val::from(i as i32), Val::from(&s[..])];
-                let res = table.insert_row(buf_pool, &mut stmt, insert).await;
+                let res = stmt.insert_row(&table, insert).await;
                 assert!(res.is_ok());
                 let trx = stmt.succeed();
-                session = trx_sys.commit(trx, buf_pool, catalog).await.unwrap();
+                session = trx.commit().await.unwrap();
             }
 
             unsafe {
-                StaticLifetime::drop_static(trx_sys);
-                StaticLifetime::drop_static(catalog);
-                StaticLifetime::drop_static(buf_pool);
+                StaticLifetime::drop_static(engine);
             }
         });
     }

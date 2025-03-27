@@ -9,14 +9,11 @@ use doradb_catalog::{
 };
 use doradb_datatype::{Collation, PreciseType};
 use doradb_storage::buffer::BufferPool;
-use doradb_storage::buffer::FixedBufferPool;
-use doradb_storage::catalog::Catalog;
+use doradb_storage::engine::Engine;
 use doradb_storage::lifetime::StaticLifetime;
-use doradb_storage::session::Session;
-use doradb_storage::stmt::Statement;
 use doradb_storage::table::TableID;
 use doradb_storage::trx::log::LogSync;
-use doradb_storage::trx::sys::{TransactionSystem, TrxSysConfig};
+use doradb_storage::trx::sys::TrxSysConfig;
 use doradb_storage::value::Val;
 use easy_parallel::Parallel;
 use semistr::SemiStr;
@@ -35,21 +32,22 @@ fn main() {
     smol::block_on(async {
         let args = Args::parse();
 
-        let buf_pool = FixedBufferPool::with_capacity_static(args.buffer_pool_size).unwrap();
-        println!("buffer pool size is {}", buf_pool.size());
-        let catalog = Catalog::empty_static(buf_pool).await;
-        let trx_sys = TrxSysConfig::default()
-            .log_file_prefix(args.log_file_prefix.to_string())
-            .log_partitions(args.log_partitions)
-            .io_depth_per_log(args.io_depth_per_log)
-            .log_file_max_size(args.log_file_max_size)
-            .log_sync(args.log_sync)
-            .max_io_size(args.max_io_size)
-            .purge_threads(args.purge_threads)
-            .build_static(buf_pool, catalog);
-        // create empty table
+        let engine = Engine::new_fixed(
+            args.buffer_pool_size,
+            TrxSysConfig::default()
+                .log_file_prefix(args.log_file_prefix.to_string())
+                .log_partitions(args.log_partitions)
+                .io_depth_per_log(args.io_depth_per_log)
+                .log_file_max_size(args.log_file_max_size)
+                .log_sync(args.log_sync)
+                .max_io_size(args.max_io_size)
+                .purge_threads(args.purge_threads),
+        )
+        .await
+        .unwrap();
+        println!("buffer pool size is {}", engine.buf_pool.size());
 
-        let table_id = sbtest(buf_pool, trx_sys, catalog).await;
+        let table_id = sbtest(engine).await;
         // start benchmark
         {
             let start = Instant::now();
@@ -62,9 +60,7 @@ fn main() {
                 let wg = wg.clone();
                 let stop = Arc::clone(&stop);
                 ex.spawn(worker(
-                    buf_pool,
-                    trx_sys,
-                    catalog,
+                    engine,
                     table_id,
                     sess_id as i32,
                     args.sessions as i32,
@@ -88,7 +84,7 @@ fn main() {
                     }
                 });
             let dur = start.elapsed();
-            let stats = trx_sys.trx_sys_stats();
+            let stats = engine.trx_sys.trx_sys_stats();
             let total_trx_count = stats.trx_count;
             let commit_count = stats.commit_count;
             let log_bytes = stats.log_bytes;
@@ -142,26 +138,22 @@ fn main() {
             );
         }
         unsafe {
-            StaticLifetime::drop_static(trx_sys);
-            StaticLifetime::drop_static(catalog);
-            StaticLifetime::drop_static(buf_pool);
+            StaticLifetime::drop_static(engine);
         }
     })
 }
 
 #[inline]
 async fn worker<P: BufferPool>(
-    buf_pool: &'static P,
-    trx_sys: &TransactionSystem,
-    catalog: &'static Catalog<P>,
+    engine: &'static Engine<P>,
     table_id: TableID,
     id_start: i32,
     id_step: i32,
     stop: Arc<AtomicBool>,
     wg: WaitGroup,
 ) {
-    let table = catalog.get_table(table_id).unwrap();
-    let mut session = Session::new();
+    let table = engine.catalog.get_table(table_id).unwrap();
+    let mut session = engine.new_session();
     let stop = &*stop;
     let mut id = id_start;
     let mut c = [0u8; 120];
@@ -174,12 +166,11 @@ async fn worker<P: BufferPool>(
         pad.iter_mut().for_each(|b| {
             *b = fastrand::alphabetic() as u8;
         });
-        let mut trx = session.begin_trx(trx_sys);
+        let mut trx = session.begin_trx();
         let mut stmt = trx.start_stmt();
-        let res = table
+        let res = stmt
             .insert_row(
-                buf_pool,
-                &mut stmt,
+                &table,
                 vec![
                     Val::from(id),
                     Val::from(k),
@@ -190,7 +181,7 @@ async fn worker<P: BufferPool>(
             .await;
         assert!(res.is_ok());
         trx = stmt.succeed();
-        match trx_sys.commit(trx, buf_pool, &catalog).await {
+        match trx.commit().await {
             Ok(s) => session = s,
             Err(_) => return,
         }
@@ -250,43 +241,30 @@ fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
 }
 
 #[inline]
-pub(crate) async fn db1<P: BufferPool>(
-    buf_pool: &'static P,
-    trx_sys: &'static TransactionSystem,
-    catalog: &Catalog<P>,
-) -> SchemaID {
-    let session = Session::new();
-    let trx = session.begin_trx(trx_sys);
-    let mut stmt = Statement::new(trx);
+pub(crate) async fn db1<P: BufferPool>(engine: &'static Engine<P>) -> SchemaID {
+    let session = engine.new_session();
+    let trx = session.begin_trx();
+    let mut stmt = trx.start_stmt();
 
-    let schema_id = catalog
-        .create_schema(buf_pool, &mut stmt, "db1")
-        .await
-        .unwrap();
+    let schema_id = stmt.create_schema("db1").await.unwrap();
 
     let trx = stmt.succeed();
-    let session = trx_sys.commit(trx, buf_pool, catalog).await.unwrap();
+    let session = trx.commit().await.unwrap();
     drop(session);
     schema_id
 }
 
 /// Sbtest is target table of sysbench.
 #[inline]
-pub async fn sbtest<P: BufferPool>(
-    buf_pool: &'static P,
-    trx_sys: &'static TransactionSystem,
-    catalog: &Catalog<P>,
-) -> TableID {
-    let schema_id = db1(buf_pool, trx_sys, catalog).await;
+pub async fn sbtest<P: BufferPool>(engine: &'static Engine<P>) -> TableID {
+    let schema_id = db1(engine).await;
 
-    let session = Session::new();
-    let trx = session.begin_trx(trx_sys);
-    let mut stmt = Statement::new(trx);
+    let session = engine.new_session();
+    let trx = session.begin_trx();
+    let mut stmt = trx.start_stmt();
 
-    let table_id = catalog
+    let table_id = stmt
         .create_table(
-            buf_pool,
-            &mut stmt,
             schema_id,
             TableSpec {
                 table_name: SemiStr::new("sbtest"),
@@ -326,7 +304,7 @@ pub async fn sbtest<P: BufferPool>(
         .unwrap();
 
     let trx = stmt.succeed();
-    let session = trx_sys.commit(trx, buf_pool, catalog).await.unwrap();
+    let session = trx.commit().await.unwrap();
     drop(session);
     table_id
 }

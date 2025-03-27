@@ -1,3 +1,4 @@
+use crate::buffer::BufferPool;
 use crate::io::{pwrite, Buf, IocbRawPtr, SparseFile};
 use crate::notify::{Notify, Signal};
 use crate::serde::{Ser, SerdeCtx};
@@ -10,17 +11,17 @@ use std::sync::atomic::Ordering;
 
 /// GroupCommit is optimization to group multiple transactions
 /// and perform single IO to speed up overall commit performance.
-pub(super) struct GroupCommit {
+pub(super) struct GroupCommit<P: BufferPool> {
     // Commit group queue, there can be multiple groups in commit phase.
     // Each of them submit IO request to AIO manager and then wait for
     // pwrite & fsync done.
-    pub(super) queue: VecDeque<Commit>,
+    pub(super) queue: VecDeque<Commit<P>>,
     // Current log file.
     pub(super) log_file: Option<SparseFile>,
 }
 
-pub(super) enum Commit {
-    Group(CommitGroup),
+pub(super) enum Commit<P: BufferPool> {
+    Group(CommitGroup<P>),
     // switch from old log file to new log file.
     Switch(SparseFile),
     Shutdown,
@@ -31,8 +32,8 @@ pub(super) enum Commit {
 /// It is controlled by two parameters:
 /// 1. Maximum IO size, e.g. 16KB.
 /// 2. Timeout to wait for next transaction to join.
-pub(super) struct CommitGroup {
-    pub(super) trx_list: Vec<PrecommitTrx>,
+pub(super) struct CommitGroup<P: BufferPool> {
+    pub(super) trx_list: Vec<PrecommitTrx<P>>,
     pub(super) max_cts: TrxID,
     pub(super) fd: RawFd,
     pub(super) offset: usize,
@@ -41,9 +42,9 @@ pub(super) struct CommitGroup {
     pub(super) serde_ctx: SerdeCtx,
 }
 
-impl CommitGroup {
+impl<P: BufferPool> CommitGroup<P> {
     #[inline]
-    pub(super) fn can_join(&self, trx: &PrecommitTrx) -> bool {
+    pub(super) fn can_join(&self, trx: &PrecommitTrx<P>) -> bool {
         if let Some(redo_bin) = trx.redo_bin.as_ref() {
             return redo_bin.ser_len(&self.serde_ctx) <= self.log_buf.remaining_capacity();
         }
@@ -51,7 +52,7 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn join(&mut self, mut trx: PrecommitTrx) -> (Session, Notify) {
+    pub(super) fn join(&mut self, mut trx: PrecommitTrx<P>) -> (Session<P>, Notify) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
             self.log_buf.extend_ser(&self.serde_ctx, &redo_bin);
@@ -63,7 +64,7 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn split(self) -> (IocbRawPtr, SyncGroup) {
+    pub(super) fn split(self) -> (IocbRawPtr, SyncGroup<P>) {
         let log_bytes = self.log_buf.aligned_len();
         let aio = pwrite(self.max_cts, self.fd, self.offset, self.log_buf);
         let iocb_ptr = aio.iocb().load(Ordering::Relaxed);
