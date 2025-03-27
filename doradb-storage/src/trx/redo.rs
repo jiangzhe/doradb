@@ -5,7 +5,7 @@ use crate::row::RowID;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::table::TableID;
 use crate::value::Val;
-use doradb_catalog::IndexID;
+use doradb_catalog::{IndexID, SchemaID};
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::mem;
@@ -133,10 +133,12 @@ impl Deser for RowRedo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum DDLRedoCode {
-    CreateTable = 1,
-    DropTable = 2,
-    CreateIndex = 3,
-    DropIndex = 4,
+    CreateSchema = 1,
+    DropSchema = 2,
+    CreateTable = 3,
+    DropTable = 4,
+    CreateIndex = 5,
+    DropIndex = 6,
 }
 
 impl From<u8> for DDLRedoCode {
@@ -148,6 +150,8 @@ impl From<u8> for DDLRedoCode {
 
 /// Represents a redo record of any DDL operation.
 pub enum DDLRedo {
+    CreateSchema(SchemaID),
+    DropSchema(SchemaID),
     // Create a new table with given table id.
     // Actual metadata change is recorded in DML logs.
     CreateTable(TableID),
@@ -161,6 +165,8 @@ impl DDLRedo {
     #[inline]
     pub fn code(&self) -> DDLRedoCode {
         match self {
+            DDLRedo::CreateSchema { .. } => DDLRedoCode::CreateSchema,
+            DDLRedo::DropSchema { .. } => DDLRedoCode::DropSchema,
             DDLRedo::CreateTable { .. } => DDLRedoCode::CreateTable,
             DDLRedo::DropTable { .. } => DDLRedoCode::DropTable,
             DDLRedo::CreateIndex { .. } => DDLRedoCode::CreateIndex,
@@ -171,9 +177,11 @@ impl DDLRedo {
 
 impl Ser<'_> for DDLRedo {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
         mem::size_of::<u8>()
             + match self {
+                DDLRedo::CreateSchema(_) => mem::size_of::<u64>(),
+                DDLRedo::DropSchema(_) => mem::size_of::<u64>(),
                 DDLRedo::CreateTable(_) => mem::size_of::<u64>(),
                 DDLRedo::DropTable(_) => mem::size_of::<u64>(),
                 DDLRedo::CreateIndex(_) => mem::size_of::<u64>(),
@@ -186,6 +194,12 @@ impl Ser<'_> for DDLRedo {
         let mut idx = start_idx;
         idx = ctx.ser_u8(out, idx, self.code() as u8);
         match self {
+            DDLRedo::CreateSchema(schema_id) => {
+                idx = ctx.ser_u64(out, idx, *schema_id);
+            }
+            DDLRedo::DropSchema(schema_id) => {
+                idx = ctx.ser_u64(out, idx, *schema_id);
+            }
             DDLRedo::CreateTable(table_id) => {
                 idx = ctx.ser_u64(out, idx, *table_id);
             }
@@ -208,6 +222,14 @@ impl Deser for DDLRedo {
     fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let (idx, code) = ctx.deser_u8(data, start_idx)?;
         match DDLRedoCode::from(code) {
+            DDLRedoCode::CreateSchema => {
+                let (idx, schema_id) = ctx.deser_u64(data, idx)?;
+                Ok((idx, DDLRedo::CreateSchema(schema_id)))
+            }
+            DDLRedoCode::DropSchema => {
+                let (idx, schema_id) = ctx.deser_u64(data, idx)?;
+                Ok((idx, DDLRedo::DropSchema(schema_id)))
+            }
             DDLRedoCode::CreateTable => {
                 let (idx, table_id) = ctx.deser_u64(data, idx)?;
                 Ok((idx, DDLRedo::CreateTable(table_id)))

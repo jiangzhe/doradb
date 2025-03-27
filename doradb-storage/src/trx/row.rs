@@ -1,5 +1,6 @@
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::PageID;
+use crate::buffer::BufferPool;
 use crate::catalog::TableMetadata;
 use crate::notify::Notify;
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
@@ -83,9 +84,9 @@ impl<'a> RowReadAccess<'a> {
     }
 
     #[inline]
-    pub fn read_row_mvcc(
+    pub fn read_row_mvcc<P: BufferPool>(
         &self,
-        trx: &ActiveTrx,
+        trx: &ActiveTrx<P>,
         schema: &TableMetadata,
         user_read_set: &[usize],
         key: &SelectKey,
@@ -469,9 +470,9 @@ impl<'a> RowWriteAccess<'a> {
 
     /// Add a Lock undo entry as a transaction-level logical row lock.
     #[inline]
-    pub fn lock_undo(
+    pub fn lock_undo<P: BufferPool>(
         &mut self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<P>,
         schema: &TableMetadata,
         table_id: TableID,
         page_id: PageID,
@@ -587,11 +588,11 @@ impl<'a> RowWriteAccess<'a> {
     /// 5. The old row does not match key but one old version with same key found.
     ///    Add record modifications and then link new row to that specific entry.
     #[inline]
-    pub fn find_old_version_for_unique_key(
+    pub fn find_old_version_for_unique_key<P: BufferPool>(
         &self,
         schema: &TableMetadata,
         key: &SelectKey,
-        trx: &ActiveTrx,
+        trx: &ActiveTrx<P>,
     ) -> FindOldVersion {
         match &*self.undo {
             None => {

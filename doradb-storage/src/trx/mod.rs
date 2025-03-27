@@ -23,9 +23,12 @@ pub mod row;
 pub mod sys;
 pub mod undo;
 
+use crate::buffer::BufferPool;
+use crate::engine::Engine;
+use crate::error::Result;
 use crate::notify::{Notify, Signal};
 use crate::serde::{LenPrefixStruct, SerdeCtx};
-use crate::session::{InternalSession, IntoSession, Session};
+use crate::session::{IntoSession, Session};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoLogs, RowRedo, RowRedoKind};
 use crate::trx::undo::{IndexPurge, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
@@ -123,7 +126,8 @@ pub fn trx_must_not_see_even_if_prepare(sts: TrxID, ts: TrxID) -> bool {
     sts < (ts & SNAPSHOT_TS_MASK)
 }
 
-pub struct ActiveTrx {
+pub struct ActiveTrx<P: BufferPool> {
+    pub(crate) session: Option<Session<P>>,
     // Status of the transaction.
     // Every undo log will refer to this object on heap.
     // There are nested pointers to allow atomic update on status when
@@ -141,21 +145,20 @@ pub struct ActiveTrx {
     pub(crate) index_undo: IndexUndoLogs,
     // transaction-level redo logs.
     pub(crate) redo: RedoLogs,
-    // session of current transaction.
-    pub session: Option<Box<InternalSession>>,
 }
 
-impl ActiveTrx {
+impl<P: BufferPool> ActiveTrx<P> {
     /// Create a new transaction.
     #[inline]
     pub fn new(
-        session: Option<Box<InternalSession>>,
+        session: Session<P>,
         trx_id: TrxID,
         sts: TrxID,
         log_no: usize,
         gc_no: usize,
     ) -> Self {
         ActiveTrx {
+            session: Some(session),
             status: Arc::new(SharedTrxStatus::new(trx_id)),
             sts,
             log_no,
@@ -163,8 +166,12 @@ impl ActiveTrx {
             row_undo: RowUndoLogs::empty(),
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
-            session,
         }
+    }
+
+    #[inline]
+    pub fn engine(&self) -> Option<&'static Engine<P>> {
+        self.session.as_ref().map(|s| s.engine)
     }
 
     #[inline]
@@ -187,7 +194,7 @@ impl ActiveTrx {
 
     /// Starts a statement.
     #[inline]
-    pub fn start_stmt(self) -> Statement {
+    pub fn start_stmt(self) -> Statement<P> {
         Statement::new(self)
     }
 
@@ -199,7 +206,7 @@ impl ActiveTrx {
 
     /// Prepare current transaction for committing.
     #[inline]
-    pub fn prepare(mut self) -> PreparedTrx {
+    pub fn prepare(mut self) -> PreparedTrx<P> {
         // fast path for readonly transactions
         if self.readonly() {
             // there should be no ref count of transaction status.
@@ -235,6 +242,7 @@ impl ActiveTrx {
         let row_undo = mem::take(&mut self.row_undo);
         let index_undo = mem::take(&mut self.index_undo);
         PreparedTrx {
+            session: self.session.take(),
             status: self.status.clone(),
             sts: self.sts,
             log_no: self.log_no,
@@ -242,8 +250,21 @@ impl ActiveTrx {
             redo_bin,
             row_undo,
             index_undo,
-            session: self.session.take(),
         }
+    }
+
+    /// Commit the transaction.
+    #[inline]
+    pub async fn commit(self) -> Result<Session<P>> {
+        let engine = self.engine().unwrap();
+        engine.trx_sys.commit(self).await
+    }
+
+    /// Rollback the transaction.
+    #[inline]
+    pub async fn rollback(self) -> Session<P> {
+        let engine = self.engine().unwrap();
+        engine.trx_sys.rollback(self).await
     }
 
     /// Add one redo log entry.
@@ -270,7 +291,7 @@ impl ActiveTrx {
     }
 }
 
-impl Drop for ActiveTrx {
+impl<P: BufferPool> Drop for ActiveTrx<P> {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo.is_empty(), "redo should be cleared");
@@ -279,15 +300,15 @@ impl Drop for ActiveTrx {
     }
 }
 
-impl IntoSession for ActiveTrx {
+impl<P: BufferPool> IntoSession<P> for ActiveTrx<P> {
     #[inline]
-    fn into_session(mut self) -> Session {
-        Session::with_internal_session(self.session.take().unwrap())
+    fn into_session(mut self) -> Session<P> {
+        self.session.take().unwrap()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Session {
-        Session::with_internal_session(self.session.take().unwrap())
+    fn split_session(&mut self) -> Session<P> {
+        self.session.take().unwrap()
     }
 }
 
@@ -295,7 +316,8 @@ static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
 static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
-pub struct PreparedTrx {
+pub struct PreparedTrx<P: BufferPool> {
+    session: Option<Session<P>>,
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
     log_no: usize,
@@ -303,12 +325,16 @@ pub struct PreparedTrx {
     redo_bin: Option<LenPrefixStruct<'static, RedoLogs>>,
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
-    session: Option<Box<InternalSession>>,
 }
 
-impl PreparedTrx {
+impl<P: BufferPool> PreparedTrx<P> {
     #[inline]
-    pub fn fill_cts(mut self, cts: TrxID) -> PrecommitTrx {
+    pub fn engine(&self) -> Option<&'static Engine<P>> {
+        self.session.as_ref().map(|s| s.engine)
+    }
+
+    #[inline]
+    pub fn fill_cts(mut self, cts: TrxID) -> PrecommitTrx<P> {
         let redo_bin = if let Some(redo_bin) = self.redo_bin.take() {
             // todo: fill cts into binary log.
             Some(redo_bin)
@@ -340,19 +366,19 @@ impl PreparedTrx {
     }
 }
 
-impl IntoSession for PreparedTrx {
+impl<P: BufferPool> IntoSession<P> for PreparedTrx<P> {
     #[inline]
-    fn into_session(mut self) -> Session {
-        Session::with_internal_session(self.session.take().unwrap())
+    fn into_session(mut self) -> Session<P> {
+        self.session.take().unwrap()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Session {
-        Session::with_internal_session(self.session.take().unwrap())
+    fn split_session(&mut self) -> Session<P> {
+        self.session.take().unwrap()
     }
 }
 
-impl Drop for PreparedTrx {
+impl<P: BufferPool> Drop for PreparedTrx<P> {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
@@ -362,7 +388,7 @@ impl Drop for PreparedTrx {
 }
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
-pub struct PrecommitTrx {
+pub struct PrecommitTrx<P: BufferPool> {
     status: Arc<SharedTrxStatus>,
     pub sts: TrxID,
     pub cts: TrxID,
@@ -370,14 +396,14 @@ pub struct PrecommitTrx {
     pub redo_bin: Option<LenPrefixStruct<'static, RedoLogs>>,
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurge>,
-    session: Option<Box<InternalSession>>,
+    session: Option<Session<P>>,
 }
 
-impl PrecommitTrx {
+impl<P: BufferPool> PrecommitTrx<P> {
     /// Commit this transaction, the only thing to do is replace ongoing transaction ids
     /// in undo log with cts, and this is atomic operation.
     #[inline]
-    pub fn commit(mut self) -> CommittedTrx {
+    pub fn commit(mut self) -> CommittedTrx<P> {
         assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
                                           // release the prepare notifier in transaction status
         {
@@ -399,7 +425,7 @@ impl PrecommitTrx {
     }
 }
 
-impl Drop for PrecommitTrx {
+impl<P: BufferPool> Drop for PrecommitTrx<P> {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
@@ -408,35 +434,35 @@ impl Drop for PrecommitTrx {
     }
 }
 
-impl IntoSession for PrecommitTrx {
+impl<P: BufferPool> IntoSession<P> for PrecommitTrx<P> {
     #[inline]
-    fn into_session(mut self) -> Session {
-        Session::with_internal_session(self.session.take().unwrap())
+    fn into_session(mut self) -> Session<P> {
+        self.session.take().unwrap()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Session {
-        Session::with_internal_session(self.session.take().unwrap())
+    fn split_session(&mut self) -> Session<P> {
+        self.session.take().unwrap()
     }
 }
 
-pub struct CommittedTrx {
+pub struct CommittedTrx<P: BufferPool> {
     pub sts: TrxID,
     pub cts: TrxID,
     pub gc_no: usize,
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurge>,
-    session: Option<Box<InternalSession>>,
+    session: Option<Session<P>>,
 }
 
-impl IntoSession for CommittedTrx {
+impl<P: BufferPool> IntoSession<P> for CommittedTrx<P> {
     #[inline]
-    fn into_session(mut self) -> Session {
-        Session::with_internal_session(self.session.take().unwrap())
+    fn into_session(mut self) -> Session<P> {
+        self.session.take().unwrap()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Session {
-        Session::with_internal_session(self.session.take().unwrap())
+    fn split_session(&mut self) -> Session<P> {
+        self.session.take().unwrap()
     }
 }
