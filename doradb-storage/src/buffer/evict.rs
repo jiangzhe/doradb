@@ -267,7 +267,9 @@ impl EvictableBufferPool {
         let bf = self.frame_ptr(page_id);
         let frame = &mut *bf.0;
         frame.next_free = INVALID_PAGE_ID;
-        init_bf_exclusive_guard(bf)
+        let mut guard = init_bf_exclusive_guard::<T>(bf);
+        guard.page_mut().zero();
+        guard
     }
 
     #[inline]
@@ -740,6 +742,7 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     fn deallocate_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
+        g.page_mut().zero(); // zero the page
         let old_id = self.free_page.add(&mut g);
         self.unpin_page(g.page_id());
         self.mark_page_dontneed(g);
@@ -814,6 +817,21 @@ impl Drop for EvictableBufferPool {
 
         // Close file IO.
         self.file_io.close();
+
+        unsafe {
+            // Drop all frames.
+            for page_id in 0..self.max_nbr {
+                let frame_ptr = self.frames.add(page_id as usize);
+                std::ptr::drop_in_place(frame_ptr);
+            }
+
+            // Deallocate memory of frames.
+            let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.max_nbr + SAFETY_PAGES);
+            mmap_deallocate(self.frames as *mut u8, frame_total_bytes);
+            // Deallocate memory of pages.
+            let page_total_bytes = mem::size_of::<Page>() * (self.max_nbr + SAFETY_PAGES);
+            mmap_deallocate(self.pages as *mut u8, page_total_bytes);
+        }
     }
 }
 
@@ -1669,6 +1687,9 @@ mod tests {
         }
         for h in handles {
             h.join().unwrap();
+        }
+        unsafe {
+            StaticLifetime::drop_static(pool);
         }
     }
 }

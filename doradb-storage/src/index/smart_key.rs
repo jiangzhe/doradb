@@ -33,7 +33,7 @@ impl From<Vec<u8>> for SmartKey {
                 k_mut.0.len = value.len();
                 k_mut.0.u.i[..value.len()].copy_from_slice(&value);
                 return k.assume_init();
-            };
+            }
         }
         unsafe {
             // avoid allocation caused by shrinking.
@@ -59,11 +59,11 @@ impl From<&[u8]> for SmartKey {
         if value.len() <= SMART_KEY_INLINE {
             unsafe {
                 let mut k = MaybeUninit::<SmartKey>::uninit();
-                let k_mut = k.assume_init_mut();
-                k_mut.0.len = value.len();
-                k_mut.0.u.i[..value.len()].copy_from_slice(&value);
+                let inner = &mut k.assume_init_mut().0;
+                inner.len = value.len();
+                inner.u.i[..value.len()].copy_from_slice(value);
                 return k.assume_init();
-            };
+            }
         }
         unsafe {
             let ptr = alloc(Layout::from_size_align_unchecked(value.len(), 1));
@@ -71,12 +71,12 @@ impl From<&[u8]> for SmartKey {
             data.copy_from_slice(value);
             let data = data.into_boxed_slice();
             let mut k = MaybeUninit::<SmartKey>::uninit();
-            let k_mut = k.assume_init_mut();
-            k_mut.0.len = value.len();
-            (*k_mut.0.u.h)
+            let inner = &mut k.assume_init_mut().0;
+            inner.len = value.len();
+            (*inner.u.h)
                 .prefix
                 .copy_from_slice(&data[..SMART_KEY_HEAP_PREFIX]);
-            std::ptr::write(&mut (*k_mut.0.u.h).data, data);
+            std::ptr::write(&mut (*inner.u.h).data, data);
             k.assume_init()
         }
     }
@@ -143,4 +143,16 @@ union InlineOrHeap {
 struct Heap {
     data: Box<[u8]>,
     prefix: [u8; SMART_KEY_HEAP_PREFIX],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_smart_key_from_str() {
+        let s = Vec::from(b"hello");
+        let smart_key = SmartKey::from(&s[..]);
+        assert_eq!(smart_key.as_bytes(), &s[..]);
+    }
 }

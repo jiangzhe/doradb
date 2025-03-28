@@ -136,7 +136,8 @@ impl BufferPool for FixedBufferPool {
             let bf = self.get_new_frame(page_id);
             (*bf.0).page_id = page_id;
             (*bf.0).next_free = INVALID_PAGE_ID;
-            let g = init_bf_exclusive_guard(bf);
+            let mut g = init_bf_exclusive_guard::<T>(bf);
+            g.page_mut().zero();
             g
         }
     }
@@ -159,6 +160,7 @@ impl BufferPool for FixedBufferPool {
     /// Deallocate page.
     #[inline]
     fn deallocate_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
+        g.page_mut().zero();
         let mut page_id = self.free_list.lock();
         g.bf_mut().next_free = *page_id;
         *page_id = g.page_id();
@@ -189,8 +191,16 @@ impl BufferPool for FixedBufferPool {
 impl Drop for FixedBufferPool {
     fn drop(&mut self) {
         unsafe {
+            // We should drop all frames before deallocating memory.
+            let allocated = self.allocated.load(Ordering::Relaxed);
+            for page_id in 0..allocated {
+                let frame_ptr = self.frames.add(page_id as usize);
+                std::ptr::drop_in_place(frame_ptr);
+            }
+            // Deallocate memory of frames.
             let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.size + SAFETY_PAGES);
             mmap_deallocate(self.frames as *mut u8, frame_total_bytes);
+            // Deallocate memory of pages.
             let page_total_bytes = mem::size_of::<Page>() * (self.size + SAFETY_PAGES);
             mmap_deallocate(self.pages as *mut u8, page_total_bytes);
         }

@@ -434,7 +434,7 @@ impl TrxSysConfig {
                 file_seq: AtomicU32::new(file_seq),
                 file_max_size: self.log_file_max_size.as_u64() as usize,
                 buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
-                    PageBuf::uninit(max_io_size)
+                    PageBuf::zeroed(max_io_size)
                 }),
                 sync_thread: Mutex::new(None),
                 gc_thread: Mutex::new(None),

@@ -1108,48 +1108,42 @@ impl MemVar {
     #[inline]
     pub fn inline(data: &[u8]) -> Self {
         debug_assert!(data.len() <= MEM_VAR_LEN_INLINE);
-        let mut inline = MaybeUninit::<MemVarInline>::uninit();
         unsafe {
-            let i = inline.assume_init_mut();
+            let mut var = MaybeUninit::<MemVar>::uninit();
+            let i = &mut var.assume_init_mut().i;
             i.len = data.len() as u16;
             i.data[..data.len()].copy_from_slice(data);
-            MemVar {
-                i: inline.assume_init(),
-            }
+            var.assume_init()
         }
     }
 
     /// Create a new outlined PageVar.
     #[inline]
     pub fn outline(data: &[u8]) -> Self {
-        debug_assert!(data.len() <= 0xffff); // must be in range of u16
-        let mut outline = MaybeUninit::<MemVarOutline>::uninit();
+        debug_assert!(data.len() > MEM_VAR_LEN_INLINE && data.len() <= 0xffff); // must be in range of u16
         unsafe {
-            let o = outline.assume_init_mut();
+            let mut var = MaybeUninit::<MemVar>::uninit();
+            let o = &mut var.assume_init_mut().o;
             o.len = data.len() as u16;
             o.prefix.copy_from_slice(&data[..MEM_VAR_LEN_PREFIX]);
             let layout = AllocLayout::from_size_align_unchecked(data.len(), 1);
             o.ptr = alloc(layout);
-            let bs = std::slice::from_raw_parts_mut(o.ptr, data.len());
-            bs.copy_from_slice(data);
-            MemVar {
-                o: ManuallyDrop::new(outline.assume_init()),
-            }
+            o.ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
+            var.assume_init()
         }
     }
 
     #[inline]
     pub fn outline_boxed_slice(data: Box<[u8]>) -> Self {
-        debug_assert!(data.len() <= 0xffff);
-        let mut outline = MaybeUninit::<MemVarOutline>::uninit();
+        debug_assert!(data.len() > MEM_VAR_LEN_INLINE && data.len() <= 0xffff);
         unsafe {
-            let o = outline.assume_init_mut();
+            let mut var = MaybeUninit::<MemVar>::uninit();
+            let o = &mut var.assume_init_mut().o;
+            o.len = data.len() as u16;
             o.prefix.copy_from_slice(&data[..MEM_VAR_LEN_PREFIX]);
             let ptr = Box::leak(data);
             o.ptr = ptr as *mut [u8] as *mut u8;
-            MemVar {
-                o: ManuallyDrop::new(outline.assume_init()),
-            }
+            var.assume_init()
         }
     }
 
@@ -1346,14 +1340,14 @@ fn fail_long_bytes<T, E: serde::de::Error>() -> StdResult<T, E> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
+#[repr(C, align(8))]
 struct MemVarInline {
     len: u16,
     data: [u8; MEM_VAR_LEN_INLINE],
 }
 
 #[derive(PartialEq, Eq)]
-#[repr(C)]
+#[repr(C, align(8))]
 struct MemVarOutline {
     len: u16,
     prefix: [u8; MEM_VAR_LEN_PREFIX],

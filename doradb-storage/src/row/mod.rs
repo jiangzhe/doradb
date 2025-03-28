@@ -112,7 +112,7 @@ impl RowPage {
                 let ptr = self
                     .data_ptr_mut()
                     .add(self.header.del_bitset_offset as usize);
-                std::ptr::write_bytes(ptr, 0xff, count);
+                ptr.write_bytes(0xff, count);
             }
             // initialize null_bitset_list to all zeros.
             {
@@ -121,7 +121,7 @@ impl RowPage {
                 let ptr = self
                     .data_ptr_mut()
                     .add(self.header.null_bitset_list_offset as usize);
-                std::ptr::write_bytes(ptr, 0xff, count);
+                ptr.write_bytes(0xff, count);
             }
         }
     }
@@ -1455,7 +1455,7 @@ mod tests {
 
     fn create_row_page() -> RowPage {
         unsafe {
-            let new = MaybeUninit::<RowPage>::uninit();
+            let new = MaybeUninit::<RowPage>::zeroed();
             new.assume_init()
         }
     }

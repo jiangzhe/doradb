@@ -109,7 +109,7 @@ impl DirectBuf {
     pub fn zeroed(len: usize) -> Self {
         let mut buf = Self::uninit(len);
         unsafe {
-            std::ptr::write_bytes(buf.as_mut_ptr(), 0, len);
+            buf.as_mut_ptr().write_bytes(0, buf.capacity());
         }
         buf
     }
@@ -202,9 +202,19 @@ impl PageBuf {
     pub fn zeroed(page_size: usize) -> Self {
         let mut buf = Self::uninit(page_size);
         unsafe {
-            std::ptr::write_bytes(buf.page.as_mut_ptr(), 0, page_size);
+            buf.page.as_mut_ptr().write_bytes(0, page_size);
         }
         buf
+    }
+
+    /// Reset the buffer to zero.
+    #[inline]
+    pub fn reset(&mut self) {
+        unsafe {
+            self.page.as_mut_ptr().write_bytes(0, self.page_len());
+        }
+        self.data_len = 0;
+        self.aligned_len = 0;
     }
 
     #[inline]
