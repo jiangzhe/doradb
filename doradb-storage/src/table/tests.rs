@@ -456,9 +456,6 @@ fn test_evict_pool_insert_full() {
 }
 
 struct TestSys<P: BufferPool> {
-    // buf_pool: &'static P,
-    // catalog: &'static Catalog<P>,
-    // trx_sys: &'static TransactionSystem,
     engine: &'static Engine<P>,
     table: Table<P>,
 }

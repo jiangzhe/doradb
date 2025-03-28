@@ -196,6 +196,7 @@ impl_self_encode_float!(ValidF64, as_f64);
 impl EncodeKeySelf for SmartKey {
     #[inline]
     fn encode(key: &[Val]) -> Self {
+        debug_assert!(key.len() == 1);
         let bs = key[0].as_bytes().unwrap();
         SmartKey::from(bs)
     }
@@ -444,9 +445,9 @@ impl PartitionMultiKeyIndex {
 
 impl UniqueIndex for PartitionMultiKeyIndex {
     #[inline]
-    fn lookup(&self, key: &[Val]) -> Option<RowID> {
-        let key = self.encode(key);
-        let key = std::slice::from_ref(&key);
+    fn lookup(&self, keys: &[Val]) -> Option<RowID> {
+        let encoded = self.encode(keys);
+        let key = std::slice::from_ref(&encoded);
         self.index.lookup(key)
     }
 

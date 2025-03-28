@@ -72,6 +72,15 @@ impl<T> Default for FreeList<T> {
     }
 }
 
+impl<T> Drop for FreeList<T> {
+    #[inline]
+    fn drop(&mut self) {
+        while let Some(elem) = self.pop() {
+            drop(elem);
+        }
+    }
+}
+
 /// Convenient wrapper to combine free list and factory function.
 /// So user can just fetch data only from cache layer.
 pub struct FreeListWithFactory<T> {

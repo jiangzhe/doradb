@@ -1,4 +1,5 @@
 use crate::buffer::guard::PageExclusiveGuard;
+use std::mem;
 
 pub const PAGE_SIZE: usize = 64 * 1024;
 pub type Page = [u8; PAGE_SIZE];
@@ -13,7 +14,18 @@ pub const INVALID_PAGE_ID: PageID = !0;
 /// exist.
 /// Additionally, this type should not impl Drop because we
 /// don't expect to drop it when it is swapped to disk.
-pub trait BufferPage: Sized + 'static {}
+pub trait BufferPage: Sized + 'static {
+    /// zero the page.
+    /// Default implementation is to zero all bytes.
+    #[inline]
+    fn zero(&mut self) {
+        let bytes = mem::size_of::<Self>();
+        unsafe {
+            let ptr = self as *mut Self as *mut u8;
+            ptr.write_bytes(0, bytes);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IOKind {

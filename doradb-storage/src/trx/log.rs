@@ -67,7 +67,7 @@ impl<P: BufferPool> LogPartition<P> {
     fn buf(&self, serde_ctx: &SerdeCtx, data: &LenPrefixStruct<'static, RedoLogs>) -> Buf {
         let len = data.ser_len(serde_ctx);
         if len > self.max_io_size {
-            let mut buf = DirectBuf::uninit(len);
+            let mut buf = DirectBuf::zeroed(len);
             data.ser(serde_ctx, buf.as_mut(), 0);
             Buf::Direct(buf)
         } else {
@@ -132,7 +132,6 @@ impl<P: BufferPool> LogPartition<P> {
             }
             Err(_) => unreachable!(),
         };
-        // let fd = log_file.as_raw_fd();
         let log_buf = self.buf(&serde_ctx, &redo_bin);
         let session = trx.split_session();
         let sync_signal = Signal::default();
@@ -489,7 +488,8 @@ impl<'a, P: BufferPool> FileProcessor<'a, P> {
 
             // Put IO buffer back into free list.
             for mut sync_group in self.written.drain(..) {
-                if let Some(Buf::Reuse(elem)) = sync_group.aio.take_buf() {
+                if let Some(Buf::Reuse(mut elem)) = sync_group.aio.take_buf() {
+                    elem.reset(); // reset buffer to zero
                     self.partition.buf_free_list.push_elem(elem); // return buf to free list for future reuse
                 }
                 // commit transactions to let waiting read operations to continue
