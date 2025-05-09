@@ -4,7 +4,7 @@
 //! including start, stop, recover, and execute commands.
 
 use crate::buffer::{BufferPool, EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
-use crate::catalog::{Catalog, CatalogCache, CatalogStorage};
+use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::lifetime::StaticLifetime;
 use crate::session::{Session, SessionWorker};
@@ -16,7 +16,7 @@ use std::panic::{RefUnwindSafe, UnwindSafe};
 /// Storage engine of DoraDB.
 pub struct Engine<P: BufferPool> {
     pub trx_sys: TransactionSystem<P>,
-    pub catalog: Catalog<P>,
+    // pub catalog: Catalog<P>,
     pub buf_pool: P,
 }
 
@@ -30,6 +30,11 @@ impl<P: BufferPool> Engine<P> {
     pub fn new_session_worker(&'static self) -> SessionWorker<P> {
         SessionWorker::new(self)
     }
+
+    #[inline]
+    pub fn catalog(&self) -> &Catalog<P> {
+        &self.trx_sys.catalog
+    }
 }
 
 unsafe impl<P: BufferPool> StaticLifetime for Engine<P> {
@@ -38,7 +43,6 @@ unsafe impl<P: BufferPool> StaticLifetime for Engine<P> {
         let mut engine = Box::from_raw(this as *const _ as *mut ManuallyDrop<Engine<P>>);
         // control the drop order manually.
         std::ptr::drop_in_place(&mut engine.trx_sys);
-        std::ptr::drop_in_place(&mut engine.catalog);
         std::ptr::drop_in_place(&mut engine.buf_pool);
     }
 }
@@ -62,15 +66,10 @@ impl Engine<FixedBufferPool> {
 
             std::ptr::write(&mut engine.buf_pool, buf_pool);
             std::ptr::write(&mut engine.trx_sys, trx_sys);
-
-            let catalog_cache = CatalogCache::new();
-            let catalog_storage = CatalogStorage::new(&engine.buf_pool).await;
-            let catalog = Catalog::new(catalog_cache, catalog_storage);
-            std::ptr::write(&mut engine.catalog, catalog);
-
             engine
                 .trx_sys
-                .start(&engine.buf_pool, &engine.catalog, trx_sys_start_ctx);
+                .start(&engine.buf_pool, trx_sys_start_ctx)
+                .await;
 
             Ok(engine)
         }
@@ -106,17 +105,11 @@ impl EngineConfig {
 
             std::ptr::write(&mut engine.buf_pool, buf_pool);
             engine.buf_pool.start(pool_start_ctx);
-
             std::ptr::write(&mut engine.trx_sys, trx_sys);
-
-            let catalog_cache = CatalogCache::new();
-            let catalog_storage = CatalogStorage::new(&engine.buf_pool).await;
-            let catalog = Catalog::new(catalog_cache, catalog_storage);
-            std::ptr::write(&mut engine.catalog, catalog);
-
             engine
                 .trx_sys
-                .start(&engine.buf_pool, &engine.catalog, trx_sys_start_ctx);
+                .start(&engine.buf_pool, trx_sys_start_ctx)
+                .await;
 
             Ok(engine)
         }

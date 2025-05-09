@@ -469,7 +469,7 @@ impl TestSys<FixedBufferPool> {
             .await
             .unwrap();
         let table_id = table2(engine).await;
-        let table = engine.catalog.get_table(table_id).unwrap();
+        let table = engine.catalog().get_table(table_id).unwrap();
         TestSys { engine, table }
     }
 }
@@ -489,7 +489,7 @@ impl TestSys<EvictableBufferPool> {
             .await
             .unwrap();
         let table_id = table2(engine).await;
-        let table = engine.catalog.get_table(table_id).unwrap();
+        let table = engine.catalog().get_table(table_id).unwrap();
         TestSys { engine, table }
     }
 }

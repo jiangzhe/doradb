@@ -4,6 +4,7 @@ use crate::row::ops::UpdateCol;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::table::TableID;
+use crate::trx::TrxID;
 use crate::value::Val;
 use doradb_catalog::{IndexID, SchemaID};
 use std::collections::btree_map::Entry;
@@ -133,12 +134,13 @@ impl Deser for RowRedo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum DDLRedoCode {
-    CreateSchema = 1,
-    DropSchema = 2,
-    CreateTable = 3,
-    DropTable = 4,
-    CreateIndex = 5,
-    DropIndex = 6,
+    CreateSchema = 129,
+    DropSchema = 130,
+    CreateTable = 131,
+    DropTable = 132,
+    CreateIndex = 133,
+    DropIndex = 134,
+    CreateRowPage = 135,
 }
 
 impl From<u8> for DDLRedoCode {
@@ -158,6 +160,12 @@ pub enum DDLRedo {
     DropTable(TableID),
     CreateIndex(IndexID),
     DropIndex(IndexID),
+    CreateRowPage {
+        table_id: TableID,
+        page_id: PageID,
+        start_row_id: RowID,
+        end_row_id: RowID,
+    },
 }
 
 impl DDLRedo {
@@ -171,6 +179,7 @@ impl DDLRedo {
             DDLRedo::DropTable { .. } => DDLRedoCode::DropTable,
             DDLRedo::CreateIndex { .. } => DDLRedoCode::CreateIndex,
             DDLRedo::DropIndex { .. } => DDLRedoCode::DropIndex,
+            DDLRedo::CreateRowPage { .. } => DDLRedoCode::CreateRowPage,
         }
     }
 }
@@ -180,12 +189,17 @@ impl Ser<'_> for DDLRedo {
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
         mem::size_of::<u8>()
             + match self {
-                DDLRedo::CreateSchema(_) => mem::size_of::<u64>(),
-                DDLRedo::DropSchema(_) => mem::size_of::<u64>(),
-                DDLRedo::CreateTable(_) => mem::size_of::<u64>(),
-                DDLRedo::DropTable(_) => mem::size_of::<u64>(),
-                DDLRedo::CreateIndex(_) => mem::size_of::<u64>(),
-                DDLRedo::DropIndex(_) => mem::size_of::<u64>(),
+                DDLRedo::CreateSchema(_) => mem::size_of::<SchemaID>(),
+                DDLRedo::DropSchema(_) => mem::size_of::<SchemaID>(),
+                DDLRedo::CreateTable(_) => mem::size_of::<TableID>(),
+                DDLRedo::DropTable(_) => mem::size_of::<TableID>(),
+                DDLRedo::CreateIndex(_) => mem::size_of::<IndexID>(),
+                DDLRedo::DropIndex(_) => mem::size_of::<IndexID>(),
+                DDLRedo::CreateRowPage { .. } => {
+                    mem::size_of::<TableID>()
+                        + mem::size_of::<PageID>()
+                        + mem::size_of::<RowID>() * 2
+                }
             }
     }
 
@@ -211,6 +225,17 @@ impl Ser<'_> for DDLRedo {
             }
             DDLRedo::DropIndex(index_id) => {
                 idx = ctx.ser_u64(out, idx, *index_id);
+            }
+            DDLRedo::CreateRowPage {
+                table_id,
+                page_id,
+                start_row_id,
+                end_row_id,
+            } => {
+                idx = ctx.ser_u64(out, idx, *table_id);
+                idx = ctx.ser_u64(out, idx, *page_id);
+                idx = ctx.ser_u64(out, idx, *start_row_id);
+                idx = ctx.ser_u64(out, idx, *end_row_id);
             }
         }
         idx
@@ -246,6 +271,21 @@ impl Deser for DDLRedo {
                 let (idx, index_id) = ctx.deser_u64(data, idx)?;
                 Ok((idx, DDLRedo::DropIndex(index_id)))
             }
+            DDLRedoCode::CreateRowPage => {
+                let (idx, table_id) = ctx.deser_u64(data, idx)?;
+                let (idx, page_id) = ctx.deser_u64(data, idx)?;
+                let (idx, start_row_id) = ctx.deser_u64(data, idx)?;
+                let (idx, end_row_id) = ctx.deser_u64(data, idx)?;
+                Ok((
+                    idx,
+                    DDLRedo::CreateRowPage {
+                        table_id,
+                        page_id,
+                        start_row_id,
+                        end_row_id,
+                    },
+                ))
+            }
         }
     }
 }
@@ -273,7 +313,7 @@ impl RedoLogs {
 
     /// Insert a redo entry into the redo logs.
     #[inline]
-    pub fn insert(&mut self, table_id: TableID, entry: RowRedo) {
+    pub fn insert_dml(&mut self, table_id: TableID, entry: RowRedo) {
         let table = self.dml.entry(table_id).or_default();
         table.insert(entry);
     }
@@ -320,6 +360,56 @@ impl Deser for RedoLogs {
         let (idx, ddl) = Vec::<DDLRedo>::deser(ctx, data, start_idx)?;
         let (idx, dml) = BTreeMap::<TableID, TableDML>::deser(ctx, data, idx)?;
         Ok((idx, RedoLogs { ddl, dml }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RedoTrxKind {
+    User = 0,
+    System = 1,
+}
+
+impl From<u8> for RedoTrxKind {
+    #[inline]
+    fn from(code: u8) -> Self {
+        unsafe { mem::transmute(code) }
+    }
+}
+
+/// Redo header of a transaction.
+pub struct RedoHeader {
+    pub cts: TrxID,
+    pub trx_kind: RedoTrxKind,
+}
+
+impl Ser<'_> for RedoHeader {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<TrxID>() + mem::size_of::<u8>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let mut idx = start_idx;
+        idx = self.cts.ser(ctx, out, idx);
+        idx = (self.trx_kind as u8).ser(ctx, out, idx);
+        idx
+    }
+}
+
+impl Deser for RedoHeader {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, cts) = TrxID::deser(ctx, data, start_idx)?;
+        let (idx, code) = u8::deser(ctx, data, idx)?;
+        Ok((
+            idx,
+            RedoHeader {
+                cts,
+                trx_kind: RedoTrxKind::from(code),
+            },
+        ))
     }
 }
 
@@ -434,7 +524,7 @@ mod tests {
             row_id: 100,
             kind: RowRedoKind::Insert(vec![Val::Byte8(42)]),
         };
-        redo_logs.insert(1, insert_entry);
+        redo_logs.insert_dml(1, insert_entry);
         assert_eq!(redo_logs.dml.len(), 1);
         let table = redo_logs.dml.get(&1).unwrap();
         assert_eq!(table.rows.len(), 1);
@@ -448,7 +538,7 @@ mod tests {
                 val: Val::Byte8(43),
             }]),
         };
-        redo_logs.insert(1, update_entry);
+        redo_logs.insert_dml(1, update_entry);
         let table = redo_logs.dml.get(&1).unwrap();
         if let RowRedoKind::Insert(vals) = &table.rows.get(&100).unwrap().kind {
             assert_eq!(vals[0], Val::Byte8(43));
@@ -462,7 +552,7 @@ mod tests {
             row_id: 100,
             kind: RowRedoKind::Delete,
         };
-        redo_logs.insert(1, delete_entry);
+        redo_logs.insert_dml(1, delete_entry);
         let table = redo_logs.dml.get(&1).unwrap();
         assert_eq!(table.rows.len(), 0);
 
@@ -472,7 +562,7 @@ mod tests {
             row_id: 200,
             kind: RowRedoKind::Insert(vec![Val::Byte8(1), Val::Byte8(2)]),
         };
-        redo_logs.insert(1, insert_entry);
+        redo_logs.insert_dml(1, insert_entry);
 
         let update1 = RowRedo {
             page_id: 1,
@@ -482,7 +572,7 @@ mod tests {
                 val: Val::Byte8(3),
             }]),
         };
-        redo_logs.insert(1, update1);
+        redo_logs.insert_dml(1, update1);
 
         let update2 = RowRedo {
             page_id: 1,
@@ -492,7 +582,7 @@ mod tests {
                 val: Val::Byte8(4),
             }]),
         };
-        redo_logs.insert(1, update2);
+        redo_logs.insert_dml(1, update2);
 
         let table = redo_logs.dml.get(&1).unwrap();
         if let RowRedoKind::Insert(vals) = &table.rows.get(&200).unwrap().kind {
@@ -508,7 +598,7 @@ mod tests {
             row_id: 300,
             kind: RowRedoKind::Insert(vec![Val::Byte8(50)]),
         };
-        redo_logs.insert(2, another_insert);
+        redo_logs.insert_dml(2, another_insert);
         assert_eq!(redo_logs.dml.len(), 2);
     }
 
@@ -526,14 +616,14 @@ mod tests {
             row_id: 100,
             kind: RowRedoKind::Insert(vec![Val::Byte8(42)]),
         };
-        redo_logs1.insert(1, insert1);
+        redo_logs1.insert_dml(1, insert1);
 
         let insert2 = RowRedo {
             page_id: 2,
             row_id: 200,
             kind: RowRedoKind::Insert(vec![Val::Byte8(43)]),
         };
-        redo_logs2.insert(2, insert2);
+        redo_logs2.insert_dml(2, insert2);
 
         redo_logs1.merge(redo_logs2);
         assert_eq!(redo_logs1.dml.len(), 2);
@@ -547,7 +637,7 @@ mod tests {
             row_id: 101,
             kind: RowRedoKind::Insert(vec![Val::Byte8(44)]),
         };
-        redo_logs2.insert(1, insert3);
+        redo_logs2.insert_dml(1, insert3);
 
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&1).unwrap();
@@ -569,7 +659,7 @@ mod tests {
                 val: Val::Byte8(45),
             }]),
         };
-        redo_logs2.insert(1, update1);
+        redo_logs2.insert_dml(1, update1);
 
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&1).unwrap();
@@ -590,7 +680,7 @@ mod tests {
             row_id: 101,
             kind: RowRedoKind::Delete,
         };
-        redo_logs2.insert(1, delete1);
+        redo_logs2.insert_dml(1, delete1);
 
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&1).unwrap();

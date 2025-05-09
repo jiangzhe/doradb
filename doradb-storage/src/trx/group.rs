@@ -52,7 +52,7 @@ impl<P: BufferPool> CommitGroup<P> {
     }
 
     #[inline]
-    pub(super) fn join(&mut self, mut trx: PrecommitTrx<P>) -> (Session<P>, Notify) {
+    pub(super) fn join(&mut self, mut trx: PrecommitTrx<P>) -> (Option<Session<P>>, Notify) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
             self.log_buf.extend_ser(&self.serde_ctx, &redo_bin);

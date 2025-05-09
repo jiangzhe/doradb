@@ -21,16 +21,17 @@ pub mod purge;
 pub mod redo;
 pub mod row;
 pub mod sys;
+pub mod sys_trx;
 pub mod undo;
 
 use crate::buffer::BufferPool;
 use crate::engine::Engine;
 use crate::error::Result;
 use crate::notify::{Notify, Signal};
-use crate::serde::{LenPrefixStruct, SerdeCtx};
+use crate::serde::{LenPrefixPod, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::stmt::Statement;
-use crate::trx::redo::{RedoLogs, RowRedo, RowRedoKind};
+use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
 use crate::trx::undo::{IndexPurge, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
 use flume::{Receiver, Sender};
@@ -213,13 +214,15 @@ impl<P: BufferPool> ActiveTrx<P> {
             debug_assert!(Arc::strong_count(&self.status) == 1);
             debug_assert!(self.index_undo.is_empty());
             return PreparedTrx {
-                status: Arc::clone(&self.status),
-                sts: self.sts,
-                log_no: self.log_no,
-                gc_no: self.gc_no,
                 redo_bin: None,
-                row_undo: RowUndoLogs::empty(),
-                index_undo: IndexUndoLogs::empty(),
+                payload: Some(PreparedTrxPayload {
+                    status: Arc::clone(&self.status),
+                    sts: self.sts,
+                    log_no: self.log_no,
+                    gc_no: self.gc_no,
+                    row_undo: RowUndoLogs::empty(),
+                    index_undo: IndexUndoLogs::empty(),
+                }),
                 session: self.session.take(),
             };
         }
@@ -234,7 +237,11 @@ impl<P: BufferPool> ActiveTrx<P> {
         let redo_bin = if self.redo.is_empty() {
             None
         } else {
-            Some(LenPrefixStruct::new(
+            Some(LenPrefixPod::new(
+                RedoHeader {
+                    cts: 0,
+                    trx_kind: RedoTrxKind::User,
+                },
                 mem::take(&mut self.redo),
                 &SerdeCtx::default(),
             ))
@@ -242,14 +249,16 @@ impl<P: BufferPool> ActiveTrx<P> {
         let row_undo = mem::take(&mut self.row_undo);
         let index_undo = mem::take(&mut self.index_undo);
         PreparedTrx {
-            session: self.session.take(),
-            status: self.status.clone(),
-            sts: self.sts,
-            log_no: self.log_no,
-            gc_no: self.gc_no,
             redo_bin,
-            row_undo,
-            index_undo,
+            payload: Some(PreparedTrxPayload {
+                status: self.status.clone(),
+                sts: self.sts,
+                log_no: self.log_no,
+                gc_no: self.gc_no,
+                row_undo,
+                index_undo,
+            }),
+            session: self.session.take(),
         }
     }
 
@@ -257,14 +266,14 @@ impl<P: BufferPool> ActiveTrx<P> {
     #[inline]
     pub async fn commit(self) -> Result<Session<P>> {
         let engine = self.engine().unwrap();
-        engine.trx_sys.commit(self).await
+        engine.trx_sys.commit(self, &engine.buf_pool).await
     }
 
     /// Rollback the transaction.
     #[inline]
     pub async fn rollback(self) -> Session<P> {
         let engine = self.engine().unwrap();
-        engine.trx_sys.rollback(self).await
+        engine.trx_sys.rollback(self, &engine.buf_pool).await
     }
 
     /// Add one redo log entry.
@@ -274,7 +283,7 @@ impl<P: BufferPool> ActiveTrx<P> {
         // self.trx_redo.push(RedoEntry{page_id: 0, row_id: 0, kind: RedoKind::Delete})
         // simulate sysbench record
         // uint64 + int32 + int32 + char(60) + char(120)
-        self.redo.insert(
+        self.redo.insert_dml(
             0,
             RowRedo {
                 page_id: 0,
@@ -297,34 +306,39 @@ impl<P: BufferPool> Drop for ActiveTrx<P> {
         assert!(self.redo.is_empty(), "redo should be cleared");
         assert!(self.row_undo.is_empty(), "row undo should be cleared");
         assert!(self.index_undo.is_empty(), "index undo should be cleared");
+        assert!(self.session.is_none(), "session should be cleared");
     }
 }
 
 impl<P: BufferPool> IntoSession<P> for ActiveTrx<P> {
     #[inline]
-    fn into_session(mut self) -> Session<P> {
-        self.session.take().unwrap()
+    fn into_session(mut self) -> Option<Session<P>> {
+        self.session.take()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Session<P> {
-        self.session.take().unwrap()
+    fn split_session(&mut self) -> Option<Session<P>> {
+        self.session.take()
     }
 }
 
 static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
 static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
-/// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
-pub struct PreparedTrx<P: BufferPool> {
-    session: Option<Session<P>>,
+pub struct PreparedTrxPayload {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
     log_no: usize,
     gc_no: usize,
-    redo_bin: Option<LenPrefixStruct<'static, RedoLogs>>,
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
+}
+
+/// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
+pub struct PreparedTrx<P: BufferPool> {
+    redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
+    payload: Option<PreparedTrxPayload>,
+    session: Option<Session<P>>,
 }
 
 impl<P: BufferPool> PreparedTrx<P> {
@@ -335,46 +349,71 @@ impl<P: BufferPool> PreparedTrx<P> {
 
     #[inline]
     pub fn fill_cts(mut self, cts: TrxID) -> PrecommitTrx<P> {
-        let redo_bin = if let Some(redo_bin) = self.redo_bin.take() {
-            // todo: fill cts into binary log.
+        let redo_bin = if let Some(mut redo_bin) = self.redo_bin.take() {
+            redo_bin.header.cts = cts;
             Some(redo_bin)
         } else {
             None
         };
-        let row_undo = mem::take(&mut self.row_undo);
-        // Once we get a concrete CTS, we won't rollback this transaction.
-        // So we convert IndexUndo to IndexGC, and let purge threads to
-        // remove unused index entries.
-        // let index_undo = mem::take(&mut self.index_undo);
-        let index_gc = self.index_undo.commit_for_gc();
-        PrecommitTrx {
-            status: Arc::clone(&self.status),
-            sts: self.sts,
-            cts,
-            gc_no: self.gc_no,
-            redo_bin,
-            row_undo,
-            index_gc,
-            session: self.session.take(),
+        match self.payload.take() {
+            Some(PreparedTrxPayload {
+                status,
+                sts,
+                log_no: _,
+                gc_no,
+                row_undo,
+                mut index_undo,
+            }) => {
+                // Once we get a concrete CTS, we won't rollback this transaction.
+                // So we convert IndexUndo to IndexGC, and let purge threads to
+                // remove unused index entries.
+                let index_gc = index_undo.commit_for_gc();
+                PrecommitTrx {
+                    cts,
+                    redo_bin,
+                    payload: Some(PrecommitTrxPayload {
+                        status,
+                        sts,
+                        gc_no,
+                        row_undo,
+                        index_gc,
+                    }),
+                    session: self.session.take(),
+                }
+            }
+            None => {
+                debug_assert!(self.session.is_none());
+                PrecommitTrx {
+                    cts,
+                    redo_bin,
+                    payload: None,
+                    session: None,
+                }
+            }
         }
     }
 
     /// Returns whether the prepared transaction is readonly.
     #[inline]
     pub fn readonly(&self) -> bool {
-        self.redo_bin.is_none() && self.row_undo.is_empty()
+        self.redo_bin.is_none()
+            && self
+                .payload
+                .as_ref()
+                .map(|p| p.row_undo.is_empty())
+                .unwrap_or(true)
     }
 }
 
 impl<P: BufferPool> IntoSession<P> for PreparedTrx<P> {
     #[inline]
-    fn into_session(mut self) -> Session<P> {
-        self.session.take().unwrap()
+    fn into_session(mut self) -> Option<Session<P>> {
+        self.session.take()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Session<P> {
-        self.session.take().unwrap()
+    fn split_session(&mut self) -> Option<Session<P>> {
+        self.session.take()
     }
 }
 
@@ -382,21 +421,30 @@ impl<P: BufferPool> Drop for PreparedTrx<P> {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
-        assert!(self.row_undo.is_empty(), "row undo should be cleared");
-        assert!(self.index_undo.is_empty(), "index undo should be cleared");
+        assert!(self.payload.is_none(), "payload should be cleared");
+        assert!(self.session.is_none(), "session should be cleared");
     }
 }
 
-/// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
-pub struct PrecommitTrx<P: BufferPool> {
+pub struct PrecommitTrxPayload {
     status: Arc<SharedTrxStatus>,
     pub sts: TrxID,
-    pub cts: TrxID,
     pub gc_no: usize,
-    pub redo_bin: Option<LenPrefixStruct<'static, RedoLogs>>,
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurge>,
-    session: Option<Session<P>>,
+}
+
+/// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
+/// There are two kinds of PrecommitTrx.
+/// One is user transaction which will contains payload such as undo logs and index GC records
+/// and session info.
+/// The other is system transaction which will be directly dropped and has no other info.
+pub struct PrecommitTrx<P: BufferPool> {
+    pub cts: TrxID,
+    pub redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
+    // Payload is only for user transaction
+    pub payload: Option<PrecommitTrxPayload>,
+    pub session: Option<Session<P>>,
 }
 
 impl<P: BufferPool> PrecommitTrx<P> {
@@ -406,21 +454,42 @@ impl<P: BufferPool> PrecommitTrx<P> {
     pub fn commit(mut self) -> CommittedTrx<P> {
         assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
                                           // release the prepare notifier in transaction status
-        {
-            self.status.ts.store(self.cts, Ordering::SeqCst);
-            self.status.preparing.store(false, Ordering::SeqCst);
-            let mut g = self.status.prepare_signal.lock();
-            drop(g.take());
-        }
-        let row_undo = mem::take(&mut self.row_undo);
-        let index_gc = mem::take(&mut self.index_gc);
-        CommittedTrx {
-            sts: self.sts,
-            cts: self.cts,
-            gc_no: self.gc_no,
-            row_undo,
-            index_gc,
-            session: self.session.take(),
+        match self.payload.take() {
+            Some(PrecommitTrxPayload {
+                status,
+                sts,
+                gc_no,
+                row_undo,
+                index_gc,
+            }) => {
+                // For user transaction, we need to notify readers that this transaction is committed,
+                // and readers can continue their work.
+                {
+                    status.ts.store(self.cts, Ordering::SeqCst);
+                    status.preparing.store(false, Ordering::SeqCst);
+                    let mut g = status.prepare_signal.lock();
+                    drop(g.take());
+                }
+                CommittedTrx {
+                    cts: self.cts,
+                    payload: Some(CommittedTrxPayload {
+                        sts,
+                        gc_no,
+                        row_undo,
+                        index_gc,
+                    }),
+                    session: self.session.take(),
+                }
+            }
+            None => {
+                debug_assert!(self.session.is_none());
+                // For system transaction, there is nothing we have to keep once it's committed.
+                CommittedTrx {
+                    cts: self.cts,
+                    payload: None,
+                    session: None,
+                }
+            }
         }
     }
 }
@@ -429,40 +498,67 @@ impl<P: BufferPool> Drop for PrecommitTrx<P> {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
-        assert!(self.row_undo.is_empty(), "row undo should be cleared");
-        assert!(self.index_gc.is_empty(), "index gc should be cleared");
+        assert!(self.payload.is_none(), "payload should be cleared");
+        assert!(self.session.is_none(), "session should be cleared");
     }
 }
 
 impl<P: BufferPool> IntoSession<P> for PrecommitTrx<P> {
     #[inline]
-    fn into_session(mut self) -> Session<P> {
-        self.session.take().unwrap()
+    fn into_session(mut self) -> Option<Session<P>> {
+        self.session.take()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Session<P> {
-        self.session.take().unwrap()
+    fn split_session(&mut self) -> Option<Session<P>> {
+        self.session.take()
     }
 }
 
-pub struct CommittedTrx<P: BufferPool> {
+pub struct CommittedTrxPayload {
     pub sts: TrxID,
-    pub cts: TrxID,
     pub gc_no: usize,
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurge>,
+}
+
+pub struct CommittedTrx<P: BufferPool> {
+    pub cts: TrxID,
+    pub payload: Option<CommittedTrxPayload>,
     session: Option<Session<P>>,
+}
+
+impl<P: BufferPool> CommittedTrx<P> {
+    #[inline]
+    pub fn sts(&self) -> Option<TrxID> {
+        self.payload.as_ref().map(|p| p.sts)
+    }
+
+    /// Returns gc_no if this transaction is GC-aware.
+    #[inline]
+    pub fn gc_no(&self) -> Option<usize> {
+        self.payload.as_ref().map(|p| p.gc_no)
+    }
+
+    #[inline]
+    pub fn row_undo(&self) -> Option<&RowUndoLogs> {
+        self.payload.as_ref().map(|p| &p.row_undo)
+    }
+
+    #[inline]
+    pub fn index_gc(&self) -> Option<&[IndexPurge]> {
+        self.payload.as_ref().map(|p| &p.index_gc[..])
+    }
 }
 
 impl<P: BufferPool> IntoSession<P> for CommittedTrx<P> {
     #[inline]
-    fn into_session(mut self) -> Session<P> {
-        self.session.take().unwrap()
+    fn into_session(mut self) -> Option<Session<P>> {
+        self.session.take()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Session<P> {
-        self.session.take().unwrap()
+    fn split_session(&mut self) -> Option<Session<P>> {
+        self.session.take()
     }
 }

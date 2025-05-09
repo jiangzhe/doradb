@@ -62,7 +62,6 @@ pub use doradb_catalog::TableID;
 /// index does not contain version information, and out-of-date index entry
 /// should ignored if visible data version does not match index key.
 pub struct Table<P: BufferPool> {
-    table_id: TableID,
     pub metadata: Arc<TableMetadata>,
     pub blk_idx: Arc<BlockIndex<P>>,
     pub sec_idx: Arc<[SecondaryIndex]>,
@@ -71,8 +70,7 @@ pub struct Table<P: BufferPool> {
 impl<P: BufferPool> Table<P> {
     /// Create a new table.
     #[inline]
-    pub async fn new(buf_pool: &'static P, table_id: TableID, metadata: TableMetadata) -> Self {
-        let blk_idx = BlockIndex::new(buf_pool).await;
+    pub fn new(blk_idx: BlockIndex<P>, metadata: TableMetadata) -> Self {
         let sec_idx: Vec<_> = metadata
             .index_specs
             .iter()
@@ -83,7 +81,6 @@ impl<P: BufferPool> Table<P> {
             })
             .collect();
         Table {
-            table_id,
             metadata: Arc::new(metadata),
             blk_idx: Arc::new(blk_idx),
             sec_idx: Arc::from(sec_idx.into_boxed_slice()),
@@ -92,7 +89,7 @@ impl<P: BufferPool> Table<P> {
 
     #[inline]
     pub fn table_id(&self) -> TableID {
-        self.table_id
+        self.blk_idx.table_id
     }
 
     #[inline]
@@ -596,7 +593,7 @@ impl<P: BufferPool> Table<P> {
             let page_id = page_guard.page_id();
             match self.insert_row_to_page(stmt, page_guard, insert, undo_kind, move_entry) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
-                    stmt.save_active_insert_page(self.table_id, page_id, row_id);
+                    stmt.save_active_insert_page(self.table_id(), page_id, row_id);
                     return (row_id, page_guard);
                 }
                 // this page cannot be inserted any more, just leave it and retry another page.
@@ -642,7 +639,7 @@ impl<P: BufferPool> Table<P> {
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
         let mut access = page_guard.write_row(row_idx);
-        access.lock_undo(stmt, &self.metadata, self.table_id, page_id, row_id, None);
+        access.lock_undo(stmt, &self.metadata, self.table_id(), page_id, row_id, None);
         // Apply insert
         let mut new_row = page.new_row(row_idx as usize, var_offset);
         for v in &insert {
@@ -702,7 +699,7 @@ impl<P: BufferPool> Table<P> {
             kind: RowRedoKind::Insert(insert),
         };
         // store redo log into transaction redo buffer.
-        stmt.redo.insert(self.table_id, redo_entry);
+        stmt.redo.insert_dml(self.table_id(), redo_entry);
         InsertRowIntoPage::Ok(row_id, page_guard)
     }
 
@@ -775,7 +772,7 @@ impl<P: BufferPool> Table<P> {
                             // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
                             kind: RowRedoKind::Delete,
                         };
-                        stmt.redo.insert(self.table_id, redo_entry);
+                        stmt.redo.insert_dml(self.table_id(), redo_entry);
                         UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
                     }
                     UpdateRow::Ok(mut row) => {
@@ -821,7 +818,7 @@ impl<P: BufferPool> Table<P> {
                                 row_id,
                                 kind: RowRedoKind::Update(redo_cols),
                             };
-                            stmt.redo.insert(self.table_id, redo_entry);
+                            stmt.redo.insert_dml(self.table_id(), redo_entry);
                         }
                         UpdateRowInplace::Ok(row_id, index_change_cols, page_guard)
                     }
@@ -866,7 +863,7 @@ impl<P: BufferPool> Table<P> {
                     row_id,
                     kind: RowRedoKind::Delete,
                 };
-                stmt.redo.insert(self.table_id, redo_entry);
+                stmt.redo.insert_dml(self.table_id(), redo_entry);
                 DeleteInternal::Ok(page_guard)
             }
         }
@@ -879,7 +876,7 @@ impl<P: BufferPool> Table<P> {
         stmt: &mut Statement<P>,
         row_count: usize,
     ) -> PageSharedGuard<RowPage> {
-        if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id) {
+        if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
             let page_guard = buf_pool
                 .get_page(page_id, LatchFallbackMode::Shared)
                 .await
@@ -912,7 +909,7 @@ impl<P: BufferPool> Table<P> {
             let lock_undo = access.lock_undo(
                 stmt,
                 &self.metadata,
-                self.table_id,
+                self.table_id(),
                 page_guard.page_id(),
                 row_id,
                 key,
@@ -951,7 +948,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     fn index_undo(&self, row_id: RowID, kind: IndexUndoKind) -> IndexUndo {
         IndexUndo {
-            table_id: self.table_id,
+            table_id: self.table_id(),
             row_id,
             kind,
         }
@@ -1345,7 +1342,6 @@ impl<P: BufferPool> Clone for Table<P> {
     #[inline]
     fn clone(&self) -> Self {
         Table {
-            table_id: self.table_id,
             metadata: Arc::clone(&self.metadata),
             blk_idx: Arc::clone(&self.blk_idx),
             sec_idx: Arc::clone(&self.sec_idx),

@@ -2,6 +2,7 @@ use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::{row_id_spec, TableMetadata};
 use crate::error::{Error, Result};
+use crate::index::BlockIndex;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::RowID;
 use crate::table::Table;
@@ -73,7 +74,7 @@ impl<P: BufferPool> Statement<P> {
         let engine = self.trx.engine().unwrap();
         self.row_undo.rollback(&engine.buf_pool).await;
         // rollback index data.
-        self.index_undo.rollback(&engine.catalog);
+        self.index_undo.rollback(&engine.catalog());
         // clear redo logs.
         self.redo.clear();
         self.trx
@@ -100,9 +101,9 @@ impl<P: BufferPool> Statement<P> {
         let engine = self.trx.engine().unwrap();
         // Check if schema exists
         if engine
-            .catalog
+            .catalog()
             .storage
-            .schemas
+            .schemas()
             .find_uncommitted_by_name(&engine.buf_pool, schema_name)
             .await
             .is_some()
@@ -111,18 +112,18 @@ impl<P: BufferPool> Statement<P> {
         }
 
         // Prepare schema object
-        let schema_id = engine.catalog.next_obj_id();
+        let schema_id = engine.catalog().next_obj_id();
         let schema_object = SchemaObject {
             schema_id,
             schema_name: SemiStr::new(schema_name),
         };
 
-        let mut schema_cache_g = engine.catalog.cache.schemas.write();
+        let mut schema_cache_g = engine.catalog().cache.schemas.write();
 
         let inserted = engine
-            .catalog
+            .catalog()
             .storage
-            .schemas
+            .schemas()
             .insert(&engine.buf_pool, self, &schema_object)
             .await;
         if !inserted {
@@ -148,9 +149,9 @@ impl<P: BufferPool> Statement<P> {
         let engine = self.trx.engine().unwrap();
         // Check if schema exists
         if engine
-            .catalog
+            .catalog()
             .storage
-            .schemas
+            .schemas()
             .find_uncommitted_by_id(&engine.buf_pool, schema_id)
             .await
             .is_none()
@@ -160,9 +161,9 @@ impl<P: BufferPool> Statement<P> {
 
         // Check if table exists
         if engine
-            .catalog
+            .catalog()
             .storage
-            .tables
+            .tables()
             .find_uncommitted_by_name(&engine.buf_pool, schema_id, &table_spec.table_name)
             .await
             .is_some()
@@ -171,7 +172,7 @@ impl<P: BufferPool> Statement<P> {
         }
 
         // Prepare table object
-        let table_id = engine.catalog.next_obj_id();
+        let table_id = engine.catalog().next_obj_id();
         let table_object = TableObject {
             table_id,
             table_name: table_spec.table_name.clone(),
@@ -184,7 +185,7 @@ impl<P: BufferPool> Statement<P> {
             .chain(table_spec.columns.iter())
             .enumerate()
             .map(|(col_no, col_spec)| ColumnObject {
-                column_id: engine.catalog.next_obj_id(),
+                column_id: engine.catalog().next_obj_id(),
                 column_name: col_spec.column_name.clone(),
                 table_id,
                 column_no: col_no as u16,
@@ -197,20 +198,20 @@ impl<P: BufferPool> Statement<P> {
         let index_objects: Vec<_> = index_specs
             .iter()
             .map(|index_spec| IndexObject {
-                index_id: engine.catalog.next_obj_id(),
+                index_id: engine.catalog().next_obj_id(),
                 table_id,
                 index_name: index_spec.index_name.clone(),
                 index_attributes: index_spec.index_attributes,
             })
             .collect();
 
-        let mut table_cache_g = engine.catalog.cache.tables.write();
+        let mut table_cache_g = engine.catalog().cache.tables.write();
 
         // Insert table object, column objects, index objects
         let inserted = engine
-            .catalog
+            .catalog()
             .storage
-            .tables
+            .tables()
             .insert(&engine.buf_pool, self, &table_object)
             .await;
         if !inserted {
@@ -219,18 +220,18 @@ impl<P: BufferPool> Statement<P> {
 
         for column_object in column_objects {
             let inserted = engine
-                .catalog
+                .catalog()
                 .storage
-                .columns
+                .columns()
                 .insert(&engine.buf_pool, self, &column_object)
                 .await;
             debug_assert!(inserted);
         }
         for index_object in index_objects {
             let inserted = engine
-                .catalog
+                .catalog()
                 .storage
-                .indexes
+                .indexes()
                 .insert(&engine.buf_pool, self, &index_object)
                 .await;
             debug_assert!(inserted);
@@ -238,7 +239,8 @@ impl<P: BufferPool> Statement<P> {
 
         // Prepare in-memory representation of new table
         let table_metadata = TableMetadata::new(table_spec.columns, index_specs);
-        let table = Table::new(&engine.buf_pool, table_id, table_metadata).await;
+        let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, table_id).await;
+        let table = Table::new(blk_idx, table_metadata);
         let res = table_cache_g.insert(table_id, table);
         debug_assert!(res.is_none());
 

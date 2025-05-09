@@ -53,6 +53,8 @@ pub enum Error {
     SchemaAlreadyExists,
     #[error("table already exists")]
     TableAlreadyExists,
+    #[error("user session missing")]
+    UserSessionMissing,
 }
 
 impl From<TryFromSliceError> for Error {
