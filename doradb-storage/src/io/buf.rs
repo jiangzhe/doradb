@@ -1,7 +1,7 @@
 use crate::io::free_list::FreeElem;
 use crate::io::{align_to_sector_size, MIN_PAGE_SIZE, STORAGE_SECTOR_SIZE};
-use crate::serde::{LenPrefixStruct, Ser, SerdeCtx};
-use crate::trx::redo::RedoLogs;
+use crate::serde::{LenPrefixPod, Ser, SerdeCtx};
+use crate::trx::redo::{RedoHeader, RedoLogs};
 use std::alloc::{alloc, Layout};
 use std::ops::{Deref, DerefMut};
 
@@ -43,7 +43,7 @@ impl Buf {
     }
 
     #[inline]
-    pub fn extend_ser(&mut self, serde_ctx: &SerdeCtx, data: &LenPrefixStruct<'static, RedoLogs>) {
+    pub fn extend_ser(&mut self, serde_ctx: &SerdeCtx, data: &LenPrefixPod<RedoHeader, RedoLogs>) {
         match self {
             Buf::Reuse(buf) => {
                 let offset = buf.data_len();

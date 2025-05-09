@@ -21,7 +21,6 @@ impl<P: BufferPool> TransactionSystem<P> {
     pub(super) fn start_purge_threads(
         &'static self,
         buf_pool: &'static P,
-        catalog: &'static Catalog<P>,
         purge_chan: Receiver<Purge>,
     ) {
         if self.config.purge_threads == 1 {
@@ -29,16 +28,21 @@ impl<P: BufferPool> TransactionSystem<P> {
             let handle = thread::spawn_named("Purge-Thread", move || {
                 let ex = LocalExecutor::new();
                 let mut purger = PurgeSingleThreaded::default();
-                smol::block_on(ex.run(purger.purge_loop(buf_pool, catalog, self, purge_chan)))
+                smol::block_on(ex.run(purger.purge_loop(buf_pool, &self.catalog, self, purge_chan)))
             });
             let mut g = self.purge_threads.lock();
             g.push(handle);
         } else {
             // multi-threaded purger
-            let (mut dispatcher, executors) = self.dispatch_purge(buf_pool, catalog);
+            let (mut dispatcher, executors) = self.dispatch_purge(buf_pool, &self.catalog);
             let handle = thread::spawn_named("Purge-Dispatcher", move || {
                 let ex = LocalExecutor::new();
-                smol::block_on(ex.run(dispatcher.purge_loop(buf_pool, catalog, self, purge_chan)));
+                smol::block_on(ex.run(dispatcher.purge_loop(
+                    buf_pool,
+                    &self.catalog,
+                    self,
+                    purge_chan,
+                )));
             });
             let mut g = self.purge_threads.lock();
             g.push(handle);
@@ -114,9 +118,11 @@ impl<P: BufferPool> TransactionSystem<P> {
         // First, we collect pages and row ids to purge row undo.
         let mut target: HashMap<PageID, HashSet<RowID>> = HashMap::new();
         for trx in &trx_list {
-            purge_row_count += trx.row_undo.len();
-            for undo in &*trx.row_undo {
-                target.entry(undo.page_id).or_default().insert(undo.row_id);
+            if let Some(row_undo) = trx.row_undo() {
+                purge_row_count += row_undo.len();
+                for undo in &**row_undo {
+                    target.entry(undo.page_id).or_default().insert(undo.row_id);
+                }
             }
         }
         for (page_id, row_ids) in target {
@@ -133,10 +139,12 @@ impl<P: BufferPool> TransactionSystem<P> {
 
         // Second, we purge index.
         for trx in &trx_list {
-            for ip in &trx.index_gc {
-                if let Some(table) = table_cache.get_table(ip.table_id) {
-                    if table.delete_index(buf_pool, &ip.key, ip.row_id).await {
-                        purge_index_count += 1;
+            if let Some(index_gc) = trx.index_gc() {
+                for ip in index_gc {
+                    if let Some(table) = table_cache.get_table(ip.table_id) {
+                        if table.delete_index(buf_pool, &ip.key, ip.row_id).await {
+                            purge_index_count += 1;
+                        }
                     }
                 }
             }
@@ -309,8 +317,10 @@ impl<P: BufferPool> GCBucket<P> {
         {
             let mut committed_trx_list = self.committed_trx_list.lock();
             for trx in trx_list {
-                min_sts = active_sts_list.remove(trx.sts);
-                committed_trx_list.push_back(trx);
+                if let Some(sts) = trx.sts() {
+                    min_sts = active_sts_list.remove(sts);
+                    committed_trx_list.push_back(trx);
+                }
             }
         }
         // Update minimum active STS
@@ -548,7 +558,7 @@ mod tests {
                     .unwrap();
 
             let table_id = table1(engine).await;
-            let table = engine.catalog.get_table(table_id).unwrap();
+            let table = engine.catalog().get_table(table_id).unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
@@ -621,7 +631,7 @@ mod tests {
                     .unwrap();
 
             let table_id = table1(engine).await;
-            let table = engine.catalog.get_table(table_id).unwrap();
+            let table = engine.catalog().get_table(table_id).unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.

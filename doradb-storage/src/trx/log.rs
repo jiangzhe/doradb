@@ -5,11 +5,11 @@ use crate::io::{
     PageBuf, SparseFile, AIO,
 };
 use crate::notify::{Notify, Signal};
-use crate::serde::{LenPrefixStruct, Ser, SerdeCtx};
+use crate::serde::{LenPrefixPod, Ser, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::trx::group::{Commit, CommitGroup, GroupCommit};
 use crate::trx::purge::{GCBucket, GC};
-use crate::trx::redo::RedoLogs;
+use crate::trx::redo::{RedoHeader, RedoLogs};
 use crate::trx::sys::TrxSysConfig;
 use crate::trx::{CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
@@ -64,7 +64,7 @@ pub(super) struct LogPartition<P: BufferPool> {
 
 impl<P: BufferPool> LogPartition<P> {
     #[inline]
-    fn buf(&self, serde_ctx: &SerdeCtx, data: &LenPrefixStruct<'static, RedoLogs>) -> Buf {
+    fn buf(&self, serde_ctx: &SerdeCtx, data: &LenPrefixPod<RedoHeader, RedoLogs>) -> Buf {
         let len = data.ser_len(serde_ctx);
         if len > self.max_io_size {
             let mut buf = DirectBuf::zeroed(len);
@@ -110,7 +110,7 @@ impl<P: BufferPool> LogPartition<P> {
         &self,
         mut trx: PrecommitTrx<P>,
         mut group_commit_g: MutexGuard<'_, GroupCommit<P>>,
-    ) -> (Session<P>, Notify) {
+    ) -> (Option<Session<P>>, Notify) {
         let cts = trx.cts;
         let serde_ctx = SerdeCtx::default();
         let redo_bin = trx.redo_bin.take().unwrap();
@@ -152,9 +152,13 @@ impl<P: BufferPool> LogPartition<P> {
     }
 
     #[inline]
-    pub(super) async fn commit(&self, trx: PreparedTrx<P>, ts: &AtomicU64) -> Result<Session<P>> {
+    pub(super) async fn commit(
+        &self,
+        trx: PreparedTrx<P>,
+        global_ts: &AtomicU64,
+    ) -> Result<Option<Session<P>>> {
         let mut group_commit_g = self.group_commit.0.lock_async().await;
-        let cts = ts.fetch_add(1, Ordering::SeqCst);
+        let cts = global_ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
@@ -496,7 +500,10 @@ impl<'a, P: BufferPool> FileProcessor<'a, P> {
                 let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx<P>>> = HashMap::new();
                 for trx in mem::take(&mut sync_group.trx_list) {
                     let trx = trx.commit();
-                    committed_trx_list.entry(trx.gc_no).or_default().push(trx);
+                    if let Some(gc_no) = trx.gc_no() {
+                        // Only user transaction is involved in GC process.
+                        committed_trx_list.entry(gc_no).or_default().push(trx);
+                    }
                 }
                 // send committed transaction list to GC thread
                 let _ = self.partition.gc_chan.send(GC::Commit(committed_trx_list));

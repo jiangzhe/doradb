@@ -365,43 +365,52 @@ impl<K: Ord + Deser, V: Deser> Deser for BTreeMap<K, V> {
 /// This struct is used to serialize a length-prefixed object.
 /// The length is serialized as a u64 value.
 /// The data is serialized using the Ser trait.
-pub struct LenPrefixStruct<'a, T> {
+pub struct LenPrefixSerView<'a, H, P> {
     data_len: u32,
     checksum: AtomicU32,
-    data: T,
-    _marker: PhantomData<&'a T>,
+    header: &'a H,
+    payload: &'a P,
+    _marker: PhantomData<(&'a H, &'a P)>,
 }
 
-impl<'a, T: Ser<'a>> LenPrefixStruct<'a, T> {
+impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixSerView<'a, H, P> {
     /// Create a new LenPrefixStruct.
     #[inline]
-    pub fn new(data: T, ctx: &SerdeCtx) -> Self {
-        let data_len = data.ser_len(ctx);
+    pub fn new(header: &'a H, payload: &'a P, ctx: &SerdeCtx) -> Self {
+        let header_len = header.ser_len(ctx);
+        let payload_len = payload.ser_len(ctx);
+        let data_len = header_len + payload_len;
         assert!(data_len <= u32::MAX as usize);
         Self {
             data_len: data_len as u32,
             checksum: AtomicU32::new(0),
-            data,
+            header,
+            payload,
             _marker: PhantomData,
         }
     }
 }
 
-impl<'a, T> LenPrefixStruct<'a, T> {
+impl<'a, H, P> LenPrefixSerView<'a, H, P> {
     /// Get the length of the data.
     #[inline]
     pub fn data_len(&self) -> usize {
         self.data_len as usize
     }
 
+    #[inline]
+    pub fn header(&self) -> &H {
+        self.header
+    }
+
     /// Get the data.
     #[inline]
-    pub fn data(&self) -> &T {
-        &self.data
+    pub fn payload(&self) -> &P {
+        self.payload
     }
 }
 
-impl<'a, T: Ser<'a>> Ser<'a> for LenPrefixStruct<'a, T> {
+impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixSerView<'a, H, P> {
     #[inline]
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
         mem::size_of::<u32>() + mem::size_of::<u32>() + self.data_len as usize
@@ -409,14 +418,17 @@ impl<'a, T: Ser<'a>> Ser<'a> for LenPrefixStruct<'a, T> {
 
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        debug_assert!(self.data_len as usize == self.data.ser_len(ctx));
+        debug_assert!(
+            self.data_len as usize == self.header.ser_len(ctx) + self.payload.ser_len(ctx)
+        );
         debug_assert!(start_idx + self.ser_len(ctx) <= out.len());
         let mut idx = start_idx;
         idx = ctx.ser_u32(out, idx, self.data_len);
         // Leave space for checksum
         let checksum_start_idx = idx;
         let checksum_end_idx = idx + mem::size_of::<u32>();
-        idx = self.data.ser(ctx, out, checksum_end_idx);
+        idx = self.header.ser(ctx, out, checksum_end_idx);
+        idx = self.payload.ser(ctx, out, idx);
         // Calculate and store checksum
         let checksum = crc32fast::hash(&out[checksum_end_idx..idx]);
         self.checksum.store(checksum, Ordering::Relaxed);
@@ -426,29 +438,78 @@ impl<'a, T: Ser<'a>> Ser<'a> for LenPrefixStruct<'a, T> {
     }
 }
 
-impl<T: Deser> Deser for LenPrefixStruct<'_, T> {
+pub struct LenPrefixPod<H, P> {
+    data_len: u32,
+    pub header: H,
+    pub payload: P,
+}
+
+impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixPod<H, P> {
+    /// Create a new LenPrefixStruct.
+    #[inline]
+    pub fn new(header: H, payload: P, ctx: &SerdeCtx) -> Self {
+        let header_len = header.ser_len(ctx);
+        let payload_len = payload.ser_len(ctx);
+        let data_len = header_len + payload_len;
+        assert!(data_len <= u32::MAX as usize);
+        Self {
+            data_len: data_len as u32,
+            header,
+            payload,
+        }
+    }
+}
+
+impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixPod<H, P> {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u32>() + mem::size_of::<u32>() + self.data_len as usize
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        debug_assert!(
+            self.data_len as usize == self.header.ser_len(ctx) + self.payload.ser_len(ctx)
+        );
+        debug_assert!(start_idx + self.ser_len(ctx) <= out.len());
+        let mut idx = start_idx;
+        idx = ctx.ser_u32(out, idx, self.data_len);
+        // Leave space for checksum
+        let checksum_start_idx = idx;
+        let checksum_end_idx = idx + mem::size_of::<u32>();
+        idx = self.header.ser(ctx, out, checksum_end_idx);
+        idx = self.payload.ser(ctx, out, idx);
+        // Calculate and store checksum
+        let checksum = crc32fast::hash(&out[checksum_end_idx..idx]);
+        let c_idx = ctx.ser_u32(out, checksum_start_idx, checksum);
+        debug_assert!(c_idx == checksum_end_idx);
+        idx
+    }
+}
+impl<H: Deser, P: Deser> Deser for LenPrefixPod<H, P> {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, len) = ctx.deser_u32(input, start_idx)?;
+        let (idx, data_len) = ctx.deser_u32(input, start_idx)?;
         let (idx, checksum) = ctx.deser_u32(input, idx)?;
-        let (idx, data) = if ctx.validate_checksum {
-            let start_idx = idx;
-            let (idx, data) = T::deser(ctx, input, idx)?;
-            let calculated_checksum = crc32fast::hash(&input[start_idx..idx]);
+        let (idx, header, payload) = if ctx.validate_checksum {
+            let calculated_checksum = crc32fast::hash(&input[idx..idx + data_len as usize]);
             if calculated_checksum != checksum {
                 return Err(Error::ChecksumMismatch);
             }
-            (idx, data)
+            let (idx, header) = H::deser(ctx, input, idx)?;
+            let (idx, payload) = P::deser(ctx, input, idx)?;
+            (idx, header, payload)
         } else {
-            T::deser(ctx, input, idx)?
+            let (idx, header) = H::deser(ctx, input, idx)?;
+            let (idx, payload) = P::deser(ctx, input, idx)?;
+            (idx, header, payload)
         };
         Ok((
             idx,
-            LenPrefixStruct {
-                data_len: len,
-                checksum: AtomicU32::new(checksum),
-                data,
-                _marker: PhantomData,
+            LenPrefixPod {
+                data_len,
+                header,
+                payload,
             },
         ))
     }
@@ -483,6 +544,25 @@ impl Deser for IndexKey {
     }
 }
 
+impl Ser<'_> for () {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        0
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        start_idx
+    }
+}
+
+impl Deser for () {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        Ok((start_idx, ()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,33 +570,23 @@ mod tests {
     #[test]
     fn test_len_prefix_struct_serde() {
         let mut ctx = SerdeCtx::default().validate_checksum(true);
-        let len_prefix_struct = LenPrefixStruct::new(
-            TestStruct {
-                a: 1,
-                b: 2,
-                c: 3,
-                d: 4,
-            },
-            &ctx,
-        );
+        let test_struct = TestStruct {
+            a: 1,
+            b: 2,
+            c: 3,
+            d: 4,
+        };
+        let len_prefix_struct = LenPrefixSerView::new(&(), &test_struct, &ctx);
         let mut out = vec![0; len_prefix_struct.ser_len(&ctx)];
         len_prefix_struct.ser(&ctx, &mut out, 0);
         println!("{:?}", out);
-        let (idx, val) = LenPrefixStruct::<TestStruct>::deser(&mut ctx, &out, 0).unwrap();
+        let (idx, pod) = LenPrefixPod::<(), TestStruct>::deser(&mut ctx, &out, 0).unwrap();
         assert_eq!(idx, out.len());
-        assert_eq!(
-            val.data(),
-            &TestStruct {
-                a: 1,
-                b: 2,
-                c: 3,
-                d: 4
-            }
-        );
+        assert_eq!(pod.payload, test_struct);
 
         // overwrite checksum so that checksum mismatch
         out[4..8].fill(0);
-        let res = LenPrefixStruct::<TestStruct>::deser(&mut ctx, &out, 0);
+        let res = LenPrefixPod::<(), TestStruct>::deser(&mut ctx, &out, 0);
         if let Err(Error::ChecksumMismatch) = res {
             println!("expected checksum mismatch");
         } else {

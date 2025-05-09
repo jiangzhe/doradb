@@ -1,21 +1,22 @@
 use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::io::{align_to_sector_size, AIOManagerConfig, FreeListWithFactory, PageBuf};
+use crate::latch::Mutex;
 use crate::lifetime::StaticLifetime;
 use crate::notify::Signal;
 use crate::session::{IntoSession, Session};
+use crate::thread;
 use crate::trx::group::{Commit, GroupCommit};
 use crate::trx::log::{create_log_file, LogPartition, LogPartitionStats, LogSync};
 use crate::trx::purge::{GCBucket, Purge, GC};
+use crate::trx::redo::RedoLogs;
+use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
     ActiveTrx, PreparedTrx, TrxID, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
 };
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
-// use parking_lot::{Condvar, Mutex};
-use crate::latch::Mutex;
-use crate::thread;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -81,6 +82,8 @@ pub struct TransactionSystem<P: BufferPool> {
     pub(super) log_partitions: CachePadded<Box<[CachePadded<LogPartition<P>>]>>,
     /// Transaction system configuration.
     pub(super) config: CachePadded<TrxSysConfig>,
+    /// Catalog of the database.
+    pub(crate) catalog: CachePadded<Catalog<P>>,
     /// Channel to send message to purge threads.
     purge_chan: Sender<Purge>,
     /// Purge threads purge unused undo logs, row pages and index entries.
@@ -89,17 +92,16 @@ pub struct TransactionSystem<P: BufferPool> {
 
 impl<P: BufferPool> TransactionSystem<P> {
     #[inline]
-    pub fn start(
-        &'static self,
-        buf_pool: &'static P,
-        catalog: &'static Catalog<P>,
-        start_ctx: TrxSysStartContext<P>,
-    ) {
+    pub async fn start(&'static self, buf_pool: &'static P, start_ctx: TrxSysStartContext<P>) {
         self.start_sync_threads();
         self.start_gc_threads(start_ctx.gc_chans);
-        self.start_purge_threads(buf_pool, catalog, start_ctx.purge_rx);
+        self.start_purge_threads(buf_pool, start_ctx.purge_rx);
 
-        // todo: recover from log file.
+        // todo: recover catalog.
+        unsafe {
+            self.catalog.init(buf_pool, self).await;
+        }
+        // todo: recover data from log file.
     }
 
     /// Create a new transaction.
@@ -135,6 +137,13 @@ impl<P: BufferPool> TransactionSystem<P> {
         ActiveTrx::new(session, trx_id, sts, log_no, gc_no)
     }
 
+    #[inline]
+    pub fn begin_sys_trx(&self) -> SysTrx {
+        SysTrx {
+            redo: RedoLogs::default(),
+        }
+    }
+
     /// Commit an active transaction.
     /// The commit process is implemented as group commit.
     /// If multiple transactions are being committed at the same time, one of them
@@ -142,7 +151,7 @@ impl<P: BufferPool> TransactionSystem<P> {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub async fn commit(&self, trx: ActiveTrx<P>) -> Result<Session<P>> {
+    pub async fn commit(&self, trx: ActiveTrx<P>, buf_pool: &'static P) -> Result<Session<P>> {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_no];
@@ -160,22 +169,38 @@ impl<P: BufferPool> TransactionSystem<P> {
             // page-level undo maps.
             // In such case, we can just rollback this transaction because it actually
             // do nothing.
-            let session = self.rollback_prepared(prepared_trx).await;
+            let session = self.rollback_prepared(prepared_trx, buf_pool).await;
             return Ok(session);
         }
         // start group commit
-        partition.commit(prepared_trx, &self.ts).await
+        partition
+            .commit(prepared_trx, &self.ts)
+            .await
+            .and_then(|res| res.ok_or(Error::UserSessionMissing))
+    }
+
+    #[inline]
+    pub async fn commit_sys(&self, trx: SysTrx) -> Result<()> {
+        if trx.redo.is_empty() {
+            // System transaction does not hold any active start timestamp
+            // so we can just drop it if there is no change to replay.
+            return Ok(());
+        }
+        // system transactions are always submitted to first log partition.
+        const LOG_NO: usize = 0;
+        let partition = &*self.log_partitions[LOG_NO];
+        let prepared_trx = trx.prepare::<P>();
+        partition.commit(prepared_trx, &self.ts).await.map(|_| ())
     }
 
     /// Rollback active transaction.
     #[inline]
-    pub async fn rollback(&self, mut trx: ActiveTrx<P>) -> Session<P> {
-        let engine = trx.engine().unwrap();
-        trx.row_undo.rollback(&engine.buf_pool).await;
-        trx.index_undo.rollback(&engine.catalog);
+    pub async fn rollback(&self, mut trx: ActiveTrx<P>, buf_pool: &'static P) -> Session<P> {
+        trx.row_undo.rollback(buf_pool).await;
+        trx.index_undo.rollback(&self.catalog);
         trx.redo.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
-        trx.into_session()
+        trx.into_session().unwrap()
     }
 
     /// Rollback prepared transaction.
@@ -183,14 +208,16 @@ impl<P: BufferPool> TransactionSystem<P> {
     /// In such case, we do not need to go through entire commit process but just
     /// rollback the transaction, because it actually do nothing.
     #[inline]
-    async fn rollback_prepared(&self, mut trx: PreparedTrx<P>) -> Session<P> {
+    async fn rollback_prepared(&self, mut trx: PreparedTrx<P>, buf_pool: &'static P) -> Session<P> {
         debug_assert!(trx.redo_bin.is_none());
-        let engine = trx.engine().unwrap();
-        trx.row_undo.rollback(&engine.buf_pool).await;
-        trx.index_undo.rollback(&engine.catalog);
+        // Note: rollback can only happens to user transaction, so payload is always non-empty.
+        let mut payload = trx.payload.take().unwrap();
+        payload.row_undo.rollback(buf_pool).await;
+        payload.index_undo.rollback(&self.catalog);
         trx.redo_bin.take();
-        self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
-        trx.into_session()
+        self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
+            .gc_analyze_rollback(payload.sts);
+        trx.into_session().unwrap()
     }
 
     /// Returns statistics of group commit.
@@ -460,6 +487,7 @@ impl TrxSysConfig {
             partition_id: CachePadded::new(AtomicUsize::new(0)),
             log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
             config: CachePadded::new(self),
+            catalog: CachePadded::new(Catalog::empty()),
             purge_chan,
             purge_threads: Mutex::new(vec![]),
         };
@@ -469,14 +497,13 @@ impl TrxSysConfig {
     /// Build transaction system with logging and GC, leak it to heap
     /// for the convenience to share the singleton among multiple threads.
     #[inline]
-    pub fn build_static<P: BufferPool>(
+    pub async fn build_static<P: BufferPool>(
         self,
         buf_pool: &'static P,
-        catalog: &'static Catalog<P>,
     ) -> &'static TransactionSystem<P> {
         let (trx_sys, start_ctx) = self.build();
         let trx_sys = StaticLifetime::new_static(trx_sys);
-        trx_sys.start(buf_pool, catalog, start_ctx);
+        trx_sys.start(buf_pool, start_ctx).await;
         trx_sys
     }
 }
@@ -728,7 +755,7 @@ mod tests {
             .await
             .unwrap();
             let table_id = table2(engine).await;
-            let table = engine.catalog.get_table(table_id).unwrap();
+            let table = engine.catalog().get_table(table_id).unwrap();
 
             let mut session = engine.new_session();
             let s = vec![1u8; 200];

@@ -1,10 +1,12 @@
 use crate::buffer::BufferPool;
 use crate::catalog::table::TableMetadata;
+use crate::index::BlockIndex;
 use crate::row::ops::SelectKey;
 use crate::row::Row;
 use crate::row::RowRead;
 use crate::stmt::Statement;
 use crate::table::Table;
+use crate::trx::sys::TransactionSystem;
 use crate::value::Val;
 use doradb_catalog::{
     ColumnAttributes, ColumnID, ColumnObject, ColumnSpec, IndexAttributes, IndexColumnObject,
@@ -13,30 +15,74 @@ use doradb_catalog::{
 };
 use doradb_datatype::{Collation, PreciseType};
 use semistr::SemiStr;
+use std::cell::UnsafeCell;
 
-pub struct CatalogStorage<P: BufferPool> {
-    pub schemas: Schemas<P>,
-    pub tables: Tables<P>,
-    pub columns: Columns<P>,
-    pub indexes: Indexes<P>,
-    pub index_columns: IndexColumns<P>,
-}
+pub struct CatalogStorage<P: BufferPool>(pub(crate) UnsafeCell<Vec<Table<P>>>);
 
 impl<P: BufferPool> CatalogStorage<P> {
     #[inline]
-    pub async fn new(buf_pool: &'static P) -> Self {
-        let schemas = Schemas::new(buf_pool).await;
-        let tables = Tables::new(buf_pool).await;
-        let columns = Columns::new(buf_pool).await;
-        let indexes = Indexes::new(buf_pool).await;
-        let index_columns = IndexColumns::new(buf_pool).await;
-        CatalogStorage {
-            schemas,
-            tables,
-            columns,
-            indexes,
-            index_columns,
+    pub fn new() -> Self {
+        CatalogStorage(UnsafeCell::new(vec![]))
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        unsafe { (*self.0.get()).is_empty() }
+    }
+
+    #[inline]
+    pub fn table(&self, index: usize) -> &Table<P> {
+        unsafe { &(*self.0.get())[index] }
+    }
+
+    /// This method is marked as unsafe because we use internal mutability.
+    #[inline]
+    pub async unsafe fn init(&self, buf_pool: &'static P, trx_sys: &'static TransactionSystem<P>) {
+        assert!(self.is_empty());
+
+        let mut vec = vec![];
+        for (table_id, metadata) in [
+            (TABLE_ID_SCHEMAS, metadata_of_schemas()),
+            (TABLE_ID_TABLES, metadata_of_tables()),
+            (TABLE_ID_COLUMNS, metadata_of_columns()),
+            (TABLE_ID_INDEXES, metadata_of_indexes()),
+            (TABLE_ID_INDEX_COLUMNS, metadata_of_index_columns()),
+        ] {
+            // make sure table id matches.
+            assert_eq!(vec.len(), table_id as usize);
+            let blk_idx = BlockIndex::new(buf_pool, trx_sys, table_id).await;
+            let table = Table::new(blk_idx, metadata);
+            vec.push(table);
         }
+        unsafe {
+            (*self.0.get()) = vec;
+        }
+        // todo: recover catalog from redo.
+    }
+
+    #[inline]
+    pub fn schemas(&self) -> Schemas<P> {
+        Schemas(self.table(TABLE_ID_SCHEMAS as usize))
+    }
+
+    #[inline]
+    pub fn tables(&self) -> Tables<P> {
+        Tables(self.table(TABLE_ID_TABLES as usize))
+    }
+
+    #[inline]
+    pub fn columns(&self) -> Columns<P> {
+        Columns(self.table(TABLE_ID_COLUMNS as usize))
+    }
+
+    #[inline]
+    pub fn indexes(&self) -> Indexes<P> {
+        Indexes(self.table(TABLE_ID_INDEXES as usize))
+    }
+
+    #[inline]
+    pub fn index_columns(&self) -> IndexColumns<P> {
+        IndexColumns(self.table(TABLE_ID_INDEX_COLUMNS as usize))
     }
 }
 
@@ -392,16 +438,9 @@ fn row_to_index_column_object(row: Row<'_>) -> IndexColumnObject {
     }
 }
 
-pub struct Schemas<P: BufferPool>(Table<P>);
+pub struct Schemas<'a, P: BufferPool>(&'a Table<P>);
 
-impl<P: BufferPool> Schemas<P> {
-    /// Create a new schemas table.
-    #[inline]
-    pub async fn new(buf_pool: &'static P) -> Self {
-        let table = Table::new(buf_pool, TABLE_ID_SCHEMAS, metadata_of_schemas()).await;
-        Schemas(table)
-    }
-
+impl<P: BufferPool> Schemas<'_, P> {
     /// Find a schema by name.
     #[inline]
     pub async fn find_uncommitted_by_name(
@@ -456,15 +495,9 @@ impl<P: BufferPool> Schemas<P> {
     }
 }
 
-pub struct Tables<P: BufferPool>(Table<P>);
+pub struct Tables<'a, P: BufferPool>(&'a Table<P>);
 
-impl<P: BufferPool> Tables<P> {
-    /// Create a new tables table.
-    pub async fn new(buf_pool: &'static P) -> Self {
-        let table = Table::new(buf_pool, TABLE_ID_TABLES, metadata_of_tables()).await;
-        Tables(table)
-    }
-
+impl<P: BufferPool> Tables<'_, P> {
     /// Find a table by name.
     #[inline]
     pub async fn find_uncommitted_by_name(
@@ -509,14 +542,9 @@ impl<P: BufferPool> Tables<P> {
     }
 }
 
-pub struct Columns<P: BufferPool>(Table<P>);
+pub struct Columns<'a, P: BufferPool>(&'a Table<P>);
 
-impl<P: BufferPool> Columns<P> {
-    pub async fn new(buf_pool: &'static P) -> Self {
-        let table = Table::new(buf_pool, TABLE_ID_COLUMNS, metadata_of_columns()).await;
-        Columns(table)
-    }
-
+impl<P: BufferPool> Columns<'_, P> {
     /// Insert a column.
     pub async fn insert(
         &self,
@@ -547,14 +575,9 @@ impl<P: BufferPool> Columns<P> {
     }
 }
 
-pub struct Indexes<P: BufferPool>(Table<P>);
+pub struct Indexes<'a, P: BufferPool>(&'a Table<P>);
 
-impl<P: BufferPool> Indexes<P> {
-    pub async fn new(buf_pool: &'static P) -> Self {
-        let table = Table::new(buf_pool, TABLE_ID_INDEXES, metadata_of_indexes()).await;
-        Indexes(table)
-    }
-
+impl<P: BufferPool> Indexes<'_, P> {
     /// Insert an index.
     pub async fn insert(
         &self,
@@ -583,19 +606,9 @@ impl<P: BufferPool> Indexes<P> {
     }
 }
 
-pub struct IndexColumns<P: BufferPool>(Table<P>);
+pub struct IndexColumns<'a, P: BufferPool>(&'a Table<P>);
 
-impl<P: BufferPool> IndexColumns<P> {
-    pub async fn new(buf_pool: &'static P) -> Self {
-        let table = Table::new(
-            buf_pool,
-            TABLE_ID_INDEX_COLUMNS,
-            metadata_of_index_columns(),
-        )
-        .await;
-        IndexColumns(table)
-    }
-
+impl<P: BufferPool> IndexColumns<'_, P> {
     pub async fn insert(
         &self,
         buf_pool: &'static P,

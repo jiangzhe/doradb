@@ -51,9 +51,9 @@ impl<P: BufferPool> Session<P> {
 }
 
 pub trait IntoSession<P: BufferPool>: Sized {
-    fn into_session(self) -> Session<P>;
+    fn into_session(self) -> Option<Session<P>>;
 
-    fn split_session(&mut self) -> Session<P>;
+    fn split_session(&mut self) -> Option<Session<P>>;
 }
 
 #[derive(Default)]

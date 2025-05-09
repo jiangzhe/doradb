@@ -4,8 +4,8 @@ mod libaio_abi;
 mod ringbuffer;
 
 use libc::{
-    c_long, c_void, close, fdatasync, fsync, ftruncate, open, EAGAIN, O_CREAT, O_DIRECT, O_RDWR,
-    O_TRUNC,
+    c_long, c_void, close, fdatasync, fsync, ftruncate, open, EAGAIN, EINTR, O_CREAT, O_DIRECT,
+    O_RDWR, O_TRUNC,
 };
 use std::ffi::CString;
 use std::ops::Deref;
@@ -298,23 +298,30 @@ impl AIOManager {
         F: FnMut(AIOKey, Result<usize, std::io::Error>),
     {
         let max_nwait = events.len();
-        let ret = unsafe {
-            io_getevents(
-                *self.ctx,
-                min_nr as c_long,
-                max_nwait as c_long,
-                events.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
+        let count = loop {
+            let ret = unsafe {
+                io_getevents(
+                    *self.ctx,
+                    min_nr as c_long,
+                    max_nwait as c_long,
+                    events.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ret < 0 {
+                let errcode = -ret;
+                if errcode == EINTR {
+                    // retry if interrupt
+                    continue;
+                }
+                panic!("io_getevents returns error code {}", errcode);
+            }
+            break ret as usize;
         };
-        if ret < 0 {
-            panic!("io_getevents returns error code {}", ret);
-        }
         assert!(
-            ret != 0,
+            count != 0,
             "io_getevents with min_nr=1 and timeout=None should not return 0"
         );
-        let count = ret as usize;
         for ev in &events[..count] {
             let key = ev.data;
             let res = if ev.res >= 0 {

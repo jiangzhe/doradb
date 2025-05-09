@@ -7,15 +7,13 @@ pub use storage::*;
 pub use table::*;
 
 use crate::buffer::BufferPool;
-use crate::error::{Error, Result};
 use crate::lifetime::StaticLifetime;
 use crate::stmt::Statement;
 use crate::table::Table;
-use crate::trx::redo::DDLRedo;
+use crate::trx::sys::TransactionSystem;
 use doradb_catalog::{
     ColumnAttributes, ColumnID, ColumnObject, ColumnSpec, IndexAttributes, IndexColumnObject,
-    IndexID, IndexObject, IndexOrder, IndexSpec, SchemaID, SchemaObject, TableID, TableObject,
-    TableSpec,
+    IndexID, IndexObject, IndexOrder, SchemaID, SchemaObject, TableID, TableObject,
 };
 use doradb_datatype::PreciseType;
 use parking_lot::RwLock;
@@ -43,49 +41,21 @@ pub struct Catalog<P: BufferPool> {
 
 impl<P: BufferPool> Catalog<P> {
     #[inline]
-    pub fn new(cache: CatalogCache<P>, storage: CatalogStorage<P>) -> Self {
+    pub fn empty() -> Self {
         Catalog {
             obj_id: AtomicU64::new(0),
-            cache,
-            storage,
+            cache: CatalogCache::new(),
+            storage: CatalogStorage::new(),
         }
+    }
+
+    pub async unsafe fn init(&self, buf_pool: &'static P, trx_sys: &'static TransactionSystem<P>) {
+        self.storage.init(buf_pool, trx_sys).await;
     }
 
     #[inline]
     pub fn next_obj_id(&self) -> u64 {
         self.obj_id.fetch_add(1, Ordering::SeqCst)
-    }
-}
-
-pub struct CatalogCache<P: BufferPool> {
-    pub schemas: RwLock<HashMap<SchemaID, SchemaObject>>,
-    pub tables: RwLock<HashMap<TableID, Table<P>>>,
-}
-
-impl<P: BufferPool> CatalogCache<P> {
-    #[inline]
-    pub fn new() -> Self {
-        CatalogCache {
-            schemas: RwLock::new(HashMap::new()),
-            tables: RwLock::new(HashMap::new()),
-        }
-    }
-}
-
-impl<P: BufferPool> Catalog<P> {
-    #[inline]
-    pub async fn empty(buf_pool: &'static P) -> Self {
-        Catalog {
-            obj_id: AtomicU64::new(0),
-            cache: CatalogCache::new(),
-            storage: CatalogStorage::new(buf_pool).await,
-        }
-    }
-
-    #[inline]
-    pub async fn empty_static(buf_pool: &'static P) -> &'static Self {
-        let cat = Self::empty(buf_pool).await;
-        StaticLifetime::new_static(cat)
     }
 
     #[inline]
@@ -101,7 +71,7 @@ impl<P: BufferPool> Catalog<P> {
     ) -> Option<SchemaObject> {
         if self
             .storage
-            .schemas
+            .schemas()
             .find_uncommitted_by_name(buf_pool, &schema_name)
             .await
             .is_some()
@@ -115,7 +85,7 @@ impl<P: BufferPool> Catalog<P> {
             schema_name,
         };
         self.storage
-            .schemas
+            .schemas()
             .insert(buf_pool, stmt, &schema_object)
             .await;
         Some(schema_object)
@@ -130,7 +100,7 @@ impl<P: BufferPool> Catalog<P> {
     ) -> Option<TableObject> {
         if self
             .storage
-            .tables
+            .tables()
             .find_uncommitted_by_name(buf_pool, schema_id, &table_name)
             .await
             .is_some()
@@ -145,7 +115,7 @@ impl<P: BufferPool> Catalog<P> {
             schema_id,
         };
         self.storage
-            .tables
+            .tables()
             .insert(buf_pool, stmt, &table_object)
             .await;
         Some(table_object)
@@ -171,7 +141,7 @@ impl<P: BufferPool> Catalog<P> {
             column_attributes,
         };
         self.storage
-            .columns
+            .columns()
             .insert(buf_pool, stmt, &column_object)
             .await;
         Some(column_object)
@@ -194,7 +164,7 @@ impl<P: BufferPool> Catalog<P> {
             index_attributes,
         };
         self.storage
-            .indexes
+            .indexes()
             .insert(buf_pool, stmt, &index_object)
             .await;
         Some(index_object)
@@ -215,7 +185,7 @@ impl<P: BufferPool> Catalog<P> {
             index_order,
         };
         self.storage
-            .index_columns
+            .index_columns()
             .insert(buf_pool, stmt, &index_column_object)
             .await;
         Some(index_column_object)
@@ -233,6 +203,21 @@ unsafe impl<P: BufferPool> Sync for Catalog<P> {}
 unsafe impl<P: BufferPool> StaticLifetime for Catalog<P> {}
 impl<P: BufferPool> UnwindSafe for Catalog<P> {}
 impl<P: BufferPool> RefUnwindSafe for Catalog<P> {}
+
+pub struct CatalogCache<P: BufferPool> {
+    pub schemas: RwLock<HashMap<SchemaID, SchemaObject>>,
+    pub tables: RwLock<HashMap<TableID, Table<P>>>,
+}
+
+impl<P: BufferPool> CatalogCache<P> {
+    #[inline]
+    pub fn new() -> Self {
+        CatalogCache {
+            schemas: RwLock::new(HashMap::new()),
+            tables: RwLock::new(HashMap::new()),
+        }
+    }
+}
 
 pub struct TableCache<'a, P: BufferPool> {
     catalog: &'a Catalog<P>,
@@ -262,7 +247,7 @@ impl<'a, P: BufferPool> TableCache<'a, P> {
 pub mod tests {
     use super::*;
     use crate::engine::Engine;
-    use doradb_catalog::{IndexKey, IndexSpec};
+    use doradb_catalog::{IndexKey, IndexSpec, TableSpec};
     use doradb_datatype::Collation;
 
     #[inline]

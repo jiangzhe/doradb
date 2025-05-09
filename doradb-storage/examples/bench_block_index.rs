@@ -3,8 +3,10 @@ use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, In
 use doradb_datatype::PreciseType;
 use doradb_storage::buffer::FixedBufferPool;
 use doradb_storage::catalog::TableMetadata;
+use doradb_storage::engine::Engine;
 use doradb_storage::index::{BlockIndex, RowLocation};
 use doradb_storage::lifetime::StaticLifetime;
+use doradb_storage::trx::sys::TrxSysConfig;
 use parking_lot::RwLock;
 use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
 use perfcnt::{AbstractPerfCounter, PerfCounter};
@@ -20,7 +22,9 @@ fn main() {
     let args = Args::parse();
     smol::block_on(async {
         let args = args.clone();
-        let buf_pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+        let engine = Engine::new_fixed(2 * 1024 * 1024 * 1024, TrxSysConfig::default())
+            .await
+            .unwrap();
         {
             let metadata = TableMetadata::new(
                 vec![ColumnSpec {
@@ -34,11 +38,11 @@ fn main() {
                     IndexAttributes::PK,
                 )],
             );
-            let blk_idx = BlockIndex::new(buf_pool).await;
+            let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, 101).await;
             let blk_idx = Box::leak(Box::new(blk_idx));
 
             for _ in 0..args.pages {
-                let _ = blk_idx.get_insert_page(buf_pool, args.rows_per_page, &metadata);
+                let _ = blk_idx.get_insert_page(&engine.buf_pool, args.rows_per_page, &metadata);
             }
             let mut perf_monitor = PerfMonitor::new();
             perf_monitor.start();
@@ -50,7 +54,7 @@ fn main() {
                 let stop = Arc::clone(&stop);
                 let handle = std::thread::spawn(|| {
                     let ex = smol::LocalExecutor::new();
-                    smol::block_on(ex.run(worker(args, buf_pool, blk_idx, stop)))
+                    smol::block_on(ex.run(worker(args, &engine.buf_pool, blk_idx, stop)))
                 });
                 handles.push(handle);
             }
@@ -81,7 +85,7 @@ fn main() {
             }
         }
         unsafe {
-            StaticLifetime::drop_static(buf_pool);
+            StaticLifetime::drop_static(engine);
         }
     });
 
