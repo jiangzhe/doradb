@@ -1,14 +1,16 @@
 use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
-use crate::io::{align_to_sector_size, AIOManagerConfig, FreeListWithFactory, PageBuf};
+use crate::io::{align_to_sector_size, AIOManagerConfig, DirectBuf, FreeListWithFactory};
 use crate::latch::Mutex;
 use crate::lifetime::StaticLifetime;
 use crate::notify::Signal;
 use crate::session::{IntoSession, Session};
 use crate::thread;
 use crate::trx::group::{Commit, GroupCommit};
-use crate::trx::log::{create_log_file, LogPartition, LogPartitionStats, LogSync};
+use crate::trx::log::{
+    create_log_file, LogPartition, LogPartitionStats, LogSync, MmapLogReader, LOG_HEADER_PAGES,
+};
 use crate::trx::purge::{GCBucket, Purge, GC};
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_trx::SysTrx;
@@ -22,6 +24,7 @@ use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 pub const GC_BUCKETS: usize = 64;
@@ -93,7 +96,7 @@ pub struct TransactionSystem<P: BufferPool> {
 impl<P: BufferPool> TransactionSystem<P> {
     #[inline]
     pub async fn start(&'static self, buf_pool: &'static P, start_ctx: TrxSysStartContext<P>) {
-        self.start_sync_threads();
+        self.start_io_threads();
         self.start_gc_threads(start_ctx.gc_chans);
         self.start_purge_threads(buf_pool, start_ctx.purge_rx);
 
@@ -254,16 +257,26 @@ impl<P: BufferPool> TransactionSystem<P> {
         }
     }
 
-    /// Start background sync threads.
+    /// Start background IO threads.
     #[inline]
-    fn start_sync_threads(&'static self) {
+    fn start_io_threads(&'static self) {
         // Start threads for all log partitions
         for (idx, partition) in self.log_partitions.iter().enumerate() {
-            let thread_name = format!("Sync-Thread-{}", idx);
+            let thread_name = format!("IO-Thread-{}", idx);
             let partition = &**partition;
             let handle = thread::spawn_named(thread_name, move || partition.io_loop(&self.config));
-            *partition.sync_thread.lock() = Some(handle);
+            *partition.io_thread.lock() = Some(handle);
         }
+    }
+
+    #[inline]
+    pub fn log_reader(&self, log_file_path: impl AsRef<Path>) -> Result<MmapLogReader> {
+        MmapLogReader::new(
+            log_file_path,
+            self.config.max_io_size.as_u64() as usize,
+            self.config.log_file_max_size.as_u64() as usize,
+            self.config.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
+        )
     }
 }
 
@@ -291,7 +304,7 @@ impl<P: BufferPool> Drop for TransactionSystem<P> {
         }
         // wait for sync thread and GC thread to quit.
         for partition in log_partitions {
-            let sync_thread = { partition.sync_thread.lock().take().unwrap() };
+            let sync_thread = { partition.io_thread.lock().take().unwrap() };
             sync_thread.join().unwrap();
             let gc_thread = { partition.gc_thread.lock().take().unwrap() };
             gc_thread.join().unwrap();
@@ -436,6 +449,7 @@ impl TrxSysConfig {
             log_no,
             file_seq,
             self.log_file_max_size.as_u64() as usize,
+            self.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
         )
         .expect("create log file");
         file_seq += 1;
@@ -461,9 +475,11 @@ impl TrxSysConfig {
                 file_seq: AtomicU32::new(file_seq),
                 file_max_size: self.log_file_max_size.as_u64() as usize,
                 buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
-                    PageBuf::zeroed(max_io_size)
+                    let mut buf = DirectBuf::page_zeroed(max_io_size);
+                    buf.set_data_len(0);
+                    buf
                 }),
-                sync_thread: Mutex::new(None),
+                io_thread: Mutex::new(None),
                 gc_thread: Mutex::new(None),
             },
             gc_rx,

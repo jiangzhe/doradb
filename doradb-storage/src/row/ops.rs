@@ -211,7 +211,7 @@ pub trait UndoVal {
     fn val(&self) -> &Val;
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateCol {
     pub idx: usize,
     pub val: Val,

@@ -28,7 +28,7 @@ pub(super) enum Commit<P: BufferPool> {
 }
 
 /// CommitGroup groups multiple transactions with only
-/// one log IO and at most one fsync() call.
+/// one logical log IO and at most one fsync() call.
 /// It is controlled by two parameters:
 /// 1. Maximum IO size, e.g. 16KB.
 /// 2. Timeout to wait for next transaction to join.
@@ -55,7 +55,7 @@ impl<P: BufferPool> CommitGroup<P> {
     pub(super) fn join(&mut self, mut trx: PrecommitTrx<P>) -> (Option<Session<P>>, Notify) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
-            self.log_buf.extend_ser(&self.serde_ctx, &redo_bin);
+            self.log_buf.extend_ser(&redo_bin, &self.serde_ctx);
         }
         self.max_cts = trx.cts;
         let session = trx.split_session();
@@ -65,7 +65,8 @@ impl<P: BufferPool> CommitGroup<P> {
 
     #[inline]
     pub(super) fn split(self) -> (IocbRawPtr, SyncGroup<P>) {
-        let log_bytes = self.log_buf.aligned_len();
+        // we always write a complete page instead of partial data.
+        let log_bytes = self.log_buf.capacity();
         let aio = pwrite(self.max_cts, self.fd, self.offset, self.log_buf);
         let iocb_ptr = aio.iocb().load(Ordering::Relaxed);
         let sync_group = SyncGroup {

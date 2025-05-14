@@ -28,6 +28,7 @@ impl From<u8> for RowRedoCode {
 }
 
 /// Defines the kind of redo operation on a row.
+#[derive(Debug)]
 pub enum RowRedoKind {
     Insert(Vec<Val>),
     Delete,
@@ -92,6 +93,7 @@ impl Deser for RowRedoKind {
 }
 
 /// Represents a redo operation on a row.
+#[derive(Debug)]
 pub struct RowRedo {
     pub page_id: PageID,
     pub row_id: RowID,
@@ -151,6 +153,7 @@ impl From<u8> for DDLRedoCode {
 }
 
 /// Represents a redo record of any DDL operation.
+#[derive(Debug)]
 pub enum DDLRedo {
     CreateSchema(SchemaID),
     DropSchema(SchemaID),
@@ -291,7 +294,7 @@ impl Deser for DDLRedo {
 }
 
 /// Represents the redo logs of a transaction.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct RedoLogs {
     pub ddl: Vec<DDLRedo>,
     pub dml: BTreeMap<TableID, TableDML>,
@@ -378,6 +381,7 @@ impl From<u8> for RedoTrxKind {
 }
 
 /// Redo header of a transaction.
+#[derive(Debug)]
 pub struct RedoHeader {
     pub cts: TrxID,
     pub trx_kind: RedoTrxKind,
@@ -414,7 +418,7 @@ impl Deser for RedoHeader {
 }
 
 /// Represents the redo logs of a table.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct TableDML {
     pub rows: BTreeMap<RowID, RowRedo>,
 }
