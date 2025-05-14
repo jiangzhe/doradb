@@ -55,6 +55,8 @@ pub enum Error {
     TableAlreadyExists,
     #[error("user session missing")]
     UserSessionMissing,
+    #[error("glob error")]
+    GlobError,
 }
 
 impl From<TryFromSliceError> for Error {
@@ -78,6 +80,13 @@ impl From<std::io::Error> for Error {
     #[inline]
     fn from(_src: std::io::Error) -> Self {
         Error::IOError
+    }
+}
+
+impl From<glob::GlobError> for Error {
+    #[inline]
+    fn from(_src: glob::GlobError) -> Self {
+        Error::GlobError
     }
 }
 

@@ -1,11 +1,11 @@
 use crate::buffer::BufferPool;
 use crate::error::{Error, Result};
 use crate::io::{
-    io_event, AIOError, AIOManager, Buf, DirectBuf, FileSyncer, FreeListWithFactory, IocbRawPtr,
-    PageBuf, SparseFile, AIO,
+    align_to_sector_size, buf_data, buf_raw_len, io_event, AIOError, AIOManager, Buf, DirectBuf,
+    FileSyncer, FreeListWithFactory, IocbRawPtr, SparseFile, AIO,
 };
 use crate::notify::{Notify, Signal};
-use crate::serde::{LenPrefixPod, Ser, SerdeCtx};
+use crate::serde::{Deser, LenPrefixPod, Ser, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::trx::group::{Commit, CommitGroup, GroupCommit};
 use crate::trx::purge::{GCBucket, GC};
@@ -16,15 +16,21 @@ use crossbeam_utils::CachePadded;
 use flume::Sender;
 // use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::latch::{Mutex, MutexGuard};
+use glob::glob;
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::File;
 use std::mem;
 use std::os::fd::AsRawFd;
 use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+pub const LOG_HEADER_PAGES: usize = 2;
 
 pub(super) struct LogPartition<P: BufferPool> {
     /// Group commit of this partition.
@@ -53,27 +59,30 @@ pub(super) struct LogPartition<P: BufferPool> {
     pub(super) file_max_size: usize,
     /// Free list of page buffer, which is used by commit group to concat
     /// redo logs.
-    pub(super) buf_free_list: FreeListWithFactory<PageBuf>,
+    pub(super) buf_free_list: FreeListWithFactory<DirectBuf>,
     /// Standalone thread to handle transaction commit.
     /// Including submit IO requests, wait IO responses
     /// and do fsync().
-    pub(super) sync_thread: Mutex<Option<JoinHandle<()>>>,
+    pub(super) io_thread: Mutex<Option<JoinHandle<()>>>,
     /// Standalone thread for GC info analysis.
     pub(super) gc_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl<P: BufferPool> LogPartition<P> {
+    /// Create a new log buffer to hold one transaction's redo log.
     #[inline]
-    fn buf(&self, serde_ctx: &SerdeCtx, data: &LenPrefixPod<RedoHeader, RedoLogs>) -> Buf {
+    fn new_buf(&self, serde_ctx: &SerdeCtx, data: LenPrefixPod<RedoHeader, RedoLogs>) -> Buf {
         let len = data.ser_len(serde_ctx);
         if len > self.max_io_size {
             let mut buf = DirectBuf::zeroed(len);
-            data.ser(serde_ctx, buf.as_mut(), 0);
+            buf.set_data_len(0);
+            buf.extend_ser(&data, serde_ctx);
             Buf::Direct(buf)
         } else {
             let mut buf = self.buf_free_list.pop_elem_or_new();
-            buf.set_len(len);
-            data.ser(serde_ctx, buf.data_mut(), 0);
+            // freed buffer should be always empty.
+            debug_assert!(buf.data_len() == 0);
+            buf.extend_ser(&data, serde_ctx);
             Buf::Reuse(buf)
         }
     }
@@ -92,17 +101,24 @@ impl<P: BufferPool> LogPartition<P> {
 
     #[inline]
     fn rotate_log_file(&self, group_commit_g: &mut MutexGuard<'_, GroupCommit<P>>) -> Result<()> {
+        let new_log_file = self.create_log_file()?;
+        let old_log_file = group_commit_g.log_file.replace(new_log_file).unwrap();
+        group_commit_g.queue.push_back(Commit::Switch(old_log_file));
+        Ok(())
+    }
+
+    #[inline]
+    fn create_log_file(&self) -> Result<SparseFile> {
         let file_seq = self.file_seq.fetch_add(1, Ordering::SeqCst);
-        let new_log_file = create_log_file(
+        create_log_file(
             &self.aio_mgr,
             &self.file_prefix,
             self.log_no,
             file_seq,
             self.file_max_size,
-        )?;
-        let old_log_file = group_commit_g.log_file.replace(new_log_file).unwrap();
-        group_commit_g.queue.push_back(Commit::Switch(old_log_file));
-        Ok(())
+            // we use two pages as file header to maintain metadata of log file.
+            self.max_io_size * LOG_HEADER_PAGES,
+        )
     }
 
     #[inline]
@@ -114,10 +130,11 @@ impl<P: BufferPool> LogPartition<P> {
         let cts = trx.cts;
         let serde_ctx = SerdeCtx::default();
         let redo_bin = trx.redo_bin.take().unwrap();
-        // inside the lock, we only need to determine which range of the log file this transaction
-        // should write to.
+        // Serialize redo log to buffer.
+        let log_buf = self.new_buf(&serde_ctx, redo_bin);
         let log_file = group_commit_g.log_file.as_ref().unwrap();
-        let (fd, offset) = match log_file.alloc(redo_bin.ser_len(&serde_ctx)) {
+        // Allocate space of log file.
+        let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
             Ok((offset, _)) => (log_file.as_raw_fd(), offset),
             Err(AIOError::OutOfRange) => {
                 // rotate log file and try again.
@@ -126,13 +143,12 @@ impl<P: BufferPool> LogPartition<P> {
 
                 let new_log_file = group_commit_g.log_file.as_ref().unwrap();
                 let (offset, _) = new_log_file
-                    .alloc(redo_bin.ser_len(&serde_ctx))
+                    .alloc(log_buf.capacity())
                     .expect("alloc on new log file");
                 (new_log_file.as_raw_fd(), offset)
             }
             Err(_) => unreachable!(),
         };
-        let log_buf = self.buf(&serde_ctx, &redo_bin);
         let session = trx.split_session();
         let sync_signal = Signal::default();
         let sync_notify = sync_signal.new_notify(false);
@@ -243,6 +259,8 @@ impl<P: BufferPool> LogPartition<P> {
                 debug_assert!(fp.sync_groups.is_empty());
 
                 // todo: update file header.
+                // this may include information which can speed up recovery.
+                // e.g. DDL start/end pages, min/max transaction CTS.
 
                 // Close file explicitly.
                 self.aio_mgr.drop_sparse_file(ended_log_file);
@@ -251,6 +269,11 @@ impl<P: BufferPool> LogPartition<P> {
                 return;
             }
         }
+    }
+
+    #[inline]
+    pub fn logs(&self, desc: bool) -> Result<Vec<PathBuf>> {
+        list_log_files(&self.file_prefix, self.log_no, desc)
     }
 }
 
@@ -587,7 +610,7 @@ impl<'a, P: BufferPool> FileProcessor<'a, P> {
                     .wait_at_least(&mut self.events, wait_count, |cts, res| match res {
                         Ok(len) => {
                             let sg = self.inflight.get_mut(&cts).expect("finish inflight IO");
-                            debug_assert!(sg.aio.buf().unwrap().aligned_len() == len);
+                            debug_assert!(sg.aio.buf().unwrap().capacity() == len);
                             sg.finished = true;
                         }
                         Err(err) => {
@@ -642,9 +665,189 @@ pub(super) fn create_log_file(
     log_no: usize,
     file_seq: u32,
     file_max_size: usize,
+    file_header_size: usize,
 ) -> Result<SparseFile> {
-    // todo: Add two pages as file header.
     let file_name = log_file_name(file_prefix, log_no, file_seq);
     let log_file = aio_mgr.create_sparse_file(&file_name, file_max_size)?;
+    // todo: Add two pages as file header.
+    let _ = log_file.alloc(file_header_size)?;
     Ok(log_file)
+}
+
+#[inline]
+fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<PathBuf>> {
+    let pattern = format!("{}.{}.*", file_prefix, log_no);
+    let mut res = vec![];
+    for entry in glob(&pattern).unwrap() {
+        res.push(entry?);
+    }
+    if desc {
+        res.sort_by(|a, b| b.cmp(a));
+    } else {
+        res.sort_by(|a, b| a.cmp(b));
+    }
+    Ok(res)
+}
+
+pub struct MmapLogReader {
+    m: Mmap,
+    page_size: usize,
+    max_file_size: usize,
+    offset: usize,
+}
+
+impl MmapLogReader {
+    #[inline]
+    pub fn new(
+        log_file_path: impl AsRef<Path>,
+        page_size: usize,
+        max_file_size: usize,
+        offset: usize,
+    ) -> Result<Self> {
+        let file = File::open(log_file_path.as_ref())?;
+        let m = unsafe { Mmap::map(&file)? };
+
+        Ok(MmapLogReader {
+            m,
+            page_size: page_size,
+            max_file_size: max_file_size,
+            offset,
+        })
+    }
+
+    #[inline]
+    pub fn read(&mut self) -> ReadLog {
+        if self.offset >= self.max_file_size {
+            return ReadLog::SizeLimit; // file is exhausted.
+        }
+        // Always read multiple pages.
+        debug_assert!(self.offset as usize == align_to_sector_size(self.offset as usize));
+        // Try single page first.
+        // This may fail as log is incomplete.
+        if let Some(mut buf) = self.m.get(self.offset..self.offset + self.page_size) {
+            let raw_len = buf_raw_len(buf);
+            // Log file is truncated to certain size, and if no data is written, the header of page
+            // will always be zeroed. This is the default behavior on Linux.
+            // Raw length is always data length plus 4.
+            if raw_len == mem::size_of::<u32>() {
+                return ReadLog::DataEnd; // empty data means end of file.
+            }
+            if raw_len > buf.len() {
+                // log occupies more than one page, so read more.
+                let new_len = align_to_sector_size(raw_len);
+                if let Some(new_buf) = self.m.get(self.offset..self.offset + new_len) {
+                    buf = new_buf;
+                } else {
+                    return ReadLog::DataCorrupted; // file is incomplete.
+                }
+                self.offset += new_len;
+            } else {
+                self.offset += self.page_size;
+            }
+            return ReadLog::Some(LogGroup {
+                data: buf_data(buf),
+                ctx: SerdeCtx::default(),
+            });
+        }
+        ReadLog::DataCorrupted
+    }
+}
+
+/// Result of log read.
+pub enum ReadLog<'a> {
+    /// Log is ended with empty page.
+    DataEnd,
+    /// File reach maximum size limit.
+    SizeLimit,
+    /// Data in file is corrupted.
+    DataCorrupted,
+    /// A group of log.
+    Some(LogGroup<'a>),
+}
+
+pub struct LogGroup<'a> {
+    data: &'a [u8],
+    ctx: SerdeCtx,
+}
+
+impl LogGroup<'_> {
+    #[inline]
+    pub fn next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
+        if self.data.is_empty() {
+            return Ok(None);
+        }
+        let (offset, res) =
+            LenPrefixPod::<RedoHeader, RedoLogs>::deser(&mut self.ctx, self.data, 0)?;
+        self.data = &self.data[offset..];
+        Ok(Some(res))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::EvictableBufferPoolConfig;
+    use crate::catalog::tests::table2;
+    use crate::engine::EngineConfig;
+    use crate::lifetime::StaticLifetime;
+    use crate::value::Val;
+
+    #[test]
+    fn test_mmap_log_reader() {
+        smol::block_on(async {
+            const SIZE: i32 = 100;
+
+            let engine = EngineConfig::default()
+                .buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(1024u64 * 1024)
+                        .max_file_size(1024u64 * 1024 * 32),
+                )
+                .build_static()
+                .await
+                .unwrap();
+            let table_id = table2(engine).await;
+            let table = engine.catalog().get_table(table_id).unwrap();
+
+            let mut session = engine.new_session();
+            {
+                for i in 0..SIZE {
+                    let mut trx = session.begin_trx();
+                    let mut stmt = trx.start_stmt();
+                    let s = format!("{}", i);
+                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let res = stmt.insert_row(&table, insert).await;
+                    debug_assert!(res.is_ok());
+                    trx = stmt.succeed();
+                    session = trx.commit().await.unwrap();
+                }
+            }
+            drop(session);
+
+            let mut log_recs = 0usize;
+            let logs = engine.trx_sys.log_partitions[0].logs(false).unwrap();
+            for log in logs {
+                println!("log file {:?}", log.file_name());
+                let mut reader = engine.trx_sys.log_reader(&log).unwrap();
+                loop {
+                    match reader.read() {
+                        ReadLog::SizeLimit => unreachable!(),
+                        ReadLog::DataCorrupted => unreachable!(),
+                        ReadLog::DataEnd => break,
+                        ReadLog::Some(mut group) => {
+                            while let Some(pod) = group.next().unwrap() {
+                                println!("header={:?}, payload={:?}", pod.header, pod.payload);
+                                log_recs += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!("total log records {}", log_recs);
+
+            unsafe {
+                StaticLifetime::drop_static(engine);
+            }
+        });
+    }
 }

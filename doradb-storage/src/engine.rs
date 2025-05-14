@@ -16,7 +16,6 @@ use std::panic::{RefUnwindSafe, UnwindSafe};
 /// Storage engine of DoraDB.
 pub struct Engine<P: BufferPool> {
     pub trx_sys: TransactionSystem<P>,
-    // pub catalog: Catalog<P>,
     pub buf_pool: P,
 }
 

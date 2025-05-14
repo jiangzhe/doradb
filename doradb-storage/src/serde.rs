@@ -551,14 +551,14 @@ impl Ser<'_> for () {
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser(&self, _ctx: &SerdeCtx, _out: &mut [u8], start_idx: usize) -> usize {
         start_idx
     }
 }
 
 impl Deser for () {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(_ctx: &mut SerdeCtx, _input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         Ok((start_idx, ()))
     }
 }

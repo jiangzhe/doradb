@@ -29,6 +29,8 @@ smol = "2.0"
 crc32fast = "1.4"
 toml = "0.8"
 byte-unit = { version = "5", features = ["serde"] }
+glob = "0.3"
+memmap2 = "0.9"
 
 [features]
 default = []

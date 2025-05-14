@@ -100,8 +100,8 @@ impl AIO {
         iocb.aio_fildes = fd as u32;
         iocb.aio_lio_opcode = opcode as u16;
         iocb.aio_reqprio = priority;
-        iocb.buf = buf.as_mut_ptr();
-        iocb.count = buf.aligned_len() as u64;
+        iocb.buf = buf.raw_ptr_mut();
+        iocb.count = buf.capacity() as u64;
         iocb.offset = offset as u64;
         iocb.flags = flags;
         iocb.data = key; // store and send back via io_event
@@ -140,6 +140,11 @@ impl Drop for AIO {
 /// AIO backed by a raw pointer.
 /// The raw pointer must be aigned to page and
 /// has outlive the async IO call.
+///
+/// This struct is mainly used for page IO in a buffer pool,
+/// Which pre-assign many pages through mmap() call and do
+/// not release any of them. So the IO request is guaranteed
+/// to be safe.
 pub struct UnsafeAIO {
     iocb: IocbPtr,
     pub key: AIOKey,
@@ -194,16 +199,43 @@ impl AIOManager {
     #[inline]
     pub fn create_sparse_file(
         &self,
-        file_path: &str,
+        file_path: impl AsRef<str>,
         max_len: usize,
     ) -> Result<SparseFile, AIOError> {
         unsafe {
-            let c_string = CString::new(file_path).map_err(|_| AIOError::OpenFileError)?;
+            let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
             let fd = open(
                 c_string.as_ptr(),
                 O_CREAT | O_RDWR | O_TRUNC | O_DIRECT,
                 0o644,
             );
+            if fd < 0 {
+                return Err(AIOError::OpenFileError);
+            }
+            let ret = ftruncate(fd, max_len as i64);
+            if ret < 0 {
+                let _ = close(fd); // close file descriptor if truncate fail.
+                return Err(AIOError::OpenFileError);
+            }
+            self.register_fd(fd);
+            Ok(SparseFile {
+                fd,
+                offset: AtomicUsize::new(0),
+                max_len,
+            })
+        }
+    }
+
+    /// Open an existing sparse file with given maximum length.
+    #[inline]
+    pub fn open_sparse_file(
+        &self,
+        file_path: impl AsRef<str>,
+        max_len: usize,
+    ) -> Result<SparseFile, AIOError> {
+        unsafe {
+            let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
+            let fd = open(c_string.as_ptr(), O_RDWR | O_DIRECT, 0o644);
             if fd < 0 {
                 return Err(AIOError::OpenFileError);
             }
@@ -333,13 +365,6 @@ impl AIOManager {
             callback(key, res);
         }
         count
-    }
-
-    #[inline]
-    pub fn drop_static(this: &'static Self) {
-        unsafe {
-            drop(Box::from_raw(this as *const _ as *mut Self));
-        }
     }
 }
 

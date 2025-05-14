@@ -184,3 +184,66 @@ impl<T> FreeElem<T> {
         self.data
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn test_free_list_basic() {
+        let list = FreeList::<i32>::default();
+        assert!(list.pop().is_none());
+
+        list.push(1);
+        list.push(2);
+        assert_eq!(list.pop(), Some(2));
+        assert_eq!(list.pop(), Some(1));
+        assert!(list.pop().is_none());
+    }
+
+    #[test]
+    fn test_free_list_concurrent() {
+        let list = Arc::new(FreeList::<i32>::default());
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let list = list.clone();
+            handles.push(thread::spawn(move || {
+                list.push(i);
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut results = vec![];
+        while let Some(val) = list.pop() {
+            results.push(val);
+        }
+        results.sort();
+        assert_eq!(results, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_free_list_with_factory() {
+        let factory = || 42;
+        let list = FreeListWithFactory::new(factory);
+        assert_eq!(list.pop_or_new(), 42);
+
+        let list = FreeListWithFactory::prefill(3, factory);
+        assert_eq!(list.pop().unwrap(), 42);
+        assert_eq!(list.pop().unwrap(), 42);
+        assert_eq!(list.pop().unwrap(), 42);
+        assert_eq!(list.pop_or_new(), 42);
+    }
+
+    #[test]
+    fn test_free_elem() {
+        let elem = FreeElem::new(100);
+        assert_eq!(*elem, 100);
+        assert_eq!(elem.into_inner(), 100);
+    }
+}
