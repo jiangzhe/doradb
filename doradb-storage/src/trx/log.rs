@@ -798,6 +798,10 @@ mod tests {
             const SIZE: i32 = 100;
 
             let engine = EngineConfig::default()
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix(String::from("mmap_log_reader_redo.log")),
+                )
                 .buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(1024u64 * 1024)
@@ -848,6 +852,22 @@ mod tests {
             unsafe {
                 StaticLifetime::drop_static(engine);
             }
+            // remove log file
+            remove_files("*mmap_log_reader_redo.log.*");
         });
+    }
+
+    fn remove_files(file_pattern: &str) {
+        let files = glob::glob(file_pattern);
+        if files.is_err() {
+            return;
+        }
+        for f in files.unwrap() {
+            if f.is_err() {
+                continue;
+            }
+            let fp = f.unwrap();
+            let _ = std::fs::remove_file(&fp);
+        }
     }
 }

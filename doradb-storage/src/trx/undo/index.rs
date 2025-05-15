@@ -1,5 +1,6 @@
 use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
+use crate::index::IndexCompareExchange;
 use crate::row::ops::SelectKey;
 use crate::row::RowID;
 use crate::table::TableID;
@@ -51,11 +52,16 @@ impl IndexUndoLogs {
                 }
                 IndexUndoKind::UpdateUnique(key, old_row_id) => {
                     let new_row_id = entry.row_id;
-                    let res = table.sec_idx[key.index_no]
+                    match table.sec_idx[key.index_no]
                         .unique()
                         .unwrap()
-                        .compare_exchange(&key.vals, new_row_id, old_row_id);
-                    assert!(res);
+                        .compare_exchange(&key.vals, new_row_id, old_row_id)
+                    {
+                        IndexCompareExchange::Ok => (),
+                        IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
+                            unreachable!()
+                        }
+                    }
                 }
                 IndexUndoKind::DeferDelete(_) => (), // do nothing.
             }

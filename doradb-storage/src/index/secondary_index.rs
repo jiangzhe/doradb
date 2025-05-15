@@ -140,9 +140,24 @@ pub trait UniqueIndex: Send + Sync + 'static {
 
     fn compare_delete(&self, key: &[Val], old_row_id: RowID) -> bool;
 
-    fn compare_exchange(&self, key: &[Val], old_row_id: RowID, new_row_id: RowID) -> bool;
+    /// atomically update an existing value associated to given key to another value.
+    /// if not exists, returns specified bool value.
+    fn compare_exchange(
+        &self,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+    ) -> IndexCompareExchange;
 
     fn scan_values(&self, values: &mut Vec<RowID>);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IndexCompareExchange {
+    Ok,
+    Failure,
+    NotExists,
 }
 
 pub trait NonUniqueIndex: Send + Sync + 'static {
@@ -396,7 +411,12 @@ impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
     }
 
     #[inline]
-    fn compare_exchange(&self, key: &[Val], old_row_id: RowID, new_row_id: RowID) -> bool {
+    fn compare_exchange(
+        &self,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+    ) -> IndexCompareExchange {
         let key = T::encode(key);
         let tree = self.select(&key);
         let mut g = tree.write();
@@ -404,12 +424,12 @@ impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
             Some(row_id) => {
                 if *row_id == old_row_id {
                     *row_id = new_row_id;
-                    true
+                    IndexCompareExchange::Ok
                 } else {
-                    false
+                    IndexCompareExchange::Failure
                 }
             }
-            None => false,
+            None => IndexCompareExchange::NotExists,
         }
     }
 
@@ -473,7 +493,12 @@ impl UniqueIndex for PartitionMultiKeyIndex {
     }
 
     #[inline]
-    fn compare_exchange(&self, key: &[Val], old_row_id: RowID, new_row_id: RowID) -> bool {
+    fn compare_exchange(
+        &self,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+    ) -> IndexCompareExchange {
         let key = self.encode(key);
         let key = std::slice::from_ref(&key);
         self.index.compare_exchange(key, old_row_id, new_row_id)
@@ -552,11 +577,11 @@ mod tests {
         assert_eq!(index.insert(&key, row_id1), None);
 
         // 测试成功的 compare_exchange
-        assert!(index.compare_exchange(&key, row_id1, row_id2));
+        assert!(index.compare_exchange(&key, row_id1, row_id2) == IndexCompareExchange::Ok);
         assert_eq!(index.lookup(&key), Some(row_id2));
 
         // 测试失败的 compare_exchange
-        assert!(!index.compare_exchange(&key, row_id1, row_id2));
+        assert!(index.compare_exchange(&key, row_id1, row_id2) == IndexCompareExchange::Failure);
 
         // 测试用例5：scan_values 操作
         let mut values = Vec::new();
