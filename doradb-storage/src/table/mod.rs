@@ -6,7 +6,7 @@ use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::TableMetadata;
-use crate::index::{BlockIndex, RowLocation, SecondaryIndex, UniqueIndex};
+use crate::index::{BlockIndex, IndexCompareExchange, RowLocation, SecondaryIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, SelectKey, SelectMvcc,
@@ -564,7 +564,7 @@ impl<P: BufferPool> Table<P> {
         // given key and then link new row to it.
         let old_access = old_guard.write_row_by_id(old_id);
         match old_access.find_old_version_for_unique_key(&self.metadata, key, &stmt.trx) {
-            FindOldVersion::None => LinkForUniqueIndex::Ok,
+            FindOldVersion::None => LinkForUniqueIndex::None,
             FindOldVersion::DuplicateKey => LinkForUniqueIndex::DuplicateKey,
             FindOldVersion::WriteConflict => LinkForUniqueIndex::WriteConflict,
             FindOldVersion::Ok(old_row, cts, old_entry) => {
@@ -964,49 +964,74 @@ impl<P: BufferPool> Table<P> {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> InsertIndex {
         let index = self.sec_idx[key.index_no].unique().unwrap();
-        match index.insert_if_not_exists(&key.vals, row_id) {
-            None => {
-                // insert index success.
-                let index_undo = self.index_undo(row_id, IndexUndoKind::InsertUnique(key));
-                stmt.index_undo.push(index_undo);
-                InsertIndex::Ok
-            }
-            Some(old_row_id) => {
-                // we found there is already one existing row with same key.
-                // so perform move+link.
-                debug_assert!(old_row_id != row_id);
-                match self
-                    .link_for_unique_index(buf_pool, stmt, old_row_id, &key, row_id, page_guard)
-                    .await
-                {
-                    LinkForUniqueIndex::DuplicateKey => InsertIndex::DuplicateKey,
-                    LinkForUniqueIndex::WriteConflict => InsertIndex::WriteConflict,
-                    LinkForUniqueIndex::None => {
-                        // No old row found, so we can update index to point to self.
-                        // This case can happen if purge thread removed row data,
-                        // but index is not purged.
-                        if !index.compare_exchange(&key.vals, old_row_id, row_id) {
-                            // there is another transaction update the unique index concurrently,
-                            // we can directly fail.
+        loop {
+            match index.insert_if_not_exists(&key.vals, row_id) {
+                None => {
+                    // insert index success.
+                    let index_undo = self.index_undo(row_id, IndexUndoKind::InsertUnique(key));
+                    stmt.index_undo.push(index_undo);
+                    return InsertIndex::Ok;
+                }
+                Some(old_row_id) => {
+                    // we found there is already one existing row with same key.
+                    // so perform move+link.
+                    debug_assert!(old_row_id != row_id);
+                    match self
+                        .link_for_unique_index(buf_pool, stmt, old_row_id, &key, row_id, page_guard)
+                        .await
+                    {
+                        LinkForUniqueIndex::DuplicateKey => return InsertIndex::DuplicateKey,
+                        LinkForUniqueIndex::WriteConflict => {
                             return InsertIndex::WriteConflict;
                         }
-                        let index_undo =
-                            self.index_undo(row_id, IndexUndoKind::UpdateUnique(key, old_row_id));
-                        stmt.index_undo.push(index_undo);
-                        InsertIndex::Ok
-                    }
-                    LinkForUniqueIndex::Ok => {
-                        // There is scenario that two transactions update different rows to the same
-                        // key. Because we only search the matched version of old row but not add
-                        // logical lock on it, it's possible that both transactions are trying to
-                        // update the index. Only one should succeed and the other will fail.
-                        if !index.compare_exchange(&key.vals, old_row_id, row_id) {
-                            return InsertIndex::WriteConflict;
+                        LinkForUniqueIndex::None => {
+                            // No old row found, so we can update index to point to self.
+                            // This may happen because purge thread can remove row data,
+                            // but leave index not purged.
+                            // The purge thread may delete the key before we apply the update.
+                            // so our update can fail.
+                            match index.compare_exchange(&key.vals, old_row_id, row_id) {
+                                IndexCompareExchange::Ok => {
+                                    // If we rollback this transaction, we need to undo the index update.
+                                    let index_undo = self.index_undo(
+                                        row_id,
+                                        IndexUndoKind::UpdateUnique(key, old_row_id),
+                                    );
+                                    stmt.index_undo.push(index_undo);
+                                    return InsertIndex::Ok;
+                                }
+                                IndexCompareExchange::NotExists => {
+                                    // re-insert index entry
+                                    continue;
+                                }
+                                IndexCompareExchange::Failure => {
+                                    return InsertIndex::WriteConflict;
+                                }
+                            }
                         }
-                        let index_undo =
-                            self.index_undo(row_id, IndexUndoKind::UpdateUnique(key, old_row_id));
-                        stmt.index_undo.push(index_undo);
-                        InsertIndex::Ok
+                        LinkForUniqueIndex::Ok => {
+                            // There is scenario that two transactions update different rows to the same
+                            // key. Because we only search the matched version of old row but not add
+                            // logical lock on it, it's possible that both transactions are trying to
+                            // update the index. Only one should succeed and the other will fail.
+                            match index.compare_exchange(&key.vals, old_row_id, row_id) {
+                                IndexCompareExchange::Ok => {
+                                    let index_undo = self.index_undo(
+                                        row_id,
+                                        IndexUndoKind::UpdateUnique(key, old_row_id),
+                                    );
+                                    stmt.index_undo.push(index_undo);
+                                    return InsertIndex::Ok;
+                                }
+                                IndexCompareExchange::NotExists => {
+                                    // link succeeds, so no one can remove this index entry.
+                                    unreachable!();
+                                }
+                                IndexCompareExchange::Failure => {
+                                    return InsertIndex::WriteConflict;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1168,74 +1193,104 @@ impl<P: BufferPool> Table<P> {
         new_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        match index.insert_if_not_exists(&key.vals, new_row_id) {
-            None => {
-                let index_undo = self.index_undo(new_row_id, IndexUndoKind::InsertUnique(key));
-                stmt.index_undo.push(index_undo);
-                UpdateIndex::Ok
-            }
-            Some(index_row_id) => {
-                // new row id is the insert id so index value must not be the same.
-                debug_assert!(index_row_id != new_row_id);
-                if index_row_id == old_row_id {
-                    // This is possible.
-                    // For example, transaction update row(RowID=100) key=1 to key=2.
-                    //
-                    // Then index has following entries:
-                    // key=1 -> RowID=100 (old version)
-                    // key=2 -> RowID=100 (latest version)
-                    //
-                    // Then we update key=2 to key=1 again.
-                    // And page does not have enough space, so move+update with RowID=200.
-                    // Now we should have:
-                    // key=1 -> RowID=200 (latest version)
-                    // key=2 -> RowID=100 (old version)
-                    //
-                    // In this case, we can just update index to point to new version.
-                    let res = index.compare_exchange(&key.vals, old_row_id, new_row_id);
-                    assert!(res);
-                    let index_undo =
-                        self.index_undo(new_row_id, IndexUndoKind::UpdateUnique(key, old_row_id));
+        loop {
+            match index.insert_if_not_exists(&key.vals, new_row_id) {
+                None => {
+                    let index_undo = self.index_undo(new_row_id, IndexUndoKind::InsertUnique(key));
                     stmt.index_undo.push(index_undo);
                     return UpdateIndex::Ok;
                 }
-                match self
-                    .link_for_unique_index(
-                        buf_pool,
-                        stmt,
-                        index_row_id,
-                        &key,
-                        new_row_id,
-                        new_guard,
-                    )
-                    .await
-                {
-                    LinkForUniqueIndex::DuplicateKey => UpdateIndex::DuplicateKey,
-                    LinkForUniqueIndex::WriteConflict => UpdateIndex::WriteConflict,
-                    LinkForUniqueIndex::None => {
-                        // move+insert does not find old row.
-                        // so we can update index to point to self
-                        if !index.compare_exchange(&key.vals, index_row_id, new_row_id) {
-                            // there is another transaction update the unique index concurrently,
-                            // we can directly fail.
-                            return UpdateIndex::WriteConflict;
+                Some(index_row_id) => {
+                    // new row id is the insert id so index value must not be the same.
+                    debug_assert!(index_row_id != new_row_id);
+                    if index_row_id == old_row_id {
+                        // This is possible.
+                        // For example, transaction update row(RowID=100) key=1 to key=2.
+                        //
+                        // Then index has following entries:
+                        // key=1 -> RowID=100 (old version)
+                        // key=2 -> RowID=100 (latest version)
+                        //
+                        // Then we update key=2 to key=1 again.
+                        // And page does not have enough space, so move+update with RowID=200.
+                        // Now we should have:
+                        // key=1 -> RowID=200 (latest version)
+                        // key=2 -> RowID=100 (old version)
+                        //
+                        // In this case, we can just update index to point to new version.
+                        match index.compare_exchange(&key.vals, old_row_id, new_row_id) {
+                            IndexCompareExchange::Ok => {
+                                let index_undo = self.index_undo(
+                                    new_row_id,
+                                    IndexUndoKind::UpdateUnique(key, old_row_id),
+                                );
+                                stmt.index_undo.push(index_undo);
+                                return UpdateIndex::Ok;
+                            }
+                            IndexCompareExchange::Failure => {
+                                unreachable!();
+                            }
+                            IndexCompareExchange::NotExists => {
+                                // re-insert index entry.
+                                continue;
+                            }
                         }
-                        let index_undo = self
-                            .index_undo(new_row_id, IndexUndoKind::UpdateUnique(key, index_row_id));
-                        stmt.index_undo.push(index_undo);
-                        UpdateIndex::Ok
                     }
-                    LinkForUniqueIndex::Ok => {
-                        // Once move+insert is done,
-                        // we already locked both old and new row, and make undo chain linked.
-                        // So any other transaction that want to modify the index with same key
-                        // should fail because lock can not be acquired by them.
-                        let res = index.compare_exchange(&key.vals, index_row_id, new_row_id);
-                        assert!(res);
-                        let index_undo = self
-                            .index_undo(new_row_id, IndexUndoKind::UpdateUnique(key, index_row_id));
-                        stmt.index_undo.push(index_undo);
-                        UpdateIndex::Ok
+                    match self
+                        .link_for_unique_index(
+                            buf_pool,
+                            stmt,
+                            index_row_id,
+                            &key,
+                            new_row_id,
+                            new_guard,
+                        )
+                        .await
+                    {
+                        LinkForUniqueIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
+                        LinkForUniqueIndex::WriteConflict => return UpdateIndex::WriteConflict,
+                        LinkForUniqueIndex::None => {
+                            // move+update does not find old row.
+                            // so we can update index to point to self
+                            match index.compare_exchange(&key.vals, index_row_id, new_row_id) {
+                                IndexCompareExchange::Ok => {
+                                    let index_undo = self.index_undo(
+                                        new_row_id,
+                                        IndexUndoKind::UpdateUnique(key, index_row_id),
+                                    );
+                                    stmt.index_undo.push(index_undo);
+                                    return UpdateIndex::Ok;
+                                }
+                                IndexCompareExchange::Failure => {
+                                    // This may happen when another transaction insert/update with same key.
+                                    return UpdateIndex::WriteConflict;
+                                }
+                                IndexCompareExchange::NotExists => {
+                                    // Purge thread may delete the index entry before we update,
+                                    // we should re-insert.
+                                    continue;
+                                }
+                            }
+                        }
+                        LinkForUniqueIndex::Ok => {
+                            // Once move+update is done,
+                            // we already locked both old and new row, and make undo chain linked.
+                            // So any other transaction that want to modify the index with same key
+                            // should fail because lock can not be acquired by them.
+                            match index.compare_exchange(&key.vals, index_row_id, new_row_id) {
+                                IndexCompareExchange::Ok => {
+                                    let index_undo = self.index_undo(
+                                        new_row_id,
+                                        IndexUndoKind::UpdateUnique(key, index_row_id),
+                                    );
+                                    stmt.index_undo.push(index_undo);
+                                    return UpdateIndex::Ok;
+                                }
+                                IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
+                                    unreachable!()
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1252,11 +1307,17 @@ impl<P: BufferPool> Table<P> {
         new_row_id: RowID,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        let res = index.compare_exchange(&key.vals, old_row_id, new_row_id);
-        assert!(res);
-        let index_undo = self.index_undo(new_row_id, IndexUndoKind::UpdateUnique(key, old_row_id));
-        stmt.index_undo.push(index_undo);
-        UpdateIndex::Ok
+        match index.compare_exchange(&key.vals, old_row_id, new_row_id) {
+            IndexCompareExchange::Ok => {
+                let index_undo =
+                    self.index_undo(new_row_id, IndexUndoKind::UpdateUnique(key, old_row_id));
+                stmt.index_undo.push(index_undo);
+                UpdateIndex::Ok
+            }
+            IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
+                unreachable!()
+            }
+        }
     }
 
     /// Update unique index due to key change.
@@ -1272,65 +1333,82 @@ impl<P: BufferPool> Table<P> {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
-        match index.insert_if_not_exists(&new_key.vals, row_id) {
-            None => {
-                let index_undo = self.index_undo(row_id, IndexUndoKind::InsertUnique(new_key));
-                stmt.index_undo.push(index_undo);
-                UpdateIndex::Ok
-            }
-            Some(index_row_id) => {
-                // There is already a row with same new key.
-                // We have to check its status.
-                if index_row_id == row_id {
-                    // This is possible.
-                    // For example, transaction update row(RowID=100) key=1 to key=2.
-                    //
-                    // Then index has following entries:
-                    // key=1 -> RowID=100 (old version)
-                    // key=2 -> RowID=100 (latest version)
-                    //
-                    // Then we update key=2 to key=1 again.
-                    // Now we should have:
-                    // key=1 -> RowID=100 (latest version)
-                    // key=2 -> RowID=100 (old version)
-                    //
-                    // nothing to do in this case.
+        loop {
+            match index.insert_if_not_exists(&new_key.vals, row_id) {
+                None => {
+                    let index_undo = self.index_undo(row_id, IndexUndoKind::InsertUnique(new_key));
+                    stmt.index_undo.push(index_undo);
                     return UpdateIndex::Ok;
                 }
-                match self
-                    .link_for_unique_index(
-                        buf_pool,
-                        stmt,
-                        index_row_id,
-                        &new_key,
-                        row_id,
-                        page_guard,
-                    )
-                    .await
-                {
-                    LinkForUniqueIndex::DuplicateKey => UpdateIndex::DuplicateKey,
-                    LinkForUniqueIndex::WriteConflict => UpdateIndex::WriteConflict,
-                    LinkForUniqueIndex::None => {
-                        // no old row found.
-                        if !index.compare_exchange(&new_key.vals, index_row_id, row_id) {
-                            // there is another transaction updating the unique index concurrently,
-                            // we can directly fail.
-                            return UpdateIndex::WriteConflict;
-                        }
-                        let index_undo = self
-                            .index_undo(row_id, IndexUndoKind::UpdateUnique(new_key, index_row_id));
-                        stmt.index_undo.push(index_undo);
-                        UpdateIndex::Ok
+                Some(index_row_id) => {
+                    // There is already a row with same new key.
+                    // We have to check its status.
+                    if index_row_id == row_id {
+                        // This is possible.
+                        // For example, transaction update row(RowID=100) key=1 to key=2.
+                        //
+                        // Then index has following entries:
+                        // key=1 -> RowID=100 (old version)
+                        // key=2 -> RowID=100 (latest version)
+                        //
+                        // Then we update key=2 to key=1 again.
+                        // Now we should have:
+                        // key=1 -> RowID=100 (latest version)
+                        // key=2 -> RowID=100 (old version)
+                        //
+                        // nothing to do in this case.
+                        return UpdateIndex::Ok;
                     }
-                    LinkForUniqueIndex::Ok => {
-                        // Both old row(index points to) and new row are locked.
-                        // we must succeed on updateing index.
-                        let res = index.compare_exchange(&new_key.vals, index_row_id, row_id);
-                        assert!(res);
-                        let index_undo = self
-                            .index_undo(row_id, IndexUndoKind::UpdateUnique(new_key, index_row_id));
-                        stmt.index_undo.push(index_undo);
-                        UpdateIndex::Ok
+                    match self
+                        .link_for_unique_index(
+                            buf_pool,
+                            stmt,
+                            index_row_id,
+                            &new_key,
+                            row_id,
+                            page_guard,
+                        )
+                        .await
+                    {
+                        LinkForUniqueIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
+                        LinkForUniqueIndex::WriteConflict => return UpdateIndex::WriteConflict,
+                        LinkForUniqueIndex::None => {
+                            // no old row found.
+                            match index.compare_exchange(&new_key.vals, index_row_id, row_id) {
+                                IndexCompareExchange::Ok => {
+                                    let index_undo = self.index_undo(
+                                        row_id,
+                                        IndexUndoKind::UpdateUnique(new_key, index_row_id),
+                                    );
+                                    stmt.index_undo.push(index_undo);
+                                    return UpdateIndex::Ok;
+                                }
+                                IndexCompareExchange::Failure => return UpdateIndex::WriteConflict,
+                                IndexCompareExchange::NotExists => {
+                                    // re-insert
+                                    continue;
+                                }
+                            }
+                        }
+                        LinkForUniqueIndex::Ok => {
+                            // Both old row(index points to) and new row are locked.
+                            // we must succeed on updateing index.
+                            match index.compare_exchange(&new_key.vals, index_row_id, row_id) {
+                                IndexCompareExchange::Ok => {
+                                    let index_undo = self.index_undo(
+                                        row_id,
+                                        IndexUndoKind::UpdateUnique(new_key, index_row_id),
+                                    );
+                                    stmt.index_undo.push(index_undo);
+                                    return UpdateIndex::Ok;
+                                }
+                                IndexCompareExchange::Failure => return UpdateIndex::WriteConflict,
+                                IndexCompareExchange::NotExists => {
+                                    // re-insert
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
             }

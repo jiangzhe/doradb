@@ -447,10 +447,8 @@ fn test_evict_pool_insert_full() {
                 let s: String = (0..1000).map(|_| 'a').collect();
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
-                println!("trx {}", i);
             }
             let _ = trx.commit().await.unwrap();
-            println!("commit end");
         }
     });
 }
