@@ -171,6 +171,7 @@ impl<'a, T: fmt::Display + 'a> fmt::Display for MutexGuard<'a, T> {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::UnsafeCell;
@@ -223,6 +224,7 @@ mod tests {
         data: UnsafeCell<usize>,
         mu: RawMutex,
     }
+
     impl Counter {
         fn new() -> Self {
             Counter {

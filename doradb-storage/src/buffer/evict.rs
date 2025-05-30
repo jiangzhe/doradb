@@ -2,12 +2,12 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
 use crate::buffer::page::{BufferPage, IOKind, Page, PageID, PageIO, INVALID_PAGE_ID, PAGE_SIZE};
 use crate::buffer::util::{
-    init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate,
+    init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate, AllocMap,
 };
 use crate::buffer::{BufferPool, BufferRequest};
 use crate::error::Validation::Valid;
-use crate::error::{Result, Validation};
-use crate::io::{mlock, munlock, AIOManager, AIOManagerConfig, IocbRawPtr, SparseFile, UnsafeAIO};
+use crate::error::{Error, Result, Validation};
+use crate::io::{AIOManager, AIOManagerConfig, IocbRawPtr, SparseFile, UnsafeAIO};
 use crate::latch::LatchFallbackMode;
 use crate::latch::Mutex;
 use crate::lifetime::StaticLifetime;
@@ -38,16 +38,14 @@ pub struct EvictableBufferPool {
     frames: *mut BufferFrame,
     // Continuous memory area of pages.
     pages: *mut Page,
-    // Maximum page number.
-    // The file size limits this number.
-    max_nbr: usize,
     // In-memory page set.
     in_mem: InMemPageSet,
-    // Take care of free page allocation and deallocation.
-    // When setup buffer pool, we populate free list with all available page
-    // ids backed by the underlying file. So we only need to check free list
-    // when request new page.
-    free_page: FreePage,
+    // Takes care of page allocation and deallocation.
+    alloc_map: AllocMap,
+    // Support notifying and waiting for page allocation.
+    alloc_signal: Signal,
+    // Number of allocated pages.
+    allocated: AtomicUsize,
     // Page IO control read pages from disk and write pages
     // to disk.
     file_io: SingleFileIO,
@@ -266,6 +264,7 @@ impl EvictableBufferPool {
     unsafe fn init_page<T: BufferPage>(&'static self, page_id: PageID) -> PageExclusiveGuard<T> {
         let bf = self.frame_ptr(page_id);
         let frame = &mut *bf.0;
+        T::init_frame(frame);
         frame.next_free = INVALID_PAGE_ID;
         let mut guard = init_bf_exclusive_guard::<T>(bf);
         guard.page_mut().zero();
@@ -452,8 +451,7 @@ impl EvictableBufferPool {
                                     bf.set_kind(FrameKind::Evicted);
                                     let signal = status.signal.take();
                                     self.inflight_io.writes.fetch_sub(1, Ordering::Relaxed);
-                                    self.unpin_page(page_id);
-                                    self.mark_page_dontneed(page_guard);
+                                    self.evict_page(page_guard);
                                     // Unlock map after changing page kind to avoid race condition.
                                     drop(g);
                                     drop(signal);
@@ -600,8 +598,7 @@ impl EvictableBufferPool {
                     // Page is not dirty means it's a read-only only of the data on disk.
                     // So we can directly remove it from memory without IO write.
                     page_guard.bf_mut().set_kind(FrameKind::Evicted);
-                    self.unpin_page(page_guard.page_id());
-                    self.mark_page_dontneed(page_guard);
+                    self.evict_page(page_guard);
                 }
             }
 
@@ -629,7 +626,10 @@ impl EvictableBufferPool {
     #[inline]
     fn clock_sweep(&'static self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
         match self.frame_kind(page_id) {
-            FrameKind::Evicting | FrameKind::Evicted => (),
+            FrameKind::Uninitialized
+            | FrameKind::Fixed
+            | FrameKind::Evicting
+            | FrameKind::Evicted => (),
             FrameKind::Cool => {
                 // Acquire exclusive lock first, in order to block other thread to access
                 // this page at the same time. If fails, we just skip.
@@ -674,27 +674,59 @@ impl EvictableBufferPool {
 
 impl BufferPool for EvictableBufferPool {
     #[inline]
+    fn capacity(&self) -> usize {
+        self.alloc_map.len()
+    }
+
+    #[inline]
+    fn allocated(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed)
+    }
+
+    #[inline]
     async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
         loop {
             while !self.reserve_page().await {}
 
             // Now we have memory budget to allocate new page.
-            if let Some(page_id) = self.free_page.next(self.frames) {
-                self.pin_page(page_id);
-                return unsafe { self.init_page(page_id) };
-            } else {
-                let notify = self.free_page.signal.new_notify(false);
-                // re-check
-                if let Some(page_id) = self.free_page.next(self.frames) {
-                    self.pin_page(page_id);
-                    return unsafe { self.init_page(page_id) };
+            match self.alloc_map.allocate() {
+                Some(page_id) => {
+                    self.allocated.fetch_add(1, Ordering::Relaxed);
+                    self.pin_page(page_id as PageID);
+                    return unsafe { self.init_page(page_id as PageID) };
                 }
+                None => {
+                    let notify = self.alloc_signal.new_notify(false);
+                    // re-check
+                    if let Some(page_id) = self.alloc_map.allocate() {
+                        self.allocated.fetch_add(1, Ordering::Relaxed);
+                        self.pin_page(page_id as PageID);
+                        return unsafe { self.init_page(page_id as PageID) };
+                    }
 
-                // Here we cannot find a free page to load, we should cancel reservation of a page
-                // and retry.
-                self.in_mem.dec();
-                notify.wait_async(false).await;
+                    // Here we cannot find a free page to load, we should cancel reservation of a page
+                    // and retry.
+                    self.in_mem.dec();
+                    notify.wait_async(false).await;
+                }
             }
+        }
+    }
+
+    #[inline]
+    async fn allocate_page_at<T: BufferPage>(
+        &'static self,
+        page_id: PageID,
+    ) -> Result<PageExclusiveGuard<T>> {
+        while !self.reserve_page().await {}
+
+        if self.alloc_map.allocate_at(page_id as usize) {
+            self.allocated.fetch_add(1, Ordering::Relaxed);
+            self.pin_page(page_id as PageID);
+            Ok(unsafe { self.init_page(page_id as PageID) })
+        } else {
+            self.in_mem.dec();
+            Err(Error::BufferPageAlreadyAllocated)
         }
     }
 
@@ -709,7 +741,10 @@ impl BufferPool for EvictableBufferPool {
                 let bf = self.frame_ptr(page_id);
                 let frame = &mut *bf.0;
                 match frame.kind() {
-                    FrameKind::Hot => {
+                    FrameKind::Uninitialized => {
+                        panic!("get an uninitialized page");
+                    }
+                    FrameKind::Fixed | FrameKind::Hot => {
                         let g = frame.latch.optimistic_fallback(mode).await;
                         return PageGuard::new(bf, g);
                     }
@@ -742,13 +777,23 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     fn deallocate_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
+        let page_id = g.page_id();
         g.page_mut().zero(); // zero the page
-        let old_id = self.free_page.add(&mut g);
-        self.unpin_page(g.page_id());
+        T::deinit_frame(g.bf_mut());
+        self.unpin_page(page_id);
         self.mark_page_dontneed(g);
-        if old_id == INVALID_PAGE_ID {
-            Signal::set_and_notify(&self.free_page.signal, usize::MAX);
-        }
+        self.alloc_map.deallocate(page_id as usize);
+        self.alloc_signal.notify(usize::MAX);
+    }
+
+    #[inline]
+    fn evict_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
+        let page_id = g.page_id();
+        g.page_mut().zero(); // zero the page
+        g.bf_mut().set_kind(FrameKind::Evicted);
+        self.unpin_page(page_id);
+        self.mark_page_dontneed(g);
+        self.alloc_signal.notify(usize::MAX);
     }
 
     #[inline]
@@ -763,7 +808,10 @@ impl BufferPool for EvictableBufferPool {
                 let bf = self.frame_ptr(page_id);
                 let frame = &mut *bf.0;
                 match frame.kind() {
-                    FrameKind::Hot => {
+                    FrameKind::Uninitialized => {
+                        panic!("get an uninitialized page");
+                    }
+                    FrameKind::Fixed | FrameKind::Hot => {
                         let g = frame.latch.optimistic_fallback(mode).await;
                         // apply lock coupling.
                         // the validation make sure parent page does not change until child
@@ -820,16 +868,17 @@ impl Drop for EvictableBufferPool {
 
         unsafe {
             // Drop all frames.
-            for page_id in 0..self.max_nbr {
+            for page_id in 0..self.capacity() {
                 let frame_ptr = self.frames.add(page_id as usize);
                 std::ptr::drop_in_place(frame_ptr);
             }
 
             // Deallocate memory of frames.
-            let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.max_nbr + SAFETY_PAGES);
+            let frame_total_bytes =
+                mem::size_of::<BufferFrame>() * (self.capacity() + SAFETY_PAGES);
             mmap_deallocate(self.frames as *mut u8, frame_total_bytes);
             // Deallocate memory of pages.
-            let page_total_bytes = mem::size_of::<Page>() * (self.max_nbr + SAFETY_PAGES);
+            let page_total_bytes = mem::size_of::<Page>() * (self.capacity() + SAFETY_PAGES);
             mmap_deallocate(self.pages as *mut u8, page_total_bytes);
         }
     }
@@ -980,14 +1029,14 @@ impl InMemPageSet {
     /// Pin given page in memory.
     /// Use mlock() to prevent page to swap out to disk.
     #[inline]
-    unsafe fn pin(&self, page_id: PageID, ptr: *mut Page) {
+    unsafe fn pin(&self, page_id: PageID, _ptr: *mut Page) {
         // assert!(mlock(ptr as *mut u8, PAGE_SIZE));
         let mut g = self.set.lock();
         g.insert(page_id);
     }
 
     #[inline]
-    unsafe fn unpin(&self, page_id: PageID, ptr: *mut Page) {
+    unsafe fn unpin(&self, page_id: PageID, _ptr: *mut Page) {
         // assert!(munlock(ptr as *mut u8, PAGE_SIZE));
         let mut g = self.set.lock();
         g.remove(&page_id);
@@ -1347,9 +1396,10 @@ impl EvictableBufferPoolConfig {
         let pool = EvictableBufferPool {
             frames,
             pages,
-            max_nbr,
             in_mem: InMemPageSet::new(max_nbr_in_mem),
-            free_page: FreePage::new(0),
+            alloc_map: AllocMap::new(max_nbr),
+            alloc_signal: Signal::default(),
+            allocated: AtomicUsize::new(0),
             file_io: SingleFileIO::new(aio_reader, aio_writer, file, io_read_tx, io_write_tx),
             shutdown_flag: AtomicBool::new(false),
             inflight_io: CachePadded::new(InflightIO::default()),
@@ -1526,6 +1576,7 @@ pub struct EvictableBufferPoolStartContext {
 mod tests {
     use super::*;
     use crate::buffer::guard::PageOptimisticGuard;
+    use crate::row::RowPage;
     use std::thread;
     use std::time::Duration;
 
@@ -1539,18 +1590,18 @@ mod tests {
                 .build_static()
                 .unwrap();
             {
-                let g: PageExclusiveGuard<Page> = pool.allocate_page().await;
+                let g: PageExclusiveGuard<RowPage> = pool.allocate_page().await;
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g: PageExclusiveGuard<Page> = pool.allocate_page().await;
+                let g: PageExclusiveGuard<RowPage> = pool.allocate_page().await;
                 assert_eq!(g.page_id(), 1);
                 pool.deallocate_page(g);
-                let g: PageExclusiveGuard<Page> = pool.allocate_page().await;
+                let g: PageExclusiveGuard<RowPage> = pool.allocate_page().await;
                 assert_eq!(g.page_id(), 1);
             }
             {
-                let g: PageOptimisticGuard<Page> =
+                let g: PageOptimisticGuard<RowPage> =
                     pool.get_page(0, LatchFallbackMode::Spin).await.downgrade();
                 assert_eq!(unsafe { g.page_id() }, 0);
             }
@@ -1575,7 +1626,7 @@ mod tests {
                 smol::block_on(async move {
                     // allocate more pages than memory limit.
                     for i in 0..20 {
-                        let g = pool.allocate_page::<Page>().await;
+                        let g = pool.allocate_page::<RowPage>().await;
                         let _ = tx.send(g.page_id());
                         println!("allocated page {}", i);
                     }
@@ -1589,7 +1640,7 @@ mod tests {
         smol::block_on(async move {
             while let Ok(page_id) = rx.recv() {
                 let g = pool
-                    .get_page::<Page>(page_id, LatchFallbackMode::Exclusive)
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                     .await
                     .exclusive_blocking();
                 pool.deallocate_page(g);
@@ -1616,12 +1667,13 @@ mod tests {
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
-            pool.max_nbr, pool.in_mem.max_count
+            pool.capacity(),
+            pool.in_mem.max_count
         );
         smol::block_on(async {
             let mut pages = vec![];
-            for _ in 0..2048 {
-                let g = pool.allocate_page::<Page>().await;
+            for i in 0..2048 {
+                let g = pool.allocate_page::<RowPage>().await;
                 pages.push(g.page_id());
             }
             debug_assert!(pages.len() == 2048);
@@ -1640,7 +1692,8 @@ mod tests {
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
-            pool.max_nbr, pool.in_mem.max_count
+            pool.capacity(),
+            pool.in_mem.max_count
         );
         let mut handles = vec![];
         for thread_id in 0..10 {
@@ -1650,7 +1703,7 @@ mod tests {
 
                     let mut pages = vec![];
                     for _ in 0..1024 {
-                        let g = pool.allocate_page::<Page>().await;
+                        let g = pool.allocate_page::<RowPage>().await;
                         pages.push(g.page_id());
                         println!(
                             "thread {} alloc page {}, in-mem {}, threshold {}, reads {}, writes {}",
@@ -1674,7 +1727,7 @@ mod tests {
                                 pool.inflight_io.writes.load(Ordering::Relaxed),
                             );
                             let g = pool
-                                .get_page::<Page>(page_id, LatchFallbackMode::Shared)
+                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await;
                             println!("thread {} read page {} end", thread_id, page_id);
                             drop(g);

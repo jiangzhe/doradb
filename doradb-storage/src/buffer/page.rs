@@ -1,3 +1,4 @@
+use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
 use std::mem;
 
@@ -25,6 +26,17 @@ pub trait BufferPage: Sized + 'static {
             ptr.write_bytes(0, bytes);
         }
     }
+
+    /// Initialize frame before the first use of this page.
+    fn init_frame(frame: &mut BufferFrame) {
+        debug_assert_eq!(frame.kind(), FrameKind::Uninitialized);
+        frame.set_kind(FrameKind::Hot);
+    }
+
+    /// Deinitialize frame before the return of page to buffer pool.
+    fn deinit_frame(frame: &mut BufferFrame) {
+        frame.set_kind(FrameKind::Uninitialized);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,4 +56,6 @@ pub struct PageIO {
     pub kind: IOKind,
 }
 
+/// Convenient for IO thread to process, no matter
+/// what kind this page belongs to.
 impl BufferPage for Page {}

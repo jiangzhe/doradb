@@ -1,10 +1,9 @@
 use crate::buffer::{BufferPool, EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
 use crate::engine::{Engine, EngineConfig};
-use crate::lifetime::StaticLifetime;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::session::Session;
 use crate::table::Table;
-use crate::trx::sys::TrxSysConfig;
+use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::ActiveTrx;
 use crate::value::Val;
 
@@ -453,8 +452,40 @@ fn test_evict_pool_insert_full() {
     });
 }
 
+#[test]
+fn test_row_page_scan_rows_uncommitted() {
+    smol::block_on(async {
+        const SIZE: i32 = 10000;
+
+        let sys = TestSys::new_fixed().await;
+
+        let session = sys.new_session();
+        {
+            let mut trx = session.begin_trx();
+            for i in 0..SIZE {
+                let s = format!("{}", i);
+                let insert = vec![Val::from(i), Val::from(&s[..])];
+                trx = sys.trx_insert(trx, insert).await;
+            }
+            _ = trx.commit().await.unwrap();
+        }
+        {
+            // let mut trx = session.begin_trx();
+            let mut res_len = 0usize;
+            sys.table
+                .scan_rows_uncommitted(sys.engine.buf_pool, |row| {
+                    res_len += 1;
+                    true
+                })
+                .await;
+            println!("res.len()={}", res_len);
+            assert!(res_len == SIZE as usize);
+        }
+    });
+}
+
 struct TestSys<P: BufferPool> {
-    engine: &'static Engine<P>,
+    engine: Engine<P>,
     table: Table<P>,
 }
 
@@ -463,10 +494,13 @@ impl TestSys<FixedBufferPool> {
     async fn new_fixed() -> Self {
         use crate::catalog::tests::table2;
         // 64KB * 16
-        let engine = Engine::new_fixed(1024 * 1024, TrxSysConfig::default())
-            .await
-            .unwrap();
-        let table_id = table2(engine).await;
+        let engine =
+            Engine::new_fixed_initializer(1024 * 1024, TrxSysConfig::default().skip_recovery(true))
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
+        let table_id = table2(&engine).await;
         let table = engine.catalog().get_table(table_id).unwrap();
         TestSys { engine, table }
     }
@@ -483,10 +517,13 @@ impl TestSys<EvictableBufferPool> {
                     .max_mem_size(1024u64 * 1024)
                     .max_file_size(1024u64 * 1024 * 32),
             )
-            .build_static()
+            .trx(TrxSysConfig::default().skip_recovery(true))
+            .build()
+            .unwrap()
+            .init()
             .await
             .unwrap();
-        let table_id = table2(engine).await;
+        let table_id = table2(&engine).await;
         let table = engine.catalog().get_table(table_id).unwrap();
         TestSys { engine, table }
     }
@@ -604,15 +641,6 @@ impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
     fn new_session(&self) -> Session<P> {
         self.engine.new_session()
-    }
-}
-
-impl<P: BufferPool + 'static> Drop for TestSys<P> {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            StaticLifetime::drop_static(self.engine);
-        }
     }
 }
 

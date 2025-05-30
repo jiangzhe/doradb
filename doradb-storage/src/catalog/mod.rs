@@ -7,10 +7,10 @@ pub use storage::*;
 pub use table::*;
 
 use crate::buffer::BufferPool;
+use crate::error::{Error, Result};
 use crate::lifetime::StaticLifetime;
 use crate::stmt::Statement;
 use crate::table::Table;
-use crate::trx::sys::TransactionSystem;
 use doradb_catalog::{
     ColumnAttributes, ColumnID, ColumnObject, ColumnSpec, IndexAttributes, IndexColumnObject,
     IndexID, IndexObject, IndexOrder, SchemaID, SchemaObject, TableID, TableObject,
@@ -41,16 +41,12 @@ pub struct Catalog<P: BufferPool> {
 
 impl<P: BufferPool> Catalog<P> {
     #[inline]
-    pub fn empty() -> Self {
+    pub fn new(storage: CatalogStorage<P>) -> Self {
         Catalog {
             obj_id: AtomicU64::new(0),
             cache: CatalogCache::new(),
-            storage: CatalogStorage::new(),
+            storage,
         }
-    }
-
-    pub async unsafe fn init(&self, buf_pool: &'static P, trx_sys: &'static TransactionSystem<P>) {
-        self.storage.init(buf_pool, trx_sys).await;
     }
 
     #[inline]
@@ -63,32 +59,72 @@ impl<P: BufferPool> Catalog<P> {
         self.obj_id.fetch_max(obj_id, Ordering::SeqCst);
     }
 
-    pub async fn create_schema_object(
+    /// Reload schema cache for given schema id.
+    /// If exists flag is set to true, schema should exist.
+    /// Otherwise, schema should not exist.
+    pub async fn reload_schema(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        schema_name: SemiStr,
-    ) -> Option<SchemaObject> {
-        if self
+        schema_id: SchemaID,
+        exists: bool,
+    ) -> Result<()> {
+        let res = self
             .storage
             .schemas()
-            .find_uncommitted_by_name(buf_pool, &schema_name)
-            .await
-            .is_some()
-        {
-            return None;
-        }
-
-        let schema_id = self.obj_id.fetch_add(1, Ordering::SeqCst);
-        let schema_object = SchemaObject {
-            schema_id,
-            schema_name,
-        };
-        self.storage
-            .schemas()
-            .insert(buf_pool, stmt, &schema_object)
+            .find_uncommitted_by_id(buf_pool, schema_id)
             .await;
-        Some(schema_object)
+        match (exists, res) {
+            (true, Some(schema)) => {
+                let mut g = self.cache.schemas.write();
+                let _ = g.insert(schema_id, schema);
+                Ok(())
+            }
+            (false, None) => {
+                let mut g = self.cache.schemas.write();
+                let _ = g.remove(&schema_id);
+                Ok(())
+            }
+            (true, None) => Err(Error::SchemaNotFound),
+            (false, Some(_)) => Err(Error::SchemaNotDeleted),
+        }
+    }
+
+    pub async fn reload_table(
+        &self,
+        buf_pool: &'static P,
+        table_id: TableID,
+        exists: bool,
+    ) -> Result<()> {
+        // todo
+        let res = self
+            .storage
+            .tables()
+            .find_uncommitted_by_id(buf_pool, table_id)
+            .await;
+        match (exists, res) {
+            (true, Some(table)) => {
+                // todo: use secondary index to improve performance
+                let columns = self
+                    .storage
+                    .columns()
+                    .list_uncommitted_by_table_id(buf_pool, table_id)
+                    .await;
+
+                let indexes = self
+                    .storage
+                    .indexes()
+                    .list_uncommitted_by_table_id(buf_pool, table_id)
+                    .await;
+                todo!()
+            }
+            (false, None) => {
+                let mut g = self.cache.tables.write();
+                let _ = g.remove(&table_id);
+                Ok(())
+            }
+            (true, None) => Err(Error::TableNotFound),
+            (false, Some(_)) => Err(Error::TableNotDeleted),
+        }
     }
 
     pub async fn create_table_object(
@@ -251,7 +287,7 @@ pub mod tests {
     use doradb_datatype::Collation;
 
     #[inline]
-    pub(crate) async fn db1<P: BufferPool>(engine: &'static Engine<P>) -> SchemaID {
+    pub(crate) async fn db1<P: BufferPool>(engine: &Engine<P>) -> SchemaID {
         let session = engine.new_session();
         let trx = session.begin_trx();
         let mut stmt = trx.start_stmt();
@@ -266,7 +302,7 @@ pub mod tests {
 
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
-    pub(crate) async fn table1<P: BufferPool>(engine: &'static Engine<P>) -> TableID {
+    pub(crate) async fn table1<P: BufferPool>(engine: &Engine<P>) -> TableID {
         let schema_id = db1(engine).await;
 
         let session = engine.new_session();
@@ -301,7 +337,7 @@ pub mod tests {
 
     /// Table2 has i32(unique key) and string column.
     #[inline]
-    pub(crate) async fn table2<P: BufferPool>(engine: &'static Engine<P>) -> TableID {
+    pub(crate) async fn table2<P: BufferPool>(engine: &Engine<P>) -> TableID {
         let schema_id = db1(engine).await;
 
         let session = engine.new_session();

@@ -33,6 +33,8 @@ pub enum Error {
     // buffer pool errors
     #[error("insufficient memory({0})")]
     InsufficientMemory(usize),
+    #[error("buffer page already allocated")]
+    BufferPageAlreadyAllocated,
     #[error("empty free list of buffer pool")]
     EmptyFreeListOfBufferPool,
     // latch errors
@@ -49,14 +51,22 @@ pub enum Error {
     AIOError(#[from] AIOError),
     #[error("schema not found")]
     SchemaNotFound,
+    #[error("schema not deleted")]
+    SchemaNotDeleted,
     #[error("schema already exists")]
     SchemaAlreadyExists,
+    #[error("table not found")]
+    TableNotFound,
+    #[error("table not deleted")]
+    TableNotDeleted,
     #[error("table already exists")]
     TableAlreadyExists,
     #[error("user session missing")]
     UserSessionMissing,
     #[error("glob error")]
     GlobError,
+    #[error("log file corrupted")]
+    LogFileCorrupted,
 }
 
 impl From<TryFromSliceError> for Error {
@@ -80,6 +90,20 @@ impl From<std::io::Error> for Error {
     #[inline]
     fn from(_src: std::io::Error) -> Self {
         Error::IOError
+    }
+}
+
+impl From<std::str::Utf8Error> for Error {
+    #[inline]
+    fn from(_src: std::str::Utf8Error) -> Error {
+        Error::InvalidFormat
+    }
+}
+
+impl From<std::num::ParseIntError> for Error {
+    #[inline]
+    fn from(_src: std::num::ParseIntError) -> Error {
+        Error::InvalidFormat
     }
 }
 
