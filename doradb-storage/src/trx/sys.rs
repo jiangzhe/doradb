@@ -1,34 +1,29 @@
 use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
-use crate::io::{align_to_sector_size, AIOManagerConfig, DirectBuf, FreeListWithFactory};
 use crate::latch::Mutex;
 use crate::lifetime::StaticLifetime;
 use crate::notify::Signal;
 use crate::session::{IntoSession, Session};
 use crate::thread;
-use crate::trx::group::{Commit, GroupCommit};
-use crate::trx::log::{
-    create_log_file, LogPartition, LogPartitionStats, LogSync, MmapLogReader, LOG_HEADER_PAGES,
-};
-use crate::trx::purge::{GCBucket, Purge, GC};
+use crate::trx::group::Commit;
+use crate::trx::log::{LogPartition, MmapLogReader, LOG_HEADER_PAGES};
+use crate::trx::purge::{Purge, GC};
 use crate::trx::redo::RedoLogs;
+use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
     ActiveTrx, PreparedTrx, TrxID, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
 };
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
-use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 pub const GC_BUCKETS: usize = 64;
-use byte_unit::Byte;
 
 /// TransactionSystem controls lifecycle of all transactions.
 ///
@@ -95,17 +90,36 @@ pub struct TransactionSystem<P: BufferPool> {
 
 impl<P: BufferPool> TransactionSystem<P> {
     #[inline]
-    pub async fn start(&'static self, buf_pool: &'static P, start_ctx: TrxSysStartContext<P>) {
-        self.start_io_threads();
-        self.start_gc_threads(start_ctx.gc_chans);
-        self.start_purge_threads(buf_pool, start_ctx.purge_rx);
-
-        // todo: recover catalog.
-        unsafe {
-            self.catalog.init(buf_pool, self).await;
+    pub(super) fn new(
+        config: TrxSysConfig,
+        catalog: Catalog<P>,
+        log_partitions: Vec<CachePadded<LogPartition<P>>>,
+        purge_chan: Sender<Purge>,
+    ) -> Self {
+        TransactionSystem {
+            ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+            min_active_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+            partition_id: CachePadded::new(AtomicUsize::new(0)),
+            log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
+            config: CachePadded::new(config),
+            catalog: CachePadded::new(catalog),
+            purge_chan,
+            purge_threads: Mutex::new(vec![]),
         }
-        // todo: recover data from log file.
     }
+
+    // #[inline]
+    // pub async fn start(&'static self, buf_pool: &'static P, start_ctx: TrxSysStartContext<P>) {
+    //     self.start_io_threads();
+    //     self.start_gc_threads(start_ctx.gc_chans);
+    //     self.start_purge_threads(buf_pool, start_ctx.purge_rx);
+
+    //     // todo: recover catalog.
+    //     unsafe {
+    //         self.catalog.init(buf_pool).await;
+    //     }
+    //     // todo: recover data from log file.
+    // }
 
     /// Create a new transaction.
     #[inline]
@@ -246,8 +260,8 @@ impl<P: BufferPool> TransactionSystem<P> {
 
     /// Start background GC threads.
     #[inline]
-    fn start_gc_threads(&'static self, gc_chans: Vec<Receiver<GC<P>>>) {
-        for ((idx, partition), gc_rx) in self.log_partitions.iter().enumerate().zip(gc_chans) {
+    pub(super) fn start_gc_threads(&'static self, gc_rxs: Vec<Receiver<GC<P>>>) {
+        for ((idx, partition), gc_rx) in self.log_partitions.iter().enumerate().zip(gc_rxs) {
             let thread_name = format!("GC-Thread-{}", idx);
             let partition = &**partition;
             let purge_chan = self.purge_chan.clone();
@@ -259,7 +273,7 @@ impl<P: BufferPool> TransactionSystem<P> {
 
     /// Start background IO threads.
     #[inline]
-    fn start_io_threads(&'static self) {
+    pub(super) fn start_io_threads(&'static self) {
         // Start threads for all log partitions
         for (idx, partition) in self.log_partitions.iter().enumerate() {
             let thread_name = format!("IO-Thread-{}", idx);
@@ -334,211 +348,6 @@ fn gc_no(sts: TrxID) -> usize {
     value as usize % GC_BUCKETS
 }
 
-pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
-pub const DEFAULT_LOG_IO_MAX_SIZE: Byte = Byte::from_u64(8192);
-pub const DEFAULT_LOG_FILE_PREFIX: &'static str = "redo.log";
-pub const DEFAULT_LOG_PARTITIONS: usize = 1;
-pub const MAX_LOG_PARTITIONS: usize = 99; // big enough for log partitions, so fix two digits in file name.
-pub const DEFAULT_LOG_FILE_MAX_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // 1GB, sparse file will not occupy space until actual write.
-pub const DEFAULT_LOG_SYNC: LogSync = LogSync::Fsync;
-pub const DEFAULT_PURGE_THREADS: usize = 2;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrxSysConfig {
-    // Controls infight IO request number of each log file.
-    pub io_depth_per_log: usize,
-    // Controls maximum IO size of each IO request.
-    // This only limit the combination of multiple transactions.
-    // If single transaction has very large redo log. It is kept
-    // what it is and send to AIO manager as one IO request.
-    pub max_io_size: Byte,
-    // Prefix of log file.
-    // the complete file name pattern is:
-    // <file-prefix>.<partition_idx>.<file-sequence>
-    // e.g. redo.log.0.00000001
-    pub log_file_prefix: String,
-    // Log partition number.
-    pub log_partitions: usize,
-    // Controls the maximum size of each log file.
-    // Log file will be rotated once the size limit is reached.
-    // a u32 suffix is appended at end of the file name in
-    // hexdigit format.
-    pub log_file_max_size: Byte,
-    // Controls which method to sync data on disk.
-    // By default, use fsync(),
-    // Can be switched to fdatasync() or not sync.
-    pub log_sync: LogSync,
-    // Threads for purging undo logs.
-    pub purge_threads: usize,
-}
-
-impl TrxSysConfig {
-    /// How many commits can be issued concurrently.
-    #[inline]
-    pub fn io_depth_per_log(mut self, io_depth_per_log: usize) -> Self {
-        self.io_depth_per_log = io_depth_per_log;
-        self
-    }
-
-    /// How large single IO operation can be.
-    #[inline]
-    pub fn max_io_size<T>(mut self, max_io_size: T) -> Self
-    where
-        Byte: From<T>,
-    {
-        self.max_io_size = Byte::from(max_io_size);
-        self
-    }
-
-    /// How many threads to execute for purge undo logs and remove
-    /// unused index and row pages.
-    #[inline]
-    pub fn purge_threads(mut self, purge_threads: usize) -> Self {
-        self.purge_threads = purge_threads;
-        self
-    }
-
-    /// Log file name.
-    #[inline]
-    pub fn log_file_prefix(mut self, log_file_prefix: String) -> Self {
-        self.log_file_prefix = log_file_prefix;
-        self
-    }
-
-    /// Maximum size of single log file.
-    #[inline]
-    pub fn log_file_max_size<T>(mut self, log_file_max_size: T) -> Self
-    where
-        Byte: From<T>,
-    {
-        let size = Byte::from(log_file_max_size);
-        let aligned_size = align_to_sector_size(size.as_u64() as usize);
-        self.log_file_max_size = <Byte as From<usize>>::from(aligned_size);
-        self
-    }
-
-    /// Controls how many files can be used for concurrent logging.
-    #[inline]
-    pub fn log_partitions(mut self, log_partitions: usize) -> Self {
-        assert!(log_partitions > 0 && log_partitions <= MAX_LOG_PARTITIONS);
-        self.log_partitions = log_partitions;
-        self
-    }
-
-    /// Sync method of log files.
-    #[inline]
-    pub fn log_sync(mut self, log_sync: LogSync) -> Self {
-        self.log_sync = log_sync;
-        self
-    }
-
-    fn setup_log_partition<P: BufferPool>(
-        &self,
-        log_no: usize,
-    ) -> (LogPartition<P>, Receiver<GC<P>>) {
-        let aio_mgr = AIOManagerConfig::default()
-            .max_events(self.io_depth_per_log)
-            .build()
-            .expect("create AIO manager");
-
-        // todo: handle recovery from previous log file.
-        let mut file_seq = 0;
-        let log_file = create_log_file(
-            &aio_mgr,
-            &self.log_file_prefix,
-            log_no,
-            file_seq,
-            self.log_file_max_size.as_u64() as usize,
-            self.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
-        )
-        .expect("create log file");
-        file_seq += 1;
-
-        let group_commit = GroupCommit {
-            queue: VecDeque::new(),
-            log_file: Some(log_file),
-        };
-        let max_io_size = self.max_io_size.as_u64() as usize;
-        let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
-        let (gc_chan, gc_rx) = flume::unbounded();
-        (
-            LogPartition {
-                group_commit: CachePadded::new((Mutex::new(group_commit), Signal::default())),
-                persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-                stats: CachePadded::new(LogPartitionStats::default()),
-                gc_chan,
-                gc_buckets: gc_info.into_boxed_slice(),
-                aio_mgr,
-                log_no,
-                max_io_size,
-                file_prefix: self.log_file_prefix.clone(),
-                file_seq: AtomicU32::new(file_seq),
-                file_max_size: self.log_file_max_size.as_u64() as usize,
-                buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
-                    let mut buf = DirectBuf::page_zeroed(max_io_size);
-                    buf.set_data_len(0);
-                    buf
-                }),
-                io_thread: Mutex::new(None),
-                gc_thread: Mutex::new(None),
-            },
-            gc_rx,
-        )
-    }
-
-    #[inline]
-    pub fn build<P: BufferPool>(self) -> (TransactionSystem<P>, TrxSysStartContext<P>) {
-        let (purge_chan, purge_rx) = flume::unbounded();
-
-        let mut log_partitions = Vec::with_capacity(self.log_partitions);
-        let mut gc_chans = Vec::with_capacity(self.log_partitions);
-        for idx in 0..self.log_partitions {
-            let (partition, gc_rx) = self.setup_log_partition(idx);
-            log_partitions.push(CachePadded::new(partition));
-            gc_chans.push(gc_rx);
-        }
-        let trx_sys = TransactionSystem {
-            ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            min_active_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            partition_id: CachePadded::new(AtomicUsize::new(0)),
-            log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
-            config: CachePadded::new(self),
-            catalog: CachePadded::new(Catalog::empty()),
-            purge_chan,
-            purge_threads: Mutex::new(vec![]),
-        };
-        (trx_sys, TrxSysStartContext { purge_rx, gc_chans })
-    }
-
-    /// Build transaction system with logging and GC, leak it to heap
-    /// for the convenience to share the singleton among multiple threads.
-    #[inline]
-    pub async fn build_static<P: BufferPool>(
-        self,
-        buf_pool: &'static P,
-    ) -> &'static TransactionSystem<P> {
-        let (trx_sys, start_ctx) = self.build();
-        let trx_sys = StaticLifetime::new_static(trx_sys);
-        trx_sys.start(buf_pool, start_ctx).await;
-        trx_sys
-    }
-}
-
-impl Default for TrxSysConfig {
-    #[inline]
-    fn default() -> Self {
-        TrxSysConfig {
-            io_depth_per_log: DEFAULT_LOG_IO_DEPTH,
-            max_io_size: DEFAULT_LOG_IO_MAX_SIZE,
-            log_file_prefix: String::from(DEFAULT_LOG_FILE_PREFIX),
-            log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,
-            log_partitions: DEFAULT_LOG_PARTITIONS,
-            log_sync: DEFAULT_LOG_SYNC,
-            purge_threads: DEFAULT_PURGE_THREADS,
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct TrxSysStats {
     pub commit_count: usize,
@@ -576,9 +385,14 @@ mod tests {
     #[test]
     fn test_transaction_system() {
         smol::block_on(async {
-            let engine = Engine::new_fixed(128 * 1024 * 1024, TrxSysConfig::default())
-                .await
-                .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                128 * 1024 * 1024,
+                TrxSysConfig::default().skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
             let session = engine.new_session();
             {
                 let trx = session.begin_trx();
@@ -591,9 +405,6 @@ mod tests {
             })
             .join()
             .unwrap();
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
         })
     }
 
@@ -729,9 +540,14 @@ mod tests {
     fn test_single_thread_trx_begin_and_commit() {
         const COUNT: usize = 1000000;
         smol::block_on(async {
-            let engine = Engine::new_fixed(128 * 1024 * 1024, TrxSysConfig::default())
-                .await
-                .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                128 * 1024 * 1024,
+                TrxSysConfig::default().skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
             let mut session = engine.new_session();
             let start = Instant::now();
             for _ in 0..COUNT {
@@ -747,9 +563,6 @@ mod tests {
                 dur.as_micros(),
                 COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
             );
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
         });
     }
 
@@ -762,15 +575,18 @@ mod tests {
         // be higher and produce more files.
         const COUNT: usize = 10000;
         smol::block_on(async {
-            let engine = Engine::new_fixed(
+            let engine = Engine::new_fixed_initializer(
                 128 * 1024 * 1024,
                 TrxSysConfig::default()
                     .log_partitions(1)
-                    .log_file_max_size(1024u64 * 1024 * 5),
+                    .log_file_max_size(1024u64 * 1024 * 5)
+                    .skip_recovery(true),
             )
+            .unwrap()
+            .init()
             .await
             .unwrap();
-            let table_id = table2(engine).await;
+            let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).unwrap();
 
             let mut session = engine.new_session();
@@ -785,9 +601,7 @@ mod tests {
                 session = trx.commit().await.unwrap();
             }
 
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
         });
     }
 }

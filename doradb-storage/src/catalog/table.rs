@@ -5,6 +5,7 @@ use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexSpec};
 use semistr::SemiStr;
 use std::collections::HashSet;
 
+#[derive(Clone)]
 pub struct TableMetadata {
     pub(crate) col_names: Vec<SemiStr>,
     pub(crate) col_types: Vec<ValType>,

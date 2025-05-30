@@ -10,10 +10,9 @@ use doradb_catalog::{
 use doradb_datatype::{Collation, PreciseType};
 use doradb_storage::buffer::BufferPool;
 use doradb_storage::engine::Engine;
-use doradb_storage::lifetime::StaticLifetime;
 use doradb_storage::table::TableID;
 use doradb_storage::trx::log::LogSync;
-use doradb_storage::trx::sys::TrxSysConfig;
+use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::Val;
 use easy_parallel::Parallel;
 use semistr::SemiStr;
@@ -32,7 +31,7 @@ fn main() {
     smol::block_on(async {
         let args = Args::parse();
 
-        let engine = Engine::new_fixed(
+        let engine = Engine::new_fixed_initializer(
             args.buffer_pool_size,
             TrxSysConfig::default()
                 .log_file_prefix(args.log_file_prefix.to_string())
@@ -41,13 +40,16 @@ fn main() {
                 .log_file_max_size(args.log_file_max_size)
                 .log_sync(args.log_sync)
                 .max_io_size(args.max_io_size)
-                .purge_threads(args.purge_threads),
+                .purge_threads(args.purge_threads)
+                .skip_recovery(true),
         )
+        .unwrap()
+        .init()
         .await
         .unwrap();
         println!("buffer pool size is {}", engine.buf_pool.size());
 
-        let table_id = sbtest(engine).await;
+        let table_id = sbtest(&engine).await;
         // start benchmark
         {
             let start = Instant::now();
@@ -59,6 +61,7 @@ fn main() {
             for sess_id in 0..args.sessions {
                 let wg = wg.clone();
                 let stop = Arc::clone(&stop);
+                let engine = engine.weak();
                 ex.spawn(worker(
                     engine,
                     table_id,
@@ -137,15 +140,13 @@ fn main() {
                 stats.purge_index_count,
             );
         }
-        unsafe {
-            StaticLifetime::drop_static(engine);
-        }
+        drop(engine);
     })
 }
 
 #[inline]
 async fn worker<P: BufferPool>(
-    engine: &'static Engine<P>,
+    engine: Engine<P>,
     table_id: TableID,
     id_start: i32,
     id_step: i32,
@@ -241,7 +242,7 @@ fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
 }
 
 #[inline]
-pub(crate) async fn db1<P: BufferPool>(engine: &'static Engine<P>) -> SchemaID {
+pub(crate) async fn db1<P: BufferPool>(engine: &Engine<P>) -> SchemaID {
     let session = engine.new_session();
     let trx = session.begin_trx();
     let mut stmt = trx.start_stmt();
@@ -256,7 +257,7 @@ pub(crate) async fn db1<P: BufferPool>(engine: &'static Engine<P>) -> SchemaID {
 
 /// Sbtest is target table of sysbench.
 #[inline]
-pub async fn sbtest<P: BufferPool>(engine: &'static Engine<P>) -> TableID {
+pub async fn sbtest<P: BufferPool>(engine: &Engine<P>) -> TableID {
     let schema_id = db1(engine).await;
 
     let session = engine.new_session();

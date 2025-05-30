@@ -1,4 +1,4 @@
-use crate::buffer::frame::FrameContext;
+use crate::buffer::frame::{BufferFrame, FrameContext, FrameKind};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
 use crate::buffer::BufferPool;
@@ -77,6 +77,14 @@ impl BlockNode {
         self.header.end_row_id = INVALID_ROW_ID;
         self.header.count = 0;
         self.leaf_add_block(start_row_id, count, insert_page_id);
+    }
+
+    #[inline]
+    pub fn init_empty(&mut self) {
+        self.header.height = 0;
+        self.header.start_row_id = 0;
+        self.header.end_row_id = INVALID_ROW_ID;
+        self.header.count = 0;
     }
 
     /// Returns whether the block node is leaf.
@@ -388,7 +396,7 @@ pub struct BlockIndex<P: BufferPool> {
     insert_free_list: Mutex<Vec<PageID>>,
     // Reference to storage engine,
     // used for committing new page.
-    page_committer: RedoLogCommitter<P>,
+    page_committer: Mutex<Option<RedoLogCommitter<P>>>,
     _marker: PhantomData<P>,
 }
 
@@ -403,17 +411,44 @@ impl<P: BufferPool> BlockIndex<P> {
         let mut g: PageExclusiveGuard<BlockNode> = buf_pool.allocate_page().await;
         let page_id = g.page_id();
         let page = g.page_mut();
-        page.header.height = 0;
-        page.header.count = 0;
-        page.header.start_row_id = 0;
-        page.header.end_row_id = INVALID_ROW_ID;
+        page.init_empty();
         BlockIndex {
             table_id,
             root: page_id,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
-            page_committer: RedoLogCommitter::new(trx_sys, table_id),
+            page_committer: Mutex::new(Some(RedoLogCommitter::new(trx_sys, table_id))),
             _marker: PhantomData,
         }
+    }
+
+    /// Create a new block index by given page id.
+    /// This is used for specific table that require pre-defined
+    /// root page id such as catalog tables.
+    #[inline]
+    pub async fn new_with_page(mut g: PageExclusiveGuard<BlockNode>, table_id: TableID) -> Self {
+        let page_id = g.page_id();
+        let page = g.page_mut();
+        page.init_empty();
+        BlockIndex {
+            table_id,
+            root: page_id,
+            insert_free_list: Mutex::new(Vec::with_capacity(64)),
+            page_committer: Mutex::new(None),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Enable page committer by injecting transaction system for redo logging
+    #[inline]
+    pub fn enable_page_committer(&self, trx_sys: &'static TransactionSystem<P>) {
+        let mut g = self.page_committer.lock();
+        *g = Some(RedoLogCommitter::new(trx_sys, self.table_id))
+    }
+
+    /// Returns true if page committer is enabled.
+    #[inline]
+    pub fn is_page_committer_enabled(&self) -> bool {
+        self.page_committer.lock().is_some()
     }
 
     /// Get row page for insertion.
@@ -448,10 +483,14 @@ impl<P: BufferPool> BlockIndex<P> {
                     new_page.bf_mut().ctx = Some(Box::new(FrameContext::UndoMap(undo_map)));
 
                     // persist log to commit this page.
-                    self.page_committer
-                        .commit_new_page(new_page_id, start_row_id, end_row_id)
-                        .await;
-
+                    if let Some(page_committer) = {
+                        let page_committer_guard = self.page_committer.lock();
+                        page_committer_guard.as_ref().cloned()
+                    } {
+                        page_committer
+                            .commit_new_page(new_page_id, start_row_id, end_row_id)
+                            .await;
+                    }
                     // finally, we downgrade the page lock for shared mode.
                     return new_page.downgrade_shared();
                 }
@@ -946,6 +985,16 @@ struct RedoLogCommitter<P: BufferPool> {
     table_id: TableID,
 }
 
+impl<P: BufferPool> Clone for RedoLogCommitter<P> {
+    #[inline]
+    fn clone(&self) -> Self {
+        RedoLogCommitter {
+            trx_sys: self.trx_sys,
+            table_id: self.table_id,
+        }
+    }
+}
+
 impl<P: BufferPool> RedoLogCommitter<P> {
     #[inline]
     pub fn new(trx_sys: &'static TransactionSystem<P>, table_id: TableID) -> Self {
@@ -967,8 +1016,7 @@ impl<P: BufferPool> RedoLogCommitter<P> {
 mod tests {
     use super::*;
     use crate::engine::Engine;
-    use crate::lifetime::StaticLifetime;
-    use crate::trx::sys::TrxSysConfig;
+    use crate::trx::sys_conf::TrxSysConfig;
     use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use doradb_datatype::PreciseType;
     use semistr::SemiStr;
@@ -976,9 +1024,14 @@ mod tests {
     #[test]
     fn test_block_index_free_list() {
         smol::block_on(async {
-            let engine = Engine::new_fixed(64 * 1024 * 1024, TrxSysConfig::default())
-                .await
-                .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                64 * 1024 * 1024,
+                TrxSysConfig::default().skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -988,7 +1041,7 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
                 let p1 = blk_idx
                     .get_insert_page(&engine.buf_pool, 100, &metadata)
                     .await;
@@ -1002,18 +1055,21 @@ mod tests {
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
         })
     }
 
     #[test]
     fn test_block_index_insert_row_page() {
         smol::block_on(async {
-            let engine = Engine::new_fixed(64 * 1024 * 1024, TrxSysConfig::default())
-                .await
-                .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                64 * 1024 * 1024,
+                TrxSysConfig::default().skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1023,23 +1079,21 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
                 let p1 = blk_idx
-                    .get_insert_page(&engine.buf_pool, 100, &metadata)
+                    .get_insert_page(engine.buf_pool, 100, &metadata)
                     .await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.free_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
                 let p2 = blk_idx
-                    .get_insert_page(&engine.buf_pool, 100, &metadata)
+                    .get_insert_page(engine.buf_pool, 100, &metadata)
                     .await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
         })
     }
 
@@ -1048,9 +1102,14 @@ mod tests {
         smol::block_on(async {
             let row_pages = 10240usize;
             // allocate 1GB buffer pool is enough: 10240 pages ~= 640MB
-            let engine = Engine::new_fixed(1024 * 1024 * 1024, TrxSysConfig::default())
-                .await
-                .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                1024 * 1024 * 1024,
+                TrxSysConfig::default().skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1060,14 +1119,14 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(&engine.buf_pool, 100, &metadata)
+                        .get_insert_page(engine.buf_pool, 100, &metadata)
                         .await;
                 }
                 let mut count = 0usize;
-                let mut cursor = blk_idx.cursor(&engine.buf_pool).seek(0).await;
+                let mut cursor = blk_idx.cursor(engine.buf_pool).seek(0).await;
                 while let Some(res) = cursor.next().await {
                     count += 1;
                     if count == 10000 {
@@ -1098,9 +1157,7 @@ mod tests {
                 let row_pages_per_leaf = NBR_BLOCKS_IN_LEAF * NBR_PAGES_IN_ROW_BLOCK;
                 assert!(count == (row_pages + row_pages_per_leaf - 1) / row_pages_per_leaf);
             }
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
         })
     }
 
@@ -1113,9 +1170,14 @@ mod tests {
         smol::block_on(async {
             let row_pages = 10240usize;
             let rows_per_page = 100usize;
-            let engine = Engine::new_fixed(1024 * 1024 * 1024, TrxSysConfig::default())
-                .await
-                .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                1024 * 1024 * 1024,
+                TrxSysConfig::default().skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1125,10 +1187,10 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(&engine.buf_pool, rows_per_page, &metadata)
+                        .get_insert_page(engine.buf_pool, rows_per_page, &metadata)
                         .await;
                 }
                 {
@@ -1149,7 +1211,7 @@ mod tests {
                 }
                 for i in 0..row_pages {
                     let row_id = (i * rows_per_page + rows_per_page / 2) as u64;
-                    let res = blk_idx.find_row_id(&engine.buf_pool, row_id).await;
+                    let res = blk_idx.find_row_id(engine.buf_pool, row_id).await;
                     match res {
                         RowLocation::RowPage(page_id) => {
                             let g: PageGuard<RowPage> = engine
@@ -1164,9 +1226,7 @@ mod tests {
                     }
                 }
             }
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
         })
     }
 
@@ -1174,9 +1234,14 @@ mod tests {
     fn test_block_index_log() {
         smol::block_on(async {
             let rows_per_page = 100;
-            let engine = Engine::new_fixed(64 * 1024 * 1024, TrxSysConfig::default())
-                .await
-                .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                64 * 1024 * 1024,
+                TrxSysConfig::default().skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1186,16 +1251,14 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
                 // create a new page for rowid=0..100
                 let _ = blk_idx
-                    .get_insert_page(&engine.buf_pool, rows_per_page, &metadata)
+                    .get_insert_page(engine.buf_pool, rows_per_page, &metadata)
                     .await;
                 // todo: analyze log to see the log is persisted.
             }
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
         })
     }
 }

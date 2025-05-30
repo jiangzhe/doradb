@@ -2,76 +2,107 @@
 //!
 //! This module provides the main entry point of the storage engine,
 //! including start, stop, recover, and execute commands.
-
 use crate::buffer::{BufferPool, EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::lifetime::StaticLifetime;
-use crate::session::{Session, SessionWorker};
-use crate::trx::sys::{TransactionSystem, TrxSysConfig};
+use crate::session::Session;
+use crate::trx::sys::TransactionSystem;
+use crate::trx::sys_conf::TrxSysConfig;
 use serde::{Deserialize, Serialize};
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ops::Deref;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
+pub type DefaultEngine = Engine<EvictableBufferPool>;
+
 /// Storage engine of DoraDB.
-pub struct Engine<P: BufferPool> {
-    pub trx_sys: TransactionSystem<P>,
-    pub buf_pool: P,
+pub struct Engine<P: BufferPool>(EngineInner<P>);
+
+impl<P: BufferPool> Deref for Engine<P> {
+    type Target = EngineInner<P>;
+    #[inline]
+    fn deref(&self) -> &EngineInner<P> {
+        &self.0
+    }
 }
 
 impl<P: BufferPool> Engine<P> {
     #[inline]
-    pub fn new_session(&'static self) -> Session<P> {
-        Session::new(self)
-    }
-
-    #[inline]
-    pub fn new_session_worker(&'static self) -> SessionWorker<P> {
-        SessionWorker::new(self)
+    pub fn new_session(&self) -> Session<P> {
+        Session::new(self.weak())
     }
 
     #[inline]
     pub fn catalog(&self) -> &Catalog<P> {
         &self.trx_sys.catalog
     }
-}
 
-unsafe impl<P: BufferPool> StaticLifetime for Engine<P> {
     #[inline]
-    unsafe fn drop_static(this: &'static Self) {
-        let mut engine = Box::from_raw(this as *const _ as *mut ManuallyDrop<Engine<P>>);
-        // control the drop order manually.
-        std::ptr::drop_in_place(&mut engine.trx_sys);
-        std::ptr::drop_in_place(&mut engine.buf_pool);
+    pub fn weak(&self) -> Self {
+        Engine(EngineInner {
+            trx_sys: self.0.trx_sys,
+            buf_pool: self.0.buf_pool,
+            stop_all: false,
+        })
     }
 }
+
+pub struct EngineInner<P: BufferPool> {
+    pub trx_sys: &'static TransactionSystem<P>,
+    pub buf_pool: &'static P,
+    // only one instance should have this flag to be true to
+    // stop the engine.
+    stop_all: bool,
+}
+
+impl<P: BufferPool> Drop for EngineInner<P> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.stop_all {
+            unsafe {
+                StaticLifetime::drop_static(self.trx_sys);
+                StaticLifetime::drop_static(self.buf_pool);
+            }
+        }
+    }
+}
+
 unsafe impl<P: BufferPool> Send for Engine<P> {}
 unsafe impl<P: BufferPool> Sync for Engine<P> {}
 impl<P: BufferPool> UnwindSafe for Engine<P> {}
 impl<P: BufferPool> RefUnwindSafe for Engine<P> {}
 
 impl Engine<FixedBufferPool> {
-    /// Create a new engine with fixed buffer pool.
+    /// Create a new engine initializer with fixed buffer pool.
     #[inline]
-    pub async fn new_fixed(
+    pub fn new_fixed_initializer(
         mem_size: usize,
         trx_sys_config: TrxSysConfig,
-    ) -> Result<&'static Engine<FixedBufferPool>> {
+    ) -> Result<EngineInitializer<FixedBufferPool>> {
         let buf_pool = FixedBufferPool::with_capacity(mem_size)?;
-        let (trx_sys, trx_sys_start_ctx) = trx_sys_config.build();
-        unsafe {
-            let engine = Box::new(MaybeUninit::<Engine<FixedBufferPool>>::uninit());
-            let engine = Box::leak(engine).assume_init_mut();
+        let buf_pool = StaticLifetime::new_static(buf_pool);
+        Ok(EngineInitializer {
+            buf_pool,
+            trx_sys_config,
+        })
+    }
+}
 
-            std::ptr::write(&mut engine.buf_pool, buf_pool);
-            std::ptr::write(&mut engine.trx_sys, trx_sys);
-            engine
-                .trx_sys
-                .start(&engine.buf_pool, trx_sys_start_ctx)
-                .await;
+pub struct EngineInitializer<P: BufferPool> {
+    buf_pool: &'static P,
+    trx_sys_config: TrxSysConfig,
+}
 
-            Ok(engine)
-        }
+impl<P: BufferPool> EngineInitializer<P> {
+    #[inline]
+    pub async fn init(self) -> Result<Engine<P>> {
+        let trx_sys = self.trx_sys_config.build().init(self.buf_pool).await?;
+        let engine = Engine(EngineInner {
+            buf_pool: self.buf_pool,
+            trx_sys,
+            stop_all: true,
+        });
+        Ok(engine)
     }
 }
 
@@ -95,23 +126,14 @@ impl EngineConfig {
     }
 
     #[inline]
-    pub async fn build_static(self) -> Result<&'static Engine<EvictableBufferPool>> {
+    pub fn build(self) -> Result<EngineInitializer<EvictableBufferPool>> {
         let (buf_pool, pool_start_ctx) = self.buffer.build()?;
-        let (trx_sys, trx_sys_start_ctx) = self.trx.build();
-        unsafe {
-            let engine = Box::new(MaybeUninit::<Engine<EvictableBufferPool>>::uninit());
-            let engine = Box::leak(engine).assume_init_mut();
-
-            std::ptr::write(&mut engine.buf_pool, buf_pool);
-            engine.buf_pool.start(pool_start_ctx);
-            std::ptr::write(&mut engine.trx_sys, trx_sys);
-            engine
-                .trx_sys
-                .start(&engine.buf_pool, trx_sys_start_ctx)
-                .await;
-
-            Ok(engine)
-        }
+        let buf_pool = StaticLifetime::new_static(buf_pool);
+        buf_pool.start(pool_start_ctx);
+        Ok(EngineInitializer {
+            buf_pool,
+            trx_sys_config: self.trx,
+        })
     }
 }
 

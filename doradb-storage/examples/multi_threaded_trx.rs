@@ -6,9 +6,8 @@ use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
 use doradb_storage::buffer::BufferPool;
 use doradb_storage::engine::Engine;
-use doradb_storage::lifetime::StaticLifetime;
 use doradb_storage::trx::log::LogSync;
-use doradb_storage::trx::sys::TrxSysConfig;
+use doradb_storage::trx::sys_conf::TrxSysConfig;
 use easy_parallel::Parallel;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +19,7 @@ fn main() {
     smol::block_on(async {
         let args = Args::parse();
 
-        let engine = Engine::new_fixed(
+        let engine = Engine::new_fixed_initializer(
             128 * 1024 * 1024,
             TrxSysConfig::default()
                 .log_file_prefix(args.log_file_prefix.to_string())
@@ -28,8 +27,11 @@ fn main() {
                 .io_depth_per_log(args.io_depth_per_log)
                 .log_file_max_size(args.log_file_max_size)
                 .log_sync(args.log_sync)
-                .max_io_size(args.max_io_size),
+                .max_io_size(args.max_io_size)
+                .skip_recovery(true),
         )
+        .unwrap()
+        .init()
         .await
         .unwrap();
         {
@@ -42,6 +44,7 @@ fn main() {
             for _ in 0..args.sessions {
                 let wg = wg.clone();
                 let stop = Arc::clone(&stop);
+                let engine = engine.weak();
                 ex.spawn(worker(engine, stop, wg)).detach();
             }
             // start system threads.
@@ -86,14 +89,12 @@ fn main() {
             log_bytes as f64 / dur.as_micros() as f64,
         );
         }
-        unsafe {
-            StaticLifetime::drop_static(engine);
-        }
+        drop(engine);
     })
 }
 
 #[inline]
-async fn worker<P: BufferPool>(engine: &'static Engine<P>, stop: Arc<AtomicBool>, wg: WaitGroup) {
+async fn worker<P: BufferPool>(engine: Engine<P>, stop: Arc<AtomicBool>, wg: WaitGroup) {
     let mut session = engine.new_session();
     let stop = &*stop;
     while !stop.load(Ordering::Relaxed) {
