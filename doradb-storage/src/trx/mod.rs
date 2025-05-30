@@ -18,9 +18,11 @@
 pub mod group;
 pub mod log;
 pub mod purge;
+pub mod recover;
 pub mod redo;
 pub mod row;
 pub mod sys;
+pub mod sys_conf;
 pub mod sys_trx;
 pub mod undo;
 
@@ -170,9 +172,16 @@ impl<P: BufferPool> ActiveTrx<P> {
         }
     }
 
+    /// Returns reference of the storage engine.
     #[inline]
-    pub fn engine(&self) -> Option<&'static Engine<P>> {
-        self.session.as_ref().map(|s| s.engine)
+    pub fn engine_ref(&self) -> Option<&Engine<P>> {
+        self.session.as_ref().map(|s| &s.engine)
+    }
+
+    /// Returns a weak clone of the storage engine.
+    #[inline]
+    pub fn engine_weak(&self) -> Option<Engine<P>> {
+        self.session.as_ref().map(|s| s.engine.weak())
     }
 
     #[inline]
@@ -265,14 +274,14 @@ impl<P: BufferPool> ActiveTrx<P> {
     /// Commit the transaction.
     #[inline]
     pub async fn commit(self) -> Result<Session<P>> {
-        let engine = self.engine().unwrap();
-        engine.trx_sys.commit(self, &engine.buf_pool).await
+        let engine = self.engine_weak().unwrap();
+        engine.trx_sys.commit(self, engine.buf_pool).await
     }
 
     /// Rollback the transaction.
     #[inline]
     pub async fn rollback(self) -> Session<P> {
-        let engine = self.engine().unwrap();
+        let engine = self.engine_weak().unwrap();
         engine.trx_sys.rollback(self, &engine.buf_pool).await
     }
 
@@ -343,8 +352,8 @@ pub struct PreparedTrx<P: BufferPool> {
 
 impl<P: BufferPool> PreparedTrx<P> {
     #[inline]
-    pub fn engine(&self) -> Option<&'static Engine<P>> {
-        self.session.as_ref().map(|s| s.engine)
+    pub fn engine(&self) -> Option<&Engine<P>> {
+        self.session.as_ref().map(|s| &s.engine)
     }
 
     #[inline]

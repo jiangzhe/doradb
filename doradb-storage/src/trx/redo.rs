@@ -296,7 +296,8 @@ impl Deser for DDLRedo {
 /// Represents the redo logs of a transaction.
 #[derive(Default, Debug)]
 pub struct RedoLogs {
-    pub ddl: Vec<DDLRedo>,
+    // Currently only one DDL per transaction is supported.
+    pub ddl: Option<Box<DDLRedo>>,
     pub dml: BTreeMap<TableID, TableDML>,
 }
 
@@ -304,13 +305,13 @@ impl RedoLogs {
     /// Returns true if the redo logs are empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.ddl.is_empty() && self.dml.is_empty()
+        self.ddl.is_none() && self.dml.is_empty()
     }
 
     /// Clear all redo logs.
     #[inline]
     pub fn clear(&mut self) {
-        self.ddl.clear();
+        self.ddl.take();
         self.dml.clear();
     }
 
@@ -328,7 +329,19 @@ impl RedoLogs {
             *self = other;
             return;
         }
-        self.ddl.extend(other.ddl);
+        // Merge DDL.
+        // There should be only one DDL in either statement.
+        // So merging is just replace with existing one.
+        match (self.ddl.as_mut(), other.ddl) {
+            (Some(_), Some(_)) => {
+                panic!("multiple DDLs are not supported in single transaction");
+            }
+            (None, Some(other)) => {
+                self.ddl.replace(other);
+            }
+            (Some(_), None) | (None, None) => (),
+        }
+        // Merge DML.
         for (table_id, table) in other.dml {
             match self.dml.entry(table_id) {
                 Entry::Vacant(vac) => {
@@ -360,7 +373,7 @@ impl Ser<'_> for RedoLogs {
 impl Deser for RedoLogs {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, ddl) = Vec::<DDLRedo>::deser(ctx, data, start_idx)?;
+        let (idx, ddl) = Option::<Box<DDLRedo>>::deser(ctx, data, start_idx)?;
         let (idx, dml) = BTreeMap::<TableID, TableDML>::deser(ctx, data, idx)?;
         Ok((idx, RedoLogs { ddl, dml }))
     }

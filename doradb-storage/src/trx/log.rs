@@ -10,18 +10,21 @@ use crate::session::{IntoSession, Session};
 use crate::trx::group::{Commit, CommitGroup, GroupCommit};
 use crate::trx::purge::{GCBucket, GC};
 use crate::trx::redo::{RedoHeader, RedoLogs};
-use crate::trx::sys::TrxSysConfig;
+use crate::trx::sys::GC_BUCKETS;
+use crate::trx::sys_conf::TrxSysConfig;
+use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::{CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
-use flume::Sender;
+use flume::{Receiver, Sender};
 // use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::latch::{Mutex, MutexGuard};
 use glob::glob;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::fs::File;
 use std::mem;
+use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::path::{Path, PathBuf};
@@ -31,6 +34,105 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const LOG_HEADER_PAGES: usize = 2;
+
+pub struct LogPartitionInitializer {
+    pub(super) aio_mgr: AIOManager,
+    pub(super) mode: LogPartitionMode,
+    pub(super) file_prefix: String,
+    pub(super) file_max_size: usize,
+    pub(super) file_header_size: usize,
+    pub(super) page_size: usize,
+    pub(super) io_depth_per_log: usize,
+    pub(super) log_no: usize,
+    // sequence of last log file.
+    pub(crate) file_seq: Option<u32>,
+}
+
+impl LogPartitionInitializer {
+    #[inline]
+    pub fn stream(self) -> LogPartitionStream {
+        LogPartitionStream {
+            initializer: self,
+            reader: None,
+            buffer: VecDeque::new(),
+        }
+    }
+
+    #[inline]
+    pub fn next_reader(&mut self) -> Result<Option<MmapLogReader>> {
+        match &mut self.mode {
+            LogPartitionMode::Done => Ok(None),
+            LogPartitionMode::Recovery(logs) => {
+                let log = logs.pop_front().unwrap();
+                self.file_seq.replace(parse_file_seq(log.as_path())?);
+                let reader = MmapLogReader::new(
+                    &log,
+                    self.page_size,
+                    self.file_max_size,
+                    self.file_header_size,
+                )?;
+                if logs.is_empty() {
+                    // add file seq so we always open a new log file.
+                    *self.file_seq.as_mut().unwrap() += 1;
+                    self.mode = LogPartitionMode::Done;
+                }
+                Ok(Some(reader))
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn finish<P: BufferPool>(self) -> Result<(LogPartition<P>, Receiver<GC<P>>)> {
+        let mut file_seq = self.file_seq.unwrap_or(0);
+        let log_file = create_log_file(
+            &self.aio_mgr,
+            &self.file_prefix,
+            self.log_no,
+            file_seq,
+            self.file_max_size,
+            self.file_header_size,
+        )?;
+        file_seq += 1;
+
+        let group_commit = GroupCommit {
+            queue: VecDeque::new(),
+            log_file: Some(log_file),
+        };
+        let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
+        let (gc_chan, gc_rx) = flume::unbounded();
+        Ok((
+            LogPartition {
+                group_commit: CachePadded::new((Mutex::new(group_commit), Signal::default())),
+                persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+                stats: CachePadded::new(LogPartitionStats::default()),
+                gc_chan,
+                gc_buckets: gc_info.into_boxed_slice(),
+                aio_mgr: self.aio_mgr,
+                log_no: self.log_no,
+                max_io_size: self.page_size,
+                file_prefix: self.file_prefix,
+                file_seq: AtomicU32::new(file_seq),
+                file_max_size: self.file_max_size,
+                buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
+                    let mut buf = DirectBuf::page_zeroed(self.page_size);
+                    buf.set_data_len(0);
+                    buf
+                }),
+                io_thread: Mutex::new(None),
+                gc_thread: Mutex::new(None),
+            },
+            gc_rx,
+        ))
+    }
+}
+
+pub enum LogPartitionMode {
+    /// Previous log should be analyzed and replayed
+    /// for data recovery.
+    Recovery(VecDeque<PathBuf>),
+    /// Recovery is done or there is no existing log files.
+    Done,
+}
 
 pub(super) struct LogPartition<P: BufferPool> {
     /// Group commit of this partition.
@@ -675,7 +777,7 @@ pub(super) fn create_log_file(
 }
 
 #[inline]
-fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<PathBuf>> {
+pub fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<PathBuf>> {
     let pattern = format!("{}.{}.*", file_prefix, log_no);
     let mut res = vec![];
     for entry in glob(&pattern).unwrap() {
@@ -687,6 +789,22 @@ fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<Pa
         res.sort_by(|a, b| a.cmp(b));
     }
     Ok(res)
+}
+
+#[inline]
+pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
+    let file_name = file_path
+        .file_name()
+        .ok_or_else(|| Error::InvalidFormat)?
+        .to_str()
+        .ok_or_else(|| Error::InvalidFormat)?;
+    if file_name.len() < 9 {
+        return Err(Error::InvalidFormat);
+    }
+    // last 8 bytes are hex encoded.
+    let suffix = std::str::from_utf8(&file_name.as_bytes()[file_name.len() - 8..])?;
+    let file_seq = u32::from_str_radix(suffix, 16)?;
+    Ok(file_seq)
 }
 
 pub struct MmapLogReader {
@@ -783,13 +901,163 @@ impl LogGroup<'_> {
     }
 }
 
+pub struct LogPartitionStream {
+    initializer: LogPartitionInitializer,
+    reader: Option<MmapLogReader>,
+    buffer: VecDeque<LenPrefixPod<RedoHeader, RedoLogs>>,
+}
+
+impl Deref for LogPartitionStream {
+    type Target = VecDeque<LenPrefixPod<RedoHeader, RedoLogs>>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl LogPartitionStream {
+    #[inline]
+    pub fn fill_buffer(&mut self) -> Result<()> {
+        loop {
+            // fill buffer by reading current log file.
+            if let Some(reader) = self.reader.as_mut() {
+                match reader.read() {
+                    ReadLog::DataCorrupted => return Err(Error::LogFileCorrupted),
+                    ReadLog::Some(mut log_group) => {
+                        while let Some(res) = log_group.next()? {
+                            self.buffer.push_back(res);
+                        }
+                        return Ok(());
+                    }
+                    ReadLog::DataEnd | ReadLog::SizeLimit => {
+                        // current file exhausted.
+                        self.reader.take();
+                    }
+                }
+            }
+            debug_assert!(self.reader.is_none());
+            let reader = self.initializer.next_reader()?;
+            if reader.is_none() {
+                return Ok(());
+            }
+            self.reader = reader;
+        }
+    }
+
+    #[inline]
+    pub fn fill_if_empty(&mut self) -> Result<bool> {
+        if self.len() > 0 {
+            return Ok(true);
+        }
+        self.fill_buffer()?;
+        Ok(self.len() > 0)
+    }
+
+    #[inline]
+    pub fn pop(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
+        match self.buffer.pop_front() {
+            res @ Some(_) => Ok(res),
+            None => {
+                self.fill_buffer()?;
+                Ok(self.buffer.pop_front())
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn into_initializer(self) -> LogPartitionInitializer {
+        debug_assert!(self.reader.is_none());
+        debug_assert!(self.buffer.is_empty());
+        self.initializer
+    }
+}
+
+impl PartialEq for LogPartitionStream {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        debug_assert!(!self.is_empty());
+        debug_assert!(!other.is_empty());
+        self.buffer[0].header.cts == other.buffer[0].header.cts
+    }
+}
+
+impl Eq for LogPartitionStream {}
+
+impl Ord for LogPartitionStream {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        debug_assert!(!self.is_empty());
+        debug_assert!(!other.is_empty());
+        // ordered by CTS in ascending order.
+        // so we need to reverse the comparison.
+        other.buffer[0].header.cts.cmp(&self.buffer[0].header.cts)
+    }
+}
+
+impl PartialOrd for LogPartitionStream {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub struct LogMerger {
+    heap: BinaryHeap<LogPartitionStream>,
+    finished: Vec<LogPartitionStream>,
+}
+
+impl LogMerger {
+    #[inline]
+    pub fn new() -> Self {
+        LogMerger {
+            heap: BinaryHeap::new(),
+            finished: vec![],
+        }
+    }
+
+    #[inline]
+    pub fn add_stream(&mut self, mut stream: LogPartitionStream) -> Result<()> {
+        // before put the stream into priority queue, make sure there is
+        // at least one log entry.
+        if stream.fill_if_empty()? {
+            self.heap.push(stream);
+        } else {
+            // log stream is empty.
+            self.finished.push(stream);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
+        match self.heap.pop() {
+            Some(mut stream) => {
+                let res = stream.pop()?;
+                if stream.fill_if_empty()? {
+                    // some logs remaining in the buffer, so put into heap again.
+                    self.heap.push(stream);
+                } else {
+                    // all logs are processed, put this stream into finish list.
+                    self.finished.push(stream);
+                }
+                Ok(res)
+            }
+            None => Ok(None),
+        }
+    }
+
+    #[inline]
+    pub fn finished_streams(self) -> Vec<LogPartitionStream> {
+        self.finished
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table2;
     use crate::engine::EngineConfig;
-    use crate::lifetime::StaticLifetime;
     use crate::value::Val;
 
     #[test]
@@ -800,17 +1068,20 @@ mod tests {
             let engine = EngineConfig::default()
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix(String::from("mmap_log_reader_redo.log")),
+                        .log_file_prefix(String::from("mmap_log_reader_redo.log"))
+                        .skip_recovery(true),
                 )
                 .buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(1024u64 * 1024)
                         .max_file_size(1024u64 * 1024 * 32),
                 )
-                .build_static()
+                .build()
+                .unwrap()
+                .init()
                 .await
                 .unwrap();
-            let table_id = table2(engine).await;
+            let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).unwrap();
 
             let mut session = engine.new_session();
@@ -849,11 +1120,94 @@ mod tests {
             }
             println!("total log records {}", log_recs);
 
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
+
             // remove log file
             remove_files("*mmap_log_reader_redo.log.*");
+        });
+    }
+
+    #[test]
+    fn test_log_merger() {
+        smol::block_on(async {
+            const SIZE: i32 = 1000;
+
+            let engine = EngineConfig::default()
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix(String::from("log_merger_redo.log"))
+                        .log_partitions(2)
+                        .skip_recovery(true),
+                )
+                .buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(1024u64 * 1024)
+                        .max_file_size(1024u64 * 1024 * 32),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
+            let table_id = table2(&engine).await;
+            let table = engine.catalog().get_table(table_id).unwrap();
+
+            let mut session = engine.new_session();
+            {
+                for i in 0..SIZE {
+                    let mut trx = session.begin_trx();
+                    let mut stmt = trx.start_stmt();
+                    let s = format!("{}", i);
+                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let res = stmt.insert_row(&table, insert).await;
+                    debug_assert!(res.is_ok());
+                    trx = stmt.succeed();
+                    session = trx.commit().await.unwrap();
+                }
+            }
+            drop(session);
+
+            let mut log_recs = 0usize;
+            let logs = engine.trx_sys.log_partitions[0].logs(false).unwrap();
+            for log in logs {
+                println!("log file {:?}", log.file_name());
+                let mut reader = engine.trx_sys.log_reader(&log).unwrap();
+                loop {
+                    match reader.read() {
+                        ReadLog::SizeLimit => unreachable!(),
+                        ReadLog::DataCorrupted => unreachable!(),
+                        ReadLog::DataEnd => break,
+                        ReadLog::Some(mut group) => {
+                            while let Some(pod) = group.next().unwrap() {
+                                println!("header={:?}, payload={:?}", pod.header, pod.payload);
+                                log_recs += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!("total log records {}", log_recs);
+
+            drop(engine);
+
+            // after the first engine is done, we reopen log files to test log merger.
+            let trx_sys_config = TrxSysConfig::default()
+                .log_file_prefix(String::from("log_merger_redo.log"))
+                .log_partitions(2)
+                .skip_recovery(true);
+
+            let mut log_merger = LogMerger::new();
+            for i in 0..trx_sys_config.log_partitions {
+                let initializer = trx_sys_config.log_partition_initializer(i).unwrap();
+                let stream = initializer.stream();
+                log_merger.add_stream(stream).unwrap();
+            }
+
+            while let Some(log) = log_merger.next().unwrap() {
+                println!("header={:?}, payload={:?}", log.header, log.payload);
+            }
+            // remove log file
+            remove_files("*log_merger_redo.log.*");
         });
     }
 

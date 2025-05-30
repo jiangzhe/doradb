@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use doradb_catalog::{IndexKey, IndexOrder};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -290,9 +291,29 @@ impl Deser for i8 {
     }
 }
 
+impl Ser<'_> for bool {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u8>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        ctx.ser_u8(out, start_idx, if *self { 1u8 } else { 0u8 })
+    }
+}
+
+impl Deser for bool {
+    #[inline]
+    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+        ctx.deser_u8(input, start_idx).map(|(idx, v)| (idx, v != 0))
+    }
+}
+
 impl<'a, T: Ser<'a>> Ser<'a> for [T] {
     #[inline]
     fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+        // 8-byte vector length + data
         mem::size_of::<u64>() + self.iter().map(|v| v.ser_len(ctx)).sum::<usize>()
     }
 
@@ -319,6 +340,64 @@ impl<T: Deser> Deser for Vec<T> {
             vec.push(val);
         }
         Ok((idx, vec))
+    }
+}
+
+impl<'a, T: Ser<'a>> Ser<'a> for Option<T> {
+    #[inline]
+    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+        // 1-byte bool + data
+        match self.as_ref() {
+            Some(v) => mem::size_of::<u8>() + v.ser_len(ctx),
+            None => mem::size_of::<u8>(),
+        }
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let mut idx = start_idx;
+        match self.as_ref() {
+            Some(v) => {
+                idx = true.ser(ctx, out, idx);
+                idx = v.ser(ctx, out, idx);
+            }
+            None => {
+                idx = false.ser(ctx, out, idx);
+            }
+        }
+        idx
+    }
+}
+
+impl<T: Deser> Deser for Option<T> {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, flag) = bool::deser(ctx, input, start_idx)?;
+        if flag {
+            let (idx, v) = T::deser(ctx, input, idx)?;
+            Ok((idx, Some(v)))
+        } else {
+            Ok((idx, None))
+        }
+    }
+}
+
+impl<'a, T: Ser<'a>> Ser<'a> for Box<T> {
+    #[inline]
+    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+        self.as_ref().ser_len(ctx)
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        self.as_ref().ser(ctx, out, start_idx)
+    }
+}
+
+impl<T: Deser> Deser for Box<T> {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        T::deser(ctx, input, start_idx).map(|(idx, v)| (idx, Box::new(v)))
     }
 }
 
@@ -444,6 +523,16 @@ pub struct LenPrefixPod<H, P> {
     pub payload: P,
 }
 
+impl<H: fmt::Debug, P: fmt::Debug> fmt::Debug for LenPrefixPod<H, P> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LenPrefixPod")
+            .field("header", &self.header)
+            .field("payload", &self.payload)
+            .finish()
+    }
+}
+
 impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixPod<H, P> {
     /// Create a new LenPrefixStruct.
     #[inline]
@@ -486,6 +575,7 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixPod<H, P> {
         idx
     }
 }
+
 impl<H: Deser, P: Deser> Deser for LenPrefixPod<H, P> {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {

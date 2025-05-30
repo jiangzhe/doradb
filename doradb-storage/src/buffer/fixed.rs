@@ -1,12 +1,11 @@
 use crate::buffer::frame::BufferFrame;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
-use crate::buffer::page::{BufferPage, Page, PageID, INVALID_PAGE_ID};
-use crate::buffer::util::{init_bf_exclusive_guard, mmap_allocate, mmap_deallocate};
+use crate::buffer::page::{BufferPage, Page, PageID};
+use crate::buffer::util::{init_bf_exclusive_guard, mmap_allocate, mmap_deallocate, AllocMap};
 use crate::buffer::BufferPool;
 use crate::error::Validation::Valid;
-use crate::error::{Result, Validation};
+use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
-use crate::latch::Mutex;
 use crate::lifetime::StaticLifetime;
 use crate::ptr::UnsafePtr;
 use std::mem;
@@ -22,7 +21,8 @@ pub struct FixedBufferPool {
     pages: *mut Page,
     size: usize,
     allocated: AtomicU64,
-    free_list: Mutex<PageID>,
+    // free_list: Mutex<PageID>,
+    alloc_map: AllocMap,
 }
 
 impl FixedBufferPool {
@@ -37,7 +37,6 @@ impl FixedBufferPool {
         let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
         let frame_total_bytes = mem::size_of::<BufferFrame>() * (size + SAFETY_PAGES);
         let page_total_bytes = mem::size_of::<Page>() * (size + SAFETY_PAGES);
-        // let dram_total_size = mem::size_of::<BufferFrame>() * (size + SAFETY_PAGES);
         let frames = unsafe { mmap_allocate(frame_total_bytes)? } as *mut BufferFrame;
         let pages = unsafe {
             match mmap_allocate(page_total_bytes) {
@@ -54,7 +53,8 @@ impl FixedBufferPool {
             pages,
             size,
             allocated: AtomicU64::new(0),
-            free_list: Mutex::new(INVALID_PAGE_ID),
+            // free_list: Mutex::new(INVALID_PAGE_ID),
+            alloc_map: AllocMap::new(size),
         })
     }
 
@@ -70,24 +70,6 @@ impl FixedBufferPool {
     #[inline]
     pub fn size(&self) -> usize {
         self.size
-    }
-
-    #[inline]
-    fn try_get_page_from_free_list<T: BufferPage>(&'static self) -> Option<PageExclusiveGuard<T>> {
-        unsafe {
-            let bf = {
-                let mut page_id = self.free_list.lock();
-                if *page_id == INVALID_PAGE_ID {
-                    return None;
-                }
-                let bf = self.get_frame(*page_id);
-                *page_id = (*bf.0).next_free;
-                bf
-            };
-            (*bf.0).next_free = INVALID_PAGE_ID;
-            let g = init_bf_exclusive_guard(bf);
-            Some(g)
-        }
     }
 
     #[inline]
@@ -117,28 +99,56 @@ impl FixedBufferPool {
         let bf_ptr = self.frames.offset(page_id as isize);
         UnsafePtr(bf_ptr)
     }
+
+    #[inline]
+    unsafe fn allocate_internal<T: BufferPage>(
+        &'static self,
+        page_id: PageID,
+    ) -> PageExclusiveGuard<T> {
+        let bf = self.get_new_frame(page_id as PageID);
+        (*bf.0).page_id = page_id as PageID;
+        let mut g = init_bf_exclusive_guard::<T>(bf);
+        T::init_frame(g.bf_mut());
+        g.page_mut().zero();
+        g
+    }
 }
 
 impl BufferPool for FixedBufferPool {
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.size
+    }
+
+    #[inline]
+    fn allocated(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed) as usize
+    }
+
     // allocate a new page with exclusive lock.
     #[inline]
     async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
-        // try get from free list.
-        if let Some(g) = self.try_get_page_from_free_list() {
-            return g;
+        match self.alloc_map.allocate() {
+            Some(page_id) => {
+                self.allocated.fetch_add(1, Ordering::AcqRel);
+                unsafe { self.allocate_internal(page_id as PageID) }
+            }
+            None => {
+                panic!("buffer pool full");
+            }
         }
-        // try get from page pool.
-        let page_id = self.allocated.fetch_add(1, Ordering::AcqRel);
-        if page_id as usize >= self.size {
-            panic!("buffer pool full");
-        }
-        unsafe {
-            let bf = self.get_new_frame(page_id);
-            (*bf.0).page_id = page_id;
-            (*bf.0).next_free = INVALID_PAGE_ID;
-            let mut g = init_bf_exclusive_guard::<T>(bf);
-            g.page_mut().zero();
-            g
+    }
+
+    #[inline]
+    async fn allocate_page_at<T: BufferPage>(
+        &'static self,
+        page_id: PageID,
+    ) -> Result<PageExclusiveGuard<T>> {
+        if self.alloc_map.allocate_at(page_id as usize) {
+            self.allocated.fetch_add(1, Ordering::AcqRel);
+            Ok(unsafe { self.allocate_internal(page_id as PageID) })
+        } else {
+            Err(Error::BufferPageAlreadyAllocated)
         }
     }
 
@@ -151,8 +161,8 @@ impl BufferPool for FixedBufferPool {
         mode: LatchFallbackMode,
     ) -> PageGuard<T> {
         debug_assert!(
-            page_id < self.allocated.load(Ordering::Relaxed),
-            "page id out of bound"
+            self.alloc_map.is_allocated(page_id as usize),
+            "page not allocated"
         );
         self.get_page_internal(page_id, mode).await
     }
@@ -160,10 +170,16 @@ impl BufferPool for FixedBufferPool {
     /// Deallocate page.
     #[inline]
     fn deallocate_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
+        let page_id = g.page_id();
         g.page_mut().zero();
-        let mut page_id = self.free_list.lock();
-        g.bf_mut().next_free = *page_id;
-        *page_id = g.page_id();
+        T::deinit_frame(g.bf_mut());
+        let res = self.alloc_map.deallocate(page_id as usize);
+        debug_assert!(res);
+    }
+
+    #[inline]
+    fn evict_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>) {
+        panic!("FixedBufferPool does not support page eviction.")
     }
 
     /// Get child page by page id provided by parent page.
@@ -177,9 +193,10 @@ impl BufferPool for FixedBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> Validation<PageGuard<T>> {
-        if page_id >= self.allocated.load(Ordering::Relaxed) {
-            panic!("page id out of bound");
-        }
+        debug_assert!(
+            self.alloc_map.is_allocated(page_id as usize),
+            "page not allocated"
+        );
         let g = self.get_page_internal(page_id, mode).await;
         // apply lock coupling.
         // the validation make sure parent page does not change until child

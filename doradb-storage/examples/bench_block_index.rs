@@ -5,8 +5,7 @@ use doradb_storage::buffer::FixedBufferPool;
 use doradb_storage::catalog::TableMetadata;
 use doradb_storage::engine::Engine;
 use doradb_storage::index::{BlockIndex, RowLocation};
-use doradb_storage::lifetime::StaticLifetime;
-use doradb_storage::trx::sys::TrxSysConfig;
+use doradb_storage::trx::sys_conf::TrxSysConfig;
 use parking_lot::RwLock;
 use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
 use perfcnt::{AbstractPerfCounter, PerfCounter};
@@ -22,9 +21,14 @@ fn main() {
     let args = Args::parse();
     smol::block_on(async {
         let args = args.clone();
-        let engine = Engine::new_fixed(2 * 1024 * 1024 * 1024, TrxSysConfig::default())
-            .await
-            .unwrap();
+        let engine = Engine::new_fixed_initializer(
+            2 * 1024 * 1024 * 1024,
+            TrxSysConfig::default().skip_recovery(true),
+        )
+        .unwrap()
+        .init()
+        .await
+        .unwrap();
         {
             let metadata = TableMetadata::new(
                 vec![ColumnSpec {
@@ -38,11 +42,13 @@ fn main() {
                     IndexAttributes::PK,
                 )],
             );
-            let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, 101).await;
+            let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
             let blk_idx = Box::leak(Box::new(blk_idx));
 
             for _ in 0..args.pages {
-                let _ = blk_idx.get_insert_page(&engine.buf_pool, args.rows_per_page, &metadata);
+                let _ = blk_idx
+                    .get_insert_page(engine.buf_pool, args.rows_per_page, &metadata)
+                    .await;
             }
             let mut perf_monitor = PerfMonitor::new();
             perf_monitor.start();
@@ -52,9 +58,11 @@ fn main() {
             for _ in 0..args.threads {
                 let args = args.clone();
                 let stop = Arc::clone(&stop);
-                let handle = std::thread::spawn(|| {
+                let engine = engine.weak();
+                let blk_idx = &*blk_idx;
+                let handle = std::thread::spawn(move || {
                     let ex = smol::LocalExecutor::new();
-                    smol::block_on(ex.run(worker(args, &engine.buf_pool, blk_idx, stop)))
+                    smol::block_on(ex.run(worker(args, engine.buf_pool, blk_idx, stop)))
                 });
                 handles.push(handle);
             }
@@ -84,9 +92,7 @@ fn main() {
                 ));
             }
         }
-        unsafe {
-            StaticLifetime::drop_static(engine);
-        }
+        drop(engine);
     });
 
     bench_btreemap(args);
@@ -214,11 +220,11 @@ fn worker_btreemap(
 }
 
 struct PerfMonitor {
-    cache_refs: PerfCounter,
-    cache_misses: PerfCounter,
-    cycles: PerfCounter,
-    instructions: PerfCounter,
-    branch_misses: PerfCounter,
+    cache_refs: Option<PerfCounter>,
+    cache_misses: Option<PerfCounter>,
+    cycles: Option<PerfCounter>,
+    instructions: Option<PerfCounter>,
+    branch_misses: Option<PerfCounter>,
     start: Option<Instant>,
 }
 
@@ -229,23 +235,23 @@ impl PerfMonitor {
         let cache_refs = Builder::from_hardware_event(Hardware::CacheReferences)
             .for_pid(pid)
             .finish()
-            .unwrap();
+            .ok();
         let cache_misses = Builder::from_hardware_event(Hardware::CacheMisses)
             .for_pid(pid)
             .finish()
-            .unwrap();
+            .ok();
         let cycles = Builder::from_hardware_event(Hardware::CPUCycles)
             .for_pid(pid)
             .finish()
-            .unwrap();
+            .ok();
         let instructions = Builder::from_hardware_event(Hardware::Instructions)
             .for_pid(pid)
             .finish()
-            .unwrap();
+            .ok();
         let branch_misses = Builder::from_hardware_event(Hardware::BranchMisses)
             .for_pid(pid)
             .finish()
-            .unwrap();
+            .ok();
         PerfMonitor {
             cache_refs,
             cache_misses,
@@ -258,28 +264,68 @@ impl PerfMonitor {
 
     #[inline]
     pub fn start(&mut self) {
-        self.cache_refs.start().unwrap();
-        self.cache_misses.start().unwrap();
-        self.cycles.start().unwrap();
-        self.instructions.start().unwrap();
-        self.branch_misses.start().unwrap();
+        if let Some(cache_refs) = self.cache_refs.as_mut() {
+            cache_refs.start().unwrap();
+        }
+        if let Some(cache_misses) = self.cache_misses.as_mut() {
+            cache_misses.start().unwrap();
+        }
+        if let Some(cycles) = self.cycles.as_mut() {
+            cycles.start().unwrap();
+        }
+        if let Some(instructions) = self.instructions.as_mut() {
+            instructions.start().unwrap();
+        }
+        if let Some(branch_misses) = self.branch_misses.as_mut() {
+            branch_misses.start().unwrap();
+        }
         self.start = Some(Instant::now());
     }
 
     #[inline]
     pub fn stop(&mut self) -> PerfStats {
-        self.cache_refs.stop().unwrap();
-        self.cache_misses.stop().unwrap();
-        self.cycles.stop().unwrap();
-        self.instructions.stop().unwrap();
-        self.branch_misses.stop().unwrap();
+        if let Some(cache_refs) = self.cache_refs.as_mut() {
+            cache_refs.stop().unwrap();
+        }
+        if let Some(cache_misses) = self.cache_misses.as_mut() {
+            cache_misses.stop().unwrap();
+        }
+        if let Some(cycles) = self.cycles.as_mut() {
+            cycles.stop().unwrap();
+        }
+        if let Some(instructions) = self.instructions.as_mut() {
+            instructions.stop().unwrap();
+        }
+        if let Some(branch_misses) = self.branch_misses.as_mut() {
+            branch_misses.stop().unwrap();
+        }
         let dur = self.start.take().unwrap().elapsed();
         PerfStats {
-            cache_refs: self.cache_refs.read().unwrap(),
-            cache_misses: self.cache_misses.read().unwrap(),
-            cycles: self.cycles.read().unwrap(),
-            instructions: self.instructions.read().unwrap(),
-            branch_misses: self.branch_misses.read().unwrap(),
+            cache_refs: self
+                .cache_refs
+                .as_mut()
+                .and_then(|p| p.read().ok())
+                .unwrap_or_default(),
+            cache_misses: self
+                .cache_misses
+                .as_mut()
+                .and_then(|p| p.read().ok())
+                .unwrap_or_default(),
+            cycles: self
+                .cycles
+                .as_mut()
+                .and_then(|p| p.read().ok())
+                .unwrap_or_default(),
+            instructions: self
+                .instructions
+                .as_mut()
+                .and_then(|p| p.read().ok())
+                .unwrap_or_default(),
+            branch_misses: self
+                .branch_misses
+                .as_mut()
+                .and_then(|p| p.read().ok())
+                .unwrap_or_default(),
             dur,
         }
     }
@@ -305,7 +351,7 @@ struct Args {
     #[arg(long, default_value = "400")]
     rows_per_page: usize,
 
-    /// size of log file
+    /// query thread count
     #[arg(long, default_value = "1")]
     threads: usize,
 

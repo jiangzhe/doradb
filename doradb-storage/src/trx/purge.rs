@@ -512,10 +512,9 @@ mod tests {
     use crate::engine::Engine;
     use crate::index::RowLocation;
     use crate::latch::LatchFallbackMode;
-    use crate::lifetime::StaticLifetime;
     use crate::row::ops::SelectKey;
     use crate::row::RowPage;
-    use crate::trx::sys::TrxSysConfig;
+    use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::Val;
     use std::time::{Duration, Instant};
 
@@ -552,12 +551,16 @@ mod tests {
 
         const PURGE_SIZE: usize = 1000;
         smol::block_on(async {
-            let engine =
-                Engine::new_fixed(16 * 1024 * 1024, TrxSysConfig::default().purge_threads(1))
-                    .await
-                    .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                16 * 1024 * 1024,
+                TrxSysConfig::default().purge_threads(1).skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
 
-            let table_id = table1(engine).await;
+            let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
@@ -613,9 +616,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
         });
     }
 
@@ -625,12 +626,16 @@ mod tests {
 
         smol::block_on(async {
             const PURGE_SIZE: usize = 1000;
-            let engine =
-                Engine::new_fixed(16 * 1024 * 1024, TrxSysConfig::default().purge_threads(2))
-                    .await
-                    .unwrap();
+            let engine = Engine::new_fixed_initializer(
+                16 * 1024 * 1024,
+                TrxSysConfig::default().purge_threads(2).skip_recovery(true),
+            )
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
 
-            let table_id = table1(engine).await;
+            let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
@@ -715,9 +720,7 @@ mod tests {
                 "final min_active_sts={}",
                 engine.trx_sys.min_active_sts.load(Ordering::Relaxed)
             );
-            unsafe {
-                StaticLifetime::drop_static(engine);
-            }
+            drop(engine);
         });
     }
 }

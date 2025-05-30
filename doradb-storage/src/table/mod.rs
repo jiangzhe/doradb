@@ -93,8 +93,32 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    pub async fn scan_rows(&self) {
-        todo!()
+    pub async fn scan_rows_uncommitted<F>(&self, buf_pool: &'static P, mut row_action: F)
+    where
+        F: for<'a> FnMut(Row<'a>) -> bool,
+    {
+        // With cursor, we lock two pages in block index and one row page
+        // when scanning rows.
+        let mut cursor = self.blk_idx.cursor(buf_pool).seek(0).await;
+        while let Some(leaf) = cursor.next().await {
+            let g = leaf.shared_async().await;
+            debug_assert!(g.page().is_leaf());
+            let blocks = g.page().leaf_blocks();
+            for block in blocks {
+                for page_entry in block.row_page_entries() {
+                    let row_page: PageSharedGuard<RowPage> = buf_pool
+                        .get_page(page_entry.page_id, LatchFallbackMode::Shared)
+                        .await
+                        .shared_async()
+                        .await;
+                    for row_access in row_page.read_all_rows() {
+                        if !row_action(row_access.row()) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Select row with unique index with MVCC.
@@ -1024,8 +1048,9 @@ impl<P: BufferPool> Table<P> {
                                     return InsertIndex::Ok;
                                 }
                                 IndexCompareExchange::NotExists => {
-                                    // link succeeds, so no one can remove this index entry.
-                                    unreachable!();
+                                    // The purge thread may concurrently delete the index entry.
+                                    // In this case, we need to retry the insertion of index.
+                                    continue;
                                 }
                                 IndexCompareExchange::Failure => {
                                     return InsertIndex::WriteConflict;

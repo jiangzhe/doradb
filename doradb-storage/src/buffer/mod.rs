@@ -11,19 +11,33 @@ pub use fixed::FixedBufferPool;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
+use crate::error::Result;
 use crate::error::Validation;
 use crate::latch::LatchFallbackMode;
+use crate::lifetime::StaticLifetime;
 use std::future::Future;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 /// Abstraction of buffer pool.
 /// The implementation should be a static pointer providing
 /// pooling functionality.
-pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + 'static {
+pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + StaticLifetime + 'static {
+    /// Returns the maximum number of pages that can be allocated.
+    fn capacity(&self) -> usize;
+
+    /// Returns the number of allocated pages.
+    fn allocated(&self) -> usize;
+
     /// Allocate a new page.
     fn allocate_page<T: BufferPage>(
         &'static self,
     ) -> impl Future<Output = PageExclusiveGuard<T>> + Send;
+
+    /// Allocate a new page at given id(offset);
+    fn allocate_page_at<T: BufferPage>(
+        &'static self,
+        page_id: PageID,
+    ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send;
 
     /// Get page.
     fn get_page<T: BufferPage>(
@@ -34,6 +48,11 @@ pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + 'static {
 
     /// Deallocate page.
     fn deallocate_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>);
+
+    /// Evict page.
+    /// Implementor should take care of maintainance of page data.
+    /// For example, persist to disk before evict it.
+    fn evict_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>);
 
     /// Get child page.
     /// This method is used for tree-like data structure with lock coupling support.
