@@ -1,5 +1,6 @@
 pub mod ops;
 
+use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::page::{BufferPage, PAGE_SIZE};
 use crate::catalog::TableMetadata;
 use crate::row::ops::{Delete, InsertRow, Select, SelectKey, Update, UpdateCol};

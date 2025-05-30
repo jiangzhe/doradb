@@ -1,3 +1,4 @@
+use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
@@ -69,15 +70,17 @@ impl<'a> RowReadAccess<'a> {
         &self,
         schema: &TableMetadata,
         user_read_set: &[usize],
-        key: &SelectKey,
+        key: Option<&SelectKey>,
     ) -> ReadRow {
         let row = self.row();
         // latest version in row page.
         if row.is_deleted() {
             return ReadRow::NotFound;
         }
-        if row.is_key_different(schema, key) {
-            return ReadRow::InvalidIndex;
+        if let Some(key) = key {
+            if row.is_key_different(schema, key) {
+                return ReadRow::InvalidIndex;
+            }
         }
         let vals = row.clone_vals_for_read_set(schema, user_read_set);
         ReadRow::Ok(vals)
@@ -92,7 +95,7 @@ impl<'a> RowReadAccess<'a> {
         key: &SelectKey,
     ) -> ReadRow {
         match &*self.undo {
-            None => self.read_row_latest(schema, user_read_set, key),
+            None => self.read_row_latest(schema, user_read_set, Some(key)),
             Some(undo_head) => {
                 // At this point, we already wait for preparation of commit is done.
                 // So we only have two cases: uncommitted, and committed.
@@ -100,13 +103,13 @@ impl<'a> RowReadAccess<'a> {
                 if trx_is_committed(ts) {
                     if trx.sts > ts {
                         // This version is visible
-                        return self.read_row_latest(schema, user_read_set, key);
+                        return self.read_row_latest(schema, user_read_set, Some(key));
                     } // Otherwise, go to next version
                 } else {
                     let trx_id = trx.trx_id();
                     if trx_id == ts {
                         // Self update, see the latest version
-                        return self.read_row_latest(schema, user_read_set, key);
+                        return self.read_row_latest(schema, user_read_set, Some(key));
                     } // Otherwise, go to next version
                 }
                 // Page data is invisible, we have to backtrace version chain
@@ -288,6 +291,27 @@ impl<'a> RowReadAccess<'a> {
                 }
             }
         }
+    }
+}
+
+pub struct ReadAllRows<'a> {
+    ctx: &'a FrameContext,
+    page: &'a RowPage,
+    start_idx: usize,
+    end_idx: usize,
+}
+
+impl<'a> Iterator for ReadAllRows<'a> {
+    type Item = RowReadAccess<'a>;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let row_idx = self.start_idx;
+        if row_idx >= self.end_idx {
+            return None;
+        }
+        self.start_idx += 1;
+        let undo = self.ctx.undo().read(row_idx);
+        Some(RowReadAccess::new(self.page, row_idx, undo))
     }
 }
 
@@ -848,6 +872,18 @@ impl PageSharedGuard<RowPage> {
         let (ctx, page) = self.ctx_and_page();
         let undo = ctx.undo().read(row_idx);
         RowReadAccess::new(page, row_idx, undo)
+    }
+
+    #[inline]
+    pub fn read_all_rows(&self) -> ReadAllRows<'_> {
+        let (ctx, page) = self.ctx_and_page();
+        let end_idx = page.header.row_count();
+        ReadAllRows {
+            ctx,
+            page,
+            start_idx: 0,
+            end_idx,
+        }
     }
 
     /// Acquire read latch for single row with row id.

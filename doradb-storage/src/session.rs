@@ -1,7 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::engine::Engine;
-use crate::error::Result;
 use crate::row::RowID;
 use crate::stmt::Statement;
 use crate::table::TableID;
@@ -9,13 +8,13 @@ use crate::trx::ActiveTrx;
 use std::collections::HashMap;
 
 pub struct Session<P: BufferPool> {
-    pub(crate) engine: &'static Engine<P>,
+    pub(crate) engine: Engine<P>,
     inner: Option<Box<InternalSession>>,
 }
 
 impl<P: BufferPool> Session<P> {
     #[inline]
-    pub(crate) fn new(engine: &'static Engine<P>) -> Self {
+    pub(crate) fn new(engine: Engine<P>) -> Self {
         Session {
             engine,
             inner: Some(Box::new(InternalSession::new())),
@@ -23,7 +22,7 @@ impl<P: BufferPool> Session<P> {
     }
 
     #[inline]
-    pub fn with_internal_session(engine: &'static Engine<P>, inner: Box<InternalSession>) -> Self {
+    pub fn with_internal_session(engine: Engine<P>, inner: Box<InternalSession>) -> Self {
         Session {
             engine,
             inner: Some(inner),
@@ -89,46 +88,4 @@ pub enum SessionState<P: BufferPool> {
     ActiveTrx(ActiveTrx<P>),
     // One statement is in progress.
     Statement(Statement<P>),
-}
-
-pub struct SessionWorker<P: BufferPool> {
-    pub(crate) engine: &'static Engine<P>,
-    state: SessionState<P>,
-}
-
-impl<P: BufferPool> SessionWorker<P> {
-    #[inline]
-    pub fn new(engine: &'static Engine<P>) -> Self {
-        SessionWorker {
-            engine,
-            state: SessionState::Idle(Session::new(engine)),
-        }
-    }
-
-    #[inline]
-    pub async fn step(&mut self) -> Result<()> {
-        match &mut self.state {
-            SessionState::Idle(session) => {
-                todo!("wait for user command")
-            }
-            SessionState::ActiveTrx(trx) => {
-                todo!("wait for trx to finish")
-            }
-            SessionState::Statement(stmt) => {
-                todo!("wait for stmt to finish")
-            }
-        }
-    }
-
-    #[inline]
-    pub async fn run(&mut self) {
-        loop {
-            match self.step().await {
-                Ok(_) => {}
-                Err(e) => {
-                    todo!("handle error: {:?}", e);
-                }
-            }
-        }
-    }
 }

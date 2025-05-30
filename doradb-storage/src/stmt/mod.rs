@@ -71,8 +71,8 @@ impl<P: BufferPool> Statement<P> {
     pub async fn fail(mut self) -> ActiveTrx<P> {
         // rollback row data.
         // todo: group by page level may be better.
-        let engine = self.trx.engine().unwrap();
-        self.row_undo.rollback(&engine.buf_pool).await;
+        let engine = self.trx.engine_weak().unwrap();
+        self.row_undo.rollback(engine.buf_pool).await;
         // rollback index data.
         self.index_undo.rollback(&engine.catalog());
         // clear redo logs.
@@ -98,7 +98,7 @@ impl<P: BufferPool> Statement<P> {
     /// Create a new schema.
     #[inline]
     pub async fn create_schema(&mut self, schema_name: &str) -> Result<SchemaID> {
-        let engine = self.trx.engine().unwrap();
+        let engine = self.trx.engine_weak().unwrap();
         // Check if schema exists
         if engine
             .catalog()
@@ -133,7 +133,11 @@ impl<P: BufferPool> Statement<P> {
         schema_cache_g.insert(schema_id, schema_object);
 
         // Finally add DDL redo log to redo log buffer
-        self.redo.ddl.push(DDLRedo::CreateSchema(schema_id));
+        let res = self
+            .redo
+            .ddl
+            .replace(Box::new(DDLRedo::CreateSchema(schema_id)));
+        debug_assert!(res.is_none());
 
         Ok(schema_id)
     }
@@ -146,7 +150,7 @@ impl<P: BufferPool> Statement<P> {
         table_spec: TableSpec,
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
-        let engine = self.trx.engine().unwrap();
+        let engine = self.trx.engine_weak().unwrap();
         // Check if schema exists
         if engine
             .catalog()
@@ -239,13 +243,17 @@ impl<P: BufferPool> Statement<P> {
 
         // Prepare in-memory representation of new table
         let table_metadata = TableMetadata::new(table_spec.columns, index_specs);
-        let blk_idx = BlockIndex::new(&engine.buf_pool, &engine.trx_sys, table_id).await;
+        let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, table_id).await;
         let table = Table::new(blk_idx, table_metadata);
         let res = table_cache_g.insert(table_id, table);
         debug_assert!(res.is_none());
 
         // Finally add DDL redo log to redo log buffer
-        self.redo.ddl.push(DDLRedo::CreateTable(table_id));
+        let res = self
+            .redo
+            .ddl
+            .replace(Box::new(DDLRedo::CreateTable(table_id)));
+        debug_assert!(res.is_none());
 
         Ok(table_id)
     }
@@ -253,13 +261,13 @@ impl<P: BufferPool> Statement<P> {
     /// Insert a row into a table.
     #[inline]
     pub async fn insert_row(&mut self, table: &Table<P>, cols: Vec<Val>) -> InsertMvcc {
-        let engine = self.trx.engine().unwrap();
+        let engine = self.trx.engine_weak().unwrap();
         table.insert_row(&engine.buf_pool, self, cols).await
     }
 
     #[inline]
     pub async fn delete_row(&mut self, table: &Table<P>, key: &SelectKey) -> DeleteMvcc {
-        let engine = self.trx.engine().unwrap();
+        let engine = self.trx.engine_weak().unwrap();
         table.delete_row(&engine.buf_pool, self, key).await
     }
 
@@ -270,7 +278,7 @@ impl<P: BufferPool> Statement<P> {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> SelectMvcc {
-        let engine = self.trx.engine().unwrap();
+        let engine = self.trx.engine_weak().unwrap();
         table
             .select_row_mvcc(&engine.buf_pool, self, key, user_read_set)
             .await
@@ -283,7 +291,7 @@ impl<P: BufferPool> Statement<P> {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
-        let engine = self.trx.engine().unwrap();
+        let engine = self.trx.engine_weak().unwrap();
         table.update_row(&engine.buf_pool, self, key, update).await
     }
 }

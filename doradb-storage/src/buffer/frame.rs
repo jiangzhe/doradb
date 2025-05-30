@@ -73,7 +73,7 @@ impl Default for BufferFrame {
             latch: HybridLatch::new(),
             page_id: 0,
             next_free: INVALID_PAGE_ID,
-            frame_kind: AtomicU8::new(FrameKind::Hot as u8),
+            frame_kind: AtomicU8::new(FrameKind::Uninitialized as u8),
             // by default the page is dirty because no copy on disk.
             dirty: AtomicBool::new(true),
             ctx: None,
@@ -89,24 +89,30 @@ unsafe impl Sync for BufferFrame {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameKind {
+    /// Uninitialized means this page is only allocated, but not used for any purpose.
+    Uninitialized = 0,
+    /// Fixed means this page must be fixed in memory. Evict thread will ignore such page.
+    Fixed = 1,
     /// HOT means this page is in memory.
-    Hot = 0,
+    Hot = 2,
     /// COOL means this page is selected as candidate to be spilled to disk.
-    Cool = 1,
+    Cool = 3,
     /// EVICTING means this page is being evicted.
-    Evicting = 2,
+    Evicting = 4,
     /// EVICTING means this page is spilled to disk.
-    Evicted = 3,
+    Evicted = 5,
 }
 
 impl From<u8> for FrameKind {
     #[inline]
     fn from(value: u8) -> Self {
         match value {
-            0 => FrameKind::Hot,
-            1 => FrameKind::Cool,
-            2 => FrameKind::Evicting,
-            3 => FrameKind::Evicted,
+            0 => FrameKind::Uninitialized,
+            1 => FrameKind::Fixed,
+            2 => FrameKind::Hot,
+            3 => FrameKind::Cool,
+            4 => FrameKind::Evicting,
+            5 => FrameKind::Evicted,
             _ => unreachable!("invalid frame kind"),
         }
     }
