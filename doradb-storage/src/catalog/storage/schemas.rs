@@ -1,5 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
+use crate::catalog::storage::object::SchemaObject;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::table::TableMetadata;
 use crate::row::ops::SelectKey;
@@ -8,8 +9,7 @@ use crate::stmt::Statement;
 use crate::table::Table;
 use crate::value::Val;
 use doradb_catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, SchemaObject,
-    TableID,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableID,
 };
 use doradb_datatype::{Collation, PreciseType};
 use semistr::SemiStr;

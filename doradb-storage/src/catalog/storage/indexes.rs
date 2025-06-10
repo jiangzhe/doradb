@@ -1,5 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
+use crate::catalog::storage::object::{IndexColumnObject, IndexObject};
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::table::TableMetadata;
 use crate::row::ops::SelectKey;
@@ -8,8 +9,8 @@ use crate::stmt::Statement;
 use crate::table::Table;
 use crate::value::Val;
 use doradb_catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject, IndexID, IndexKey,
-    IndexObject, IndexOrder, IndexSpec, TableID,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKey, IndexOrder, IndexSpec,
+    TableID,
 };
 use doradb_datatype::{Collation, PreciseType};
 use semistr::SemiStr;
@@ -158,7 +159,12 @@ const COL_NO_INDEX_COLUMNS_COLUMN_ID: usize = 0;
 const COL_NAME_INDEX_COLUMNS_COLUMN_ID: &'static str = "column_id";
 const COL_NO_INDEX_COLUMNS_INDEX_ID: usize = 1;
 const COL_NAME_INDEX_COLUMNS_INDEX_ID: &'static str = "index_id";
-const COL_NO_INDEX_COLUMNS_INDEX_ORDER: usize = 2;
+const COL_NO_INDEX_COLUMNS_COLUMN_NO: usize = 2;
+const COL_NAME_INDEX_COLUMNS_COLUMN_NO: &'static str = "column_no";
+const COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO: usize = 3;
+const COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO: &'static str = "index_column_no";
+
+const COL_NO_INDEX_COLUMNS_INDEX_ORDER: usize = 4;
 const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &'static str = "index_order";
 const INDEX_NO_INDEX_COLUMNS_INDEX_ID: usize = 0;
 const INDEX_NAME_INDEX_COLUMNS_INDEX_ID: &'static str = "idx_index_columns_index_id";
@@ -182,6 +188,18 @@ pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_ID),
                         column_type: PreciseType::Int(8, false),
                         column_attributes: ColumnAttributes::INDEX,
+                    },
+                    // column_no smallint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_COLUMN_NO),
+                        column_type: PreciseType::Int(2, false),
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                    // index_column_no smallint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO),
+                        column_type: PreciseType::Int(2, false),
+                        column_attributes: ColumnAttributes::empty(),
                     },
                     // descending boolean not null
                     ColumnSpec {
@@ -207,10 +225,14 @@ pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
 fn row_to_index_column_object(row: Row<'_>) -> IndexColumnObject {
     let column_id = row.user_val::<u64>(COL_NO_INDEX_COLUMNS_COLUMN_ID);
     let index_id = row.user_val::<u64>(COL_NO_INDEX_COLUMNS_INDEX_ID);
+    let column_no = row.user_val::<u16>(COL_NO_INDEX_COLUMNS_COLUMN_NO);
+    let index_column_no = row.user_val::<u16>(COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO);
     let index_order = row.user_val::<u8>(COL_NO_INDEX_COLUMNS_INDEX_ORDER);
     IndexColumnObject {
         column_id: *column_id,
         index_id: *index_id,
+        column_no: *column_no,
+        index_column_no: *index_column_no,
         index_order: IndexOrder::from(*index_order),
     }
 }
@@ -227,6 +249,8 @@ impl<P: BufferPool> IndexColumns<'_, P> {
         let cols = vec![
             Val::from(obj.column_id),
             Val::from(obj.index_id),
+            Val::from(obj.column_no),
+            Val::from(obj.index_column_no),
             Val::from(obj.index_order as u8),
         ];
         self.0.insert_row(buf_pool, stmt, cols).await.is_ok()
@@ -239,5 +263,24 @@ impl<P: BufferPool> IndexColumns<'_, P> {
         _index_id: IndexID,
     ) -> bool {
         todo!()
+    }
+
+    pub async fn list_uncommitted_by_index_id(
+        &self,
+        buf_pool: &'static P,
+        index_id: IndexID,
+    ) -> Vec<IndexColumnObject> {
+        let mut res = vec![];
+        self.0
+            .scan_rows_uncommitted(buf_pool, |row| {
+                let index_id_in_row = *row.user_val::<TableID>(COL_NO_INDEX_COLUMNS_INDEX_ID);
+                if index_id_in_row == index_id {
+                    let obj = row_to_index_column_object(row);
+                    res.push(obj);
+                }
+                true
+            })
+            .await;
+        res
     }
 }

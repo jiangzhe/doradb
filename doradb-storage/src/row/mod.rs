@@ -1,9 +1,8 @@
 pub mod ops;
 
-use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::page::{BufferPage, PAGE_SIZE};
 use crate::catalog::TableMetadata;
-use crate::row::ops::{Delete, InsertRow, Select, SelectKey, Update, UpdateCol};
+use crate::row::ops::{Delete, InsertRow, Recover, Select, SelectKey, Update, UpdateCol};
 use crate::value::*;
 use std::fmt;
 use std::mem;
@@ -145,7 +144,7 @@ impl RowPage {
     #[inline]
     pub fn row_id_in_valid_range(&self, row_id: RowID) -> bool {
         row_id >= self.header.start_row_id
-            && row_id < self.header.start_row_id + self.header.row_count() as u64
+            && row_id < self.header.start_row_id + self.header.max_row_count as u64
     }
 
     /// Returns row id list in this page.
@@ -204,6 +203,17 @@ impl RowPage {
             ) {
                 return Some(var_field_offset - var_len);
             }
+        }
+    }
+
+    #[inline]
+    pub fn update_count_to_include_row_id(&mut self, row_id: RowID) {
+        debug_assert!(row_id >= self.header.start_row_id);
+        debug_assert!(row_id < self.header.start_row_id + self.header.max_row_count as u64);
+        let row_count = self.header.row_count();
+        let new_count = row_id - self.header.start_row_id;
+        if row_count < new_count as usize {
+            self.header.update_row_count(new_count as usize);
         }
     }
 
@@ -339,14 +349,16 @@ impl RowPage {
     /// Creates a new row in page.
     #[inline]
     pub(crate) fn new_row(&self, row_idx: usize, var_offset: usize) -> NewRow {
+        let row_id = self.row_id(row_idx);
         let mut row = NewRow {
             page: self,
             row_idx,
             col_idx: 0,
             var_offset,
+            row_id,
         };
         // always add RowID as first column
-        row.add_val(self.row_id(row_idx));
+        row.add_val(row_id);
         row
     }
 
@@ -365,6 +377,21 @@ impl RowPage {
     pub(crate) fn row_mut(&self, row_idx: usize, var_offset: usize, var_end: usize) -> RowMut {
         debug_assert!(row_idx < self.header.row_count() as usize);
         RowMut {
+            page: self,
+            row_idx,
+            var_offset,
+            var_end,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn row_mut_exclusive(
+        &mut self,
+        row_idx: usize,
+        var_offset: usize,
+        var_end: usize,
+    ) -> RowMutExclusive {
+        RowMutExclusive {
             page: self,
             row_idx,
             var_offset,
@@ -434,7 +461,154 @@ impl RowPage {
             let val = val.to_val();
             let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
             let ptr = self.data_ptr().add(offset);
-            val.atomic_store(ptr as *mut _);
+            val.atomic_store(ptr);
+        }
+    }
+
+    #[inline]
+    pub fn update_col(
+        &self,
+        row_idx: usize,
+        col_idx: usize,
+        value: &Val,
+        mut var_offset: usize,
+        old_exists: bool,
+    ) -> usize {
+        match value {
+            Val::Null => {
+                self.set_null(row_idx, col_idx, true);
+            }
+            Val::Byte1(v1) => {
+                self.update_val(row_idx, col_idx, v1);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::Byte2(v2) => {
+                self.update_val(row_idx, col_idx, v2);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::Byte4(v4) => {
+                self.update_val(row_idx, col_idx, v4);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::Byte8(v8) => {
+                self.update_val(row_idx, col_idx, v8);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::VarByte(var) => {
+                if let Some(new_offset) =
+                    self.modify_var(row_idx, col_idx, var.as_bytes(), var_offset, old_exists)
+                {
+                    var_offset = new_offset;
+                }
+                self.set_null(row_idx, col_idx, false);
+            }
+        }
+        var_offset
+    }
+
+    #[inline]
+    pub fn update_col_exclusive(
+        &mut self,
+        row_idx: usize,
+        col_idx: usize,
+        value: &Val,
+        mut var_offset: usize,
+        old_exists: bool,
+    ) -> usize {
+        match value {
+            Val::Null => {
+                self.set_null_exclusive(row_idx, col_idx, true);
+            }
+            Val::Byte1(v1) => {
+                self.update_val_exclusive(row_idx, col_idx, v1);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::Byte2(v2) => {
+                self.update_val_exclusive(row_idx, col_idx, v2);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::Byte4(v4) => {
+                self.update_val_exclusive(row_idx, col_idx, v4);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::Byte8(v8) => {
+                self.update_val_exclusive(row_idx, col_idx, v8);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::VarByte(var) => {
+                if let Some(new_offset) =
+                    self.modify_var(row_idx, col_idx, var.as_bytes(), var_offset, old_exists)
+                {
+                    var_offset = new_offset;
+                }
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+        }
+        var_offset
+    }
+
+    /// Update variable-length value.
+    /// If old value exists, we will try to reuse space occupied by old value.
+    /// Returns the updated var length offset.
+    #[inline]
+    pub fn modify_var(
+        &self,
+        row_idx: usize,
+        col_idx: usize,
+        input: &[u8],
+        var_offset: usize,
+        old_exists: bool,
+    ) -> Option<usize> {
+        if input.len() <= PAGE_VAR_LEN_INLINE {
+            // inlined var can be directly updated,
+            // without overwriting original var-len data in page.
+            let var = PageVar::inline(input);
+            self.update_var(row_idx, col_idx, var);
+            return None;
+        }
+        // todo: reuse released space by update.
+        // if update value is longer than original value,
+        // the original space is wasted.
+        // there can be optimization that additionally record
+        // the head free offset of released var-len space at the page header.
+        // and any released space is at lest 7 bytes(larger than VAR_LEN_INLINE)
+        // long and is enough to connect the free list.
+        if !old_exists {
+            // use free space.
+            let (var, var_offset) = self.add_var(input, var_offset);
+            self.update_var(row_idx, col_idx, var);
+            return Some(var_offset);
+        }
+
+        unsafe {
+            let old_var = self.var_unchecked(row_idx, col_idx);
+            if input.len() <= old_var.len() {
+                let offset = old_var.offset().unwrap();
+                // overwrite original var data.
+                let (var, _) = self.add_var(input, offset);
+                self.update_var(row_idx, col_idx, var);
+                None
+            } else {
+                // use free space.
+                let (var, var_offset) = self.add_var(input, var_offset);
+                self.update_var(row_idx, col_idx, var);
+                Some(var_offset)
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn update_val_exclusive<V: ToValue>(
+        &mut self,
+        row_idx: usize,
+        col_idx: usize,
+        val: &V,
+    ) {
+        unsafe {
+            let val = val.to_val();
+            let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
+            let ptr = self.data_ptr().add(offset);
+            val.store(ptr as *mut _);
         }
     }
 
@@ -442,6 +616,12 @@ impl RowPage {
     pub(crate) fn update_var(&self, row_idx: usize, col_idx: usize, var: PageVar) {
         debug_assert!(mem::size_of::<PageVar>() == mem::size_of::<u64>());
         self.update_val::<u64>(row_idx, col_idx, unsafe { mem::transmute(&var) });
+    }
+
+    #[inline]
+    pub(crate) fn update_var_exclusive(&mut self, row_idx: usize, col_idx: usize, var: PageVar) {
+        debug_assert!(mem::size_of::<PageVar>() == mem::size_of::<u64>());
+        self.update_val_exclusive::<u64>(row_idx, col_idx, unsafe { mem::transmute(&var) });
     }
 
     #[inline]
@@ -463,6 +643,15 @@ impl RowPage {
             PageVar::outline(len as u16, var_offset as u16, &input[..PAGE_VAR_LEN_PREFIX]),
             var_offset + len,
         )
+    }
+
+    #[inline]
+    pub(crate) fn add_var_exclusive(
+        &mut self,
+        input: &[u8],
+        var_offset: usize,
+    ) -> (PageVar, usize) {
+        self.add_var(input, var_offset)
     }
 
     #[inline]
@@ -540,6 +729,21 @@ impl RowPage {
     }
 
     #[inline]
+    pub(crate) fn set_deleted_exclusive(&mut self, row_idx: usize, deleted: bool) {
+        unsafe {
+            let offset = self.header.del_bit_offset(row_idx);
+            let ptr = self.data_ptr_mut().add(offset);
+            let current = *ptr;
+            let bit_mask = 1 << (row_idx % 8);
+            *ptr = if deleted {
+                current | bit_mask
+            } else {
+                current & !bit_mask
+            };
+        }
+    }
+
+    #[inline]
     fn is_null(&self, row_idx: usize, col_idx: usize) -> bool {
         unsafe {
             let offset = self.header.null_bit_offset(row_idx, col_idx);
@@ -549,6 +753,7 @@ impl RowPage {
         }
     }
 
+    /// Set null bit of given row given column.
     #[inline]
     pub(crate) fn set_null(&self, row_idx: usize, col_idx: usize, null: bool) {
         unsafe {
@@ -569,6 +774,23 @@ impl RowPage {
                 {
                     return;
                 }
+            }
+        }
+    }
+
+    /// Set null bit of given row given column.
+    /// Page is owned exclusively, so no need to perform atomicly.
+    #[inline]
+    pub(crate) fn set_null_exclusive(&mut self, row_idx: usize, col_idx: usize, null: bool) {
+        unsafe {
+            let offset = self.header.null_bit_offset(row_idx, col_idx);
+            let ptr = self.data_ptr_mut().add(offset);
+            let current = *ptr;
+            let bit_mask = 1 << (row_idx % 8);
+            *ptr = if null {
+                current | bit_mask
+            } else {
+                current & !bit_mask
             }
         }
     }
@@ -612,24 +834,39 @@ pub struct RowPageHeader {
 }
 
 impl RowPageHeader {
+    /// Returns row count of this page.
     #[inline]
     pub fn row_count(&self) -> usize {
         let value = self.row_count_and_var_field_offset.load(Ordering::Relaxed);
         ((value >> 16) & 0xffff) as usize
     }
 
+    /// Update row count of this page.
+    #[inline]
+    pub fn update_row_count(&mut self, row_count: usize) {
+        debug_assert!(row_count <= self.max_row_count as usize);
+        let value = self.row_count_and_var_field_offset.load(Ordering::Relaxed);
+        let new_value = ((row_count as u32) << 16) | (value & 0xffff);
+        self.row_count_and_var_field_offset
+            .store(new_value, Ordering::Relaxed);
+    }
+
+    /// Returns var-length field offset of this page.
     #[inline]
     pub fn var_field_offset(&self) -> usize {
         let value = self.row_count_and_var_field_offset.load(Ordering::Relaxed);
         (value & 0xffff) as usize
     }
 
+    /// Returns row count and var-length field offset of this page.
     #[inline]
     pub fn row_count_and_var_field_offset(&self) -> (usize, usize) {
         let value = self.row_count_and_var_field_offset.load(Ordering::Relaxed);
         (((value >> 16) & 0xffff) as usize, (value & 0xffff) as usize)
     }
 
+    /// Atomically update(CAS) row count and var-length field offset.
+    /// This is required when multiple threads are inserting/updating on the same page.
     #[inline]
     pub fn compare_exchange_row_count_and_var_field_offset(
         &self,
@@ -643,6 +880,7 @@ impl RowPageHeader {
             .is_ok()
     }
 
+    /// Store row count and var-length field offset.
     #[inline]
     pub fn store_row_count_and_var_field_offset(&self, row_count: usize, var_field_offset: usize) {
         let new = ((row_count & 0xffff) << 16) as u32 | (var_field_offset & 0xffff) as u32;
@@ -650,6 +888,7 @@ impl RowPageHeader {
             .store(new, Ordering::Relaxed);
     }
 
+    /// Returns offset of null bits.
     #[inline]
     pub fn null_bit_offset(&self, row_idx: usize, col_idx: usize) -> usize {
         let len = align8(self.max_row_count as usize) / 8;
@@ -657,6 +896,7 @@ impl RowPageHeader {
         start + len * col_idx + row_idx / 8
     }
 
+    /// Returns offset of delete bits.
     #[inline]
     pub fn del_bit_offset(&self, row_idx: usize) -> usize {
         self.del_bitset_offset as usize + row_idx / 8
@@ -689,6 +929,7 @@ pub struct NewRow<'a> {
     row_idx: usize,
     col_idx: usize,
     var_offset: usize,
+    row_id: RowID,
 }
 
 impl<'a> NewRow<'a> {
@@ -731,7 +972,7 @@ impl<'a> NewRow<'a> {
     pub fn finish(self) -> RowID {
         debug_assert!(self.col_idx == self.page.header.col_count as usize);
         self.page.set_deleted(self.row_idx, false);
-        self.page.row_id(self.row_idx)
+        self.row_id
     }
 }
 
@@ -902,7 +1143,6 @@ pub trait RowRead {
                 (Val::from(*v), None)
             }
             Layout::VarByte => {
-                // let v = self.var(col_idx);
                 let pv = unsafe { self.page().var_unchecked(self.row_idx(), col_idx) };
                 let v = pv.as_bytes(self.page().data_ptr());
                 let offset = pv.offset().map(|os| os as u16);
@@ -1078,69 +1318,12 @@ impl<'a> RowRead for RowMut<'a> {
 
 impl<'a> RowMut<'a> {
     /// Update column by given index and value.
-    /// the column index is
     #[inline]
     pub fn update_user_col(&mut self, user_col_idx: usize, value: &Val) {
         let col_idx = user_col_idx + 1;
-        match value {
-            Val::Null => {
-                self.page.set_null(self.row_idx, col_idx, true);
-            }
-            Val::Byte1(v1) => {
-                self.page.update_val(self.row_idx, col_idx, v1);
-                self.page.set_null(self.row_idx, col_idx, false);
-            }
-            Val::Byte2(v2) => {
-                self.page.update_val(self.row_idx, col_idx, v2);
-                self.page.set_null(self.row_idx, col_idx, false);
-            }
-            Val::Byte4(v4) => {
-                self.page.update_val(self.row_idx, col_idx, v4);
-                self.page.set_null(self.row_idx, col_idx, false);
-            }
-            Val::Byte8(v8) => {
-                self.page.update_val(self.row_idx, col_idx, v8);
-                self.page.set_null(self.row_idx, col_idx, false);
-            }
-            Val::VarByte(var) => {
-                self.update_user_var(user_col_idx, var.as_bytes());
-                self.page.set_null(self.row_idx, col_idx, false);
-            }
-        }
-    }
-
-    /// Update variable-length value.
-    #[inline]
-    pub fn update_user_var(&mut self, user_col_idx: usize, input: &[u8]) {
-        let col_idx = user_col_idx + 1;
-        if input.len() <= PAGE_VAR_LEN_INLINE {
-            // inlined var can be directly updated,
-            // without overwriting original var-len data in page.
-            let var = PageVar::inline(input);
-            self.page.update_var(self.row_idx, col_idx, var);
-            return;
-        }
-        // todo: reuse released space by update.
-        // if update value is longer than original value,
-        // the original space is wasted.
-        // there can be optimization that additionally record
-        // the head free offset of released var-len space at the page header.
-        // and any released space is at lest 7 bytes(larger than VAR_LEN_INLINE)
-        // long and is enough to connect the free list.
-        unsafe {
-            let old_var = self.page.var_unchecked(self.row_idx, col_idx);
-            if input.len() <= old_var.len() {
-                let offset = old_var.offset().unwrap();
-                // overwrite original var data.
-                let (var, _) = self.page.add_var(input, offset);
-                self.page.update_var(self.row_idx, col_idx, var);
-            } else {
-                // use free space.
-                let (var, var_offset) = self.page.add_var(input, self.var_offset);
-                self.page.update_var(self.row_idx, col_idx, var);
-                self.var_offset = var_offset;
-            }
-        }
+        self.var_offset = self
+            .page
+            .update_col(self.row_idx, col_idx, value, self.var_offset, true);
     }
 
     /// Set null bit by given column index.
@@ -1158,6 +1341,62 @@ impl<'a> RowMut<'a> {
     #[inline]
     pub fn finish(self) {
         debug_assert!(self.var_offset == self.var_end);
+    }
+}
+
+/// RowRecover is the row to recover in this page.
+pub struct RowMutExclusive<'a> {
+    page: &'a mut RowPage,
+    row_idx: usize,
+    var_offset: usize,
+    var_end: usize,
+}
+
+impl<'a> RowRead for RowMutExclusive<'a> {
+    #[inline]
+    fn page(&self) -> &RowPage {
+        self.page
+    }
+
+    #[inline]
+    fn row_idx(&self) -> usize {
+        self.row_idx
+    }
+}
+
+impl<'a> RowMutExclusive<'a> {
+    /// Update column by given index and value.
+    #[inline]
+    pub fn update_user_col(&mut self, user_col_idx: usize, value: &Val, old_exists: bool) {
+        let col_idx = user_col_idx + 1;
+        self.var_offset = self.page.update_col_exclusive(
+            self.row_idx,
+            col_idx,
+            value,
+            self.var_offset,
+            old_exists,
+        );
+    }
+
+    /// Update row id.
+    #[inline]
+    pub fn update_row_id(&mut self, row_id: RowID) {
+        self.page.update_val_exclusive(self.row_idx, 0, &row_id);
+    }
+
+    /// Finish row replace.
+    #[inline]
+    pub fn finish_insert(self) -> Recover {
+        debug_assert!(self.var_offset == self.var_end);
+        self.page.set_deleted(self.row_idx, false);
+        Recover::Ok
+    }
+
+    #[inline]
+    pub fn finish_update(self) -> Recover {
+        debug_assert!(self.var_offset == self.var_end);
+        debug_assert!(!self.page.is_deleted(self.row_idx));
+        Recover::Ok
     }
 }
 

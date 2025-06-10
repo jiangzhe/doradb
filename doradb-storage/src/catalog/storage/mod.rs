@@ -1,9 +1,9 @@
 mod columns;
 mod indexes;
+mod object;
 mod schemas;
 mod tables;
 
-use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::table::TableMetadata;
@@ -13,6 +13,7 @@ use doradb_catalog::TableID;
 
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
+pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::schemas::*;
 use crate::catalog::storage::tables::*;
 
@@ -36,7 +37,7 @@ impl<P: BufferPool> CatalogStorage<P> {
             // make sure table id matches.
             assert_eq!(cat.len(), *table_id as usize);
             // catalog table with manually allocated page id.
-            let g: PageExclusiveGuard<BlockNode> = buf_pool.allocate_page().await;
+            let g = buf_pool.allocate_page::<BlockNode>().await;
             let page_id = g.page_id();
             assert_eq!(*root_page_id, page_id);
             let blk_idx = BlockIndex::new_with_page(g, *table_id).await;
@@ -69,6 +70,20 @@ impl<P: BufferPool> CatalogStorage<P> {
     #[inline]
     pub fn index_columns(&self) -> IndexColumns<P> {
         IndexColumns(&self.0[TABLE_ID_INDEX_COLUMNS as usize])
+    }
+
+    #[inline]
+    pub fn all(&self) -> Vec<(TableID, Table<P>)> {
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(idx, table)| (idx as TableID, table.clone()))
+            .collect()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
 

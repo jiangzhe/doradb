@@ -1,5 +1,8 @@
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
+use crate::catalog::storage::{
+    ColumnObject, IndexColumnObject, IndexObject, SchemaObject, TableObject,
+};
 use crate::catalog::{row_id_spec, TableMetadata};
 use crate::error::{Error, Result};
 use crate::index::BlockIndex;
@@ -12,9 +15,7 @@ use crate::trx::redo::RedoLogs;
 use crate::trx::undo::{IndexUndoLogs, RowUndoKind, RowUndoLogs};
 use crate::trx::ActiveTrx;
 use crate::value::Val;
-use doradb_catalog::{
-    ColumnObject, IndexObject, IndexSpec, SchemaID, SchemaObject, TableObject, TableSpec,
-};
+use doradb_catalog::{IndexSpec, SchemaID, TableSpec};
 use semistr::SemiStr;
 use std::mem;
 
@@ -177,10 +178,11 @@ impl<P: BufferPool> Statement<P> {
 
         // Prepare table object
         let table_id = engine.catalog().next_obj_id();
-        let table_object = TableObject {
+        let mut table_object = TableObject {
             table_id,
             table_name: table_spec.table_name.clone(),
             schema_id,
+            block_index_root_page: u64::MAX,
         };
         let row_id_spec = row_id_spec();
 
@@ -198,29 +200,33 @@ impl<P: BufferPool> Statement<P> {
             })
             .collect();
 
-        // Prepare index objects
-        let index_objects: Vec<_> = index_specs
-            .iter()
-            .map(|index_spec| IndexObject {
-                index_id: engine.catalog().next_obj_id(),
+        // Prepare index objects and index column objects
+        let mut index_objects = vec![];
+        let mut index_column_objects = vec![];
+
+        for index_spec in &index_specs {
+            let index_id = engine.catalog().next_obj_id();
+            index_objects.push(IndexObject {
+                index_id,
                 table_id,
                 index_name: index_spec.index_name.clone(),
                 index_attributes: index_spec.index_attributes,
-            })
-            .collect();
+            });
+            for (index_column_no, ik) in index_spec.index_cols.iter().enumerate() {
+                let column = &column_objects[ik.col_no as usize];
+                index_column_objects.push(IndexColumnObject {
+                    column_id: column.column_id,
+                    index_id,
+                    column_no: column.column_no,
+                    index_column_no: index_column_no as u16,
+                    index_order: ik.order,
+                });
+            }
+        }
 
         let mut table_cache_g = engine.catalog().cache.tables.write();
 
-        // Insert table object, column objects, index objects
-        let inserted = engine
-            .catalog()
-            .storage
-            .tables()
-            .insert(&engine.buf_pool, self, &table_object)
-            .await;
-        if !inserted {
-            return Err(Error::TableAlreadyExists);
-        }
+        // Insert column objects, index objects, index column objects, and finally table object.
 
         for column_object in column_objects {
             let inserted = engine
@@ -240,11 +246,38 @@ impl<P: BufferPool> Statement<P> {
                 .await;
             debug_assert!(inserted);
         }
+        for index_column_object in index_column_objects {
+            let inserted = engine
+                .catalog()
+                .storage
+                .index_columns()
+                .insert(&engine.buf_pool, self, &index_column_object)
+                .await;
+            debug_assert!(inserted);
+        }
 
         // Prepare in-memory representation of new table
         let table_metadata = TableMetadata::new(table_spec.columns, index_specs);
         let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, table_id).await;
+        let block_index_root_page: u64 = blk_idx.root_page();
+        table_object.block_index_root_page = block_index_root_page;
+
+        let inserted = engine
+            .catalog()
+            .storage
+            .tables()
+            .insert(&engine.buf_pool, self, &table_object)
+            .await;
+        if !inserted {
+            return Err(Error::TableAlreadyExists);
+        }
+
         let table = Table::new(blk_idx, table_metadata);
+        // Enable page committer so all row pages can be recovered.
+        table
+            .blk_idx
+            .enable_page_committer(self.trx.engine_weak().unwrap().trx_sys);
+
         let res = table_cache_g.insert(table_id, table);
         debug_assert!(res.is_none());
 

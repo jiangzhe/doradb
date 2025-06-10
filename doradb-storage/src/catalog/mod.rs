@@ -2,19 +2,16 @@
 pub mod storage;
 pub mod table;
 
-// pub use index::*;
 pub use storage::*;
 pub use table::*;
 
 use crate::buffer::BufferPool;
 use crate::error::{Error, Result};
+use crate::index::BlockIndex;
 use crate::lifetime::StaticLifetime;
-use crate::stmt::Statement;
 use crate::table::Table;
-use doradb_catalog::{
-    ColumnAttributes, ColumnID, ColumnObject, ColumnSpec, IndexAttributes, IndexColumnObject,
-    IndexID, IndexObject, IndexOrder, SchemaID, SchemaObject, TableID, TableObject,
-};
+use crate::trx::sys::TransactionSystem;
+use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexKey, IndexSpec, SchemaID, TableID};
 use doradb_datatype::PreciseType;
 use parking_lot::RwLock;
 use semistr::SemiStr;
@@ -42,9 +39,14 @@ pub struct Catalog<P: BufferPool> {
 impl<P: BufferPool> Catalog<P> {
     #[inline]
     pub fn new(storage: CatalogStorage<P>) -> Self {
+        let mut cache = CatalogCache::new();
+        let obj_id = storage.len() as u64;
+        for (table_id, table) in storage.all() {
+            cache.tables.get_mut().insert(table_id, table);
+        }
         Catalog {
-            obj_id: AtomicU64::new(0),
-            cache: CatalogCache::new(),
+            obj_id: AtomicU64::new(obj_id),
+            cache,
             storage,
         }
     }
@@ -55,8 +57,19 @@ impl<P: BufferPool> Catalog<P> {
     }
 
     #[inline]
-    fn update_obj_id(&self, obj_id: u64) {
-        self.obj_id.fetch_max(obj_id, Ordering::SeqCst);
+    fn try_update_obj_id(&self, next_obj_id: u64) {
+        let obj_id = self.obj_id.load(Ordering::Relaxed);
+        if next_obj_id > obj_id {
+            self.obj_id.fetch_max(obj_id, Ordering::SeqCst);
+        }
+    }
+
+    #[inline]
+    pub fn enable_page_committer_for_all_tables(&self, trx_sys: &'static TransactionSystem<P>) {
+        let tables_g = self.cache.tables.read();
+        for table in tables_g.values() {
+            table.blk_idx.enable_page_committer(trx_sys);
+        }
     }
 
     /// Reload schema cache for given schema id.
@@ -75,6 +88,8 @@ impl<P: BufferPool> Catalog<P> {
             .await;
         match (exists, res) {
             (true, Some(schema)) => {
+                let schema_id = schema.schema_id;
+                self.try_update_obj_id(schema_id);
                 let mut g = self.cache.schemas.write();
                 let _ = g.insert(schema_id, schema);
                 Ok(())
@@ -89,142 +104,82 @@ impl<P: BufferPool> Catalog<P> {
         }
     }
 
-    pub async fn reload_table(
-        &self,
-        buf_pool: &'static P,
-        table_id: TableID,
-        exists: bool,
-    ) -> Result<()> {
+    pub async fn reload_create_table(&self, buf_pool: &'static P, table_id: TableID) -> Result<()> {
         // todo
         let res = self
             .storage
             .tables()
             .find_uncommitted_by_id(buf_pool, table_id)
             .await;
-        match (exists, res) {
-            (true, Some(table)) => {
+        match res {
+            Some(table) => {
+                // A table creation involves table, column and index.
+                // Try to find the maximum object id and update the global one.
+                let mut next_obj_id = table.table_id;
+
                 // todo: use secondary index to improve performance
                 let columns = self
                     .storage
                     .columns()
                     .list_uncommitted_by_table_id(buf_pool, table_id)
                     .await;
+                debug_assert!(!columns.is_empty());
+                if let Some(column_id) = columns.iter().map(|c| c.column_id).max() {
+                    next_obj_id = next_obj_id.max(column_id);
+                }
+
+                let column_specs = columns
+                    .into_iter()
+                    .map(|c| ColumnSpec::new(&c.column_name, c.column_type, c.column_attributes))
+                    .collect::<Vec<_>>();
 
                 let indexes = self
                     .storage
                     .indexes()
                     .list_uncommitted_by_table_id(buf_pool, table_id)
                     .await;
-                todo!()
-            }
-            (false, None) => {
-                let mut g = self.cache.tables.write();
-                let _ = g.remove(&table_id);
+                if let Some(index_id) = indexes.iter().map(|i| i.index_id).max() {
+                    next_obj_id = next_obj_id.max(index_id);
+                }
+                self.try_update_obj_id(next_obj_id);
+
+                let mut index_specs = vec![];
+                for index in indexes {
+                    let mut index_columns = self
+                        .storage
+                        .index_columns()
+                        .list_uncommitted_by_index_id(buf_pool, index.index_id)
+                        .await;
+                    index_columns.sort_by_key(|ic| ic.index_column_no);
+                    let mut index_cols = vec![];
+                    for index_column in index_columns {
+                        let ik = IndexKey {
+                            col_no: index_column.column_no,
+                            order: index_column.index_order,
+                        };
+                        index_cols.push(ik);
+                    }
+                    index_specs.push(IndexSpec::new(
+                        &index.index_name,
+                        index_cols,
+                        index.index_attributes,
+                    ));
+                }
+
+                let table_metadata = TableMetadata::new(column_specs, index_specs);
+                let root_page = buf_pool
+                    .allocate_page_at(table.block_index_root_page)
+                    .await?;
+                let blk_idx = BlockIndex::new_with_page(root_page, table.table_id).await;
+                let table = Table::new(blk_idx, table_metadata);
+                // Update table into cache
+                let mut table_cache_g = self.cache.tables.write();
+                let res = table_cache_g.insert(table_id, table);
+                assert!(res.is_none());
                 Ok(())
             }
-            (true, None) => Err(Error::TableNotFound),
-            (false, Some(_)) => Err(Error::TableNotDeleted),
+            None => Err(Error::TableNotFound),
         }
-    }
-
-    pub async fn create_table_object(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        table_name: SemiStr,
-        schema_id: SchemaID,
-    ) -> Option<TableObject> {
-        if self
-            .storage
-            .tables()
-            .find_uncommitted_by_name(buf_pool, schema_id, &table_name)
-            .await
-            .is_some()
-        {
-            return None;
-        }
-
-        let table_id = self.obj_id.fetch_add(1, Ordering::SeqCst);
-        let table_object = TableObject {
-            table_id,
-            table_name,
-            schema_id,
-        };
-        self.storage
-            .tables()
-            .insert(buf_pool, stmt, &table_object)
-            .await;
-        Some(table_object)
-    }
-
-    pub async fn create_column_object(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        column_name: SemiStr,
-        table_id: TableID,
-        column_no: u16,
-        column_type: PreciseType,
-        column_attributes: ColumnAttributes,
-    ) -> Option<ColumnObject> {
-        let column_id = self.obj_id.fetch_add(1, Ordering::SeqCst);
-        let column_object = ColumnObject {
-            column_id,
-            column_name,
-            table_id,
-            column_no,
-            column_type,
-            column_attributes,
-        };
-        self.storage
-            .columns()
-            .insert(buf_pool, stmt, &column_object)
-            .await;
-        Some(column_object)
-    }
-
-    pub async fn create_index_object(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        index_name: SemiStr,
-        table_id: TableID,
-        index_attributes: IndexAttributes,
-    ) -> Option<IndexObject> {
-        // todo: index check
-        let index_id = self.obj_id.fetch_add(1, Ordering::SeqCst);
-        let index_object = IndexObject {
-            index_id,
-            table_id,
-            index_name,
-            index_attributes,
-        };
-        self.storage
-            .indexes()
-            .insert(buf_pool, stmt, &index_object)
-            .await;
-        Some(index_object)
-    }
-
-    pub async fn create_index_column_object(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        column_id: ColumnID,
-        index_id: IndexID,
-        index_order: IndexOrder,
-    ) -> Option<IndexColumnObject> {
-        // todo: index column check
-        let index_column_object = IndexColumnObject {
-            column_id,
-            index_id,
-            index_order,
-        };
-        self.storage
-            .index_columns()
-            .insert(buf_pool, stmt, &index_column_object)
-            .await;
-        Some(index_column_object)
     }
 
     #[inline]
@@ -283,7 +238,7 @@ impl<'a, P: BufferPool> TableCache<'a, P> {
 pub mod tests {
     use super::*;
     use crate::engine::Engine;
-    use doradb_catalog::{IndexKey, IndexSpec, TableSpec};
+    use doradb_catalog::{IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use doradb_datatype::Collation;
 
     #[inline]

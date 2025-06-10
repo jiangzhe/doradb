@@ -1,5 +1,6 @@
 use crate::buffer::page::{Page, PageID, INVALID_PAGE_ID};
 use crate::latch::HybridLatch;
+use crate::trx::recover::RecoverMap;
 use crate::trx::undo::UndoMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -64,6 +65,16 @@ impl BufferFrame {
     pub fn set_dirty(&self, dirty: bool) {
         self.dirty.store(dirty, Ordering::Release);
     }
+
+    #[inline]
+    pub fn init_undo_map(&mut self, max_size: usize) {
+        self.ctx = Some(Box::new(FrameContext::UndoMap(UndoMap::new(max_size))));
+    }
+
+    #[inline]
+    pub fn init_recover_map(&mut self) {
+        self.ctx = Some(Box::new(FrameContext::RecoverMap(RecoverMap::empty())));
+    }
 }
 
 impl Default for BufferFrame {
@@ -120,13 +131,31 @@ impl From<u8> for FrameKind {
 
 pub enum FrameContext {
     UndoMap(UndoMap),
+    RecoverMap(RecoverMap),
 }
 
 impl FrameContext {
     #[inline]
-    pub fn undo(&self) -> &UndoMap {
+    pub fn undo(&self) -> Option<&UndoMap> {
         match self {
-            FrameContext::UndoMap(undo) => undo,
+            FrameContext::UndoMap(undo) => Some(undo),
+            FrameContext::RecoverMap(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn recover(&self) -> Option<&RecoverMap> {
+        match self {
+            FrameContext::RecoverMap(rec) => Some(rec),
+            FrameContext::UndoMap(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn recover_mut(&mut self) -> Option<&mut RecoverMap> {
+        match self {
+            FrameContext::RecoverMap(rec) => Some(rec),
+            FrameContext::UndoMap(_) => None,
         }
     }
 }

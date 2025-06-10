@@ -68,12 +68,11 @@ pub struct TransactionSystem<P: BufferPool> {
     /// sts range: 1 to 1<<63
     /// cts range: 1 to 1<<63
     pub(super) ts: CachePadded<AtomicU64>,
-    /// Minimum active snapshot timestamp.
-    /// It's updated by group committer thread, and is used by query/GC thread to clean
-    /// out-of-date version chains.
+    /// Global visible snapshot timestamp.
+    /// It's updated by query/GC thread after cleaning out-of-date version chains.
     ///
-    /// Note: this field may not reflect the latest value, but is enough for GC purpose.
-    pub(super) min_active_sts: CachePadded<AtomicU64>,
+    /// Data associated with smaller timestamp will be always visible to all transactions.
+    global_visible_sts: CachePadded<AtomicU64>,
     /// Round-robin partition id generator.
     partition_id: CachePadded<AtomicUsize>,
     /// Multiple log partitions.
@@ -98,7 +97,7 @@ impl<P: BufferPool> TransactionSystem<P> {
     ) -> Self {
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            min_active_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+            global_visible_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
             partition_id: CachePadded::new(AtomicUsize::new(0)),
             log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
             config: CachePadded::new(config),
@@ -107,19 +106,6 @@ impl<P: BufferPool> TransactionSystem<P> {
             purge_threads: Mutex::new(vec![]),
         }
     }
-
-    // #[inline]
-    // pub async fn start(&'static self, buf_pool: &'static P, start_ctx: TrxSysStartContext<P>) {
-    //     self.start_io_threads();
-    //     self.start_gc_threads(start_ctx.gc_chans);
-    //     self.start_purge_threads(buf_pool, start_ctx.purge_rx);
-
-    //     // todo: recover catalog.
-    //     unsafe {
-    //         self.catalog.init(buf_pool).await;
-    //     }
-    //     // todo: recover data from log file.
-    // }
 
     /// Create a new transaction.
     #[inline]
@@ -213,8 +199,8 @@ impl<P: BufferPool> TransactionSystem<P> {
     /// Rollback active transaction.
     #[inline]
     pub async fn rollback(&self, mut trx: ActiveTrx<P>, buf_pool: &'static P) -> Session<P> {
-        trx.row_undo.rollback(buf_pool).await;
         trx.index_undo.rollback(&self.catalog);
+        trx.row_undo.rollback(buf_pool).await;
         trx.redo.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         trx.into_session().unwrap()
@@ -256,6 +242,22 @@ impl<P: BufferPool> TransactionSystem<P> {
             stats.purge_index_count += partition.stats.purge_index_count.load(Ordering::Relaxed);
         }
         stats
+    }
+
+    /// Returns global visible snapshot timestamp.
+    #[inline]
+    pub fn global_visible_sts(&self) -> TrxID {
+        self.global_visible_sts.load(Ordering::Relaxed)
+    }
+
+    /// Update global visible snapshot timestamp.
+    #[inline]
+    pub fn update_global_visible_sts(&self, sts: TrxID) {
+        debug_assert!({
+            let curr_sts = self.global_visible_sts.load(Ordering::Relaxed);
+            sts >= curr_sts
+        });
+        self.global_visible_sts.store(sts, Ordering::SeqCst)
     }
 
     /// Start background GC threads.
@@ -375,6 +377,7 @@ pub struct TrxSysStartContext<P: BufferPool> {
 mod tests {
     use super::*;
     use crate::engine::Engine;
+    use crate::trx::tests::remove_files;
     use crate::value::Val;
     use crossbeam_utils::CachePadded;
     use parking_lot::Mutex;
@@ -387,7 +390,9 @@ mod tests {
         smol::block_on(async {
             let engine = Engine::new_fixed_initializer(
                 128 * 1024 * 1024,
-                TrxSysConfig::default().skip_recovery(true),
+                TrxSysConfig::default()
+                    .log_file_prefix("redo_trx")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -405,6 +410,8 @@ mod tests {
             })
             .join()
             .unwrap();
+
+            remove_files("redo_trx*");
         })
     }
 
@@ -542,7 +549,9 @@ mod tests {
         smol::block_on(async {
             let engine = Engine::new_fixed_initializer(
                 128 * 1024 * 1024,
-                TrxSysConfig::default().skip_recovery(true),
+                TrxSysConfig::default()
+                    .log_file_prefix("redo_trx")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -563,6 +572,10 @@ mod tests {
                 dur.as_micros(),
                 COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
             );
+
+            drop(engine);
+
+            remove_files("redo_trx*");
         });
     }
 
@@ -579,7 +592,8 @@ mod tests {
                 128 * 1024 * 1024,
                 TrxSysConfig::default()
                     .log_partitions(1)
-                    .log_file_max_size(1024u64 * 1024 * 5)
+                    .log_file_prefix("log_rotate")
+                    .log_file_max_size(1024u64 * 1024 * 8)
                     .skip_recovery(true),
             )
             .unwrap()
@@ -590,7 +604,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).unwrap();
 
             let mut session = engine.new_session();
-            let s = vec![1u8; 200];
+            let s = vec![1u8; 120];
             for i in 0..COUNT {
                 let trx = session.begin_trx();
                 let mut stmt = trx.start_stmt();
@@ -602,6 +616,8 @@ mod tests {
             }
 
             drop(engine);
+
+            remove_files("log_rotate*");
         });
     }
 }

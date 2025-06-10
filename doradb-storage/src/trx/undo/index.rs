@@ -4,6 +4,7 @@ use crate::index::IndexCompareExchange;
 use crate::row::ops::SelectKey;
 use crate::row::RowID;
 use crate::table::TableID;
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct IndexUndoLogs(Vec<IndexUndo>);
@@ -52,16 +53,11 @@ impl IndexUndoLogs {
                 }
                 IndexUndoKind::UpdateUnique(key, old_row_id) => {
                     let new_row_id = entry.row_id;
-                    match table.sec_idx[key.index_no]
+                    let res = table.sec_idx[key.index_no]
                         .unique()
                         .unwrap()
-                        .compare_exchange(&key.vals, new_row_id, old_row_id)
-                    {
-                        IndexCompareExchange::Ok => (),
-                        IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
-                            unreachable!()
-                        }
-                    }
+                        .compare_exchange(&key.vals, new_row_id, old_row_id);
+                    assert!(res.is_ok());
                 }
                 IndexUndoKind::DeferDelete(_) => (), // do nothing.
             }
@@ -94,6 +90,51 @@ impl IndexUndoLogs {
             })
             .collect()
     }
+
+    // If one transaction update index back and forth, there might be
+    // unneccessary index purge entries.
+    // To avoid incorrect purge of index, here we analyze row undo to
+    // find whether the index purge entry should be removed.
+    // e.g. One transaction update one row(row_id=100) twice:
+    // 1. Begin.
+    // 2. Update k=1 to k=2.
+    // 3. Update k=2 to k=1.
+    // 4. Commit.
+    // We will have two row undo:
+    // update row row_id=100, k=1 => k=2
+    // update row row_id=100, k=2 => k=1
+    // four index undo:
+    // delete index k=1, row_id=100
+    // insert index k=2, row_id=100
+    // delete index k=2, row_id=100
+    // insert index k=1, row_id=100
+    // When transaction commits, the index purge entries will be kept for GC.
+    // So both k=1 and k=2 will be removed by GC thread.
+    // This is wrong. we may either re-check if the row exists or pre-process
+    // index purge entries when committing the transaction.
+    #[inline]
+    pub fn remove_unneccessary_purges(&mut self) {
+        let mut deletes = HashMap::new();
+        let mut to_remove = vec![];
+        for (idx, undo) in self.0.iter().enumerate() {
+            match &undo.kind {
+                IndexUndoKind::DeferDelete(_) => {
+                    let res = deletes.insert((undo.table_id, undo.row_id), idx);
+                    assert!(res.is_none());
+                }
+                IndexUndoKind::InsertUnique(_) => {
+                    // one delete is covered by a later insert, we can safely remove it from undo logs.
+                    if let Some(del_idx) = deletes.remove(&(undo.table_id, undo.row_id)) {
+                        to_remove.push(del_idx);
+                    }
+                }
+                IndexUndoKind::UpdateUnique(..) => (),
+            }
+        }
+        for idx in to_remove.iter().rev() {
+            self.0.remove(*idx);
+        }
+    }
 }
 
 /// IndexUndo represent the undo operation of a index.
@@ -121,4 +162,123 @@ pub struct IndexPurge {
     pub table_id: TableID,
     pub row_id: RowID,
     pub key: SelectKey,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::row::ops::SelectKey;
+
+    fn create_test_key(index_no: usize) -> SelectKey {
+        SelectKey {
+            index_no,
+            vals: vec![],
+        }
+    }
+
+    #[test]
+    fn test_index_undo_logs_merge() {
+        let mut log1 = IndexUndoLogs::empty();
+        let mut log2 = IndexUndoLogs::empty();
+
+        // Test merging empty logs
+        log1.merge(&mut log2);
+        assert!(log1.is_empty());
+        assert!(log2.is_empty());
+
+        // Add entries to log1
+        log1.push(IndexUndo {
+            table_id: 1,
+            row_id: 1,
+            kind: IndexUndoKind::InsertUnique(create_test_key(1)),
+        });
+
+        // Add entries to log2
+        log2.push(IndexUndo {
+            table_id: 2,
+            row_id: 2,
+            kind: IndexUndoKind::DeferDelete(create_test_key(2)),
+        });
+        log2.push(IndexUndo {
+            table_id: 3,
+            row_id: 3,
+            kind: IndexUndoKind::UpdateUnique(create_test_key(3), 4),
+        });
+
+        // Merge and verify
+        let original_len = log1.len() + log2.len();
+        log1.merge(&mut log2);
+        assert_eq!(log1.len(), original_len);
+        assert!(log2.is_empty());
+
+        // Verify order is preserved
+        match &log1.0[0].kind {
+            IndexUndoKind::InsertUnique(_) => (),
+            _ => panic!("First entry should be InsertUnique"),
+        }
+        match &log1.0[1].kind {
+            IndexUndoKind::DeferDelete(_) => (),
+            _ => panic!("Second entry should be DeferDelete"),
+        }
+    }
+
+    #[test]
+    fn test_index_undo_logs_remove_unneccessary_purges() {
+        let mut logs = IndexUndoLogs::empty();
+
+        // Add some purge entries that should remain
+        logs.push(IndexUndo {
+            table_id: 1,
+            row_id: 1,
+            kind: IndexUndoKind::DeferDelete(create_test_key(1)),
+        });
+        logs.push(IndexUndo {
+            table_id: 2,
+            row_id: 2,
+            kind: IndexUndoKind::DeferDelete(create_test_key(2)),
+        });
+
+        // Add purge entries that will be removed
+        logs.push(IndexUndo {
+            table_id: 3,
+            row_id: 3,
+            kind: IndexUndoKind::DeferDelete(create_test_key(3)),
+        });
+        logs.push(IndexUndo {
+            table_id: 3,
+            row_id: 3,
+            kind: IndexUndoKind::InsertUnique(create_test_key(3)),
+        });
+
+        // Add another purge that should remain
+        logs.push(IndexUndo {
+            table_id: 4,
+            row_id: 4,
+            kind: IndexUndoKind::DeferDelete(create_test_key(4)),
+        });
+
+        // Add update which shouldn't affect purge entries
+        logs.push(IndexUndo {
+            table_id: 5,
+            row_id: 5,
+            kind: IndexUndoKind::UpdateUnique(create_test_key(5), 6),
+        });
+
+        let original_len = logs.len();
+        logs.remove_unneccessary_purges();
+
+        // Only one purge entry should be removed (table_id=3, row_id=3)
+        assert_eq!(logs.len(), original_len - 1);
+
+        // Verify remaining entries
+        let mut remaining_purges = 0;
+        for entry in &logs.0 {
+            if let IndexUndoKind::DeferDelete(_) = &entry.kind {
+                remaining_purges += 1;
+                // Verify the purge for table_id=3,row_id=3 was removed
+                assert!(!(entry.table_id == 3 && entry.row_id == 3));
+            }
+        }
+        assert_eq!(remaining_purges, 3); // Original 3 purges minus 1 removed
+    }
 }

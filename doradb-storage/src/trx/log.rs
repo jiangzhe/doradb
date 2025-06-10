@@ -1058,6 +1058,7 @@ mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table2;
     use crate::engine::EngineConfig;
+    use crate::trx::tests::remove_files;
     use crate::value::Val;
 
     #[test]
@@ -1074,7 +1075,8 @@ mod tests {
                 .buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(1024u64 * 1024)
-                        .max_file_size(1024u64 * 1024 * 32),
+                        .max_file_size(1024u64 * 1024 * 32)
+                        .file_path("databuffer_mmap.bin"),
                 )
                 .build()
                 .unwrap()
@@ -1123,6 +1125,7 @@ mod tests {
             drop(engine);
 
             // remove log file
+            let _ = std::fs::remove_file("databuffer_mmap.bin");
             remove_files("*mmap_log_reader_redo.log.*");
         });
     }
@@ -1135,14 +1138,15 @@ mod tests {
             let engine = EngineConfig::default()
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix(String::from("log_merger_redo.log"))
+                        .log_file_prefix("redo_merger")
                         .log_partitions(2)
                         .skip_recovery(true),
                 )
                 .buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(1024u64 * 1024)
-                        .max_file_size(1024u64 * 1024 * 32),
+                        .max_file_size(1024u64 * 1024 * 32)
+                        .file_path("databuffer_mmap.bin"),
                 )
                 .build()
                 .unwrap()
@@ -1192,7 +1196,7 @@ mod tests {
 
             // after the first engine is done, we reopen log files to test log merger.
             let trx_sys_config = TrxSysConfig::default()
-                .log_file_prefix(String::from("log_merger_redo.log"))
+                .log_file_prefix("redo_merger")
                 .log_partitions(2)
                 .skip_recovery(true);
 
@@ -1207,21 +1211,8 @@ mod tests {
                 println!("header={:?}, payload={:?}", log.header, log.payload);
             }
             // remove log file
-            remove_files("*log_merger_redo.log.*");
+            let _ = std::fs::remove_file("databuffer_mmap.bin");
+            remove_files("redo_merger*");
         });
-    }
-
-    fn remove_files(file_pattern: &str) {
-        let files = glob::glob(file_pattern);
-        if files.is_err() {
-            return;
-        }
-        for f in files.unwrap() {
-            if f.is_err() {
-                continue;
-            }
-            let fp = f.unwrap();
-            let _ = std::fs::remove_file(&fp);
-        }
     }
 }

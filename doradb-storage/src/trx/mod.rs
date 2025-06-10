@@ -256,7 +256,9 @@ impl<P: BufferPool> ActiveTrx<P> {
             ))
         };
         let row_undo = mem::take(&mut self.row_undo);
-        let index_undo = mem::take(&mut self.index_undo);
+        let mut index_undo = mem::take(&mut self.index_undo);
+        index_undo.remove_unneccessary_purges();
+
         PreparedTrx {
             redo_bin,
             payload: Some(PreparedTrxPayload {
@@ -569,5 +571,22 @@ impl<P: BufferPool> IntoSession<P> for CommittedTrx<P> {
     #[inline]
     fn split_session(&mut self) -> Option<Session<P>> {
         self.session.take()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    pub(crate) fn remove_files(file_pattern: &str) {
+        let files = glob::glob(file_pattern);
+        if files.is_err() {
+            return;
+        }
+        for f in files.unwrap() {
+            if f.is_err() {
+                continue;
+            }
+            let fp = f.unwrap();
+            let _ = std::fs::remove_file(&fp);
+        }
     }
 }
