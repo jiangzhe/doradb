@@ -2,15 +2,15 @@
 #[cfg(test)]
 mod tests;
 
-use crate::buffer::guard::PageSharedGuard;
+use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::TableMetadata;
 use crate::index::{BlockIndex, IndexCompareExchange, RowLocation, SecondaryIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, SelectKey, SelectMvcc,
-    UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
+    DeleteMvcc, InsertIndex, InsertMvcc, InsertRow, LinkForUniqueIndex, ReadRow, Recover,
+    RecoverIndex, SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
 };
 use crate::row::{estimate_max_row_count, var_len_for_insert, Row, RowID, RowPage, RowRead};
 use crate::stmt::Statement;
@@ -19,9 +19,10 @@ use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, MainBranch, NextRowUndo, RowUndoKind, UndoStatus,
 };
+use crate::trx::TrxID;
 use crate::value::{Val, PAGE_VAR_LEN_INLINE};
 use doradb_catalog::IndexSpec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::Arc;
 
@@ -251,25 +252,365 @@ impl<P: BufferPool> Table<P> {
             .await;
         // insert index
         for key in keys {
-            if self.metadata.index_specs[key.index_no].unique() {
-                let res = self
-                    .insert_unique_index(buf_pool, stmt, key, row_id, &page_guard)
-                    .await;
-                match res {
-                    InsertIndex::Ok => (),
-                    InsertIndex::DuplicateKey => {
-                        return InsertMvcc::DuplicateKey;
-                    }
-                    InsertIndex::WriteConflict => {
-                        return InsertMvcc::WriteConflict;
-                    }
+            match self
+                .insert_index(buf_pool, stmt, key, row_id, &page_guard)
+                .await
+            {
+                InsertIndex::Ok => (),
+                InsertIndex::DuplicateKey => {
+                    return InsertMvcc::DuplicateKey;
                 }
-            } else {
-                todo!()
+                InsertIndex::WriteConflict => {
+                    return InsertMvcc::WriteConflict;
+                }
             }
         }
         page_guard.set_dirty(); // mark as dirty page.
         InsertMvcc::Ok(row_id)
+    }
+
+    #[inline]
+    pub async fn insert_index(
+        &self,
+        buf_pool: &'static P,
+        stmt: &mut Statement<P>,
+        key: SelectKey,
+        row_id: RowID,
+        page_guard: &PageSharedGuard<RowPage>,
+    ) -> InsertIndex {
+        if self.metadata.index_specs[key.index_no].unique() {
+            self.insert_unique_index(buf_pool, stmt, key, row_id, page_guard)
+                .await
+        } else {
+            todo!()
+        }
+    }
+
+    /// Recover row insert from redo log.
+    #[inline]
+    pub async fn recover_row_insert(
+        &self,
+        buf_pool: &'static P,
+        page_id: PageID,
+        row_id: RowID,
+        cols: &[Val],
+        cts: TrxID,
+        disable_index: bool,
+    ) {
+        debug_assert!(cols.len() + 1 == self.metadata.col_count());
+        debug_assert!({
+            cols.iter()
+                .enumerate()
+                .all(|(idx, val)| self.metadata.user_col_type_match(idx, val))
+        });
+        // Since we always dispatch rows of one page to same thread,
+        // we can just hold exclusive lock on this page and process all rows in it.
+        let mut page_guard = buf_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+            .await
+            .exclusive_async()
+            .await;
+
+        let res = self.recover_row_insert_to_page(&mut page_guard, row_id, cols, cts);
+        assert!(res.is_ok());
+        page_guard.set_dirty(); // mark as dirty page.
+
+        if !disable_index {
+            let keys = self.metadata.keys_for_insert(&cols);
+            for key in keys {
+                match self.recover_index_insert(buf_pool, key, row_id, cts).await {
+                    RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
+                    RecoverIndex::DeleteOutdated => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn recover_row_insert_to_page(
+        &self,
+        page_guard: &mut PageExclusiveGuard<RowPage>,
+        row_id: RowID,
+        user_cols: &[Val],
+        cts: TrxID,
+    ) -> Recover {
+        let (ctx, page) = page_guard.ctx_and_page_mut();
+        debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
+        debug_assert!(user_cols.len() + 1 == page.header.col_count as usize);
+        let row_idx = page.row_idx(row_id);
+        // Insert log should always be located to an empty slot.
+        debug_assert!(ctx.recover().unwrap().is_vacant(row_idx));
+        let var_len = var_len_for_insert(&self.metadata, &user_cols);
+        let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
+            (var_offset, var_offset + var_len)
+        } else {
+            return Recover::NoSpace;
+        };
+        // update count field to include current row id.
+        page.update_count_to_include_row_id(row_id);
+        // insert CTS.
+        ctx.recover_mut().unwrap().insert_at(row_idx, cts);
+        let row_idx = page.row_idx(row_id);
+        let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
+        debug_assert!(row.is_deleted()); // before recovery, this row should be initialized as deleted.
+        row.update_row_id(row_id);
+        for (user_col_idx, user_col) in user_cols.iter().enumerate() {
+            row.update_user_col(user_col_idx, user_col, false);
+        }
+        row.finish_insert()
+    }
+
+    #[inline]
+    pub async fn recover_index_insert(
+        &self,
+        buf_pool: &'static P,
+        key: SelectKey,
+        row_id: RowID,
+        cts: TrxID,
+    ) -> RecoverIndex {
+        if self.metadata.index_specs[key.index_no].unique() {
+            self.recover_unique_index_insert(buf_pool, key, row_id, cts)
+                .await
+        } else {
+            todo!()
+        }
+    }
+
+    #[inline]
+    pub async fn recover_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+        if self.metadata.index_specs[key.index_no].unique() {
+            self.recover_unique_index_delete(key, row_id).await
+        } else {
+            todo!()
+        }
+    }
+
+    /// Recover row update.
+    #[inline]
+    pub async fn recover_row_update(
+        &self,
+        buf_pool: &'static P,
+        page_id: PageID,
+        row_id: RowID,
+        update: &[UpdateCol],
+        cts: TrxID,
+        disable_index: bool,
+    ) {
+        let mut page_guard = buf_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+            .await
+            .exclusive_async()
+            .await;
+
+        if disable_index {
+            let res = self.recover_row_update_to_page(&mut page_guard, row_id, update, cts, None);
+            assert!(res.is_ok());
+            page_guard.set_dirty(); // mark as dirty page.
+        } else {
+            let mut index_change_cols = HashMap::new();
+            let res = self.recover_row_update_to_page(
+                &mut page_guard,
+                row_id,
+                update,
+                cts,
+                Some(&mut index_change_cols),
+            );
+            assert!(res.is_ok());
+            page_guard.set_dirty(); // mark as dirty page.
+
+            if !index_change_cols.is_empty() {
+                // There is index change, we need to update index.
+                let page_guard = buf_pool
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+
+                for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+                    debug_assert!(index.is_unique() == index_schema.unique());
+                    if index_schema.unique() {
+                        if index_key_is_changed(index_schema, &index_change_cols) {
+                            let new_key = read_latest_index_key(
+                                &self.metadata,
+                                index.index_no,
+                                &page_guard,
+                                row_id,
+                            );
+                            let old_key =
+                                index_key_replace(index_schema, &new_key, &index_change_cols);
+                            // insert new index entry.
+                            match self
+                                .recover_index_insert(buf_pool, new_key, row_id, cts)
+                                .await
+                            {
+                                RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
+                                RecoverIndex::DeleteOutdated => unreachable!(),
+                            }
+                            // delete old index entry.
+                            match self.recover_index_delete(old_key, row_id).await {
+                                RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
+                                RecoverIndex::InsertOutdated => unreachable!(),
+                            }
+                        }
+                    } else {
+                        todo!();
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn recover_row_update_to_page(
+        &self,
+        page_guard: &mut PageExclusiveGuard<RowPage>,
+        row_id: RowID,
+        user_cols: &[UpdateCol],
+        cts: TrxID,
+        index_change_cols: Option<&mut HashMap<usize, Val>>,
+    ) -> Recover {
+        let (ctx, page) = page_guard.ctx_and_page_mut();
+        // column indexes must be in range
+        debug_assert!(
+            {
+                user_cols
+                    .iter()
+                    .all(|uc| uc.idx < page.header.col_count as usize)
+            },
+            "update column indexes must be in range"
+        );
+        // column indexes should be in order.
+        debug_assert!(
+            {
+                user_cols.is_empty()
+                    || user_cols
+                        .iter()
+                        .zip(user_cols.iter().skip(1))
+                        .all(|(l, r)| l.idx < r.idx)
+            },
+            "update columns should be in order"
+        );
+        if !page.row_id_in_valid_range(row_id) {
+            return Recover::NotFound;
+        }
+        let row_idx = page.row_idx(row_id);
+        if page.row(row_idx).is_deleted() {
+            return Recover::AlreadyDeleted;
+        }
+        let var_len = page.var_len_for_update(row_idx, user_cols);
+        let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
+            (var_offset, var_offset + var_len)
+        } else {
+            return Recover::NoSpace;
+        };
+        // update CTS.
+        ctx.recover_mut().unwrap().update_at(row_idx, cts);
+        let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
+        debug_assert_eq!(row_id, row.row_id());
+
+        let disable_index = index_change_cols.is_none();
+        if disable_index {
+            for uc in user_cols {
+                row.update_user_col(uc.idx, &uc.val, true);
+            }
+            row.finish_update()
+        } else {
+            // collect index change columns.
+            let index_change_cols = index_change_cols.unwrap();
+            for uc in user_cols {
+                if let Some((old_val, _)) = row.user_different(&self.metadata, uc.idx, &uc.val) {
+                    // we also check whether the value change is related to any index,
+                    // so we can update index later.
+                    if self.metadata.user_index_cols.contains(&uc.idx) {
+                        index_change_cols.insert(uc.idx, old_val);
+                    }
+                    // actual update
+                    row.update_user_col(uc.idx, &uc.val, true);
+                }
+            }
+            row.finish_update()
+        }
+    }
+
+    /// Recover row delete.
+    #[inline]
+    pub async fn recover_row_delete(
+        &self,
+        buf_pool: &'static P,
+        page_id: PageID,
+        row_id: RowID,
+        cts: TrxID,
+        disable_index: bool,
+    ) {
+        let mut page_guard = buf_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+            .await
+            .exclusive_async()
+            .await;
+
+        if disable_index {
+            let res = self.recover_row_delete_to_page(&mut page_guard, row_id, cts, None);
+            assert!(res.is_ok());
+            page_guard.set_dirty(); // mark as dirty page.
+        } else {
+            let mut index_cols = HashMap::new();
+            let res = self.recover_row_delete_to_page(
+                &mut page_guard,
+                row_id,
+                cts,
+                Some(&mut index_cols),
+            );
+            assert!(res.is_ok());
+            page_guard.set_dirty(); // mark as dirty page.
+
+            for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+                debug_assert!(index.is_unique() == index_schema.unique());
+                if index_schema.unique() {
+                    let vals: Vec<Val> = index_schema
+                        .index_cols
+                        .iter()
+                        .map(|ik| index_cols[&(ik.col_no as usize)].clone())
+                        .collect();
+                    let key = SelectKey::new(index.index_no, vals);
+                    // delete old index entry.
+                    match self.recover_index_delete(key, row_id).await {
+                        RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
+                        RecoverIndex::InsertOutdated => unreachable!(),
+                    }
+                } else {
+                    todo!();
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn recover_row_delete_to_page(
+        &self,
+        page_guard: &mut PageExclusiveGuard<RowPage>,
+        row_id: RowID,
+        cts: TrxID,
+        index_cols: Option<&mut HashMap<usize, Val>>,
+    ) -> Recover {
+        let (ctx, page) = page_guard.ctx_and_page_mut();
+        if !page.row_id_in_valid_range(row_id) {
+            return Recover::NotFound;
+        }
+        let row_idx = page.row_idx(row_id);
+        if page.row(row_idx).is_deleted() {
+            return Recover::AlreadyDeleted;
+        }
+        ctx.recover_mut().unwrap().update_at(row_idx, cts);
+        page.set_deleted_exclusive(row_idx, true);
+        if let Some(index_cols) = index_cols {
+            // save index columns for index update.
+            let row = page.row(row_idx);
+            for idx_col_no in &self.metadata.user_index_cols {
+                let val = row.clone_user_val(&self.metadata, *idx_col_no);
+                index_cols.insert(*idx_col_no, val);
+            }
+        }
+        Recover::Ok
     }
 
     /// Update row with MVCC.
@@ -500,10 +841,10 @@ impl<P: BufferPool> Table<P> {
         update: Vec<UpdateCol>,
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
-    ) -> (RowID, HashSet<usize>, PageSharedGuard<RowPage>) {
+    ) -> (RowID, HashMap<usize, Val>, PageSharedGuard<RowPage>) {
         // calculate new row and undo entry.
         let (new_row, undo_kind, index_change_cols) = {
-            let mut index_change_cols = HashSet::new();
+            let mut index_change_cols = HashMap::new();
             let mut row = Vec::with_capacity(old_row.len());
             let mut var_offsets = Vec::with_capacity(old_row.len());
             for (v, var_offset) in old_row {
@@ -515,7 +856,7 @@ impl<P: BufferPool> Table<P> {
                 let old_val = &mut row[uc.idx];
                 if old_val != &uc.val {
                     if self.metadata.user_index_cols.contains(&uc.idx) {
-                        index_change_cols.insert(uc.idx);
+                        index_change_cols.insert(uc.idx, old_val.clone());
                     }
                     // swap old value and new value, then put into undo columns
                     mem::swap(&mut uc.val, old_val);
@@ -800,7 +1141,8 @@ impl<P: BufferPool> Table<P> {
                         UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
                     }
                     UpdateRow::Ok(mut row) => {
-                        let mut index_change_cols = HashSet::new();
+                        // Index change columns contains the col_no and old value.
+                        let mut index_change_cols = HashMap::new();
                         // perform in-place update.
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
                         for uc in &mut update {
@@ -812,7 +1154,7 @@ impl<P: BufferPool> Table<P> {
                                 // we also check whether the value change is related to any index,
                                 // so we can update index later.
                                 if self.metadata.user_index_cols.contains(&uc.idx) {
-                                    index_change_cols.insert(uc.idx);
+                                    index_change_cols.insert(uc.idx, old_val.clone());
                                 }
                                 // actual update
                                 row.update_user_col(uc.idx, &new_val);
@@ -1064,13 +1406,92 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
+    async fn recover_unique_index_insert(
+        &self,
+        buf_pool: &'static P,
+        key: SelectKey,
+        row_id: RowID,
+        cts: TrxID,
+    ) -> RecoverIndex {
+        let index = self.sec_idx[key.index_no].unique().unwrap();
+        loop {
+            match index.insert_if_not_exists(&key.vals, row_id) {
+                None => {
+                    // insert index success.
+                    return RecoverIndex::Ok;
+                }
+                Some(old_row_id) => {
+                    debug_assert!(old_row_id != row_id);
+                    // Find CTS of old row.
+                    match self.find_recover_cts_for_row_id(buf_pool, old_row_id).await {
+                        Some(old_cts) => {
+                            if cts < old_cts {
+                                // Current row has smaller CTS, that means this insert
+                                // can be skipped, and probably there is a followed DELETE
+                                // operation on it.
+                                return RecoverIndex::InsertOutdated;
+                            }
+                            // Current row is newer, we should update the index entry.
+                            match index.compare_exchange(&key.vals, old_row_id, row_id) {
+                                IndexCompareExchange::Ok => {
+                                    return RecoverIndex::Ok;
+                                }
+                                // retry the insert.
+                                IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
+                                }
+                            }
+                        }
+                        None => {
+                            unreachable!()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    async fn recover_unique_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+        let index = self.sec_idx[key.index_no].unique().unwrap();
+        if !index.compare_delete(&key.vals, row_id) {
+            // Another recover thread concurrently insert index entry with same key, probably with greater CTS.
+            // We just skip this deletion.
+            return RecoverIndex::DeleteOutdated;
+        }
+        RecoverIndex::Ok
+    }
+
+    #[inline]
+    async fn find_recover_cts_for_row_id(
+        &self,
+        buf_pool: &'static P,
+        row_id: RowID,
+    ) -> Option<TrxID> {
+        match self.blk_idx.find_row_id(buf_pool, row_id).await {
+            RowLocation::NotFound => None,
+            RowLocation::ColSegment(..) => todo!(),
+            RowLocation::RowPage(page_id) => {
+                let page_guard = buf_pool
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));
+                let row_idx = page_guard.page().row_idx(row_id);
+                let access = page_guard.read_row(row_idx);
+                access.ts()
+            }
+        }
+    }
+
+    #[inline]
     async fn update_indexes_only_key_change(
         &self,
         buf_pool: &'static P,
         stmt: &mut Statement<P>,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-        index_change_cols: &HashSet<usize>,
+        index_change_cols: &HashMap<usize, Val>,
     ) -> UpdateIndex {
         for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
@@ -1078,6 +1499,11 @@ impl<P: BufferPool> Table<P> {
                 if index_key_is_changed(index_schema, index_change_cols) {
                     let new_key =
                         read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
+
+                    let old_key = index_key_replace(index_schema, &new_key, index_change_cols);
+                    // First we need to insert new entry to index due to key change.
+                    // There might be conflict we will try to fix (if old one is already deleted).
+                    // Once the insert is done, we also need to defer deletion of original key.
                     match self
                         .update_unique_index_only_key_change(
                             buf_pool,
@@ -1089,7 +1515,11 @@ impl<P: BufferPool> Table<P> {
                         )
                         .await
                     {
-                        UpdateIndex::Ok => (),
+                        UpdateIndex::Ok => {
+                            let index_undo =
+                                self.index_undo(row_id, IndexUndoKind::DeferDelete(old_key));
+                            stmt.index_undo.push(index_undo);
+                        }
                         UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
                     };
@@ -1140,7 +1570,7 @@ impl<P: BufferPool> Table<P> {
         stmt: &mut Statement<P>,
         old_row_id: RowID,
         new_row_id: RowID,
-        index_change_cols: &HashSet<usize>,
+        index_change_cols: &HashMap<usize, Val>,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
@@ -1150,6 +1580,7 @@ impl<P: BufferPool> Table<P> {
                 let key =
                     read_latest_index_key(&self.metadata, index.index_no, &page_guard, new_row_id);
                 if index_key_is_changed(index_schema, index_change_cols) {
+                    let old_key = index_key_replace(index_schema, &key, index_change_cols);
                     // key change and row id change.
                     match self
                         .update_unique_index_key_and_row_id_change(
@@ -1165,7 +1596,12 @@ impl<P: BufferPool> Table<P> {
                     {
                         UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
-                        UpdateIndex::Ok => (),
+                        UpdateIndex::Ok => {
+                            // defer delete index entry of old row.
+                            let index_undo =
+                                self.index_undo(old_row_id, IndexUndoKind::DeferDelete(old_key));
+                            stmt.index_undo.push(index_undo);
+                        }
                     }
                 } else {
                     // only row id change.
@@ -1439,6 +1875,39 @@ impl<P: BufferPool> Table<P> {
             }
         }
     }
+
+    /// Recover index with given page data.
+    #[inline]
+    pub async fn populate_index_via_row_page(&self, buf_pool: &'static P, page_id: PageID) {
+        let page_guard = buf_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .await
+            .shared_async()
+            .await;
+        for (index_spec, sec_idx) in self.metadata.index_specs.iter().zip(&*self.sec_idx) {
+            let read_set: Vec<_> = index_spec
+                .index_cols
+                .iter()
+                .map(|c| c.col_no as usize)
+                .collect();
+            for row_access in page_guard.read_all_rows() {
+                let row_id = row_access.row().row_id();
+                match row_access.read_row_latest(&self.metadata, &read_set, None) {
+                    ReadRow::Ok(vals) => {
+                        if index_spec.unique() {
+                            let index = sec_idx.unique().unwrap();
+                            let res = index.insert_if_not_exists(&vals, row_id);
+                            debug_assert!(res.is_none());
+                        } else {
+                            todo!()
+                        }
+                    }
+                    ReadRow::NotFound => (),
+                    ReadRow::InvalidIndex => unreachable!(),
+                }
+            }
+        }
+    }
 }
 
 impl<P: BufferPool> Clone for Table<P> {
@@ -1507,7 +1976,10 @@ enum InsertRowIntoPage {
 enum UpdateRowInplace {
     // We keep row page lock if there is any index change,
     // so we can read latest values from page.
-    Ok(RowID, HashSet<usize>, PageSharedGuard<RowPage>),
+    // The hash map stores the changed column number and its old value.
+    // for other columns in the changed index, we can read value(old and new are same)
+    // from current page.
+    Ok(RowID, HashMap<usize, Val>, PageSharedGuard<RowPage>),
     RowNotFound,
     RowDeleted,
     WriteConflict,
@@ -1526,11 +1998,29 @@ enum DeleteInternal {
 }
 
 #[inline]
-fn index_key_is_changed(index_schema: &IndexSpec, index_change_cols: &HashSet<usize>) -> bool {
+fn index_key_is_changed(index_schema: &IndexSpec, index_change_cols: &HashMap<usize, Val>) -> bool {
     index_schema
         .index_cols
         .iter()
-        .any(|key| index_change_cols.contains(&(key.col_no as usize)))
+        .any(|key| index_change_cols.contains_key(&(key.col_no as usize)))
+}
+
+#[inline]
+fn index_key_replace(
+    index_schema: &IndexSpec,
+    key: &SelectKey,
+    updates: &HashMap<usize, Val>,
+) -> SelectKey {
+    let vals: Vec<Val> = index_schema
+        .index_cols
+        .iter()
+        .zip(&key.vals)
+        .map(|(ik, val)| {
+            let col_no = ik.col_no as usize;
+            updates.get(&col_no).cloned().unwrap_or_else(|| val.clone())
+        })
+        .collect();
+    SelectKey::new(key.index_no, vals)
 }
 
 #[inline]

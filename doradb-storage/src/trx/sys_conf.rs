@@ -83,8 +83,8 @@ impl TrxSysConfig {
 
     /// Log file name.
     #[inline]
-    pub fn log_file_prefix(mut self, log_file_prefix: String) -> Self {
-        self.log_file_prefix = log_file_prefix;
+    pub fn log_file_prefix(mut self, log_file_prefix: impl Into<String>) -> Self {
+        self.log_file_prefix = log_file_prefix.into();
         self
     }
 
@@ -258,6 +258,10 @@ impl TrxSysInitializer {
         let (purge_chan, purge_rx) = flume::unbounded();
         let trx_sys = TransactionSystem::new(self.config, catalog, log_partitions, purge_chan);
         let trx_sys = StaticLifetime::new_static(trx_sys);
+
+        trx_sys
+            .catalog
+            .enable_page_committer_for_all_tables(trx_sys);
         trx_sys.start_io_threads();
         trx_sys.start_gc_threads(gc_rxs);
         trx_sys.start_purge_threads(buf_pool, purge_rx);

@@ -676,7 +676,9 @@ impl<'a> From<&'a str> for ValRef<'a> {
 pub trait Value: Sized {
     const LAYOUT: Layout;
 
-    unsafe fn atomic_store(&self, ptr: *mut u8);
+    unsafe fn atomic_store(&self, ptr: *const u8);
+
+    unsafe fn store(&self, ptr: *mut u8);
 
     unsafe fn atomic_load(ptr: *mut u8) -> Self;
 }
@@ -697,9 +699,14 @@ pub trait Byte1ValSlice {
 impl Value for Byte1Val {
     const LAYOUT: Layout = Layout::Byte1;
     #[inline]
-    unsafe fn atomic_store(&self, ptr: *mut u8) {
-        let atom = AtomicU8::from_ptr(ptr);
+    unsafe fn atomic_store(&self, ptr: *const u8) {
+        let atom = AtomicU8::from_ptr(ptr as *mut _);
         atom.store(*self, Ordering::Relaxed);
+    }
+
+    #[inline]
+    unsafe fn store(&self, ptr: *mut u8) {
+        *ptr = *self;
     }
 
     #[inline]
@@ -746,10 +753,15 @@ pub trait Byte2ValSlice {
 impl Value for Byte2Val {
     const LAYOUT: Layout = Layout::Byte2;
     #[inline]
-    unsafe fn atomic_store(&self, ptr: *mut u8) {
+    unsafe fn atomic_store(&self, ptr: *const u8) {
         debug_assert!(ptr as usize % 2 == 0);
-        let atom = AtomicU16::from_ptr(ptr as *mut _);
+        let atom = AtomicU16::from_ptr(ptr as *mut u8 as *mut u16);
         atom.store(*self, Ordering::Relaxed);
+    }
+
+    #[inline]
+    unsafe fn store(&self, ptr: *mut u8) {
+        *(ptr as *mut u16) = *self;
     }
 
     #[inline]
@@ -802,10 +814,15 @@ pub trait Byte4ValSlice {
 impl Value for Byte4Val {
     const LAYOUT: Layout = Layout::Byte4;
     #[inline]
-    unsafe fn atomic_store(&self, ptr: *mut u8) {
+    unsafe fn atomic_store(&self, ptr: *const u8) {
         debug_assert!(ptr as usize % 4 == 0);
-        let atom = AtomicU32::from_ptr(ptr as *mut _);
+        let atom = AtomicU32::from_ptr(ptr as *mut u8 as *mut u32);
         atom.store(*self, Ordering::Relaxed);
+    }
+
+    #[inline]
+    unsafe fn store(&self, ptr: *mut u8) {
+        *(ptr as *mut u32) = *self;
     }
 
     #[inline]
@@ -868,10 +885,15 @@ pub trait Byte8ValSlice {
 impl Value for Byte8Val {
     const LAYOUT: Layout = Layout::Byte8;
     #[inline]
-    unsafe fn atomic_store(&self, ptr: *mut u8) {
+    unsafe fn atomic_store(&self, ptr: *const u8) {
         debug_assert!(ptr as usize % 8 == 0);
-        let atom = AtomicU64::from_ptr(ptr as *mut _);
+        let atom = AtomicU64::from_ptr(ptr as *mut u8 as *mut u64);
         atom.store(*self, Ordering::Relaxed);
+    }
+
+    #[inline]
+    unsafe fn store(&self, ptr: *mut u8) {
+        *(ptr as *mut u64) = *self;
     }
 
     #[inline]

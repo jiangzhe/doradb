@@ -482,6 +482,15 @@ impl<T: 'static> PageExclusiveGuard<T> {
         self.bf.next_free = next_free;
     }
 
+    #[inline]
+    pub fn ctx_and_page_mut(&mut self) -> (&mut FrameContext, &mut T) {
+        let bf = &mut self.bf;
+        let ctx = bf.ctx.as_mut().unwrap().as_mut();
+        let page = bf.page;
+        let page = unsafe { &mut *(page as *mut T) };
+        (ctx, page)
+    }
+
     /// Returns facade guard.
     #[inline]
     pub fn facade(self, dirty: bool) -> PageGuard<T> {

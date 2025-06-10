@@ -1,6 +1,5 @@
 pub mod error;
 pub mod mem_impl;
-pub mod object;
 pub mod spec;
 
 use crate::error::Result;
@@ -10,8 +9,13 @@ use semistr::SemiStr;
 use std::hash::Hash;
 use std::mem;
 
-pub use object::*;
 pub use spec::*;
+
+pub type ObjID = u64;
+pub type TableID = ObjID;
+pub type SchemaID = ObjID;
+pub type ColumnID = ObjID;
+pub type IndexID = ObjID;
 
 /// Catalog maintains metadata of all database objects.
 /// It could be shared between threads.
@@ -189,6 +193,7 @@ bitflags! {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexKey {
+    // This is user_col_idx. RowID is not included.
     pub col_no: u16,
     pub order: IndexOrder,
 }

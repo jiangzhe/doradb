@@ -24,7 +24,7 @@ use std::mem;
 use std::ops::{Range, RangeFrom, RangeTo};
 use std::os::fd::AsRawFd;
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -892,62 +892,6 @@ unsafe impl StaticLifetime for EvictableBufferPool {}
 
 impl UnwindSafe for EvictableBufferPool {}
 
-struct FreePage {
-    id: AtomicU64,
-    signal: Signal,
-}
-
-impl FreePage {
-    #[inline]
-    fn new(head: PageID) -> Self {
-        FreePage {
-            id: AtomicU64::new(head),
-            signal: Signal::default(),
-        }
-    }
-
-    #[inline]
-    fn next(&self, start_ptr: *mut BufferFrame) -> Option<PageID> {
-        let mut page_id = self.id.load(Ordering::Acquire);
-        while page_id != INVALID_PAGE_ID {
-            unsafe {
-                let bf_ptr = start_ptr.offset(page_id as isize);
-                let next_page_id = (*bf_ptr).next_free;
-                match self.id.compare_exchange(
-                    page_id,
-                    next_page_id,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => {
-                        return Some(page_id);
-                    }
-                    Err(p) => page_id = p,
-                }
-            }
-        }
-        None
-    }
-
-    /// Add new page to free list, and return old id in free list.
-    #[inline]
-    fn add<T: BufferPage>(&self, page_guard: &mut PageExclusiveGuard<T>) -> PageID {
-        let new_id = page_guard.page_id();
-        let frame = page_guard.bf_mut();
-        let mut page_id = self.id.load(Ordering::Acquire);
-        loop {
-            frame.next_free = page_id;
-            match self
-                .id
-                .compare_exchange(page_id, new_id, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => return page_id,
-                Err(p) => page_id = p,
-            }
-        }
-    }
-}
-
 struct InMemPageSet {
     // Current page number held in memory.
     count: AtomicUsize,
@@ -1266,7 +1210,7 @@ impl SingleFileIO {
     }
 }
 
-const DEFAULT_FILE_PATH: &'static str = "buffer_pool.bin";
+const DEFAULT_FILE_PATH: &'static str = "databuffer.bin";
 const DEFAULT_MAX_FILE_SIZE: Byte = Byte::from_u64(2 * 1024 * 1024 * 1024); // by default 2GB
 const DEFAULT_MAX_MEM_SIZE: Byte = Byte::from_u64(1 * 1024 * 1024 * 1024); // by default 1GB
 const DEFAULT_MAX_IO_READS: usize = 64;
@@ -1296,8 +1240,8 @@ impl Default for EvictableBufferPoolConfig {
 
 impl EvictableBufferPoolConfig {
     #[inline]
-    pub fn file_path(mut self, file_path: String) -> Self {
-        self.file_path = file_path;
+    pub fn file_path(mut self, file_path: impl Into<String>) -> Self {
+        self.file_path = file_path.into();
         self
     }
 
@@ -1575,7 +1519,6 @@ pub struct EvictableBufferPoolStartContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::guard::PageOptimisticGuard;
     use crate::row::RowPage;
     use std::thread;
     use std::time::Duration;
@@ -1586,29 +1529,31 @@ mod tests {
             let pool = EvictableBufferPoolConfig::default()
                 .max_mem_size(1024u64 * 1024 * 128)
                 .max_file_size(1024u64 * 1024 * 256)
-                .file_path(String::from("buffer_pool.bin"))
+                .file_path("data1.bin")
                 .build_static()
                 .unwrap();
             {
-                let g: PageExclusiveGuard<RowPage> = pool.allocate_page().await;
+                let g = pool.allocate_page::<RowPage>().await;
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g: PageExclusiveGuard<RowPage> = pool.allocate_page().await;
+                let g = pool.allocate_page::<RowPage>().await;
                 assert_eq!(g.page_id(), 1);
                 pool.deallocate_page(g);
-                let g: PageExclusiveGuard<RowPage> = pool.allocate_page().await;
+                let g = pool.allocate_page::<RowPage>().await;
                 assert_eq!(g.page_id(), 1);
             }
             {
-                let g: PageOptimisticGuard<RowPage> =
-                    pool.get_page(0, LatchFallbackMode::Spin).await.downgrade();
+                let g = pool
+                    .get_page::<RowPage>(0, LatchFallbackMode::Spin)
+                    .await
+                    .downgrade();
                 assert_eq!(unsafe { g.page_id() }, 0);
             }
             unsafe {
                 StaticLifetime::drop_static(pool);
             }
-            let _ = std::fs::remove_file("buffer_pool.bin");
+            let _ = std::fs::remove_file("data1.bin");
         })
     }
 
@@ -1617,6 +1562,7 @@ mod tests {
         let pool: &EvictableBufferPool = EvictableBufferPoolConfig::default()
             .max_mem_size(1024u64 * 1024)
             .max_file_size(1024u64 * 1024 * 2)
+            .file_path("data2.bin")
             .build_static()
             .unwrap();
 
@@ -1653,7 +1599,7 @@ mod tests {
         unsafe {
             StaticLifetime::drop_static(pool);
         }
-        let _ = std::fs::remove_file("buffer_pool.bin");
+        let _ = std::fs::remove_file("data2.bin");
     }
 
     #[test]
@@ -1662,6 +1608,7 @@ mod tests {
         let pool = EvictableBufferPoolConfig::default()
             .max_mem_size(1024u64 * 1024 * 64)
             .max_file_size(1024u64 * 1024 * 64 * 16)
+            .file_path("data3.bin")
             .build_static()
             .unwrap();
 
@@ -1678,6 +1625,7 @@ mod tests {
             }
             debug_assert!(pages.len() == 2048);
         });
+        let _ = std::fs::remove_file("data3.bin");
     }
 
     #[test]
@@ -1687,6 +1635,7 @@ mod tests {
         let pool = EvictableBufferPoolConfig::default()
             .max_mem_size(1024u64 * 1024 * 64)
             .max_file_size(1024u64 * 1024 * 64 * 16)
+            .file_path("data4.bin")
             .build_static()
             .unwrap();
 
@@ -1744,5 +1693,6 @@ mod tests {
         unsafe {
             StaticLifetime::drop_static(pool);
         }
+        let _ = std::fs::remove_file("data4.bin");
     }
 }

@@ -1,12 +1,8 @@
-use crate::{ColumnAttributes, IndexAttributes, IndexOrder};
+use crate::buffer::page::PageID;
+use doradb_catalog::{ColumnAttributes, IndexAttributes, IndexOrder};
+use doradb_catalog::{ColumnID, IndexID, SchemaID, TableID};
 use doradb_datatype::PreciseType;
 use semistr::SemiStr;
-
-pub type ObjID = u64;
-pub type TableID = ObjID;
-pub type SchemaID = ObjID;
-pub type ColumnID = ObjID;
-pub type IndexID = ObjID;
 
 #[derive(Debug)]
 pub struct SchemaObject {
@@ -19,6 +15,7 @@ pub struct TableObject {
     pub table_id: TableID,
     pub schema_id: SchemaID,
     pub table_name: SemiStr,
+    pub block_index_root_page: PageID,
 }
 
 #[derive(Debug)]
@@ -43,5 +40,9 @@ pub struct IndexObject {
 pub struct IndexColumnObject {
     pub column_id: ColumnID,
     pub index_id: IndexID,
+    // column position in table.
+    pub column_no: u16,
+    // column position in index.
+    pub index_column_no: u16,
     pub index_order: IndexOrder,
 }

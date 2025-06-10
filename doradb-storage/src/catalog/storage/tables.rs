@@ -1,5 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
+use crate::catalog::storage::object::TableObject;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::table::TableMetadata;
 use crate::row::ops::SelectKey;
@@ -9,7 +10,6 @@ use crate::table::Table;
 use crate::value::Val;
 use doradb_catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableID,
-    TableObject,
 };
 use doradb_datatype::{Collation, PreciseType};
 use semistr::SemiStr;
@@ -23,6 +23,8 @@ const COL_NO_TABLES_SCHEMA_ID: usize = 1;
 const COL_NAME_TABLES_SCHEMA_ID: &'static str = "schema_id";
 const COL_NO_TABLES_TABLE_NAME: usize = 2;
 const COL_NAME_TABLES_TABLE_NAME: &'static str = "table_name";
+const COL_NO_TABLES_BLOCK_INDEX_ROOT_PAGE: usize = 3;
+const COL_NAME_TABLES_BLOCK_INDEX_ROOT_PAGE: &'static str = "block_index_root_page";
 const INDEX_NO_TABLES_TABLE_ID: usize = 0;
 const INDEX_NAME_TABLES_TABLE_ID: &'static str = "idx_tables_table_id";
 const INDEX_NO_TABLES_TABLE_NAME: usize = 1;
@@ -54,6 +56,11 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                         column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
                         column_attributes: ColumnAttributes::INDEX,
                     },
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_TABLES_BLOCK_INDEX_ROOT_PAGE),
+                        column_type: PreciseType::Int(8, false),
+                        column_attributes: ColumnAttributes::empty(),
+                    },
                 ],
                 vec![
                     // primary key idx_tables_table_id (table_id)
@@ -79,10 +86,12 @@ fn row_to_table_object(row: Row<'_>) -> TableObject {
     let table_id = row.user_val::<u64>(COL_NO_TABLES_TABLE_ID);
     let schema_id = row.user_val::<u64>(COL_NO_TABLES_SCHEMA_ID);
     let table_name = row.user_str(COL_NO_TABLES_TABLE_NAME);
+    let block_index_root_page = row.user_val::<u64>(COL_NO_TABLES_BLOCK_INDEX_ROOT_PAGE);
     TableObject {
         table_id: *table_id,
         schema_id: *schema_id,
         table_name: SemiStr::new(table_name),
+        block_index_root_page: *block_index_root_page,
     }
 }
 
@@ -130,6 +139,7 @@ impl<P: BufferPool> Tables<'_, P> {
             Val::from(obj.table_id),
             Val::from(obj.schema_id),
             Val::from(obj.table_name.as_str()),
+            Val::from(obj.block_index_root_page),
         ];
         self.0.insert_row(buf_pool, stmt, cols).await.is_ok()
     }

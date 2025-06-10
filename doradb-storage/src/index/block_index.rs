@@ -1,4 +1,3 @@
-use crate::buffer::frame::{BufferFrame, FrameContext, FrameKind};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
 use crate::buffer::BufferPool;
@@ -10,7 +9,6 @@ use crate::error::{
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage, INVALID_ROW_ID};
 use crate::trx::sys::TransactionSystem;
-use crate::trx::undo::UndoMap;
 use doradb_catalog::TableID;
 use either::Either::{Left, Right};
 use parking_lot::Mutex;
@@ -396,7 +394,7 @@ pub struct BlockIndex<P: BufferPool> {
     insert_free_list: Mutex<Vec<PageID>>,
     // Reference to storage engine,
     // used for committing new page.
-    page_committer: Mutex<Option<RedoLogCommitter<P>>>,
+    page_committer: Mutex<Option<RedoLogPageCommitter<P>>>,
     _marker: PhantomData<P>,
 }
 
@@ -408,7 +406,8 @@ impl<P: BufferPool> BlockIndex<P> {
         trx_sys: &'static TransactionSystem<P>,
         table_id: TableID,
     ) -> Self {
-        let mut g: PageExclusiveGuard<BlockNode> = buf_pool.allocate_page().await;
+        let page_committer = RedoLogPageCommitter::new(trx_sys, table_id);
+        let mut g = buf_pool.allocate_page::<BlockNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init_empty();
@@ -416,7 +415,7 @@ impl<P: BufferPool> BlockIndex<P> {
             table_id,
             root: page_id,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
-            page_committer: Mutex::new(Some(RedoLogCommitter::new(trx_sys, table_id))),
+            page_committer: Mutex::new(Some(page_committer)),
             _marker: PhantomData,
         }
     }
@@ -438,11 +437,17 @@ impl<P: BufferPool> BlockIndex<P> {
         }
     }
 
+    /// Returns root page of this block index.
+    #[inline]
+    pub fn root_page(&self) -> PageID {
+        self.root
+    }
+
     /// Enable page committer by injecting transaction system for redo logging
     #[inline]
     pub fn enable_page_committer(&self, trx_sys: &'static TransactionSystem<P>) {
         let mut g = self.page_committer.lock();
-        *g = Some(RedoLogCommitter::new(trx_sys, self.table_id))
+        *g = Some(RedoLogPageCommitter::new(trx_sys, self.table_id))
     }
 
     /// Returns true if page committer is enabled.
@@ -458,13 +463,45 @@ impl<P: BufferPool> BlockIndex<P> {
         &self,
         buf_pool: &'static P,
         count: usize,
-        schema: &TableMetadata,
+        metadata: &TableMetadata,
     ) -> PageSharedGuard<RowPage> {
         match self.get_insert_page_from_free_list(buf_pool).await {
             Ok(free_page) => return free_page,
             _ => (), // we just ignore the free list error and latch error, and continue to get new page.
         }
-        let mut new_page: PageExclusiveGuard<RowPage> = buf_pool.allocate_page().await;
+        let mut new_page = buf_pool.allocate_page::<RowPage>().await;
+        self.insert_page_guard(buf_pool, count, metadata, &mut new_page)
+            .await;
+        new_page.downgrade_shared()
+    }
+
+    /// Allocate a row page with given page id.
+    /// This method is used for data recovery, which replay all commit logs including row page creation.
+    #[inline]
+    pub async fn allocate_row_page_at(
+        &self,
+        buf_pool: &'static P,
+        count: usize,
+        metadata: &TableMetadata,
+        page_id: PageID,
+    ) -> PageExclusiveGuard<RowPage> {
+        let mut new_page = buf_pool
+            .allocate_page_at::<RowPage>(page_id)
+            .await
+            .expect("allocate page with specific page id failed");
+        self.insert_page_guard(buf_pool, count, metadata, &mut new_page)
+            .await;
+        new_page
+    }
+
+    #[inline]
+    async fn insert_page_guard(
+        &self,
+        buf_pool: &'static P,
+        count: usize,
+        metadata: &TableMetadata,
+        new_page: &mut PageExclusiveGuard<RowPage>,
+    ) {
         let new_page_id = new_page.page_id();
         loop {
             match self
@@ -477,10 +514,9 @@ impl<P: BufferPool> BlockIndex<P> {
                     debug_assert!(end_row_id == start_row_id + count as u64);
                     new_page
                         .page_mut()
-                        .init(start_row_id, count as usize, schema);
+                        .init(start_row_id, count as usize, metadata);
                     // create and attach a new empty undo map.
-                    let undo_map = UndoMap::new(count);
-                    new_page.bf_mut().ctx = Some(Box::new(FrameContext::UndoMap(undo_map)));
+                    new_page.bf_mut().init_undo_map(count);
 
                     // persist log to commit this page.
                     if let Some(page_committer) = {
@@ -488,11 +524,11 @@ impl<P: BufferPool> BlockIndex<P> {
                         page_committer_guard.as_ref().cloned()
                     } {
                         page_committer
-                            .commit_new_page(new_page_id, start_row_id, end_row_id)
+                            .commit_row_page(new_page_id, start_row_id, end_row_id)
                             .await;
                     }
                     // finally, we downgrade the page lock for shared mode.
-                    return new_page.downgrade_shared();
+                    return;
                 }
             }
         }
@@ -573,13 +609,13 @@ impl<P: BufferPool> BlockIndex<P> {
         let max_row_id = r_row_id + count;
 
         // create left child and copy all contents to it.
-        let mut l_guard: PageExclusiveGuard<BlockNode> = buf_pool.allocate_page().await;
+        let mut l_guard = buf_pool.allocate_page::<BlockNode>().await;
         let l_page_id = l_guard.page_id();
         l_guard.page_mut().clone_from(p_guard.page());
         l_guard.page_mut().header.end_row_id = row_id; // update original page's end row id
 
         // create right child, add one row block with one page entry.
-        let mut r_guard: PageExclusiveGuard<BlockNode> = buf_pool.allocate_page().await;
+        let mut r_guard = buf_pool.allocate_page::<BlockNode>().await;
         let r_page_id = r_guard.page_id();
         {
             let r = r_guard.page_mut();
@@ -636,7 +672,7 @@ impl<P: BufferPool> BlockIndex<P> {
             }
         }
         // create new leaf node with one insert page id
-        let mut leaf: PageExclusiveGuard<BlockNode> = buf_pool.allocate_page().await;
+        let mut leaf = buf_pool.allocate_page::<BlockNode>().await;
         let leaf_page_id = leaf.page_id();
         {
             let b: &mut BlockNode = leaf.page_mut();
@@ -980,28 +1016,28 @@ struct BranchLookup {
     idx: usize,
 }
 
-struct RedoLogCommitter<P: BufferPool> {
+struct RedoLogPageCommitter<P: BufferPool> {
     trx_sys: &'static TransactionSystem<P>,
     table_id: TableID,
 }
 
-impl<P: BufferPool> Clone for RedoLogCommitter<P> {
+impl<P: BufferPool> Clone for RedoLogPageCommitter<P> {
     #[inline]
     fn clone(&self) -> Self {
-        RedoLogCommitter {
+        RedoLogPageCommitter {
             trx_sys: self.trx_sys,
             table_id: self.table_id,
         }
     }
 }
 
-impl<P: BufferPool> RedoLogCommitter<P> {
+impl<P: BufferPool> RedoLogPageCommitter<P> {
     #[inline]
     pub fn new(trx_sys: &'static TransactionSystem<P>, table_id: TableID) -> Self {
-        RedoLogCommitter { trx_sys, table_id }
+        RedoLogPageCommitter { trx_sys, table_id }
     }
 
-    pub async fn commit_new_page(&self, page_id: PageID, start_row_id: RowID, end_row_id: RowID) {
+    pub async fn commit_row_page(&self, page_id: PageID, start_row_id: RowID, end_row_id: RowID) {
         let mut trx = self.trx_sys.begin_sys_trx();
         let table_id = self.table_id;
         // Once a row page is added to block index, we start
@@ -1017,6 +1053,7 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use crate::trx::sys_conf::TrxSysConfig;
+    use crate::trx::tests::remove_files;
     use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use doradb_datatype::PreciseType;
     use semistr::SemiStr;
@@ -1026,7 +1063,9 @@ mod tests {
         smol::block_on(async {
             let engine = Engine::new_fixed_initializer(
                 64 * 1024 * 1024,
-                TrxSysConfig::default().skip_recovery(true),
+                TrxSysConfig::default()
+                    .log_file_prefix("redo_bi")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -1056,6 +1095,8 @@ mod tests {
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
             drop(engine);
+
+            remove_files("redo_bi*");
         })
     }
 
@@ -1064,7 +1105,9 @@ mod tests {
         smol::block_on(async {
             let engine = Engine::new_fixed_initializer(
                 64 * 1024 * 1024,
-                TrxSysConfig::default().skip_recovery(true),
+                TrxSysConfig::default()
+                    .log_file_prefix("redo_bi")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -1094,6 +1137,8 @@ mod tests {
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
             drop(engine);
+
+            remove_files("redo_bi*");
         })
     }
 
@@ -1104,7 +1149,9 @@ mod tests {
             // allocate 1GB buffer pool is enough: 10240 pages ~= 640MB
             let engine = Engine::new_fixed_initializer(
                 1024 * 1024 * 1024,
-                TrxSysConfig::default().skip_recovery(true),
+                TrxSysConfig::default()
+                    .log_file_prefix("redo_bi")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -1158,6 +1205,8 @@ mod tests {
                 assert!(count == (row_pages + row_pages_per_leaf - 1) / row_pages_per_leaf);
             }
             drop(engine);
+
+            remove_files("redo_bi*");
         })
     }
 
@@ -1172,7 +1221,9 @@ mod tests {
             let rows_per_page = 100usize;
             let engine = Engine::new_fixed_initializer(
                 1024 * 1024 * 1024,
-                TrxSysConfig::default().skip_recovery(true),
+                TrxSysConfig::default()
+                    .log_file_prefix("redo_bi")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -1227,6 +1278,8 @@ mod tests {
                 }
             }
             drop(engine);
+
+            remove_files("redo_bi*");
         })
     }
 
@@ -1236,7 +1289,9 @@ mod tests {
             let rows_per_page = 100;
             let engine = Engine::new_fixed_initializer(
                 64 * 1024 * 1024,
-                TrxSysConfig::default().skip_recovery(true),
+                TrxSysConfig::default()
+                    .log_file_prefix("redo_bi")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -1259,6 +1314,8 @@ mod tests {
                 // todo: analyze log to see the log is persisted.
             }
             drop(engine);
+
+            remove_files("redo_bi*");
         })
     }
 }

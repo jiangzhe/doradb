@@ -4,6 +4,7 @@ use crate::row::ops::{SelectKey, UpdateCol};
 use crate::session::Session;
 use crate::table::Table;
 use crate::trx::sys_conf::TrxSysConfig;
+use crate::trx::tests::remove_files;
 use crate::trx::ActiveTrx;
 use crate::value::Val;
 
@@ -39,6 +40,8 @@ fn test_mvcc_insert_normal() {
             }
             let _ = trx.commit().await.unwrap();
         }
+
+        sys.clean_all();
     });
 }
 
@@ -103,6 +106,7 @@ fn test_mvcc_update_normal() {
 
             let _ = trx.commit().await.unwrap();
         }
+        sys.clean_all();
     });
 }
 
@@ -139,6 +143,7 @@ fn test_mvcc_delete_normal() {
             trx = sys.trx_select_not_found(trx, &k1).await;
             let _ = trx.commit().await.unwrap();
         }
+        sys.clean_all();
     });
 }
 
@@ -159,6 +164,7 @@ fn test_mvcc_rollback_insert_normal() {
             let key = single_key(1i32);
             _ = sys.new_trx_select_not_found(session, &key).await;
         }
+        sys.clean_all();
     });
 }
 
@@ -189,6 +195,7 @@ fn test_mvcc_insert_link_unique_index() {
                 })
                 .await;
         }
+        sys.clean_all();
     });
 }
 
@@ -217,6 +224,7 @@ fn test_mvcc_rollback_insert_link_unique_index() {
             let key = single_key(1i32);
             _ = sys.new_trx_select_not_found(session, &key).await;
         }
+        sys.clean_all();
     });
 }
 
@@ -285,6 +293,7 @@ fn test_mvcc_insert_link_update() {
                 })
                 .await;
         }
+        sys.clean_all();
     });
 }
 
@@ -365,7 +374,7 @@ fn test_mvcc_update_link_insert() {
                 assert!(vals[1] == Val::from("c++"));
             })
         }
-        drop(sys);
+        sys.clean_all();
     });
 }
 
@@ -428,6 +437,7 @@ fn test_mvcc_multi_update() {
                 .await;
             trx1.commit().await.unwrap();
         }
+        sys.clean_all();
     });
 }
 
@@ -449,6 +459,7 @@ fn test_evict_pool_insert_full() {
             }
             let _ = trx.commit().await.unwrap();
         }
+        sys.clean_all();
     });
 }
 
@@ -470,7 +481,6 @@ fn test_row_page_scan_rows_uncommitted() {
             _ = trx.commit().await.unwrap();
         }
         {
-            // let mut trx = session.begin_trx();
             let mut res_len = 0usize;
             sys.table
                 .scan_rows_uncommitted(sys.engine.buf_pool, |row| {
@@ -481,6 +491,8 @@ fn test_row_page_scan_rows_uncommitted() {
             println!("res.len()={}", res_len);
             assert!(res_len == SIZE as usize);
         }
+
+        sys.clean_all();
     });
 }
 
@@ -494,12 +506,16 @@ impl TestSys<FixedBufferPool> {
     async fn new_fixed() -> Self {
         use crate::catalog::tests::table2;
         // 64KB * 16
-        let engine =
-            Engine::new_fixed_initializer(1024 * 1024, TrxSysConfig::default().skip_recovery(true))
-                .unwrap()
-                .init()
-                .await
-                .unwrap();
+        let engine = Engine::new_fixed_initializer(
+            1024 * 1024,
+            TrxSysConfig::default()
+                .log_file_prefix("redo_testsys")
+                .skip_recovery(true),
+        )
+        .unwrap()
+        .init()
+        .await
+        .unwrap();
         let table_id = table2(&engine).await;
         let table = engine.catalog().get_table(table_id).unwrap();
         TestSys { engine, table }
@@ -515,9 +531,14 @@ impl TestSys<EvictableBufferPool> {
             .buffer(
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(1024u64 * 1024)
-                    .max_file_size(1024u64 * 1024 * 32),
+                    .max_file_size(1024u64 * 1024 * 32)
+                    .file_path("databuffer_testsys.bin"),
             )
-            .trx(TrxSysConfig::default().skip_recovery(true))
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_prefix("redo_testsys")
+                    .skip_recovery(true),
+            )
             .build()
             .unwrap()
             .init()
@@ -530,6 +551,14 @@ impl TestSys<EvictableBufferPool> {
 }
 
 impl<P: BufferPool + 'static> TestSys<P> {
+    #[inline]
+    fn clean_all(self) {
+        drop(self);
+
+        let _ = std::fs::remove_file("databuffer_testsys.bin");
+        remove_files("redo_testsys*");
+    }
+
     #[inline]
     async fn new_trx_insert(&self, session: Session<P>, insert: Vec<Val>) -> Session<P> {
         let mut trx = session.begin_trx();

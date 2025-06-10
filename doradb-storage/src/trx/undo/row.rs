@@ -52,6 +52,11 @@ impl UndoMap {
     pub fn write(&self, row_idx: usize) -> RwLockWriteGuard<'_, Option<Box<RowUndoHead>>> {
         self.entries[row_idx].write()
     }
+
+    #[inline]
+    pub fn write_exclusive(&mut self, row_idx: usize) -> &mut Option<Box<RowUndoHead>> {
+        self.entries[row_idx].get_mut()
+    }
 }
 
 /// RowUndoKind represents the kind of original operation.
@@ -518,6 +523,20 @@ pub struct RowUndoHead {
 }
 
 impl RowUndoHead {
+    #[inline]
+    pub fn new(status: Arc<SharedTrxStatus>, entry: RowUndoRef) -> Self {
+        RowUndoHead {
+            next: NextRowUndo {
+                main: MainBranch {
+                    entry,
+                    status: UndoStatus::Ref(status),
+                },
+                indexes: vec![],
+            },
+            purge_ts: MIN_SNAPSHOT_TS,
+        }
+    }
+
     /// Returns timestamp of undo head.
     #[inline]
     pub fn ts(&self) -> TrxID {
@@ -537,22 +556,6 @@ impl RowUndoHead {
         match &self.next.main.status {
             UndoStatus::Ref(status) => status.prepare_notify(),
             _ => None,
-        }
-    }
-}
-
-impl RowUndoHead {
-    #[inline]
-    pub fn new(status: Arc<SharedTrxStatus>, entry: RowUndoRef) -> Self {
-        RowUndoHead {
-            next: NextRowUndo {
-                main: MainBranch {
-                    entry,
-                    status: UndoStatus::Ref(status),
-                },
-                indexes: vec![],
-            },
-            purge_ts: MIN_SNAPSHOT_TS,
         }
     }
 }

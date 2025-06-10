@@ -160,6 +160,13 @@ pub enum IndexCompareExchange {
     NotExists,
 }
 
+impl IndexCompareExchange {
+    #[inline]
+    pub fn is_ok(self) -> bool {
+        matches!(self, IndexCompareExchange::Ok)
+    }
+}
+
 pub trait NonUniqueIndex: Send + Sync + 'static {
     fn lookup(&self, key: &[Val], res: &mut Vec<RowID>);
 

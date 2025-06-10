@@ -51,8 +51,7 @@ impl<P: BufferPool> TransactionSystem<P> {
     }
 
     #[inline]
-    pub(super) fn refresh_min_active_sts(&self) -> Option<TrxID> {
-        // Refresh minimum active STS.
+    pub(super) fn calc_min_active_sts_for_gc(&self) -> TrxID {
         // first, we load current STS as upperbound.
         // There might be case a transaction begins and commits
         // when we refresh min_active_sts, if we do not hold this
@@ -64,17 +63,7 @@ impl<P: BufferPool> TransactionSystem<P> {
             let ts = partition.min_active_sts();
             min_ts = min_ts.min(ts);
         }
-        min_ts = min_ts.min(max_active_sts);
-
-        // update global min_active_sts
-        let old_ts = self.min_active_sts.load(Ordering::Relaxed);
-        if min_ts > old_ts {
-            // Only single thread will update this watermark, so it's safe to overwrite
-            // current value.
-            self.min_active_sts.store(min_ts, Ordering::SeqCst);
-            return Some(min_ts);
-        }
-        None
+        min_ts.min(max_active_sts)
     }
 
     #[inline]
@@ -392,6 +381,8 @@ impl PurgeLoop for PurgeSingleThreaded {
         trx_sys: &TransactionSystem<P>,
         purge_chan: Receiver<Purge>,
     ) {
+        // initialize min_active_sts.
+        let mut min_sts = trx_sys.global_visible_sts();
         while let Ok(purge) = purge_chan.recv() {
             match purge {
                 Purge::Stop => return,
@@ -403,18 +394,24 @@ impl PurgeLoop for PurgeSingleThreaded {
                             Purge::Next => (),
                         }
                     }
-                    if let Some(min_active_sts) = trx_sys.refresh_min_active_sts() {
+                    let curr_sts = trx_sys.calc_min_active_sts_for_gc();
+                    if curr_sts > min_sts {
+                        // Start GC.
                         for partition in &*trx_sys.log_partitions {
                             let mut trx_list = vec![];
                             for gc_bucket in &partition.gc_buckets {
-                                gc_bucket.get_purge_list(min_active_sts, &mut trx_list);
+                                gc_bucket.get_purge_list(curr_sts, &mut trx_list);
                             }
                             let log_no = partition.log_no;
                             trx_sys
-                                .purge_trx_list(buf_pool, catalog, log_no, trx_list, min_active_sts)
+                                .purge_trx_list(buf_pool, catalog, log_no, trx_list, curr_sts)
                                 .await;
                         }
                     }
+                    // Once GC is finished, update global_visible_sts so other threads can use it to
+                    // speed up visibility check.
+                    trx_sys.update_global_visible_sts(curr_sts);
+                    min_sts = curr_sts;
                 }
             }
         }
@@ -432,7 +429,7 @@ impl PurgeLoop for PurgeDispatcher {
         trx_sys: &TransactionSystem<P>,
         purge_chan: Receiver<Purge>,
     ) {
-        // let chans = self.init(trx_sys);
+        let mut min_sts = trx_sys.global_visible_sts();
         let mut dispatch_no: usize = 0;
         'DISPATCH_LOOP: while let Ok(purge) = purge_chan.recv_async().await {
             match purge {
@@ -445,7 +442,8 @@ impl PurgeLoop for PurgeDispatcher {
                             Purge::Next => (),
                         }
                     }
-                    if let Some(min_active_sts) = trx_sys.refresh_min_active_sts() {
+                    let curr_sts = trx_sys.calc_min_active_sts_for_gc();
+                    if curr_sts > min_sts {
                         // dispatch tasks to executors
                         let (signal, notify) = flume::unbounded();
                         for partition in &*trx_sys.log_partitions {
@@ -454,7 +452,7 @@ impl PurgeLoop for PurgeDispatcher {
                                 let task = PurgeTask {
                                     log_no,
                                     gc_no,
-                                    min_active_sts,
+                                    min_active_sts: curr_sts,
                                     signal: signal.clone(),
                                 };
                                 let _ = self.0[dispatch_no % self.0.len()].send(task);
@@ -464,6 +462,11 @@ impl PurgeLoop for PurgeDispatcher {
                         drop(signal);
                         // wait for all executors finish their tasks.
                         let _ = notify.recv_async().await;
+
+                        // Once GC is finished, update global_visible_sts so other threads can use it to
+                        // speed up visibility check.
+                        trx_sys.update_global_visible_sts(curr_sts);
+                        min_sts = curr_sts;
                     }
                 }
             }
@@ -515,6 +518,7 @@ mod tests {
     use crate::row::ops::SelectKey;
     use crate::row::RowPage;
     use crate::trx::sys_conf::TrxSysConfig;
+    use crate::trx::tests::remove_files;
     use crate::value::Val;
     use std::time::{Duration, Instant};
 
@@ -553,7 +557,10 @@ mod tests {
         smol::block_on(async {
             let engine = Engine::new_fixed_initializer(
                 16 * 1024 * 1024,
-                TrxSysConfig::default().purge_threads(1).skip_recovery(true),
+                TrxSysConfig::default()
+                    .purge_threads(1)
+                    .log_file_prefix("redo_purge")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -617,6 +624,8 @@ mod tests {
                 }
             }
             drop(engine);
+
+            remove_files("redo_purge*");
         });
     }
 
@@ -628,7 +637,10 @@ mod tests {
             const PURGE_SIZE: usize = 1000;
             let engine = Engine::new_fixed_initializer(
                 16 * 1024 * 1024,
-                TrxSysConfig::default().purge_threads(2).skip_recovery(true),
+                TrxSysConfig::default()
+                    .purge_threads(2)
+                    .log_file_prefix("redo_purge")
+                    .skip_recovery(true),
             )
             .unwrap()
             .init()
@@ -713,14 +725,16 @@ mod tests {
                     .shared_async()
                     .await;
                 let access = page_guard.read_row_by_id(row_id);
-                let status = access.latest_status();
-                println!("row status={:?}", status);
+                let ts = access.ts();
+                println!("row ts={:?}", ts);
             }
             println!(
                 "final min_active_sts={}",
-                engine.trx_sys.min_active_sts.load(Ordering::Relaxed)
+                engine.trx_sys.global_visible_sts()
             );
             drop(engine);
+
+            remove_files("redo_purge*");
         });
     }
 }

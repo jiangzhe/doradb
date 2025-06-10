@@ -178,8 +178,8 @@ impl BufferPool for FixedBufferPool {
     }
 
     #[inline]
-    fn evict_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>) {
-        panic!("FixedBufferPool does not support page eviction.")
+    fn evict_page<T: BufferPage>(&'static self, _g: PageExclusiveGuard<T>) {
+        panic!("FixedBufferPool does not support page eviction")
     }
 
     /// Get child page by page id provided by parent page.
@@ -237,7 +237,6 @@ impl RefUnwindSafe for FixedBufferPool {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::guard::PageOptimisticGuard;
     use crate::index::BlockNode;
 
     #[test]
@@ -245,19 +244,21 @@ mod tests {
         smol::block_on(async {
             let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
             {
-                let g: PageExclusiveGuard<BlockNode> = pool.allocate_page().await;
+                let g = pool.allocate_page::<BlockNode>().await;
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g: PageExclusiveGuard<BlockNode> = pool.allocate_page().await;
+                let g = pool.allocate_page::<BlockNode>().await;
                 assert_eq!(g.page_id(), 1);
                 pool.deallocate_page(g);
-                let g: PageExclusiveGuard<BlockNode> = pool.allocate_page().await;
+                let g = pool.allocate_page::<BlockNode>().await;
                 assert_eq!(g.page_id(), 1);
             }
             {
-                let g: PageOptimisticGuard<BlockNode> =
-                    pool.get_page(0, LatchFallbackMode::Spin).await.downgrade();
+                let g = pool
+                    .get_page::<BlockNode>(0, LatchFallbackMode::Spin)
+                    .await
+                    .downgrade();
                 assert_eq!(unsafe { g.page_id() }, 0);
             }
             unsafe {
