@@ -59,7 +59,7 @@ impl CommitGroup {
         self.max_cts = trx.cts;
         let session = trx.split_session();
         self.trx_list.push(trx);
-        (session, self.sync_signal.new_notify(false))
+        (session, self.sync_signal.new_notify())
     }
 
     #[inline]

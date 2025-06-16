@@ -108,7 +108,7 @@ impl SharedTrxStatus {
     #[inline]
     pub fn prepare_notify(&self) -> Option<Notify> {
         let g = self.prepare_signal.lock();
-        g.as_ref().map(|signal| signal.new_notify(false))
+        g.as_ref().map(|signal| signal.new_notify())
     }
 }
 

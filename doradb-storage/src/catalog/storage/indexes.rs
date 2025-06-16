@@ -84,10 +84,10 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
 
 #[inline]
 fn row_to_index_object(row: Row<'_>) -> IndexObject {
-    let index_id = row.user_val::<u64>(COL_NO_INDEXES_INDEX_ID);
-    let table_id = row.user_val::<u64>(COL_NO_INDEXES_TABLE_ID);
-    let index_name = row.user_str(COL_NO_INDEXES_INDEX_NAME);
-    let index_attributes = row.user_val::<u32>(COL_NO_INDEXES_INDEX_ATTRIBUTES);
+    let index_id = row.val::<u64>(COL_NO_INDEXES_INDEX_ID);
+    let table_id = row.val::<u64>(COL_NO_INDEXES_TABLE_ID);
+    let index_name = row.str(COL_NO_INDEXES_INDEX_NAME);
+    let index_attributes = row.val::<u32>(COL_NO_INDEXES_INDEX_ATTRIBUTES);
     IndexObject {
         index_id: *index_id,
         table_id: *table_id,
@@ -131,7 +131,7 @@ impl<P: BufferPool> Indexes<'_, P> {
         self.table
             .scan_rows_uncommitted(self.buf_pool, |row| {
                 // filter by table id before deserializing the whole object.
-                let table_id_in_row = *row.user_val::<TableID>(COL_NO_INDEXES_TABLE_ID);
+                let table_id_in_row = *row.val::<TableID>(COL_NO_INDEXES_TABLE_ID);
                 if table_id_in_row == table_id {
                     let obj = row_to_index_object(row);
                     res.push(obj);
@@ -213,11 +213,11 @@ pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
 
 #[inline]
 fn row_to_index_column_object(row: Row<'_>) -> IndexColumnObject {
-    let column_id = row.user_val::<u64>(COL_NO_INDEX_COLUMNS_COLUMN_ID);
-    let index_id = row.user_val::<u64>(COL_NO_INDEX_COLUMNS_INDEX_ID);
-    let column_no = row.user_val::<u16>(COL_NO_INDEX_COLUMNS_COLUMN_NO);
-    let index_column_no = row.user_val::<u16>(COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO);
-    let index_order = row.user_val::<u8>(COL_NO_INDEX_COLUMNS_INDEX_ORDER);
+    let column_id = row.val::<u64>(COL_NO_INDEX_COLUMNS_COLUMN_ID);
+    let index_id = row.val::<u64>(COL_NO_INDEX_COLUMNS_INDEX_ID);
+    let column_no = row.val::<u16>(COL_NO_INDEX_COLUMNS_COLUMN_NO);
+    let index_column_no = row.val::<u16>(COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO);
+    let index_order = row.val::<u8>(COL_NO_INDEX_COLUMNS_INDEX_ORDER);
     IndexColumnObject {
         column_id: *column_id,
         index_id: *index_id,
@@ -255,7 +255,7 @@ impl<P: BufferPool> IndexColumns<'_, P> {
         let mut res = vec![];
         self.table
             .scan_rows_uncommitted(self.buf_pool, |row| {
-                let index_id_in_row = *row.user_val::<TableID>(COL_NO_INDEX_COLUMNS_INDEX_ID);
+                let index_id_in_row = *row.val::<TableID>(COL_NO_INDEX_COLUMNS_INDEX_ID);
                 if index_id_in_row == index_id {
                     let obj = row_to_index_column_object(row);
                     res.push(obj);

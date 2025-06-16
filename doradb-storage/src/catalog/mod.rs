@@ -5,29 +5,19 @@ pub mod table;
 pub use storage::*;
 pub use table::*;
 
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::FixedBufferPool;
 use crate::error::{Error, Result};
 use crate::index::BlockIndex;
 use crate::lifetime::StaticLifetime;
 use crate::table::Table;
 use crate::trx::sys::TransactionSystem;
-use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexKey, IndexSpec, SchemaID, TableID};
-use doradb_datatype::PreciseType;
+use doradb_catalog::{ColumnSpec, IndexKey, IndexSpec, SchemaID, TableID};
 use parking_lot::RwLock;
-use semistr::SemiStr;
 use std::collections::HashMap;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ROW_ID_COL_NAME: &'static str = "__row_id";
-
-pub fn row_id_spec() -> ColumnSpec {
-    ColumnSpec {
-        column_name: SemiStr::new(ROW_ID_COL_NAME),
-        column_type: PreciseType::Int(8, false),
-        column_attributes: ColumnAttributes::empty(),
-    }
-}
 
 /// Catalog contains metadata of user tables.
 pub struct Catalog {
@@ -130,10 +120,8 @@ impl Catalog {
                     next_obj_id = next_obj_id.max(column_id);
                 }
 
-                // todo: remove row id skipping logic.
                 let column_specs = columns
                     .into_iter()
-                    .skip(1) // skip row id
                     .map(|c| ColumnSpec::new(&c.column_name, c.column_type, c.column_attributes))
                     .collect::<Vec<_>>();
 
@@ -244,8 +232,9 @@ impl<'a> TableCache<'a> {
 pub mod tests {
     use super::*;
     use crate::engine::Engine;
-    use doradb_catalog::{IndexAttributes, IndexKey, IndexSpec, TableSpec};
-    use doradb_datatype::Collation;
+    use doradb_catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
+    use doradb_datatype::{Collation, PreciseType};
+    use semistr::SemiStr;
 
     #[inline]
     pub(crate) async fn db1(engine: &Engine) -> SchemaID {

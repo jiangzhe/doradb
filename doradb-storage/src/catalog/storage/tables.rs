@@ -73,9 +73,9 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
 
 #[inline]
 fn row_to_table_object(row: Row<'_>) -> TableObject {
-    let table_id = row.user_val::<u64>(COL_NO_TABLES_TABLE_ID);
-    let schema_id = row.user_val::<u64>(COL_NO_TABLES_SCHEMA_ID);
-    let table_name = row.user_str(COL_NO_TABLES_TABLE_NAME);
+    let table_id = row.val::<u64>(COL_NO_TABLES_TABLE_ID);
+    let schema_id = row.val::<u64>(COL_NO_TABLES_SCHEMA_ID);
+    let table_name = row.str(COL_NO_TABLES_TABLE_NAME);
     TableObject {
         table_id: *table_id,
         schema_id: *schema_id,
