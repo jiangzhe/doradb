@@ -252,7 +252,7 @@ impl LogPartition {
         };
         let session = trx.split_session();
         let sync_signal = Signal::default();
-        let sync_notify = sync_signal.new_notify(false);
+        let sync_notify = sync_signal.new_notify();
         let new_group = CommitGroup {
             trx_list: vec![trx],
             max_cts: cts,
@@ -280,9 +280,9 @@ impl LogPartition {
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
             let (session, sync_notify) = self.create_new_group(precommit_trx, group_commit_g);
-            Signal::set_and_notify(&self.group_commit.1, 1); // notify sync thread to work.
+            self.group_commit.1.notify(1); // notify sync thread to work.
 
-            let _ = sync_notify.wait_async(false).await; // wait for fsync
+            let _ = sync_notify.wait_async().await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
@@ -298,14 +298,14 @@ impl LogPartition {
             let (session, sync_notify) = last_group.join(precommit_trx);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
 
-            let _ = sync_notify.wait_async(false).await; // wait for fsync
+            let _ = sync_notify.wait_async().await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
 
         let (session, sync_notify) = self.create_new_group(precommit_trx, group_commit_g);
 
-        let _ = sync_notify.wait_async(false).await; // wait for fsync
+        let _ = sync_notify.wait_async().await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
         Ok(session)
     }
@@ -563,9 +563,9 @@ impl<'a> FileProcessor<'a> {
             if !self.io_reqs.is_empty() {
                 return None;
             }
-            let notify = self.partition.group_commit.1.new_notify(true);
+            let notify = self.partition.group_commit.1.new_notify();
             drop(group_commit_g);
-            notify.wait_timeout(true, Duration::from_secs(1));
+            notify.wait_timeout(Duration::from_secs(1));
         }
     }
 

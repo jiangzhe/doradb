@@ -5,43 +5,46 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-pub struct Signal(Arc<SignalImpl>);
+pub struct Signal {
+    inner: Arc<SignalImpl>,
+    notified: bool,
+}
 
 impl Signal {
     /// Create a new notify object which can be used to wait for
     /// notification.
     #[inline]
-    pub fn new_notify(&self, from_last_notify: bool) -> Notify {
-        let ver = if from_last_notify {
-            self.0.notified.load(Ordering::Acquire)
-        } else {
-            self.0.version.load(Ordering::Acquire)
-        };
+    pub fn new_notify(&self) -> Notify {
+        let ver = self.inner.version.load(Ordering::Acquire);
         Notify {
-            inner: Arc::clone(&self.0),
+            inner: Arc::clone(&self.inner),
             ver,
         }
     }
 
-    /// Increase version and notify waiters of given number.
-    #[inline]
-    pub fn set_and_notify(this: &Self, count: usize) {
-        this.0.version.fetch_add(1, Ordering::SeqCst);
-        this.0.event.notify(count);
-    }
-
-    /// Notify additional waiters.
-    /// This method will not increase version.
+    /// Notify addtional number of waiters.
     #[inline]
     pub fn notify(&self, count: usize) {
-        self.0.event.notify(count);
+        self.inner.version.fetch_add(1, Ordering::SeqCst);
+        self.inner.event.notify(count);
+    }
+
+    /// Consume the signal and notify addtional number of waiters.
+    #[inline]
+    pub fn done(mut self, count: usize) {
+        self.inner.version.fetch_add(1, Ordering::SeqCst);
+        self.inner.event.notify(count);
+        self.notified = true;
     }
 }
 
 impl Drop for Signal {
     #[inline]
     fn drop(&mut self) {
-        Signal::set_and_notify(self, usize::MAX);
+        if !self.notified {
+            self.inner.version.fetch_add(1, Ordering::SeqCst);
+            self.inner.event.notify(usize::MAX);
+        }
     }
 }
 
@@ -52,22 +55,16 @@ pub struct Notify {
 
 impl Notify {
     #[inline]
-    pub fn wait(self, update: bool) {
+    pub fn wait(self) {
         loop {
             let ver = self.inner.version.load(Ordering::Acquire);
             if ver > self.ver {
-                if update {
-                    self.inner.notified.store(ver, Ordering::Release);
-                }
                 break;
             }
             let listener = self.inner.event.listen();
 
             let ver = self.inner.version.load(Ordering::Acquire);
             if ver > self.ver {
-                if update {
-                    self.inner.notified.store(ver, Ordering::Release);
-                }
                 break;
             }
             listener.wait();
@@ -75,22 +72,16 @@ impl Notify {
     }
 
     #[inline]
-    pub async fn wait_async(self, update: bool) {
+    pub async fn wait_async(self) {
         loop {
             let ver = self.inner.version.load(Ordering::Acquire);
             if ver > self.ver {
-                if update {
-                    self.inner.notified.store(self.ver, Ordering::Release);
-                }
                 break;
             }
             let listener = self.inner.event.listen();
 
             let ver = self.inner.version.load(Ordering::Acquire);
             if ver > self.ver {
-                if update {
-                    self.inner.notified.store(self.ver, Ordering::Release);
-                }
                 break;
             }
             listener.await;
@@ -100,24 +91,18 @@ impl Notify {
     /// Wait for notification until timeout.
     /// Returns true if notification is received, false if timeout.
     #[inline]
-    pub fn wait_timeout(self, update: bool, dur: Duration) -> bool {
+    pub fn wait_timeout(self, dur: Duration) -> bool {
         let start = Instant::now();
         let deadline = start.checked_add(dur).unwrap();
         loop {
             let ver = self.inner.version.load(Ordering::Acquire);
             if ver > self.ver {
-                if update {
-                    self.inner.notified.store(ver, Ordering::Release);
-                }
                 return true;
             }
             let listener = self.inner.event.listen();
 
             let ver = self.inner.version.load(Ordering::Acquire);
             if ver > self.ver {
-                if update {
-                    self.inner.notified.store(ver, Ordering::Release);
-                }
                 return true;
             }
             if start.elapsed() >= dur {
@@ -128,24 +113,18 @@ impl Notify {
     }
 
     #[inline]
-    pub async fn wait_timeout_async(self, update: bool, dur: Duration) -> bool {
+    pub async fn wait_timeout_async(self, dur: Duration) -> bool {
         let start = Instant::now();
         let deadline = start.checked_add(dur).unwrap();
         loop {
             let ver = self.inner.version.load(Ordering::Acquire);
             if ver > self.ver {
-                if update {
-                    self.inner.notified.store(ver, Ordering::Release);
-                }
                 return true;
             }
             let listener = self.inner.event.listen();
 
             let ver = self.inner.version.load(Ordering::Acquire);
             if ver > self.ver {
-                if update {
-                    self.inner.notified.store(ver, Ordering::Release);
-                }
                 return true;
             }
             if start.elapsed() >= dur {
@@ -163,10 +142,6 @@ impl Notify {
 struct SignalImpl {
     version: AtomicU64,
     event: Event,
-    // single thread notified can update this field to remember the previous
-    // version it gets notified, so next time, it can pre-check it to know
-    // whether there are signals during the interval.
-    notified: AtomicU64,
 }
 
 #[cfg(test)]
@@ -178,31 +153,30 @@ mod tests {
     fn test_notify_and_wait() {
         let signal = Signal::default();
         let handle = {
-            let notify = signal.new_notify(false);
+            let notify = signal.new_notify();
             thread::spawn(move || {
-                notify.wait(false);
+                notify.wait();
             })
         };
-        Signal::set_and_notify(&signal, 1);
+        signal.notify(1);
         handle.join().unwrap();
     }
 
-    #[ignore]
     #[test]
     fn test_notify_and_wait_async() {
         let signal = Signal::default();
         let handles: Vec<_> = (0..3)
             .map(|_| {
-                let notify = signal.new_notify(false);
+                let notify = signal.new_notify();
                 thread::spawn(move || {
                     smol::block_on(async {
-                        notify.wait_async(false).await;
+                        notify.wait_async().await;
                     });
                 })
             })
             .collect();
-        Signal::set_and_notify(&signal, 1);
-        signal.notify(2);
+        signal.notify(1);
+        signal.done(2);
         // Signal::set_and_notify(&signal, 2);
         for h in handles {
             h.join().unwrap();

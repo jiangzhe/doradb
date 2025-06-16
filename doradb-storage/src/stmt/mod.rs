@@ -2,7 +2,7 @@ use crate::buffer::page::PageID;
 use crate::catalog::storage::{
     ColumnObject, IndexColumnObject, IndexObject, SchemaObject, TableObject,
 };
-use crate::catalog::{row_id_spec, TableMetadata};
+use crate::catalog::TableMetadata;
 use crate::error::{Error, Result};
 use crate::index::BlockIndex;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
@@ -182,11 +182,11 @@ impl Statement {
             table_name: table_spec.table_name.clone(),
             schema_id,
         };
-        let row_id_spec = row_id_spec();
 
         // Prepare column objects
-        let column_objects: Vec<_> = std::iter::once(&row_id_spec)
-            .chain(table_spec.columns.iter())
+        let column_objects: Vec<_> = table_spec
+            .columns
+            .iter()
             .enumerate()
             .map(|(col_no, col_spec)| ColumnObject {
                 column_id: engine.catalog().next_obj_id(),

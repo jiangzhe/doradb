@@ -3,7 +3,6 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::latch::Mutex;
 use crate::lifetime::StaticLifetime;
-use crate::notify::Signal;
 use crate::session::{IntoSession, Session};
 use crate::thread;
 use crate::trx::group::Commit;
@@ -324,7 +323,7 @@ impl Drop for TransactionSystem {
                 let mut group_commit_g = partition.group_commit.0.lock();
                 group_commit_g.queue.push_back(Commit::Shutdown);
                 if group_commit_g.queue.len() == 1 {
-                    Signal::set_and_notify(&partition.group_commit.1, 1); // notify sync thread to quit.
+                    partition.group_commit.1.notify(1); // notify sync thread to quit.
                 }
             }
             // notify gc thread to quit.

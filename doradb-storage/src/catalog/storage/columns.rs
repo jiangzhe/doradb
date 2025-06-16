@@ -97,12 +97,12 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
 
 #[inline]
 fn row_to_column_object(row: Row<'_>) -> ColumnObject {
-    let column_id = row.user_val::<u64>(COL_NO_COLUMNS_COLUMN_ID);
-    let table_id = row.user_val::<u64>(COL_NO_COLUMNS_TABLE_ID);
-    let column_name = row.user_str(COL_NO_COLUMNS_COLUMN_NAME);
-    let column_no = row.user_val::<u16>(COL_NO_COLUMNS_COLUMN_NO);
-    let column_type = row.user_val::<u32>(COL_NO_COLUMNS_COLUMN_TYPE);
-    let column_attributes = row.user_val::<u32>(COL_NO_COLUMNS_COLUMN_ATTRIBUTES);
+    let column_id = row.val::<u64>(COL_NO_COLUMNS_COLUMN_ID);
+    let table_id = row.val::<u64>(COL_NO_COLUMNS_TABLE_ID);
+    let column_name = row.str(COL_NO_COLUMNS_COLUMN_NAME);
+    let column_no = row.val::<u16>(COL_NO_COLUMNS_COLUMN_NO);
+    let column_type = row.val::<u32>(COL_NO_COLUMNS_COLUMN_TYPE);
+    let column_attributes = row.val::<u32>(COL_NO_COLUMNS_COLUMN_ATTRIBUTES);
     ColumnObject {
         column_id: *column_id,
         table_id: *table_id,
@@ -140,7 +140,7 @@ impl<P: BufferPool> Columns<'_, P> {
         self.table
             .scan_rows_uncommitted(self.buf_pool, |row| {
                 // filter by table id before deserializing the whole object.
-                let table_id_in_row = *row.user_val::<TableID>(COL_NO_COLUMNS_TABLE_ID);
+                let table_id_in_row = *row.val::<TableID>(COL_NO_COLUMNS_TABLE_ID);
                 if table_id_in_row == table_id {
                     let obj = row_to_column_object(row);
                     res.push(obj);

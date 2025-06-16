@@ -65,8 +65,8 @@ pub fn catalog_definition_of_schemas() -> &'static CatalogDefinition {
 
 #[inline]
 fn row_to_schema_object(row: Row<'_>) -> SchemaObject {
-    let schema_id = row.user_val::<u64>(COL_NO_SCHEMAS_SCHEMA_ID);
-    let schema_name = row.user_str(COL_NO_SCHEMAS_SCHEMA_NAME);
+    let schema_id = row.val::<u64>(COL_NO_SCHEMAS_SCHEMA_ID);
+    let schema_name = row.str(COL_NO_SCHEMAS_SCHEMA_NAME);
     SchemaObject {
         schema_id: *schema_id,
         schema_name: SemiStr::new(schema_name),

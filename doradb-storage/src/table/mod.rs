@@ -77,7 +77,7 @@ impl Table {
             .iter()
             .enumerate()
             .map(|(index_no, index_spec)| {
-                let ty_infer = |col_no: usize| metadata.user_col_type(col_no);
+                let ty_infer = |col_no: usize| metadata.col_type(col_no);
                 SecondaryIndex::new(index_no, index_spec, ty_infer)
             })
             .collect();
@@ -242,11 +242,11 @@ impl Table {
         stmt: &mut Statement,
         cols: Vec<Val>,
     ) -> InsertMvcc {
-        debug_assert!(cols.len() + 1 == self.metadata.col_count());
+        debug_assert!(cols.len() == self.metadata.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata.user_col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
         });
         let keys = self.metadata.keys_for_insert(&cols);
         // insert row into page with undo log linked.
@@ -273,18 +273,17 @@ impl Table {
     }
 
     #[inline]
-    pub async fn insert_row_no_trx<P: BufferPool>(&self, buf_pool: &'static P, user_cols: &[Val]) {
-        debug_assert!(user_cols.len() + 1 == self.metadata.col_count());
+    pub async fn insert_row_no_trx<P: BufferPool>(&self, buf_pool: &'static P, cols: &[Val]) {
+        debug_assert!(cols.len() == self.metadata.col_count());
         debug_assert!({
-            user_cols
-                .iter()
+            cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata.user_col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
         });
         // prepare index keys.
-        let keys = self.metadata.keys_for_insert(user_cols);
+        let keys = self.metadata.keys_for_insert(cols);
         // calculate row length.
-        let row_len = row_len(&self.metadata, user_cols);
+        let row_len = row_len(&self.metadata, cols);
         // estimate max row count for insert page.
         let row_count = estimate_max_row_count(row_len, self.metadata.col_count());
         loop {
@@ -295,8 +294,8 @@ impl Table {
                 .await;
             let page = page_guard.page_mut();
             debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
-            debug_assert!(user_cols.len() + 1 == page.header.col_count as usize);
-            let var_len = var_len_for_insert(&self.metadata, user_cols);
+            debug_assert!(cols.len() == page.header.col_count as usize);
+            let var_len = var_len_for_insert(&self.metadata, cols);
             let (row_idx, var_offset) =
                 if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                     (row_idx, var_offset)
@@ -307,8 +306,8 @@ impl Table {
             let row_id = page.header.start_row_id + row_idx as RowID;
             let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
             debug_assert!(row.is_deleted());
-            for (user_col_idx, user_col) in user_cols.iter().enumerate() {
-                row.update_user_col(user_col_idx, user_col, false);
+            for (col_idx, user_col) in cols.iter().enumerate() {
+                row.update_col(col_idx, user_col, false);
             }
             // update index
             for key in keys {
@@ -362,11 +361,11 @@ impl Table {
         cts: TrxID,
         disable_index: bool,
     ) {
-        debug_assert!(cols.len() + 1 == self.metadata.col_count());
+        debug_assert!(cols.len() == self.metadata.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata.user_col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
         });
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
@@ -396,16 +395,16 @@ impl Table {
         &self,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         row_id: RowID,
-        user_cols: &[Val],
+        cols: &[Val],
         cts: TrxID,
     ) -> Recover {
         let (ctx, page) = page_guard.ctx_and_page_mut();
         debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
-        debug_assert!(user_cols.len() + 1 == page.header.col_count as usize);
+        debug_assert!(cols.len() == page.header.col_count as usize);
         let row_idx = page.row_idx(row_id);
         // Insert log should always be located to an empty slot.
         debug_assert!(ctx.recover().unwrap().is_vacant(row_idx));
-        let var_len = var_len_for_insert(&self.metadata, &user_cols);
+        let var_len = var_len_for_insert(&self.metadata, &cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -418,9 +417,8 @@ impl Table {
         let row_idx = page.row_idx(row_id);
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert!(row.is_deleted()); // before recovery, this row should be initialized as deleted.
-        row.update_row_id(row_id);
-        for (user_col_idx, user_col) in user_cols.iter().enumerate() {
-            row.update_user_col(user_col_idx, user_col, false);
+        for (user_col_idx, user_col) in cols.iter().enumerate() {
+            row.update_col(user_col_idx, user_col, false);
         }
         row.finish_insert()
     }
@@ -530,7 +528,7 @@ impl Table {
         &self,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         row_id: RowID,
-        user_cols: &[UpdateCol],
+        cols: &[UpdateCol],
         cts: TrxID,
         index_change_cols: Option<&mut HashMap<usize, Val>>,
     ) -> Recover {
@@ -538,8 +536,7 @@ impl Table {
         // column indexes must be in range
         debug_assert!(
             {
-                user_cols
-                    .iter()
+                cols.iter()
                     .all(|uc| uc.idx < page.header.col_count as usize)
             },
             "update column indexes must be in range"
@@ -547,10 +544,10 @@ impl Table {
         // column indexes should be in order.
         debug_assert!(
             {
-                user_cols.is_empty()
-                    || user_cols
+                cols.is_empty()
+                    || cols
                         .iter()
-                        .zip(user_cols.iter().skip(1))
+                        .zip(cols.iter().skip(1))
                         .all(|(l, r)| l.idx < r.idx)
             },
             "update columns should be in order"
@@ -562,7 +559,7 @@ impl Table {
         if page.row(row_idx).is_deleted() {
             return Recover::AlreadyDeleted;
         }
-        let var_len = page.var_len_for_update(row_idx, user_cols);
+        let var_len = page.var_len_for_update(row_idx, cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -575,22 +572,22 @@ impl Table {
 
         let disable_index = index_change_cols.is_none();
         if disable_index {
-            for uc in user_cols {
-                row.update_user_col(uc.idx, &uc.val, true);
+            for uc in cols {
+                row.update_col(uc.idx, &uc.val, true);
             }
             row.finish_update()
         } else {
             // collect index change columns.
             let index_change_cols = index_change_cols.unwrap();
-            for uc in user_cols {
-                if let Some((old_val, _)) = row.user_different(&self.metadata, uc.idx, &uc.val) {
+            for uc in cols {
+                if let Some((old_val, _)) = row.different(&self.metadata, uc.idx, &uc.val) {
                     // we also check whether the value change is related to any index,
                     // so we can update index later.
-                    if self.metadata.user_index_cols.contains(&uc.idx) {
+                    if self.metadata.index_cols.contains(&uc.idx) {
                         index_change_cols.insert(uc.idx, old_val);
                     }
                     // actual update
-                    row.update_user_col(uc.idx, &uc.val, true);
+                    row.update_col(uc.idx, &uc.val, true);
                 }
             }
             row.finish_update()
@@ -670,8 +667,8 @@ impl Table {
         if let Some(index_cols) = index_cols {
             // save index columns for index update.
             let row = page.row(row_idx);
-            for idx_col_no in &self.metadata.user_index_cols {
-                let val = row.clone_user_val(&self.metadata, *idx_col_no);
+            for idx_col_no in &self.metadata.index_cols {
+                let val = row.clone_val(&self.metadata, *idx_col_no);
                 index_cols.insert(*idx_col_no, val);
             }
         }
@@ -983,7 +980,7 @@ impl Table {
             for mut uc in update {
                 let old_val = &mut row[uc.idx];
                 if old_val != &uc.val {
-                    if self.metadata.user_index_cols.contains(&uc.idx) {
+                    if self.metadata.index_cols.contains(&uc.idx) {
                         index_change_cols.insert(uc.idx, old_val.clone());
                     }
                     // swap old value and new value, then put into undo columns
@@ -1107,7 +1104,7 @@ impl Table {
         &self,
         stmt: &mut Statement,
         page_guard: PageSharedGuard<RowPage>,
-        insert: Vec<Val>,
+        cols: Vec<Val>,
         undo_kind: RowUndoKind,
         move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
     ) -> InsertRowIntoPage {
@@ -1119,15 +1116,14 @@ impl Table {
         let page_id = page_guard.page_id();
         let page = page_guard.page();
         debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
-        // insert row does not include RowID, as RowID is auto-generated.
-        debug_assert!(insert.len() + 1 == page.header.col_count as usize);
+        debug_assert!(cols.len() == page.header.col_count as usize);
 
-        let var_len = var_len_for_insert(&self.metadata, &insert);
+        let var_len = var_len_for_insert(&self.metadata, &cols);
         let (row_idx, var_offset) =
             if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
             } else {
-                return InsertRowIntoPage::NoSpaceOrRowID(insert, undo_kind, move_entry);
+                return InsertRowIntoPage::NoSpaceOrRowID(cols, undo_kind, move_entry);
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
@@ -1135,7 +1131,7 @@ impl Table {
         access.lock_undo(stmt, &self.metadata, self.table_id(), page_id, row_id, None);
         // Apply insert
         let mut new_row = page.new_row(row_idx as usize, var_offset);
-        for v in &insert {
+        for v in &cols {
             match v {
                 Val::Null => new_row.add_null(),
                 Val::Byte1(v1) => new_row.add_val(*v1),
@@ -1189,7 +1185,7 @@ impl Table {
         let redo_entry = RowRedo {
             page_id,
             row_id,
-            kind: RowRedoKind::Insert(insert),
+            kind: RowRedoKind::Insert(cols),
         };
         // store redo log into transaction redo buffer.
         stmt.redo.insert_dml(self.table_id(), redo_entry);
@@ -1275,17 +1271,17 @@ impl Table {
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
                         for uc in &mut update {
                             if let Some((old, var_offset)) =
-                                row.user_different(&self.metadata, uc.idx, &uc.val)
+                                row.different(&self.metadata, uc.idx, &uc.val)
                             {
                                 let old_val = Val::from(old);
                                 let new_val = mem::take(&mut uc.val);
                                 // we also check whether the value change is related to any index,
                                 // so we can update index later.
-                                if self.metadata.user_index_cols.contains(&uc.idx) {
+                                if self.metadata.index_cols.contains(&uc.idx) {
                                     index_change_cols.insert(uc.idx, old_val.clone());
                                 }
                                 // actual update
-                                row.update_user_col(uc.idx, &new_val);
+                                row.update_col(uc.idx, &new_val);
                                 // record undo and redo
                                 undo_cols.push(UndoCol {
                                     idx: uc.idx,
@@ -1433,7 +1429,7 @@ impl Table {
                         // disk.
                         // Other transactions can still access this page and modify other rows.
 
-                        let _ = notify.wait_async(false).await; // wait for that transaction to be committed.
+                        let _ = notify.wait_async().await; // wait for that transaction to be committed.
 
                         // now we get back on current page.
                         // maybe another thread modify our row before the lock acquisition,
@@ -2079,12 +2075,12 @@ fn validate_page_row_range(
 }
 
 #[inline]
-fn row_len(schema: &TableMetadata, user_cols: &[Val]) -> usize {
-    let var_len = schema
+fn row_len(metadata: &TableMetadata, cols: &[Val]) -> usize {
+    let var_len = metadata
         .var_cols
         .iter()
         .map(|idx| {
-            let val = &user_cols[*idx - 1];
+            let val = &cols[*idx];
             match val {
                 Val::Null => 0,
                 Val::VarByte(var) => {
@@ -2098,7 +2094,7 @@ fn row_len(schema: &TableMetadata, user_cols: &[Val]) -> usize {
             }
         })
         .sum::<usize>();
-    schema.fix_len + var_len
+    metadata.fix_len + var_len
 }
 
 enum InsertRowIntoPage {
@@ -2135,8 +2131,8 @@ enum DeleteInternal {
 }
 
 #[inline]
-fn index_key_is_changed(index_schema: &IndexSpec, index_change_cols: &HashMap<usize, Val>) -> bool {
-    index_schema
+fn index_key_is_changed(index_spec: &IndexSpec, index_change_cols: &HashMap<usize, Val>) -> bool {
+    index_spec
         .index_cols
         .iter()
         .any(|key| index_change_cols.contains_key(&(key.col_no as usize)))
@@ -2144,11 +2140,11 @@ fn index_key_is_changed(index_schema: &IndexSpec, index_change_cols: &HashMap<us
 
 #[inline]
 fn index_key_replace(
-    index_schema: &IndexSpec,
+    index_spec: &IndexSpec,
     key: &SelectKey,
     updates: &HashMap<usize, Val>,
 ) -> SelectKey {
-    let vals: Vec<Val> = index_schema
+    let vals: Vec<Val> = index_spec
         .index_cols
         .iter()
         .zip(&key.vals)
@@ -2162,16 +2158,16 @@ fn index_key_replace(
 
 #[inline]
 fn read_latest_index_key(
-    schema: &TableMetadata,
+    metadata: &TableMetadata,
     index_no: usize,
     page_guard: &PageSharedGuard<RowPage>,
     row_id: RowID,
 ) -> SelectKey {
-    let index_spec = &schema.index_specs[index_no];
+    let index_spec = &metadata.index_specs[index_no];
     let mut new_key = SelectKey::null(index_no, index_spec.index_cols.len());
     for (pos, key) in index_spec.index_cols.iter().enumerate() {
         let access = page_guard.read_row_by_id(row_id);
-        let val = access.row().clone_user_val(schema, key.col_no as usize);
+        let val = access.row().clone_val(metadata, key.col_no as usize);
         new_key.vals[pos] = val;
     }
     new_key
