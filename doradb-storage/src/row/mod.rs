@@ -211,7 +211,7 @@ impl RowPage {
         debug_assert!(row_id >= self.header.start_row_id);
         debug_assert!(row_id < self.header.start_row_id + self.header.max_row_count as u64);
         let row_count = self.header.row_count();
-        let new_count = row_id - self.header.start_row_id;
+        let new_count = row_id - self.header.start_row_id + 1;
         if row_count < new_count as usize {
             self.header.update_row_count(new_count as usize);
         }

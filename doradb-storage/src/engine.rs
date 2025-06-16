@@ -2,38 +2,37 @@
 //!
 //! This module provides the main entry point of the storage engine,
 //! including start, stop, recover, and execute commands.
-use crate::buffer::{BufferPool, EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
+use crate::buffer::{EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::lifetime::StaticLifetime;
 use crate::session::Session;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::sys_conf::TrxSysConfig;
+use byte_unit::Byte;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
-pub type DefaultEngine = Engine<EvictableBufferPool>;
-
 /// Storage engine of DoraDB.
-pub struct Engine<P: BufferPool>(EngineInner<P>);
+pub struct Engine(EngineInner);
 
-impl<P: BufferPool> Deref for Engine<P> {
-    type Target = EngineInner<P>;
+impl Deref for Engine {
+    type Target = EngineInner;
     #[inline]
-    fn deref(&self) -> &EngineInner<P> {
+    fn deref(&self) -> &EngineInner {
         &self.0
     }
 }
 
-impl<P: BufferPool> Engine<P> {
+impl Engine {
     #[inline]
-    pub fn new_session(&self) -> Session<P> {
+    pub fn new_session(&self) -> Session {
         Session::new(self.weak())
     }
 
     #[inline]
-    pub fn catalog(&self) -> &Catalog<P> {
+    pub fn catalog(&self) -> &Catalog {
         &self.trx_sys.catalog
     }
 
@@ -41,64 +40,64 @@ impl<P: BufferPool> Engine<P> {
     pub fn weak(&self) -> Self {
         Engine(EngineInner {
             trx_sys: self.0.trx_sys,
-            buf_pool: self.0.buf_pool,
+            meta_pool: self.0.meta_pool,
+            _index_pool: self.0._index_pool,
+            data_pool: self.0.data_pool,
             stop_all: false,
         })
     }
 }
 
-pub struct EngineInner<P: BufferPool> {
-    pub trx_sys: &'static TransactionSystem<P>,
-    pub buf_pool: &'static P,
+pub struct EngineInner {
+    pub trx_sys: &'static TransactionSystem,
+    // meta pool is used for block index and catalog tables.
+    pub meta_pool: &'static FixedBufferPool,
+    // index pool is used for secondary index.
+    // This pool will be optimized to support CoW B+tree index.
+    pub _index_pool: &'static FixedBufferPool,
+    // data pool is used for data tables.
+    pub data_pool: &'static EvictableBufferPool,
     // only one instance should have this flag to be true to
     // stop the engine.
     stop_all: bool,
 }
 
-impl<P: BufferPool> Drop for EngineInner<P> {
+impl Drop for EngineInner {
     #[inline]
     fn drop(&mut self) {
         if self.stop_all {
             unsafe {
                 StaticLifetime::drop_static(self.trx_sys);
-                StaticLifetime::drop_static(self.buf_pool);
+                StaticLifetime::drop_static(self.data_pool);
             }
         }
     }
 }
 
-unsafe impl<P: BufferPool> Send for Engine<P> {}
-unsafe impl<P: BufferPool> Sync for Engine<P> {}
-impl<P: BufferPool> UnwindSafe for Engine<P> {}
-impl<P: BufferPool> RefUnwindSafe for Engine<P> {}
+unsafe impl Send for Engine {}
+unsafe impl Sync for Engine {}
+impl UnwindSafe for Engine {}
+impl RefUnwindSafe for Engine {}
 
-impl Engine<FixedBufferPool> {
-    /// Create a new engine initializer with fixed buffer pool.
-    #[inline]
-    pub fn new_fixed_initializer(
-        mem_size: usize,
-        trx_sys_config: TrxSysConfig,
-    ) -> Result<EngineInitializer<FixedBufferPool>> {
-        let buf_pool = FixedBufferPool::with_capacity(mem_size)?;
-        let buf_pool = StaticLifetime::new_static(buf_pool);
-        Ok(EngineInitializer {
-            buf_pool,
-            trx_sys_config,
-        })
-    }
-}
-
-pub struct EngineInitializer<P: BufferPool> {
-    buf_pool: &'static P,
+pub struct EngineInitializer {
+    meta_pool: &'static FixedBufferPool,
+    index_pool: &'static FixedBufferPool,
+    data_pool: &'static EvictableBufferPool,
     trx_sys_config: TrxSysConfig,
 }
 
-impl<P: BufferPool> EngineInitializer<P> {
+impl EngineInitializer {
     #[inline]
-    pub async fn init(self) -> Result<Engine<P>> {
-        let trx_sys = self.trx_sys_config.build().init(self.buf_pool).await?;
+    pub async fn init(self) -> Result<Engine> {
+        let trx_sys = self
+            .trx_sys_config
+            .build()
+            .init(self.meta_pool, self.data_pool)
+            .await?;
         let engine = Engine(EngineInner {
-            buf_pool: self.buf_pool,
+            meta_pool: self.meta_pool,
+            _index_pool: self.index_pool,
+            data_pool: self.data_pool,
             trx_sys,
             stop_all: true,
         });
@@ -106,10 +105,24 @@ impl<P: BufferPool> EngineInitializer<P> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+const DEFAULT_META_BUFFER: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     trx: TrxSysConfig,
-    buffer: EvictableBufferPoolConfig,
+    meta_buffer: Byte,
+    data_buffer: EvictableBufferPoolConfig,
+}
+
+impl Default for EngineConfig {
+    #[inline]
+    fn default() -> Self {
+        EngineConfig {
+            trx: TrxSysConfig::default(),
+            meta_buffer: Byte::from_u64(DEFAULT_META_BUFFER as u64),
+            data_buffer: EvictableBufferPoolConfig::default(),
+        }
+    }
 }
 
 impl EngineConfig {
@@ -120,18 +133,29 @@ impl EngineConfig {
     }
 
     #[inline]
-    pub fn buffer(mut self, buffer: EvictableBufferPoolConfig) -> Self {
-        self.buffer = buffer;
+    pub fn meta_buffer(mut self, meta_buffer: impl Into<Byte>) -> Self {
+        self.meta_buffer = meta_buffer.into();
         self
     }
 
     #[inline]
-    pub fn build(self) -> Result<EngineInitializer<EvictableBufferPool>> {
-        let (buf_pool, pool_start_ctx) = self.buffer.build()?;
+    pub fn data_buffer(mut self, data_buffer: EvictableBufferPoolConfig) -> Self {
+        self.data_buffer = data_buffer;
+        self
+    }
+
+    #[inline]
+    pub fn build(self) -> Result<EngineInitializer> {
+        let meta_pool = FixedBufferPool::with_capacity_static(self.meta_buffer.as_u64() as usize)?;
+        // mock index pool using meta pool because index pool is not used.
+        // todo: implement index pool
+        let (buf_pool, pool_start_ctx) = self.data_buffer.build()?;
         let buf_pool = StaticLifetime::new_static(buf_pool);
         buf_pool.start(pool_start_ctx);
         Ok(EngineInitializer {
-            buf_pool,
+            meta_pool,
+            index_pool: meta_pool,
+            data_pool: buf_pool,
             trx_sys_config: self.trx,
         })
     }

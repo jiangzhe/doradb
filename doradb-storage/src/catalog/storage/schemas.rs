@@ -1,4 +1,3 @@
-use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::storage::object::SchemaObject;
 use crate::catalog::storage::CatalogDefinition;
@@ -16,7 +15,6 @@ use semistr::SemiStr;
 use std::sync::OnceLock;
 
 pub const TABLE_ID_SCHEMAS: TableID = 0;
-const ROOT_PAGE_ID_SCHEMAS: PageID = 0;
 const COL_NO_SCHEMAS_SCHEMA_ID: usize = 0;
 const COL_NAME_SCHEMAS_SCHEMA_ID: &'static str = "schema_id";
 const COL_NO_SCHEMAS_SCHEMA_NAME: usize = 1;
@@ -31,7 +29,6 @@ pub fn catalog_definition_of_schemas() -> &'static CatalogDefinition {
     DEF.get_or_init(|| {
         CatalogDefinition {
             table_id: TABLE_ID_SCHEMAS,
-            root_page_id: ROOT_PAGE_ID_SCHEMAS,
             metadata: TableMetadata::new(
                 vec![
                     // schema_id bigint primary key not null
@@ -76,59 +73,50 @@ fn row_to_schema_object(row: Row<'_>) -> SchemaObject {
     }
 }
 
-pub struct Schemas<'a, P: BufferPool>(pub(super) &'a Table<P>);
+pub struct Schemas<'a, P: BufferPool> {
+    pub(super) buf_pool: &'static P,
+    pub(super) table: &'a Table,
+}
 
-impl<P: BufferPool> Schemas<'_, P> {
+impl<'a, P: BufferPool> Schemas<'a, P> {
     /// Find a schema by name.
     #[inline]
-    pub async fn find_uncommitted_by_name(
-        &self,
-        buf_pool: &'static P,
-        name: &str,
-    ) -> Option<SchemaObject> {
+    pub async fn find_uncommitted_by_name(&self, name: &str) -> Option<SchemaObject> {
         let name = Val::from(name);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_NAME, vec![name]);
-        self.0
-            .select_row_uncommitted(buf_pool, &key, row_to_schema_object)
+        self.table
+            .select_row_uncommitted(self.buf_pool, &key, row_to_schema_object)
             .await
     }
 
     #[inline]
-    pub async fn find_uncommitted_by_id(
-        &self,
-        buf_pool: &'static P,
-        id: SchemaID,
-    ) -> Option<SchemaObject> {
+    pub async fn find_uncommitted_by_id(&self, id: SchemaID) -> Option<SchemaObject> {
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![Val::from(id)]);
-        self.0
-            .select_row_uncommitted(buf_pool, &key, row_to_schema_object)
+        self.table
+            .select_row_uncommitted(self.buf_pool, &key, row_to_schema_object)
             .await
     }
 
     /// Insert a schema.
     #[inline]
-    pub async fn insert(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        obj: &SchemaObject,
-    ) -> bool {
+    pub async fn insert(&self, stmt: &mut Statement, obj: &SchemaObject) -> bool {
         let cols = vec![
             Val::from(obj.schema_id),
             Val::from(obj.schema_name.as_str()),
         ];
-        self.0.insert_row(buf_pool, stmt, cols).await.is_ok()
+        self.table
+            .insert_row(self.buf_pool, stmt, cols)
+            .await
+            .is_ok()
     }
 
     /// Delete a schema by id.
     #[inline]
-    pub async fn delete_by_id(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        id: SchemaID,
-    ) -> bool {
+    pub async fn delete_by_id(&self, stmt: &mut Statement, id: SchemaID) -> bool {
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![Val::from(id)]);
-        self.0.delete_row(buf_pool, stmt, &key).await.is_ok()
+        self.table
+            .delete_row(self.buf_pool, stmt, &key, true)
+            .await
+            .is_ok()
     }
 }

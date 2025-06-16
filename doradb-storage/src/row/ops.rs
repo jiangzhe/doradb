@@ -5,7 +5,7 @@ use crate::value::Val;
 use serde::{Deserialize, Serialize};
 use std::mem;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectKey {
     pub index_no: usize,
     pub vals: Vec<Val>,
@@ -23,6 +23,28 @@ impl SelectKey {
             index_no,
             vals: vec![Val::Null; val_count],
         }
+    }
+}
+
+impl<'a> Ser<'a> for SelectKey {
+    #[inline]
+    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u32>() + self.vals.ser_len(ctx)
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let idx = ctx.ser_u32(out, start_idx, self.index_no as u32);
+        self.vals.ser(ctx, out, idx)
+    }
+}
+
+impl Deser for SelectKey {
+    #[inline]
+    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, index_no) = ctx.deser_u32(input, start_idx)?;
+        let (idx, vals) = <Vec<Val>>::deser(ctx, input, idx)?;
+        Ok((idx, SelectKey::new(index_no as usize, vals)))
     }
 }
 

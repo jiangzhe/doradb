@@ -1,6 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::error::Result;
-use crate::row::ops::UpdateCol;
+use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::table::TableID;
@@ -18,6 +18,7 @@ pub enum RowRedoCode {
     Insert = 1,
     Delete = 2,
     Update = 3,
+    DeleteByUniqueKey = 4,
 }
 
 impl From<u8> for RowRedoCode {
@@ -33,6 +34,8 @@ pub enum RowRedoKind {
     Insert(Vec<Val>),
     Delete,
     Update(Vec<UpdateCol>),
+    /// This is special kind for catalog update/delete.
+    DeleteByUniqueKey(SelectKey),
 }
 
 impl RowRedoKind {
@@ -43,6 +46,7 @@ impl RowRedoKind {
             RowRedoKind::Insert(..) => RowRedoCode::Insert,
             RowRedoKind::Delete => RowRedoCode::Delete,
             RowRedoKind::Update(..) => RowRedoCode::Update,
+            RowRedoKind::DeleteByUniqueKey(_) => RowRedoCode::DeleteByUniqueKey,
         }
     }
 }
@@ -54,6 +58,7 @@ impl Ser<'_> for RowRedoKind {
                 RowRedoKind::Insert(vals) => vals.ser_len(ctx),
                 RowRedoKind::Delete => 0,
                 RowRedoKind::Update(cols) => cols.ser_len(ctx),
+                RowRedoKind::DeleteByUniqueKey(key) => key.ser_len(ctx),
             }
     }
 
@@ -68,6 +73,9 @@ impl Ser<'_> for RowRedoKind {
             RowRedoKind::Delete => (),
             RowRedoKind::Update(cols) => {
                 idx = cols.ser(ctx, out, idx);
+            }
+            RowRedoKind::DeleteByUniqueKey(key) => {
+                idx = key.ser(ctx, out, idx);
             }
         }
         idx
@@ -87,6 +95,10 @@ impl Deser for RowRedoKind {
             RowRedoCode::Update => {
                 let (idx, cols) = Vec::<UpdateCol>::deser(ctx, data, idx)?;
                 Ok((idx, RowRedoKind::Update(cols)))
+            }
+            RowRedoCode::DeleteByUniqueKey => {
+                let (idx, key) = SelectKey::deser(ctx, data, idx)?;
+                Ok((idx, RowRedoKind::DeleteByUniqueKey(key)))
             }
         }
     }
@@ -447,7 +459,7 @@ impl TableDML {
             Entry::Occupied(mut occ) => {
                 let old = occ.get_mut();
                 match (&mut old.kind, entry.kind) {
-                    (RowRedoKind::Delete, _) => {
+                    (RowRedoKind::Delete, _) | (RowRedoKind::DeleteByUniqueKey(_), _) => {
                         // Once the old RowID is deleted, there is impossible
                         // to have another operation on the same RowID.
                         unreachable!()
@@ -463,7 +475,10 @@ impl TableDML {
                             vals[upd_col.idx] = upd_col.val;
                         }
                     }
-                    (RowRedoKind::Insert(..), RowRedoKind::Delete) => {
+                    (
+                        RowRedoKind::Insert(..),
+                        RowRedoKind::Delete | RowRedoKind::DeleteByUniqueKey(_),
+                    ) => {
                         // Insert and then delete the same RowID.
                         // Remove this entry.
                         occ.remove_entry();
@@ -482,10 +497,20 @@ impl TableDML {
                             }
                         }
                     }
+                    (RowRedoKind::Update(_), RowRedoKind::DeleteByUniqueKey(_)) => {
+                        // We do not allow Update and then DeleteByUniqueKey,
+                        // because DeleteByUniqueKey is only used for catalog tables.
+                        // And they are not allow to update, instead we perform delete+insert.
+                        unreachable!()
+                    }
                     (RowRedoKind::Update(..), RowRedoKind::Delete) => {
                         // Update and then delete the same RowID.
-                        // Remove this entry.
-                        occ.remove_entry();
+                        // Replace Update with Delete.
+                        *old = RowRedo {
+                            page_id: entry.page_id,
+                            row_id: entry.page_id,
+                            kind: RowRedoKind::Delete,
+                        };
                     }
                     (RowRedoKind::Update(..), RowRedoKind::Insert(..)) => {
                         // It's impossible to insert a row with same RowID.

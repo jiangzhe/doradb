@@ -1,5 +1,4 @@
 use crate::buffer::page::PageID;
-use crate::buffer::BufferPool;
 use crate::engine::Engine;
 use crate::row::RowID;
 use crate::stmt::Statement;
@@ -7,14 +6,14 @@ use crate::table::TableID;
 use crate::trx::ActiveTrx;
 use std::collections::HashMap;
 
-pub struct Session<P: BufferPool> {
-    pub(crate) engine: Engine<P>,
+pub struct Session {
+    pub(crate) engine: Engine,
     inner: Option<Box<InternalSession>>,
 }
 
-impl<P: BufferPool> Session<P> {
+impl Session {
     #[inline]
-    pub(crate) fn new(engine: Engine<P>) -> Self {
+    pub(crate) fn new(engine: Engine) -> Self {
         Session {
             engine,
             inner: Some(Box::new(InternalSession::new())),
@@ -22,7 +21,7 @@ impl<P: BufferPool> Session<P> {
     }
 
     #[inline]
-    pub fn with_internal_session(engine: Engine<P>, inner: Box<InternalSession>) -> Self {
+    pub fn with_internal_session(engine: Engine, inner: Box<InternalSession>) -> Self {
         Session {
             engine,
             inner: Some(inner),
@@ -44,15 +43,15 @@ impl<P: BufferPool> Session<P> {
     }
 
     #[inline]
-    pub fn begin_trx(self) -> ActiveTrx<P> {
+    pub fn begin_trx(self) -> ActiveTrx {
         self.engine.trx_sys.begin_trx(self)
     }
 }
 
-pub trait IntoSession<P: BufferPool>: Sized {
-    fn into_session(self) -> Option<Session<P>>;
+pub trait IntoSession: Sized {
+    fn into_session(self) -> Option<Session>;
 
-    fn split_session(&mut self) -> Option<Session<P>>;
+    fn split_session(&mut self) -> Option<Session>;
 }
 
 #[derive(Default)]
@@ -80,12 +79,12 @@ impl InternalSession {
     }
 }
 
-pub enum SessionState<P: BufferPool> {
+pub enum SessionState {
     // Idle state. The user session does not have any active transaction
     // and wait for user command.
-    Idle(Session<P>),
+    Idle(Session),
     // Active transaction. There is one active transaction in progress.
-    ActiveTrx(ActiveTrx<P>),
+    ActiveTrx(ActiveTrx),
     // One statement is in progress.
-    Statement(Statement<P>),
+    Statement(Statement),
 }

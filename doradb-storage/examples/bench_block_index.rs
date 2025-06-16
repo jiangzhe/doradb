@@ -1,9 +1,9 @@
 use clap::Parser;
 use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
 use doradb_datatype::PreciseType;
-use doradb_storage::buffer::FixedBufferPool;
+use doradb_storage::buffer::EvictableBufferPoolConfig;
 use doradb_storage::catalog::TableMetadata;
-use doradb_storage::engine::Engine;
+use doradb_storage::engine::EngineConfig;
 use doradb_storage::index::{BlockIndex, RowLocation};
 use doradb_storage::trx::sys_conf::TrxSysConfig;
 use parking_lot::RwLock;
@@ -21,14 +21,20 @@ fn main() {
     let args = Args::parse();
     smol::block_on(async {
         let args = args.clone();
-        let engine = Engine::new_fixed_initializer(
-            2 * 1024 * 1024 * 1024,
-            TrxSysConfig::default().skip_recovery(true),
-        )
-        .unwrap()
-        .init()
-        .await
-        .unwrap();
+        let engine = EngineConfig::default()
+            .meta_buffer(64usize * 1024 * 1024)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(2usize * 1024 * 1024 * 1024)
+                    .max_file_size(3usize * 1024 * 1024 * 1024)
+                    .file_path("databuffer_bench1.bin"),
+            )
+            .trx(TrxSysConfig::default().skip_recovery(true))
+            .build()
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
         {
             let metadata = TableMetadata::new(
                 vec![ColumnSpec {
@@ -42,12 +48,13 @@ fn main() {
                     IndexAttributes::PK,
                 )],
             );
-            let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
+            let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
             let blk_idx = Box::leak(Box::new(blk_idx));
+            blk_idx.enable_page_committer(engine.trx_sys);
 
             for _ in 0..args.pages {
                 let _ = blk_idx
-                    .get_insert_page(engine.buf_pool, args.rows_per_page, &metadata)
+                    .get_insert_page(engine.data_pool, args.rows_per_page, &metadata)
                     .await;
             }
             let mut perf_monitor = PerfMonitor::new();
@@ -58,11 +65,10 @@ fn main() {
             for _ in 0..args.threads {
                 let args = args.clone();
                 let stop = Arc::clone(&stop);
-                let engine = engine.weak();
                 let blk_idx = &*blk_idx;
                 let handle = std::thread::spawn(move || {
                     let ex = smol::LocalExecutor::new();
-                    smol::block_on(ex.run(worker(args, engine.buf_pool, blk_idx, stop)))
+                    smol::block_on(ex.run(worker(args, blk_idx, stop)))
                 });
                 handles.push(handle);
             }
@@ -85,14 +91,10 @@ fn main() {
                 perf_stats.cycles as f64,
                 perf_stats.instructions as f64,
                 perf_stats.branch_misses as f64);
-
-            unsafe {
-                drop(Box::from_raw(
-                    blk_idx as *const _ as *mut BlockIndex<FixedBufferPool>,
-                ));
-            }
         }
         drop(engine);
+
+        let _ = std::fs::remove_file("databuffer_bench1.bin");
     });
 
     bench_btreemap(args);
@@ -155,12 +157,7 @@ fn bench_btreemap(args: Args) {
     }
 }
 
-async fn worker(
-    args: Args,
-    buf_pool: &'static FixedBufferPool,
-    blk_idx: &'static BlockIndex<FixedBufferPool>,
-    stop: Arc<AtomicBool>,
-) -> (usize, u64) {
+async fn worker(args: Args, blk_idx: &'static BlockIndex, stop: Arc<AtomicBool>) -> (usize, u64) {
     let max_row_id = (args.pages * args.rows_per_page) as u64;
     let mut rng = rand::thread_rng();
     // rng.next_u64() as usize % max_row_id;
@@ -168,7 +165,7 @@ async fn worker(
     let mut sum_page_id = 0u64;
     for _ in 0..args.count {
         let row_id = rng.next_u64() % max_row_id;
-        let res = blk_idx.find_row_id(buf_pool, row_id).await;
+        let res = blk_idx.find_row_id(row_id).await;
         match res {
             RowLocation::RowPage(page_id) => {
                 count += 1;

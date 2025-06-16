@@ -1,7 +1,6 @@
 use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::PageID;
-use crate::buffer::BufferPool;
 use crate::catalog::TableMetadata;
 use crate::notify::Notify;
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
@@ -13,7 +12,7 @@ use crate::trx::undo::{
     IndexBranch, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRef,
     UndoMap, UndoStatus,
 };
-use crate::trx::{trx_is_committed, ActiveTrx, SharedTrxStatus, TrxID, GLOBAL_VISIBLE_COMMIT_TS};
+use crate::trx::{trx_is_committed, ActiveTrx, SharedTrxStatus, TrxID};
 use crate::value::Val;
 use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -43,14 +42,6 @@ impl<'a> RowReadAccess<'a> {
         self.page.row(self.row_idx)
     }
 
-    // #[inline]
-    // pub fn undo(&self) -> &Option<Box<RowUndoHead>> {
-    //     match &self.state {
-    //         RowReadState::Undo(undo) => undo,
-    //         RowReadState::Recover(recover) => panic!("recover map instead of undo map"),
-    //     }
-    // }
-
     #[inline]
     pub fn ts(&self) -> Option<TrxID> {
         match &self.state {
@@ -58,21 +49,6 @@ impl<'a> RowReadAccess<'a> {
             RowReadState::Recover(rec) => rec.at(self.row_idx),
         }
     }
-
-    // #[inline]
-    // pub fn latest_status(&self) -> RowLatestStatus {
-    //     let cts = if let Some(head) = &*self.undo {
-    //         let ts = head.ts();
-    //         if !trx_is_committed(ts) {
-    //             return RowLatestStatus::Uncommitted;
-    //         }
-    //         ts
-    //     } else {
-    //         GLOBAL_VISIBLE_COMMIT_TS
-    //     };
-    //     // the row is committed, check if it's deleted.
-    //     RowLatestStatus::Committed(cts, self.row().is_deleted())
-    // }
 
     #[inline]
     pub fn read_row_latest(
@@ -96,9 +72,9 @@ impl<'a> RowReadAccess<'a> {
     }
 
     #[inline]
-    pub fn read_row_mvcc<P: BufferPool>(
+    pub fn read_row_mvcc(
         &self,
-        trx: &ActiveTrx<P>,
+        trx: &ActiveTrx,
         schema: &TableMetadata,
         user_read_set: &[usize],
         key: &SelectKey,
@@ -530,9 +506,9 @@ impl<'a> RowWriteAccess<'a> {
 
     /// Add a Lock undo entry as a transaction-level logical row lock.
     #[inline]
-    pub fn lock_undo<P: BufferPool>(
+    pub fn lock_undo(
         &mut self,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         schema: &TableMetadata,
         table_id: TableID,
         page_id: PageID,
@@ -648,11 +624,11 @@ impl<'a> RowWriteAccess<'a> {
     /// 5. The old row does not match key but one old version with same key found.
     ///    Add record modifications and then link new row to that specific entry.
     #[inline]
-    pub fn find_old_version_for_unique_key<P: BufferPool>(
+    pub fn find_old_version_for_unique_key(
         &self,
         schema: &TableMetadata,
         key: &SelectKey,
-        trx: &ActiveTrx<P>,
+        trx: &ActiveTrx,
     ) -> FindOldVersion {
         match &*self.undo {
             None => {

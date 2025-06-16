@@ -1,4 +1,4 @@
-use crate::buffer::BufferPool;
+use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::Catalog;
 use crate::error::Result;
@@ -149,48 +149,6 @@ impl TrxSysConfig {
             log_no,
             file_seq: None,
         })
-
-        // // let mut file_seq = 0;
-        // let log_file = create_log_file(
-        //     &aio_mgr,
-        //     &self.log_file_prefix,
-        //     log_no,
-        //     file_seq,
-        //     self.log_file_max_size.as_u64() as usize,
-        //     self.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
-        // )?;
-        // file_seq += 1;
-
-        // let group_commit = GroupCommit {
-        //     queue: VecDeque::new(),
-        //     log_file: Some(log_file),
-        // };
-        // let max_io_size = self.max_io_size.as_u64() as usize;
-        // let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
-        // let (gc_chan, gc_rx) = flume::unbounded();
-        // (
-        //     LogPartition {
-        //         group_commit: CachePadded::new((Mutex::new(group_commit), Signal::default())),
-        //         persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-        //         stats: CachePadded::new(LogPartitionStats::default()),
-        //         gc_chan,
-        //         gc_buckets: gc_info.into_boxed_slice(),
-        //         aio_mgr,
-        //         log_no,
-        //         max_io_size,
-        //         file_prefix: self.log_file_prefix.clone(),
-        //         file_seq: AtomicU32::new(file_seq),
-        //         file_max_size: self.log_file_max_size.as_u64() as usize,
-        //         buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
-        //             let mut buf = DirectBuf::page_zeroed(max_io_size);
-        //             buf.set_data_len(0);
-        //             buf
-        //         }),
-        //         io_thread: Mutex::new(None),
-        //         gc_thread: Mutex::new(None),
-        //     },
-        //     gc_rx,
-        // )
     }
 
     #[inline]
@@ -234,21 +192,22 @@ impl Deref for TrxSysInitializer {
 impl TrxSysInitializer {
     pub async fn init<P: BufferPool>(
         self,
-        buf_pool: &'static P,
-    ) -> Result<&'static TransactionSystem<P>> {
+        meta_pool: &'static FixedBufferPool,
+        data_pool: &'static P,
+    ) -> Result<&'static TransactionSystem> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
             let initializer = self.log_partition_initializer(idx)?;
             log_partition_initializers.push(initializer);
         }
 
-        let catalog_storage = CatalogStorage::new(buf_pool).await;
+        let catalog_storage = CatalogStorage::new(meta_pool).await;
         let mut catalog = Catalog::new(catalog_storage);
 
         // Now we have an empty catalog, all log partitions and buffer pool.
         // Recover all committed data if required.
         let (log_partitions, gc_rxs) = log_recover(
-            buf_pool,
+            data_pool,
             &mut catalog,
             log_partition_initializers,
             self.skip_recovery,
@@ -259,12 +218,10 @@ impl TrxSysInitializer {
         let trx_sys = TransactionSystem::new(self.config, catalog, log_partitions, purge_chan);
         let trx_sys = StaticLifetime::new_static(trx_sys);
 
-        trx_sys
-            .catalog
-            .enable_page_committer_for_all_tables(trx_sys);
+        trx_sys.catalog.enable_page_committer_for_tables(trx_sys);
         trx_sys.start_io_threads();
         trx_sys.start_gc_threads(gc_rxs);
-        trx_sys.start_purge_threads(buf_pool, purge_rx);
+        trx_sys.start_purge_threads(data_pool, purge_rx);
 
         Ok(trx_sys)
     }

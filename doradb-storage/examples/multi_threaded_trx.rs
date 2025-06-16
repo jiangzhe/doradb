@@ -4,8 +4,8 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
-use doradb_storage::buffer::BufferPool;
-use doradb_storage::engine::Engine;
+use doradb_storage::buffer::EvictableBufferPoolConfig;
+use doradb_storage::engine::{Engine, EngineConfig};
 use doradb_storage::trx::log::LogSync;
 use doradb_storage::trx::sys_conf::TrxSysConfig;
 use easy_parallel::Parallel;
@@ -19,21 +19,29 @@ fn main() {
     smol::block_on(async {
         let args = Args::parse();
 
-        let engine = Engine::new_fixed_initializer(
-            128 * 1024 * 1024,
-            TrxSysConfig::default()
-                .log_file_prefix(args.log_file_prefix.to_string())
-                .log_partitions(args.log_partitions)
-                .io_depth_per_log(args.io_depth_per_log)
-                .log_file_max_size(args.log_file_max_size)
-                .log_sync(args.log_sync)
-                .max_io_size(args.max_io_size)
-                .skip_recovery(true),
-        )
-        .unwrap()
-        .init()
-        .await
-        .unwrap();
+        let engine = EngineConfig::default()
+            .meta_buffer(64usize * 1024 * 1024)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(2usize * 1024 * 1024 * 1024)
+                    .max_file_size(3usize * 1024 * 1024 * 1024)
+                    .file_path("databuffer_bench2.bin"),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_prefix(args.log_file_prefix.to_string())
+                    .log_partitions(args.log_partitions)
+                    .io_depth_per_log(args.io_depth_per_log)
+                    .log_file_max_size(args.log_file_max_size)
+                    .log_sync(args.log_sync)
+                    .max_io_size(args.max_io_size)
+                    .skip_recovery(true),
+            )
+            .build()
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
         {
             let start = Instant::now();
             let wg = WaitGroup::new();
@@ -90,11 +98,13 @@ fn main() {
         );
         }
         drop(engine);
+
+        let _ = std::fs::remove_file("databuffer_bench3.bin");
     })
 }
 
 #[inline]
-async fn worker<P: BufferPool>(engine: Engine<P>, stop: Arc<AtomicBool>, wg: WaitGroup) {
+async fn worker(engine: Engine, stop: Arc<AtomicBool>, wg: WaitGroup) {
     let mut session = engine.new_session();
     let stop = &*stop;
     while !stop.load(Ordering::Relaxed) {

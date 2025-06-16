@@ -1,4 +1,3 @@
-use crate::buffer::BufferPool;
 use crate::error::{Error, Result};
 use crate::io::{
     align_to_sector_size, buf_data, buf_raw_len, io_event, AIOError, AIOManager, Buf, DirectBuf,
@@ -82,7 +81,7 @@ impl LogPartitionInitializer {
     }
 
     #[inline]
-    pub(super) fn finish<P: BufferPool>(self) -> Result<(LogPartition<P>, Receiver<GC<P>>)> {
+    pub(super) fn finish(self) -> Result<(LogPartition, Receiver<GC>)> {
         let mut file_seq = self.file_seq.unwrap_or(0);
         let log_file = create_log_file(
             &self.aio_mgr,
@@ -134,19 +133,19 @@ pub enum LogPartitionMode {
     Done,
 }
 
-pub(super) struct LogPartition<P: BufferPool> {
+pub(super) struct LogPartition {
     /// Group commit of this partition.
-    pub(super) group_commit: CachePadded<(Mutex<GroupCommit<P>>, Signal)>,
+    pub(super) group_commit: CachePadded<(Mutex<GroupCommit>, Signal)>,
     /// Maximum persisted CTS of this partition.
     pub(super) persisted_cts: CachePadded<AtomicU64>,
     /// Stats of transaction system.
     pub(super) stats: CachePadded<LogPartitionStats>,
     /// GC channel to send committed transactions to GC threads.
-    pub(super) gc_chan: Sender<GC<P>>,
+    pub(super) gc_chan: Sender<GC>,
     /// Each GC bucket contains active sts list, committed transaction list and
     /// old transaction list.
     /// Split into multiple buckets in order to avoid bottleneck of global synchronization.
-    pub(super) gc_buckets: Box<[GCBucket<P>]>,
+    pub(super) gc_buckets: Box<[GCBucket]>,
     /// AIO manager to handle async IO with libaio.
     pub(super) aio_mgr: AIOManager,
     /// Index of log partition in total partitions, starts from 0.
@@ -170,7 +169,7 @@ pub(super) struct LogPartition<P: BufferPool> {
     pub(super) gc_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl<P: BufferPool> LogPartition<P> {
+impl LogPartition {
     /// Create a new log buffer to hold one transaction's redo log.
     #[inline]
     fn new_buf(&self, serde_ctx: &SerdeCtx, data: LenPrefixPod<RedoHeader, RedoLogs>) -> Buf {
@@ -202,7 +201,7 @@ impl<P: BufferPool> LogPartition<P> {
     }
 
     #[inline]
-    fn rotate_log_file(&self, group_commit_g: &mut MutexGuard<'_, GroupCommit<P>>) -> Result<()> {
+    fn rotate_log_file(&self, group_commit_g: &mut MutexGuard<'_, GroupCommit>) -> Result<()> {
         let new_log_file = self.create_log_file()?;
         let old_log_file = group_commit_g.log_file.replace(new_log_file).unwrap();
         group_commit_g.queue.push_back(Commit::Switch(old_log_file));
@@ -226,9 +225,9 @@ impl<P: BufferPool> LogPartition<P> {
     #[inline]
     fn create_new_group(
         &self,
-        mut trx: PrecommitTrx<P>,
-        mut group_commit_g: MutexGuard<'_, GroupCommit<P>>,
-    ) -> (Option<Session<P>>, Notify) {
+        mut trx: PrecommitTrx,
+        mut group_commit_g: MutexGuard<'_, GroupCommit>,
+    ) -> (Option<Session>, Notify) {
         let cts = trx.cts;
         let serde_ctx = SerdeCtx::default();
         let redo_bin = trx.redo_bin.take().unwrap();
@@ -272,9 +271,9 @@ impl<P: BufferPool> LogPartition<P> {
     #[inline]
     pub(super) async fn commit(
         &self,
-        trx: PreparedTrx<P>,
+        trx: PreparedTrx,
         global_ts: &AtomicU64,
-    ) -> Result<Option<Session<P>>> {
+    ) -> Result<Option<Session>> {
         let mut group_commit_g = self.group_commit.0.lock_async().await;
         let cts = global_ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
@@ -334,7 +333,7 @@ impl<P: BufferPool> LogPartition<P> {
     }
 
     #[inline]
-    fn file_processor(&self, config: &TrxSysConfig) -> FileProcessor<P> {
+    fn file_processor(&self, config: &TrxSysConfig) -> FileProcessor {
         let syncer = {
             self.group_commit
                 .0
@@ -379,11 +378,11 @@ impl<P: BufferPool> LogPartition<P> {
     }
 }
 
-impl<P: BufferPool> UnwindSafe for LogPartition<P> {}
-impl<P: BufferPool> RefUnwindSafe for LogPartition<P> {}
+impl UnwindSafe for LogPartition {}
+impl RefUnwindSafe for LogPartition {}
 
-pub(super) struct SyncGroup<P: BufferPool> {
-    pub(super) trx_list: Vec<PrecommitTrx<P>>,
+pub(super) struct SyncGroup {
+    pub(super) trx_list: Vec<PrecommitTrx>,
     pub(super) max_cts: TrxID,
     pub(super) log_bytes: usize,
     pub(super) aio: AIO,
@@ -438,15 +437,15 @@ impl FromStr for LogSync {
     }
 }
 
-struct FileProcessor<'a, P: BufferPool> {
-    partition: &'a LogPartition<P>,
+struct FileProcessor<'a> {
+    partition: &'a LogPartition,
     io_depth: usize,
-    inflight: BTreeMap<TrxID, SyncGroup<P>>,
+    inflight: BTreeMap<TrxID, SyncGroup>,
     in_progress: usize,
     io_reqs: Vec<IocbRawPtr>,
-    sync_groups: VecDeque<SyncGroup<P>>,
+    sync_groups: VecDeque<SyncGroup>,
     events: Box<[io_event]>,
-    written: Vec<SyncGroup<P>>,
+    written: Vec<SyncGroup>,
     syncer: FileSyncer,
     log_sync: LogSync,
     shutdown: bool,
@@ -456,9 +455,9 @@ struct FileProcessor<'a, P: BufferPool> {
     io_wait_nanos: usize,
 }
 
-impl<'a, P: BufferPool> FileProcessor<'a, P> {
+impl<'a> FileProcessor<'a> {
     #[inline]
-    fn new(partition: &'a LogPartition<P>, config: &TrxSysConfig, syncer: FileSyncer) -> Self {
+    fn new(partition: &'a LogPartition, config: &TrxSysConfig, syncer: FileSyncer) -> Self {
         FileProcessor {
             partition,
             io_depth: config.io_depth_per_log,
@@ -622,7 +621,7 @@ impl<'a, P: BufferPool> FileProcessor<'a, P> {
                     self.partition.buf_free_list.push_elem(elem); // return buf to free list for future reuse
                 }
                 // commit transactions to let waiting read operations to continue
-                let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx<P>>> = HashMap::new();
+                let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
                 for trx in mem::take(&mut sync_group.trx_list) {
                     let trx = trx.commit();
                     if let Some(gc_no) = trx.gc_no() {
@@ -733,9 +732,9 @@ impl<'a, P: BufferPool> FileProcessor<'a, P> {
 }
 
 #[inline]
-fn shrink_inflight<P: BufferPool>(
-    tree: &mut BTreeMap<TrxID, SyncGroup<P>>,
-    buffer: &mut Vec<SyncGroup<P>>,
+fn shrink_inflight(
+    tree: &mut BTreeMap<TrxID, SyncGroup>,
+    buffer: &mut Vec<SyncGroup>,
 ) -> (usize, usize, usize) {
     let mut trx_count = 0;
     let mut commit_count = 0;
@@ -1072,7 +1071,7 @@ mod tests {
                         .log_file_prefix(String::from("mmap_log_reader_redo.log"))
                         .skip_recovery(true),
                 )
-                .buffer(
+                .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(1024u64 * 1024)
                         .max_file_size(1024u64 * 1024 * 32)
@@ -1142,7 +1141,7 @@ mod tests {
                         .log_partitions(2)
                         .skip_recovery(true),
                 )
-                .buffer(
+                .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(1024u64 * 1024)
                         .max_file_size(1024u64 * 1024 * 32)
