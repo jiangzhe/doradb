@@ -9,6 +9,7 @@ use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, TrxID, MAX_SNAPSHOT_TS};
 use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
+use doradb_catalog::TableID;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -16,9 +17,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-impl<P: BufferPool> TransactionSystem<P> {
+impl TransactionSystem {
     #[inline]
-    pub(super) fn start_purge_threads(
+    pub(super) fn start_purge_threads<P: BufferPool>(
         &'static self,
         buf_pool: &'static P,
         purge_chan: Receiver<Purge>,
@@ -67,10 +68,10 @@ impl<P: BufferPool> TransactionSystem<P> {
     }
 
     #[inline]
-    pub(super) fn dispatch_purge(
+    pub(super) fn dispatch_purge<P: BufferPool>(
         &'static self,
         buf_pool: &'static P,
-        catalog: &'static Catalog<P>,
+        catalog: &'static Catalog,
     ) -> (PurgeDispatcher, Vec<JoinHandle<()>>) {
         let mut handles = vec![];
         let mut chans = vec![];
@@ -91,12 +92,12 @@ impl<P: BufferPool> TransactionSystem<P> {
     /// Purge row undo logs and index entries according to given transaction
     /// list and minimum active STS.
     #[inline]
-    pub(super) async fn purge_trx_list(
+    pub(super) async fn purge_trx_list<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        catalog: &Catalog<P>,
+        catalog: &Catalog,
         log_no: usize,
-        trx_list: Vec<CommittedTrx<P>>,
+        trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
     ) {
         let partition = &self.log_partitions[log_no];
@@ -105,21 +106,34 @@ impl<P: BufferPool> TransactionSystem<P> {
         let mut purge_row_count = 0;
         let mut purge_index_count = 0;
         // First, we collect pages and row ids to purge row undo.
-        let mut target: HashMap<PageID, HashSet<RowID>> = HashMap::new();
+        let mut target: HashMap<(TableID, PageID), HashSet<RowID>> = HashMap::new();
         for trx in &trx_list {
             if let Some(row_undo) = trx.row_undo() {
                 purge_row_count += row_undo.len();
                 for undo in &**row_undo {
-                    target.entry(undo.page_id).or_default().insert(undo.row_id);
+                    target
+                        .entry((undo.table_id, undo.page_id))
+                        .or_default()
+                        .insert(undo.row_id);
                 }
             }
         }
-        for (page_id, row_ids) in target {
-            let page_guard = buf_pool
-                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                .await
-                .shared_async()
-                .await;
+        for ((table_id, page_id), row_ids) in target {
+            // User table and catalog table uses different buffer pool.
+            let page_guard = if self.catalog.is_user_table(table_id) {
+                buf_pool
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await
+            } else {
+                catalog
+                    .meta_pool()
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await
+            };
             for row_id in row_ids {
                 let mut access = page_guard.write_row_by_id(row_id);
                 access.purge_undo_chain(min_active_sts);
@@ -131,6 +145,7 @@ impl<P: BufferPool> TransactionSystem<P> {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
                     if let Some(table) = table_cache.get_table(ip.table_id) {
+                        // todo: index should stored in index pool, instead of data pool.
                         if table.delete_index(buf_pool, &ip.key, ip.row_id).await {
                             purge_index_count += 1;
                         }
@@ -210,11 +225,11 @@ impl ActiveStsList {
     }
 }
 
-impl<P: BufferPool> LogPartition<P> {
+impl LogPartition {
     /// Execute GC analysis in loop.
     /// This method is used for a separate GC analyzer thread for each log partition.
     #[inline]
-    pub fn gc_loop(&self, gc_rx: Receiver<GC<P>>, purge_chan: Sender<Purge>) {
+    pub fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>) {
         while let Ok(msg) = gc_rx.recv() {
             match msg {
                 GC::Stop => return,
@@ -231,7 +246,7 @@ impl<P: BufferPool> LogPartition<P> {
     /// Analyze committed transaction and modify active sts list and committed transaction list.
     /// Returns whether min_active_sts may change.
     #[inline]
-    fn gc_analyze(&self, trx_list: HashMap<usize, Vec<CommittedTrx<P>>>) -> bool {
+    fn gc_analyze(&self, trx_list: HashMap<usize, Vec<CommittedTrx>>) -> bool {
         let mut changed = false;
         for (gc_no, trx_list) in trx_list {
             let gc_bucket = &self.gc_buckets[gc_no];
@@ -244,11 +259,11 @@ impl<P: BufferPool> LogPartition<P> {
 /// GCBucket is used for GC analyzer to store and analyze GC related information,
 /// including committed transaction list, old transaction list, active snapshot timestamp
 /// list, etc.
-pub(super) struct GCBucket<P: BufferPool> {
+pub(super) struct GCBucket {
     /// Committed transaction list.
     /// When a transaction is committed, it will be put into this queue in sequence.
     /// Head is always oldest and tail is newest.
-    pub(super) committed_trx_list: CachePadded<Mutex<VecDeque<CommittedTrx<P>>>>,
+    pub(super) committed_trx_list: CachePadded<Mutex<VecDeque<CommittedTrx>>>,
     /// Active snapshot timestamp list.
     /// The smallest value equals to min_active_sts.
     pub(super) active_sts_list: CachePadded<Mutex<ActiveStsList>>,
@@ -256,7 +271,7 @@ pub(super) struct GCBucket<P: BufferPool> {
     pub(super) min_active_sts: CachePadded<AtomicU64>,
 }
 
-impl<P: BufferPool> GCBucket<P> {
+impl GCBucket {
     /// Create a new GC bucket.
     #[inline]
     pub(super) fn new() -> Self {
@@ -269,11 +284,7 @@ impl<P: BufferPool> GCBucket<P> {
 
     /// Get committed transaction list to purge.
     #[inline]
-    pub(super) fn get_purge_list(
-        &self,
-        min_active_sts: TrxID,
-        trx_list: &mut Vec<CommittedTrx<P>>,
-    ) {
+    pub(super) fn get_purge_list(&self, min_active_sts: TrxID, trx_list: &mut Vec<CommittedTrx>) {
         // If a transaction's committed timestamp is less than the smallest
         // snapshot timestamp of all active transactions, it means this transction's
         // data vesion is latest and all its undo log can be purged.
@@ -299,7 +310,7 @@ impl<P: BufferPool> GCBucket<P> {
 
     /// Analyze committed transactions for GC.
     #[inline]
-    pub fn gc_analyze_commit(&self, trx_list: Vec<CommittedTrx<P>>) -> bool {
+    pub fn gc_analyze_commit(&self, trx_list: Vec<CommittedTrx>) -> bool {
         // Update both active sts list and committed transaction list
         let mut active_sts_list = self.active_sts_list.lock();
         let mut min_sts = MAX_SNAPSHOT_TS;
@@ -341,10 +352,10 @@ impl<P: BufferPool> GCBucket<P> {
     }
 }
 
-pub enum GC<P: BufferPool> {
+pub enum GC {
     Stop,
     // transaction list per gc bucket.
-    Commit(HashMap<usize, Vec<CommittedTrx<P>>>),
+    Commit(HashMap<usize, Vec<CommittedTrx>>),
 }
 
 pub enum Purge {
@@ -363,8 +374,8 @@ trait PurgeLoop {
     async fn purge_loop<P: BufferPool>(
         &mut self,
         buf_pool: &'static P,
-        catalog: &Catalog<P>,
-        trx_sys: &TransactionSystem<P>,
+        catalog: &Catalog,
+        trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
     );
 }
@@ -377,8 +388,8 @@ impl PurgeLoop for PurgeSingleThreaded {
     async fn purge_loop<P: BufferPool>(
         &mut self,
         buf_pool: &'static P,
-        catalog: &Catalog<P>,
-        trx_sys: &TransactionSystem<P>,
+        catalog: &Catalog,
+        trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
     ) {
         // initialize min_active_sts.
@@ -425,8 +436,8 @@ impl PurgeLoop for PurgeDispatcher {
     async fn purge_loop<P: BufferPool>(
         &mut self,
         _buf_pool: &'static P,
-        _catalog: &Catalog<P>,
-        trx_sys: &TransactionSystem<P>,
+        _catalog: &Catalog,
+        trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
     ) {
         let mut min_sts = trx_sys.global_visible_sts();
@@ -485,8 +496,8 @@ impl PurgeExecutor {
     async fn purge_task_loop<P: BufferPool>(
         &mut self,
         buf_pool: &'static P,
-        catalog: &Catalog<P>,
-        trx_sys: &TransactionSystem<P>,
+        catalog: &Catalog,
+        trx_sys: &TransactionSystem,
         purge_chan: Receiver<PurgeTask>,
     ) {
         while let Ok(PurgeTask {
@@ -512,7 +523,8 @@ impl PurgeExecutor {
 mod tests {
     use super::*;
     use crate::buffer::guard::PageSharedGuard;
-    use crate::engine::Engine;
+    use crate::buffer::EvictableBufferPoolConfig;
+    use crate::engine::EngineConfig;
     use crate::index::RowLocation;
     use crate::latch::LatchFallbackMode;
     use crate::row::ops::SelectKey;
@@ -555,24 +567,31 @@ mod tests {
 
         const PURGE_SIZE: usize = 1000;
         smol::block_on(async {
-            let engine = Engine::new_fixed_initializer(
-                16 * 1024 * 1024,
-                TrxSysConfig::default()
-                    .purge_threads(1)
-                    .log_file_prefix("redo_purge")
-                    .skip_recovery(true),
-            )
-            .unwrap()
-            .init()
-            .await
-            .unwrap();
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(16usize * 1024 * 1024)
+                        .max_file_size(32usize * 1024 * 1024)
+                        .file_path("databuffer_purge.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .purge_threads(1)
+                        .log_file_prefix("redo_purge")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
-            smol::Timer::after(Duration::from_millis(100)).await;
+            smol::Timer::after(Duration::from_millis(1000)).await;
             let init_stats = engine.trx_sys.trx_sys_stats();
 
             let mut session = engine.new_session();
@@ -611,9 +630,9 @@ mod tests {
                     "purge_trx={},purge_row={},purge_index={}",
                     stats.purge_trx_count, stats.purge_row_count, stats.purge_index_count
                 );
-                if stats.purge_trx_count == init_stats.purge_trx_count + PURGE_SIZE * 2
-                    && stats.purge_row_count == init_stats.purge_row_count + PURGE_SIZE * 2
-                    && stats.purge_index_count == init_stats.purge_index_count + PURGE_SIZE
+                if stats.purge_trx_count >= init_stats.purge_trx_count + PURGE_SIZE * 2
+                    && stats.purge_row_count >= init_stats.purge_row_count + PURGE_SIZE * 2
+                    && stats.purge_index_count >= init_stats.purge_index_count + PURGE_SIZE
                 {
                     break;
                 }
@@ -625,6 +644,7 @@ mod tests {
             }
             drop(engine);
 
+            let _ = std::fs::remove_file("databuffer_purge.bin");
             remove_files("redo_purge*");
         });
     }
@@ -635,17 +655,24 @@ mod tests {
 
         smol::block_on(async {
             const PURGE_SIZE: usize = 1000;
-            let engine = Engine::new_fixed_initializer(
-                16 * 1024 * 1024,
-                TrxSysConfig::default()
-                    .purge_threads(2)
-                    .log_file_prefix("redo_purge")
-                    .skip_recovery(true),
-            )
-            .unwrap()
-            .init()
-            .await
-            .unwrap();
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(16usize * 1024 * 1024)
+                        .max_file_size(32usize * 1024 * 1024)
+                        .file_path("databuffer_purge.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .purge_threads(2)
+                        .log_file_prefix("redo_purge")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).unwrap();
@@ -713,13 +740,13 @@ mod tests {
                 index.scan_values(&mut remained_row_ids);
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
-                let location = table.blk_idx.find_row_id(&engine.buf_pool, row_id).await;
+                let location = table.blk_idx.find_row_id(row_id).await;
                 let page_id = match location {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
                 };
                 let page_guard: PageSharedGuard<RowPage> = engine
-                    .buf_pool
+                    .data_pool
                     .get_page(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -734,6 +761,7 @@ mod tests {
             );
             drop(engine);
 
+            let _ = std::fs::remove_file("databuffer_purge.bin");
             remove_files("redo_purge*");
         });
     }

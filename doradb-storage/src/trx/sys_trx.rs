@@ -1,5 +1,4 @@
 use crate::buffer::page::PageID;
-use crate::buffer::BufferPool;
 use crate::row::RowID;
 use crate::serde::{LenPrefixPod, SerdeCtx};
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
@@ -36,7 +35,7 @@ impl SysTrx {
 
     /// Prepare this transaction for commit.
     #[inline]
-    pub fn prepare<P: BufferPool>(mut self) -> PreparedTrx<P> {
+    pub fn prepare(mut self) -> PreparedTrx {
         let redo_bin = if self.redo.is_empty() {
             None
         } else {

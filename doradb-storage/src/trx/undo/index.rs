@@ -1,6 +1,4 @@
-use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
-use crate::index::IndexCompareExchange;
 use crate::row::ops::SelectKey;
 use crate::row::RowID;
 use crate::table::TableID;
@@ -40,7 +38,7 @@ impl IndexUndoLogs {
     /// because other transaction can not update the same index entry
     /// concurrently.
     #[inline]
-    pub fn rollback<P: BufferPool>(&mut self, catalog: &Catalog<P>) {
+    pub fn rollback(&mut self, catalog: &Catalog) {
         while let Some(entry) = self.0.pop() {
             let table = catalog.get_table(entry.table_id).unwrap();
             match entry.kind {

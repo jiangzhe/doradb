@@ -1,5 +1,6 @@
 use crate::catalog::ROW_ID_COL_NAME;
 use crate::row::ops::{SelectKey, UpdateCol};
+use crate::row::{Row, RowRead};
 use crate::value::{Layout, Val, ValKind, ValType};
 use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexSpec};
 use semistr::SemiStr;
@@ -137,6 +138,22 @@ impl TableMetadata {
                     .index_cols
                     .iter()
                     .map(|k| row[k.col_no as usize].clone())
+                    .collect();
+                SelectKey { index_no, vals }
+            })
+            .collect()
+    }
+
+    #[inline]
+    pub fn keys_for_delete(&self, row: Row<'_>) -> Vec<SelectKey> {
+        self.index_specs
+            .iter()
+            .enumerate()
+            .map(|(index_no, is)| {
+                let vals: Vec<Val> = is
+                    .index_cols
+                    .iter()
+                    .map(|k| row.clone_user_val(&self, k.col_no as usize))
                     .collect();
                 SelectKey { index_no, vals }
             })

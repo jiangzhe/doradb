@@ -1,5 +1,4 @@
 use crate::buffer::page::PageID;
-use crate::buffer::BufferPool;
 use crate::catalog::storage::{
     ColumnObject, IndexColumnObject, IndexObject, SchemaObject, TableObject,
 };
@@ -24,9 +23,9 @@ pub enum StmtKind {
     CreateTable(SchemaID, TableSpec),
 }
 
-pub struct Statement<P: BufferPool> {
+pub struct Statement {
     // Transaction it belongs to.
-    pub trx: ActiveTrx<P>,
+    pub trx: ActiveTrx,
     // statement-level undo logs of row data.
     pub row_undo: RowUndoLogs,
     // statement-level index undo operations.
@@ -35,10 +34,10 @@ pub struct Statement<P: BufferPool> {
     pub redo: RedoLogs,
 }
 
-impl<P: BufferPool> Statement<P> {
+impl Statement {
     /// Create a new statement.
     #[inline]
-    pub fn new(trx: ActiveTrx<P>) -> Self {
+    pub fn new(trx: ActiveTrx) -> Self {
         Statement {
             trx,
             row_undo: RowUndoLogs::empty(),
@@ -58,7 +57,7 @@ impl<P: BufferPool> Statement<P> {
     /// Succeed current statement and return transaction it belongs to.
     /// All undo and redo logs it holds will be merged into transaction buffer.
     #[inline]
-    pub fn succeed(mut self) -> ActiveTrx<P> {
+    pub fn succeed(mut self) -> ActiveTrx {
         self.trx.row_undo.merge(&mut self.row_undo);
         self.trx.index_undo.merge(&mut self.index_undo);
         self.trx.redo.merge(mem::take(&mut self.redo));
@@ -69,11 +68,11 @@ impl<P: BufferPool> Statement<P> {
     /// This will trigger statement-level rollback based on its undo.
     /// Redo logs will be discarded.
     #[inline]
-    pub async fn fail(mut self) -> ActiveTrx<P> {
+    pub async fn fail(mut self) -> ActiveTrx {
         // rollback row data.
         // todo: group by page level may be better.
         let engine = self.trx.engine_weak().unwrap();
-        self.row_undo.rollback(engine.buf_pool).await;
+        self.row_undo.rollback(engine.data_pool).await;
         // rollback index data.
         self.index_undo.rollback(&engine.catalog());
         // clear redo logs.
@@ -105,7 +104,7 @@ impl<P: BufferPool> Statement<P> {
             .catalog()
             .storage
             .schemas()
-            .find_uncommitted_by_name(&engine.buf_pool, schema_name)
+            .find_uncommitted_by_name(schema_name)
             .await
             .is_some()
         {
@@ -125,7 +124,7 @@ impl<P: BufferPool> Statement<P> {
             .catalog()
             .storage
             .schemas()
-            .insert(&engine.buf_pool, self, &schema_object)
+            .insert(self, &schema_object)
             .await;
         if !inserted {
             return Err(Error::SchemaAlreadyExists);
@@ -157,7 +156,7 @@ impl<P: BufferPool> Statement<P> {
             .catalog()
             .storage
             .schemas()
-            .find_uncommitted_by_id(&engine.buf_pool, schema_id)
+            .find_uncommitted_by_id(schema_id)
             .await
             .is_none()
         {
@@ -169,7 +168,7 @@ impl<P: BufferPool> Statement<P> {
             .catalog()
             .storage
             .tables()
-            .find_uncommitted_by_name(&engine.buf_pool, schema_id, &table_spec.table_name)
+            .find_uncommitted_by_name(schema_id, &table_spec.table_name)
             .await
             .is_some()
         {
@@ -178,11 +177,10 @@ impl<P: BufferPool> Statement<P> {
 
         // Prepare table object
         let table_id = engine.catalog().next_obj_id();
-        let mut table_object = TableObject {
+        let table_object = TableObject {
             table_id,
             table_name: table_spec.table_name.clone(),
             schema_id,
-            block_index_root_page: u64::MAX,
         };
         let row_id_spec = row_id_spec();
 
@@ -226,14 +224,24 @@ impl<P: BufferPool> Statement<P> {
 
         let mut table_cache_g = engine.catalog().cache.tables.write();
 
-        // Insert column objects, index objects, index column objects, and finally table object.
+        // Insert table object, column objects, index objects, index column objects.
+
+        let inserted = engine
+            .catalog()
+            .storage
+            .tables()
+            .insert(self, &table_object)
+            .await;
+        if !inserted {
+            return Err(Error::TableAlreadyExists);
+        }
 
         for column_object in column_objects {
             let inserted = engine
                 .catalog()
                 .storage
                 .columns()
-                .insert(&engine.buf_pool, self, &column_object)
+                .insert(self, &column_object)
                 .await;
             debug_assert!(inserted);
         }
@@ -242,7 +250,7 @@ impl<P: BufferPool> Statement<P> {
                 .catalog()
                 .storage
                 .indexes()
-                .insert(&engine.buf_pool, self, &index_object)
+                .insert(self, &index_object)
                 .await;
             debug_assert!(inserted);
         }
@@ -251,27 +259,14 @@ impl<P: BufferPool> Statement<P> {
                 .catalog()
                 .storage
                 .index_columns()
-                .insert(&engine.buf_pool, self, &index_column_object)
+                .insert(self, &index_column_object)
                 .await;
             debug_assert!(inserted);
         }
 
         // Prepare in-memory representation of new table
         let table_metadata = TableMetadata::new(table_spec.columns, index_specs);
-        let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, table_id).await;
-        let block_index_root_page: u64 = blk_idx.root_page();
-        table_object.block_index_root_page = block_index_root_page;
-
-        let inserted = engine
-            .catalog()
-            .storage
-            .tables()
-            .insert(&engine.buf_pool, self, &table_object)
-            .await;
-        if !inserted {
-            return Err(Error::TableAlreadyExists);
-        }
-
+        let blk_idx = BlockIndex::new(engine.meta_pool, table_id).await;
         let table = Table::new(blk_idx, table_metadata);
         // Enable page committer so all row pages can be recovered.
         table
@@ -293,38 +288,40 @@ impl<P: BufferPool> Statement<P> {
 
     /// Insert a row into a table.
     #[inline]
-    pub async fn insert_row(&mut self, table: &Table<P>, cols: Vec<Val>) -> InsertMvcc {
+    pub async fn insert_row(&mut self, table: &Table, cols: Vec<Val>) -> InsertMvcc {
         let engine = self.trx.engine_weak().unwrap();
-        table.insert_row(&engine.buf_pool, self, cols).await
+        table.insert_row(engine.data_pool, self, cols).await
     }
 
     #[inline]
-    pub async fn delete_row(&mut self, table: &Table<P>, key: &SelectKey) -> DeleteMvcc {
+    pub async fn delete_row(&mut self, table: &Table, key: &SelectKey) -> DeleteMvcc {
         let engine = self.trx.engine_weak().unwrap();
-        table.delete_row(&engine.buf_pool, self, key).await
+        table.delete_row(engine.data_pool, self, key, false).await
     }
 
     #[inline]
     pub async fn select_row_mvcc(
         &self,
-        table: &Table<P>,
+        table: &Table,
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> SelectMvcc {
         let engine = self.trx.engine_weak().unwrap();
         table
-            .select_row_mvcc(&engine.buf_pool, self, key, user_read_set)
+            .select_row_mvcc(engine.data_pool, self, key, user_read_set)
             .await
     }
 
     #[inline]
     pub async fn update_row(
         &mut self,
-        table: &Table<P>,
+        table: &Table,
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
         let engine = self.trx.engine_weak().unwrap();
-        table.update_row(&engine.buf_pool, self, key, update).await
+        table
+            .update_row(engine.data_pool, self, key, update, false)
+            .await
     }
 }

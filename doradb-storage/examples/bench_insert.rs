@@ -8,8 +8,8 @@ use doradb_catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableSpec,
 };
 use doradb_datatype::{Collation, PreciseType};
-use doradb_storage::buffer::BufferPool;
-use doradb_storage::engine::Engine;
+use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig};
+use doradb_storage::engine::{Engine, EngineConfig};
 use doradb_storage::table::TableID;
 use doradb_storage::trx::log::LogSync;
 use doradb_storage::trx::sys_conf::TrxSysConfig;
@@ -31,23 +31,31 @@ fn main() {
     smol::block_on(async {
         let args = Args::parse();
 
-        let engine = Engine::new_fixed_initializer(
-            args.buffer_pool_size,
-            TrxSysConfig::default()
-                .log_file_prefix(args.log_file_prefix.to_string())
-                .log_partitions(args.log_partitions)
-                .io_depth_per_log(args.io_depth_per_log)
-                .log_file_max_size(args.log_file_max_size)
-                .log_sync(args.log_sync)
-                .max_io_size(args.max_io_size)
-                .purge_threads(args.purge_threads)
-                .skip_recovery(true),
-        )
-        .unwrap()
-        .init()
-        .await
-        .unwrap();
-        println!("buffer pool size is {}", engine.buf_pool.size());
+        let engine = EngineConfig::default()
+            .meta_buffer(64usize * 1024 * 1024)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(2usize * 1024 * 1024 * 1024)
+                    .max_file_size(3usize * 1024 * 1024 * 1024)
+                    .file_path("databuffer_bench2.bin"),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_prefix(args.log_file_prefix.to_string())
+                    .log_partitions(args.log_partitions)
+                    .io_depth_per_log(args.io_depth_per_log)
+                    .log_file_max_size(args.log_file_max_size)
+                    .log_sync(args.log_sync)
+                    .max_io_size(args.max_io_size)
+                    .purge_threads(args.purge_threads)
+                    .skip_recovery(true),
+            )
+            .build()
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
+        println!("buffer pool size is {}", engine.data_pool.capacity());
 
         let table_id = sbtest(&engine).await;
         // start benchmark
@@ -141,12 +149,14 @@ fn main() {
             );
         }
         drop(engine);
+
+        let _ = std::fs::remove_file("databuffer_bench1.bin");
     })
 }
 
 #[inline]
-async fn worker<P: BufferPool>(
-    engine: Engine<P>,
+async fn worker(
+    engine: Engine,
     table_id: TableID,
     id_start: i32,
     id_step: i32,
@@ -242,7 +252,7 @@ fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
 }
 
 #[inline]
-pub(crate) async fn db1<P: BufferPool>(engine: &Engine<P>) -> SchemaID {
+pub(crate) async fn db1(engine: &Engine) -> SchemaID {
     let session = engine.new_session();
     let trx = session.begin_trx();
     let mut stmt = trx.start_stmt();
@@ -257,7 +267,7 @@ pub(crate) async fn db1<P: BufferPool>(engine: &Engine<P>) -> SchemaID {
 
 /// Sbtest is target table of sysbench.
 #[inline]
-pub async fn sbtest<P: BufferPool>(engine: &Engine<P>) -> TableID {
+pub async fn sbtest(engine: &Engine) -> TableID {
     let schema_id = db1(engine).await;
 
     let session = engine.new_session();

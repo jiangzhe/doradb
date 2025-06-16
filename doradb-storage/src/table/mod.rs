@@ -9,8 +9,8 @@ use crate::catalog::TableMetadata;
 use crate::index::{BlockIndex, IndexCompareExchange, RowLocation, SecondaryIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, InsertMvcc, InsertRow, LinkForUniqueIndex, ReadRow, Recover,
-    RecoverIndex, SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
+    DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex,
+    SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
 };
 use crate::row::{estimate_max_row_count, var_len_for_insert, Row, RowID, RowPage, RowRead};
 use crate::stmt::Statement;
@@ -22,7 +22,7 @@ use crate::trx::undo::{
 use crate::trx::TrxID;
 use crate::value::{Val, PAGE_VAR_LEN_INLINE};
 use doradb_catalog::IndexSpec;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 
@@ -62,16 +62,16 @@ pub use doradb_catalog::TableID;
 /// Additional key validation is performed if index lookup is used, because
 /// index does not contain version information, and out-of-date index entry
 /// should ignored if visible data version does not match index key.
-pub struct Table<P: BufferPool> {
+pub struct Table {
     pub metadata: Arc<TableMetadata>,
-    pub blk_idx: Arc<BlockIndex<P>>,
+    pub blk_idx: Arc<BlockIndex>,
     pub sec_idx: Arc<[SecondaryIndex]>,
 }
 
-impl<P: BufferPool> Table<P> {
+impl Table {
     /// Create a new table.
     #[inline]
-    pub fn new(blk_idx: BlockIndex<P>, metadata: TableMetadata) -> Self {
+    pub fn new(blk_idx: BlockIndex, metadata: TableMetadata) -> Self {
         let sec_idx: Vec<_> = metadata
             .index_specs
             .iter()
@@ -94,13 +94,16 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    pub async fn scan_rows_uncommitted<F>(&self, buf_pool: &'static P, mut row_action: F)
-    where
+    pub async fn scan_rows_uncommitted<P: BufferPool, F>(
+        &self,
+        buf_pool: &'static P,
+        mut row_action: F,
+    ) where
         F: for<'a> FnMut(Row<'a>) -> bool,
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let mut cursor = self.blk_idx.cursor(buf_pool).seek(0).await;
+        let mut cursor = self.blk_idx.cursor().seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.shared_async().await;
             debug_assert!(g.page().is_leaf());
@@ -125,10 +128,10 @@ impl<P: BufferPool> Table<P> {
     /// Select row with unique index with MVCC.
     /// Result should be no more than one row.
     #[inline]
-    pub async fn select_row_mvcc(
+    pub async fn select_row_mvcc<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &Statement<P>,
+        stmt: &Statement,
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> SelectMvcc {
@@ -149,7 +152,7 @@ impl<P: BufferPool> Table<P> {
                 .lookup(&key.vals)
             {
                 None => return SelectMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row_id(buf_pool, row_id).await {
+                Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
                     RowLocation::NotFound => return SelectMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -179,7 +182,7 @@ impl<P: BufferPool> Table<P> {
 
     /// Select row with unique index in uncommitted mode.
     #[inline]
-    pub async fn select_row_uncommitted<R, F>(
+    pub async fn select_row_uncommitted<P: BufferPool, R, F>(
         &self,
         buf_pool: &'static P,
         key: &SelectKey,
@@ -198,7 +201,7 @@ impl<P: BufferPool> Table<P> {
                 .lookup(&key.vals)
             {
                 None => return None,
-                Some(row_id) => match self.blk_idx.find_row_id(buf_pool, row_id).await {
+                Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
                     RowLocation::NotFound => return None,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -233,10 +236,10 @@ impl<P: BufferPool> Table<P> {
     /// Insert row with MVCC.
     /// This method will also take care of index update.
     #[inline]
-    pub async fn insert_row(
+    pub async fn insert_row<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         cols: Vec<Val>,
     ) -> InsertMvcc {
         debug_assert!(cols.len() + 1 == self.metadata.col_count());
@@ -270,10 +273,72 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    pub async fn insert_index(
+    pub async fn insert_row_no_trx<P: BufferPool>(&self, buf_pool: &'static P, user_cols: &[Val]) {
+        debug_assert!(user_cols.len() + 1 == self.metadata.col_count());
+        debug_assert!({
+            user_cols
+                .iter()
+                .enumerate()
+                .all(|(idx, val)| self.metadata.user_col_type_match(idx, val))
+        });
+        // prepare index keys.
+        let keys = self.metadata.keys_for_insert(user_cols);
+        // calculate row length.
+        let row_len = row_len(&self.metadata, user_cols);
+        // estimate max row count for insert page.
+        let row_count = estimate_max_row_count(row_len, self.metadata.col_count());
+        loop {
+            // acquire insert page from block index.
+            let mut page_guard = self
+                .blk_idx
+                .get_insert_page_exclusive(buf_pool, row_count, &self.metadata)
+                .await;
+            let page = page_guard.page_mut();
+            debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
+            debug_assert!(user_cols.len() + 1 == page.header.col_count as usize);
+            let var_len = var_len_for_insert(&self.metadata, user_cols);
+            let (row_idx, var_offset) =
+                if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
+                    (row_idx, var_offset)
+                } else {
+                    // we just ignore this page and retry.
+                    continue;
+                };
+            let row_id = page.header.start_row_id + row_idx as RowID;
+            let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
+            debug_assert!(row.is_deleted());
+            for (user_col_idx, user_col) in user_cols.iter().enumerate() {
+                row.update_user_col(user_col_idx, user_col, false);
+            }
+            // update index
+            for key in keys {
+                self.insert_index_no_trx(key, row_id).await;
+            }
+            row.finish_insert();
+            // Cache insert page.
+            self.blk_idx.cache_exclusive_insert_page(page_guard);
+            return;
+        }
+    }
+
+    #[inline]
+    async fn insert_index_no_trx(&self, key: SelectKey, row_id: RowID) {
+        if self.metadata.index_specs[key.index_no].unique() {
+            let res = self.sec_idx[key.index_no]
+                .unique()
+                .unwrap()
+                .insert(&key.vals, row_id);
+            assert!(res.is_none());
+        } else {
+            todo!()
+        }
+    }
+
+    #[inline]
+    pub async fn insert_index<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
@@ -288,7 +353,7 @@ impl<P: BufferPool> Table<P> {
 
     /// Recover row insert from redo log.
     #[inline]
-    pub async fn recover_row_insert(
+    pub async fn recover_row_insert<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         page_id: PageID,
@@ -361,7 +426,7 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    pub async fn recover_index_insert(
+    pub async fn recover_index_insert<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         key: SelectKey,
@@ -387,7 +452,7 @@ impl<P: BufferPool> Table<P> {
 
     /// Recover row update.
     #[inline]
-    pub async fn recover_row_update(
+    pub async fn recover_row_update<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         page_id: PageID,
@@ -534,7 +599,7 @@ impl<P: BufferPool> Table<P> {
 
     /// Recover row delete.
     #[inline]
-    pub async fn recover_row_delete(
+    pub async fn recover_row_delete<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         page_id: PageID,
@@ -616,13 +681,17 @@ impl<P: BufferPool> Table<P> {
     /// Update row with MVCC.
     /// This method is for update based on unique index lookup.
     /// It also takes care of index change.
+    ///
+    /// If parameter disable_inplace is set to true, update will be
+    /// converted to delete+insert.
     #[inline]
-    pub async fn update_row(
+    pub async fn update_row<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         key: &SelectKey,
         update: Vec<UpdateCol>,
+        disable_inplace: bool,
     ) -> UpdateMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata.index_specs[key.index_no].unique());
@@ -631,7 +700,7 @@ impl<P: BufferPool> Table<P> {
         let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
                 None => return UpdateMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row_id(buf_pool, row_id).await {
+                Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
                     RowLocation::NotFound => return UpdateMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -647,6 +716,9 @@ impl<P: BufferPool> Table<P> {
                 },
             }
         };
+        if disable_inplace {
+            todo!()
+        }
         let res = self
             .update_row_inplace(stmt, page_guard, key, row_id, update)
             .await;
@@ -717,12 +789,19 @@ impl<P: BufferPool> Table<P> {
 
     /// Delete row with MVCC.
     /// This method is for delete based on unique index lookup.
+    ///
+    /// If the parameter log_by_key is set to true, the delete operation
+    /// is logged with (unique) key instead of row id.
+    /// Such type of log is used for catalog tables, which will have
+    /// inconsistent page_id/row_id among multiple restarts(recoveries)
+    /// of database.
     #[inline]
-    pub async fn delete_row(
+    pub async fn delete_row<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         key: &SelectKey,
+        log_by_key: bool,
     ) -> DeleteMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata.index_specs[key.index_no].unique());
@@ -731,7 +810,7 @@ impl<P: BufferPool> Table<P> {
         let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
                 None => return DeleteMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row_id(buf_pool, row_id).await {
+                Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -748,7 +827,7 @@ impl<P: BufferPool> Table<P> {
             }
         };
         match self
-            .delete_row_internal(stmt, page_guard, row_id, key)
+            .delete_row_internal(stmt, page_guard, row_id, key, log_by_key)
             .await
         {
             DeleteInternal::NotFound => DeleteMvcc::NotFound,
@@ -762,6 +841,50 @@ impl<P: BufferPool> Table<P> {
         }
     }
 
+    #[inline]
+    pub async fn delete_row_no_trx<P: BufferPool>(&self, buf_pool: &'static P, key: &SelectKey) {
+        debug_assert!(key.index_no < self.sec_idx.len());
+        debug_assert!(self.metadata.index_specs[key.index_no].unique());
+        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
+        let index = self.sec_idx[key.index_no].unique().unwrap();
+        let (mut page_guard, row_id) = match index.lookup(&key.vals) {
+            None => unreachable!(),
+            Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
+                RowLocation::NotFound => unreachable!(),
+                RowLocation::ColSegment(..) => todo!(),
+                RowLocation::RowPage(page_id) => {
+                    let page_guard = buf_pool
+                        .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+                        .await
+                        .exclusive_async()
+                        .await;
+                    (page_guard, row_id)
+                }
+            },
+        };
+        let page = page_guard.page_mut();
+        let row_idx = page.row_idx(row_id);
+        debug_assert!(!page.is_deleted(row_idx));
+        let row = page.row(row_idx);
+        let keys = self.metadata.keys_for_delete(row);
+        // delete index immediately.
+        for key in keys {
+            let res = self.delete_index_directly(&key, row_id).await;
+            assert!(res);
+        }
+        page.set_deleted_exclusive(row_idx, true);
+    }
+
+    #[inline]
+    async fn delete_index_directly(&self, key: &SelectKey, row_id: RowID) -> bool {
+        let index_schema = &self.metadata.index_specs[key.index_no];
+        if index_schema.unique() {
+            let index = self.sec_idx[key.index_no].unique().unwrap();
+            return index.compare_delete(&key.vals, row_id);
+        }
+        todo!()
+    }
+
     /// Delete index by purge threads.
     /// This method will be only called by internal threads and don't maintain
     /// transaction properties.
@@ -773,7 +896,12 @@ impl<P: BufferPool> Table<P> {
     /// key is not found on the path of undo chain, it means the index entry can be
     /// removed.
     #[inline]
-    pub async fn delete_index(&self, buf_pool: &'static P, key: &SelectKey, row_id: RowID) -> bool {
+    pub async fn delete_index<P: BufferPool>(
+        &self,
+        buf_pool: &'static P,
+        key: &SelectKey,
+        row_id: RowID,
+    ) -> bool {
         // todo: consider index drop.
         let index_schema = &self.metadata.index_specs[key.index_no];
         if index_schema.unique() {
@@ -784,7 +912,7 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    async fn delete_unique_index(
+    async fn delete_unique_index<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         index: &dyn UniqueIndex,
@@ -801,7 +929,7 @@ impl<P: BufferPool> Table<P> {
                         // So we skip to delete it.
                         return false;
                     }
-                    match self.blk_idx.find_row_id(buf_pool, row_id).await {
+                    match self.blk_idx.find_row_id(row_id).await {
                         RowLocation::NotFound => {
                             return index.compare_delete(&key.vals, row_id);
                         }
@@ -833,10 +961,10 @@ impl<P: BufferPool> Table<P> {
     /// Move update is similar to a delete+insert.
     /// It's caused by no more space on current row page.
     #[inline]
-    async fn move_update_for_space(
+    async fn move_update_for_space<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         old_row: Vec<(Val, Option<u16>)>,
         update: Vec<UpdateCol>,
         old_id: RowID,
@@ -899,10 +1027,10 @@ impl<P: BufferPool> Table<P> {
     /// We need to find the key-match version, and can link new row
     /// to it.
     #[inline]
-    async fn link_for_unique_index(
+    async fn link_for_unique_index<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &Statement<P>,
+        stmt: &Statement,
         old_id: RowID,
         key: &SelectKey,
         new_id: RowID,
@@ -910,7 +1038,7 @@ impl<P: BufferPool> Table<P> {
     ) -> LinkForUniqueIndex {
         debug_assert!(old_id != new_id);
         let (old_guard, old_id) = loop {
-            match self.blk_idx.find_row_id(buf_pool, old_id).await {
+            match self.blk_idx.find_row_id(old_id).await {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::ColSegment(..) => todo!(),
                 RowLocation::RowPage(page_id) => {
@@ -943,10 +1071,10 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    async fn insert_row_internal(
+    async fn insert_row_internal<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
         mut move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
@@ -977,7 +1105,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     fn insert_row_to_page(
         &self,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         page_guard: PageSharedGuard<RowPage>,
         insert: Vec<Val>,
         undo_kind: RowUndoKind,
@@ -1071,7 +1199,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn update_row_inplace(
         &self,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         page_guard: PageSharedGuard<RowPage>,
         key: &SelectKey,
         row_id: RowID,
@@ -1196,10 +1324,11 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn delete_row_internal(
         &self,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         page_guard: PageSharedGuard<RowPage>,
         row_id: RowID,
         key: &SelectKey,
+        log_by_key: bool,
     ) -> DeleteInternal {
         let page_id = page_guard.page_id();
         let page = page_guard.page();
@@ -1220,14 +1349,18 @@ impl<P: BufferPool> Table<P> {
                 access.delete_row();
                 // update LOCK entry to DELETE entry.
                 stmt.update_last_undo(RowUndoKind::Delete);
-                drop(access); // unlock row
+                drop(access); // unlock row.
                 drop(lock_row);
                 // hold page lock in order to update index later.
-                // create redo log
+                // create redo log.
                 let redo_entry = RowRedo {
                     page_id,
                     row_id,
-                    kind: RowRedoKind::Delete,
+                    kind: if log_by_key {
+                        RowRedoKind::DeleteByUniqueKey(key.clone())
+                    } else {
+                        RowRedoKind::Delete
+                    },
                 };
                 stmt.redo.insert_dml(self.table_id(), redo_entry);
                 DeleteInternal::Ok(page_guard)
@@ -1236,10 +1369,10 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    async fn get_insert_page(
+    async fn get_insert_page<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         row_count: usize,
     ) -> PageSharedGuard<RowPage> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
@@ -1265,7 +1398,7 @@ impl<P: BufferPool> Table<P> {
     #[inline]
     async fn lock_row_for_write<'a>(
         &self,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         page_guard: &'a PageSharedGuard<RowPage>,
         row_id: RowID,
         key: Option<&SelectKey>,
@@ -1321,10 +1454,10 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    async fn insert_unique_index(
+    async fn insert_unique_index<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
@@ -1406,7 +1539,7 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    async fn recover_unique_index_insert(
+    async fn recover_unique_index_insert<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         key: SelectKey,
@@ -1462,12 +1595,12 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    async fn find_recover_cts_for_row_id(
+    async fn find_recover_cts_for_row_id<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         row_id: RowID,
     ) -> Option<TrxID> {
-        match self.blk_idx.find_row_id(buf_pool, row_id).await {
+        match self.blk_idx.find_row_id(row_id).await {
             RowLocation::NotFound => None,
             RowLocation::ColSegment(..) => todo!(),
             RowLocation::RowPage(page_id) => {
@@ -1485,10 +1618,10 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    async fn update_indexes_only_key_change(
+    async fn update_indexes_only_key_change<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
         index_change_cols: &HashMap<usize, Val>,
@@ -1532,9 +1665,9 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    fn update_indexes_only_row_id_change<'a>(
+    fn update_indexes_only_row_id_change(
         &self,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         old_row_id: RowID,
         new_row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
@@ -1564,10 +1697,10 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    async fn update_indexes_may_both_change(
+    async fn update_indexes_may_both_change<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         old_row_id: RowID,
         new_row_id: RowID,
         index_change_cols: &HashMap<usize, Val>,
@@ -1625,9 +1758,9 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    fn defer_delete_indexes<'a>(
+    fn defer_delete_indexes(
         &self,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) {
@@ -1643,10 +1776,10 @@ impl<P: BufferPool> Table<P> {
         }
     }
 
-    async fn update_unique_index_key_and_row_id_change(
+    async fn update_unique_index_key_and_row_id_change<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         index: &dyn UniqueIndex,
         key: SelectKey,
         old_row_id: RowID,
@@ -1759,9 +1892,9 @@ impl<P: BufferPool> Table<P> {
     }
 
     #[inline]
-    fn update_unique_index_only_row_id_change<'a>(
+    fn update_unique_index_only_row_id_change(
         &self,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         index: &dyn UniqueIndex,
         key: SelectKey,
         old_row_id: RowID,
@@ -1785,10 +1918,10 @@ impl<P: BufferPool> Table<P> {
     /// In this scenario, we only need to insert pair of new key and row id
     /// into index. Keep old index entry as is.
     #[inline]
-    async fn update_unique_index_only_key_change(
+    async fn update_unique_index_only_key_change<P: BufferPool>(
         &self,
         buf_pool: &'static P,
-        stmt: &mut Statement<P>,
+        stmt: &mut Statement,
         index: &dyn UniqueIndex,
         new_key: SelectKey,
         row_id: RowID,
@@ -1878,7 +2011,11 @@ impl<P: BufferPool> Table<P> {
 
     /// Recover index with given page data.
     #[inline]
-    pub async fn populate_index_via_row_page(&self, buf_pool: &'static P, page_id: PageID) {
+    pub async fn populate_index_via_row_page<P: BufferPool>(
+        &self,
+        buf_pool: &'static P,
+        page_id: PageID,
+    ) {
         let page_guard = buf_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
@@ -1910,7 +2047,7 @@ impl<P: BufferPool> Table<P> {
     }
 }
 
-impl<P: BufferPool> Clone for Table<P> {
+impl Clone for Table {
     #[inline]
     fn clone(&self) -> Self {
         Table {

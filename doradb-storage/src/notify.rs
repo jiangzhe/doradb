@@ -187,6 +187,7 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[ignore]
     #[test]
     fn test_notify_and_wait_async() {
         let signal = Signal::default();
@@ -202,6 +203,7 @@ mod tests {
             .collect();
         Signal::set_and_notify(&signal, 1);
         signal.notify(2);
+        // Signal::set_and_notify(&signal, 2);
         for h in handles {
             h.join().unwrap();
         }

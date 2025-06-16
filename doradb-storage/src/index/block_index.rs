@@ -1,6 +1,6 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
-use crate::buffer::BufferPool;
+use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::error::{
     Error, Result, Validation,
@@ -12,7 +12,6 @@ use crate::trx::sys::TransactionSystem;
 use doradb_catalog::TableID;
 use either::Either::{Left, Right};
 use parking_lot::Mutex;
-use std::marker::PhantomData;
 use std::mem;
 
 pub const BLOCK_PAGE_SIZE: usize = PAGE_SIZE;
@@ -388,52 +387,31 @@ pub struct ColSegmentMeta {
 /// 2. table scan: traverse all column files and row pages to perform
 ///    full table scan.
 ///
-pub struct BlockIndex<P: BufferPool> {
+pub struct BlockIndex {
     pub table_id: TableID,
     root: PageID,
     insert_free_list: Mutex<Vec<PageID>>,
+    // Fixed buffer pool to hold block nodes.
+    pool: &'static FixedBufferPool,
     // Reference to storage engine,
     // used for committing new page.
-    page_committer: Mutex<Option<RedoLogPageCommitter<P>>>,
-    _marker: PhantomData<P>,
+    page_committer: Mutex<Option<RedoLogPageCommitter>>,
 }
 
-impl<P: BufferPool> BlockIndex<P> {
+impl BlockIndex {
     /// Create a new block index backed by buffer pool.
     #[inline]
-    pub async fn new(
-        buf_pool: &'static P,
-        trx_sys: &'static TransactionSystem<P>,
-        table_id: TableID,
-    ) -> Self {
-        let page_committer = RedoLogPageCommitter::new(trx_sys, table_id);
-        let mut g = buf_pool.allocate_page::<BlockNode>().await;
+    pub async fn new(pool: &'static FixedBufferPool, table_id: TableID) -> Self {
+        let mut g = pool.allocate_page::<BlockNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init_empty();
         BlockIndex {
             table_id,
             root: page_id,
-            insert_free_list: Mutex::new(Vec::with_capacity(64)),
-            page_committer: Mutex::new(Some(page_committer)),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Create a new block index by given page id.
-    /// This is used for specific table that require pre-defined
-    /// root page id such as catalog tables.
-    #[inline]
-    pub async fn new_with_page(mut g: PageExclusiveGuard<BlockNode>, table_id: TableID) -> Self {
-        let page_id = g.page_id();
-        let page = g.page_mut();
-        page.init_empty();
-        BlockIndex {
-            table_id,
-            root: page_id,
+            pool,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
             page_committer: Mutex::new(None),
-            _marker: PhantomData,
         }
     }
 
@@ -445,7 +423,7 @@ impl<P: BufferPool> BlockIndex<P> {
 
     /// Enable page committer by injecting transaction system for redo logging
     #[inline]
-    pub fn enable_page_committer(&self, trx_sys: &'static TransactionSystem<P>) {
+    pub fn enable_page_committer(&self, trx_sys: &'static TransactionSystem) {
         let mut g = self.page_committer.lock();
         *g = Some(RedoLogPageCommitter::new(trx_sys, self.table_id))
     }
@@ -459,7 +437,7 @@ impl<P: BufferPool> BlockIndex<P> {
     /// Get row page for insertion.
     /// Caller should cache insert page id to avoid invoking this method frequently.
     #[inline]
-    pub async fn get_insert_page(
+    pub async fn get_insert_page<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         count: usize,
@@ -470,15 +448,34 @@ impl<P: BufferPool> BlockIndex<P> {
             _ => (), // we just ignore the free list error and latch error, and continue to get new page.
         }
         let mut new_page = buf_pool.allocate_page::<RowPage>().await;
-        self.insert_page_guard(buf_pool, count, metadata, &mut new_page)
-            .await;
+        self.insert_page_guard(count, metadata, &mut new_page).await;
         new_page.downgrade_shared()
+    }
+
+    /// Get exclusive row page for insertion.
+    #[inline]
+    pub async fn get_insert_page_exclusive<P: BufferPool>(
+        &self,
+        buf_pool: &'static P,
+        count: usize,
+        metadata: &TableMetadata,
+    ) -> PageExclusiveGuard<RowPage> {
+        match self
+            .get_insert_page_exclusive_from_free_list(buf_pool)
+            .await
+        {
+            Ok(free_page) => return free_page,
+            _ => (), // we just ignore the free list error and latch error, and continue to get new page.
+        }
+        let mut new_page = buf_pool.allocate_page::<RowPage>().await;
+        self.insert_page_guard(count, metadata, &mut new_page).await;
+        new_page
     }
 
     /// Allocate a row page with given page id.
     /// This method is used for data recovery, which replay all commit logs including row page creation.
     #[inline]
-    pub async fn allocate_row_page_at(
+    pub async fn allocate_row_page_at<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         count: usize,
@@ -489,25 +486,20 @@ impl<P: BufferPool> BlockIndex<P> {
             .allocate_page_at::<RowPage>(page_id)
             .await
             .expect("allocate page with specific page id failed");
-        self.insert_page_guard(buf_pool, count, metadata, &mut new_page)
-            .await;
+        self.insert_page_guard(count, metadata, &mut new_page).await;
         new_page
     }
 
     #[inline]
     async fn insert_page_guard(
         &self,
-        buf_pool: &'static P,
         count: usize,
         metadata: &TableMetadata,
         new_page: &mut PageExclusiveGuard<RowPage>,
     ) {
         let new_page_id = new_page.page_id();
         loop {
-            match self
-                .insert_row_page(buf_pool, count as u64, new_page_id)
-                .await
-            {
+            match self.insert_row_page(count as u64, new_page_id).await {
                 Invalid => (),
                 Valid((start_row_id, end_row_id)) => {
                     // initialize row page.
@@ -536,9 +528,9 @@ impl<P: BufferPool> BlockIndex<P> {
 
     /// Find location of given row id, maybe in column file or row page.
     #[inline]
-    pub async fn find_row_id(&self, buf_pool: &'static P, row_id: RowID) -> RowLocation {
+    pub async fn find_row_id(&self, row_id: RowID) -> RowLocation {
         loop {
-            let res = self.try_find_row_id(buf_pool, row_id).await;
+            let res = self.try_find_row_id(row_id).await;
             let res = verify_continue!(res);
             return res;
         }
@@ -546,7 +538,7 @@ impl<P: BufferPool> BlockIndex<P> {
 
     /// Put given page into insert free list.
     #[inline]
-    pub fn free_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
+    pub fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
         let page_id = guard.page_id();
         drop(guard);
         let mut free_list = self.insert_free_list.lock();
@@ -555,9 +547,8 @@ impl<P: BufferPool> BlockIndex<P> {
 
     /// Returns the cursor for range scan.
     #[inline]
-    pub fn cursor(&self, buf_pool: &'static P) -> Cursor<P> {
+    pub fn cursor(&self) -> Cursor {
         Cursor {
-            buf_pool,
             blk_idx: self,
             parent: None,
             child: None,
@@ -565,7 +556,7 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 
     #[inline]
-    async fn get_insert_page_from_free_list(
+    async fn get_insert_page_from_free_list<P: BufferPool>(
         &self,
         buf_pool: &'static P,
     ) -> Result<PageSharedGuard<RowPage>> {
@@ -585,9 +576,28 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 
     #[inline]
-    async fn insert_row_page_split_root(
+    async fn get_insert_page_exclusive_from_free_list<P: BufferPool>(
         &self,
         buf_pool: &'static P,
+    ) -> Result<PageExclusiveGuard<RowPage>> {
+        let page_id = {
+            let mut g = self.insert_free_list.lock();
+            if g.is_empty() {
+                return Err(Error::EmptyFreeListOfBufferPool);
+            }
+            g.pop().unwrap()
+        };
+        let page_guard = buf_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+            .await
+            .exclusive_async()
+            .await;
+        Ok(page_guard)
+    }
+
+    #[inline]
+    async fn insert_row_page_split_root(
+        &self,
         mut p_guard: PageExclusiveGuard<BlockNode>,
         row_id: RowID,
         count: u64,
@@ -609,13 +619,13 @@ impl<P: BufferPool> BlockIndex<P> {
         let max_row_id = r_row_id + count;
 
         // create left child and copy all contents to it.
-        let mut l_guard = buf_pool.allocate_page::<BlockNode>().await;
+        let mut l_guard = self.pool.allocate_page::<BlockNode>().await;
         let l_page_id = l_guard.page_id();
         l_guard.page_mut().clone_from(p_guard.page());
         l_guard.page_mut().header.end_row_id = row_id; // update original page's end row id
 
         // create right child, add one row block with one page entry.
-        let mut r_guard = buf_pool.allocate_page::<BlockNode>().await;
+        let mut r_guard = self.pool.allocate_page::<BlockNode>().await;
         let r_page_id = r_guard.page_id();
         {
             let r = r_guard.page_mut();
@@ -647,7 +657,6 @@ impl<P: BufferPool> BlockIndex<P> {
     #[inline]
     async fn insert_row_page_to_new_leaf(
         &self,
-        buf_pool: &'static P,
         stack: &mut Vec<PageOptimisticGuard<BlockNode>>,
         c_guard: PageExclusiveGuard<BlockNode>,
         row_id: RowID,
@@ -666,13 +675,13 @@ impl<P: BufferPool> BlockIndex<P> {
             } else if stack.is_empty() {
                 // root is full, should split
                 let res = self
-                    .insert_row_page_split_root(buf_pool, p_guard, row_id, count, insert_page_id)
+                    .insert_row_page_split_root(p_guard, row_id, count, insert_page_id)
                     .await;
                 return Valid(res);
             }
         }
         // create new leaf node with one insert page id
-        let mut leaf = buf_pool.allocate_page::<BlockNode>().await;
+        let mut leaf = self.pool.allocate_page::<BlockNode>().await;
         let leaf_page_id = leaf.page_id();
         {
             let b: &mut BlockNode = leaf.page_mut();
@@ -690,14 +699,13 @@ impl<P: BufferPool> BlockIndex<P> {
     #[inline]
     async fn insert_row_page(
         &self,
-        buf_pool: &'static P,
         count: u64,
         insert_page_id: PageID,
     ) -> Validation<(RowID, RowID)> {
         let mut stack = vec![];
         let mut p_guard = {
             let g = self
-                .find_right_most_leaf(buf_pool, &mut stack, LatchFallbackMode::Exclusive)
+                .find_right_most_leaf(&mut stack, LatchFallbackMode::Exclusive)
                 .await;
             let mut guard = verify!(g);
             verify!(guard.try_exclusive());
@@ -722,19 +730,12 @@ impl<P: BufferPool> BlockIndex<P> {
                 if stack.is_empty() {
                     // root is full and already exclusive locked
                     let res = self
-                        .insert_row_page_split_root(
-                            buf_pool,
-                            p_guard,
-                            end_row_id,
-                            count,
-                            insert_page_id,
-                        )
+                        .insert_row_page_split_root(p_guard, end_row_id, count, insert_page_id)
                         .await;
                     return Valid(res);
                 }
                 return self
                     .insert_row_page_to_new_leaf(
-                        buf_pool,
                         &mut stack,
                         p_guard,
                         end_row_id,
@@ -766,12 +767,13 @@ impl<P: BufferPool> BlockIndex<P> {
     #[inline]
     async fn find_right_most_leaf(
         &self,
-        buf_pool: &'static P,
         stack: &mut Vec<PageOptimisticGuard<BlockNode>>,
         mode: LatchFallbackMode,
     ) -> Validation<PageGuard<BlockNode>> {
-        let mut p_guard: PageGuard<BlockNode> =
-            buf_pool.get_page(self.root, LatchFallbackMode::Spin).await;
+        let mut p_guard = self
+            .pool
+            .get_page::<BlockNode>(self.root, LatchFallbackMode::Spin)
+            .await;
         // optimistic mode, should always check version after use protected data.
         let mut pu = unsafe { p_guard.page_unchecked() };
         let height = pu.header.height;
@@ -782,12 +784,16 @@ impl<P: BufferPool> BlockIndex<P> {
             let page_id = pu.branch_entries()[idx].page_id;
             verify!(p_guard.validate());
             p_guard = if level == height {
-                let g = buf_pool.get_child_page(&p_guard, page_id, mode).await;
+                let g = self
+                    .pool
+                    .get_child_page::<BlockNode>(&p_guard, page_id, mode)
+                    .await;
                 stack.push(p_guard.downgrade());
                 verify!(g)
             } else {
-                let g = buf_pool
-                    .get_child_page(&p_guard, page_id, LatchFallbackMode::Spin)
+                let g = self
+                    .pool
+                    .get_child_page::<BlockNode>(&p_guard, page_id, LatchFallbackMode::Spin)
                     .await;
                 stack.push(p_guard.downgrade());
                 verify!(g)
@@ -799,13 +805,9 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 
     #[inline]
-    async fn try_find_row_id(
-        &self,
-        buf_pool: &'static P,
-        row_id: RowID,
-    ) -> Validation<RowLocation> {
+    async fn try_find_row_id(&self, row_id: RowID) -> Validation<RowLocation> {
         let mut g: PageGuard<BlockNode> =
-            buf_pool.get_page(self.root, LatchFallbackMode::Spin).await;
+            self.pool.get_page(self.root, LatchFallbackMode::Spin).await;
         loop {
             let pu = unsafe { g.page_unchecked() };
             if pu.is_leaf() {
@@ -871,7 +873,8 @@ impl<P: BufferPool> BlockIndex<P> {
             };
             verify!(g.validate());
             g = {
-                let v = buf_pool
+                let v = self
+                    .pool
                     .get_child_page(&g, page_id, LatchFallbackMode::Spin)
                     .await;
                 verify!(v)
@@ -880,7 +883,7 @@ impl<P: BufferPool> BlockIndex<P> {
     }
 }
 
-unsafe impl<P: BufferPool> Send for BlockIndex<P> {}
+unsafe impl Send for BlockIndex {}
 
 pub enum RowLocation {
     ColSegment(u64, u64),
@@ -894,15 +897,14 @@ pub enum CursorState {
 }
 
 /// A cursor to read all leaf values.
-pub struct Cursor<'a, P: BufferPool> {
-    buf_pool: &'static P,
-    blk_idx: &'a BlockIndex<P>,
+pub struct Cursor<'a> {
+    blk_idx: &'a BlockIndex,
     // The parent node of current located
     parent: Option<BranchLookup>,
     child: Option<PageGuard<BlockNode>>,
 }
 
-impl<'a, P: BufferPool> Cursor<'a, P> {
+impl<'a> Cursor<'a> {
     #[inline]
     pub async fn seek(mut self, row_id: RowID) -> Self {
         self.clear();
@@ -944,8 +946,9 @@ impl<'a, P: BufferPool> Cursor<'a, P> {
             let page_id = entries[next_idx].page_id;
             self.parent.as_mut().unwrap().idx = next_idx; // update parent position.
             let child = self
-                .buf_pool
-                .get_page(page_id, LatchFallbackMode::Shared)
+                .blk_idx
+                .pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Shared)
                 .await;
             return Some(child.shared_async().await.facade(false));
         }
@@ -961,9 +964,10 @@ impl<'a, P: BufferPool> Cursor<'a, P> {
     #[inline]
     async fn try_find_leaf_with_parent(&mut self, row_id: RowID) -> Validation<()> {
         debug_assert!(row_id != INVALID_ROW_ID); // every row id other than MAX_ROW_ID can find a leaf.
-        let mut g: PageGuard<BlockNode> = self
-            .buf_pool
-            .get_page(self.blk_idx.root, LatchFallbackMode::Shared)
+        let mut g = self
+            .blk_idx
+            .pool
+            .get_page::<BlockNode>(self.blk_idx.root, LatchFallbackMode::Shared)
             .await;
         'SEARCH: loop {
             let pu = unsafe { g.page_unchecked() };
@@ -1001,8 +1005,9 @@ impl<'a, P: BufferPool> Cursor<'a, P> {
             let page_id = entries[idx].page_id;
             verify!(g.validate());
             let c = self
-                .buf_pool
-                .get_child_page(&g, page_id, LatchFallbackMode::Spin)
+                .blk_idx
+                .pool
+                .get_child_page::<BlockNode>(&g, page_id, LatchFallbackMode::Spin)
                 .await;
             let c = verify!(c);
             self.parent = Some(BranchLookup { g, idx });
@@ -1016,12 +1021,12 @@ struct BranchLookup {
     idx: usize,
 }
 
-struct RedoLogPageCommitter<P: BufferPool> {
-    trx_sys: &'static TransactionSystem<P>,
+struct RedoLogPageCommitter {
+    trx_sys: &'static TransactionSystem,
     table_id: TableID,
 }
 
-impl<P: BufferPool> Clone for RedoLogPageCommitter<P> {
+impl Clone for RedoLogPageCommitter {
     #[inline]
     fn clone(&self) -> Self {
         RedoLogPageCommitter {
@@ -1031,9 +1036,9 @@ impl<P: BufferPool> Clone for RedoLogPageCommitter<P> {
     }
 }
 
-impl<P: BufferPool> RedoLogPageCommitter<P> {
+impl RedoLogPageCommitter {
     #[inline]
-    pub fn new(trx_sys: &'static TransactionSystem<P>, table_id: TableID) -> Self {
+    pub fn new(trx_sys: &'static TransactionSystem, table_id: TableID) -> Self {
         RedoLogPageCommitter { trx_sys, table_id }
     }
 
@@ -1051,7 +1056,8 @@ impl<P: BufferPool> RedoLogPageCommitter<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Engine;
+    use crate::buffer::EvictableBufferPoolConfig;
+    use crate::engine::{Engine, EngineConfig};
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
     use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
@@ -1061,16 +1067,23 @@ mod tests {
     #[test]
     fn test_block_index_free_list() {
         smol::block_on(async {
-            let engine = Engine::new_fixed_initializer(
-                64 * 1024 * 1024,
-                TrxSysConfig::default()
-                    .log_file_prefix("redo_bi")
-                    .skip_recovery(true),
-            )
-            .unwrap()
-            .init()
-            .await
-            .unwrap();
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024)
+                        .file_path("databuffer_bi.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_bi")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1080,22 +1093,23 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
                 let p1 = blk_idx
-                    .get_insert_page(&engine.buf_pool, 100, &metadata)
+                    .get_insert_page(engine.data_pool, 100, &metadata)
                     .await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
-                blk_idx.free_exclusive_insert_page(p1);
+                blk_idx.cache_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
                 let p2 = blk_idx
-                    .get_insert_page(&engine.buf_pool, 100, &metadata)
+                    .get_insert_page(engine.data_pool, 100, &metadata)
                     .await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
             drop(engine);
 
+            let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
         })
     }
@@ -1103,16 +1117,23 @@ mod tests {
     #[test]
     fn test_block_index_insert_row_page() {
         smol::block_on(async {
-            let engine = Engine::new_fixed_initializer(
-                64 * 1024 * 1024,
-                TrxSysConfig::default()
-                    .log_file_prefix("redo_bi")
-                    .skip_recovery(true),
-            )
-            .unwrap()
-            .init()
-            .await
-            .unwrap();
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024)
+                        .file_path("databuffer_bi.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_bi")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1122,22 +1143,23 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
                 let p1 = blk_idx
-                    .get_insert_page(engine.buf_pool, 100, &metadata)
+                    .get_insert_page(engine.data_pool, 100, &metadata)
                     .await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
-                blk_idx.free_exclusive_insert_page(p1);
+                blk_idx.cache_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
                 let p2 = blk_idx
-                    .get_insert_page(engine.buf_pool, 100, &metadata)
+                    .get_insert_page(engine.data_pool, 100, &metadata)
                     .await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
             drop(engine);
 
+            let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
         })
     }
@@ -1147,16 +1169,23 @@ mod tests {
         smol::block_on(async {
             let row_pages = 10240usize;
             // allocate 1GB buffer pool is enough: 10240 pages ~= 640MB
-            let engine = Engine::new_fixed_initializer(
-                1024 * 1024 * 1024,
-                TrxSysConfig::default()
-                    .log_file_prefix("redo_bi")
-                    .skip_recovery(true),
-            )
-            .unwrap()
-            .init()
-            .await
-            .unwrap();
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(1024usize * 1024 * 1024)
+                        .max_file_size(2usize * 1024 * 1024 * 1024)
+                        .file_path("databuffer_bi.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_bi")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1166,14 +1195,14 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(engine.buf_pool, 100, &metadata)
+                        .get_insert_page(engine.data_pool, 100, &metadata)
                         .await;
                 }
                 let mut count = 0usize;
-                let mut cursor = blk_idx.cursor(engine.buf_pool).seek(0).await;
+                let mut cursor = blk_idx.cursor().seek(0).await;
                 while let Some(res) = cursor.next().await {
                     count += 1;
                     if count == 10000 {
@@ -1206,6 +1235,7 @@ mod tests {
             }
             drop(engine);
 
+            let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
         })
     }
@@ -1219,16 +1249,23 @@ mod tests {
         smol::block_on(async {
             let row_pages = 10240usize;
             let rows_per_page = 100usize;
-            let engine = Engine::new_fixed_initializer(
-                1024 * 1024 * 1024,
-                TrxSysConfig::default()
-                    .log_file_prefix("redo_bi")
-                    .skip_recovery(true),
-            )
-            .unwrap()
-            .init()
-            .await
-            .unwrap();
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(1024usize * 1024 * 1024)
+                        .max_file_size(2usize * 1024 * 1024 * 1024)
+                        .file_path("databuffer_bi.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_bi")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1238,15 +1275,15 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(engine.buf_pool, rows_per_page, &metadata)
+                        .get_insert_page(engine.data_pool, rows_per_page, &metadata)
                         .await;
                 }
                 {
                     let res = engine
-                        .buf_pool
+                        .meta_pool
                         .get_page::<BlockNode>(blk_idx.root, LatchFallbackMode::Spin)
                         .await;
                     let p = res.shared_async().await;
@@ -1262,12 +1299,12 @@ mod tests {
                 }
                 for i in 0..row_pages {
                     let row_id = (i * rows_per_page + rows_per_page / 2) as u64;
-                    let res = blk_idx.find_row_id(engine.buf_pool, row_id).await;
+                    let res = blk_idx.find_row_id(row_id).await;
                     match res {
                         RowLocation::RowPage(page_id) => {
-                            let g: PageGuard<RowPage> = engine
-                                .buf_pool
-                                .get_page(page_id, LatchFallbackMode::Shared)
+                            let g = engine
+                                .data_pool
+                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await;
                             let g = g.shared_async().await;
                             let p = g.page();
@@ -1279,6 +1316,7 @@ mod tests {
             }
             drop(engine);
 
+            let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
         })
     }
@@ -1287,16 +1325,23 @@ mod tests {
     fn test_block_index_log() {
         smol::block_on(async {
             let rows_per_page = 100;
-            let engine = Engine::new_fixed_initializer(
-                64 * 1024 * 1024,
-                TrxSysConfig::default()
-                    .log_file_prefix("redo_bi")
-                    .skip_recovery(true),
-            )
-            .unwrap()
-            .init()
-            .await
-            .unwrap();
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024)
+                        .file_path("databuffer_bi.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_bi")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
             {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
@@ -1306,15 +1351,16 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.buf_pool, engine.trx_sys, 101).await;
+                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
                 // create a new page for rowid=0..100
                 let _ = blk_idx
-                    .get_insert_page(engine.buf_pool, rows_per_page, &metadata)
+                    .get_insert_page(engine.data_pool, rows_per_page, &metadata)
                     .await;
                 // todo: analyze log to see the log is persisted.
             }
             drop(engine);
 
+            let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
         })
     }

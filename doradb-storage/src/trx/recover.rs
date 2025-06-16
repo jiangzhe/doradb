@@ -69,10 +69,10 @@ impl RecoverMap {
 
 pub(super) async fn log_recover<P: BufferPool>(
     buf_pool: &'static P,
-    catalog: &mut Catalog<P>,
+    catalog: &mut Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
-) -> Result<(Vec<CachePadded<LogPartition<P>>>, Vec<Receiver<GC<P>>>)> {
+) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>)> {
     // In recovery, we disable GC and redo logging.
     // All data are purely processed in memory and if
     // any failure occurs, we abort the whole process.
@@ -104,14 +104,14 @@ pub(super) async fn log_recover<P: BufferPool>(
 
 pub struct LogRecovery<'a, P: BufferPool> {
     buf_pool: &'static P,
-    catalog: &'a mut Catalog<P>,
+    catalog: &'a mut Catalog,
     log_merger: LogMerger,
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
 }
 
 impl<'a, P: BufferPool> LogRecovery<'a, P> {
     #[inline]
-    pub fn new(buf_pool: &'static P, catalog: &'a mut Catalog<P>, log_merger: LogMerger) -> Self {
+    pub fn new(buf_pool: &'static P, catalog: &'a mut Catalog, log_merger: LogMerger) -> Self {
         LogRecovery {
             buf_pool,
             catalog,
@@ -140,7 +140,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             // Execute DDL after all previous DML is done.
             // We treat every DDL as pipeline breaker.
             self.wait_for_dml_done().await?;
-            self.replay_ddl(ddl, dml, log.header.cts).await?;
+            self.replay_ddl(ddl, dml).await?;
         } else {
             // replay DML-only transaction.
             // todo: dispatch DML execution to multiple threads.
@@ -180,26 +180,19 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
         &mut self,
         ddl: Box<DDLRedo>,
         dml: BTreeMap<TableID, TableDML>,
-        cts: TrxID,
     ) -> Result<()> {
         match &*ddl {
             DDLRedo::CreateSchema(schema_id) => {
-                self.replay_dml(dml, cts, false).await?;
-                self.catalog
-                    .reload_schema(self.buf_pool, *schema_id, true)
-                    .await?;
+                self.replay_catalog_modifications(dml).await?;
+                self.catalog.reload_schema(*schema_id, true).await?;
             }
             DDLRedo::DropSchema(schema_id) => {
-                self.replay_dml(dml, cts, false).await?;
-                self.catalog
-                    .reload_schema(self.buf_pool, *schema_id, false)
-                    .await?;
+                self.replay_catalog_modifications(dml).await?;
+                self.catalog.reload_schema(*schema_id, false).await?;
             }
             DDLRedo::CreateTable(table_id) => {
-                self.replay_dml(dml, cts, false).await?;
-                self.catalog
-                    .reload_create_table(self.buf_pool, *table_id)
-                    .await?;
+                self.replay_catalog_modifications(dml).await?;
+                self.catalog.reload_create_table(*table_id).await?;
             }
             DDLRedo::CreateRowPage {
                 table_id,
@@ -270,9 +263,49 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
         Ok(())
     }
 
+    /// Replay catalog DML log.
+    /// Page id and row id in log are ignored because we do not keep physical structure for metadata.
+    async fn replay_catalog_modifications(
+        &mut self,
+        dml: BTreeMap<TableID, TableDML>,
+    ) -> Result<()> {
+        for (table_id, table_dml) in dml {
+            let table = self
+                .catalog
+                .get_table(table_id)
+                .ok_or_else(|| Error::TableNotFound)?;
+            self.replay_catalog_table_modifications(&table, &table_dml.rows)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn replay_catalog_table_modifications(
+        &mut self,
+        table: &Table,
+        rows: &BTreeMap<RowID, RowRedo>,
+    ) {
+        for row in rows.values() {
+            match &row.kind {
+                RowRedoKind::Insert(vals) => {
+                    table
+                        .insert_row_no_trx(self.catalog.meta_pool(), vals)
+                        .await;
+                }
+                RowRedoKind::DeleteByUniqueKey(key) => {
+                    table.delete_row_no_trx(self.catalog.meta_pool(), key).await;
+                }
+                RowRedoKind::Delete | RowRedoKind::Update(_) => {
+                    // updates of catalog are implemented as DeleteByUniqueKey and Insert.
+                    unreachable!()
+                }
+            }
+        }
+    }
+
     async fn replay_table_dml(
         &mut self,
-        table: &Table<P>,
+        table: &Table,
         rows: &BTreeMap<RowID, RowRedo>,
         cts: TrxID,
         disable_index: bool,
@@ -314,6 +347,10 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                         )
                         .await;
                 }
+                RowRedoKind::DeleteByUniqueKey(_) => {
+                    // We do not allow DeleteByUniqueKey log on data tables.
+                    unreachable!();
+                }
             }
         }
         Ok(())
@@ -324,18 +361,20 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
 mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::engine::EngineConfig;
+    use crate::row::RowRead;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
+    use crate::value::Val;
     use doradb_catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
     };
-    use doradb_datatype::PreciseType;
+    use doradb_datatype::{Collation, PreciseType};
 
     #[test]
     fn test_log_recover_empty() {
         smol::block_on(async {
             let engine = EngineConfig::default()
-                .buffer(
+                .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(16usize * 1024 * 1024)
                         .max_file_size(32usize * 1024 * 1024)
@@ -364,7 +403,7 @@ mod tests {
         smol::block_on(async {
             remove_files("recover2*");
             let engine = EngineConfig::default()
-                .buffer(
+                .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(16usize * 1024 * 1024)
                         .max_file_size(32usize * 1024 * 1024)
@@ -418,7 +457,7 @@ mod tests {
 
             // second recovery.
             let engine = EngineConfig::default()
-                .buffer(
+                .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(16usize * 1024 * 1024)
                         .max_file_size(32usize * 1024 * 1024)
@@ -440,6 +479,120 @@ mod tests {
             drop(engine);
             let _ = std::fs::remove_file("databuffer_recover.bin");
             remove_files("recover2*");
+        })
+    }
+
+    #[test]
+    fn test_log_recover_dml() {
+        smol::block_on(async {
+            const DML_SIZE: usize = 5000;
+
+            remove_files("recover3*");
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(16usize * 1024 * 1024)
+                        .max_file_size(32usize * 1024 * 1024)
+                        .file_path("databuffer_recover.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover3")
+                        .skip_recovery(false),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
+
+            let mut session = engine.new_session();
+            let mut trx = session.begin_trx();
+            let mut stmt = trx.start_stmt();
+            let schema_id = stmt.create_schema("db1").await.unwrap();
+            trx = stmt.succeed();
+            session = trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx();
+            let mut stmt = trx.start_stmt();
+            let table_spec = TableSpec::new(
+                "t1",
+                vec![
+                    ColumnSpec::new("c0", PreciseType::u32(), ColumnAttributes::empty()),
+                    ColumnSpec::new(
+                        "c1",
+                        PreciseType::varchar(200, Collation::Ascii),
+                        ColumnAttributes::empty(),
+                    ),
+                ],
+            );
+
+            let table_id = stmt
+                .create_table(
+                    schema_id,
+                    table_spec,
+                    vec![IndexSpec::new(
+                        "idx_t1_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+            trx = stmt.succeed();
+            session = trx.commit().await.unwrap();
+
+            let table = session.engine.catalog().get_table(table_id).unwrap();
+
+            let s: String = std::iter::repeat_n('0', 200).collect();
+            for i in 0..DML_SIZE {
+                let trx = session.begin_trx();
+                let mut stmt = trx.start_stmt();
+                let res = stmt
+                    .insert_row(&table, vec![Val::from(i as u32), Val::from(&s[..])])
+                    .await;
+                assert!(res.is_ok());
+                let trx = stmt.succeed();
+                session = trx.commit().await.unwrap();
+            }
+
+            drop(table);
+            drop(session);
+            drop(engine);
+
+            // second recovery.
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(16usize * 1024 * 1024)
+                        .max_file_size(32usize * 1024 * 1024)
+                        .file_path("databuffer_recover.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover3")
+                        .skip_recovery(false),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).unwrap();
+            let mut rows = 0usize;
+            table
+                .scan_rows_uncommitted(engine.data_pool, |row| {
+                    assert!(row.row_id() as usize <= DML_SIZE);
+                    rows += 1;
+                    true
+                })
+                .await;
+            assert_eq!(rows, DML_SIZE);
+
+            drop(engine);
+            let _ = std::fs::remove_file("databuffer_recover.bin");
+            remove_files("recover3*");
         })
     }
 }

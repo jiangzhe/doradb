@@ -5,7 +5,7 @@ pub mod table;
 pub use storage::*;
 pub use table::*;
 
-use crate::buffer::BufferPool;
+use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::error::{Error, Result};
 use crate::index::BlockIndex;
 use crate::lifetime::StaticLifetime;
@@ -30,15 +30,15 @@ pub fn row_id_spec() -> ColumnSpec {
 }
 
 /// Catalog contains metadata of user tables.
-pub struct Catalog<P: BufferPool> {
+pub struct Catalog {
     obj_id: AtomicU64,
-    pub cache: CatalogCache<P>,
-    pub storage: CatalogStorage<P>,
+    pub cache: CatalogCache,
+    pub storage: CatalogStorage,
 }
 
-impl<P: BufferPool> Catalog<P> {
+impl Catalog {
     #[inline]
-    pub fn new(storage: CatalogStorage<P>) -> Self {
+    pub fn new(storage: CatalogStorage) -> Self {
         let mut cache = CatalogCache::new();
         let obj_id = storage.len() as u64;
         for (table_id, table) in storage.all() {
@@ -64,27 +64,33 @@ impl<P: BufferPool> Catalog<P> {
         }
     }
 
+    /// Returns whether a table is user table.
     #[inline]
-    pub fn enable_page_committer_for_all_tables(&self, trx_sys: &'static TransactionSystem<P>) {
+    pub fn is_user_table(&self, table_id: TableID) -> bool {
+        table_id as usize >= self.storage.len()
+    }
+
+    /// Enable page committer for tables, excluding catalog tables.
+    /// The catalog tables uses different buffer pool than data(user) tables.
+    /// So no page creation should be persisted in redo log.
+    #[inline]
+    pub fn enable_page_committer_for_tables(&self, trx_sys: &'static TransactionSystem) {
         let tables_g = self.cache.tables.read();
         for table in tables_g.values() {
-            table.blk_idx.enable_page_committer(trx_sys);
+            if self.is_user_table(table.table_id()) {
+                table.blk_idx.enable_page_committer(trx_sys);
+            }
         }
     }
 
     /// Reload schema cache for given schema id.
     /// If exists flag is set to true, schema should exist.
     /// Otherwise, schema should not exist.
-    pub async fn reload_schema(
-        &self,
-        buf_pool: &'static P,
-        schema_id: SchemaID,
-        exists: bool,
-    ) -> Result<()> {
+    pub async fn reload_schema(&self, schema_id: SchemaID, exists: bool) -> Result<()> {
         let res = self
             .storage
             .schemas()
-            .find_uncommitted_by_id(buf_pool, schema_id)
+            .find_uncommitted_by_id(schema_id)
             .await;
         match (exists, res) {
             (true, Some(schema)) => {
@@ -104,13 +110,9 @@ impl<P: BufferPool> Catalog<P> {
         }
     }
 
-    pub async fn reload_create_table(&self, buf_pool: &'static P, table_id: TableID) -> Result<()> {
+    pub async fn reload_create_table(&self, table_id: TableID) -> Result<()> {
         // todo
-        let res = self
-            .storage
-            .tables()
-            .find_uncommitted_by_id(buf_pool, table_id)
-            .await;
+        let res = self.storage.tables().find_uncommitted_by_id(table_id).await;
         match res {
             Some(table) => {
                 // A table creation involves table, column and index.
@@ -121,22 +123,24 @@ impl<P: BufferPool> Catalog<P> {
                 let columns = self
                     .storage
                     .columns()
-                    .list_uncommitted_by_table_id(buf_pool, table_id)
+                    .list_uncommitted_by_table_id(table_id)
                     .await;
                 debug_assert!(!columns.is_empty());
                 if let Some(column_id) = columns.iter().map(|c| c.column_id).max() {
                     next_obj_id = next_obj_id.max(column_id);
                 }
 
+                // todo: remove row id skipping logic.
                 let column_specs = columns
                     .into_iter()
+                    .skip(1) // skip row id
                     .map(|c| ColumnSpec::new(&c.column_name, c.column_type, c.column_attributes))
                     .collect::<Vec<_>>();
 
                 let indexes = self
                     .storage
                     .indexes()
-                    .list_uncommitted_by_table_id(buf_pool, table_id)
+                    .list_uncommitted_by_table_id(table_id)
                     .await;
                 if let Some(index_id) = indexes.iter().map(|i| i.index_id).max() {
                     next_obj_id = next_obj_id.max(index_id);
@@ -148,7 +152,7 @@ impl<P: BufferPool> Catalog<P> {
                     let mut index_columns = self
                         .storage
                         .index_columns()
-                        .list_uncommitted_by_index_id(buf_pool, index.index_id)
+                        .list_uncommitted_by_index_id(index.index_id)
                         .await;
                     index_columns.sort_by_key(|ic| ic.index_column_no);
                     let mut index_cols = vec![];
@@ -167,10 +171,7 @@ impl<P: BufferPool> Catalog<P> {
                 }
 
                 let table_metadata = TableMetadata::new(column_specs, index_specs);
-                let root_page = buf_pool
-                    .allocate_page_at(table.block_index_root_page)
-                    .await?;
-                let blk_idx = BlockIndex::new_with_page(root_page, table.table_id).await;
+                let blk_idx = BlockIndex::new(self.storage.meta_pool, table.table_id).await;
                 let table = Table::new(blk_idx, table_metadata);
                 // Update table into cache
                 let mut table_cache_g = self.cache.tables.write();
@@ -183,24 +184,29 @@ impl<P: BufferPool> Catalog<P> {
     }
 
     #[inline]
-    pub fn get_table(&self, table_id: TableID) -> Option<Table<P>> {
+    pub fn get_table(&self, table_id: TableID) -> Option<Table> {
         let g = self.cache.tables.read();
         g.get(&table_id).cloned()
     }
+
+    #[inline]
+    pub fn meta_pool(&self) -> &'static FixedBufferPool {
+        self.storage.meta_pool
+    }
 }
 
-unsafe impl<P: BufferPool> Send for Catalog<P> {}
-unsafe impl<P: BufferPool> Sync for Catalog<P> {}
-unsafe impl<P: BufferPool> StaticLifetime for Catalog<P> {}
-impl<P: BufferPool> UnwindSafe for Catalog<P> {}
-impl<P: BufferPool> RefUnwindSafe for Catalog<P> {}
+unsafe impl Send for Catalog {}
+unsafe impl Sync for Catalog {}
+unsafe impl StaticLifetime for Catalog {}
+impl UnwindSafe for Catalog {}
+impl RefUnwindSafe for Catalog {}
 
-pub struct CatalogCache<P: BufferPool> {
+pub struct CatalogCache {
     pub schemas: RwLock<HashMap<SchemaID, SchemaObject>>,
-    pub tables: RwLock<HashMap<TableID, Table<P>>>,
+    pub tables: RwLock<HashMap<TableID, Table>>,
 }
 
-impl<P: BufferPool> CatalogCache<P> {
+impl CatalogCache {
     #[inline]
     pub fn new() -> Self {
         CatalogCache {
@@ -210,14 +216,14 @@ impl<P: BufferPool> CatalogCache<P> {
     }
 }
 
-pub struct TableCache<'a, P: BufferPool> {
-    catalog: &'a Catalog<P>,
-    map: HashMap<TableID, Option<Table<P>>>,
+pub struct TableCache<'a> {
+    catalog: &'a Catalog,
+    map: HashMap<TableID, Option<Table>>,
 }
 
-impl<'a, P: BufferPool> TableCache<'a, P> {
+impl<'a> TableCache<'a> {
     #[inline]
-    pub fn new(catalog: &'a Catalog<P>) -> Self {
+    pub fn new(catalog: &'a Catalog) -> Self {
         TableCache {
             catalog,
             map: HashMap::new(),
@@ -225,7 +231,7 @@ impl<'a, P: BufferPool> TableCache<'a, P> {
     }
 
     #[inline]
-    pub fn get_table(&mut self, table_id: TableID) -> &Option<Table<P>> {
+    pub fn get_table(&mut self, table_id: TableID) -> &Option<Table> {
         if self.map.contains_key(&table_id) {
             return &self.map[&table_id];
         }
@@ -242,7 +248,7 @@ pub mod tests {
     use doradb_datatype::Collation;
 
     #[inline]
-    pub(crate) async fn db1<P: BufferPool>(engine: &Engine<P>) -> SchemaID {
+    pub(crate) async fn db1(engine: &Engine) -> SchemaID {
         let session = engine.new_session();
         let trx = session.begin_trx();
         let mut stmt = trx.start_stmt();
@@ -257,7 +263,7 @@ pub mod tests {
 
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
-    pub(crate) async fn table1<P: BufferPool>(engine: &Engine<P>) -> TableID {
+    pub(crate) async fn table1(engine: &Engine) -> TableID {
         let schema_id = db1(engine).await;
 
         let session = engine.new_session();
@@ -292,7 +298,7 @@ pub mod tests {
 
     /// Table2 has i32(unique key) and string column.
     #[inline]
-    pub(crate) async fn table2<P: BufferPool>(engine: &Engine<P>) -> TableID {
+    pub(crate) async fn table2(engine: &Engine) -> TableID {
         let schema_id = db1(engine).await;
 
         let session = engine.new_session();

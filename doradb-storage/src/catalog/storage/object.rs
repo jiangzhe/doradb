@@ -1,4 +1,3 @@
-use crate::buffer::page::PageID;
 use doradb_catalog::{ColumnAttributes, IndexAttributes, IndexOrder};
 use doradb_catalog::{ColumnID, IndexID, SchemaID, TableID};
 use doradb_datatype::PreciseType;
@@ -15,7 +14,6 @@ pub struct TableObject {
     pub table_id: TableID,
     pub schema_id: SchemaID,
     pub table_name: SemiStr,
-    pub block_index_root_page: PageID,
 }
 
 #[derive(Debug)]

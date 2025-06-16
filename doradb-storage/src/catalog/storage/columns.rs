@@ -1,4 +1,3 @@
-use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::storage::CatalogDefinition;
@@ -16,7 +15,6 @@ use semistr::SemiStr;
 use std::sync::OnceLock;
 
 pub const TABLE_ID_COLUMNS: TableID = 2;
-const ROOT_PAGE_ID_COLUMNS: PageID = 2;
 const COL_NO_COLUMNS_COLUMN_ID: usize = 0;
 const COL_NAME_COLUMNS_COLUMN_ID: &'static str = "column_id";
 const COL_NO_COLUMNS_TABLE_ID: usize = 1;
@@ -39,7 +37,6 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
     DEF.get_or_init(|| {
         CatalogDefinition {
             table_id: TABLE_ID_COLUMNS,
-            root_page_id: ROOT_PAGE_ID_COLUMNS,
             metadata: TableMetadata::new(
                 vec![
                     // column_id bigint primary key not null
@@ -116,16 +113,14 @@ fn row_to_column_object(row: Row<'_>) -> ColumnObject {
     }
 }
 
-pub struct Columns<'a, P: BufferPool>(pub(super) &'a Table<P>);
+pub struct Columns<'a, P: BufferPool> {
+    pub(super) buf_pool: &'static P,
+    pub(super) table: &'a Table,
+}
 
 impl<P: BufferPool> Columns<'_, P> {
     /// Insert a column.
-    pub async fn insert(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        obj: &ColumnObject,
-    ) -> bool {
+    pub async fn insert(&self, stmt: &mut Statement, obj: &ColumnObject) -> bool {
         let cols = vec![
             Val::from(obj.column_id),
             Val::from(obj.table_id),
@@ -134,17 +129,16 @@ impl<P: BufferPool> Columns<'_, P> {
             Val::from(u32::from(obj.column_type)),
             Val::from(obj.column_attributes.bits()),
         ];
-        self.0.insert_row(buf_pool, stmt, cols).await.is_ok()
+        self.table
+            .insert_row(self.buf_pool, stmt, cols)
+            .await
+            .is_ok()
     }
 
-    pub async fn list_uncommitted_by_table_id(
-        &self,
-        buf_pool: &'static P,
-        table_id: TableID,
-    ) -> Vec<ColumnObject> {
+    pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<ColumnObject> {
         let mut res = vec![];
-        self.0
-            .scan_rows_uncommitted(buf_pool, |row| {
+        self.table
+            .scan_rows_uncommitted(self.buf_pool, |row| {
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = *row.user_val::<TableID>(COL_NO_COLUMNS_TABLE_ID);
                 if table_id_in_row == table_id {
@@ -157,16 +151,12 @@ impl<P: BufferPool> Columns<'_, P> {
         res
     }
 
-    // pub async fn
-
     /// Delete a column by id.
-    pub async fn delete_by_id(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement<P>,
-        id: ColumnID,
-    ) -> bool {
+    pub async fn delete_by_id(&self, stmt: &mut Statement, id: ColumnID) -> bool {
         let key = SelectKey::new(INDEX_NO_COLUMNS_COLUMN_ID, vec![Val::from(id)]);
-        self.0.delete_row(buf_pool, stmt, &key).await.is_ok()
+        self.table
+            .delete_row(self.buf_pool, stmt, &key, true)
+            .await
+            .is_ok()
     }
 }

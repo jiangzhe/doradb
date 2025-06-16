@@ -1,4 +1,4 @@
-use crate::buffer::{BufferPool, EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
+use crate::buffer::EvictableBufferPoolConfig;
 use crate::engine::{Engine, EngineConfig};
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::session::Session;
@@ -13,7 +13,7 @@ fn test_mvcc_insert_normal() {
     smol::block_on(async {
         const SIZE: i32 = 10000;
 
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
 
         let mut session = sys.new_session();
         {
@@ -50,7 +50,7 @@ fn test_mvcc_update_normal() {
     smol::block_on(async {
         const SIZE: i32 = 1000;
 
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
         {
             let mut session = sys.new_session();
             // insert 1000 rows
@@ -115,7 +115,7 @@ fn test_mvcc_delete_normal() {
     smol::block_on(async {
         const SIZE: i32 = 1000;
 
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
         {
             let mut session = sys.new_session();
             // insert 1000 rows
@@ -150,7 +150,7 @@ fn test_mvcc_delete_normal() {
 #[test]
 fn test_mvcc_rollback_insert_normal() {
     smol::block_on(async {
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
         {
             let mut session = sys.new_session();
             // insert 1 row
@@ -171,7 +171,7 @@ fn test_mvcc_rollback_insert_normal() {
 #[test]
 fn test_mvcc_insert_link_unique_index() {
     smol::block_on(async {
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
         {
             let mut session = sys.new_session();
             // insert 1 row
@@ -202,7 +202,7 @@ fn test_mvcc_insert_link_unique_index() {
 #[test]
 fn test_mvcc_rollback_insert_link_unique_index() {
     smol::block_on(async {
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
         {
             let mut session = sys.new_session();
             // insert 1 row
@@ -231,7 +231,7 @@ fn test_mvcc_rollback_insert_link_unique_index() {
 #[test]
 fn test_mvcc_insert_link_update() {
     smol::block_on(async {
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
         {
             let mut session = sys.new_session();
             // insert 1 row: v1=1, v2=hello
@@ -300,7 +300,7 @@ fn test_mvcc_insert_link_update() {
 #[test]
 fn test_mvcc_update_link_insert() {
     smol::block_on(async {
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
         {
             let mut session = sys.new_session();
             // insert 1 row: v1=1, v2=hello
@@ -381,7 +381,7 @@ fn test_mvcc_update_link_insert() {
 #[test]
 fn test_mvcc_multi_update() {
     smol::block_on(async {
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
         {
             let mut session = sys.new_session();
             // insert: v1
@@ -468,7 +468,7 @@ fn test_row_page_scan_rows_uncommitted() {
     smol::block_on(async {
         const SIZE: i32 = 10000;
 
-        let sys = TestSys::new_fixed().await;
+        let sys = TestSys::new_evictable().await;
 
         let session = sys.new_session();
         {
@@ -483,7 +483,7 @@ fn test_row_page_scan_rows_uncommitted() {
         {
             let mut res_len = 0usize;
             sys.table
-                .scan_rows_uncommitted(sys.engine.buf_pool, |row| {
+                .scan_rows_uncommitted(sys.engine.data_pool, |_row| {
                     res_len += 1;
                     true
                 })
@@ -496,39 +496,18 @@ fn test_row_page_scan_rows_uncommitted() {
     });
 }
 
-struct TestSys<P: BufferPool> {
-    engine: Engine<P>,
-    table: Table<P>,
+struct TestSys {
+    engine: Engine,
+    table: Table,
 }
 
-impl TestSys<FixedBufferPool> {
-    #[inline]
-    async fn new_fixed() -> Self {
-        use crate::catalog::tests::table2;
-        // 64KB * 16
-        let engine = Engine::new_fixed_initializer(
-            1024 * 1024,
-            TrxSysConfig::default()
-                .log_file_prefix("redo_testsys")
-                .skip_recovery(true),
-        )
-        .unwrap()
-        .init()
-        .await
-        .unwrap();
-        let table_id = table2(&engine).await;
-        let table = engine.catalog().get_table(table_id).unwrap();
-        TestSys { engine, table }
-    }
-}
-
-impl TestSys<EvictableBufferPool> {
+impl TestSys {
     #[inline]
     async fn new_evictable() -> Self {
         use crate::catalog::tests::table2;
         // 64KB * 16
         let engine = EngineConfig::default()
-            .buffer(
+            .data_buffer(
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(1024u64 * 1024)
                     .max_file_size(1024u64 * 1024 * 32)
@@ -550,7 +529,7 @@ impl TestSys<EvictableBufferPool> {
     }
 }
 
-impl<P: BufferPool + 'static> TestSys<P> {
+impl TestSys {
     #[inline]
     fn clean_all(self) {
         drop(self);
@@ -560,14 +539,14 @@ impl<P: BufferPool + 'static> TestSys<P> {
     }
 
     #[inline]
-    async fn new_trx_insert(&self, session: Session<P>, insert: Vec<Val>) -> Session<P> {
+    async fn new_trx_insert(&self, session: Session, insert: Vec<Val>) -> Session {
         let mut trx = session.begin_trx();
         trx = self.trx_insert(trx, insert).await;
         trx.commit().await.unwrap()
     }
 
     #[inline]
-    async fn trx_insert(&self, trx: ActiveTrx<P>, insert: Vec<Val>) -> ActiveTrx<P> {
+    async fn trx_insert(&self, trx: ActiveTrx, insert: Vec<Val>) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
         let res = stmt.insert_row(&self.table, insert).await;
         if !res.is_ok() {
@@ -578,14 +557,14 @@ impl<P: BufferPool + 'static> TestSys<P> {
     }
 
     #[inline]
-    async fn new_trx_delete(&self, session: Session<P>, key: &SelectKey) -> Session<P> {
+    async fn new_trx_delete(&self, session: Session, key: &SelectKey) -> Session {
         let mut trx = session.begin_trx();
         trx = self.trx_delete(trx, key).await;
         trx.commit().await.unwrap()
     }
 
     #[inline]
-    async fn trx_delete(&self, trx: ActiveTrx<P>, key: &SelectKey) -> ActiveTrx<P> {
+    async fn trx_delete(&self, trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
         let res = stmt.delete_row(&self.table, key).await;
         if !res.is_ok() {
@@ -598,10 +577,10 @@ impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
     async fn new_trx_update(
         &self,
-        session: Session<P>,
+        session: Session,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> Session<P> {
+    ) -> Session {
         let mut trx = session.begin_trx();
         trx = self.trx_update(trx, key, update).await;
         trx.commit().await.unwrap()
@@ -610,10 +589,10 @@ impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
     async fn trx_update(
         &self,
-        trx: ActiveTrx<P>,
+        trx: ActiveTrx,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> ActiveTrx<P> {
+    ) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
         let res = stmt.update_row(&self.table, key, update).await;
         if !res.is_ok() {
@@ -626,24 +605,24 @@ impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
     async fn new_trx_select<F: FnOnce(Vec<Val>)>(
         &self,
-        session: Session<P>,
+        session: Session,
         key: &SelectKey,
         action: F,
-    ) -> Session<P> {
+    ) -> Session {
         let mut trx = session.begin_trx();
         trx = self.trx_select(trx, key, action).await;
         trx.commit().await.unwrap()
     }
 
     #[inline]
-    async fn new_trx_select_not_found(&self, session: Session<P>, key: &SelectKey) -> Session<P> {
+    async fn new_trx_select_not_found(&self, session: Session, key: &SelectKey) -> Session {
         let mut trx = session.begin_trx();
         trx = self.trx_select_not_found(trx, key).await;
         trx.commit().await.unwrap()
     }
 
     #[inline]
-    async fn trx_select_not_found(&self, trx: ActiveTrx<P>, key: &SelectKey) -> ActiveTrx<P> {
+    async fn trx_select_not_found(&self, trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&self.table, key, &[0, 1]).await;
         assert!(res.not_found());
@@ -653,10 +632,10 @@ impl<P: BufferPool + 'static> TestSys<P> {
     #[inline]
     async fn trx_select<F: FnOnce(Vec<Val>)>(
         &self,
-        trx: ActiveTrx<P>,
+        trx: ActiveTrx,
         key: &SelectKey,
         action: F,
-    ) -> ActiveTrx<P> {
+    ) -> ActiveTrx {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&self.table, key, &[0, 1]).await;
         if !res.is_ok() {
@@ -668,7 +647,7 @@ impl<P: BufferPool + 'static> TestSys<P> {
     }
 
     #[inline]
-    fn new_session(&self) -> Session<P> {
+    fn new_session(&self) -> Session {
         self.engine.new_session()
     }
 }

@@ -26,7 +26,6 @@ pub mod sys_conf;
 pub mod sys_trx;
 pub mod undo;
 
-use crate::buffer::BufferPool;
 use crate::engine::Engine;
 use crate::error::Result;
 use crate::notify::{Notify, Signal};
@@ -129,8 +128,8 @@ pub fn trx_must_not_see_even_if_prepare(sts: TrxID, ts: TrxID) -> bool {
     sts < (ts & SNAPSHOT_TS_MASK)
 }
 
-pub struct ActiveTrx<P: BufferPool> {
-    pub(crate) session: Option<Session<P>>,
+pub struct ActiveTrx {
+    pub(crate) session: Option<Session>,
     // Status of the transaction.
     // Every undo log will refer to this object on heap.
     // There are nested pointers to allow atomic update on status when
@@ -150,16 +149,10 @@ pub struct ActiveTrx<P: BufferPool> {
     pub(crate) redo: RedoLogs,
 }
 
-impl<P: BufferPool> ActiveTrx<P> {
+impl ActiveTrx {
     /// Create a new transaction.
     #[inline]
-    pub fn new(
-        session: Session<P>,
-        trx_id: TrxID,
-        sts: TrxID,
-        log_no: usize,
-        gc_no: usize,
-    ) -> Self {
+    pub fn new(session: Session, trx_id: TrxID, sts: TrxID, log_no: usize, gc_no: usize) -> Self {
         ActiveTrx {
             session: Some(session),
             status: Arc::new(SharedTrxStatus::new(trx_id)),
@@ -174,13 +167,13 @@ impl<P: BufferPool> ActiveTrx<P> {
 
     /// Returns reference of the storage engine.
     #[inline]
-    pub fn engine_ref(&self) -> Option<&Engine<P>> {
+    pub fn engine_ref(&self) -> Option<&Engine> {
         self.session.as_ref().map(|s| &s.engine)
     }
 
     /// Returns a weak clone of the storage engine.
     #[inline]
-    pub fn engine_weak(&self) -> Option<Engine<P>> {
+    pub fn engine_weak(&self) -> Option<Engine> {
         self.session.as_ref().map(|s| s.engine.weak())
     }
 
@@ -204,7 +197,7 @@ impl<P: BufferPool> ActiveTrx<P> {
 
     /// Starts a statement.
     #[inline]
-    pub fn start_stmt(self) -> Statement<P> {
+    pub fn start_stmt(self) -> Statement {
         Statement::new(self)
     }
 
@@ -216,7 +209,7 @@ impl<P: BufferPool> ActiveTrx<P> {
 
     /// Prepare current transaction for committing.
     #[inline]
-    pub fn prepare(mut self) -> PreparedTrx<P> {
+    pub fn prepare(mut self) -> PreparedTrx {
         // fast path for readonly transactions
         if self.readonly() {
             // there should be no ref count of transaction status.
@@ -275,16 +268,16 @@ impl<P: BufferPool> ActiveTrx<P> {
 
     /// Commit the transaction.
     #[inline]
-    pub async fn commit(self) -> Result<Session<P>> {
+    pub async fn commit(self) -> Result<Session> {
         let engine = self.engine_weak().unwrap();
-        engine.trx_sys.commit(self, engine.buf_pool).await
+        engine.trx_sys.commit(self, engine.data_pool).await
     }
 
     /// Rollback the transaction.
     #[inline]
-    pub async fn rollback(self) -> Session<P> {
+    pub async fn rollback(self) -> Session {
         let engine = self.engine_weak().unwrap();
-        engine.trx_sys.rollback(self, &engine.buf_pool).await
+        engine.trx_sys.rollback(self, engine.data_pool).await
     }
 
     /// Add one redo log entry.
@@ -311,7 +304,7 @@ impl<P: BufferPool> ActiveTrx<P> {
     }
 }
 
-impl<P: BufferPool> Drop for ActiveTrx<P> {
+impl Drop for ActiveTrx {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo.is_empty(), "redo should be cleared");
@@ -321,14 +314,14 @@ impl<P: BufferPool> Drop for ActiveTrx<P> {
     }
 }
 
-impl<P: BufferPool> IntoSession<P> for ActiveTrx<P> {
+impl IntoSession for ActiveTrx {
     #[inline]
-    fn into_session(mut self) -> Option<Session<P>> {
+    fn into_session(mut self) -> Option<Session> {
         self.session.take()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Option<Session<P>> {
+    fn split_session(&mut self) -> Option<Session> {
         self.session.take()
     }
 }
@@ -346,20 +339,20 @@ pub struct PreparedTrxPayload {
 }
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
-pub struct PreparedTrx<P: BufferPool> {
+pub struct PreparedTrx {
     redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
     payload: Option<PreparedTrxPayload>,
-    session: Option<Session<P>>,
+    session: Option<Session>,
 }
 
-impl<P: BufferPool> PreparedTrx<P> {
+impl PreparedTrx {
     #[inline]
-    pub fn engine(&self) -> Option<&Engine<P>> {
+    pub fn engine(&self) -> Option<&Engine> {
         self.session.as_ref().map(|s| &s.engine)
     }
 
     #[inline]
-    pub fn fill_cts(mut self, cts: TrxID) -> PrecommitTrx<P> {
+    pub fn fill_cts(mut self, cts: TrxID) -> PrecommitTrx {
         let redo_bin = if let Some(mut redo_bin) = self.redo_bin.take() {
             redo_bin.header.cts = cts;
             Some(redo_bin)
@@ -416,19 +409,19 @@ impl<P: BufferPool> PreparedTrx<P> {
     }
 }
 
-impl<P: BufferPool> IntoSession<P> for PreparedTrx<P> {
+impl IntoSession for PreparedTrx {
     #[inline]
-    fn into_session(mut self) -> Option<Session<P>> {
+    fn into_session(mut self) -> Option<Session> {
         self.session.take()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Option<Session<P>> {
+    fn split_session(&mut self) -> Option<Session> {
         self.session.take()
     }
 }
 
-impl<P: BufferPool> Drop for PreparedTrx<P> {
+impl Drop for PreparedTrx {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
@@ -450,19 +443,19 @@ pub struct PrecommitTrxPayload {
 /// One is user transaction which will contains payload such as undo logs and index GC records
 /// and session info.
 /// The other is system transaction which will be directly dropped and has no other info.
-pub struct PrecommitTrx<P: BufferPool> {
+pub struct PrecommitTrx {
     pub cts: TrxID,
     pub redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
     // Payload is only for user transaction
     pub payload: Option<PrecommitTrxPayload>,
-    pub session: Option<Session<P>>,
+    pub session: Option<Session>,
 }
 
-impl<P: BufferPool> PrecommitTrx<P> {
+impl PrecommitTrx {
     /// Commit this transaction, the only thing to do is replace ongoing transaction ids
     /// in undo log with cts, and this is atomic operation.
     #[inline]
-    pub fn commit(mut self) -> CommittedTrx<P> {
+    pub fn commit(mut self) -> CommittedTrx {
         assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
                                           // release the prepare notifier in transaction status
         match self.payload.take() {
@@ -505,7 +498,7 @@ impl<P: BufferPool> PrecommitTrx<P> {
     }
 }
 
-impl<P: BufferPool> Drop for PrecommitTrx<P> {
+impl Drop for PrecommitTrx {
     #[inline]
     fn drop(&mut self) {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
@@ -514,14 +507,14 @@ impl<P: BufferPool> Drop for PrecommitTrx<P> {
     }
 }
 
-impl<P: BufferPool> IntoSession<P> for PrecommitTrx<P> {
+impl IntoSession for PrecommitTrx {
     #[inline]
-    fn into_session(mut self) -> Option<Session<P>> {
+    fn into_session(mut self) -> Option<Session> {
         self.session.take()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Option<Session<P>> {
+    fn split_session(&mut self) -> Option<Session> {
         self.session.take()
     }
 }
@@ -533,13 +526,13 @@ pub struct CommittedTrxPayload {
     pub index_gc: Vec<IndexPurge>,
 }
 
-pub struct CommittedTrx<P: BufferPool> {
+pub struct CommittedTrx {
     pub cts: TrxID,
     pub payload: Option<CommittedTrxPayload>,
-    session: Option<Session<P>>,
+    session: Option<Session>,
 }
 
-impl<P: BufferPool> CommittedTrx<P> {
+impl CommittedTrx {
     #[inline]
     pub fn sts(&self) -> Option<TrxID> {
         self.payload.as_ref().map(|p| p.sts)
@@ -562,14 +555,14 @@ impl<P: BufferPool> CommittedTrx<P> {
     }
 }
 
-impl<P: BufferPool> IntoSession<P> for CommittedTrx<P> {
+impl IntoSession for CommittedTrx {
     #[inline]
-    fn into_session(mut self) -> Option<Session<P>> {
+    fn into_session(mut self) -> Option<Session> {
         self.session.take()
     }
 
     #[inline]
-    fn split_session(&mut self) -> Option<Session<P>> {
+    fn split_session(&mut self) -> Option<Session> {
         self.session.take()
     }
 }
