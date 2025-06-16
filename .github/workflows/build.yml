@@ -25,7 +25,7 @@ jobs:
     - name: Build
       run: cargo build --verbose --all
     - name: Run tests
-      run: cargo test --verbose --all
+      run: cargo test --verbose --all --jobs 1
     - name: Install cargo-tarpaulin
       uses: actions-rs/install@v0.1
       with:
@@ -33,7 +33,7 @@ jobs:
         version: latest
         use-tool-cache: true
     - name: Run cargo-tarpaulin
-      run: cargo tarpaulin --all-features --workspace --timeout 180 --out Xml
+      run: cargo tarpaulin --all-features --jobs 1 --workspace --timeout 180 --out Xml
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v1.0.2
       with:
