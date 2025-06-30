@@ -165,7 +165,7 @@ async fn worker(args: Args, blk_idx: &'static BlockIndex, stop: Arc<AtomicBool>)
     let mut sum_page_id = 0u64;
     for _ in 0..args.count {
         let row_id = rng.next_u64() % max_row_id;
-        let res = blk_idx.find_row_id(row_id).await;
+        let res = blk_idx.find_row(row_id).await;
         match res {
             RowLocation::RowPage(page_id) => {
                 count += 1;

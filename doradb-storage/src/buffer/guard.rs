@@ -80,6 +80,16 @@ impl<T: 'static> PageGuard<T> {
     }
 
     #[inline]
+    pub fn must_exclusive(self) -> PageExclusiveGuard<T> {
+        debug_assert!(self.is_exclusive());
+        PageExclusiveGuard {
+            bf: unsafe { &mut *self.bf.0 },
+            guard: self.guard,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
     pub async fn exclusive_async(self) -> PageExclusiveGuard<T> {
         match self.guard.state {
             GuardState::Optimistic => {

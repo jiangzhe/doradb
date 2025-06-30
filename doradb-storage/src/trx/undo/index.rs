@@ -1,6 +1,9 @@
+use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
+use crate::index::RowLocation;
+use crate::latch::LatchFallbackMode;
 use crate::row::ops::SelectKey;
-use crate::row::RowID;
+use crate::row::{RowID, RowPage, RowRead};
 use crate::table::TableID;
 use std::collections::HashMap;
 
@@ -38,7 +41,7 @@ impl IndexUndoLogs {
     /// because other transaction can not update the same index entry
     /// concurrently.
     #[inline]
-    pub fn rollback(&mut self, catalog: &Catalog) {
+    pub async fn rollback<P: BufferPool>(&mut self, data_pool: &'static P, catalog: &Catalog) {
         while let Some(entry) = self.0.pop() {
             let table = catalog.get_table(entry.table_id).unwrap();
             match entry.kind {
@@ -50,12 +53,50 @@ impl IndexUndoLogs {
                     assert!(res);
                 }
                 IndexUndoKind::UpdateUnique(key, old_row_id) => {
-                    let new_row_id = entry.row_id;
-                    let res = table.sec_idx[key.index_no]
-                        .unique()
-                        .unwrap()
-                        .compare_exchange(&key.vals, new_row_id, old_row_id);
-                    assert!(res.is_ok());
+                    // There is a race condition:
+                    // Transaction A deleted a row{row_id=100, k=1} and committed.
+                    // GC thread is trying to delete index entry.
+                    // Meanwhile, transaction B is inserting a row{row_id=200, k=1}, and updates
+                    // index entry {k=1,row_id=100} to {k=1, row_id=200}.
+                    // After the index change, GC thread finds index value of transaction A
+                    // does not match orignal value(row_id != 100), then skips the index deletion.
+                    // After that, transaction B starts to rollback.
+                    // If transaction B does not care about the status of original row, it will leave
+                    // a leaked index entry {k=1, row_id=100}, and no GC will touch it again.
+                    //
+                    // To solve this, we need to re-check original row with row latch and delete
+                    // index entry if it is deleted and does not have any old version (already GCed).
+                    match table.blk_idx.find_row(old_row_id).await {
+                        RowLocation::NotFound => unreachable!(),
+                        RowLocation::ColSegment(..) => todo!(),
+                        RowLocation::RowPage(page_id) => {
+                            let page_guard = data_pool
+                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                                .await
+                                .shared_async()
+                                .await;
+                            // acquire row latch to avoid race condition.
+                            let access = page_guard.read_row_by_id(old_row_id);
+                            if access.row().is_deleted() && !access.any_old_version_exists() {
+                                // old row is invisible to all transactions.
+                                let new_row_id = entry.row_id;
+                                let res = table.sec_idx[key.index_no]
+                                    .unique()
+                                    .unwrap()
+                                    .compare_delete(&key.vals, new_row_id);
+                                assert!(res);
+                            } else {
+                                // old row must be seen for one transaction.
+                                // rollback the index change.
+                                let new_row_id = entry.row_id;
+                                let res = table.sec_idx[key.index_no]
+                                    .unique()
+                                    .unwrap()
+                                    .compare_exchange(&key.vals, new_row_id, old_row_id);
+                                assert!(res.is_ok());
+                            }
+                        }
+                    }
                 }
                 IndexUndoKind::DeferDelete(_) => (), // do nothing.
             }

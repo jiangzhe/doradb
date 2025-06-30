@@ -43,6 +43,14 @@ impl<'a> RowReadAccess<'a> {
     }
 
     #[inline]
+    pub fn any_old_version_exists(&self) -> bool {
+        match &self.state {
+            RowReadState::Undo(g) => g.is_some(),
+            RowReadState::Recover(_) => false,
+        }
+    }
+
+    #[inline]
     pub fn ts(&self) -> Option<TrxID> {
         match &self.state {
             RowReadState::Undo(head) => head.as_ref().map(|h| h.ts()),

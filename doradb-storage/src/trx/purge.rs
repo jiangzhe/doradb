@@ -740,7 +740,7 @@ mod tests {
                 index.scan_values(&mut remained_row_ids);
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
-                let location = table.blk_idx.find_row_id(row_id).await;
+                let location = table.blk_idx.find_row(row_id).await;
                 let page_id = match location {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
