@@ -74,7 +74,9 @@ impl Statement {
         let engine = self.trx.engine_weak().unwrap();
         self.row_undo.rollback(engine.data_pool).await;
         // rollback index data.
-        self.index_undo.rollback(&engine.catalog());
+        self.index_undo
+            .rollback(engine.data_pool, engine.catalog())
+            .await;
         // clear redo logs.
         self.redo.clear();
         self.trx

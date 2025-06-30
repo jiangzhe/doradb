@@ -262,6 +262,10 @@ impl<'a> HybridGuard<'a> {
     fn validate_exclusive_internal(&self) -> bool {
         debug_assert!(self.state == GuardState::Optimistic);
         // as we already acquire exclusive lock, current version is added by 1.
+        // The result can be false, because we compare the snapshot version added by 1
+        // with current version inside lock.
+        // If some other thread has locked and unlocked before this lock, version
+        // does not match.
         self.lock.version_match(self.version + LATCH_EXCLUSIVE_BIT)
     }
 

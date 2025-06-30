@@ -152,7 +152,7 @@ impl Table {
                 .lookup(&key.vals)
             {
                 None => return SelectMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
+                Some(row_id) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return SelectMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -201,7 +201,7 @@ impl Table {
                 .lookup(&key.vals)
             {
                 None => return None,
-                Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
+                Some(row_id) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return None,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -697,7 +697,7 @@ impl Table {
         let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
                 None => return UpdateMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
+                Some(row_id) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return UpdateMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -807,7 +807,7 @@ impl Table {
         let (page_guard, row_id) = loop {
             match index.lookup(&key.vals) {
                 None => return DeleteMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
+                Some(row_id) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -846,7 +846,7 @@ impl Table {
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (mut page_guard, row_id) = match index.lookup(&key.vals) {
             None => unreachable!(),
-            Some(row_id) => match self.blk_idx.find_row_id(row_id).await {
+            Some(row_id) => match self.blk_idx.find_row(row_id).await {
                 RowLocation::NotFound => unreachable!(),
                 RowLocation::ColSegment(..) => todo!(),
                 RowLocation::RowPage(page_id) => {
@@ -926,7 +926,7 @@ impl Table {
                         // So we skip to delete it.
                         return false;
                     }
-                    match self.blk_idx.find_row_id(row_id).await {
+                    match self.blk_idx.find_row(row_id).await {
                         RowLocation::NotFound => {
                             return index.compare_delete(&key.vals, row_id);
                         }
@@ -1035,7 +1035,7 @@ impl Table {
     ) -> LinkForUniqueIndex {
         debug_assert!(old_id != new_id);
         let (old_guard, old_id) = loop {
-            match self.blk_idx.find_row_id(old_id).await {
+            match self.blk_idx.find_row(old_id).await {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::ColSegment(..) => todo!(),
                 RowLocation::RowPage(page_id) => {
@@ -1496,7 +1496,8 @@ impl Table {
                                     return InsertIndex::Ok;
                                 }
                                 IndexCompareExchange::NotExists => {
-                                    // re-insert index entry
+                                    // There is race condition when GC thread delete the index entry concurrently.
+                                    // So try to insert index entry again.
                                     continue;
                                 }
                                 IndexCompareExchange::Failure => {
@@ -1596,7 +1597,7 @@ impl Table {
         buf_pool: &'static P,
         row_id: RowID,
     ) -> Option<TrxID> {
-        match self.blk_idx.find_row_id(row_id).await {
+        match self.blk_idx.find_row(row_id).await {
             RowLocation::NotFound => None,
             RowLocation::ColSegment(..) => todo!(),
             RowLocation::RowPage(page_id) => {

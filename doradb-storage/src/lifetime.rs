@@ -23,30 +23,3 @@ pub unsafe trait StaticLifetime: Sized {
         drop(Box::from_raw(this as *const Self as *mut Self));
     }
 }
-
-pub trait StaticLifetimeNew: Sized {
-    /// Create a leaked static reference from given instance.
-    fn new_static(this: Self) -> &'static Self {
-        Box::leak(Box::new(this))
-    }
-}
-
-pub trait StaticLifetimeRef: Sized + 'static {
-    type Target;
-
-    unsafe fn as_raw_ptr(self) -> *mut Self::Target;
-
-    #[inline]
-    unsafe fn drop_static(self) {
-        drop(Box::from_raw(self.as_raw_ptr()));
-    }
-}
-
-impl<T> StaticLifetimeRef for &'static T {
-    type Target = T;
-
-    #[inline]
-    unsafe fn as_raw_ptr(self) -> *mut Self::Target {
-        self as *const T as *mut T
-    }
-}

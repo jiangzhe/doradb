@@ -528,9 +528,9 @@ impl BlockIndex {
 
     /// Find location of given row id, maybe in column file or row page.
     #[inline]
-    pub async fn find_row_id(&self, row_id: RowID) -> RowLocation {
+    pub async fn find_row(&self, row_id: RowID) -> RowLocation {
         loop {
-            let res = self.try_find_row_id(row_id).await;
+            let res = self.try_find_row(row_id).await;
             let res = verify_continue!(res);
             return res;
         }
@@ -665,6 +665,14 @@ impl BlockIndex {
     ) -> Validation<(RowID, RowID)> {
         debug_assert!(!stack.is_empty());
         let mut p_guard;
+        // Block index is a special type of B+ tree, which does not implement
+        // branch node split.
+        // Split is only applied to root node. This is because block index is
+        // an append-only index, no random access is allowed (except the merge
+        // of multiple leaf nodes, but not implemented yet). So we prefer to
+        // always hold full branch node.
+        // That means we may have a block index of depth a little larger than a
+        // normal B+ tree.
         loop {
             // try to lock parent.
             let g = stack.pop().unwrap();
@@ -673,12 +681,12 @@ impl BlockIndex {
             if !p_guard.page().branch_is_full() {
                 break;
             } else if stack.is_empty() {
-                // root is full, should split
+                // root is full, should split.
                 let res = self
                     .insert_row_page_split_root(p_guard, row_id, count, insert_page_id)
                     .await;
                 return Valid(res);
-            }
+            } // do not split branch node.
         }
         // create new leaf node with one insert page id
         let mut leaf = self.pool.allocate_page::<BlockNode>().await;
@@ -693,6 +701,7 @@ impl BlockIndex {
             let p = p_guard.page_mut();
             p.branch_add_entry(PageEntry::new(row_id, leaf_page_id));
         }
+        drop(c_guard);
         Valid((row_id, row_id + count))
     }
 
@@ -702,6 +711,7 @@ impl BlockIndex {
         count: u64,
         insert_page_id: PageID,
     ) -> Validation<(RowID, RowID)> {
+        // Stack holds the path from root to leaf.
         let mut stack = vec![];
         let mut p_guard = {
             let g = self
@@ -774,7 +784,7 @@ impl BlockIndex {
             .pool
             .get_page::<BlockNode>(self.root, LatchFallbackMode::Spin)
             .await;
-        // optimistic mode, should always check version after use protected data.
+        // optimistic mode, should always check version before using protected data.
         let mut pu = unsafe { p_guard.page_unchecked() };
         let height = pu.header.height;
         let mut level = 1;
@@ -782,6 +792,7 @@ impl BlockIndex {
             let count = pu.header.count;
             let idx = 1.max(count as usize).min(NBR_ENTRIES_IN_BRANCH) - 1;
             let page_id = pu.branch_entries()[idx].page_id;
+            // fields on page are read, validate them.
             verify!(p_guard.validate());
             p_guard = if level == height {
                 let g = self
@@ -805,9 +816,11 @@ impl BlockIndex {
     }
 
     #[inline]
-    async fn try_find_row_id(&self, row_id: RowID) -> Validation<RowLocation> {
-        let mut g: PageGuard<BlockNode> =
-            self.pool.get_page(self.root, LatchFallbackMode::Spin).await;
+    async fn try_find_row(&self, row_id: RowID) -> Validation<RowLocation> {
+        let mut g = self
+            .pool
+            .get_page::<BlockNode>(self.root, LatchFallbackMode::Spin)
+            .await;
         loop {
             let pu = unsafe { g.page_unchecked() };
             if pu.is_leaf() {
@@ -1057,7 +1070,7 @@ impl RedoLogPageCommitter {
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
-    use crate::engine::{Engine, EngineConfig};
+    use crate::engine::EngineConfig;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
     use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
@@ -1299,7 +1312,7 @@ mod tests {
                 }
                 for i in 0..row_pages {
                     let row_id = (i * rows_per_page + rows_per_page / 2) as u64;
-                    let res = blk_idx.find_row_id(row_id).await;
+                    let res = blk_idx.find_row(row_id).await;
                     match res {
                         RowLocation::RowPage(page_id) => {
                             let g = engine
