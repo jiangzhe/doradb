@@ -1,8 +1,8 @@
-pub mod buffer;
 pub mod col;
 pub mod io;
 #[macro_use]
 pub mod error;
+pub mod buffer;
 pub mod catalog;
 pub mod engine;
 pub mod index;

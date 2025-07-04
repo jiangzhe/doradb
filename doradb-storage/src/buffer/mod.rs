@@ -9,7 +9,7 @@ mod util;
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use fixed::FixedBufferPool;
 
-use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
+use crate::buffer::guard::{PageExclusiveGuard, FacadePageGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::error::Result;
 use crate::error::Validation;
@@ -44,7 +44,7 @@ pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + StaticLifetime 
         &'static self,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = PageGuard<T>> + Send;
+    ) -> impl Future<Output = FacadePageGuard<T>> + Send;
 
     /// Deallocate page.
     fn deallocate_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>);
@@ -60,10 +60,10 @@ pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + StaticLifetime 
     /// to ensure no change happens in-between.
     fn get_child_page<T>(
         &'static self,
-        p_guard: &PageGuard<T>,
+        p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = Validation<PageGuard<T>>> + Send;
+    ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send;
 }
 
 pub enum BufferRequest {

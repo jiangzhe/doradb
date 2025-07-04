@@ -46,6 +46,7 @@ criterion-perf-events = "0.4"
 perfcnt = "0.8"
 fastrand = "2"
 tikv-jemallocator = "0.6"
+bplustree = "0.1.0"
 
 [profile.release]
 debug = true

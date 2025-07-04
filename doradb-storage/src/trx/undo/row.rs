@@ -1,3 +1,4 @@
+use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::latch::LatchFallbackMode;

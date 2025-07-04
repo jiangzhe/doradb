@@ -2,7 +2,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
+use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::TableMetadata;
@@ -103,7 +103,8 @@ impl Table {
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let mut cursor = self.blk_idx.cursor().seek(0).await;
+        let mut cursor = self.blk_idx.cursor();
+        cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.shared_async().await;
             debug_assert!(g.page().is_leaf());
