@@ -1,5 +1,5 @@
 use crate::buffer::frame::FrameContext;
-use crate::buffer::guard::PageSharedGuard;
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::catalog::TableMetadata;
 use crate::notify::Notify;

@@ -1,8 +1,7 @@
 use crate::buffer::frame::BufferFrame;
-use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
+use crate::buffer::guard::{PageExclusiveGuard, FacadePageGuard};
 use crate::buffer::page::BufferPage;
 use crate::error::{Error, Result};
-use crate::notify::Signal;
 use crate::ptr::UnsafePtr;
 use libc::{
     c_void, madvise, mmap, munmap, MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MADV_REMOVE,
@@ -15,8 +14,8 @@ pub(super) fn init_bf_exclusive_guard<T: BufferPage>(
     bf: UnsafePtr<BufferFrame>,
 ) -> PageExclusiveGuard<T> {
     unsafe {
-        let g = (*bf.0).latch.exclusive_blocking();
-        PageGuard::new(bf, g).exclusive_blocking()
+        let g = (*bf.0).latch.try_exclusive().unwrap();
+        FacadePageGuard::new(bf, g).must_exclusive()
     }
 }
 

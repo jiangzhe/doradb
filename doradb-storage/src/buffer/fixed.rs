@@ -1,5 +1,5 @@
 use crate::buffer::frame::BufferFrame;
-use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
+use crate::buffer::guard::{PageExclusiveGuard, FacadePageGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::buffer::util::{init_bf_exclusive_guard, mmap_allocate, mmap_deallocate, AllocMap};
 use crate::buffer::BufferPool;
@@ -77,11 +77,11 @@ impl FixedBufferPool {
         &'static self,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> PageGuard<T> {
+    ) -> FacadePageGuard<T> {
         unsafe {
             let bf = self.get_frame(page_id);
             let g = (*bf.0).latch.optimistic_fallback(mode).await;
-            PageGuard::new(bf, g)
+            FacadePageGuard::new(bf, g)
         }
     }
 
@@ -159,7 +159,7 @@ impl BufferPool for FixedBufferPool {
         &'static self,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> PageGuard<T> {
+    ) -> FacadePageGuard<T> {
         debug_assert!(
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
@@ -189,10 +189,10 @@ impl BufferPool for FixedBufferPool {
     #[inline]
     async fn get_child_page<T>(
         &'static self,
-        p_guard: &PageGuard<T>,
+        p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Validation<PageGuard<T>> {
+    ) -> Validation<FacadePageGuard<T>> {
         debug_assert!(
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
