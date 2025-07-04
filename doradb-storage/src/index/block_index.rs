@@ -1,4 +1,6 @@
-use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard};
+use crate::buffer::guard::{
+    FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
+};
 use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
@@ -6,6 +8,8 @@ use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
 };
+use crate::index::util::ParentPosition;
+use crate::index::util::RedoLogPageCommitter;
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage, INVALID_ROW_ID};
 use crate::trx::sys::TransactionSystem;
@@ -547,8 +551,8 @@ impl BlockIndex {
 
     /// Returns the cursor for range scan.
     #[inline]
-    pub fn cursor(&self) -> Cursor {
-        Cursor {
+    pub fn cursor(&self) -> BlockIndexCursor {
+        BlockIndexCursor {
             blk_idx: self,
             parent: None,
             child: None,
@@ -719,7 +723,7 @@ impl BlockIndex {
                 .await;
             let mut guard = verify!(g);
             verify!(guard.try_exclusive());
-            guard.exclusive_async().await
+            guard.must_exclusive()
         };
         debug_assert!(p_guard.page().is_leaf());
         // only empty block index will have empty leaf.
@@ -779,7 +783,7 @@ impl BlockIndex {
         &self,
         stack: &mut Vec<PageOptimisticGuard<BlockNode>>,
         mode: LatchFallbackMode,
-    ) -> Validation<PageGuard<BlockNode>> {
+    ) -> Validation<FacadePageGuard<BlockNode>> {
         let mut p_guard = self
             .pool
             .get_page::<BlockNode>(self.root, LatchFallbackMode::Spin)
@@ -904,41 +908,37 @@ pub enum RowLocation {
     NotFound,
 }
 
-pub enum CursorState {
-    Uninitialize,
-    EOF,
-}
-
 /// A cursor to read all leaf values.
-pub struct Cursor<'a> {
+pub struct BlockIndexCursor<'a> {
     blk_idx: &'a BlockIndex,
     // The parent node of current located
-    parent: Option<BranchLookup>,
-    child: Option<PageGuard<BlockNode>>,
+    parent: Option<ParentPosition<FacadePageGuard<BlockNode>>>,
+    child: Option<FacadePageGuard<BlockNode>>,
 }
 
-impl<'a> Cursor<'a> {
+impl<'a> BlockIndexCursor<'a> {
     #[inline]
-    pub async fn seek(mut self, row_id: RowID) -> Self {
-        self.clear();
-        while let Invalid = self.try_find_leaf_with_parent(row_id).await {
-            self.clear();
+    pub async fn seek(&mut self, row_id: RowID) {
+        loop {
+            self.reset();
+            let res = self.try_find_leaf_with_parent(row_id).await;
+            verify_continue!(res);
+            return;
         }
-        self
     }
 
     #[inline]
-    pub async fn next(&mut self) -> Option<PageGuard<BlockNode>> {
+    pub async fn next(&mut self) -> Option<FacadePageGuard<BlockNode>> {
         if let Some(child) = self.child.take() {
             debug_assert!(child.is_shared());
             return Some(child);
         }
         if let Some(parent) = self.parent.as_ref() {
             debug_assert!(parent.g.is_shared());
-            let shared = unsafe { parent.g.as_shared() };
-            let page = shared.page();
+            let p_guard = unsafe { parent.g.as_shared() };
+            let page = p_guard.page();
             let entries = page.branch_entries();
-            let next_idx = parent.idx + 1;
+            let next_idx = (parent.idx + 1) as usize;
             if next_idx == entries.len() {
                 // current parent is exhausted.
                 let row_id = page.header.end_row_id;
@@ -949,7 +949,7 @@ impl<'a> Cursor<'a> {
                 }
                 // otherwise, we rerun the search on given row id to get next leaf.
                 while let Invalid = self.try_find_leaf_with_parent(row_id).await {
-                    self.clear();
+                    self.reset();
                 }
                 let child = self.child.take().unwrap();
                 debug_assert!(child.is_shared());
@@ -957,19 +957,21 @@ impl<'a> Cursor<'a> {
             }
             // otherwise, we jump to next slot and get leaf node.
             let page_id = entries[next_idx].page_id;
-            self.parent.as_mut().unwrap().idx = next_idx; // update parent position.
+            self.parent.as_mut().unwrap().idx = next_idx as isize; // update parent position.
             let child = self
                 .blk_idx
                 .pool
                 .get_page::<BlockNode>(page_id, LatchFallbackMode::Shared)
+                .await
+                .shared_async()
                 .await;
-            return Some(child.shared_async().await.facade(false));
+            return Some(child.facade(false));
         }
         None
     }
 
     #[inline]
-    fn clear(&mut self) {
+    fn reset(&mut self) {
         self.parent.take();
         self.child.take();
     }
@@ -1023,46 +1025,12 @@ impl<'a> Cursor<'a> {
                 .get_child_page::<BlockNode>(&g, page_id, LatchFallbackMode::Spin)
                 .await;
             let c = verify!(c);
-            self.parent = Some(BranchLookup { g, idx });
+            self.parent = Some(ParentPosition {
+                g,
+                idx: idx as isize,
+            });
             g = c;
         }
-    }
-}
-
-struct BranchLookup {
-    g: PageGuard<BlockNode>,
-    idx: usize,
-}
-
-struct RedoLogPageCommitter {
-    trx_sys: &'static TransactionSystem,
-    table_id: TableID,
-}
-
-impl Clone for RedoLogPageCommitter {
-    #[inline]
-    fn clone(&self) -> Self {
-        RedoLogPageCommitter {
-            trx_sys: self.trx_sys,
-            table_id: self.table_id,
-        }
-    }
-}
-
-impl RedoLogPageCommitter {
-    #[inline]
-    pub fn new(trx_sys: &'static TransactionSystem, table_id: TableID) -> Self {
-        RedoLogPageCommitter { trx_sys, table_id }
-    }
-
-    pub async fn commit_row_page(&self, page_id: PageID, start_row_id: RowID, end_row_id: RowID) {
-        let mut trx = self.trx_sys.begin_sys_trx();
-        let table_id = self.table_id;
-        // Once a row page is added to block index, we start
-        // a new internal transaction and log its information.
-        trx.create_row_page(table_id, page_id, start_row_id, end_row_id);
-        let res = self.trx_sys.commit_sys(trx).await;
-        assert!(res.is_ok());
     }
 }
 
@@ -1215,7 +1183,8 @@ mod tests {
                         .await;
                 }
                 let mut count = 0usize;
-                let mut cursor = blk_idx.cursor().seek(0).await;
+                let mut cursor = blk_idx.cursor();
+                cursor.seek(0).await;
                 while let Some(res) = cursor.next().await {
                     count += 1;
                     if count == 10000 {

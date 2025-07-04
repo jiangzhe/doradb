@@ -145,37 +145,23 @@ impl HybridLatch {
         let ver = self.version_acq();
         if (ver & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT {
             self.lock.lock_exclusive_async().await;
-            let ver = self.version_acq() + LATCH_EXCLUSIVE_BIT;
-            self.version.store(ver, Ordering::Release);
-            HybridGuard::new(self, GuardState::Exclusive, ver)
+            let ver = self
+                .version
+                .fetch_add(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+            HybridGuard::new(self, GuardState::Exclusive, ver + LATCH_EXCLUSIVE_BIT)
         } else {
             HybridGuard::new(self, GuardState::Optimistic, ver)
         }
-    }
-
-    /// Get a write lock.
-    pub fn exclusive_blocking(&self) -> HybridGuard<'_> {
-        self.lock.lock_exclusive();
-        let ver = self.version_acq() + LATCH_EXCLUSIVE_BIT;
-        self.version.store(ver, Ordering::Release);
-        HybridGuard::new(self, GuardState::Exclusive, ver)
     }
 
     /// Get a write lock in async way.
     #[inline]
     pub async fn exclusive_async(&self) -> HybridGuard<'_> {
         self.lock.lock_exclusive_async().await;
-        let ver = self.version_acq() + LATCH_EXCLUSIVE_BIT;
-        self.version.store(ver, Ordering::Release);
-        HybridGuard::new(self, GuardState::Exclusive, ver)
-    }
-
-    /// Get a shared lock.
-    #[inline]
-    pub fn shared_blocking(&self) -> HybridGuard<'_> {
-        self.lock.lock_shared();
-        let ver = self.version_acq();
-        HybridGuard::new(self, GuardState::Shared, ver)
+        let ver = self
+            .version
+            .fetch_add(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+        HybridGuard::new(self, GuardState::Exclusive, ver + LATCH_EXCLUSIVE_BIT)
     }
 
     /// Get a shared lock in async way.
@@ -190,9 +176,14 @@ impl HybridLatch {
     #[inline]
     pub fn try_exclusive(&self) -> Option<HybridGuard<'_>> {
         if self.lock.try_lock_exclusive() {
-            let ver = self.version_acq() + LATCH_EXCLUSIVE_BIT;
-            self.version.store(ver, Ordering::Release);
-            return Some(HybridGuard::new(self, GuardState::Exclusive, ver));
+            let ver = self
+                .version
+                .fetch_add(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+            return Some(HybridGuard::new(
+                self,
+                GuardState::Exclusive,
+                ver + LATCH_EXCLUSIVE_BIT,
+            ));
         }
         None
     }
@@ -251,24 +242,6 @@ impl<'a> HybridGuard<'a> {
         self.lock.version_match(self.version)
     }
 
-    /// Validate whether transition from optimistic to shared is valid.
-    #[inline]
-    fn validate_shared_internal(&self) -> bool {
-        debug_assert!(self.state == GuardState::Optimistic);
-        self.lock.version_match(self.version)
-    }
-
-    #[inline]
-    fn validate_exclusive_internal(&self) -> bool {
-        debug_assert!(self.state == GuardState::Optimistic);
-        // as we already acquire exclusive lock, current version is added by 1.
-        // The result can be false, because we compare the snapshot version added by 1
-        // with current version inside lock.
-        // If some other thread has locked and unlocked before this lock, version
-        // does not match.
-        self.lock.version_match(self.version + LATCH_EXCLUSIVE_BIT)
-    }
-
     /// Convert lock mode to optimistic.
     #[inline]
     pub fn downgrade(mut self) -> Self {
@@ -315,11 +288,11 @@ impl<'a> HybridGuard<'a> {
             GuardState::Optimistic => {
                 // use try shared is ok.
                 // because only when there is a exclusive lock, this try will fail.
-                // and optimistic lock must be retried as vesion won't be matched.
+                // and optimistic lock must be retried as version won't be matched.
                 // an additional validation is required, because other thread may
                 // gain the exclusive lock inbetween.
                 if let Some(g) = self.lock.try_shared() {
-                    if self.validate_shared_internal() {
+                    if self.lock.version_match(self.version) {
                         *self = g;
                         return Valid(());
                     } // otherwise drop the read lock and notify caller to retry
@@ -332,10 +305,33 @@ impl<'a> HybridGuard<'a> {
         }
     }
 
+    /// This method can make sure shared lock is acquired based
+    /// on initial version of the guard.
+    /// After the lock is acquired, an additional verification
+    /// is performed. If version mismatches, the lock will be
+    /// dropped immediately.
+    ///
+    /// The steps are:
+    /// 1. verify version.
+    /// 2. acquire shared lock in async way.
+    /// 3. verify version agian.
     #[inline]
-    pub fn shared_blocking(self) -> Self {
-        debug_assert!(self.state == GuardState::Optimistic);
-        self.lock.shared_blocking()
+    pub async fn verify_shared_async(&mut self) -> Validation<()> {
+        match self.state {
+            GuardState::Optimistic => {
+                if !self.lock.version_match(self.version) {
+                    return Invalid;
+                }
+                let g = self.lock.shared_async().await;
+                if !self.lock.version_match(self.version) {
+                    return Invalid;
+                }
+                *self = g;
+                Valid(())
+            }
+            GuardState::Shared => Valid(()),
+            GuardState::Exclusive => panic!("verify shared async on exclusive lock is not allowed"),
+        }
     }
 
     #[inline]
@@ -351,7 +347,12 @@ impl<'a> HybridGuard<'a> {
         match self.state {
             GuardState::Optimistic => {
                 if let Some(g) = self.lock.try_exclusive() {
-                    if self.validate_exclusive_internal() {
+                    // as we already acquire exclusive lock, current version is added by 1.
+                    // The result can be false, because we compare the snapshot version added by 1
+                    // with current version inside lock.
+                    // If some other thread has locked and unlocked before this lock, version
+                    // does not match.
+                    if self.lock.version_match(self.version + LATCH_EXCLUSIVE_BIT) {
                         *self = g;
                         return Valid(());
                     }
@@ -364,10 +365,49 @@ impl<'a> HybridGuard<'a> {
         }
     }
 
+    /// This method can make sure exclusive lock is acquired
+    /// based on initial version of the guard.
+    /// After the lock is acquired, an additional verification
+    /// is performed. If version mismatches, the lock will be
+    /// dropped immediately.
+    ///
+    /// The steps are:
+    /// 1. verify version.
+    /// 2. acquire exclusive lock in async way.
+    /// 3. verify version agian.
     #[inline]
-    pub fn exclusive_blocking(self) -> Self {
-        debug_assert!(self.state == GuardState::Optimistic);
-        self.lock.exclusive_blocking()
+    pub async fn verify_exclusive_async(&mut self) -> Validation<()> {
+        match self.state {
+            GuardState::Optimistic => {
+                if !self.lock.version_match(self.version) {
+                    return Invalid;
+                }
+                let g = self.lock.exclusive_async().await;
+                // recheck version.
+                if !self.lock.version_match(self.version + LATCH_EXCLUSIVE_BIT) {
+                    // rollback lock version to avoid unneccessary version bumping.
+                    g.rollback_exclusive_bit();
+                    return Invalid;
+                }
+                *self = g;
+                Valid(())
+            }
+            GuardState::Shared => panic!("verify exclusive async on shared lock is not allowed"),
+            GuardState::Exclusive => Valid(()),
+        }
+    }
+
+    /// rollback exclusive bit set by exclusive lock.
+    #[inline]
+    fn rollback_exclusive_bit(mut self) {
+        debug_assert!(self.state == GuardState::Exclusive);
+        self.lock
+            .version
+            .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+        unsafe {
+            self.lock.lock.unlock_exclusive();
+        }
+        self.state = GuardState::Optimistic;
     }
 
     #[inline]

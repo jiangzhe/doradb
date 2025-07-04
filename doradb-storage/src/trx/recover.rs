@@ -12,6 +12,7 @@
 //! We separate all transactions into two kinds:
 //! 1. DDL involved transactions
 //! 2. DML-only transactions
+use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::catalog::Catalog;

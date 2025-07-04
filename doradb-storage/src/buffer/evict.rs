@@ -1,5 +1,5 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
+use crate::buffer::guard::{PageExclusiveGuard, FacadePageGuard};
 use crate::buffer::page::{BufferPage, IOKind, Page, PageID, PageIO, INVALID_PAGE_ID, PAGE_SIZE};
 use crate::buffer::util::{
     init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate, AllocMap,
@@ -138,7 +138,7 @@ impl EvictableBufferPool {
             frame
                 .latch
                 .try_exclusive()
-                .map(|g| PageGuard::new(bf, g).exclusive_blocking())
+                .map(|g| FacadePageGuard::new(bf, g).must_exclusive())
         }
     }
 
@@ -735,7 +735,7 @@ impl BufferPool for EvictableBufferPool {
         &'static self,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> PageGuard<T> {
+    ) -> FacadePageGuard<T> {
         loop {
             unsafe {
                 let bf = self.frame_ptr(page_id);
@@ -746,7 +746,7 @@ impl BufferPool for EvictableBufferPool {
                     }
                     FrameKind::Fixed | FrameKind::Hot => {
                         let g = frame.latch.optimistic_fallback(mode).await;
-                        return PageGuard::new(bf, g);
+                        return FacadePageGuard::new(bf, g);
                     }
                     FrameKind::Cool => {
                         let g = frame.latch.optimistic_fallback(mode).await;
@@ -757,7 +757,7 @@ impl BufferPool for EvictableBufferPool {
                             // This page is going to be evicted. we have to retry and probably wait.
                             continue;
                         }
-                        return PageGuard::new(bf, g);
+                        return FacadePageGuard::new(bf, g);
                     }
                     FrameKind::Evicting => {
                         // The page is being evicted to disk.
@@ -799,10 +799,10 @@ impl BufferPool for EvictableBufferPool {
     #[inline]
     async fn get_child_page<T>(
         &'static self,
-        p_guard: &PageGuard<T>,
+        p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Validation<PageGuard<T>> {
+    ) -> Validation<FacadePageGuard<T>> {
         loop {
             unsafe {
                 let bf = self.frame_ptr(page_id);
@@ -818,7 +818,7 @@ impl BufferPool for EvictableBufferPool {
                         // page is acquired.
                         return p_guard
                             .validate()
-                            .and_then(|_| Valid(PageGuard::new(bf, g)));
+                            .and_then(|_| Valid(FacadePageGuard::new(bf, g)));
                     }
                     FrameKind::Cool => {
                         let g = frame.latch.optimistic_fallback(mode).await;
@@ -834,7 +834,7 @@ impl BufferPool for EvictableBufferPool {
                         // page is acquired.
                         return p_guard
                             .validate()
-                            .and_then(|_| Valid(PageGuard::new(bf, g)));
+                            .and_then(|_| Valid(FacadePageGuard::new(bf, g)));
                     }
                     FrameKind::Evicting => {
                         // The page is being evicted to disk.
@@ -1588,7 +1588,8 @@ mod tests {
                 let g = pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                     .await
-                    .exclusive_blocking();
+                    .exclusive_async()
+                    .await;
                 pool.deallocate_page(g);
                 println!("deallocated page {}", page_id);
             }
