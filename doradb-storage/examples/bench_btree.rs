@@ -70,7 +70,7 @@ async fn single_thread_bench_btree(args: &Args) {
 
         if args.compact {
             let purge_list = tree
-                .compact_all::<u64>(BTreeCompactConfig::new(1.0, 1.0))
+                .compact_all::<u64>(BTreeCompactConfig::new(1.0, 1.0).unwrap())
                 .await;
             for g in purge_list {
                 pool.deallocate_page(g);
