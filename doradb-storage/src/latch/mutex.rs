@@ -1,4 +1,4 @@
-use event_listener::Event;
+use event_listener::{Event, IntoNotification};
 use parking_lot::lock_api::RawMutex as ParkingLotRawMutexAPI;
 use parking_lot::RawMutex as ParkingLotRawMutex;
 use std::cell::UnsafeCell;
@@ -110,7 +110,7 @@ impl RawMutex {
     #[inline]
     pub unsafe fn unlock(&self) {
         self.inner.unlock();
-        self.event.notify(1);
+        self.event.notify(1usize.relaxed());
     }
 
     /// Lock this mutex in async way.

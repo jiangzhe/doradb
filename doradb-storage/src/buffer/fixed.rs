@@ -1,5 +1,5 @@
 use crate::buffer::frame::BufferFrame;
-use crate::buffer::guard::{PageExclusiveGuard, FacadePageGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::buffer::util::{init_bf_exclusive_guard, mmap_allocate, mmap_deallocate, AllocMap};
 use crate::buffer::BufferPool;
@@ -81,6 +81,26 @@ impl FixedBufferPool {
         unsafe {
             let bf = self.get_frame(page_id);
             let g = (*bf.0).latch.optimistic_fallback(mode).await;
+            FacadePageGuard::new(bf, g)
+        }
+    }
+
+    /// Since all pages are kept in memory, we can use spin mode to eliminate
+    /// the cost of async/await calls.
+    #[inline]
+    pub fn get_page_spin<T: BufferPage>(&'static self, page_id: PageID) -> FacadePageGuard<T> {
+        debug_assert!(
+            self.alloc_map.is_allocated(page_id as usize),
+            "page not allocated"
+        );
+        self.get_page_spin_internal(page_id)
+    }
+
+    #[inline]
+    fn get_page_spin_internal<T: 'static>(&'static self, page_id: PageID) -> FacadePageGuard<T> {
+        unsafe {
+            let bf = self.get_frame(page_id);
+            let g = (*bf.0).latch.optimistic_spin();
             FacadePageGuard::new(bf, g)
         }
     }
@@ -197,11 +217,17 @@ impl BufferPool for FixedBufferPool {
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
         );
-        let g = self.get_page_internal(page_id, mode).await;
+        let g = self.get_page_internal::<T>(page_id, mode).await;
         // apply lock coupling.
         // the validation make sure parent page does not change until child
         // page is acquired.
-        p_guard.validate().and_then(|_| Valid(g))
+        if p_guard.validate_bool() {
+            return Valid(g);
+        }
+        if g.is_exclusive() {
+            unsafe { g.rollback_exclusive_version_change() };
+        }
+        return Validation::Invalid;
     }
 }
 
