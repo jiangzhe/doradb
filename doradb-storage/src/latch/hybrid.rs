@@ -316,10 +316,10 @@ impl<'a> HybridGuard<'a> {
     /// 2. acquire shared lock in async way.
     /// 3. verify version agian.
     #[inline]
-    pub async fn verify_shared_async(&mut self) -> Validation<()> {
+    pub async fn verify_shared_async<const PRE_VERIFY: bool>(&mut self) -> Validation<()> {
         match self.state {
             GuardState::Optimistic => {
-                if !self.lock.version_match(self.version) {
+                if PRE_VERIFY && !self.lock.version_match(self.version) {
                     return Invalid;
                 }
                 let g = self.lock.shared_async().await;
@@ -376,17 +376,17 @@ impl<'a> HybridGuard<'a> {
     /// 2. acquire exclusive lock in async way.
     /// 3. verify version agian.
     #[inline]
-    pub async fn verify_exclusive_async(&mut self) -> Validation<()> {
+    pub async fn verify_exclusive_async<const PRE_VERIFY: bool>(&mut self) -> Validation<()> {
         match self.state {
             GuardState::Optimistic => {
-                if !self.lock.version_match(self.version) {
+                if PRE_VERIFY && !self.lock.version_match(self.version) {
                     return Invalid;
                 }
                 let g = self.lock.exclusive_async().await;
                 // recheck version.
                 if !self.lock.version_match(self.version + LATCH_EXCLUSIVE_BIT) {
                     // rollback lock version to avoid unneccessary version bumping.
-                    g.rollback_exclusive_bit();
+                    unsafe { g.rollback_exclusive_bit() };
                     return Invalid;
                 }
                 *self = g;
@@ -398,15 +398,13 @@ impl<'a> HybridGuard<'a> {
     }
 
     /// rollback exclusive bit set by exclusive lock.
+    /// Caller must make sure the exclusive lock is already acquired.
     #[inline]
-    fn rollback_exclusive_bit(mut self) {
-        debug_assert!(self.state == GuardState::Exclusive);
+    pub unsafe fn rollback_exclusive_bit(mut self) {
         self.lock
             .version
             .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
-        unsafe {
-            self.lock.lock.unlock_exclusive();
-        }
+        self.lock.lock.unlock_exclusive();
         self.state = GuardState::Optimistic;
     }
 

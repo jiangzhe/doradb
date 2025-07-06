@@ -9,7 +9,7 @@ mod util;
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use fixed::FixedBufferPool;
 
-use crate::buffer::guard::{PageExclusiveGuard, FacadePageGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::error::Result;
 use crate::error::Validation;

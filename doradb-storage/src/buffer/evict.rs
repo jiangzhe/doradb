@@ -1,5 +1,5 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{PageExclusiveGuard, FacadePageGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, Page, PageID, PageIO, INVALID_PAGE_ID, PAGE_SIZE};
 use crate::buffer::util::{
     init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate, AllocMap,
@@ -8,8 +8,7 @@ use crate::buffer::{BufferPool, BufferRequest};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::io::{AIOManager, AIOManagerConfig, IocbRawPtr, SparseFile, UnsafeAIO};
-use crate::latch::LatchFallbackMode;
-use crate::latch::Mutex;
+use crate::latch::{GuardState, LatchFallbackMode, Mutex};
 use crate::lifetime::StaticLifetime;
 use crate::notify::Signal;
 use crate::ptr::UnsafePtr;
@@ -816,9 +815,13 @@ impl BufferPool for EvictableBufferPool {
                         // apply lock coupling.
                         // the validation make sure parent page does not change until child
                         // page is acquired.
-                        return p_guard
-                            .validate()
-                            .and_then(|_| Valid(FacadePageGuard::new(bf, g)));
+                        if p_guard.validate_bool() {
+                            return Valid(FacadePageGuard::new(bf, g));
+                        }
+                        if g.state == GuardState::Exclusive {
+                            g.rollback_exclusive_bit();
+                        }
+                        return Validation::Invalid;
                     }
                     FrameKind::Cool => {
                         let g = frame.latch.optimistic_fallback(mode).await;

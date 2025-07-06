@@ -102,6 +102,8 @@ const INLINE_PREFIX_LEN: usize = 16;
 
 const KEY_HEAD_LEN: usize = 4;
 
+pub type KeyHead = [u8; KEY_HEAD_LEN];
+
 const _: () = assert!(mem::size_of::<Slot>() == 8);
 
 pub type KeyVec = SmallVec<[u8; 16]>;
@@ -111,7 +113,7 @@ pub type KeyVec = SmallVec<[u8; 16]>;
 pub struct Slot {
     len: u16,
     offset: u16,
-    head: [u8; KEY_HEAD_LEN],
+    head: KeyHead,
 }
 
 impl Slot {
@@ -120,14 +122,12 @@ impl Slot {
     /// all other slot will have at least 8-byte value and
     /// does not fit inline requirement.
     #[inline]
-    pub fn inline(value: &[u8]) -> Self {
-        debug_assert!(value.len() <= KEY_HEAD_LEN);
-        let mut head = [0u8; KEY_HEAD_LEN];
-        head[..value.len()].copy_from_slice(value);
+    pub fn inline(k: &[u8]) -> Self {
+        debug_assert!(k.len() <= KEY_HEAD_LEN);
         Slot {
-            len: value.len() as u16,
+            len: k.len() as u16,
             offset: 0,
-            head,
+            head: head(k),
         }
     }
 
@@ -137,11 +137,10 @@ impl Slot {
         self.len == 0
     }
 
-    /// Returns short key suffix stored in head.
+    /// convert head to u32 value.
     #[inline]
-    pub fn short_key_suffix(&self) -> &[u8] {
-        debug_assert!(self.len as usize <= KEY_HEAD_LEN);
-        &self.head[..self.len as usize]
+    pub fn head_as_u32(&self) -> u32 {
+        u32::from_be_bytes(self.head)
     }
 }
 
@@ -321,45 +320,41 @@ impl BTreeNode {
     }
 
     #[inline]
-    fn cmp_key_without_prefix(&self, key: &[u8], slot: &Slot) -> Ordering {
-        if slot.len as usize <= KEY_HEAD_LEN {
-            return key.cmp(&slot.head[..slot.len as usize]);
+    fn cmp_key_without_prefix(&self, k: &[u8], slot: &Slot) -> Ordering {
+        match head(k).cmp(&slot.head) {
+            Ordering::Less => Ordering::Less,
+            Ordering::Greater => Ordering::Greater,
+            Ordering::Equal => {
+                let l = k.len().min(slot.len as usize);
+                if l <= KEY_HEAD_LEN {
+                    k.len().cmp(&(slot.len as usize))
+                } else {
+                    let k2 = self.k(slot);
+                    k.cmp(k2)
+                }
+            }
         }
-        let k2 = unsafe {
-            std::slice::from_raw_parts(self.body().add(slot.offset as usize), slot.len as usize)
-        };
-        key.cmp(k2)
     }
 
     /// Insert a new key value pair to current node.
     /// Returns inserted slot number.
     #[inline]
-    pub fn insert<V: BTreeValue>(&mut self, key: &[u8], value: V) -> usize {
+    pub(super) fn insert<V: BTreeValue>(&mut self, key: &[u8], value: V) -> usize {
         debug_assert!(self.can_insert(key));
-        let (slot_idx, overwrite) = match self.search::<V>(key) {
-            SearchResult::GreaterThan(idx) => {
+        let slot_idx = match self.search_key(key) {
+            SearchKey::GreaterThan(idx) => {
                 // insert at next position.
-                (idx + 1, false)
+                idx + 1
             }
-            SearchResult::EqualDeleted(idx, _) => {
-                // same key but already deleted.
-                (idx, true)
-            }
-            SearchResult::LessThanAllSlots => {
-                debug_assert!(self.within_boundary(key));
-                (0, false)
-            }
-            SearchResult::LessThanLowerFence | SearchResult::GreaterEqualUpperFence => {
-                unreachable!()
-            }
-            SearchResult::Equal(..) => {
+            SearchKey::LowerFence => 0,
+            SearchKey::Equal(..) => {
                 // duplicate key found.
                 panic!("BTreeNode does not support duplicate key");
             }
         };
         let slot = self.new_slot_with_value(key, value);
         unsafe {
-            self.insert_slot_at(slot_idx, slot, overwrite);
+            self.insert_slot_at(slot_idx, slot);
         }
         slot_idx
     }
@@ -369,7 +364,7 @@ impl BTreeNode {
         debug_assert!(idx <= self.header.count as usize);
         let slot = self.new_slot_with_value(key, value);
         unsafe {
-            self.insert_slot_at(idx, slot, false);
+            self.insert_slot_at(idx, slot);
         }
     }
 
@@ -377,8 +372,8 @@ impl BTreeNode {
     /// If key or value does not match, returns false.
     #[inline]
     pub fn delete<V: BTreeValue>(&mut self, key: &[u8], value: V) -> BTreeDelete {
-        let idx = match self.search::<V>(key) {
-            SearchResult::Equal(idx, v) | SearchResult::EqualDeleted(idx, v) => {
+        let idx = match self.search_value::<V>(key) {
+            SearchValue::Equal(idx, v) | SearchValue::EqualDeleted(idx, v) => {
                 if v != value {
                     return BTreeDelete::ValueMismatch;
                 }
@@ -394,8 +389,8 @@ impl BTreeNode {
     /// If key or value does not match, returns false.
     #[inline]
     pub fn mark_as_deleted<V: BTreeValue>(&mut self, key: &[u8], value: V) -> BTreeUpdate<V> {
-        let idx = match self.search::<V>(key) {
-            SearchResult::Equal(idx, v) | SearchResult::EqualDeleted(idx, v) => {
+        let idx = match self.search_value::<V>(key) {
+            SearchValue::Equal(idx, v) | SearchValue::EqualDeleted(idx, v) => {
                 if v != value {
                     return BTreeUpdate::ValueMismatch(v);
                 }
@@ -420,8 +415,8 @@ impl BTreeNode {
         old_value: V,
         new_value: V,
     ) -> BTreeUpdate<V> {
-        let idx = match self.search::<V>(key) {
-            SearchResult::Equal(idx, v) | SearchResult::EqualDeleted(idx, v) => {
+        let idx = match self.search_value::<V>(key) {
+            SearchValue::Equal(idx, v) | SearchValue::EqualDeleted(idx, v) => {
                 if old_value.value() != v {
                     return BTreeUpdate::ValueMismatch(v);
                 }
@@ -501,8 +496,9 @@ impl BTreeNode {
         debug_assert!(self.within_boundary(key));
         let slot = self.new_slot_with_value(key, value);
         unsafe {
-            self.insert_slot_at(self.header.count as usize, slot, false);
+            self.insert_slot_at(self.header.count as usize, slot);
         }
+        debug_assert!(&self.key(self.header.count as usize - 1)[..] == key);
         // single entry or in order.
         debug_assert!(
             self.header.count == 1
@@ -517,20 +513,38 @@ impl BTreeNode {
     /// Returns value of the last key no more than input.
     /// This method is used when searching key from root to path.
     #[inline]
-    pub fn lookup_child(&self, key: &[u8]) -> LookupChild {
-        match self.search(key) {
-            SearchResult::GreaterThan(idx) => LookupChild::Slot(idx, self.value(idx as usize)),
-            SearchResult::Equal(idx, value) => LookupChild::Slot(idx, value),
-            SearchResult::LessThanAllSlots => {
+    pub fn lookup_child_slow(&self, key: &[u8]) -> LookupChild {
+        match self.search_value_slow(key) {
+            SearchValue::GreaterThan(idx) => LookupChild::Slot(idx, self.value(idx as usize)),
+            SearchValue::Equal(idx, value) => LookupChild::Slot(idx, value),
+            SearchValue::LessThanAllSlots => {
                 if self.header.lower_fence_value == PageID::INVALID_VALUE {
                     LookupChild::NotFound
                 } else {
                     LookupChild::LowerFence(self.header.lower_fence_value)
                 }
             }
-            SearchResult::EqualDeleted(..)
-            | SearchResult::LessThanLowerFence
-            | SearchResult::GreaterEqualUpperFence => LookupChild::NotFound,
+            SearchValue::EqualDeleted(..)
+            | SearchValue::LessThanLowerFence
+            | SearchValue::GreaterEqualUpperFence => LookupChild::NotFound,
+        }
+    }
+
+    #[inline]
+    pub fn lookup_child(&self, key: &[u8]) -> LookupChild {
+        match self.search_value(key) {
+            SearchValue::GreaterThan(idx) => LookupChild::Slot(idx, self.value(idx as usize)),
+            SearchValue::Equal(idx, value) => LookupChild::Slot(idx, value),
+            SearchValue::LessThanAllSlots => {
+                if self.header.lower_fence_value == PageID::INVALID_VALUE {
+                    LookupChild::NotFound
+                } else {
+                    LookupChild::LowerFence(self.header.lower_fence_value)
+                }
+            }
+            SearchValue::EqualDeleted(..)
+            | SearchValue::LessThanLowerFence
+            | SearchValue::GreaterEqualUpperFence => LookupChild::NotFound,
         }
     }
 
@@ -538,7 +552,7 @@ impl BTreeNode {
     /// If hit on lower fence, -1 will be returned.
     #[inline]
     pub fn lookup_child_idx(&self, key: &[u8]) -> Option<isize> {
-        match self.lookup_child(key) {
+        match self.lookup_child_slow(key) {
             LookupChild::Slot(idx, _) => Some(idx as isize),
             LookupChild::LowerFence(_) => Some(-1),
             LookupChild::NotFound => None,
@@ -573,11 +587,9 @@ impl BTreeNode {
     fn new_slot_with_value<V: BTreeValue>(&mut self, key: &[u8], value: V) -> Slot {
         debug_assert!(key.len() >= self.header.prefix_len as usize);
         let k = &key[self.header.prefix_len as usize..];
+        let head = head(k);
         if k.len() <= KEY_HEAD_LEN {
             // Only value inserted at end of page.
-            // Copy head.
-            let mut head = [0u8; KEY_HEAD_LEN];
-            head[..k.len()].copy_from_slice(k);
             // Copy value.
             self.header.end_offset -= mem::size_of::<V>() as u16;
             unsafe {
@@ -592,9 +604,6 @@ impl BTreeNode {
             };
         }
         // Key suffix and value inserted at end of page.
-        // copy head.
-        let mut head = [0u8; KEY_HEAD_LEN];
-        head.copy_from_slice(&k[..KEY_HEAD_LEN]);
         // copy value.
         self.header.end_offset -= (k.len() + mem::size_of::<V>()) as u16;
         unsafe {
@@ -615,11 +624,9 @@ impl BTreeNode {
     fn new_slot_without_value(&mut self, key: &[u8]) -> Slot {
         debug_assert!(key.len() >= self.header.prefix_len as usize);
         let k = &key[self.header.prefix_len as usize..];
+        let head = head(k);
         if k.len() <= KEY_HEAD_LEN {
             // No value inserted to page.
-            // Copy head.
-            let mut head = [0u8; KEY_HEAD_LEN];
-            head[..k.len()].copy_from_slice(k);
             return Slot {
                 len: k.len() as u16,
                 offset: self.header.end_offset,
@@ -627,9 +634,6 @@ impl BTreeNode {
             };
         }
         // Key suffix inserted at end of page.
-        // copy head.
-        let mut head = [0u8; KEY_HEAD_LEN];
-        head.copy_from_slice(&k[..KEY_HEAD_LEN]);
         // copy key suffix.
         self.header.end_offset -= k.len() as u16;
         unsafe {
@@ -737,18 +741,16 @@ impl BTreeNode {
     /// insert slot at given position.
     /// If overwrite is set to true, the old value is overwritten.
     #[inline]
-    unsafe fn insert_slot_at(&mut self, idx: usize, slot: Slot, overwrite: bool) {
+    unsafe fn insert_slot_at(&mut self, idx: usize, slot: Slot) {
         let dst = (self.body_mut() as *mut Slot).add(idx);
-        if !overwrite {
-            if idx < self.header.count as usize {
-                // shift all elements starting from destination by one position.
-                let next = dst.add(1);
-                std::ptr::copy(dst, next, self.header.count as usize - idx);
-            }
-            self.header.count += 1;
-            self.header.start_offset += mem::size_of::<Slot>() as u16;
-            self.header.effective_space += mem::size_of::<Slot>() as u32;
+        if idx < self.header.count as usize {
+            // shift all elements starting from destination by one position.
+            let next = dst.add(1);
+            std::ptr::copy(dst, next, self.header.count as usize - idx);
         }
+        self.header.count += 1;
+        self.header.start_offset += mem::size_of::<Slot>() as u16;
+        self.header.effective_space += mem::size_of::<Slot>() as u32;
         *dst = slot;
     }
 
@@ -790,10 +792,10 @@ impl BTreeNode {
 
     /// Search given key in current node.
     #[inline]
-    pub(super) fn search<V: BTreeValue>(&self, key: &[u8]) -> SearchResult<V> {
+    pub fn search_value_slow<V: BTreeValue>(&self, key: &[u8]) -> SearchValue<V> {
         let prefix_len = self.header.prefix_len as usize;
         if prefix_len == 0 {
-            return self.search_without_prefix(key);
+            return self.search_value_without_prefix(key);
         }
         // Key is shorter than prefix, compare and return.
         if key.len() < prefix_len {
@@ -802,57 +804,107 @@ impl BTreeNode {
             return match key[..l].cmp(&prefix[..l]) {
                 Ordering::Greater => {
                     if self.has_no_upper_fence() {
-                        SearchResult::GreaterThan(self.header.count as usize - 1)
+                        SearchValue::GreaterThan(self.header.count as usize - 1)
                     } else {
-                        SearchResult::GreaterEqualUpperFence
+                        SearchValue::GreaterEqualUpperFence
                     }
                 }
-                Ordering::Less | Ordering::Equal => SearchResult::LessThanLowerFence,
+                Ordering::Less | Ordering::Equal => SearchValue::LessThanLowerFence,
             };
         }
         // Check if prefix matches.
         return match key[..prefix_len].cmp(self.common_prefix()) {
             Ordering::Greater => {
                 if self.has_no_upper_fence() {
-                    SearchResult::GreaterThan(self.header.count as usize - 1)
+                    SearchValue::GreaterThan(self.header.count as usize - 1)
                 } else {
-                    SearchResult::GreaterEqualUpperFence
+                    SearchValue::GreaterEqualUpperFence
                 }
             }
-            Ordering::Less => SearchResult::LessThanLowerFence,
-            Ordering::Equal => self.search_without_prefix(&key[prefix_len..]),
+            Ordering::Less => SearchValue::LessThanLowerFence,
+            Ordering::Equal => self.search_value_without_prefix(&key[prefix_len..]),
         };
+    }
+
+    /// This is used for B-tree which always guarantee the prefix matching
+    /// with its structure.
+    #[inline]
+    pub fn search_value<V: BTreeValue>(&self, key: &[u8]) -> SearchValue<V> {
+        debug_assert!(
+            key.len() >= self.header.prefix_len as usize
+                && &key[..self.header.prefix_len as usize] == self.common_prefix()
+        );
+        self.search_value_without_prefix::<V>(&key[self.header.prefix_len as usize..])
     }
 
     /// Search without prefix. The prefix of input key should be trimed.
     #[inline]
-    fn search_without_prefix<V: BTreeValue>(&self, k: &[u8]) -> SearchResult<V> {
-        let body = self.body();
-        match self.slots().binary_search_by(|s| {
-            if s.len as usize <= KEY_HEAD_LEN {
-                let sk = &s.head[..s.len as usize];
-                sk.cmp(k)
-            } else {
-                let sk = unsafe {
-                    std::slice::from_raw_parts(body.add(s.offset as usize), s.len as usize)
-                };
-                sk.cmp(k)
-            }
-        }) {
+    fn search_value_without_prefix<V: BTreeValue>(&self, k: &[u8]) -> SearchValue<V> {
+        let head = head_as_u32(k);
+        match self
+            .slots()
+            .binary_search_by(|s| match s.head_as_u32().cmp(&head) {
+                Ordering::Less => Ordering::Less,
+                Ordering::Greater => Ordering::Greater,
+                Ordering::Equal => {
+                    let l = k.len().min(s.len as usize);
+                    if l <= KEY_HEAD_LEN {
+                        (s.len as usize).cmp(&k.len())
+                    } else {
+                        let sk = self.k(s);
+                        sk.cmp(k)
+                    }
+                }
+            }) {
             Ok(idx) => {
                 let value = self.value::<V>(idx);
                 if value.is_deleted() {
-                    SearchResult::EqualDeleted(idx, value.value())
+                    SearchValue::EqualDeleted(idx, value.value())
                 } else {
-                    SearchResult::Equal(idx, value)
+                    SearchValue::Equal(idx, value)
                 }
             }
             Err(idx) => {
                 if idx == 0 {
                     // input key is less than the first slot key.
-                    SearchResult::LessThanAllSlots
+                    SearchValue::LessThanAllSlots
                 } else {
-                    SearchResult::GreaterThan(idx - 1)
+                    SearchValue::GreaterThan(idx - 1)
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn search_key(&self, key: &[u8]) -> SearchKey {
+        debug_assert!(
+            key.len() >= self.header.prefix_len as usize
+                && &key[..self.header.prefix_len as usize] == self.common_prefix()
+        );
+        let k = &key[self.header.prefix_len as usize..];
+        let head = head_as_u32(k);
+        match self
+            .slots()
+            .binary_search_by(|s| match s.head_as_u32().cmp(&head) {
+                Ordering::Less => Ordering::Less,
+                Ordering::Greater => Ordering::Greater,
+                Ordering::Equal => {
+                    let l = k.len().min(s.len as usize);
+                    if l <= KEY_HEAD_LEN {
+                        (s.len as usize).cmp(&k.len())
+                    } else {
+                        let sk = self.k(s);
+                        sk.cmp(k)
+                    }
+                }
+            }) {
+            Ok(idx) => SearchKey::Equal(idx),
+            Err(idx) => {
+                if idx == 0 {
+                    // input key is less than the first slot key.
+                    SearchKey::LowerFence
+                } else {
+                    SearchKey::GreaterThan(idx - 1)
                 }
             }
         }
@@ -940,11 +992,7 @@ impl BTreeNode {
         res.clear();
         res.reserve(len);
         res.extend_from_slice(self.common_prefix());
-        if slot.len as usize <= KEY_HEAD_LEN {
-            res.extend_from_slice(slot.short_key_suffix());
-        } else {
-            res.extend_from_slice(self.long_key_suffix(slot));
-        }
+        res.extend_from_slice(self.k(slot));
     }
 
     #[inline]
@@ -1069,7 +1117,6 @@ impl BTreeNode {
                 std::ptr::copy_nonoverlapping(src_slot, dst_slot, count);
                 {
                     // update space and offset.
-
                     let slot_space = mem::size_of::<Slot>() * count;
                     self.header.start_offset += slot_space as u16;
                     self.header.effective_space += slot_space as u32;
@@ -1107,7 +1154,7 @@ impl BTreeNode {
             debug_assert!(self.header.start_offset <= self.header.end_offset);
             return;
         }
-        // Slow path to copy key value one by one
+        // Slow path to copy key value one by one.
         let mut key = KeyVec::new(); // key buffer
         for idx in src_slot_idx..src_slot_idx + count {
             src_node.extract_key(idx, &mut key);
@@ -1179,11 +1226,12 @@ impl BTreeNode {
         old_offset: usize,
         old_len: usize,
     ) {
+        let head = head(k);
         if old_len <= KEY_HEAD_LEN {
             // no extra payload.
             let slot = self.slot_mut(idx);
             // update head.
-            slot.head[..k.len()].copy_from_slice(k);
+            slot.head = head;
             // update length.
             slot.len = k.len() as u16;
             // no value change.
@@ -1198,7 +1246,7 @@ impl BTreeNode {
             }
             // update head.
             let slot = self.slot_mut(idx);
-            slot.head.copy_from_slice(&k[..KEY_HEAD_LEN]);
+            slot.head = head;
             // no value change.
             // no change on effective space.
             return;
@@ -1211,7 +1259,7 @@ impl BTreeNode {
             }
             // update head
             let slot = self.slot_mut(idx);
-            slot.head[..k.len()].copy_from_slice(k);
+            slot.head = head;
             // update length
             slot.len = k.len() as u16;
             // update effective space, as extra payload is not effective.
@@ -1226,7 +1274,7 @@ impl BTreeNode {
         }
         // update head
         let slot = self.slot_mut(idx);
-        slot.head.copy_from_slice(&k[..KEY_HEAD_LEN]);
+        slot.head = head;
         // update length
         slot.len = k.len() as u16;
         self.header.effective_space -= (old_len - k.len()) as u32;
@@ -1261,23 +1309,37 @@ impl BTreeNode {
     fn cmp_slot_key(&self, idx1: usize, idx2: usize) -> Ordering {
         let s1 = self.slot(idx1);
         let s2 = self.slot(idx2);
-        let l = s1.len.min(s2.len) as usize;
-        if l <= KEY_HEAD_LEN {
-            match s1.head[..l].cmp(&s2.head[..l]) {
-                Ordering::Greater => Ordering::Greater,
-                Ordering::Less => Ordering::Less,
-                Ordering::Equal => s1.len.cmp(&s2.len),
+        match s1.head.cmp(&s2.head) {
+            Ordering::Greater => Ordering::Greater,
+            Ordering::Less => Ordering::Less,
+            Ordering::Equal => {
+                let l = s1.len.min(s2.len) as usize;
+                if l <= KEY_HEAD_LEN {
+                    s1.len.cmp(&s2.len)
+                } else {
+                    let k1 = self.long_key_suffix(s1);
+                    let k2 = self.long_key_suffix(s2);
+                    k1.cmp(k2)
+                }
             }
+        }
+    }
+
+    #[inline]
+    fn k<'a>(&'a self, slot: &'a Slot) -> &'a [u8] {
+        if slot.len as usize <= KEY_HEAD_LEN {
+            &slot.head[..slot.len as usize]
         } else {
-            let k1 = self.long_key_suffix(s1);
-            let k2 = self.long_key_suffix(s2);
-            k1.cmp(k2)
+            unsafe {
+                let ptr = self.body().add(slot.offset as usize);
+                std::slice::from_raw_parts(ptr, slot.len as usize)
+            }
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum SearchResult<V: BTreeValue> {
+pub enum SearchValue<V: BTreeValue> {
     /// Less than lower fence.
     LessThanLowerFence,
     /// Less than all values.
@@ -1292,6 +1354,13 @@ pub(super) enum SearchResult<V: BTreeValue> {
     GreaterThan(usize),
     /// Greater than or equal to upper fence.
     GreaterEqualUpperFence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchKey {
+    LowerFence,
+    Equal(usize),
+    GreaterThan(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1443,6 +1512,22 @@ impl SpaceEstimation {
     }
 }
 
+#[inline]
+fn head(k: &[u8]) -> KeyHead {
+    match k.len() {
+        0 => [0; 4],
+        1 => [k[0], 0, 0, 0],
+        2 => [k[0], k[1], 0, 0],
+        3 => [k[0], k[1], k[2], 0],
+        _ => [k[0], k[1], k[2], k[3]],
+    }
+}
+
+#[inline]
+fn head_as_u32(k: &[u8]) -> u32 {
+    u32::from_be_bytes(head(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,12 +1551,12 @@ mod tests {
 
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
-                    let res = node.search::<u64>(&k);
-                    assert_eq!(res, SearchResult::Equal(i as usize, i));
+                    let res = node.search_value_slow::<u64>(&k);
+                    assert_eq!(res, SearchValue::Equal(i as usize, i));
                 }
 
-                let res = node.search::<u64>(&11u64.to_be_bytes());
-                assert_eq!(res, SearchResult::GreaterThan(9));
+                let res = node.search_value_slow::<u64>(&11u64.to_be_bytes());
+                assert_eq!(res, SearchValue::GreaterThan(9));
             }
 
             unsafe {
@@ -1499,8 +1584,8 @@ mod tests {
                 // Test normal delete
                 assert_eq!(node.delete(&5u64.to_be_bytes(), 5), BTreeDelete::Ok);
                 assert_eq!(
-                    node.search::<u64>(&5u64.to_be_bytes()),
-                    SearchResult::GreaterThan(4)
+                    node.search_value_slow::<u64>(&5u64.to_be_bytes()),
+                    SearchValue::GreaterThan(4)
                 );
 
                 // Test delete non-existent key
@@ -1540,8 +1625,8 @@ mod tests {
                     node.mark_as_deleted(&3u64.to_be_bytes(), 3),
                     BTreeUpdate::Ok(3)
                 );
-                match node.search::<u64>(&3u64.to_be_bytes()) {
-                    SearchResult::EqualDeleted(_, v) => assert_eq!(v, 3),
+                match node.search_value_slow::<u64>(&3u64.to_be_bytes()) {
+                    SearchValue::EqualDeleted(_, v) => assert_eq!(v, 3),
                     _ => panic!("Expected EqualDeleted"),
                 };
 
@@ -1589,8 +1674,8 @@ mod tests {
                 // Test normal update
                 assert_eq!(node.update(&5u64.to_be_bytes(), 5, 50), BTreeUpdate::Ok(5));
                 assert_eq!(
-                    node.search::<u64>(&5u64.to_be_bytes()),
-                    SearchResult::Equal(5, 50)
+                    node.search_value_slow::<u64>(&5u64.to_be_bytes()),
+                    SearchValue::Equal(5, 50)
                 );
 
                 // Test update deleted entry
@@ -1600,8 +1685,8 @@ mod tests {
                     BTreeUpdate::Ok(6.deleted())
                 );
                 assert_eq!(
-                    node.search::<u64>(&6u64.to_be_bytes()),
-                    SearchResult::Equal(6, 60)
+                    node.search_value_slow::<u64>(&6u64.to_be_bytes()),
+                    SearchValue::Equal(6, 60)
                 );
 
                 // Test update non-existent key
@@ -1805,8 +1890,8 @@ mod tests {
 
                 // Test 1: Update short key to another short key
                 {
-                    let idx = match node.search::<u64>(b"k20") {
-                        SearchResult::Equal(idx, _) => idx,
+                    let idx = match node.search_value_slow::<u64>(b"k20") {
+                        SearchValue::Equal(idx, _) => idx,
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice("k21".as_bytes());
@@ -1818,8 +1903,8 @@ mod tests {
 
                 // Test 2: Update long key to another long key (same length)
                 {
-                    let idx = match node.search::<u64>(b"long-key-70") {
-                        SearchResult::Equal(idx, _) => idx,
+                    let idx = match node.search_value_slow::<u64>(b"long-key-70") {
+                        SearchValue::Equal(idx, _) => idx,
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(format!("long-key-75").as_bytes());
@@ -1831,8 +1916,8 @@ mod tests {
 
                 // Test 3: Update short key to long key
                 {
-                    let idx = match node.search::<u64>(b"k10") {
-                        SearchResult::Equal(idx, _) => idx,
+                    let idx = match node.search_value_slow::<u64>(b"k10") {
+                        SearchValue::Equal(idx, _) => idx,
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(b"k100000000000000");
@@ -1844,8 +1929,8 @@ mod tests {
 
                 // Test 4: Update long key to short key
                 {
-                    let idx = match node.search::<u64>(b"long-key-50") {
-                        SearchResult::Equal(idx, _) => idx,
+                    let idx = match node.search_value_slow::<u64>(b"long-key-50") {
+                        SearchValue::Equal(idx, _) => idx,
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(b"lon");

@@ -25,7 +25,7 @@ pub trait LockStrategy {
 
     fn must_locked(guard: FacadePageGuard<Self::Page>) -> Self::Guard;
 
-    fn verify_lock_async(
+    fn verify_lock_async<const PRE_VERIFY: bool>(
         guard: FacadePageGuard<Self::Page>,
     ) -> impl Future<Output = Validation<Self::Guard>>;
 }
@@ -51,10 +51,42 @@ impl<T: 'static> LockStrategy for SharedLockStrategy<T> {
     }
 
     #[inline]
-    fn verify_lock_async(
+    fn verify_lock_async<const PRE_VERIFY: bool>(
         guard: FacadePageGuard<T>,
     ) -> impl Future<Output = Validation<Self::Guard>> {
-        guard.verify_shared_async()
+        guard.verify_shared_async::<PRE_VERIFY>()
+    }
+}
+
+// With optimistic lock, it's meaningless to verify version
+// after locking, becase it's actually not locked.
+// That means we need to already verify version after we
+// use some value of the protected object.
+pub struct OptimisticLockStrategy<T: 'static> {
+    _marker: PhantomData<T>,
+}
+
+impl<T: 'static> LockStrategy for OptimisticLockStrategy<T> {
+    type Page = T;
+    type Guard = FacadePageGuard<T>;
+
+    const MODE: LatchFallbackMode = LatchFallbackMode::Spin;
+
+    #[inline]
+    fn try_lock(_guard: &mut FacadePageGuard<T>) -> Validation<()> {
+        Valid(())
+    }
+
+    #[inline]
+    fn must_locked(guard: FacadePageGuard<T>) -> Self::Guard {
+        guard
+    }
+
+    #[inline]
+    fn verify_lock_async<const PRE_VERIFY: bool>(
+        guard: FacadePageGuard<T>,
+    ) -> impl Future<Output = Validation<Self::Guard>> {
+        std::future::ready(Valid(guard))
     }
 }
 
@@ -79,10 +111,10 @@ impl<T: 'static> LockStrategy for ExclusiveLockStrategy<T> {
     }
 
     #[inline]
-    fn verify_lock_async(
+    fn verify_lock_async<const PRE_VERIFY: bool>(
         guard: FacadePageGuard<T>,
     ) -> impl Future<Output = Validation<Self::Guard>> {
-        guard.verify_exclusive_async()
+        guard.verify_exclusive_async::<PRE_VERIFY>()
     }
 }
 
@@ -137,8 +169,10 @@ impl<T: 'static> FacadePageGuard<T> {
     }
 
     #[inline]
-    pub async fn verify_exclusive_async(mut self) -> Validation<PageExclusiveGuard<T>> {
-        let res = self.guard.verify_exclusive_async().await;
+    pub async fn verify_exclusive_async<const PRE_VERIFY: bool>(
+        mut self,
+    ) -> Validation<PageExclusiveGuard<T>> {
+        let res = self.guard.verify_exclusive_async::<PRE_VERIFY>().await;
         verify!(res);
         Valid(self.must_exclusive())
     }
@@ -205,8 +239,10 @@ impl<T: 'static> FacadePageGuard<T> {
     }
 
     #[inline]
-    pub async fn verify_shared_async(mut self) -> Validation<PageSharedGuard<T>> {
-        let res = self.guard.verify_shared_async().await;
+    pub async fn verify_shared_async<const PRE_VERIFY: bool>(
+        mut self,
+    ) -> Validation<PageSharedGuard<T>> {
+        let res = self.guard.verify_shared_async::<PRE_VERIFY>().await;
         verify!(res);
         Valid(self.must_shared())
     }
@@ -293,6 +329,17 @@ impl<T: 'static> FacadePageGuard<T> {
         } else {
             Invalid
         }
+    }
+
+    #[inline]
+    pub fn validate_bool(&self) -> bool {
+        self.guard.validate()
+    }
+
+    #[inline]
+    pub unsafe fn rollback_exclusive_version_change(self) {
+        debug_assert!(self.guard.state == GuardState::Exclusive);
+        self.guard.rollback_exclusive_bit();
     }
 }
 

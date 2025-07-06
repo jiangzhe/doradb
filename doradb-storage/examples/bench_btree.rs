@@ -3,12 +3,9 @@ use clap::Parser;
 use doradb_storage::buffer::{BufferPool, FixedBufferPool};
 use doradb_storage::index::{BTree, BTreeCompactConfig};
 use doradb_storage::lifetime::StaticLifetime;
-use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
-use perfcnt::{AbstractPerfCounter, PerfCounter};
 use rand::distributions::{Distribution, Uniform};
 use std::collections::BTreeMap;
 
-use std::time::Duration;
 use std::time::Instant;
 
 fn main() {
@@ -21,23 +18,29 @@ fn main() {
 }
 
 async fn single_thread(args: &Args) {
-    single_thread_bench_btree(args).await;
+    if args.bitflag & 1 == 0 {
+        single_thread_bench_btree(args).await;
+    }
 
-    single_thread_bench_stdmap(args).await;
+    if args.bitflag & 2 == 0 {
+        single_thread_bench_stdmap(args).await;
+    }
 
-    single_thread_bench_bplustree(args).await;
+    if args.bitflag & 4 == 0 {
+        single_thread_bench_bplustree(args).await;
+    }
 }
 
 async fn single_thread_bench_btree(args: &Args) {
     let pool = FixedBufferPool::with_capacity_static(args.mem_size).unwrap();
     {
         let tree = BTree::new(pool, 1).await;
-        let mut perf_monitor = PerfMonitor::new();
-        perf_monitor.start();
 
+        let start = Instant::now();
         match &args.mode[..] {
             "seq" => {
                 for i in 0..args.total_rows {
+                    // trick to use lower 4 bytes as head
                     tree.insert(&i.to_be_bytes(), i, 100).await;
                 }
             }
@@ -51,16 +54,15 @@ async fn single_thread_bench_btree(args: &Args) {
             }
             _ => panic!("unknown mode"),
         }
-        let perf_stats = perf_monitor.stop();
+        let dur = start.elapsed();
 
-        let qps = args.total_rows as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-        let op_nanos =
-            perf_stats.dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
+        let qps = args.total_rows as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+        let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
         println!(
             "btree {} insert: threads={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
             args.mode,
             args.threads,
-            perf_stats.dur.as_millis(),
+            dur.as_millis(),
             args.total_rows,
             qps,
             op_nanos
@@ -74,10 +76,14 @@ async fn single_thread_bench_btree(args: &Args) {
                 pool.deallocate_page(g);
             }
         }
-        let stat = tree.collect_space_statistics().await;
-        println!("compact={}, space stats: {:?}", args.compact, stat);
+        // let stat = tree.collect_space_statistics().await;
+        // println!("compact={}, space stats: {:?}", args.compact, stat);
 
-        perf_monitor.start();
+        if args.insert_only {
+            return;
+        }
+
+        let start = Instant::now();
 
         match &args.search_mode[..] {
             "seq" => {
@@ -96,16 +102,15 @@ async fn single_thread_bench_btree(args: &Args) {
             _ => panic!("unknown search mode"),
         }
 
-        let perf_stats = perf_monitor.stop();
+        let dur = start.elapsed();
 
-        let qps = args.total_rows as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-        let op_nanos =
-            perf_stats.dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
+        let qps = args.total_rows as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+        let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
         println!(
             "btree {} lookup: threads={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
             args.mode,
             args.threads,
-            perf_stats.dur.as_millis(),
+            dur.as_millis(),
             args.total_rows,
             qps,
             op_nanos
@@ -118,8 +123,7 @@ async fn single_thread_bench_btree(args: &Args) {
 
 async fn single_thread_bench_stdmap(args: &Args) {
     let mut map = BTreeMap::new();
-    let mut perf_monitor = PerfMonitor::new();
-    perf_monitor.start();
+    let start = Instant::now();
     for i in 0..args.total_rows {
         map.insert(i, i);
     }
@@ -140,21 +144,24 @@ async fn single_thread_bench_stdmap(args: &Args) {
         }
         _ => panic!("unknown mode"),
     }
-    let perf_stats = perf_monitor.stop();
+    let dur = start.elapsed();
 
-    let qps = args.total_rows as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-    let op_nanos = perf_stats.dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
+    let qps = args.total_rows as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+    let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
     println!(
         "stdmap {} insert: threads={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
         args.mode,
         args.threads,
-        perf_stats.dur.as_millis(),
+        dur.as_millis(),
         args.total_rows,
         qps,
         op_nanos
     );
 
-    perf_monitor.start();
+    if args.insert_only {
+        return;
+    }
+    let start = Instant::now();
 
     match &args.search_mode[..] {
         "seq" => {
@@ -172,15 +179,15 @@ async fn single_thread_bench_stdmap(args: &Args) {
         }
         _ => panic!("unknown search mode"),
     }
-    let perf_stats = perf_monitor.stop();
+    let dur = start.elapsed();
 
-    let qps = args.total_rows as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-    let op_nanos = perf_stats.dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
+    let qps = args.total_rows as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+    let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
     println!(
         "stdmap {} lookup: threads={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
         args.mode,
         args.threads,
-        perf_stats.dur.as_millis(),
+        dur.as_millis(),
         args.total_rows,
         qps,
         op_nanos
@@ -188,18 +195,16 @@ async fn single_thread_bench_stdmap(args: &Args) {
 }
 
 async fn single_thread_bench_bplustree(args: &Args) {
-    // let tree = bplustree::BPlusTree::new();
-    let tree = bplustree::GenericBPlusTree::<u64, u64, 32768, 32768>::new();
-    let mut perf_monitor = PerfMonitor::new();
-    perf_monitor.start();
+    let tree = bplustree::GenericBPlusTree::<[u8; 8], u64, 32768, 32768>::new();
+    let start = Instant::now();
     for i in 0..args.total_rows {
-        tree.insert(i, i);
+        tree.insert(i.to_be_bytes(), i);
     }
 
     match &args.mode[..] {
         "seq" => {
             for i in 0..args.total_rows {
-                tree.insert(i, i);
+                tree.insert(i.to_be_bytes(), i);
             }
         }
         "rand" => {
@@ -207,31 +212,34 @@ async fn single_thread_bench_bplustree(args: &Args) {
             let mut thd_rng = rand::thread_rng();
             for i in 0..args.total_rows {
                 let k = between.sample(&mut thd_rng);
-                tree.insert(k, i);
+                tree.insert(k.to_be_bytes(), i);
             }
         }
         _ => panic!("unknown mode"),
     }
-    let perf_stats = perf_monitor.stop();
+    let dur = start.elapsed();
 
-    let qps = args.total_rows as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-    let op_nanos = perf_stats.dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
+    let qps = args.total_rows as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+    let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
     println!(
         "bplustree {} insert: threads={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
         args.mode,
         args.threads,
-        perf_stats.dur.as_millis(),
+        dur.as_millis(),
         args.total_rows,
         qps,
         op_nanos
     );
 
-    perf_monitor.start();
+    if args.insert_only {
+        return;
+    }
+    let start = Instant::now();
 
     match &args.search_mode[..] {
         "seq" => {
             for i in 0..args.total_rows {
-                tree.lookup(&i, |value| *value);
+                tree.lookup(&i.to_be_bytes(), |value| *value);
             }
         }
         "rand" => {
@@ -239,145 +247,24 @@ async fn single_thread_bench_bplustree(args: &Args) {
             let mut thd_rng = rand::thread_rng();
             for _ in 0..args.total_rows {
                 let k = between.sample(&mut thd_rng);
-                tree.lookup(&k, |value| *value);
+                tree.lookup(&k.to_be_bytes(), |value| *value);
             }
         }
         _ => panic!("unknown search mode"),
     }
-    let perf_stats = perf_monitor.stop();
+    let dur = start.elapsed();
 
-    let qps = args.total_rows as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-    let op_nanos = perf_stats.dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
+    let qps = args.total_rows as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+    let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
     println!(
         "bplustree {} lookup: threads={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
         args.mode,
         args.threads,
-        perf_stats.dur.as_millis(),
+        dur.as_millis(),
         args.total_rows,
         qps,
         op_nanos
     );
-}
-
-struct PerfMonitor {
-    cache_refs: Option<PerfCounter>,
-    cache_misses: Option<PerfCounter>,
-    cycles: Option<PerfCounter>,
-    instructions: Option<PerfCounter>,
-    branch_misses: Option<PerfCounter>,
-    start: Option<Instant>,
-}
-
-impl PerfMonitor {
-    #[inline]
-    pub fn new() -> PerfMonitor {
-        let pid = std::process::id() as i32;
-        let cache_refs = Builder::from_hardware_event(Hardware::CacheReferences)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        let cache_misses = Builder::from_hardware_event(Hardware::CacheMisses)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        let cycles = Builder::from_hardware_event(Hardware::CPUCycles)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        let instructions = Builder::from_hardware_event(Hardware::Instructions)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        let branch_misses = Builder::from_hardware_event(Hardware::BranchMisses)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        PerfMonitor {
-            cache_refs,
-            cache_misses,
-            cycles,
-            instructions,
-            branch_misses,
-            start: None,
-        }
-    }
-
-    #[inline]
-    pub fn start(&mut self) {
-        if let Some(cache_refs) = self.cache_refs.as_mut() {
-            cache_refs.start().unwrap();
-        }
-        if let Some(cache_misses) = self.cache_misses.as_mut() {
-            cache_misses.start().unwrap();
-        }
-        if let Some(cycles) = self.cycles.as_mut() {
-            cycles.start().unwrap();
-        }
-        if let Some(instructions) = self.instructions.as_mut() {
-            instructions.start().unwrap();
-        }
-        if let Some(branch_misses) = self.branch_misses.as_mut() {
-            branch_misses.start().unwrap();
-        }
-        self.start = Some(Instant::now());
-    }
-
-    #[inline]
-    pub fn stop(&mut self) -> PerfStats {
-        if let Some(cache_refs) = self.cache_refs.as_mut() {
-            cache_refs.stop().unwrap();
-        }
-        if let Some(cache_misses) = self.cache_misses.as_mut() {
-            cache_misses.stop().unwrap();
-        }
-        if let Some(cycles) = self.cycles.as_mut() {
-            cycles.stop().unwrap();
-        }
-        if let Some(instructions) = self.instructions.as_mut() {
-            instructions.stop().unwrap();
-        }
-        if let Some(branch_misses) = self.branch_misses.as_mut() {
-            branch_misses.stop().unwrap();
-        }
-        let dur = self.start.take().unwrap().elapsed();
-        PerfStats {
-            cache_refs: self
-                .cache_refs
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            cache_misses: self
-                .cache_misses
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            cycles: self
-                .cycles
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            instructions: self
-                .instructions
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            branch_misses: self
-                .branch_misses
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            dur,
-        }
-    }
-}
-
-struct PerfStats {
-    cache_refs: u64,
-    cache_misses: u64,
-    cycles: u64,
-    instructions: u64,
-    branch_misses: u64,
-    dur: Duration,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -394,7 +281,7 @@ struct Args {
     #[arg(long, default_value = "1")]
     threads: usize,
 
-    #[arg(long, default_value = "rand")]
+    #[arg(long, default_value = "seq")]
     mode: String,
 
     #[arg(long, default_value = "seq")]
@@ -402,6 +289,13 @@ struct Args {
 
     #[arg(long)]
     compact: bool,
+
+    /// bitflag: 1. disable btree; 2, disable stdmap; 4, disable bplustree
+    #[arg(long, default_value = "0")]
+    bitflag: u8,
+
+    #[arg(long)]
+    insert_only: bool,
 }
 
 #[inline]

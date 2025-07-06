@@ -1,12 +1,14 @@
 use crate::buffer::guard::{
-    ExclusiveLockStrategy, FacadePageGuard, LockStrategy, PageExclusiveGuard, PageGuard,
-    PageSharedGuard, SharedLockStrategy,
+    ExclusiveLockStrategy, FacadePageGuard, LockStrategy, OptimisticLockStrategy,
+    PageExclusiveGuard, PageGuard, PageSharedGuard, SharedLockStrategy,
 };
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
-use crate::index::btree_node::{BTreeNode, KeyVec, LookupChild, SearchResult, SpaceEstimation};
+use crate::index::btree_node::{
+    BTreeNode, KeyVec, LookupChild, SearchKey, SearchValue, SpaceEstimation,
+};
 use crate::index::util::ParentPosition;
 use crate::latch::LatchFallbackMode;
 use crate::trx::TrxID;
@@ -15,6 +17,10 @@ use std::marker::PhantomData;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+type SharedStrategy = SharedLockStrategy<BTreeNode>;
+type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
+type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
 
 /// BTreeValue is the value type stored in leaf node.
 /// In branch node, the value type is always page id,
@@ -148,35 +154,31 @@ impl BTree {
     #[inline]
     pub async fn insert<V: BTreeValue>(&self, key: &[u8], value: V, ts: TrxID) -> BTreeInsert {
         // Stack holds the path from root to leaf.
-        let mut stack = vec![];
         loop {
-            stack.clear();
             let res = self
-                .try_find_leaf(key, LatchFallbackMode::Exclusive, Some(&mut stack))
+                .try_find_leaf_with_optimistic_parent::<ExclusiveStrategy>(key)
                 .await;
-            let mut res = verify_continue!(res);
-            verify_continue!(res.try_exclusive());
-            let mut g = res.must_exclusive();
-            let node = g.page_mut();
-            let idx = match node.search::<V>(key) {
-                SearchResult::GreaterThan(idx) => idx + 1,
-                SearchResult::Equal(..) | SearchResult::EqualDeleted(..) => {
+            let (mut c_guard, p_guard) = verify_continue!(res);
+            let node = c_guard.page_mut();
+            let idx = match node.search_key(key) {
+                SearchKey::GreaterThan(idx) => idx + 1,
+                SearchKey::Equal(..) => {
                     // Do not allow insert even if same key is marked as deleted.
                     return BTreeInsert::DuplicateKey;
                 }
-                SearchResult::LessThanAllSlots => 0,
-                SearchResult::LessThanLowerFence | SearchResult::GreaterEqualUpperFence => {
-                    unreachable!()
-                }
+                SearchKey::LowerFence => 0,
             };
             if !node.can_insert(key) {
                 debug_assert!(node.count() > 1);
-                if stack.is_empty() {
+                if p_guard.is_none() {
                     // Root is leaf and full, should split.
                     self.split_root::<V>(node, true, ts).await;
                     continue;
                 }
-                match self.try_split_bottom_up::<V>(&mut stack, g, ts).await {
+                match self
+                    .try_split_bottom_up::<V>(p_guard.unwrap(), c_guard, ts)
+                    .await
+                {
                     // If split is done or tree structure has been changed by other thread,
                     // we can retry the insert.
                     BTreeSplit::Ok | BTreeSplit::Inconsistent => (),
@@ -214,9 +216,7 @@ impl BTree {
         ts: TrxID,
     ) -> BTreeUpdate<V> {
         loop {
-            let mut res = self.find_leaf(key, LatchFallbackMode::Exclusive).await;
-            verify_continue!(res.try_exclusive());
-            let mut g = res.must_exclusive();
+            let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
             debug_assert!(g.page().is_leaf());
             let node = g.page_mut();
             return node
@@ -235,9 +235,7 @@ impl BTree {
     #[inline]
     pub async fn delete<V: BTreeValue>(&self, key: &[u8], value: V, ts: TrxID) -> BTreeDelete {
         loop {
-            let mut res = self.find_leaf(key, LatchFallbackMode::Exclusive).await;
-            verify_continue!(res.try_exclusive());
-            let mut g = res.must_exclusive();
+            let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
             debug_assert!(g.page().is_leaf());
             let node = g.page_mut();
             return node.delete(key, value).ok_then(|| node.update_ts(ts));
@@ -254,9 +252,7 @@ impl BTree {
         ts: TrxID,
     ) -> BTreeUpdate<V> {
         loop {
-            let mut res = self.find_leaf(key, LatchFallbackMode::Exclusive).await;
-            verify_continue!(res.try_exclusive());
-            let mut g = res.must_exclusive();
+            let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
             debug_assert!(g.page().is_leaf());
             let node = g.page_mut();
             return node
@@ -268,22 +264,22 @@ impl BTree {
     /// Try to lookup a key in the tree, break if any of optimistic validation fails.
     #[inline]
     async fn try_lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Validation<BTreeLookup<V>> {
-        let g = self.find_leaf(key, LatchFallbackMode::Spin).await;
+        let g = self.find_leaf::<OptimisticStrategy>(key).await;
         let leaf = unsafe { g.page_unchecked() };
-        match leaf.search(key) {
-            SearchResult::Equal(_, value) => {
+        match leaf.search_value(key) {
+            SearchValue::Equal(_, value) => {
                 verify!(g.validate());
                 Valid(BTreeLookup::Exists(value))
             }
-            SearchResult::EqualDeleted(_, value) => {
+            SearchValue::EqualDeleted(_, value) => {
                 verify!(g.validate());
                 Valid(BTreeLookup::Deleted(value))
             }
-            SearchResult::GreaterThan(_) | SearchResult::LessThanAllSlots => {
+            SearchValue::GreaterThan(_) | SearchValue::LessThanAllSlots => {
                 verify!(g.validate());
                 Valid(BTreeLookup::NotFound)
             }
-            SearchResult::LessThanLowerFence | SearchResult::GreaterEqualUpperFence => {
+            SearchValue::LessThanLowerFence | SearchValue::GreaterEqualUpperFence => {
                 verify!(g.validate());
                 Validation::Invalid
             }
@@ -294,21 +290,19 @@ impl BTree {
     #[inline]
     async fn try_split_bottom_up<V: BTreeValue>(
         &self,
-        stack: &mut Vec<FacadePageGuard<BTreeNode>>,
+        mut p_guard: FacadePageGuard<BTreeNode>,
         mut c_guard: PageExclusiveGuard<BTreeNode>,
         ts: TrxID,
     ) -> BTreeSplit {
         let c_node = c_guard.page_mut();
         debug_assert!(c_node.is_leaf());
         debug_assert!(c_node.count() > 1);
-        debug_assert!(!stack.is_empty());
         // Construct separator key.
         let (sep_idx, sep_key) = {
             let node = c_guard.page();
             let sep_idx = node.find_separator();
             (sep_idx, node.create_sep_key(sep_idx, true))
         };
-        let mut p_guard = stack.pop().unwrap();
         // Try to gain exclusive lock to avoid dead lock.
         let mut p_guard = match p_guard.try_exclusive() {
             Valid(()) => {
@@ -375,8 +369,8 @@ impl BTree {
         let c_optimistic_guard = c_guard.downgrade();
         let mut p_guard = p_guard.exclusive_async().await;
         let p_node = p_guard.page();
-        match p_node.search::<PageID>(&c_lower_fence_key) {
-            SearchResult::Equal(_, page_id) if page_id == c_page_id => {
+        match p_node.search_value_slow::<PageID>(&c_lower_fence_key) {
+            SearchValue::Equal(_, page_id) if page_id == c_page_id => {
                 // Tree structure remains the same.
                 // Check if parent is full.
                 if !p_node.can_insert(&sep_key) {
@@ -578,9 +572,9 @@ impl BTree {
 
     /// Find leaf by given key.
     #[inline]
-    async fn find_leaf(&self, key: &[u8], mode: LatchFallbackMode) -> FacadePageGuard<BTreeNode> {
+    async fn find_leaf<S: LockStrategy<Page = BTreeNode>>(&self, key: &[u8]) -> S::Guard {
         loop {
-            let res = self.try_find_leaf(key, mode, None).await;
+            let res = self.try_find_leaf::<S>(key).await;
             let res = verify_continue!(res);
             return res;
         }
@@ -697,67 +691,101 @@ impl BTree {
     }
 
     #[inline]
-    async fn try_find_leaf(
+    async fn try_find_leaf<S: LockStrategy<Page = BTreeNode>>(
         &self,
         key: &[u8],
-        mode: LatchFallbackMode,
-        mut stack: Option<&mut Vec<FacadePageGuard<BTreeNode>>>,
-    ) -> Validation<FacadePageGuard<BTreeNode>> {
-        let mut g = self
+    ) -> Validation<S::Guard> {
+        let mut p_guard = self
             .pool
             .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
             .await;
         // check root page separately.
-        let pu = unsafe { g.page_unchecked() };
+        let pu = unsafe { p_guard.page_unchecked() };
         let height = pu.height();
-        verify!(g.validate());
+        verify!(p_guard.validate());
         if height == 0 {
             // root is leaf.
-            match mode {
-                LatchFallbackMode::Spin => {
-                    return Valid(g);
-                }
-                LatchFallbackMode::Exclusive => {
-                    verify!(g.try_exclusive());
-                    return Valid(g);
-                }
-                LatchFallbackMode::Shared => {
-                    verify!(g.try_shared());
-                    return Valid(g);
-                }
-            }
+            verify!(S::try_lock(&mut p_guard));
+            return Valid(S::must_locked(p_guard));
         }
         loop {
             // Current node is not leaf node.
-            let pu = unsafe { g.page_unchecked() };
+            let pu = unsafe { p_guard.page_unchecked() };
             let height = pu.height();
             match pu.lookup_child(key) {
                 LookupChild::Slot(_, page_id) | LookupChild::LowerFence(page_id) => {
-                    verify!(g.validate());
+                    verify!(p_guard.validate());
                     // As version validation passes, the height must not be 0.
                     debug_assert!(height != 0);
                     if height == 1 {
                         // child node is leaf.
-                        let c = self.pool.get_child_page(&g, page_id, mode).await;
-                        let c = verify!(c);
-                        if let Some(s) = stack.as_mut() {
-                            s.push(g);
-                        }
-                        return Valid(c);
+                        let c_guard = self.pool.get_child_page(&p_guard, page_id, S::MODE).await;
+                        let c_guard = verify!(c_guard);
+                        let c_guard = S::verify_lock_async::<false>(c_guard).await;
+                        let c_guard = verify!(c_guard);
+                        return Valid(c_guard);
                     }
                     // child node is branch, continue next iteration.
-                    let p = self
+                    let c_guard = self
                         .pool
-                        .get_child_page(&g, page_id, LatchFallbackMode::Spin)
+                        .get_child_page(&p_guard, page_id, LatchFallbackMode::Spin)
                         .await;
-                    let p = verify!(p);
-                    if let Some(s) = stack.as_mut() {
-                        s.push(g);
-                    }
-                    g = p;
+                    let c_guard = verify!(c_guard);
+                    p_guard = c_guard;
                 }
                 LookupChild::NotFound => {
-                    verify!(g.validate());
+                    verify!(p_guard.validate());
+                    unreachable!("BTree should always find one leaf for any key");
+                }
+            }
+        }
+    }
+
+    #[inline]
+    async fn try_find_leaf_with_optimistic_parent<S: LockStrategy<Page = BTreeNode>>(
+        &self,
+        key: &[u8],
+    ) -> Validation<(S::Guard, Option<FacadePageGuard<BTreeNode>>)> {
+        let mut p_guard = self
+            .pool
+            .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
+            .await;
+        // check root page separately.
+        let pu = unsafe { p_guard.page_unchecked() };
+        let height = pu.height();
+        verify!(p_guard.validate());
+        if height == 0 {
+            // root is leaf.
+            verify!(S::try_lock(&mut p_guard));
+            return Valid((S::must_locked(p_guard), None));
+        }
+        loop {
+            // Current node is not leaf node.
+            let pu = unsafe { p_guard.page_unchecked() };
+            let height = pu.height();
+            match pu.lookup_child(key) {
+                LookupChild::Slot(_, page_id) | LookupChild::LowerFence(page_id) => {
+                    verify!(p_guard.validate());
+                    // As version validation passes, the height must not be 0.
+                    debug_assert!(height != 0);
+                    if height == 1 {
+                        // child node is leaf.
+                        let c_guard = self.pool.get_child_page(&p_guard, page_id, S::MODE).await;
+                        let c_guard = verify!(c_guard);
+                        let c_guard = S::verify_lock_async::<false>(c_guard).await;
+                        let c_guard = verify!(c_guard);
+                        return Valid((c_guard, Some(p_guard)));
+                    }
+                    // child node is branch, continue next iteration.
+                    let c_guard = self
+                        .pool
+                        .get_child_page(&p_guard, page_id, LatchFallbackMode::Spin)
+                        .await;
+                    let c_guard = verify!(c_guard);
+                    p_guard = c_guard;
+                }
+                LookupChild::NotFound => {
+                    verify!(p_guard.validate());
                     unreachable!("BTree should always find one leaf for any key");
                 }
             }
@@ -1006,6 +1034,7 @@ where
                 return Valid(());
             }
             if curr_height == height + 1 {
+                // If parent lock is not required, we use optimistic lock
                 verify!(S::try_lock(&mut p_guard));
                 let p_guard = S::must_locked(p_guard);
                 let p_node = p_guard.page();
@@ -1016,7 +1045,7 @@ where
                     LookupChild::NotFound => unreachable!(),
                 };
                 let c_guard = tree.pool.get_page::<BTreeNode>(c_page_id, S::MODE).await;
-                let res = S::verify_lock_async(c_guard).await;
+                let res = S::verify_lock_async::<false>(c_guard).await;
                 let c_guard = verify!(res);
                 self.parent = Some(ParentPosition { g: p_guard, idx });
                 self.node = Some(c_guard);
@@ -1138,7 +1167,7 @@ pub struct NodePurgeList {
 pub struct BTreeNodeCursor<'a> {
     tree: &'a BTree,
     height: usize,
-    coupling: BTreeCoupling<SharedLockStrategy<BTreeNode>>,
+    coupling: BTreeCoupling<SharedStrategy>,
 }
 
 impl<'a> BTreeNodeCursor<'a> {
@@ -1148,7 +1177,7 @@ impl<'a> BTreeNodeCursor<'a> {
         BTreeNodeCursor {
             tree,
             height,
-            coupling: BTreeCoupling::<SharedLockStrategy<BTreeNode>>::new(),
+            coupling: BTreeCoupling::<SharedStrategy>::new(),
         }
     }
 
@@ -1250,7 +1279,7 @@ pub struct BTreeCompactor<'a, V: BTreeValue> {
     height: usize,
     low_space: usize,
     high_space: usize,
-    coupling: BTreeCoupling<ExclusiveLockStrategy<BTreeNode>>,
+    coupling: BTreeCoupling<ExclusiveStrategy>,
     _marker: PhantomData<V>,
 }
 
@@ -1266,7 +1295,7 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
             height,
             low_space,
             high_space,
-            coupling: BTreeCoupling::<ExclusiveLockStrategy<BTreeNode>>::new(),
+            coupling: BTreeCoupling::<ExclusiveStrategy>::new(),
             _marker: PhantomData,
         }
     }
@@ -1556,7 +1585,8 @@ pub struct SpaceStatistics {
 mod tests {
     use super::*;
     use crate::lifetime::StaticLifetime;
-    use std::collections::HashMap;
+    use rand::distributions::{Distribution, Uniform};
+    use std::collections::{BTreeMap, HashMap};
 
     #[derive(Debug, Default)]
     struct LevelStat {
@@ -1830,6 +1860,47 @@ mod tests {
                     // level N+1 keys plus one(lower fence key of leftmost node)
                     // should be equal to level N nodes.
                     assert!(map[&h].keys + 1 == map[&(h - 1)].nodes);
+                }
+            }
+
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_lookup() {
+        const ROWS: usize = 500000;
+        smol::block_on(async {
+            // 1GB buffer pool.
+            let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+            {
+                let tree = BTree::new(pool, 200).await;
+                let mut map = BTreeMap::new();
+
+                // number less than 10 million
+                let between = Uniform::from(0u64..10_000_000);
+                let mut rng = rand::thread_rng();
+                for i in 0..ROWS {
+                    let k = between.sample(&mut rng);
+                    let res1 = tree.insert(&k.to_be_bytes(), i as u64, 201).await;
+                    let res2 = map.entry(k).or_insert_with(|| i as u64);
+                    assert!(res1.is_ok() == (*res2 == i as u64));
+                }
+                println!("tree height {}", tree.height());
+                let space_stat = tree.collect_space_statistics().await;
+                println!("tree space statistics: {:?}", space_stat);
+
+                for _ in 0..ROWS {
+                    let k = between.sample(&mut rng);
+                    let res1 = tree.lookup_optimistic::<u64>(&k.to_be_bytes()).await;
+                    let res2 = map.get(&k);
+                    if let Some(v) = res2 {
+                        assert!(res1 == BTreeLookup::Exists(*v));
+                    } else {
+                        assert!(res1 == BTreeLookup::NotFound);
+                    }
                 }
             }
 
