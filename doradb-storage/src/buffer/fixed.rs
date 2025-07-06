@@ -285,7 +285,23 @@ mod tests {
                     .get_page::<BlockNode>(0, LatchFallbackMode::Spin)
                     .await
                     .downgrade();
-                assert_eq!(unsafe { g.page_id() }, 0);
+                assert_eq!(g.page_id(), 0);
+            }
+            {
+                let g = pool.allocate_page::<BlockNode>().await;
+                let page_id = g.page_id();
+                drop(g);
+                let g = pool.get_page_spin::<BlockNode>(page_id);
+                assert!(g.page_id() == page_id);
+                drop(g);
+
+                let p = pool.allocate_page::<BlockNode>().await;
+                let p = p.downgrade().facade();
+                let c = pool
+                    .get_child_page::<BlockNode>(&p, page_id, LatchFallbackMode::Shared)
+                    .await;
+                let c = c.unwrap();
+                drop(c);
             }
             unsafe {
                 StaticLifetime::drop_static(pool);

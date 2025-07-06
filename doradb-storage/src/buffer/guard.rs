@@ -135,6 +135,12 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Returns id of this page.
+    #[inline]
+    pub fn page_id(&self) -> PageID {
+        unsafe { (*self.bf.0).page_id }
+    }
+
     /// Try exclusive lock will do additional version check after the lock acquisition to ensure
     /// during the optimistic lock and shared lock, there is no change on protected object.
     /// If lock acquisition fails, refresh version of the optimistic lock, so next acquisition
@@ -354,8 +360,8 @@ pub struct PageOptimisticGuard<T: 'static> {
 
 impl<T> PageOptimisticGuard<T> {
     #[inline]
-    pub unsafe fn page_id(&self) -> PageID {
-        (*self.bf.0).page_id
+    pub fn page_id(&self) -> PageID {
+        unsafe { (*self.bf.0).page_id }
     }
 
     #[inline]

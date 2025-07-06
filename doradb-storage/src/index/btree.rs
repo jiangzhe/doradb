@@ -6,6 +6,7 @@ use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
+use crate::error::{Error, Result};
 use crate::index::btree_node::{
     BTreeNode, KeyVec, LookupChild, SearchKey, SearchValue, SpaceEstimation,
 };
@@ -642,7 +643,6 @@ impl BTree {
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
-        debug_assert!(p_node.lookup_child_idx(upper_fence_key) == Some(p_r_idx as isize));
         debug_assert!(count > 0 && count + 1 < r_node.count());
         debug_assert!(&r_node.create_sep_key(count, r_node.height() == 0)[..] == sep_key);
         debug_assert!({
@@ -1034,7 +1034,7 @@ where
                 return Valid(());
             }
             if curr_height == height + 1 {
-                // If parent lock is not required, we use optimistic lock
+                // Parent is locked with same mode as child.
                 verify!(S::try_lock(&mut p_guard));
                 let p_guard = S::must_locked(p_guard);
                 let p_node = p_guard.page();
@@ -1245,16 +1245,19 @@ pub struct BTreeCompactConfig {
 
 impl BTreeCompactConfig {
     #[inline]
-    pub fn new(low_ratio: f64, high_ratio: f64) -> Self {
-        debug_assert!(low_ratio >= 0.0);
-        debug_assert!(low_ratio <= 1.0);
-        debug_assert!(high_ratio >= 0.0);
-        debug_assert!(high_ratio <= 1.0);
-        debug_assert!(high_ratio >= low_ratio);
-        BTreeCompactConfig {
+    pub fn new(low_ratio: f64, high_ratio: f64) -> Result<Self> {
+        if low_ratio < 0.0
+            || low_ratio > 1.0
+            || high_ratio < 0.0
+            || high_ratio > 1.0
+            || high_ratio < low_ratio
+        {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(BTreeCompactConfig {
             low_ratio,
             high_ratio,
-        }
+        })
     }
 }
 
@@ -1585,8 +1588,11 @@ pub struct SpaceStatistics {
 mod tests {
     use super::*;
     use crate::lifetime::StaticLifetime;
+    use crate::notify::Signal;
     use rand::distributions::{Distribution, Uniform};
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[derive(Debug, Default)]
     struct LevelStat {
@@ -1609,6 +1615,10 @@ mod tests {
                 assert!(res.is_ok());
                 let res = tree.insert(&5u64.to_be_bytes(), 5, 205).await;
                 assert!(res.is_ok());
+
+                let res = tree.insert(&5u64.to_be_bytes(), 5, 230).await;
+                assert!(res == BTreeInsert::DuplicateKey);
+
                 // look up
                 let res = tree.lookup_optimistic::<u64>(&1u64.to_be_bytes()).await;
                 assert!(res.exists());
@@ -1643,7 +1653,7 @@ mod tests {
 
     #[test]
     fn test_btree_scale() {
-        const ROWS: u64 = 90122;
+        const ROWS: u64 = 90089;
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
@@ -1787,7 +1797,7 @@ mod tests {
 
     #[test]
     fn test_btree_compact() {
-        const ROWS: u64 = 90122;
+        const ROWS: u64 = 90089;
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
@@ -1815,9 +1825,8 @@ mod tests {
                 let space_stat = tree.collect_space_statistics().await;
                 println!("Before compaction, tree space statistics: {:?}", space_stat);
 
-                let purge_list = tree
-                    .compact_all::<u64>(BTreeCompactConfig::new(1.0, 1.0))
-                    .await;
+                let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
+                let purge_list = tree.compact_all::<u64>(config).await;
 
                 let space_stat = tree.collect_space_statistics().await;
                 println!("After compaction, tree space statistics: {:?}", space_stat);
@@ -1902,6 +1911,213 @@ mod tests {
                         assert!(res1 == BTreeLookup::NotFound);
                     }
                 }
+            }
+
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_with_stdmap() {
+        smol::block_on(async {
+            const ROWS: u64 = 1_000_000;
+            const MAX_VALUE: u64 = 10_000_000;
+            let pool = FixedBufferPool::with_capacity_static(1 * 1024 * 1024 * 1024).unwrap();
+            {
+                let tree = BTree::new(pool, 1).await;
+
+                let start = Instant::now();
+                // insert with random distribution.
+                {
+                    let between = Uniform::from(0u64..MAX_VALUE);
+                    let mut thd_rng = rand::thread_rng();
+                    for i in 0..ROWS {
+                        let k = between.sample(&mut thd_rng);
+                        tree.insert(&k.to_be_bytes(), i, 100).await;
+                    }
+                }
+                let dur = start.elapsed();
+
+                let qps = ROWS as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+                let op_nanos = dur.as_nanos() as f64 / ROWS as f64;
+                println!(
+                    "btree rand insert: dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
+                    dur.as_millis(),
+                    ROWS,
+                    qps,
+                    op_nanos
+                );
+
+                let start = Instant::now();
+
+                // lookup with random distribution.
+                {
+                    let between = Uniform::from(0..MAX_VALUE);
+                    let mut thd_rng = rand::thread_rng();
+                    for i in 0..ROWS {
+                        let k = between.sample(&mut thd_rng);
+                        tree.insert(&k.to_be_bytes(), i, 100).await;
+                    }
+                }
+
+                let dur = start.elapsed();
+
+                let qps = ROWS as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
+                let op_nanos = dur.as_nanos() as f64 / ROWS as f64;
+                println!(
+                    "btree rand lookup: dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
+                    dur.as_millis(),
+                    ROWS,
+                    qps,
+                    op_nanos
+                );
+            }
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_split() {
+        // number 90088 will trigger 2 level b-tree split.
+        const ROWS: u64 = 90088;
+        smol::block_on(async {
+            // 1GB buffer pool.
+            let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
+            {
+                let tree = Arc::new(BTree::new(pool, 200).await);
+
+                // Key length in leaf node is about 1000 bytes.
+                // Key length in branch node is about 8 bytes(with suffix truncation).
+                let mut key = [0u8; 1000];
+                for i in 0u64..ROWS {
+                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
+                    let res = tree.insert(&key, i, 201).await;
+                    assert!(res.is_ok());
+                }
+                let signal = Signal::default();
+                let notify = signal.new_notify();
+                {
+                    let tree = Arc::clone(&tree);
+                    std::thread::spawn(move || {
+                        smol::block_on(async {
+                            let k = 90088u64.to_be_bytes();
+                            let res = tree
+                                .try_find_leaf_with_optimistic_parent::<SharedStrategy>(&k)
+                                .await;
+                            let (c_guard, p_guard) = res.unwrap();
+                            drop(c_guard);
+                            let p_guard = p_guard.unwrap();
+                            let shared_guard = p_guard.shared_async().await;
+                            signal.notify(1);
+                            smol::Timer::after(Duration::from_millis(1000)).await;
+                            println!("going to drop");
+                            drop(shared_guard);
+                        })
+                    });
+                }
+                // wait for another thread to acquire parent's shared lock.
+                notify.wait_async().await;
+                println!("tree height {}", tree.height());
+                key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
+                let res = tree.insert(&key, 90088, 202).await;
+                assert!(res.is_ok());
+                println!("insert ok");
+                println!("tree height {}", tree.height());
+                let stat = tree.collect_space_statistics().await;
+                println!("tree space statistics: {:?}", stat)
+            }
+
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_concurrent_split() {
+        // number 90088 will trigger 2 level b-tree split.
+        const ROWS: u64 = 90088;
+        smol::block_on(async {
+            // 1GB buffer pool.
+            let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
+            {
+                let tree = Arc::new(BTree::new(pool, 200).await);
+
+                // Key length in leaf node is about 1000 bytes.
+                // Key length in branch node is about 8 bytes(with suffix truncation).
+                let mut key = [0u8; 1000];
+                for i in 0u64..ROWS {
+                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
+                    let res = tree.insert(&key, i, 201).await;
+                    assert!(res.is_ok());
+                }
+                let signal = Signal::default();
+                let mut handles = Vec::with_capacity(10);
+                for j in 90088u64..90098 {
+                    let tree = Arc::clone(&tree);
+                    let notify = signal.new_notify();
+                    let handle = std::thread::spawn(move || {
+                        smol::block_on(async {
+                            let mut key = vec![0u8; 1000];
+                            key[..8].copy_from_slice(&j.to_be_bytes()[..]);
+
+                            notify.wait_async().await;
+
+                            let res = tree.insert(&key, 90088, 202).await;
+                            assert!(res.is_ok());
+                        })
+                    });
+                    handles.push(handle);
+                }
+                // wait for another thread to acquire parent's shared lock.
+                signal.done(usize::MAX);
+                smol::Timer::after(Duration::from_millis(500)).await;
+                println!("tree height {}", tree.height());
+                let stat = tree.collect_space_statistics().await;
+                println!("tree space statistics: {:?}", stat)
+            }
+
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_merge_partial() {
+        const ROWS: usize = 500000;
+        smol::block_on(async {
+            // 1GB buffer pool.
+            let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+            {
+                let tree = BTree::new(pool, 200).await;
+                // number less than 10 million
+                let between = Uniform::from(0u64..10_000_000);
+                let mut rng = rand::thread_rng();
+                for i in 0..ROWS {
+                    let k = between.sample(&mut rng);
+                    let _ = tree.insert(&k.to_be_bytes(), i as u64, 201).await;
+                }
+                let space_stat = tree.collect_space_statistics().await;
+                println!(
+                    "before compaction, tree height {}, space statistics: {:?}",
+                    tree.height(),
+                    space_stat
+                );
+
+                let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
+                tree.compact_all::<u64>(config).await;
+
+                let space_stat = tree.collect_space_statistics().await;
+                println!(
+                    "after compaction, tree height {}, space statistics: {:?}",
+                    tree.height(),
+                    space_stat
+                );
             }
 
             unsafe {

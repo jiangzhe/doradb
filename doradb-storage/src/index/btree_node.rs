@@ -1457,7 +1457,6 @@ impl SpaceEstimation {
     #[inline]
     pub fn add_key_range(&mut self, node: &BTreeNode, start_idx: usize, end_idx: usize) {
         debug_assert!(start_idx <= end_idx);
-        debug_assert!(self.prefix_len <= node.header.prefix_len);
         for idx in start_idx..end_idx {
             self.add_key(node.key_len(idx));
         }

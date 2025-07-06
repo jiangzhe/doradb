@@ -1545,13 +1545,43 @@ mod tests {
                 pool.deallocate_page(g);
                 let g = pool.allocate_page::<RowPage>().await;
                 assert_eq!(g.page_id(), 1);
+                drop(g);
             }
             {
                 let g = pool
                     .get_page::<RowPage>(0, LatchFallbackMode::Spin)
                     .await
                     .downgrade();
-                assert_eq!(unsafe { g.page_id() }, 0);
+                assert_eq!(g.page_id(), 0);
+                let p = g.facade();
+                // test coupling.
+                let c = pool
+                    .get_child_page::<RowPage>(&p, 1, LatchFallbackMode::Exclusive)
+                    .await;
+                let c = c.unwrap();
+                drop(c);
+            }
+            {
+                let g = pool
+                    .get_page::<RowPage>(0, LatchFallbackMode::Spin)
+                    .await
+                    .downgrade();
+                assert_eq!(g.page_id(), 0);
+                let p = g.facade();
+
+                // modify page 0.
+                let g = pool
+                    .get_page::<RowPage>(0, LatchFallbackMode::Exclusive)
+                    .await
+                    .verify_exclusive_async::<false>()
+                    .await;
+                drop(g.unwrap());
+
+                // test coupling fail.
+                let c = pool
+                    .get_child_page::<RowPage>(&p, 1, LatchFallbackMode::Exclusive)
+                    .await;
+                assert!(c.is_invalid());
             }
             unsafe {
                 StaticLifetime::drop_static(pool);
