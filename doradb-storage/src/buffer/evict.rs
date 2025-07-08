@@ -43,8 +43,6 @@ pub struct EvictableBufferPool {
     alloc_map: AllocMap,
     // Support notifying and waiting for page allocation.
     alloc_signal: Signal,
-    // Number of allocated pages.
-    allocated: AtomicUsize,
     // Page IO control read pages from disk and write pages
     // to disk.
     file_io: SingleFileIO,
@@ -679,7 +677,7 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     fn allocated(&self) -> usize {
-        self.allocated.load(Ordering::Relaxed)
+        self.alloc_map.allocated()
     }
 
     #[inline]
@@ -690,7 +688,6 @@ impl BufferPool for EvictableBufferPool {
             // Now we have memory budget to allocate new page.
             match self.alloc_map.allocate() {
                 Some(page_id) => {
-                    self.allocated.fetch_add(1, Ordering::Relaxed);
                     self.pin_page(page_id as PageID);
                     return unsafe { self.init_page(page_id as PageID) };
                 }
@@ -698,7 +695,6 @@ impl BufferPool for EvictableBufferPool {
                     let notify = self.alloc_signal.new_notify();
                     // re-check
                     if let Some(page_id) = self.alloc_map.allocate() {
-                        self.allocated.fetch_add(1, Ordering::Relaxed);
                         self.pin_page(page_id as PageID);
                         return unsafe { self.init_page(page_id as PageID) };
                     }
@@ -720,7 +716,6 @@ impl BufferPool for EvictableBufferPool {
         while !self.reserve_page().await {}
 
         if self.alloc_map.allocate_at(page_id as usize) {
-            self.allocated.fetch_add(1, Ordering::Relaxed);
             self.pin_page(page_id as PageID);
             Ok(unsafe { self.init_page(page_id as PageID) })
         } else {
@@ -1346,7 +1341,6 @@ impl EvictableBufferPoolConfig {
             in_mem: InMemPageSet::new(max_nbr_in_mem),
             alloc_map: AllocMap::new(max_nbr),
             alloc_signal: Signal::default(),
-            allocated: AtomicUsize::new(0),
             file_io: SingleFileIO::new(aio_reader, aio_writer, file, io_read_tx, io_write_tx),
             shutdown_flag: AtomicBool::new(false),
             inflight_io: CachePadded::new(InflightIO::default()),

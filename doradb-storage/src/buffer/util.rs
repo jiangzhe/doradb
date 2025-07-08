@@ -1,5 +1,6 @@
+use crate::bitmap::{new_bitmap, Bitmap};
 use crate::buffer::frame::BufferFrame;
-use crate::buffer::guard::{PageExclusiveGuard, FacadePageGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::BufferPage;
 use crate::error::{Error, Result};
 use crate::ptr::UnsafePtr;
@@ -8,6 +9,8 @@ use libc::{
     MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE,
 };
 use parking_lot::Mutex;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[inline]
 pub(super) fn init_bf_exclusive_guard<T: BufferPage>(
@@ -53,80 +56,16 @@ pub(super) unsafe fn madvise_remove(ptr: *mut u8, len: usize) -> bool {
     madvise(ptr as *mut c_void, len, MADV_REMOVE) == 0
 }
 
-pub struct Bitmap(Box<[u64]>);
-
-impl Bitmap {
-    /// Create a new bitmap.
-    #[inline]
-    pub fn new(nbr_of_bits: usize) -> Self {
-        let len = (nbr_of_bits + 63) / 64;
-        let data = vec![0; len];
-        Bitmap(data.into_boxed_slice())
-    }
-
-    /// Returns bit at given position.
-    #[inline]
-    pub fn get(&self, idx: usize) -> bool {
-        let unit_idx = idx / 64;
-        let bit_idx = idx % 64;
-        let v = self.0[unit_idx];
-        v & (1 << bit_idx) == (1 << bit_idx)
-    }
-
-    /// Returns unit at given position.
-    #[inline]
-    pub fn get_unit(&self, unit_idx: usize) -> u64 {
-        self.0[unit_idx]
-    }
-
-    /// Set bit to true at given position.
-    #[inline]
-    pub fn set(&mut self, idx: usize) -> bool {
-        let unit_idx = idx / 64;
-        let bit_idx = idx % 64;
-        if self.0[unit_idx] & (1 << bit_idx) != 0 {
-            return false;
-        }
-        self.0[unit_idx] |= 1 << bit_idx;
-        true
-    }
-
-    /// Unset given bit to be false.
-    #[inline]
-    pub fn unset(&mut self, idx: usize) -> bool {
-        let unit_idx = idx / 64;
-        let bit_idx = idx % 64;
-        if self.0[unit_idx] & (1 << bit_idx) == 0 {
-            return false;
-        }
-        self.0[unit_idx] &= !(1 << bit_idx);
-        true
-    }
-
-    /// Set the first zero bit to true within given range.
-    #[inline]
-    pub fn set_first(&mut self, unit_start_idx: usize, unit_end_idx: usize) -> Option<usize> {
-        let mut unit_idx = unit_start_idx;
-        for v in &mut self.0[unit_start_idx..unit_end_idx] {
-            let bit_idx = (*v).trailing_ones();
-            if bit_idx < 64 {
-                *v |= 1 << bit_idx;
-                return Some(unit_idx * 64 + bit_idx as usize);
-            }
-            unit_idx += 1;
-        }
-        None
-    }
-}
-
 pub struct FreeBitmap {
     free_unit_idx: usize,
-    bitmap: Bitmap,
+    bitmap: Box<[u64]>,
 }
 
+/// AllocMap is an allocation controller backed by bitmap.
 pub struct AllocMap {
     inner: Mutex<FreeBitmap>,
     len: usize,
+    allocated: AtomicUsize,
 }
 
 impl AllocMap {
@@ -136,9 +75,10 @@ impl AllocMap {
         AllocMap {
             inner: Mutex::new(FreeBitmap {
                 free_unit_idx: 0,
-                bitmap: Bitmap::new(len),
+                bitmap: new_bitmap(len),
             }),
             len,
+            allocated: AtomicUsize::new(0),
         }
     }
 
@@ -148,31 +88,39 @@ impl AllocMap {
         self.len
     }
 
+    /// Returns number of allocated objects.
+    #[inline]
+    pub fn allocated(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed)
+    }
+
     /// Allocate a new object, returns the global index of object.
     #[inline]
     pub fn allocate(&self) -> Option<usize> {
         let unit_end_idx = (self.len + 63) / 64;
         let mut g = self.inner.lock();
         let unit_start_idx = g.free_unit_idx;
-        if let Some(idx) = g.bitmap.set_first(unit_start_idx, unit_end_idx) {
+        if let Some(idx) = g.bitmap.bitmap_set_first(unit_start_idx, unit_end_idx) {
             if idx < self.len {
-                if g.bitmap.get_unit(idx / 64) == 0 {
+                if g.bitmap.bitmap_unit(idx / 64) == 0 {
                     g.free_unit_idx += 1;
                     if g.free_unit_idx == unit_end_idx {
                         g.free_unit_idx = 0;
                     }
                 }
+                self.allocated.fetch_add(1, Ordering::Relaxed);
                 return Some(idx);
             }
         }
-        if let Some(idx) = g.bitmap.set_first(0, unit_start_idx) {
+        if let Some(idx) = g.bitmap.bitmap_set_first(0, unit_start_idx) {
             if idx < self.len {
-                if g.bitmap.get_unit(idx / 64) == 0 {
+                if g.bitmap.bitmap_unit(idx / 64) == 0 {
                     g.free_unit_idx += 1;
                     if g.free_unit_idx == unit_end_idx {
                         g.free_unit_idx = 0;
                     }
                 }
+                self.allocated.fetch_add(1, Ordering::Relaxed);
                 return Some(idx);
             }
         }
@@ -186,13 +134,14 @@ impl AllocMap {
         let unit_idx = idx / 64;
 
         let mut g = self.inner.lock();
-        if !g.bitmap.get(idx) {
-            return false;
+        if g.bitmap.bitmap_unset(idx) {
+            if g.free_unit_idx > unit_idx {
+                g.free_unit_idx = unit_idx;
+            }
+            self.allocated.fetch_sub(1, Ordering::Relaxed);
+            return true;
         }
-        if g.free_unit_idx > unit_idx {
-            g.free_unit_idx = unit_idx;
-        }
-        g.bitmap.unset(idx)
+        false
     }
 
     /// Allocate a new object at given index.
@@ -202,17 +151,34 @@ impl AllocMap {
             return false;
         }
         let mut g = self.inner.lock();
-        if g.bitmap.set(idx) {
+        if g.bitmap.bitmap_set(idx) {
             // Do not update free_unit_idx.
+            self.allocated.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         false
     }
 
+    /// Returns whether the object at given position is allocated.
     #[inline]
     pub fn is_allocated(&self, idx: usize) -> bool {
         let g = self.inner.lock();
-        g.bitmap.get(idx)
+        g.bitmap.bitmap_get(idx)
+    }
+
+    /// Returns allocated ranges.
+    #[inline]
+    pub fn allocated_ranges(&self) -> Vec<Range<usize>> {
+        let mut res = vec![];
+        let g = self.inner.lock();
+        let mut idx = 0usize;
+        for (flag, count) in g.bitmap.bitmap_range_iter(self.len) {
+            if flag {
+                res.push(idx..idx + count);
+            }
+            idx += count;
+        }
+        res
     }
 }
 
@@ -221,43 +187,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
-
-    #[test]
-    fn test_bitmap_basic() {
-        let bitmap = Bitmap::new(64);
-        assert!(!bitmap.get(0));
-        assert!(!bitmap.get(63));
-    }
-
-    #[test]
-    fn test_bitmap_set_unset() {
-        let mut bitmap = Bitmap::new(64);
-
-        // Test set
-        assert!(bitmap.set(0));
-        assert!(bitmap.get(0));
-        assert!(!bitmap.set(0)); // Can't set again
-
-        // Test release
-        assert!(bitmap.unset(0));
-        assert!(!bitmap.get(0));
-        assert!(!bitmap.unset(0)); // Can't unset again
-    }
-
-    #[test]
-    fn test_bitmap_boundary() {
-        let mut bitmap = Bitmap::new(64);
-
-        // Test boundary bits
-        assert!(bitmap.set(0));
-        assert!(bitmap.set(63));
-
-        assert!(bitmap.get(0));
-        assert!(bitmap.get(63));
-
-        assert!(bitmap.unset(0));
-        assert!(bitmap.unset(63));
-    }
 
     #[test]
     fn test_alloc_map_concurrent() {

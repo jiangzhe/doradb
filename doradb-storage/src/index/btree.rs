@@ -132,6 +132,65 @@ impl BTree {
         }
     }
 
+    /// Destroy the tree.
+    /// This method will traverse the tree and deallocate all the nodes recursively.
+    #[inline]
+    pub async fn destory(self) {
+        let g = self
+            .pool
+            .get_page::<BTreeNode>(self.root, LatchFallbackMode::Exclusive)
+            .await
+            .exclusive_async()
+            .await;
+        let p_node = g.page();
+        match p_node.height() {
+            0 => {
+                // single-node tree.
+                self.pool.deallocate_page::<BTreeNode>(g);
+                return;
+            }
+            1 => {
+                self.deallocate_height1(g).await;
+                return;
+            }
+            _ => {
+                let mut stack = vec![];
+                stack.push(ParentPosition { g, idx: -1 });
+
+                while let Some(pos) = stack.last_mut() {
+                    let p_node = pos.g.page();
+                    if p_node.height() == 1 {
+                        let g = stack.pop().unwrap().g;
+                        self.deallocate_height1(g).await;
+                        continue;
+                    }
+                    if pos.idx == p_node.count() as isize {
+                        // all children are dropped, we can drop the parent itself.
+                        let ParentPosition { g, .. } = stack.pop().unwrap();
+                        self.pool.deallocate_page(g);
+                        continue;
+                    }
+                    let c_page_id = if pos.idx == -1 {
+                        p_node.lower_fence_value()
+                    } else {
+                        p_node.value::<PageID>(pos.idx as usize)
+                    };
+                    let c_guard = self
+                        .pool
+                        .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
+                        .await
+                        .exclusive_async()
+                        .await;
+                    pos.idx += 1;
+                    stack.push(ParentPosition {
+                        g: c_guard,
+                        idx: -1,
+                    });
+                }
+            }
+        }
+    }
+
     /// Returns height of this btree.
     #[inline]
     pub fn height(&self) -> usize {
@@ -967,6 +1026,36 @@ impl BTree {
             self.height.store(root.height(), Ordering::Release);
             purge_list.push(c_guard);
         }
+    }
+
+    #[inline]
+    async fn deallocate_height1(&self, g: PageExclusiveGuard<BTreeNode>) {
+        let p_node = g.page();
+        debug_assert!(p_node.height() == 1);
+        // Deallocate child associated with lower fence key.
+        // Only left-most node has lower fence child.
+        if !p_node.lower_fence_value().is_deleted() {
+            let c_guard = self
+                .pool
+                .get_page::<BTreeNode>(p_node.lower_fence_value(), LatchFallbackMode::Exclusive)
+                .await
+                .exclusive_async()
+                .await;
+            self.pool.deallocate_page::<BTreeNode>(c_guard);
+        }
+        // Deallocate all children.
+        for i in 0..p_node.count() {
+            let c_page_id = p_node.value::<PageID>(i);
+            let c_guard = self
+                .pool
+                .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
+                .await
+                .exclusive_async()
+                .await;
+            self.pool.deallocate_page::<BTreeNode>(c_guard);
+        }
+        // Deallocate self.
+        self.pool.deallocate_page::<BTreeNode>(g);
     }
 }
 
@@ -2120,6 +2209,69 @@ mod tests {
                 );
             }
 
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_destory() {
+        const H0_ROWS: u64 = 10;
+        const H1_ROWS: u64 = 1000;
+        const H2_ROWS: u64 = 100000;
+        smol::block_on(async {
+            // 1GB buffer pool.
+            let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+            assert!(pool.allocated() == 0);
+            // height=0
+            {
+                let tree = BTree::new(pool, 200).await;
+                let mut key = vec![0u8; 1000];
+                for i in 0..H0_ROWS {
+                    key[..8].copy_from_slice(&i.to_be_bytes());
+                    tree.insert(&key, i, 201).await;
+                }
+                println!(
+                    "BTree with {} keys occupies {} pages",
+                    H2_ROWS,
+                    pool.allocated()
+                );
+                tree.destory().await;
+                assert!(pool.allocated() == 0);
+            }
+            // height=1
+            {
+                let tree = BTree::new(pool, 200).await;
+                let mut key = vec![0u8; 1000];
+                for i in 0..H1_ROWS {
+                    key[..8].copy_from_slice(&i.to_be_bytes());
+                    tree.insert(&key, i, 201).await;
+                }
+                println!(
+                    "BTree with {} keys occupies {} pages",
+                    H2_ROWS,
+                    pool.allocated()
+                );
+                tree.destory().await;
+                assert!(pool.allocated() == 0);
+            }
+            // height=2
+            {
+                let tree = BTree::new(pool, 200).await;
+                let mut key = vec![0u8; 1000];
+                for i in 0..H2_ROWS {
+                    key[..8].copy_from_slice(&i.to_be_bytes());
+                    tree.insert(&key, i, 201).await;
+                }
+                println!(
+                    "BTree with {} keys occupies {} pages",
+                    H2_ROWS,
+                    pool.allocated()
+                );
+                tree.destory().await;
+                assert!(pool.allocated() == 0);
+            }
             unsafe {
                 StaticLifetime::drop_static(pool);
             }

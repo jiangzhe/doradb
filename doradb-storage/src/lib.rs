@@ -1,3 +1,4 @@
+pub mod bitmap;
 pub mod col;
 pub mod io;
 #[macro_use]
