@@ -10,7 +10,6 @@ use crate::lifetime::StaticLifetime;
 use crate::ptr::UnsafePtr;
 use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const SAFETY_PAGES: usize = 10;
 
@@ -20,7 +19,6 @@ pub struct FixedBufferPool {
     frames: *mut BufferFrame,
     pages: *mut Page,
     size: usize,
-    allocated: AtomicU64,
     // free_list: Mutex<PageID>,
     alloc_map: AllocMap,
 }
@@ -52,8 +50,6 @@ impl FixedBufferPool {
             frames,
             pages,
             size,
-            allocated: AtomicU64::new(0),
-            // free_list: Mutex::new(INVALID_PAGE_ID),
             alloc_map: AllocMap::new(size),
         })
     }
@@ -142,17 +138,14 @@ impl BufferPool for FixedBufferPool {
 
     #[inline]
     fn allocated(&self) -> usize {
-        self.allocated.load(Ordering::Relaxed) as usize
+        self.alloc_map.allocated()
     }
 
     // allocate a new page with exclusive lock.
     #[inline]
     async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
         match self.alloc_map.allocate() {
-            Some(page_id) => {
-                self.allocated.fetch_add(1, Ordering::AcqRel);
-                unsafe { self.allocate_internal(page_id as PageID) }
-            }
+            Some(page_id) => unsafe { self.allocate_internal(page_id as PageID) },
             None => {
                 panic!("buffer pool full");
             }
@@ -165,7 +158,6 @@ impl BufferPool for FixedBufferPool {
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
         if self.alloc_map.allocate_at(page_id as usize) {
-            self.allocated.fetch_add(1, Ordering::AcqRel);
             Ok(unsafe { self.allocate_internal(page_id as PageID) })
         } else {
             Err(Error::BufferPageAlreadyAllocated)
@@ -234,11 +226,14 @@ impl BufferPool for FixedBufferPool {
 impl Drop for FixedBufferPool {
     fn drop(&mut self) {
         unsafe {
-            // We should drop all frames before deallocating memory.
-            let allocated = self.allocated.load(Ordering::Relaxed);
-            for page_id in 0..allocated {
-                let frame_ptr = self.frames.add(page_id as usize);
-                std::ptr::drop_in_place(frame_ptr);
+            // We should drop all active frames before deallocating memory.
+            // Because there might be some user-defined context objects stored
+            // in the frame.
+            for allocated_range in self.alloc_map.allocated_ranges() {
+                for page_id in allocated_range {
+                    let frame_ptr = self.frames.add(page_id);
+                    std::ptr::drop_in_place(frame_ptr);
+                }
             }
             // Deallocate memory of frames.
             let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.size + SAFETY_PAGES);

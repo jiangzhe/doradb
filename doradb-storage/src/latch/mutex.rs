@@ -83,7 +83,6 @@ impl RawMutex {
     pub const fn new() -> RawMutex {
         RawMutex {
             inner: ParkingLotRawMutex::INIT,
-
             event: Event::new(),
         }
     }
@@ -176,6 +175,7 @@ mod tests {
     use super::*;
     use std::cell::UnsafeCell;
     use std::sync::Arc;
+    use std::time::Instant;
 
     #[test]
     fn test_raw_mutex_sync() {
@@ -218,6 +218,38 @@ mod tests {
         }
         println!("val={:?}", counter.val());
         assert!(counter.val() == 100);
+    }
+
+    #[test]
+    fn test_raw_mutex_single_thread() {
+        const COUNT: usize = 1_000_000;
+        smol::block_on(async {
+            let counter = Counter::new();
+            let start = Instant::now();
+            for _ in 0..COUNT {
+                counter.inc();
+            }
+            let dur1 = start.elapsed();
+            println!(
+                "sync inc, dur={:?}, tps={}",
+                dur1,
+                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
+            );
+        });
+
+        smol::block_on(async {
+            let counter = Counter::new();
+            let start = Instant::now();
+            for _ in 0..COUNT {
+                counter.inc_async().await;
+            }
+            let dur1 = start.elapsed();
+            println!(
+                "async inc, dur={:?}, tps={}",
+                dur1,
+                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
+            );
+        });
     }
 
     struct Counter {

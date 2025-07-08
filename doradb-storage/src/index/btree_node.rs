@@ -102,7 +102,8 @@ const INLINE_PREFIX_LEN: usize = 16;
 
 const KEY_HEAD_LEN: usize = 4;
 
-pub type KeyHead = [u8; KEY_HEAD_LEN];
+pub type KeyHeadInt = u32;
+pub type KeyHeadBytes = [u8; 4];
 
 const _: () = assert!(mem::size_of::<Slot>() == 8);
 
@@ -113,7 +114,7 @@ pub type KeyVec = SmallVec<[u8; 16]>;
 pub struct Slot {
     len: u16,
     offset: u16,
-    head: KeyHead,
+    head: KeyHeadInt,
 }
 
 impl Slot {
@@ -127,7 +128,7 @@ impl Slot {
         Slot {
             len: k.len() as u16,
             offset: 0,
-            head: head(k),
+            head: head_int(k),
         }
     }
 
@@ -139,8 +140,8 @@ impl Slot {
 
     /// convert head to u32 value.
     #[inline]
-    pub fn head_as_u32(&self) -> u32 {
-        u32::from_be_bytes(self.head)
+    pub fn head_bytes(&self) -> [u8; 4] {
+        self.head.to_be_bytes()
     }
 }
 
@@ -321,7 +322,7 @@ impl BTreeNode {
 
     #[inline]
     fn cmp_key_without_prefix(&self, k: &[u8], slot: &Slot) -> Ordering {
-        match head(k).cmp(&slot.head) {
+        match head_int(k).cmp(&slot.head) {
             Ordering::Less => Ordering::Less,
             Ordering::Greater => Ordering::Greater,
             Ordering::Equal => {
@@ -329,7 +330,7 @@ impl BTreeNode {
                 if l <= KEY_HEAD_LEN {
                     k.len().cmp(&(slot.len as usize))
                 } else {
-                    let k2 = self.k(slot);
+                    let k2 = self.long_key_suffix(slot);
                     k.cmp(k2)
                 }
             }
@@ -587,7 +588,7 @@ impl BTreeNode {
     fn new_slot_with_value<V: BTreeValue>(&mut self, key: &[u8], value: V) -> Slot {
         debug_assert!(key.len() >= self.header.prefix_len as usize);
         let k = &key[self.header.prefix_len as usize..];
-        let head = head(k);
+        let head = head_int(k);
         if k.len() <= KEY_HEAD_LEN {
             // Only value inserted at end of page.
             // Copy value.
@@ -624,7 +625,7 @@ impl BTreeNode {
     fn new_slot_without_value(&mut self, key: &[u8]) -> Slot {
         debug_assert!(key.len() >= self.header.prefix_len as usize);
         let k = &key[self.header.prefix_len as usize..];
-        let head = head(k);
+        let head = head_int(k);
         if k.len() <= KEY_HEAD_LEN {
             // No value inserted to page.
             return Slot {
@@ -840,22 +841,20 @@ impl BTreeNode {
     /// Search without prefix. The prefix of input key should be trimed.
     #[inline]
     fn search_value_without_prefix<V: BTreeValue>(&self, k: &[u8]) -> SearchValue<V> {
-        let head = head_as_u32(k);
-        match self
-            .slots()
-            .binary_search_by(|s| match s.head_as_u32().cmp(&head) {
-                Ordering::Less => Ordering::Less,
-                Ordering::Greater => Ordering::Greater,
-                Ordering::Equal => {
-                    let l = k.len().min(s.len as usize);
-                    if l <= KEY_HEAD_LEN {
-                        (s.len as usize).cmp(&k.len())
-                    } else {
-                        let sk = self.k(s);
-                        sk.cmp(k)
-                    }
+        let head = head_int(k);
+        match self.slots().binary_search_by(|s| match s.head.cmp(&head) {
+            Ordering::Less => Ordering::Less,
+            Ordering::Greater => Ordering::Greater,
+            Ordering::Equal => {
+                let l = k.len().min(s.len as usize);
+                if l <= KEY_HEAD_LEN {
+                    (s.len as usize).cmp(&k.len())
+                } else {
+                    let sk = self.long_key_suffix(s);
+                    sk.cmp(k)
                 }
-            }) {
+            }
+        }) {
             Ok(idx) => {
                 let value = self.value::<V>(idx);
                 if value.is_deleted() {
@@ -882,22 +881,20 @@ impl BTreeNode {
                 && &key[..self.header.prefix_len as usize] == self.common_prefix()
         );
         let k = &key[self.header.prefix_len as usize..];
-        let head = head_as_u32(k);
-        match self
-            .slots()
-            .binary_search_by(|s| match s.head_as_u32().cmp(&head) {
-                Ordering::Less => Ordering::Less,
-                Ordering::Greater => Ordering::Greater,
-                Ordering::Equal => {
-                    let l = k.len().min(s.len as usize);
-                    if l <= KEY_HEAD_LEN {
-                        (s.len as usize).cmp(&k.len())
-                    } else {
-                        let sk = self.k(s);
-                        sk.cmp(k)
-                    }
+        let head = head_int(k);
+        match self.slots().binary_search_by(|s| match s.head.cmp(&head) {
+            Ordering::Less => Ordering::Less,
+            Ordering::Greater => Ordering::Greater,
+            Ordering::Equal => {
+                let l = k.len().min(s.len as usize);
+                if l <= KEY_HEAD_LEN {
+                    (s.len as usize).cmp(&k.len())
+                } else {
+                    let sk = self.long_key_suffix(s);
+                    sk.cmp(k)
                 }
-            }) {
+            }
+        }) {
             Ok(idx) => SearchKey::Equal(idx),
             Err(idx) => {
                 if idx == 0 {
@@ -992,7 +989,11 @@ impl BTreeNode {
         res.clear();
         res.reserve(len);
         res.extend_from_slice(self.common_prefix());
-        res.extend_from_slice(self.k(slot));
+        if slot.len as usize <= KEY_HEAD_LEN {
+            res.extend_from_slice(&slot.head_bytes()[..slot.len as usize]);
+        } else {
+            res.extend_from_slice(self.long_key_suffix(slot))
+        }
     }
 
     #[inline]
@@ -1058,11 +1059,15 @@ impl BTreeNode {
         let l = s1.len.min(s2.len) as usize;
         if l <= KEY_HEAD_LEN {
             // compare head is enough
-            for (i, (a, b)) in s1.head[..l].iter().zip(&s2.head[..l]).enumerate() {
+            for (i, (a, b)) in s1.head_bytes()[..l]
+                .iter()
+                .zip(&s2.head_bytes()[..l])
+                .enumerate()
+            {
                 if a != b {
                     let mut res = KeyVec::with_capacity(self.header.prefix_len as usize + i);
                     res.extend_from_slice(self.common_prefix());
-                    res.extend_from_slice(&s1.head[..i + 1]);
+                    res.extend_from_slice(&s1.head_bytes()[..i + 1]);
                     return res;
                 }
             }
@@ -1073,7 +1078,7 @@ impl BTreeNode {
             let mut res = KeyVec::with_capacity(self.header.prefix_len as usize + diff_len);
             res.extend_from_slice(self.common_prefix());
             if diff_len <= KEY_HEAD_LEN {
-                res.extend_from_slice(&s1.head[..diff_len]);
+                res.extend_from_slice(&s1.head_bytes()[..diff_len]);
             } else {
                 let src = unsafe { self.payload(s1.offset as usize, diff_len) };
                 res.extend_from_slice(src);
@@ -1226,7 +1231,7 @@ impl BTreeNode {
         old_offset: usize,
         old_len: usize,
     ) {
-        let head = head(k);
+        let head = head_int(k);
         if old_len <= KEY_HEAD_LEN {
             // no extra payload.
             let slot = self.slot_mut(idx);
@@ -1321,18 +1326,6 @@ impl BTreeNode {
                     let k2 = self.long_key_suffix(s2);
                     k1.cmp(k2)
                 }
-            }
-        }
-    }
-
-    #[inline]
-    fn k<'a>(&'a self, slot: &'a Slot) -> &'a [u8] {
-        if slot.len as usize <= KEY_HEAD_LEN {
-            &slot.head[..slot.len as usize]
-        } else {
-            unsafe {
-                let ptr = self.body().add(slot.offset as usize);
-                std::slice::from_raw_parts(ptr, slot.len as usize)
             }
         }
     }
@@ -1512,19 +1505,14 @@ impl SpaceEstimation {
 }
 
 #[inline]
-fn head(k: &[u8]) -> KeyHead {
+fn head_int(k: &[u8]) -> KeyHeadInt {
     match k.len() {
-        0 => [0; 4],
-        1 => [k[0], 0, 0, 0],
-        2 => [k[0], k[1], 0, 0],
-        3 => [k[0], k[1], k[2], 0],
-        _ => [k[0], k[1], k[2], k[3]],
+        0 => 0,
+        1 => u32::from_be_bytes([k[0], 0, 0, 0]),
+        2 => u32::from_be_bytes([k[0], k[1], 0, 0]),
+        3 => u32::from_be_bytes([k[0], k[1], k[2], 0]),
+        _ => u32::from_be_bytes([k[0], k[1], k[2], k[3]]),
     }
-}
-
-#[inline]
-fn head_as_u32(k: &[u8]) -> u32 {
-    u32::from_be_bytes(head(k))
 }
 
 #[cfg(test)]
