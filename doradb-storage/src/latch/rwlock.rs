@@ -1,8 +1,9 @@
-use crate::latch::mutex::RawMutex;
-use event_listener::{Event, Listener};
+use event_listener::{listener, Event, Listener};
 use parking_lot::lock_api::{
-    GuardSend, RawRwLock as RawRwLockApi, RawRwLockDowngrade as RawRwLockDowngradeApi,
+    GuardSend, RawMutex as RawMutexApi, RawRwLock as RawRwLockApi,
+    RawRwLockDowngrade as RawRwLockDowngradeApi,
 };
+use parking_lot::RawMutex;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -32,38 +33,93 @@ impl RawRwLock {
     #[inline]
     pub const fn new() -> Self {
         RawRwLock {
-            mu: RawMutex::new(),
+            mu: RawMutex::INIT,
             no_readers: Event::new(),
             no_writer: Event::new(),
             state: AtomicUsize::new(0),
         }
     }
 
+    #[inline]
+    fn try_lock_shared_with_ord(&self, ord: Ordering) -> bool {
+        let mut state = self.state.load(ord);
+        loop {
+            if state & WRITER_BIT != 0 {
+                return false;
+            }
+            match self.state.compare_exchange(
+                state,
+                state + ONE_READER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(s) => state = s,
+            }
+        }
+    }
+
     /// Get a read latch in async way.
     #[inline]
     pub async fn lock_shared_async(&self) {
-        while !self.try_lock_shared() {
-            self.no_writer.listen().await;
-            self.no_writer.notify(1); // let next reader to re-check
+        if self.try_lock_shared() {
+            return;
+        }
+        // slow path: setup listener and wait for no_writer signal.
+        loop {
+            listener!(self.no_writer => listener);
+            if self.try_lock_shared_with_ord(Ordering::SeqCst) {
+                self.no_writer.notify(2); // notify other readers.
+                return;
+            }
+            listener.await;
         }
     }
 
     /// Get a write latch in async way.
     #[inline]
     pub async fn lock_exclusive_async(&self) {
-        self.mu.lock_async().await;
-        loop {
+        if self.mu.try_lock() {
             let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
             if new_state & !WRITER_BIT == 0 {
                 // no reader means lock is acquired successfully.
                 return;
             }
-            // Here we already acquired mutex.
-            // If async runtime drop the future at yield point,
-            // we need to make sure the mutex is unlocked.
-            let du = DeferUnlock(&self.mu);
-            self.no_readers.listen().await;
-            mem::forget(du);
+            // slow path: setup listener and wait for no_readers signal.
+            loop {
+                listener!(self.no_readers => listener);
+                let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
+                if new_state & !WRITER_BIT == 0 {
+                    return;
+                }
+                // Here we already acquired mutex.
+                // If async runtime drop the future at yield point,
+                // we need to make sure the mutex is unlocked.
+                let du = DeferUnlock(&self.mu);
+                listener.await;
+                mem::forget(du);
+            }
+        }
+        // Waiting for writer to quit.
+        loop {
+            listener!(self.no_writer => no_writer);
+            if self.mu.try_lock() {
+                let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
+                if new_state & !WRITER_BIT == 0 {
+                    return;
+                }
+                loop {
+                    listener!(self.no_readers => listener);
+                    let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
+                    if new_state & !WRITER_BIT == 0 {
+                        return;
+                    }
+                    let du = DeferUnlock(&self.mu);
+                    listener.await;
+                    mem::forget(du);
+                }
+            }
+            no_writer.await;
         }
     }
 }
@@ -86,28 +142,22 @@ unsafe impl RawRwLockApi for RawRwLock {
 
     #[inline]
     fn try_lock_shared(&self) -> bool {
-        let mut state = self.state.load(Ordering::Acquire);
-        loop {
-            if state & WRITER_BIT != 0 {
-                return false;
-            }
-            match self.state.compare_exchange(
-                state,
-                state + ONE_READER,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(s) => state = s,
-            }
-        }
+        self.try_lock_shared_with_ord(Ordering::Acquire)
     }
 
     #[inline]
     fn lock_shared(&self) {
-        while !self.try_lock_shared() {
-            self.no_writer.listen().wait();
-            self.no_writer.notify(1); // let next reader to re-check
+        if self.try_lock_shared() {
+            return;
+        }
+        // slow path: setup listener and wait for no_writer signal.
+        loop {
+            listener!(self.no_writer => listener);
+            if self.try_lock_shared() {
+                self.no_writer.notify(2); // notify other readers.
+                return;
+            }
+            listener.wait();
         }
     }
 
@@ -132,13 +182,20 @@ unsafe impl RawRwLockApi for RawRwLock {
     #[inline]
     fn lock_exclusive(&self) {
         self.mu.lock();
+        let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
+        if new_state & !WRITER_BIT == 0 {
+            // no reader means lock is acquired successfully.
+            return;
+        }
+        // slow path, setup listener and wait for no_readers signal.
         loop {
+            listener!(self.no_readers => listener);
             let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
             if new_state & !WRITER_BIT == 0 {
                 // no reader means lock is acquired successfully.
                 return;
             }
-            self.no_readers.listen().wait();
+            listener.wait();
         }
     }
 
@@ -183,8 +240,48 @@ unsafe impl RawRwLockDowngradeApi for RawRwLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::lock_api::RawRwLock as RawRwLockApi;
+    use parking_lot::RawRwLock as ParkingLotRawRwLock;
     use std::cell::UnsafeCell;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_raw_rwlock_ops() {
+        smol::block_on(async {
+            let rw = Arc::new(RawRwLock::new());
+            rw.lock_exclusive();
+            assert!(rw.is_locked());
+            assert!(rw.is_locked_exclusive());
+            assert!(!rw.try_lock_shared());
+            assert!(!rw.try_lock_exclusive());
+            {
+                let rw = Arc::clone(&rw);
+                smol::spawn(async move {
+                    rw.lock_exclusive_async().await;
+                    unsafe {
+                        rw.unlock_exclusive();
+                    }
+                })
+                .detach();
+            }
+            {
+                let rw = Arc::clone(&rw);
+                smol::spawn(async move {
+                    rw.lock_shared_async().await;
+                    unsafe {
+                        rw.unlock_shared();
+                    }
+                })
+                .detach();
+            }
+            smol::Timer::after(Duration::from_millis(100)).await;
+            unsafe {
+                rw.unlock_exclusive();
+            }
+            smol::Timer::after(Duration::from_millis(100)).await;
+        })
+    }
 
     #[test]
     fn test_raw_rwlock_sync() {
@@ -229,11 +326,58 @@ mod tests {
         assert!(counter.val() == 100);
     }
 
+    #[test]
+    fn test_raw_rwlock_single_thread() {
+        const COUNT: usize = 10_000_000;
+        smol::block_on(async {
+            let counter = Counter::new();
+            let start = Instant::now();
+            for _ in 0..COUNT {
+                counter.inc();
+            }
+            let dur1 = start.elapsed();
+            println!(
+                "sync inc, dur={:?}, tps={}",
+                dur1,
+                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
+            );
+        });
+
+        smol::block_on(async {
+            let counter = Counter::new();
+            let start = Instant::now();
+            for _ in 0..COUNT {
+                counter.inc_async().await;
+            }
+            let dur1 = start.elapsed();
+            println!(
+                "async inc, dur={:?}, tps={}",
+                dur1,
+                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
+            );
+        });
+
+        smol::block_on(async {
+            let counter = ParkingLotCounter::new();
+            let start = Instant::now();
+            for _ in 0..COUNT {
+                counter.inc();
+            }
+            let dur1 = start.elapsed();
+            println!(
+                "parking_lot inc, dur={:?}, tps={}",
+                dur1,
+                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
+            );
+        });
+    }
+
     struct Counter {
         data: UnsafeCell<usize>,
         mu: RawRwLock,
     }
     impl Counter {
+        #[inline]
         fn new() -> Self {
             Counter {
                 data: UnsafeCell::new(0),
@@ -241,6 +385,7 @@ mod tests {
             }
         }
 
+        #[inline]
         fn inc(&self) {
             unsafe {
                 self.mu.lock_exclusive();
@@ -249,6 +394,7 @@ mod tests {
             }
         }
 
+        #[inline]
         async fn inc_async(&self) {
             unsafe {
                 self.mu.lock_exclusive_async().await;
@@ -257,10 +403,34 @@ mod tests {
             }
         }
 
+        #[inline]
         fn val(&self) -> usize {
             unsafe { *self.data.get() }
         }
     }
     unsafe impl Send for Counter {}
     unsafe impl Sync for Counter {}
+
+    struct ParkingLotCounter {
+        data: UnsafeCell<usize>,
+        mu: ParkingLotRawRwLock,
+    }
+    impl ParkingLotCounter {
+        #[inline]
+        fn new() -> Self {
+            ParkingLotCounter {
+                data: UnsafeCell::new(0),
+                mu: ParkingLotRawRwLock::INIT,
+            }
+        }
+
+        #[inline]
+        fn inc(&self) {
+            unsafe {
+                self.mu.lock_exclusive();
+                *self.data.get() += 1;
+                self.mu.unlock_exclusive();
+            }
+        }
+    }
 }
