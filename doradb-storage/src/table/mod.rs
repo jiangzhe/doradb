@@ -1420,8 +1420,8 @@ impl Table {
                 LockUndo::WriteConflict => {
                     return LockRowForWrite::WriteConflict;
                 }
-                LockUndo::Preparing(notify) => {
-                    if let Some(notify) = notify {
+                LockUndo::Preparing(listener) => {
+                    if let Some(listener) = listener {
                         drop(access);
 
                         // Here we do not unlock the page, because the preparation time of commit is supposed
@@ -1430,7 +1430,7 @@ impl Table {
                         // disk.
                         // Other transactions can still access this page and modify other rows.
 
-                        let _ = notify.wait_async().await; // wait for that transaction to be committed.
+                        listener.await; // wait for that transaction to be committed.
 
                         // now we get back on current page.
                         // maybe another thread modify our row before the lock acquisition,

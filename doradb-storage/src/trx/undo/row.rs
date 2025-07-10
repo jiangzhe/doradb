@@ -2,11 +2,11 @@ use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
 use crate::latch::LatchFallbackMode;
-use crate::notify::Notify;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
 use crate::table::TableID;
 use crate::trx::{trx_is_committed, SharedTrxStatus, TrxID, MIN_SNAPSHOT_TS};
+use event_listener::EventListener;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -553,9 +553,9 @@ impl RowUndoHead {
     }
 
     #[inline]
-    pub fn prepare_notify(&self) -> Option<Notify> {
+    pub fn prepare_listener(&self) -> Option<EventListener> {
         match &self.next.main.status {
-            UndoStatus::Ref(status) => status.prepare_notify(),
+            UndoStatus::Ref(status) => status.prepare_listener(),
             _ => None,
         }
     }

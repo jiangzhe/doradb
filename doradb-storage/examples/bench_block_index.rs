@@ -159,7 +159,7 @@ fn bench_btreemap(args: Args) {
 
 async fn worker(args: Args, blk_idx: &'static BlockIndex, stop: Arc<AtomicBool>) -> (usize, u64) {
     let max_row_id = (args.pages * args.rows_per_page) as u64;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     // rng.next_u64() as usize % max_row_id;
     let mut count = 0usize;
     let mut sum_page_id = 0u64;
@@ -187,7 +187,7 @@ fn worker_btreemap(
     stop: Arc<AtomicBool>,
 ) -> (usize, u64) {
     let max_row_id = (args.pages * args.rows_per_page) as u64;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     // rng.next_u64() as usize % max_row_id;
     let mut count = 0usize;
     let mut sum_page_id = 0u64;

@@ -1,5 +1,6 @@
 mod block_index;
 mod btree;
+mod btree_hint;
 mod btree_node;
 mod secondary_index;
 mod smart_key;

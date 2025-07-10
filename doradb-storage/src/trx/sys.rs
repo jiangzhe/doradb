@@ -320,10 +320,10 @@ impl Drop for TransactionSystem {
         for partition in log_partitions {
             // notify sync thread to quit.
             {
-                let mut group_commit_g = partition.group_commit.0.lock();
+                let mut group_commit_g = partition.group_commit.lock();
                 group_commit_g.queue.push_back(Commit::Shutdown);
                 if group_commit_g.queue.len() == 1 {
-                    partition.group_commit.1.notify(1); // notify sync thread to quit.
+                    partition.group_commit.notify_one(); // notify sync thread to quit.
                 }
             }
             // notify gc thread to quit.
@@ -346,7 +346,7 @@ impl Drop for TransactionSystem {
         }
         // finally close log files
         for partition in log_partitions {
-            let mut group_commit_g = partition.group_commit.0.lock();
+            let mut group_commit_g = partition.group_commit.lock();
             let log_file = group_commit_g.log_file.take().unwrap();
             partition.aio_mgr.drop_sparse_file(log_file);
         }

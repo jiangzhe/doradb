@@ -444,8 +444,9 @@ fn test_mvcc_multi_update() {
 #[test]
 fn test_evict_pool_insert_full() {
     smol::block_on(async {
-        const SIZE: i32 = 1000;
+        const SIZE: i32 = 800;
 
+        // in-mem ~1000 pages, on-disk 2000 pages.
         let sys = TestSys::new_evictable().await;
         {
             let session = sys.new_session();
@@ -453,6 +454,9 @@ fn test_evict_pool_insert_full() {
             let mut trx = session.begin_trx();
             for i in 0..SIZE {
                 // make string 1KB long, so a page can only hold about 60 rows.
+                // if page is full, 17 pages are required.
+                // if page is half full, 35 pages are required.
+                println!("debug-only insert {}", i);
                 let s: String = (0..1000).map(|_| 'a').collect();
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
@@ -509,8 +513,8 @@ impl TestSys {
         let engine = EngineConfig::default()
             .data_buffer(
                 EvictableBufferPoolConfig::default()
-                    .max_mem_size(1024u64 * 1024)
-                    .max_file_size(1024u64 * 1024 * 32)
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024)
                     .file_path("databuffer_testsys.bin"),
             )
             .trx(

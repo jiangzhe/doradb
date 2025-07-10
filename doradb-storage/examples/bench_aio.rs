@@ -49,7 +49,7 @@ fn worker(id: usize, aio_mgr: &'static AIOManager, args: Args, stop: Arc<AtomicB
 
     let log_io_depth = args.io_depth / args.log_partitions;
 
-    let mut thd_rng = rand::thread_rng();
+    let mut thd_rng = rand::rng();
 
     let mut id = 0;
     let mut inflight = HashMap::new();

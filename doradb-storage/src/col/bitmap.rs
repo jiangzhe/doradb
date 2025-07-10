@@ -1284,20 +1284,20 @@ mod tests {
     // generate random bitmaps and test shift operations
     #[test]
     fn test_bitmap_rand_shift() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bm = Bitmap::with_capacity(1024);
         let mut bools: Vec<bool> = Vec::new();
         for _ in 0..256 {
             bm.clear();
             bools.clear();
-            let size: usize = rng.gen_range(128..1024 * 10);
+            let size: usize = rng.random_range(128..1024 * 10);
             for _ in 0..size {
-                bools.push(rng.gen());
+                bools.push(rng.random());
             }
             for b in &bools {
                 bm.add(*b);
             }
-            let bits = rng.gen_range(0..size - 127);
+            let bits = rng.random_range(0..size - 127);
             bm.shift(bits);
             let shifted: Vec<_> = bm.bools().collect();
             let expected: Vec<_> = bools.iter().skip(bits).cloned().collect();
@@ -1321,17 +1321,17 @@ mod tests {
     // generate random bitmaps and test shift operations
     #[test]
     fn test_bitmap_rand_extend() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..1024 {
-            let size1: usize = rng.gen_range(0..256);
+            let size1: usize = rng.random_range(0..256);
             let mut bools1 = Vec::with_capacity(size1);
-            let size2: usize = rng.gen_range(0..256);
+            let size2: usize = rng.random_range(0..256);
             let mut bools2 = Vec::with_capacity(size2);
             for _ in 0..size1 {
-                bools1.push(rng.gen());
+                bools1.push(rng.random());
             }
             for _ in 0..size2 {
-                bools2.push(rng.gen());
+                bools2.push(rng.random());
             }
             let expected: Vec<_> = bools1.iter().chain(bools2.iter()).cloned().collect();
             let mut bm1 = Bitmap::with_capacity(1024);
@@ -1481,7 +1481,7 @@ mod tests {
             rand_bitmap_count(i)
         }
         for _ in 0..256 {
-            rand_bitmap_count(rand::thread_rng().gen_range(0..4096))
+            rand_bitmap_count(rand::rng().gen_range(0..4096))
         }
         let bools1: Vec<bool> = vec![];
         let bm1 = Bitmap::from_iter(bools1);
@@ -1628,12 +1628,12 @@ mod tests {
 
     #[test]
     fn test_bitmap_rand_range_iter() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..128 {
-            let size: usize = rng.gen_range(128..4096);
+            let size: usize = rng.random_range(128..4096);
             let mut bools: Vec<bool> = Vec::with_capacity(size);
             for _ in 0..size {
-                bools.push(rng.gen());
+                bools.push(rng.random());
             }
             let bm = Bitmap::from_iter(bools.clone());
             let mut base = 0;
@@ -1736,10 +1736,10 @@ mod tests {
     }
 
     fn rand_bitmap_count(n: usize) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bools1: Vec<bool> = Vec::with_capacity(n);
         for _ in 0..n {
-            bools1.push(rng.gen());
+            bools1.push(rng.random());
         }
         let expected_true: usize = bools1.iter().map(|b| if *b { 1 } else { 0 }).sum();
         let expected_false: usize = bools1.iter().map(|b| if *b { 0 } else { 1 }).sum();
@@ -1752,14 +1752,14 @@ mod tests {
     }
 
     fn rand_bitmap_extend(n1: usize, n2: usize) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bools1: Vec<bool> = Vec::with_capacity(n1);
         for _ in 0..n1 {
-            bools1.push(rng.gen());
+            bools1.push(rng.random());
         }
         let mut bools2: Vec<bool> = Vec::with_capacity(n2);
         for _ in 0..n2 {
-            bools2.push(rng.gen());
+            bools2.push(rng.random());
         }
         let expected: Vec<_> = bools1.iter().chain(bools2.iter()).cloned().collect();
         let mut bm1 = Bitmap::with_capacity(64);

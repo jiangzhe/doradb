@@ -94,9 +94,9 @@ impl AllocMap {
         self.allocated.load(Ordering::Relaxed)
     }
 
-    /// Allocate a new object, returns the global index of object.
+    /// Try to allocate a new object, returns index of object.
     #[inline]
-    pub fn allocate(&self) -> Option<usize> {
+    pub fn try_allocate(&self) -> Option<usize> {
         let unit_end_idx = (self.len + 63) / 64;
         let mut g = self.inner.lock();
         let unit_start_idx = g.free_unit_idx;

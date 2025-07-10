@@ -570,8 +570,8 @@ mod tests {
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .max_mem_size(16usize * 1024 * 1024)
-                        .max_file_size(32usize * 1024 * 1024)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024)
                         .file_path("databuffer_purge.bin"),
                 )
                 .trx(
@@ -658,8 +658,8 @@ mod tests {
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .max_mem_size(16usize * 1024 * 1024)
-                        .max_file_size(32usize * 1024 * 1024)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024)
                         .file_path("databuffer_purge.bin"),
                 )
                 .trx(

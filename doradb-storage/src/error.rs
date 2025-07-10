@@ -37,6 +37,8 @@ pub enum Error {
     BufferPageAlreadyAllocated,
     #[error("empty free list of buffer pool")]
     EmptyFreeListOfBufferPool,
+    #[error("buffer pool size is too small")]
+    BufferPoolSizeTooSmall,
     // latch errors
     // #[error("retry latch")]
     // RetryLatch,
