@@ -1,12 +1,55 @@
 use crate::io::{pwrite, Buf, IocbRawPtr, SparseFile};
-use crate::notify::{Notify, Signal};
+use crate::notify::EventNotifyOnDrop;
 use crate::serde::{Ser, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::trx::log::SyncGroup;
 use crate::trx::{PrecommitTrx, TrxID};
+use event_listener::EventListener;
+use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+/// GroupCommit with mutex and condition variable.
+pub(super) struct MutexGroupCommit {
+    mu: Mutex<GroupCommit>,
+    cv: Condvar,
+}
+
+impl MutexGroupCommit {
+    /// Create a new group commit with mutex and condition variable.
+    #[inline]
+    pub fn new(group_commit: GroupCommit) -> Self {
+        MutexGroupCommit {
+            mu: Mutex::new(group_commit),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Acquire lock.
+    /// Return lock guard of group commit.
+    #[inline]
+    pub fn lock(&self) -> MutexGuard<GroupCommit> {
+        self.mu.lock()
+    }
+
+    /// Notify one waiter.
+    #[inline]
+    pub fn notify_one(&self) -> bool {
+        self.cv.notify_one()
+    }
+
+    /// Wait on conditional variable with timeout.
+    #[inline]
+    pub fn wait_for(
+        &self,
+        g: &mut MutexGuard<GroupCommit>,
+        timeout: Duration,
+    ) -> WaitTimeoutResult {
+        self.cv.wait_for(g, timeout)
+    }
+}
 
 /// GroupCommit is optimization to group multiple transactions
 /// and perform single IO to speed up overall commit performance.
@@ -37,7 +80,7 @@ pub(super) struct CommitGroup {
     pub(super) fd: RawFd,
     pub(super) offset: usize,
     pub(super) log_buf: Buf,
-    pub(super) sync_signal: Signal,
+    pub(super) sync_ev: EventNotifyOnDrop,
     pub(super) serde_ctx: SerdeCtx,
 }
 
@@ -51,7 +94,7 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn join(&mut self, mut trx: PrecommitTrx) -> (Option<Session>, Notify) {
+    pub(super) fn join(&mut self, mut trx: PrecommitTrx) -> (Option<Session>, EventListener) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
             self.log_buf.extend_ser(&redo_bin, &self.serde_ctx);
@@ -59,7 +102,7 @@ impl CommitGroup {
         self.max_cts = trx.cts;
         let session = trx.split_session();
         self.trx_list.push(trx);
-        (session, self.sync_signal.new_notify())
+        (session, self.sync_ev.listen())
     }
 
     #[inline]
@@ -73,7 +116,7 @@ impl CommitGroup {
             max_cts: self.max_cts,
             log_bytes,
             aio,
-            sync_signal: self.sync_signal,
+            sync_ev: self.sync_ev,
             finished: false,
         };
         (iocb_ptr, sync_group)

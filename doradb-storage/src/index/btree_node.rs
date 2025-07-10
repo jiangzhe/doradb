@@ -3,6 +3,7 @@
 
 use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
 use crate::index::btree::{BTreeDelete, BTreeUpdate, BTreeValue};
+use crate::index::btree_hint::{BTreeHints, BTREE_HINTS_LEN};
 use crate::row::{RowID, INVALID_ROW_ID};
 use crate::trx::TrxID;
 use smallvec::SmallVec;
@@ -38,11 +39,13 @@ const _: () = assert!(mem::size_of::<BTreeNode>() == PAGE_SIZE);
 /// ├──────────────────────┤
 /// │ initialized(1)       │
 /// ├──────────────────────┤
-/// │ padding(1)           │
+/// │ hints_enabled(1)     │
 /// ├──────────────────────┤
 /// │ prefix_len(2)        │
 /// ├──────────────────────┤
 /// │ inline prefix(16)    │
+/// ├──────────────────────┤
+/// │ hints(32)            │
 /// └──────────────────────┘
 ///                          
 /// Lower fence is not located in header but the first slot at beginning of
@@ -89,14 +92,18 @@ pub struct BTreeHeader {
     effective_space: u32,
     /// Whether this node is initialized. This flag is used for SMO validity check.
     initialized: bool,
-    /// Padding for memory layout.
-    _padding: [u8; 1],
+    /// Whether to enable hints.
+    hints_enabled: bool,
     /// Common prefix length of all values in this node.
     prefix_len: u16,
     /// Inline prefix data.
     /// If prefix is less than 16 bytes, it will be stored here instead of end of page.
     inline_prefix: [u8; INLINE_PREFIX_LEN],
+    /// Search hints of this node.
+    hints: BTreeHints,
 }
+
+const BTREE_HINTS_MIN_KEYS: usize = BTREE_HINTS_LEN * 8;
 
 const INLINE_PREFIX_LEN: usize = 16;
 
@@ -221,6 +228,7 @@ impl BTreeNode {
         lower_fence: &[u8],
         lower_fence_value: PageID,
         upper_fence: &[u8],
+        hints_enabled: bool,
     ) {
         self.header.height = height;
         self.header.count = 0;
@@ -251,6 +259,7 @@ impl BTreeNode {
             // for upper fence, we do not store any value for it.
             self.header.upper_fence = self.new_slot_without_value(upper_fence);
         }
+        self.header.hints_enabled = hints_enabled;
 
         // 4. Mark as initialized.
         self.header.initialized = true;
@@ -340,16 +349,12 @@ impl BTreeNode {
     /// Insert a new key value pair to current node.
     /// Returns inserted slot number.
     #[inline]
-    pub(super) fn insert<V: BTreeValue>(&mut self, key: &[u8], value: V) -> usize {
+    pub fn insert<V: BTreeValue>(&mut self, key: &[u8], value: V) -> usize {
         debug_assert!(self.can_insert(key));
         let slot_idx = match self.search_key(key) {
-            SearchKey::GreaterThan(idx) => {
-                // insert at next position.
-                idx + 1
-            }
-            SearchKey::LowerFence => 0,
-            SearchKey::Equal(..) => {
-                // duplicate key found.
+            Err(idx) => idx,
+            Ok(_) => {
+                // Duplicate key found.
                 panic!("BTreeNode does not support duplicate key");
             }
         };
@@ -357,7 +362,18 @@ impl BTreeNode {
         unsafe {
             self.insert_slot_at(slot_idx, slot);
         }
+        // debug_assert!(self.head_in_order());
         slot_idx
+    }
+
+    /// Helper method to check if all heads are in order.
+    #[allow(unused)]
+    #[inline]
+    fn head_in_order(&self) -> bool {
+        self.slots()
+            .iter()
+            .zip(self.slots().iter().skip(1))
+            .all(|(s1, s2)| s1.head <= s2.head)
     }
 
     #[inline]
@@ -367,20 +383,22 @@ impl BTreeNode {
         unsafe {
             self.insert_slot_at(idx, slot);
         }
+        // debug_assert!(self.head_in_order());
     }
 
     /// Delete an existing key value pair in current node.
     /// If key or value does not match, returns false.
     #[inline]
     pub fn delete<V: BTreeValue>(&mut self, key: &[u8], value: V) -> BTreeDelete {
-        let idx = match self.search_value::<V>(key) {
-            SearchValue::Equal(idx, v) | SearchValue::EqualDeleted(idx, v) => {
-                if v != value {
+        let idx = match self.search_key(key) {
+            Ok(idx) => {
+                let old_v = self.value::<V>(idx);
+                if old_v.value() != value {
                     return BTreeDelete::ValueMismatch;
                 }
                 idx
             }
-            _ => return BTreeDelete::NotFound,
+            Err(_) => return BTreeDelete::NotFound,
         };
         self.delete_at(idx, mem::size_of::<V>());
         BTreeDelete::Ok
@@ -390,14 +408,15 @@ impl BTreeNode {
     /// If key or value does not match, returns false.
     #[inline]
     pub fn mark_as_deleted<V: BTreeValue>(&mut self, key: &[u8], value: V) -> BTreeUpdate<V> {
-        let idx = match self.search_value::<V>(key) {
-            SearchValue::Equal(idx, v) | SearchValue::EqualDeleted(idx, v) => {
-                if v != value {
-                    return BTreeUpdate::ValueMismatch(v);
+        let idx = match self.search_key(key) {
+            Ok(idx) => {
+                let old_v = self.value::<V>(idx);
+                if old_v.value() != value {
+                    return BTreeUpdate::ValueMismatch(old_v);
                 }
                 idx
             }
-            _ => return BTreeUpdate::NotFound,
+            Err(_) => return BTreeUpdate::NotFound,
         };
         let old_value = self.update_value(idx, value.deleted());
         BTreeUpdate::Ok(old_value)
@@ -416,14 +435,15 @@ impl BTreeNode {
         old_value: V,
         new_value: V,
     ) -> BTreeUpdate<V> {
-        let idx = match self.search_value::<V>(key) {
-            SearchValue::Equal(idx, v) | SearchValue::EqualDeleted(idx, v) => {
-                if old_value.value() != v {
-                    return BTreeUpdate::ValueMismatch(v);
+        let idx = match self.search_key(key) {
+            Ok(idx) => {
+                let old_v = self.value::<V>(idx);
+                if old_v.value() != old_value {
+                    return BTreeUpdate::ValueMismatch(old_v);
                 }
                 idx
             }
-            _ => return BTreeUpdate::NotFound,
+            Err(_) => return BTreeUpdate::NotFound,
         };
         let old_value = self.update_value(idx, new_value);
         BTreeUpdate::Ok(old_value)
@@ -442,6 +462,7 @@ impl BTreeNode {
             &lower_fence_key,
             self.lower_fence_value(),
             &upper_fence_key,
+            self.header.hints_enabled,
         );
         dst.extend_slots_from::<V>(self, 0, self.count());
         debug_assert!(self.free_space_after_compaction() == dst.free_space());
@@ -492,7 +513,7 @@ impl BTreeNode {
 
     /// Insert key value to the end of node.
     #[inline]
-    pub fn insert_at_end<V: BTreeValue>(&mut self, key: &[u8], value: V) {
+    fn insert_at_end<V: BTreeValue>(&mut self, key: &[u8], value: V) {
         debug_assert!(self.can_insert(key));
         debug_assert!(self.within_boundary(key));
         let slot = self.new_slot_with_value(key, value);
@@ -510,42 +531,22 @@ impl BTreeNode {
         );
     }
 
-    /// Lookup child by given key.
-    /// Returns value of the last key no more than input.
-    /// This method is used when searching key from root to path.
-    #[inline]
-    pub fn lookup_child_slow(&self, key: &[u8]) -> LookupChild {
-        match self.search_value_slow(key) {
-            SearchValue::GreaterThan(idx) => LookupChild::Slot(idx, self.value(idx as usize)),
-            SearchValue::Equal(idx, value) => LookupChild::Slot(idx, value),
-            SearchValue::LessThanAllSlots => {
-                if self.header.lower_fence_value == PageID::INVALID_VALUE {
-                    LookupChild::NotFound
-                } else {
-                    LookupChild::LowerFence(self.header.lower_fence_value)
-                }
-            }
-            SearchValue::EqualDeleted(..)
-            | SearchValue::LessThanLowerFence
-            | SearchValue::GreaterEqualUpperFence => LookupChild::NotFound,
-        }
-    }
-
     #[inline]
     pub fn lookup_child(&self, key: &[u8]) -> LookupChild {
-        match self.search_value(key) {
-            SearchValue::GreaterThan(idx) => LookupChild::Slot(idx, self.value(idx as usize)),
-            SearchValue::Equal(idx, value) => LookupChild::Slot(idx, value),
-            SearchValue::LessThanAllSlots => {
-                if self.header.lower_fence_value == PageID::INVALID_VALUE {
-                    LookupChild::NotFound
-                } else {
-                    LookupChild::LowerFence(self.header.lower_fence_value)
+        debug_assert!(!self.is_leaf());
+        match self.search_key(key) {
+            Ok(idx) => LookupChild::Slot(idx, self.value(idx)),
+            Err(idx) => {
+                if idx == 0 {
+                    // key less than first key.
+                    return if self.header.lower_fence_value.is_deleted() {
+                        LookupChild::NotFound
+                    } else {
+                        LookupChild::LowerFence(self.header.lower_fence_value)
+                    };
                 }
+                LookupChild::Slot(idx - 1, self.value(idx - 1))
             }
-            SearchValue::EqualDeleted(..)
-            | SearchValue::LessThanLowerFence
-            | SearchValue::GreaterEqualUpperFence => LookupChild::NotFound,
         }
     }
 
@@ -553,7 +554,7 @@ impl BTreeNode {
     /// If hit on lower fence, -1 will be returned.
     #[inline]
     pub fn lookup_child_idx(&self, key: &[u8]) -> Option<isize> {
-        match self.lookup_child_slow(key) {
+        match self.lookup_child(key) {
             LookupChild::Slot(idx, _) => Some(idx as isize),
             LookupChild::LowerFence(_) => Some(-1),
             LookupChild::NotFound => None,
@@ -716,6 +717,13 @@ impl BTreeNode {
         unsafe { std::slice::from_raw_parts(self.body() as *const Slot, len) }
     }
 
+    #[inline]
+    pub(super) fn slots_and_hints(&mut self) -> (&[Slot], &mut BTreeHints) {
+        let len = self.header.count as usize;
+        let slots = unsafe { std::slice::from_raw_parts(self.body() as *const Slot, len) };
+        (slots, &mut self.header.hints)
+    }
+
     /// Returns reference to slot at given position.
     #[inline]
     fn slot(&self, idx: usize) -> &Slot {
@@ -791,89 +799,6 @@ impl BTreeNode {
         self.header.effective_space += l as u32;
     }
 
-    /// Search given key in current node.
-    #[inline]
-    pub fn search_value_slow<V: BTreeValue>(&self, key: &[u8]) -> SearchValue<V> {
-        let prefix_len = self.header.prefix_len as usize;
-        if prefix_len == 0 {
-            return self.search_value_without_prefix(key);
-        }
-        // Key is shorter than prefix, compare and return.
-        if key.len() < prefix_len {
-            let l = key.len().min(prefix_len);
-            let prefix = self.common_prefix();
-            return match key[..l].cmp(&prefix[..l]) {
-                Ordering::Greater => {
-                    if self.has_no_upper_fence() {
-                        SearchValue::GreaterThan(self.header.count as usize - 1)
-                    } else {
-                        SearchValue::GreaterEqualUpperFence
-                    }
-                }
-                Ordering::Less | Ordering::Equal => SearchValue::LessThanLowerFence,
-            };
-        }
-        // Check if prefix matches.
-        return match key[..prefix_len].cmp(self.common_prefix()) {
-            Ordering::Greater => {
-                if self.has_no_upper_fence() {
-                    SearchValue::GreaterThan(self.header.count as usize - 1)
-                } else {
-                    SearchValue::GreaterEqualUpperFence
-                }
-            }
-            Ordering::Less => SearchValue::LessThanLowerFence,
-            Ordering::Equal => self.search_value_without_prefix(&key[prefix_len..]),
-        };
-    }
-
-    /// This is used for B-tree which always guarantee the prefix matching
-    /// with its structure.
-    #[inline]
-    pub fn search_value<V: BTreeValue>(&self, key: &[u8]) -> SearchValue<V> {
-        debug_assert!(
-            key.len() >= self.header.prefix_len as usize
-                && &key[..self.header.prefix_len as usize] == self.common_prefix()
-        );
-        self.search_value_without_prefix::<V>(&key[self.header.prefix_len as usize..])
-    }
-
-    /// Search without prefix. The prefix of input key should be trimed.
-    #[inline]
-    fn search_value_without_prefix<V: BTreeValue>(&self, k: &[u8]) -> SearchValue<V> {
-        let head = head_int(k);
-        match self.slots().binary_search_by(|s| match s.head.cmp(&head) {
-            Ordering::Less => Ordering::Less,
-            Ordering::Greater => Ordering::Greater,
-            Ordering::Equal => {
-                let l = k.len().min(s.len as usize);
-                if l <= KEY_HEAD_LEN {
-                    (s.len as usize).cmp(&k.len())
-                } else {
-                    let sk = self.long_key_suffix(s);
-                    sk.cmp(k)
-                }
-            }
-        }) {
-            Ok(idx) => {
-                let value = self.value::<V>(idx);
-                if value.is_deleted() {
-                    SearchValue::EqualDeleted(idx, value.value())
-                } else {
-                    SearchValue::Equal(idx, value)
-                }
-            }
-            Err(idx) => {
-                if idx == 0 {
-                    // input key is less than the first slot key.
-                    SearchValue::LessThanAllSlots
-                } else {
-                    SearchValue::GreaterThan(idx - 1)
-                }
-            }
-        }
-    }
-
     #[inline]
     pub fn search_key(&self, key: &[u8]) -> SearchKey {
         debug_assert!(
@@ -882,7 +807,15 @@ impl BTreeNode {
         );
         let k = &key[self.header.prefix_len as usize..];
         let head = head_int(k);
-        match self.slots().binary_search_by(|s| match s.head.cmp(&head) {
+        if self.hints_enabled() {
+            return self.search_key_with_hints(k, head);
+        }
+        self.search_slot(self.slots(), k, head)
+    }
+
+    #[inline]
+    fn search_slot(&self, slots: &[Slot], k: &[u8], head: KeyHeadInt) -> SearchKey {
+        slots.binary_search_by(|s| match s.head.cmp(&head) {
             Ordering::Less => Ordering::Less,
             Ordering::Greater => Ordering::Greater,
             Ordering::Equal => {
@@ -894,16 +827,64 @@ impl BTreeNode {
                     sk.cmp(k)
                 }
             }
-        }) {
-            Ok(idx) => SearchKey::Equal(idx),
-            Err(idx) => {
-                if idx == 0 {
-                    // input key is less than the first slot key.
-                    SearchKey::LowerFence
-                } else {
-                    SearchKey::GreaterThan(idx - 1)
-                }
-            }
+        })
+    }
+
+    #[inline]
+    fn hints_enabled(&self) -> bool {
+        self.header.hints_enabled && self.header.count as usize >= BTREE_HINTS_MIN_KEYS
+    }
+
+    #[inline]
+    pub fn header_hints_enabled(&self) -> bool {
+        self.header.hints_enabled
+    }
+
+    #[inline]
+    pub fn update_hints(&mut self) -> bool {
+        if !self.hints_enabled() {
+            return false;
+        }
+        let window = self.count() / (BTREE_HINTS_LEN + 1);
+        let (slots, hints) = self.slots_and_hints();
+        for i in 0..BTREE_HINTS_LEN {
+            let head = slots[(i + 1) * window].head;
+            hints.update(i, head);
+        }
+        true
+    }
+
+    #[inline]
+    pub fn update_hint_if_needed(&mut self, idx: usize, key: &[u8]) {
+        if !self.hints_enabled() {
+            return;
+        }
+        if let Some(hint_idx) = self.position_in_hints(idx) {
+            let k = &key[self.header.prefix_len as usize..];
+            let head = head_int(k);
+            self.header.hints.update(hint_idx, head);
+        }
+    }
+
+    #[inline]
+    fn search_key_with_hints(&self, k: &[u8], head: KeyHeadInt) -> SearchKey {
+        debug_assert!(self.hints_enabled());
+        let count = self.header.count as usize;
+        let (lo, up) = self.header.hints.search(head);
+        let window = count / (BTREE_HINTS_LEN + 1);
+        let start = lo * window;
+        if start >= count {
+            return Err(count - 1);
+        }
+        let end = if up == BTREE_HINTS_LEN {
+            count
+        } else {
+            (up + 1) * window
+        };
+        let search_slice = &self.slots()[start..end];
+        match self.search_slot(search_slice, k, head) {
+            Ok(idx) => Ok(start + idx),
+            Err(idx) => Err(start + idx),
         }
     }
 
@@ -1224,6 +1205,15 @@ impl BTreeNode {
     }
 
     #[inline]
+    fn position_in_hints(&self, idx: usize) -> Option<usize> {
+        let window = self.count() / (BTREE_HINTS_LEN + 1);
+        if idx != 0 && idx % window == 0 {
+            return Some(idx / window);
+        }
+        None
+    }
+
+    #[inline]
     fn update_key_in_place<V: BTreeValue>(
         &mut self,
         idx: usize,
@@ -1331,30 +1321,7 @@ impl BTreeNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SearchValue<V: BTreeValue> {
-    /// Less than lower fence.
-    LessThanLowerFence,
-    /// Less than all values.
-    LessThanAllSlots,
-    /// Exactly match at given position.
-    Equal(usize, V),
-    /// Special case of existing entry.
-    /// The value is marked as deleted.
-    EqualDeleted(usize, V),
-    /// Not found.
-    /// Greater than key at given position but less than following one.
-    GreaterThan(usize),
-    /// Greater than or equal to upper fence.
-    GreaterEqualUpperFence,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SearchKey {
-    LowerFence,
-    Equal(usize),
-    GreaterThan(usize),
-}
+pub type SearchKey = std::result::Result<usize, usize>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookupChild {
@@ -1520,6 +1487,8 @@ mod tests {
     use super::*;
     use crate::buffer::{BufferPool, FixedBufferPool};
     use crate::lifetime::StaticLifetime;
+    use rand_distr::{Distribution, Uniform};
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_btree_node_insert() {
@@ -1529,7 +1498,7 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[]);
+                node.init(0, 0, &[], !0, &[], false);
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
                     let slot_idx = node.insert(&k, i);
@@ -1538,12 +1507,12 @@ mod tests {
 
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
-                    let res = node.search_value_slow::<u64>(&k);
-                    assert_eq!(res, SearchValue::Equal(i as usize, i));
+                    let res = node.search_key(&k);
+                    assert_eq!(res, Ok(i as usize));
                 }
 
-                let res = node.search_value_slow::<u64>(&11u64.to_be_bytes());
-                assert_eq!(res, SearchValue::GreaterThan(9));
+                let res = node.search_key(&11u64.to_be_bytes());
+                assert_eq!(res, Err(10));
             }
 
             unsafe {
@@ -1560,7 +1529,7 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[]);
+                node.init(0, 0, &[], !0, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
@@ -1570,10 +1539,7 @@ mod tests {
 
                 // Test normal delete
                 assert_eq!(node.delete(&5u64.to_be_bytes(), 5), BTreeDelete::Ok);
-                assert_eq!(
-                    node.search_value_slow::<u64>(&5u64.to_be_bytes()),
-                    SearchValue::GreaterThan(4)
-                );
+                assert_eq!(node.search_key(&5u64.to_be_bytes()), Err(5));
 
                 // Test delete non-existent key
                 assert_eq!(node.delete(&15u64.to_be_bytes(), 15), BTreeDelete::NotFound);
@@ -1599,7 +1565,7 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[]);
+                node.init(0, 0, &[], !0, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
@@ -1612,8 +1578,11 @@ mod tests {
                     node.mark_as_deleted(&3u64.to_be_bytes(), 3),
                     BTreeUpdate::Ok(3)
                 );
-                match node.search_value_slow::<u64>(&3u64.to_be_bytes()) {
-                    SearchValue::EqualDeleted(_, v) => assert_eq!(v, 3),
+                match node.search_key(&3u64.to_be_bytes()) {
+                    Ok(idx) => {
+                        let old_v = node.value::<u64>(idx);
+                        assert_eq!(old_v.value(), 3);
+                    }
                     _ => panic!("Expected EqualDeleted"),
                 };
 
@@ -1650,7 +1619,7 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[]);
+                node.init(0, 0, &[], !0, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
@@ -1660,10 +1629,7 @@ mod tests {
 
                 // Test normal update
                 assert_eq!(node.update(&5u64.to_be_bytes(), 5, 50), BTreeUpdate::Ok(5));
-                assert_eq!(
-                    node.search_value_slow::<u64>(&5u64.to_be_bytes()),
-                    SearchValue::Equal(5, 50)
-                );
+                assert_eq!(node.search_key(&5u64.to_be_bytes()), Ok(5));
 
                 // Test update deleted entry
                 node.mark_as_deleted(&6u64.to_be_bytes(), 6);
@@ -1671,10 +1637,7 @@ mod tests {
                     node.update(&6u64.to_be_bytes(), 6, 60),
                     BTreeUpdate::Ok(6.deleted())
                 );
-                assert_eq!(
-                    node.search_value_slow::<u64>(&6u64.to_be_bytes()),
-                    SearchValue::Equal(6, 60)
-                );
+                assert_eq!(node.search_key(&6u64.to_be_bytes()), Ok(6));
 
                 // Test update non-existent key
                 assert_eq!(
@@ -1704,7 +1667,7 @@ mod tests {
                 // Create source leaf node with data
                 let mut src_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let src_node = src_guard.page_mut();
-                src_node.init(0, 1, &[], !0, &[]);
+                src_node.init(0, 1, &[], !0, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
@@ -1752,7 +1715,7 @@ mod tests {
                 // Create empty source node
                 let mut src_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let src_node = src_guard.page_mut();
-                src_node.init(0, 3, &[], !0, &[]);
+                src_node.init(0, 3, &[], !0, &[], false);
 
                 // Create empty destination node
                 let mut dst_guard = buf_pool.allocate_page::<BTreeNode>().await;
@@ -1797,7 +1760,7 @@ mod tests {
             {
                 let mut page1_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node1 = page1_guard.page_mut();
-                node1.init(1, 1, &[], RowID::INVALID_VALUE, &10u64.to_be_bytes());
+                node1.init(1, 1, &[], RowID::INVALID_VALUE, &10u64.to_be_bytes(), false);
 
                 // Insert test data for node 1
                 for i in 0u64..10 {
@@ -1818,6 +1781,7 @@ mod tests {
                     &10u64.to_be_bytes(),
                     RowID::INVALID_VALUE,
                     &20u64.to_be_bytes(),
+                    false,
                 );
 
                 // Insert test data for node 2
@@ -1858,7 +1822,7 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[]);
+                node.init(0, 0, &[], !0, &[], false);
 
                 // Insert test data with short keys (<= KEY_HEAD_LEN)
                 for i in 0u64..5 {
@@ -1877,8 +1841,8 @@ mod tests {
 
                 // Test 1: Update short key to another short key
                 {
-                    let idx = match node.search_value_slow::<u64>(b"k20") {
-                        SearchValue::Equal(idx, _) => idx,
+                    let idx = match node.search_key(b"k20") {
+                        Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice("k21".as_bytes());
@@ -1890,8 +1854,8 @@ mod tests {
 
                 // Test 2: Update long key to another long key (same length)
                 {
-                    let idx = match node.search_value_slow::<u64>(b"long-key-70") {
-                        SearchValue::Equal(idx, _) => idx,
+                    let idx = match node.search_key(b"long-key-70") {
+                        Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(format!("long-key-75").as_bytes());
@@ -1903,8 +1867,8 @@ mod tests {
 
                 // Test 3: Update short key to long key
                 {
-                    let idx = match node.search_value_slow::<u64>(b"k10") {
-                        SearchValue::Equal(idx, _) => idx,
+                    let idx = match node.search_key(b"k10") {
+                        Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(b"k100000000000000");
@@ -1916,8 +1880,8 @@ mod tests {
 
                 // Test 4: Update long key to short key
                 {
-                    let idx = match node.search_value_slow::<u64>(b"long-key-50") {
-                        SearchValue::Equal(idx, _) => idx,
+                    let idx = match node.search_key(b"long-key-50") {
+                        Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(b"lon");
@@ -1930,6 +1894,80 @@ mod tests {
                 // Test 5: Verify order is preserved after updates
                 for i in 1..node.count() {
                     assert!(node.cmp_slot_key(i, i - 1) == Ordering::Greater);
+                }
+            }
+
+            unsafe {
+                StaticLifetime::drop_static(buf_pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_node_enable_hints_seq() {
+        smol::block_on(async {
+            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            {
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let node = page_guard.page_mut();
+                node.init(0, 0, &[], !0, &[], true);
+                for i in 0u64..300 {
+                    let k = i.to_be_bytes();
+                    let slot_idx = node.insert(&k, i);
+                    node.update_hints();
+                    println!("inserted, slot_idx={}", slot_idx);
+                }
+
+                for i in 0u64..300 {
+                    let k = i.to_be_bytes();
+                    let res = node.search_key(&k);
+                    assert_eq!(res, Ok(i as usize));
+                }
+
+                let res = node.search_key(&300u64.to_be_bytes());
+                assert_eq!(res, Err(300));
+            }
+
+            unsafe {
+                StaticLifetime::drop_static(buf_pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_node_enable_hints_rand() {
+        use rand::prelude::SeedableRng;
+        use rand_chacha::ChaCha8Rng;
+        const COUNT: usize = 100;
+        smol::block_on(async {
+            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            {
+                let mut rng = ChaCha8Rng::seed_from_u64(0u64);
+                let uniform = Uniform::new(0u64, 1u64 << 63).unwrap();
+                let mut map = BTreeMap::new();
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let node = page_guard.page_mut();
+                node.init(0, 0, &[], !0, &[], true);
+                for _ in 0..COUNT {
+                    // let k = i.to_be_bytes();
+                    let n = uniform.sample(&mut rng);
+                    let key = n.to_be_bytes();
+                    let slot_idx = node.insert(&key, n);
+                    node.update_hints();
+                    println!("inserted, key={}, slot_idx={}", n, slot_idx);
+                    map.insert(n, n);
+                }
+
+                for (key, value) in map {
+                    let k = key.to_be_bytes();
+                    let res = node.search_key(&k);
+                    assert!(res.is_ok());
+                    let v = node.value::<u64>(res.unwrap());
+                    if v == value as u64 {
+                        println!("debug-only match");
+                    } else {
+                        panic!("debug-only mismatch");
+                    }
                 }
             }
 

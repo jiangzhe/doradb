@@ -2,7 +2,6 @@ use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::catalog::TableMetadata;
-use crate::notify::Notify;
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
 use crate::stmt::Statement;
@@ -14,6 +13,7 @@ use crate::trx::undo::{
 };
 use crate::trx::{trx_is_committed, ActiveTrx, SharedTrxStatus, TrxID};
 use crate::value::Val;
+use event_listener::EventListener;
 use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem;
@@ -610,7 +610,7 @@ impl<'a> RowWriteAccess<'a> {
                 if !undo_head.preparing() {
                     return LockUndo::WriteConflict;
                 }
-                LockUndo::Preparing(undo_head.prepare_notify())
+                LockUndo::Preparing(undo_head.prepare_listener())
             }
         }
     }
@@ -945,7 +945,7 @@ pub enum LockUndo {
     WriteConflict,
     InvalidIndex,
     // row is locked by a preparing transaction.
-    Preparing(Option<Notify>),
+    Preparing(Option<EventListener>),
 }
 
 pub enum LockRowForWrite<'a> {

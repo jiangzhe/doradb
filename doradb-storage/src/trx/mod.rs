@@ -28,13 +28,13 @@ pub mod undo;
 
 use crate::engine::Engine;
 use crate::error::Result;
-use crate::notify::{Notify, Signal};
 use crate::serde::{LenPrefixPod, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
 use crate::trx::undo::{IndexPurge, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
+use event_listener::{Event, EventListener};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::mem;
@@ -63,7 +63,7 @@ pub enum TrxStatus {
 pub struct SharedTrxStatus {
     ts: AtomicU64,
     preparing: AtomicBool,
-    prepare_signal: Mutex<Option<Signal>>,
+    prepare_ev: Mutex<Option<Event>>,
 }
 
 impl SharedTrxStatus {
@@ -73,7 +73,7 @@ impl SharedTrxStatus {
         SharedTrxStatus {
             ts: AtomicU64::new(trx_id),
             preparing: AtomicBool::new(false),
-            prepare_signal: Mutex::new(None),
+            prepare_ev: Mutex::new(None),
         }
     }
 
@@ -84,7 +84,7 @@ impl SharedTrxStatus {
         SharedTrxStatus {
             ts: AtomicU64::new(GLOBAL_VISIBLE_COMMIT_TS),
             preparing: AtomicBool::new(false),
-            prepare_signal: Mutex::new(None),
+            prepare_ev: Mutex::new(None),
         }
     }
 
@@ -106,9 +106,9 @@ impl SharedTrxStatus {
     /// To avoid partial read, other transaction read the data modified by
     /// this transaction should wait for
     #[inline]
-    pub fn prepare_notify(&self) -> Option<Notify> {
-        let g = self.prepare_signal.lock();
-        g.as_ref().map(|signal| signal.new_notify())
+    pub fn prepare_listener(&self) -> Option<EventListener> {
+        let g = self.prepare_ev.lock();
+        g.as_ref().map(|event| event.listen())
     }
 }
 
@@ -231,8 +231,8 @@ impl ActiveTrx {
 
         // change transaction status
         {
-            let mut g = self.status.prepare_signal.lock();
-            *g = Some(Signal::default());
+            let mut g = self.status.prepare_ev.lock();
+            *g = Some(Event::new());
             self.status.preparing.store(true, Ordering::SeqCst);
         }
         // use bincode to serialize redo log
@@ -452,8 +452,9 @@ pub struct PrecommitTrx {
 }
 
 impl PrecommitTrx {
-    /// Commit this transaction, the only thing to do is replace ongoing transaction ids
-    /// in undo log with cts, and this is atomic operation.
+    /// Commit this transaction.
+    /// The method should be invoked when redo logs have been persisted to disk.
+    /// It will update backfill commit timestamp and update status to committed.
     #[inline]
     pub fn commit(mut self) -> CommittedTrx {
         assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
@@ -469,9 +470,12 @@ impl PrecommitTrx {
                 // For user transaction, we need to notify readers that this transaction is committed,
                 // and readers can continue their work.
                 {
+                    // first update cts.
                     status.ts.store(self.cts, Ordering::SeqCst);
+                    // then reset preparing.
                     status.preparing.store(false, Ordering::SeqCst);
-                    let mut g = status.prepare_signal.lock();
+                    // finally, drop event to notify all waiting transactions.
+                    let mut g = status.prepare_ev.lock();
                     drop(g.take());
                 }
                 CommittedTrx {

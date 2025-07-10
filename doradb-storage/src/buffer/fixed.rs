@@ -144,7 +144,7 @@ impl BufferPool for FixedBufferPool {
     // allocate a new page with exclusive lock.
     #[inline]
     async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
-        match self.alloc_map.allocate() {
+        match self.alloc_map.try_allocate() {
             Some(page_id) => unsafe { self.allocate_internal(page_id as PageID) },
             None => {
                 panic!("buffer pool full");

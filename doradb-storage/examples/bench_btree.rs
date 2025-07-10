@@ -3,7 +3,7 @@ use clap::Parser;
 use doradb_storage::buffer::{BufferPool, FixedBufferPool};
 use doradb_storage::index::{BTree, BTreeCompactConfig};
 use doradb_storage::lifetime::StaticLifetime;
-use rand::distributions::{Distribution, Uniform};
+use rand_distr::{Distribution, Uniform};
 use std::collections::BTreeMap;
 
 use std::time::Instant;
@@ -34,7 +34,7 @@ async fn single_thread(args: &Args) {
 async fn single_thread_bench_btree(args: &Args) {
     let pool = FixedBufferPool::with_capacity_static(args.mem_size).unwrap();
     {
-        let tree = BTree::new(pool, 1).await;
+        let tree = BTree::new(pool, args.hints_enabled, 1).await;
 
         let start = Instant::now();
         match &args.mode[..] {
@@ -45,8 +45,8 @@ async fn single_thread_bench_btree(args: &Args) {
                 }
             }
             "rand" => {
-                let between = Uniform::from(0..args.total_rows);
-                let mut thd_rng = rand::thread_rng();
+                let between = Uniform::new(0, args.total_rows).unwrap();
+                let mut thd_rng = rand::rng();
                 for i in 0..args.total_rows {
                     let k = between.sample(&mut thd_rng);
                     tree.insert(&k.to_be_bytes(), i, 100).await;
@@ -59,9 +59,10 @@ async fn single_thread_bench_btree(args: &Args) {
         let qps = args.total_rows as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
         let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
         println!(
-            "btree {} insert: threads={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
+            "btree {} insert: threads={}, hints={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
             args.mode,
             args.threads,
+            args.hints_enabled,
             dur.as_millis(),
             args.total_rows,
             qps,
@@ -92,11 +93,11 @@ async fn single_thread_bench_btree(args: &Args) {
                 }
             }
             "rand" => {
-                let between = Uniform::from(0..args.total_rows);
-                let mut thd_rng = rand::thread_rng();
-                for i in 0..args.total_rows {
+                let between = Uniform::new(0, args.total_rows).unwrap();
+                let mut thd_rng = rand::rng();
+                for _ in 0..args.total_rows {
                     let k = between.sample(&mut thd_rng);
-                    tree.insert(&k.to_be_bytes(), i, 100).await;
+                    tree.lookup_optimistic::<u64>(&k.to_be_bytes()).await;
                 }
             }
             _ => panic!("unknown search mode"),
@@ -107,9 +108,10 @@ async fn single_thread_bench_btree(args: &Args) {
         let qps = args.total_rows as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
         let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / args.total_rows as f64;
         println!(
-            "btree {} lookup: threads={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
+            "btree {} lookup: threads={}, hints={}, dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
             args.mode,
             args.threads,
+            args.hints_enabled,
             dur.as_millis(),
             args.total_rows,
             qps,
@@ -135,8 +137,8 @@ async fn single_thread_bench_stdmap(args: &Args) {
             }
         }
         "rand" => {
-            let between = Uniform::from(0..args.total_rows);
-            let mut thd_rng = rand::thread_rng();
+            let between = Uniform::new(0, args.total_rows).unwrap();
+            let mut thd_rng = rand::rng();
             for i in 0..args.total_rows {
                 let k = between.sample(&mut thd_rng);
                 map.insert(k, i);
@@ -170,8 +172,8 @@ async fn single_thread_bench_stdmap(args: &Args) {
             }
         }
         "rand" => {
-            let between = Uniform::from(0..args.total_rows);
-            let mut thd_rng = rand::thread_rng();
+            let between = Uniform::new(0, args.total_rows).unwrap();
+            let mut thd_rng = rand::rng();
             for _ in 0..args.total_rows {
                 let k = between.sample(&mut thd_rng);
                 map.get(&k);
@@ -208,8 +210,8 @@ async fn single_thread_bench_bplustree(args: &Args) {
             }
         }
         "rand" => {
-            let between = Uniform::from(0..args.total_rows);
-            let mut thd_rng = rand::thread_rng();
+            let between = Uniform::new(0, args.total_rows).unwrap();
+            let mut thd_rng = rand::rng();
             for i in 0..args.total_rows {
                 let k = between.sample(&mut thd_rng);
                 tree.insert(k.to_be_bytes(), i);
@@ -243,8 +245,8 @@ async fn single_thread_bench_bplustree(args: &Args) {
             }
         }
         "rand" => {
-            let between = Uniform::from(0..args.total_rows);
-            let mut thd_rng = rand::thread_rng();
+            let between = Uniform::new(0, args.total_rows).unwrap();
+            let mut thd_rng = rand::rng();
             for _ in 0..args.total_rows {
                 let k = between.sample(&mut thd_rng);
                 tree.lookup(&k.to_be_bytes(), |value| *value);
@@ -296,6 +298,9 @@ struct Args {
 
     #[arg(long)]
     insert_only: bool,
+
+    #[arg(long)]
+    hints_enabled: bool,
 }
 
 #[inline]

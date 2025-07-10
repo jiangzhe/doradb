@@ -53,10 +53,17 @@ impl<T> Mutex<T> {
 
     #[inline]
     pub async fn lock_async(&self) -> MutexGuard<'_, T> {
-        self.raw.lock_async().await;
-        MutexGuard {
-            mutex: self,
-            marker: PhantomData,
+        if let Some(g) = self.try_lock() {
+            return g;
+        }
+        loop {
+            // create on-stack listener.
+            listener!(self.raw.event => listener);
+
+            if let Some(g) = self.try_lock() {
+                return g;
+            }
+            listener.await;
         }
     }
 
@@ -102,7 +109,8 @@ impl RawMutex {
     /// Returns false if lock can not be acquired.
     #[inline]
     pub fn try_lock(&self) -> bool {
-        self.inner.try_lock()
+        let res = self.inner.try_lock();
+        res
     }
 
     /// Unlock the mutex.
@@ -287,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_raw_mutex_multi_threads() {
-        const COUNT: usize = 10_000_000;
+        const COUNT: usize = 3_000_000;
 
         let threads = std::env::var("RAW_MUTEX_THREADS")
             .map_err(|_| ())

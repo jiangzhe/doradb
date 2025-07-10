@@ -7,9 +7,7 @@ use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
-use crate::index::btree_node::{
-    BTreeNode, KeyVec, LookupChild, SearchKey, SearchValue, SpaceEstimation,
-};
+use crate::index::btree_node::{BTreeNode, KeyVec, LookupChild, SpaceEstimation};
 use crate::index::util::ParentPosition;
 use crate::latch::LatchFallbackMode;
 use crate::trx::TrxID;
@@ -120,11 +118,11 @@ pub struct BTree {
 impl BTree {
     /// Create a new B-Tree index.
     #[inline]
-    pub async fn new(pool: &'static FixedBufferPool, ts: TrxID) -> Self {
+    pub async fn new(pool: &'static FixedBufferPool, hints_enabled: bool, ts: TrxID) -> Self {
         let mut g = pool.allocate_page::<BTreeNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
-        page.init(0, ts, &[], PageID::INVALID_VALUE, &[]);
+        page.init(0, ts, &[], PageID::INVALID_VALUE, &[], hints_enabled);
         BTree {
             root: page_id,
             height: AtomicUsize::new(0),
@@ -221,12 +219,11 @@ impl BTree {
             let (mut c_guard, p_guard) = verify_continue!(res);
             let node = c_guard.page_mut();
             let idx = match node.search_key(key) {
-                SearchKey::GreaterThan(idx) => idx + 1,
-                SearchKey::Equal(..) => {
+                Err(idx) => idx,
+                Ok(..) => {
                     // Do not allow insert even if same key is marked as deleted.
                     return BTreeInsert::DuplicateKey;
                 }
-                SearchKey::LowerFence => 0,
             };
             if !node.can_insert(key) {
                 debug_assert!(node.count() > 1);
@@ -261,7 +258,9 @@ impl BTree {
                 }
                 continue;
             }
+            // Actual insert here.
             node.insert_at(idx, key, value);
+            node.update_hints();
             node.update_ts(ts);
             return BTreeInsert::Ok;
         }
@@ -298,7 +297,12 @@ impl BTree {
             let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
             debug_assert!(g.page().is_leaf());
             let node = g.page_mut();
-            return node.delete(key, value).ok_then(|| node.update_ts(ts));
+            let res = node.delete(key, value);
+            if res.is_ok() {
+                node.update_hints();
+                node.update_ts(ts);
+            }
+            return res;
         }
     }
 
@@ -326,22 +330,18 @@ impl BTree {
     async fn try_lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Validation<BTreeLookup<V>> {
         let g = self.find_leaf::<OptimisticStrategy>(key).await;
         let leaf = unsafe { g.page_unchecked() };
-        match leaf.search_value(key) {
-            SearchValue::Equal(_, value) => {
+        match leaf.search_key(key) {
+            Ok(idx) => {
+                let value = leaf.value::<V>(idx);
                 verify!(g.validate());
+                if value.is_deleted() {
+                    return Valid(BTreeLookup::Deleted(value.value()));
+                }
                 Valid(BTreeLookup::Exists(value))
             }
-            SearchValue::EqualDeleted(_, value) => {
-                verify!(g.validate());
-                Valid(BTreeLookup::Deleted(value))
-            }
-            SearchValue::GreaterThan(_) | SearchValue::LessThanAllSlots => {
+            Err(_) => {
                 verify!(g.validate());
                 Valid(BTreeLookup::NotFound)
-            }
-            SearchValue::LessThanLowerFence | SearchValue::GreaterEqualUpperFence => {
-                verify!(g.validate());
-                Validation::Invalid
             }
         }
     }
@@ -429,44 +429,45 @@ impl BTree {
         let c_optimistic_guard = c_guard.downgrade();
         let mut p_guard = p_guard.exclusive_async().await;
         let p_node = p_guard.page();
-        match p_node.search_value_slow::<PageID>(&c_lower_fence_key) {
-            SearchValue::Equal(_, page_id) if page_id == c_page_id => {
-                // Tree structure remains the same.
-                // Check if parent is full.
-                if !p_node.can_insert(&sep_key) {
-                    let p_page_id = p_guard.page_id();
-                    if p_page_id != self.root {
-                        // Parent is full, trigger top-down split of parent node.
-                        let p_lower_fence_key = p_node.lower_fence_key();
-                        return Either::Right(BTreeSplit::full_branch(
-                            &p_lower_fence_key,
-                            p_page_id,
-                            &sep_key,
-                        ));
+        match p_node.search_key(&c_lower_fence_key) {
+            Ok(idx) => {
+                let page_id = p_node.value::<PageID>(idx);
+                if page_id == c_page_id {
+                    // Tree structure remains the same.
+                    // Check if parent is full.
+                    if !p_node.can_insert(&sep_key) {
+                        let p_page_id = p_guard.page_id();
+                        if p_page_id != self.root {
+                            // Parent is full, trigger top-down split of parent node.
+                            let p_lower_fence_key = p_node.lower_fence_key();
+                            return Either::Right(BTreeSplit::full_branch(
+                                &p_lower_fence_key,
+                                p_page_id,
+                                &sep_key,
+                            ));
+                        }
+                        // Parent is root and full, just split.
+                        self.split_root::<PageID>(p_guard.page_mut(), false, ts)
+                            .await;
+                        return Either::Right(BTreeSplit::Ok);
                     }
-                    // Parent is root and full, just split.
-                    self.split_root::<PageID>(p_guard.page_mut(), false, ts)
-                        .await;
-                    return Either::Right(BTreeSplit::Ok);
+                    // Re-lock child in exclusive mode.
+                    c_guard = c_optimistic_guard.exclusive_async().await;
+                    // Check if separator key changes
+                    let c_node = c_guard.page();
+                    let new_sep_idx = c_node.find_separator();
+                    if new_sep_idx != sep_idx {
+                        return Either::Right(BTreeSplit::Inconsistent);
+                    }
+                    let new_sep_key = c_node.create_sep_key(new_sep_idx, true);
+                    if &new_sep_key[..] != sep_key {
+                        return Either::Right(BTreeSplit::Inconsistent);
+                    }
+                    return Either::Left((p_guard, c_guard));
                 }
-                // Re-lock child in exclusive mode.
-                c_guard = c_optimistic_guard.exclusive_async().await;
-                // Check if separator key changes
-                let c_node = c_guard.page();
-                let new_sep_idx = c_node.find_separator();
-                if new_sep_idx != sep_idx {
-                    return Either::Right(BTreeSplit::Inconsistent);
-                }
-                let new_sep_key = c_node.create_sep_key(new_sep_idx, true);
-                if &new_sep_key[..] != sep_key {
-                    return Either::Right(BTreeSplit::Inconsistent);
-                }
-                Either::Left((p_guard, c_guard))
-            }
-            _ => {
-                // Tree structure changes, abort the split.
                 Either::Right(BTreeSplit::Inconsistent)
             }
+            Err(_) => Either::Right(BTreeSplit::Inconsistent),
         }
     }
 
@@ -542,6 +543,7 @@ impl BTree {
         debug_assert!(root.is_leaf() == is_leaf);
         let ts = root.ts().max(ts);
         let height = root.height() as u16;
+        let hints_enabled = root.header_hints_enabled();
         let sep_idx = root.find_separator();
         let lower_fence_key = root.lower_fence_key();
         let lower_fence_value = root.lower_fence_value();
@@ -556,16 +558,38 @@ impl BTree {
         let right_page_id = right_page.page_id();
         let right_node = right_page.page_mut();
         // Initialize and copy key values to left node.
-        left_node.init(height, ts, &lower_fence_key, lower_fence_value, &sep_key);
+        left_node.init(
+            height,
+            ts,
+            &lower_fence_key,
+            lower_fence_value,
+            &sep_key,
+            hints_enabled,
+        );
         left_node.extend_slots_from::<V>(root, 0, sep_idx);
+        left_node.update_hints();
         // Initialize and copy key values to right node.
-        right_node.init(height, ts, &sep_key, PageID::INVALID_VALUE, &[]);
+        right_node.init(
+            height,
+            ts,
+            &sep_key,
+            PageID::INVALID_VALUE,
+            &[],
+            hints_enabled,
+        );
         right_node.extend_slots_from::<V>(root, sep_idx, root.count() as usize - sep_idx);
+        right_node.update_hints();
         // Initialize temporary root node and insert separator key.
         let mut tmp_root = unsafe {
             let mut new = std::mem::MaybeUninit::<BTreeNode>::zeroed();
-            new.assume_init_mut()
-                .init(height + 1, ts, &lower_fence_key, left_page_id, &[]);
+            new.assume_init_mut().init(
+                height + 1,
+                ts,
+                &lower_fence_key,
+                left_page_id,
+                &[],
+                hints_enabled,
+            );
             new.assume_init()
         };
         let slot_idx = tmp_root.insert(&sep_key, right_page_id);
@@ -600,11 +624,12 @@ impl BTree {
                 &c_lower_fence_key,
                 c_node.lower_fence_value(),
                 sep_key,
+                c_node.header_hints_enabled(),
             );
             new.assume_init()
         };
         tmp_left.extend_slots_from::<V>(c_node, 0, sep_idx);
-
+        tmp_left.update_hints();
         // Allocate right node.
         let mut right_page = self.pool.allocate_page::<BTreeNode>().await;
         let right_page_id = right_page.page_id();
@@ -622,8 +647,10 @@ impl BTree {
             // So, right node does not need to copy lower fence value.
             PageID::INVALID_VALUE,
             &c_upper_fence_key,
+            c_node.header_hints_enabled(),
         );
         right_node.extend_slots_from::<V>(c_node, sep_idx, c_node.count() as usize - sep_idx);
+        right_node.update_hints();
         // Copy left node to current node.
         *c_node = tmp_left;
         // Insert right node into parent.
@@ -672,6 +699,7 @@ impl BTree {
                 lower_fence_key,
                 l_node.lower_fence_value(),
                 upper_fence_key,
+                l_node.header_hints_enabled(),
             );
             node.assume_init()
         };
@@ -679,8 +707,10 @@ impl BTree {
         if r_node.count() > 0 {
             tmp_l.extend_slots_from::<V>(r_node, 0, r_node.count());
         }
+        tmp_l.update_hints();
         *l_node = tmp_l;
         p_node.delete_at(p_r_idx, value_size);
+        p_node.update_hints();
         p_node.update_ts(ts);
     }
 
@@ -719,11 +749,13 @@ impl BTree {
                 lower_fence_key,
                 l_node.lower_fence_value(),
                 sep_key,
+                l_node.header_hints_enabled(),
             );
             node.assume_init()
         };
         tmp_l.extend_slots_from::<V>(l_node, 0, l_node.count());
         tmp_l.extend_slots_from::<V>(r_node, 0, count);
+        tmp_l.update_hints();
         *l_node = tmp_l;
 
         let mut tmp_r = unsafe {
@@ -739,13 +771,16 @@ impl BTree {
                 sep_key,
                 lower_fence_value,
                 &upper_fence_key,
+                r_node.header_hints_enabled(),
             );
             node.assume_init()
         };
         tmp_r.extend_slots_from::<V>(r_node, count, r_node.count() - count);
+        tmp_r.update_hints();
         *r_node = tmp_r;
 
         p_node.update_key::<PageID>(p_r_idx, sep_key);
+        p_node.update_hint_if_needed(p_r_idx, sep_key);
         p_node.update_ts(ts);
     }
 
@@ -1677,8 +1712,8 @@ pub struct SpaceStatistics {
 mod tests {
     use super::*;
     use crate::lifetime::StaticLifetime;
-    use crate::notify::Signal;
-    use rand::distributions::{Distribution, Uniform};
+    use event_listener::Event;
+    use rand_distr::{Distribution, Uniform};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1696,7 +1731,7 @@ mod tests {
         smol::block_on(async {
             let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
                 // insert 1, 2, 3.
                 let res = tree.insert(&1u64.to_be_bytes(), 1, 210).await;
                 assert!(res.is_ok());
@@ -1747,7 +1782,7 @@ mod tests {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -1820,7 +1855,7 @@ mod tests {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -1891,7 +1926,7 @@ mod tests {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -1968,18 +2003,18 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_lookup() {
+    fn test_btree_lookup_disable_hints() {
         const ROWS: usize = 500000;
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
                 let mut map = BTreeMap::new();
 
                 // number less than 10 million
-                let between = Uniform::from(0u64..10_000_000);
-                let mut rng = rand::thread_rng();
+                let between = Uniform::new(0u64, 10_000_000).unwrap();
+                let mut rng = rand::rng();
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
                     let res1 = tree.insert(&k.to_be_bytes(), i as u64, 201).await;
@@ -2009,19 +2044,66 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_lookup_enable_hints() {
+        use rand::prelude::*;
+        use rand_chacha::ChaCha8Rng;
+        use rand_distr::Distribution;
+        const ROWS: usize = 500000;
+        smol::block_on(async {
+            // 1GB buffer pool.
+            let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+            {
+                let tree = BTree::new(pool, true, 200).await;
+                let mut map = BTreeMap::new();
+
+                // number less than 10 million
+                let between = Uniform::new(0u64, 10_000_000).unwrap();
+                let mut rng = ChaCha8Rng::seed_from_u64(0u64);
+                for i in 0..ROWS {
+                    let k = between.sample(&mut rng);
+                    // println!("row k={}, i={} sampled", k, i);
+                    let res1 = tree.insert(&k.to_be_bytes(), i as u64, 201).await;
+                    let res2 = map.entry(k).or_insert_with(|| i as u64);
+                    assert!(res1.is_ok() == (*res2 == i as u64));
+                    // println!("row k={}, i={} inserted", k, i);
+                }
+                println!("tree height {}", tree.height());
+                let space_stat = tree.collect_space_statistics().await;
+                println!("tree space statistics: {:?}", space_stat);
+
+                for _ in 0..ROWS {
+                    let k = between.sample(&mut rng);
+                    let res1 = tree.lookup_optimistic::<u64>(&k.to_be_bytes()).await;
+                    let res2 = map.get(&k);
+                    if let Some(v) = res2 {
+                        assert!(res1 == BTreeLookup::Exists(*v));
+                    } else {
+                        assert!(res1 == BTreeLookup::NotFound);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
     fn test_btree_with_stdmap() {
         smol::block_on(async {
             const ROWS: u64 = 1_000_000;
             const MAX_VALUE: u64 = 10_000_000;
             let pool = FixedBufferPool::with_capacity_static(1 * 1024 * 1024 * 1024).unwrap();
             {
-                let tree = BTree::new(pool, 1).await;
+                let tree = BTree::new(pool, false, 1).await;
 
                 let start = Instant::now();
                 // insert with random distribution.
                 {
-                    let between = Uniform::from(0u64..MAX_VALUE);
-                    let mut thd_rng = rand::thread_rng();
+                    let between = Uniform::new(0u64, MAX_VALUE).unwrap();
+                    let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
                         tree.insert(&k.to_be_bytes(), i, 100).await;
@@ -2043,8 +2125,8 @@ mod tests {
 
                 // lookup with random distribution.
                 {
-                    let between = Uniform::from(0..MAX_VALUE);
-                    let mut thd_rng = rand::thread_rng();
+                    let between = Uniform::new(0, MAX_VALUE).unwrap();
+                    let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
                         tree.insert(&k.to_be_bytes(), i, 100).await;
@@ -2077,7 +2159,7 @@ mod tests {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
             {
-                let tree = Arc::new(BTree::new(pool, 200).await);
+                let tree = Arc::new(BTree::new(pool, false, 200).await);
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2087,8 +2169,8 @@ mod tests {
                     let res = tree.insert(&key, i, 201).await;
                     assert!(res.is_ok());
                 }
-                let signal = Signal::default();
-                let notify = signal.new_notify();
+                let event = Event::new();
+                let listener = event.listen();
                 {
                     let tree = Arc::clone(&tree);
                     std::thread::spawn(move || {
@@ -2101,7 +2183,7 @@ mod tests {
                             drop(c_guard);
                             let p_guard = p_guard.unwrap();
                             let shared_guard = p_guard.shared_async().await;
-                            signal.notify(1);
+                            event.notify(1);
                             smol::Timer::after(Duration::from_millis(1000)).await;
                             println!("going to drop");
                             drop(shared_guard);
@@ -2109,7 +2191,7 @@ mod tests {
                     });
                 }
                 // wait for another thread to acquire parent's shared lock.
-                notify.wait_async().await;
+                listener.await;
                 println!("tree height {}", tree.height());
                 key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
                 let res = tree.insert(&key, 90088, 202).await;
@@ -2134,7 +2216,7 @@ mod tests {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
             {
-                let tree = Arc::new(BTree::new(pool, 200).await);
+                let tree = Arc::new(BTree::new(pool, false, 200).await);
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2144,17 +2226,17 @@ mod tests {
                     let res = tree.insert(&key, i, 201).await;
                     assert!(res.is_ok());
                 }
-                let signal = Signal::default();
+                let event = Event::new();
                 let mut handles = Vec::with_capacity(10);
                 for j in 90088u64..90098 {
                     let tree = Arc::clone(&tree);
-                    let notify = signal.new_notify();
+                    let listener = event.listen();
                     let handle = std::thread::spawn(move || {
                         smol::block_on(async {
                             let mut key = vec![0u8; 1000];
                             key[..8].copy_from_slice(&j.to_be_bytes()[..]);
 
-                            notify.wait_async().await;
+                            listener.await;
 
                             let res = tree.insert(&key, 90088, 202).await;
                             assert!(res.is_ok());
@@ -2163,7 +2245,7 @@ mod tests {
                     handles.push(handle);
                 }
                 // wait for another thread to acquire parent's shared lock.
-                signal.done(usize::MAX);
+                event.notify(usize::MAX);
                 smol::Timer::after(Duration::from_millis(500)).await;
                 println!("tree height {}", tree.height());
                 let stat = tree.collect_space_statistics().await;
@@ -2183,10 +2265,10 @@ mod tests {
             // 1GB buffer pool.
             let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
                 // number less than 10 million
-                let between = Uniform::from(0u64..10_000_000);
-                let mut rng = rand::thread_rng();
+                let between = Uniform::new(0u64, 10_000_000).unwrap();
+                let mut rng = rand::rng();
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
                     let _ = tree.insert(&k.to_be_bytes(), i as u64, 201).await;
@@ -2226,7 +2308,7 @@ mod tests {
             assert!(pool.allocated() == 0);
             // height=0
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H0_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
@@ -2242,7 +2324,7 @@ mod tests {
             }
             // height=1
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H1_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
@@ -2258,7 +2340,7 @@ mod tests {
             }
             // height=2
             {
-                let tree = BTree::new(pool, 200).await;
+                let tree = BTree::new(pool, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H2_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());

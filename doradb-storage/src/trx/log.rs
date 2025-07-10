@@ -3,10 +3,11 @@ use crate::io::{
     align_to_sector_size, buf_data, buf_raw_len, io_event, AIOError, AIOManager, Buf, DirectBuf,
     FileSyncer, FreeListWithFactory, IocbRawPtr, SparseFile, AIO,
 };
-use crate::notify::{Notify, Signal};
+// use crate::latch::{Mutex, MutexGuard};
+use crate::notify::EventNotifyOnDrop;
 use crate::serde::{Deser, LenPrefixPod, Ser, SerdeCtx};
 use crate::session::{IntoSession, Session};
-use crate::trx::group::{Commit, CommitGroup, GroupCommit};
+use crate::trx::group::{Commit, CommitGroup, GroupCommit, MutexGroupCommit};
 use crate::trx::purge::{GCBucket, GC};
 use crate::trx::redo::{RedoHeader, RedoLogs};
 use crate::trx::sys::GC_BUCKETS;
@@ -14,11 +15,11 @@ use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::{CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
+use event_listener::EventListener;
 use flume::{Receiver, Sender};
-// use parking_lot::{Condvar, Mutex, MutexGuard};
-use crate::latch::{Mutex, MutexGuard};
 use glob::glob;
 use memmap2::Mmap;
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::fs::File;
@@ -101,7 +102,7 @@ impl LogPartitionInitializer {
         let (gc_chan, gc_rx) = flume::unbounded();
         Ok((
             LogPartition {
-                group_commit: CachePadded::new((Mutex::new(group_commit), Signal::default())),
+                group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
                 persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
                 stats: CachePadded::new(LogPartitionStats::default()),
                 gc_chan,
@@ -135,7 +136,7 @@ pub enum LogPartitionMode {
 
 pub(super) struct LogPartition {
     /// Group commit of this partition.
-    pub(super) group_commit: CachePadded<(Mutex<GroupCommit>, Signal)>,
+    pub(super) group_commit: CachePadded<MutexGroupCommit>,
     /// Maximum persisted CTS of this partition.
     pub(super) persisted_cts: CachePadded<AtomicU64>,
     /// Stats of transaction system.
@@ -227,7 +228,7 @@ impl LogPartition {
         &self,
         mut trx: PrecommitTrx,
         mut group_commit_g: MutexGuard<'_, GroupCommit>,
-    ) -> (Option<Session>, Notify) {
+    ) -> (Option<Session>, EventListener) {
         let cts = trx.cts;
         let serde_ctx = SerdeCtx::default();
         let redo_bin = trx.redo_bin.take().unwrap();
@@ -251,21 +252,21 @@ impl LogPartition {
             Err(_) => unreachable!(),
         };
         let session = trx.split_session();
-        let sync_signal = Signal::default();
-        let sync_notify = sync_signal.new_notify();
+        let sync_ev = EventNotifyOnDrop::new();
+        let listener = sync_ev.listen();
         let new_group = CommitGroup {
             trx_list: vec![trx],
             max_cts: cts,
             fd,
             offset,
             log_buf,
-            sync_signal,
+            sync_ev,
             serde_ctx,
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
         drop(group_commit_g);
 
-        (session, sync_notify)
+        (session, listener)
     }
 
     #[inline]
@@ -274,15 +275,14 @@ impl LogPartition {
         trx: PreparedTrx,
         global_ts: &AtomicU64,
     ) -> Result<Option<Session>> {
-        let mut group_commit_g = self.group_commit.0.lock_async().await;
+        let mut group_commit_g = self.group_commit.lock();
         let cts = global_ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
-            let (session, sync_notify) = self.create_new_group(precommit_trx, group_commit_g);
-            self.group_commit.1.notify(1); // notify sync thread to work.
-
-            let _ = sync_notify.wait_async().await; // wait for fsync
+            let (session, listener) = self.create_new_group(precommit_trx, group_commit_g);
+            self.group_commit.notify_one(); // notify sync thread to work.
+            listener.await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
@@ -295,17 +295,15 @@ impl LogPartition {
             }
         };
         if last_group.can_join(&precommit_trx) {
-            let (session, sync_notify) = last_group.join(precommit_trx);
+            let (session, listener) = last_group.join(precommit_trx);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
-
-            let _ = sync_notify.wait_async().await; // wait for fsync
+            listener.await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
-
-        let (session, sync_notify) = self.create_new_group(precommit_trx, group_commit_g);
-
-        let _ = sync_notify.wait_async().await; // wait for fsync
+        let (session, listener) = self.create_new_group(precommit_trx, group_commit_g);
+        self.group_commit.notify_one(); // notify sync thread to work.
+        listener.await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
         Ok(session)
     }
@@ -334,15 +332,7 @@ impl LogPartition {
 
     #[inline]
     fn file_processor(&self, config: &TrxSysConfig) -> FileProcessor {
-        let syncer = {
-            self.group_commit
-                .0
-                .lock()
-                .log_file
-                .as_ref()
-                .unwrap()
-                .syncer()
-        };
+        let syncer = { self.group_commit.lock().log_file.as_ref().unwrap().syncer() };
 
         FileProcessor::new(self, config, syncer)
     }
@@ -389,7 +379,7 @@ pub(super) struct SyncGroup {
     // Signal to notify transaction threads.
     // This field won't be used, until the group is dropped.
     #[allow(dead_code)]
-    pub(super) sync_signal: Signal,
+    pub(super) sync_ev: EventNotifyOnDrop,
     pub(super) finished: bool,
 }
 
@@ -542,7 +532,7 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn fetch_io_reqs_internal(&mut self) -> Option<SparseFile> {
         loop {
-            let mut group_commit_g = self.partition.group_commit.0.lock();
+            let mut group_commit_g = self.partition.group_commit.lock();
             loop {
                 match group_commit_g.queue.pop_front() {
                     None => break,
@@ -563,19 +553,21 @@ impl<'a> FileProcessor<'a> {
             if !self.io_reqs.is_empty() {
                 return None;
             }
-            let notify = self.partition.group_commit.1.new_notify();
-            drop(group_commit_g);
-            notify.wait_timeout(Duration::from_secs(1));
+            self.partition
+                .group_commit
+                .wait_for(&mut group_commit_g, Duration::from_secs(1));
         }
     }
 
     #[inline]
     fn try_fetch_io_reqs_internal(&mut self) -> Option<SparseFile> {
         // Single thread perform IO so here we only need to use sync mutex.
-        let mut group_commit_g = self.partition.group_commit.0.lock();
+        let mut group_commit_g = self.partition.group_commit.lock();
         loop {
             match group_commit_g.queue.pop_front() {
-                None => return None,
+                None => {
+                    return None;
+                }
                 Some(Commit::Shutdown) => {
                     self.shutdown = true;
                     return None;
@@ -1073,8 +1065,8 @@ mod tests {
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .max_mem_size(1024u64 * 1024)
-                        .max_file_size(1024u64 * 1024 * 32)
+                        .max_mem_size(64u64 * 1024 * 1024)
+                        .max_file_size(128u64 * 1024 * 1024)
                         .file_path("databuffer_mmap.bin"),
                 )
                 .build()
@@ -1143,8 +1135,8 @@ mod tests {
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .max_mem_size(1024u64 * 1024)
-                        .max_file_size(1024u64 * 1024 * 32)
+                        .max_mem_size(64u64 * 1024 * 1024)
+                        .max_file_size(128u64 * 1024 * 1024)
                         .file_path("databuffer_mmap.bin"),
                 )
                 .build()
