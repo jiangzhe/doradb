@@ -21,20 +21,29 @@ jobs:
     - name: Install libaio
       run: sudo apt-get install -y libaio1 libaio-dev
     - name: Checkout repository
-      uses: actions/checkout@v2
-    - name: Build
-      run: cargo build --verbose --all
-    - name: Run tests
-      run: RUSTFLAGS="-C target-cpu=native" cargo test --verbose --all --jobs 1
-    - name: Install cargo-tarpaulin
-      uses: actions-rs/install@v0.1
+      uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
       with:
-        crate: cargo-tarpaulin
-        version: latest
-        use-tool-cache: true
-    - name: Run cargo-tarpaulin
-      run: RUSTFLAGS="-C target-cpu=native" cargo tarpaulin --all-features --jobs 1 --workspace --timeout 300 --out Xml
+        toolchain: stable
+        components: llvm-tools      
+    - name: Install grcov
+      run: cargo install grcov
+    - name: Build and Test
+      env:
+        RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
+        LLVM_PROFILE_FILE: "coverage-%p-%m.profraw"
+      run: |
+        cargo build --verbose --all
+        cargo test --verbose --all --jobs 1
+    - name: Generate coverage report
+      run: |
+        grcov . --binary-path ./target/debug/ -s . -t lcov \
+          --branch --ignore-not-existing --ignore "target/" \
+          --ignore "doradb-tpch-tests" \
+          -o lcov.info
     - name: Upload to codecov.io
-      uses: codecov/codecov-action@v1.0.2
+      uses: codecov/codecov-action@v3
       with:
+        file: lcov.info
         token: ${{secrets.CODECOV_TOKEN}}
