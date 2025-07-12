@@ -3,7 +3,6 @@ mod fixed;
 pub mod frame;
 pub mod guard;
 pub mod page;
-pub mod ptr;
 mod util;
 
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};

@@ -230,10 +230,7 @@ pub trait ExprResolve<C: Catalog> {
                     .ok_or_else(|| Error::unknown_asterisk_column(q, location))?;
                 if let Some((schema_id, _)) = subquery.find_table() {
                     if schema_id != schema.id {
-                        return Err(Error::UnknownTable(format!(
-                            "{}.{}",
-                            schema_name, tbl_alias
-                        )));
+                        return Err(Error::UnknownTable(format!("{schema_name}.{tbl_alias}")));
                     }
                     // match table to simple projection, use its output list to resolve asterisk
                     let out_cols = subquery.out_cols();
@@ -246,10 +243,7 @@ pub trait ExprResolve<C: Catalog> {
                     }
                     res
                 } else {
-                    return Err(Error::UnknownTable(format!(
-                        "{}.{}",
-                        schema_name, tbl_alias
-                    )));
+                    return Err(Error::UnknownTable(format!("{schema_name}.{tbl_alias}")));
                 }
             }
             [tbl_alias] => {
@@ -561,7 +555,7 @@ pub trait ExprResolve<C: Catalog> {
         let res = match lit {
             Literal::Null => ExprKind::const_null(),
             Literal::Numeric(n) => {
-                if n.contains(|c| c == 'e' || c == 'E') {
+                if n.contains(['e', 'E']) {
                     // float64
                     let f: f64 = n.parse()?;
                     ExprKind::const_f64(f)

@@ -450,6 +450,9 @@ impl BTreeNode {
     }
 
     /// Compact source node into target node.
+    ///
+    /// # Safety
+    ///
     /// Target node must be unitialized.
     #[inline]
     pub unsafe fn compact_into<V: BTreeValue>(&self, dst: &mut BTreeNode) {
@@ -666,12 +669,12 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn body_end(&self) -> *const u8 {
-        self.body().add(mem::size_of::<BTreeBody>())
+        unsafe { self.body().add(mem::size_of::<BTreeBody>()) }
     }
 
     #[inline]
     unsafe fn body_end_mut(&mut self) -> *mut u8 {
-        self.body_mut().add(mem::size_of::<BTreeBody>())
+        unsafe { self.body_mut().add(mem::size_of::<BTreeBody>()) }
     }
 
     /// Returns mutable start pointer of body.
@@ -733,7 +736,7 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn slot_unchecked(&self, idx: usize) -> &Slot {
-        &*(self.body() as *const Slot).add(idx)
+        unsafe { &*(self.body() as *const Slot).add(idx) }
     }
 
     #[inline]
@@ -744,23 +747,25 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn slot_mut_unchecked(&mut self, idx: usize) -> &mut Slot {
-        &mut *(self.body_mut() as *mut Slot).add(idx)
+        unsafe { &mut *(self.body_mut() as *mut Slot).add(idx) }
     }
 
     /// insert slot at given position.
     /// If overwrite is set to true, the old value is overwritten.
     #[inline]
     unsafe fn insert_slot_at(&mut self, idx: usize, slot: Slot) {
-        let dst = (self.body_mut() as *mut Slot).add(idx);
-        if idx < self.header.count as usize {
-            // shift all elements starting from destination by one position.
-            let next = dst.add(1);
-            std::ptr::copy(dst, next, self.header.count as usize - idx);
+        unsafe {
+            let dst = (self.body_mut() as *mut Slot).add(idx);
+            if idx < self.header.count as usize {
+                // shift all elements starting from destination by one position.
+                let next = dst.add(1);
+                std::ptr::copy(dst, next, self.header.count as usize - idx);
+            }
+            self.header.count += 1;
+            self.header.start_offset += mem::size_of::<Slot>() as u16;
+            self.header.effective_space += mem::size_of::<Slot>() as u32;
+            *dst = slot;
         }
-        self.header.count += 1;
-        self.header.start_offset += mem::size_of::<Slot>() as u16;
-        self.header.effective_space += mem::size_of::<Slot>() as u32;
-        *dst = slot;
     }
 
     /// Returns common prefix of all values in this node.
@@ -904,7 +909,7 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn payload(&self, offset: usize, len: usize) -> &[u8] {
-        std::slice::from_raw_parts(self.body().add(offset), len)
+        unsafe { std::slice::from_raw_parts(self.body().add(offset), len) }
     }
 
     #[inline]
@@ -986,15 +991,17 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn slot_value<V: BTreeValue>(&self, slot: &Slot) -> V {
-        let offset = if slot.len as usize <= KEY_HEAD_LEN {
-            // key is inlined.
-            slot.offset
-        } else {
-            // should shift key length.
-            slot.offset + slot.len
-        } as usize;
-        let ptr = self.body().add(offset);
-        std::ptr::read_unaligned::<V>(ptr as *const V)
+        unsafe {
+            let offset = if slot.len as usize <= KEY_HEAD_LEN {
+                // key is inlined.
+                slot.offset
+            } else {
+                // should shift key length.
+                slot.offset + slot.len
+            } as usize;
+            let ptr = self.body().add(offset);
+            std::ptr::read_unaligned::<V>(ptr as *const V)
+        }
     }
 
     /// Returns all values in this node.

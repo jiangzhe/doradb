@@ -137,7 +137,7 @@ impl TableMetadata {
                 let vals: Vec<Val> = is
                     .index_cols
                     .iter()
-                    .map(|k| row.clone_val(&self, k.col_no as usize))
+                    .map(|k| row.clone_val(self, k.col_no as usize))
                     .collect();
                 SelectKey { index_no, vals }
             })
@@ -163,13 +163,13 @@ impl TableMetadata {
 
 #[inline]
 fn layout_match(val: &Val, layout: Layout) -> bool {
-    match (val, layout) {
-        (Val::Null, _) => true,
-        (Val::Byte1(_), Layout::Byte1)
-        | (Val::Byte2(_), Layout::Byte2)
-        | (Val::Byte4(_), Layout::Byte4)
-        | (Val::Byte8(_), Layout::Byte8)
-        | (Val::VarByte(_), Layout::VarByte) => true,
-        _ => false,
-    }
+    matches!(
+        (val, layout),
+        (Val::Null, _)
+            | (Val::Byte1(_), Layout::Byte1)
+            | (Val::Byte2(_), Layout::Byte2)
+            | (Val::Byte4(_), Layout::Byte4)
+            | (Val::Byte8(_), Layout::Byte8)
+            | (Val::VarByte(_), Layout::VarByte)
+    )
 }

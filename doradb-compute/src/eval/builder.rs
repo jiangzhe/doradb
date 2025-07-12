@@ -113,7 +113,7 @@ impl<'a, T: DataSourceID, I: TypeInferer> EvalBuilder<'a, T, I> {
         if let Some((idx, ty)) = self.expr_map.get(&key) {
             return Ok((EvalRef::Cache(*idx), *ty));
         }
-        let eval = self.gen(e, base)?;
+        let eval = self.create(e, base)?;
         let ty = eval.ty;
         let cache_idx = self.cache.len();
         self.expr_map.insert(key, (cache_idx, ty));
@@ -123,7 +123,7 @@ impl<'a, T: DataSourceID, I: TypeInferer> EvalBuilder<'a, T, I> {
 
     /// Generate evaluation by expression.
     #[inline]
-    fn gen(&mut self, e: &'a ExprKind, base: Option<EvalRef>) -> Result<Eval> {
+    fn create(&mut self, e: &'a ExprKind, base: Option<EvalRef>) -> Result<Eval> {
         let res = match e {
             ExprKind::Col(_) => unreachable!(), // column should be resolved via input cache.
             // const evaluation always ignore condition.

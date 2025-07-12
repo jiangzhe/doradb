@@ -103,17 +103,21 @@ impl FixedBufferPool {
 
     #[inline]
     unsafe fn get_new_frame(&'static self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        let bf_ptr = self.frames.offset(page_id as isize);
-        std::ptr::write(bf_ptr, BufferFrame::default());
-        // assign page pointer.
-        (*bf_ptr).page = self.pages.offset(page_id as isize);
-        UnsafePtr(bf_ptr)
+        unsafe {
+            let bf_ptr = self.frames.offset(page_id as isize);
+            std::ptr::write(bf_ptr, BufferFrame::default());
+            // assign page pointer.
+            (*bf_ptr).page = self.pages.offset(page_id as isize);
+            UnsafePtr(bf_ptr)
+        }
     }
 
     #[inline]
     unsafe fn get_frame(&'static self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        let bf_ptr = self.frames.offset(page_id as isize);
-        UnsafePtr(bf_ptr)
+        unsafe {
+            let bf_ptr = self.frames.offset(page_id as isize);
+            UnsafePtr(bf_ptr)
+        }
     }
 
     #[inline]
@@ -121,12 +125,14 @@ impl FixedBufferPool {
         &'static self,
         page_id: PageID,
     ) -> PageExclusiveGuard<T> {
-        let bf = self.get_new_frame(page_id as PageID);
-        (*bf.0).page_id = page_id as PageID;
-        let mut g = init_bf_exclusive_guard::<T>(bf);
-        T::init_frame(g.bf_mut());
-        g.page_mut().zero();
-        g
+        unsafe {
+            let bf = self.get_new_frame(page_id as PageID);
+            (*bf.0).page_id = page_id as PageID;
+            let mut g = init_bf_exclusive_guard::<T>(bf);
+            T::init_frame(g.bf_mut());
+            g.page_mut().zero();
+            g
+        }
     }
 }
 
@@ -219,7 +225,7 @@ impl BufferPool for FixedBufferPool {
         if g.is_exclusive() {
             unsafe { g.rollback_exclusive_version_change() };
         }
-        return Validation::Invalid;
+        Validation::Invalid
     }
 }
 

@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const SAFETY_PAGES: usize = 10;
-const EVICT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+const EVICT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 // min buffer pool size is 64KB * 512 = 32MB.
 const MIN_IN_MEM_PAGES: usize = 512;
 
@@ -155,10 +155,8 @@ impl EvictableBufferPool {
                 // First thread to initialize IO read.
                 // Try lock page for IO.
                 match self.try_lock_page_exclusive(page_id) {
-                    None => {
-                        // If page lock can not be acquired, we just retry.
-                        return;
-                    }
+                    // If page lock can not be acquired, we just retry.
+                    None => (),
                     Some(page_guard) => {
                         // Page is locked, so we dispatch read request to IO thread.
                         if !self.in_mem.try_inc() {
@@ -889,7 +887,7 @@ impl Drop for EvictableBufferPool {
         unsafe {
             // Drop all frames.
             for page_id in 0..self.capacity() {
-                let frame_ptr = self.frames.add(page_id as usize);
+                let frame_ptr = self.frames.add(page_id);
                 std::ptr::drop_in_place(frame_ptr);
             }
 
@@ -1228,9 +1226,9 @@ impl SingleFileIO {
     }
 }
 
-const DEFAULT_FILE_PATH: &'static str = "databuffer.bin";
+const DEFAULT_FILE_PATH: &str = "databuffer.bin";
 const DEFAULT_MAX_FILE_SIZE: Byte = Byte::from_u64(2 * 1024 * 1024 * 1024); // by default 2GB
-const DEFAULT_MAX_MEM_SIZE: Byte = Byte::from_u64(1 * 1024 * 1024 * 1024); // by default 1GB
+const DEFAULT_MAX_MEM_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // by default 1GB
 const DEFAULT_MAX_IO_READS: usize = 64;
 const DEFAULT_MAX_IO_WRITES: usize = 64;
 
@@ -1419,48 +1417,44 @@ impl Default for InflightIO {
 impl InflightIO {
     #[inline]
     async fn wait_for_write(&self, page_id: PageID, frame: &BufferFrame) {
-        loop {
-            let mut g = self.map.lock();
-            match g.entry(page_id) {
-                Entry::Vacant(vac) => {
-                    // Check whether the page is done.
-                    match frame.kind() {
-                        FrameKind::Evicting => {
-                            // Evict thread marked it as evicting, but for some reason, does
-                            // not process it immediately.
-                            // Here we insert a ReadWaitForWrite entry.
-                            // And wait for the event
-                            let event = Event::new();
-                            let listener = event.listen();
-                            vac.insert(IOStatus {
-                                kind: IOKind::ReadWaitForWrite,
-                                event: Some(event),
-                            });
-                            drop(g);
-                            listener.await;
-                            return;
-                        }
-                        // In any other kind, we let caller retry.
-                        FrameKind::Cool
-                        | FrameKind::Hot
-                        | FrameKind::Fixed
-                        | FrameKind::Uninitialized
-                        | FrameKind::Evicted => return,
+        let mut g = self.map.lock();
+        match g.entry(page_id) {
+            Entry::Vacant(vac) => {
+                // Check whether the page is done.
+                match frame.kind() {
+                    FrameKind::Evicting => {
+                        // Evict thread marked it as evicting, but for some reason, does
+                        // not process it immediately.
+                        // Here we insert a ReadWaitForWrite entry.
+                        // And wait for the event
+                        let event = Event::new();
+                        let listener = event.listen();
+                        vac.insert(IOStatus {
+                            kind: IOKind::ReadWaitForWrite,
+                            event: Some(event),
+                        });
+                        drop(g);
+                        listener.await;
                     }
+                    // In any other kind, we let caller retry.
+                    FrameKind::Cool
+                    | FrameKind::Hot
+                    | FrameKind::Fixed
+                    | FrameKind::Uninitialized
+                    | FrameKind::Evicted => (),
                 }
-                Entry::Occupied(mut occ) => {
-                    // There is a write in progress, or a preceding read, waiting for write.
-                    // In both cases, we can just wait for the event.
-                    debug_assert!({
-                        let kind = occ.get().kind;
-                        kind == IOKind::ReadWaitForWrite || kind == IOKind::Write
-                    });
-                    let event = occ.get_mut().event.get_or_insert_default();
-                    let listener = event.listen();
-                    drop(g);
-                    listener.await;
-                    return;
-                }
+            }
+            Entry::Occupied(mut occ) => {
+                // There is a write in progress, or a preceding read, waiting for write.
+                // In both cases, we can just wait for the event.
+                debug_assert!({
+                    let kind = occ.get().kind;
+                    kind == IOKind::ReadWaitForWrite || kind == IOKind::Write
+                });
+                let event = occ.get_mut().event.get_or_insert_default();
+                let listener = event.listen();
+                drop(g);
+                listener.await;
             }
         }
     }

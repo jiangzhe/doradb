@@ -1,6 +1,6 @@
 use crate::mysql::error::{Error, Result};
 use rsa::pkcs8::DecodePublicKey;
-use rsa::{Oaep, PublicKey, RsaPublicKey};
+use rsa::{Oaep, RsaPublicKey};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 

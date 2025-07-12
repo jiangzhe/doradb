@@ -19,7 +19,7 @@ impl Deref for Buf {
     #[inline]
     fn deref(&self) -> &Self::Target {
         match self {
-            Buf::Reuse(buf) => &***buf,
+            Buf::Reuse(buf) => buf,
             Buf::Direct(buf) => buf,
         }
     }
@@ -29,7 +29,7 @@ impl DerefMut for Buf {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            Buf::Reuse(buf) => &mut ***buf,
+            Buf::Reuse(buf) => buf,
             Buf::Direct(buf) => buf,
         }
     }

@@ -64,7 +64,7 @@ impl RecoverMap {
     /// Returns CTS at given row position.
     #[inline]
     pub fn at(&self, row_idx: usize) -> Option<TrxID> {
-        self.0.get(row_idx).and_then(|v| v.clone())
+        self.0.get(row_idx).and_then(|v| *v)
     }
 }
 
@@ -79,7 +79,7 @@ pub(super) async fn log_recover<P: BufferPool>(
     // any failure occurs, we abort the whole process.
     if !skip {
         let log_partitions = log_partition_initializers.len();
-        let mut log_merger = LogMerger::new();
+        let mut log_merger = LogMerger::default();
         for initializer in log_partition_initializers {
             let stream = initializer.stream();
             log_merger.add_stream(stream)?;
@@ -124,7 +124,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
     #[inline]
     pub async fn recover_all(mut self) -> Result<Vec<LogPartitionStream>> {
         // 1. replay all DDLs and DMLs.
-        while let Some(log) = self.log_merger.next()? {
+        while let Some(log) = self.log_merger.try_next()? {
             self.replay_log(log).await?;
         }
         // 2. Rebuild all indexes and refresh pages to enable undo map.
@@ -257,7 +257,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             let table = self
                 .catalog
                 .get_table(table_id)
-                .ok_or_else(|| Error::TableNotFound)?;
+                .ok_or(Error::TableNotFound)?;
             self.replay_table_dml(&table, &table_dml.rows, cts, disable_index)
                 .await?;
         }
@@ -274,7 +274,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             let table = self
                 .catalog
                 .get_table(table_id)
-                .ok_or_else(|| Error::TableNotFound)?;
+                .ok_or(Error::TableNotFound)?;
             self.replay_catalog_table_modifications(&table, &table_dml.rows)
                 .await;
         }

@@ -1,18 +1,14 @@
 use crate::error::{Error, Result};
-use crate::join::{Join, JoinKind, JoinOp, QualifiedJoin};
+use crate::join::{Join, QualifiedJoin};
 use crate::lgc::{Aggr, Op, OpKind, OpVisitor, ProjCol, QryIDs, QuerySet};
-use crate::rule::expr_simplify::{simplify_nested, NullCoalesce};
 use crate::rule::op_id::assign_id;
 use crate::rule::pred_move::{CollectColMapping, InnerSet, PredMap, RewriteExprIn};
 use doradb_catalog::{TableID, TblCol};
 use doradb_expr::controlflow::{Branch, ControlFlow, Unbranch};
-use doradb_expr::fold::Fold;
 use doradb_expr::{
     Col, ColIndex, ColKind, ExprExt, ExprKind, ExprVisitor, FnlDep, GlobalID, PredFuncKind, QryCol,
     QueryID,
 };
-use std::cell::RefCell;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::mem;
@@ -130,7 +126,7 @@ impl PredPushdown<'_> {
             OpKind::JoinGraph(_) => {
                 unreachable!("Predicates pushdown to join graph is not supported")
             }
-            OpKind::Join(join) => todo!(),
+            OpKind::Join(_join) => todo!(),
         }
     }
 
@@ -170,8 +166,10 @@ impl PredPushdown<'_> {
             .eq_sets
             .iter()
             .all(|eq_set| eq_set_all_included_in_groups(eq_set, &aggr.groups)));
-        let mut new_inner = InnerSet::default();
-        new_inner.eq_sets = mem::take(&mut inner.eq_sets);
+        let mut new_inner = InnerSet {
+            eq_sets: mem::take(&mut inner.eq_sets),
+            ..InnerSet::default()
+        };
         if inner.filt.is_empty() {
             self.push(&mut aggr.input, new_inner)?;
             return Ok(None);
@@ -191,7 +189,7 @@ impl PredPushdown<'_> {
 
     // create new filter node and return its child
     #[inline]
-    fn create_new_filt<'a>(&mut self, input: Op, new_inner: InnerSet) -> Op {
+    fn create_new_filt(&mut self, input: Op, new_inner: InnerSet) -> Op {
         let orig_in = input;
         let mut pred = vec![];
         self.pred_map.apply_inner(new_inner, &mut pred);
@@ -245,7 +243,7 @@ impl PredPushdown<'_> {
                 (0, _) => {
                     let mut expr_iter = new_expr_set.into_iter();
                     let e1 = expr_iter.next().unwrap();
-                    while let Some(e2) = expr_iter.next() {
+                    for e2 in expr_iter {
                         let e = ExprKind::pred_func(PredFuncKind::Equal, vec![e1.clone(), e2]);
                         new_inner.handle_filt(e.into());
                     }
@@ -380,7 +378,7 @@ impl PredPushdown<'_> {
             if orig_key.len() != key_cols.len() {
                 continue;
             }
-            let mut perm_keys = permute_keys(orig_key, &eq_sets);
+            let mut perm_keys = permute_keys(orig_key, eq_sets);
             let mut test_key = Vec::with_capacity(orig_key.len());
             while perm_keys.next(&mut test_key) {
                 if test_key == key_cols {
@@ -413,10 +411,10 @@ impl PredPushdown<'_> {
         // convert equal set to filter expression
         for eq_set in &inner.eq_sets {
             let mut eq_set_iter = eq_set.iter();
-            let gid1 = eq_set_iter.next().cloned().unwrap();
-            let c1 = self.pred_map.col_map[&gid1].clone();
-            while let Some(gid2) = eq_set_iter.next() {
-                let c2 = self.pred_map.col_map[&gid2].clone();
+            let gid1 = eq_set_iter.next().unwrap();
+            let c1 = self.pred_map.col_map[gid1].clone();
+            for gid2 in eq_set_iter {
+                let c2 = self.pred_map.col_map[gid2].clone();
                 let e = ExprKind::pred_func(
                     PredFuncKind::Equal,
                     vec![ExprKind::Col(c1.clone()), ExprKind::Col(c2)],
@@ -479,14 +477,13 @@ impl PredPushdown<'_> {
                     inner.handle_filt(e.into());
                 }
             }
-            OpKind::Join(join) => match &mut **join {
-                Join::Qualified(QualifiedJoin { filt, .. }) => {
+            OpKind::Join(join) => {
+                if let Join::Qualified(QualifiedJoin { filt, .. }) = &mut **join {
                     for e in mem::take(filt) {
                         inner.handle_filt(e.into());
                     }
                 }
-                _ => (),
-            },
+            }
             OpKind::Scan(scan) => {
                 for e in mem::take(&mut scan.filt) {
                     inner.handle_filt(e.into());
@@ -629,8 +626,7 @@ fn eq_set_all_included_in_groups(eq_set: &HashSet<GlobalID>, groups: &[ExprKind]
 mod tests {
     use super::*;
     use crate::lgc::tests::{
-        assert_j_plan1, extract_join_kinds, get_subq_by_location, get_table_filt_expr, j_catalog,
-        print_plan,
+        assert_j_plan1, get_subq_by_location, get_table_filt_expr, j_catalog, print_plan,
     };
     use crate::lgc::{LgcPlan, Location};
 
@@ -1027,7 +1023,7 @@ struct ExprAttr {
     has_subq: bool,
 }
 
-impl<'a> ExprVisitor<'a> for ExprAttr {
+impl ExprVisitor<'_> for ExprAttr {
     type Cont = ();
     type Break = ();
     #[inline]

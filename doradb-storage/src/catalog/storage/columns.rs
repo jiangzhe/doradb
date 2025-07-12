@@ -16,21 +16,21 @@ use std::sync::OnceLock;
 
 pub const TABLE_ID_COLUMNS: TableID = 2;
 const COL_NO_COLUMNS_COLUMN_ID: usize = 0;
-const COL_NAME_COLUMNS_COLUMN_ID: &'static str = "column_id";
+const COL_NAME_COLUMNS_COLUMN_ID: &str = "column_id";
 const COL_NO_COLUMNS_TABLE_ID: usize = 1;
-const COL_NAME_COLUMNS_TABLE_ID: &'static str = "table_id";
+const COL_NAME_COLUMNS_TABLE_ID: &str = "table_id";
 const COL_NO_COLUMNS_COLUMN_NAME: usize = 2;
-const COL_NAME_COLUMNS_COLUMN_NAME: &'static str = "column_name";
+const COL_NAME_COLUMNS_COLUMN_NAME: &str = "column_name";
 const COL_NO_COLUMNS_COLUMN_NO: usize = 3;
-const COL_NAME_COLUMNS_COLUMN_NO: &'static str = "column_no";
+const COL_NAME_COLUMNS_COLUMN_NO: &str = "column_no";
 const COL_NO_COLUMNS_COLUMN_TYPE: usize = 4;
-const COL_NAME_COLUMNS_COLUMN_TYPE: &'static str = "column_type";
+const COL_NAME_COLUMNS_COLUMN_TYPE: &str = "column_type";
 const COL_NO_COLUMNS_COLUMN_ATTRIBUTES: usize = 5;
-const COL_NAME_COLUMNS_COLUMN_ATTRIBUTES: &'static str = "column_attributes";
+const COL_NAME_COLUMNS_COLUMN_ATTRIBUTES: &str = "column_attributes";
 const INDEX_NO_COLUMNS_COLUMN_ID: usize = 0;
-const INDEX_NAME_COLUMNS_COLUMN_ID: &'static str = "idx_columns_column_id";
+const INDEX_NAME_COLUMNS_COLUMN_ID: &str = "idx_columns_column_id";
 const INDEX_NO_COLUMNS_TABLE_ID: usize = 1;
-const INDEX_NAME_COLUMNS_TABLE_ID: &'static str = "idx_columns_table_id";
+const INDEX_NAME_COLUMNS_TABLE_ID: &str = "idx_columns_table_id";
 
 pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();

@@ -24,36 +24,40 @@ pub(super) fn init_bf_exclusive_guard<T: BufferPage>(
 
 #[inline]
 pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
-    let memory_chunk = mmap(
-        std::ptr::null_mut(),
-        total_bytes,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
-        0,
-    );
-    if memory_chunk == MAP_FAILED {
-        return Err(Error::InsufficientMemory(total_bytes));
+    unsafe {
+        let memory_chunk = mmap(
+            std::ptr::null_mut(),
+            total_bytes,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if memory_chunk == MAP_FAILED {
+            return Err(Error::InsufficientMemory(total_bytes));
+        }
+        madvise(memory_chunk, total_bytes, MADV_HUGEPAGE);
+        madvise(memory_chunk, total_bytes, MADV_DONTFORK);
+        Ok(memory_chunk as *mut u8)
     }
-    madvise(memory_chunk, total_bytes, MADV_HUGEPAGE);
-    madvise(memory_chunk, total_bytes, MADV_DONTFORK);
-    Ok(memory_chunk as *mut u8)
 }
 
 #[inline]
 pub(super) unsafe fn mmap_deallocate(ptr: *mut u8, total_bytes: usize) {
-    munmap(ptr as *mut c_void, total_bytes);
+    unsafe {
+        munmap(ptr as *mut c_void, total_bytes);
+    }
 }
 
 #[inline]
 pub(super) unsafe fn madvise_dontneed(ptr: *mut u8, len: usize) -> bool {
-    madvise(ptr as *mut c_void, len, MADV_DONTNEED) == 0
+    unsafe { madvise(ptr as *mut c_void, len, MADV_DONTNEED) == 0 }
 }
 
 #[allow(dead_code)]
 #[inline]
 pub(super) unsafe fn madvise_remove(ptr: *mut u8, len: usize) -> bool {
-    madvise(ptr as *mut c_void, len, MADV_REMOVE) == 0
+    unsafe { madvise(ptr as *mut c_void, len, MADV_REMOVE) == 0 }
 }
 
 pub struct FreeBitmap {
@@ -95,6 +99,7 @@ impl AllocMap {
     }
 
     /// Try to allocate a new object, returns index of object.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn try_allocate(&self) -> Option<usize> {
         let unit_end_idx = (self.len + 63) / 64;

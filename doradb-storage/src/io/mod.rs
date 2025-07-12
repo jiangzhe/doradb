@@ -1,11 +1,10 @@
 mod buf;
 mod free_list;
 mod libaio_abi;
-mod ringbuffer;
 
 use libc::{
-    c_long, c_void, close, fdatasync, fsync, ftruncate, open, EAGAIN, EINTR, O_CREAT, O_DIRECT,
-    O_RDWR, O_TRUNC,
+    c_long, close, fdatasync, fsync, ftruncate, open, EAGAIN, EINTR, O_CREAT, O_DIRECT, O_RDWR,
+    O_TRUNC,
 };
 use std::ffi::CString;
 use std::ops::Deref;
@@ -21,6 +20,7 @@ pub const MIN_PAGE_SIZE: usize = 4096;
 pub const STORAGE_SECTOR_SIZE: usize = 4096;
 
 /// Align given input length to storage sector size.
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 pub fn align_to_sector_size(len: usize) -> usize {
     (len + STORAGE_SECTOR_SIZE - 1) / STORAGE_SECTOR_SIZE * STORAGE_SECTOR_SIZE
@@ -151,6 +151,13 @@ pub struct UnsafeAIO {
 }
 
 impl UnsafeAIO {
+    /// Create a new unsafe IO.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee pointer is valid during
+    /// syscall and correctly aligned.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub unsafe fn new(
         key: AIOKey,
@@ -290,10 +297,7 @@ impl AIOManager {
         // if success, non-negative value indicates how many IO submitted.
         // if error, negative value of error code.
         if ret < 0 && -ret != EAGAIN {
-            panic!(
-                "io_submit returns error code {}: batch_size={}",
-                ret, batch_size
-            );
+            panic!("io_submit returns error code {ret}: batch_size={batch_size}");
         }
         reqs.clear();
         ret.max(0) as usize
@@ -312,10 +316,7 @@ impl AIOManager {
         // if error, negative value of error code.
         // if ret < 0 && -ret != EAGAIN {
         if ret < 0 {
-            panic!(
-                "io_submit returns error code {}: batch_size={}",
-                ret, batch_size
-            );
+            panic!("io_submit returns error code {ret}: batch_size={batch_size}");
         }
         let submit_count = ret as usize;
         reqs.drain(..submit_count);
@@ -346,7 +347,7 @@ impl AIOManager {
                     // retry if interrupt
                     continue;
                 }
-                panic!("io_getevents returns error code {}", errcode);
+                panic!("io_getevents returns error code {errcode}");
             }
             break ret as usize;
         };
@@ -374,7 +375,7 @@ impl Drop for AIOManager {
         // check if there are any remained file descriptors remain opened.
         let fd_count = self.fd_count.load(Ordering::Relaxed);
         if fd_count != 0 {
-            panic!("{} files remain opened when shutdown AIOManager", fd_count);
+            panic!("{fd_count} files remain opened when shutdown AIOManager");
         }
     }
 }
@@ -462,7 +463,11 @@ impl SparseFile {
     }
 
     /// Returns a pread IO request.
-    /// User must guarantee the pointed memory is valid during IO processing.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee the pointer is valid during
+    /// syscall, and pointer is correctly aligned.
     #[inline]
     pub unsafe fn pread_unchecked(
         &self,
@@ -471,7 +476,7 @@ impl SparseFile {
         ptr: *mut u8,
         len: usize,
     ) -> UnsafeAIO {
-        pread_unchecked(key, self.fd, offset, ptr, len)
+        unsafe { pread_unchecked(key, self.fd, offset, ptr, len) }
     }
 
     /// Returns a pwrite IO request.
@@ -482,8 +487,11 @@ impl SparseFile {
     }
 
     /// Returns a pwrite IO request.
-    /// User must guarantee the pointed memory is valid during IO processing.
-    /// After the write is done, user may want to re
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee the pointer is valid during
+    /// syscall, and pointer is correctly aligned.
     #[inline]
     pub unsafe fn pwrite_unchecked(
         &self,
@@ -492,7 +500,7 @@ impl SparseFile {
         ptr: *mut u8,
         len: usize,
     ) -> UnsafeAIO {
-        pwrite_unchecked(key, self.fd, offset, ptr, len)
+        unsafe { pwrite_unchecked(key, self.fd, offset, ptr, len) }
     }
 
     /// Returns the file syncer.
@@ -547,6 +555,12 @@ pub fn pread_direct(key: AIOKey, fd: RawFd, offset: usize, len: usize) -> AIO {
     )
 }
 
+/// pread.
+///
+/// # Safety
+///
+/// Caller must guarantee the pointer is valid during
+/// syscall, and pointer is correctly aligned.
 #[inline]
 pub unsafe fn pread_unchecked(
     key: AIOKey,
@@ -555,18 +569,20 @@ pub unsafe fn pread_unchecked(
     ptr: *mut u8,
     len: usize,
 ) -> UnsafeAIO {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    UnsafeAIO::new(
-        key,
-        fd,
-        offset,
-        ptr,
-        len,
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PREAD,
-    )
+    unsafe {
+        const PRIORITY: u16 = 0;
+        const FLAGS: u32 = 0;
+        UnsafeAIO::new(
+            key,
+            fd,
+            offset,
+            ptr,
+            len,
+            PRIORITY,
+            FLAGS,
+            io_iocb_cmd::IO_CMD_PREAD,
+        )
+    }
 }
 
 #[inline]
@@ -584,6 +600,12 @@ pub fn pwrite_direct(key: AIOKey, fd: RawFd, offset: usize, buf: DirectBuf) -> A
     )
 }
 
+/// pwrite.
+///
+/// # Safety
+///
+/// Caller must guarantee the pointer is valid during
+/// syscall, and pointer is correctly aligned.
 #[inline]
 pub unsafe fn pwrite_unchecked(
     key: AIOKey,
@@ -592,20 +614,27 @@ pub unsafe fn pwrite_unchecked(
     ptr: *mut u8,
     len: usize,
 ) -> UnsafeAIO {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    UnsafeAIO::new(
-        key,
-        fd,
-        offset,
-        ptr,
-        len,
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PWRITE,
-    )
+    unsafe {
+        const PRIORITY: u16 = 0;
+        const FLAGS: u32 = 0;
+        UnsafeAIO::new(
+            key,
+            fd,
+            offset,
+            ptr,
+            len,
+            PRIORITY,
+            FLAGS,
+            io_iocb_cmd::IO_CMD_PWRITE,
+        )
+    }
 }
 
+/// mlock.
+///
+/// # Safety
+///
+/// Wrapper of mlock.
 #[cfg(feature = "mlock")]
 #[inline]
 pub unsafe fn mlock(ptr: *mut u8, len: usize) -> bool {
@@ -613,12 +642,22 @@ pub unsafe fn mlock(ptr: *mut u8, len: usize) -> bool {
     res == 0
 }
 
+/// mlock.
+///
+/// # Safety
+///
+/// Wrapper of mlock.
 #[cfg(not(feature = "mlock"))]
 #[inline]
 pub unsafe fn mlock(_ptr: *mut u8, _len: usize) -> bool {
     true
 }
 
+/// munlock.
+///
+/// # Safety
+///
+/// Wrapper of munlock.
 #[cfg(feature = "mlock")]
 #[inline]
 pub unsafe fn munlock(ptr: *mut u8, len: usize) -> bool {
@@ -626,6 +665,11 @@ pub unsafe fn munlock(ptr: *mut u8, len: usize) -> bool {
     res == 0
 }
 
+/// munlock.
+///
+/// # Safety
+///
+/// Wrapper of munlock.
 #[cfg(not(feature = "mlock"))]
 #[inline]
 pub unsafe fn munlock(_ptr: *mut u8, _len: usize) -> bool {

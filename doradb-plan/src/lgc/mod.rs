@@ -68,7 +68,7 @@ impl LgcPlan {
 fn generate_shape(qs: &QuerySet, root: &QueryID, shape: &mut Vec<OpTy>) {
     if let Some(subq) = qs.get(root) {
         let mut sg = ShapeGen { qs, shape };
-        subq.root.walk(&mut sg);
+        let _ = subq.root.walk(&mut sg);
     }
 }
 

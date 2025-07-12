@@ -136,6 +136,7 @@ impl Drop for DeferUnlock<'_> {
 }
 
 unsafe impl RawRwLockApi for RawRwLock {
+    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: RawRwLock = RawRwLock::new();
 
     type GuardMarker = GuardSend;
@@ -231,9 +232,11 @@ unsafe impl RawRwLockApi for RawRwLock {
 unsafe impl RawRwLockDowngradeApi for RawRwLock {
     #[inline]
     unsafe fn downgrade(&self) {
-        debug_assert!(self.state.load(Ordering::Acquire) & !WRITER_BIT == 0);
-        self.state.fetch_add(ONE_READER, Ordering::SeqCst);
-        self.unlock_exclusive();
+        unsafe {
+            debug_assert!(self.state.load(Ordering::Acquire) & !WRITER_BIT == 0);
+            self.state.fetch_add(ONE_READER, Ordering::SeqCst);
+            self.unlock_exclusive();
+        }
     }
 }
 

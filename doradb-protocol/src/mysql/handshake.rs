@@ -30,7 +30,7 @@ pub struct InitialHandshake<'a> {
     pub auth_plugin_name: Cow<'a, [u8]>,
 }
 
-impl<'a> NewMySer for InitialHandshake<'a> {
+impl NewMySer for InitialHandshake<'_> {
     type Ser<'s>
         = MySerPackets<'s, 8>
     where
@@ -190,7 +190,7 @@ pub struct HandshakeCliResp41<'a> {
     pub connect_attrs: Vec<ConnectAttr<'a>>,
 }
 
-impl<'a> NewMySer for HandshakeCliResp41<'a> {
+impl NewMySer for HandshakeCliResp41<'_> {
     type Ser<'s>
         = MySerPackets<'s, 7>
     where
@@ -358,7 +358,7 @@ pub struct AuthSwitchRequest<'a> {
     pub auth_plugin_data: Cow<'a, [u8]>,
 }
 
-impl<'a> NewMySer for AuthSwitchRequest<'a> {
+impl NewMySer for AuthSwitchRequest<'_> {
     type Ser<'s>
         = MySerPackets<'s, 3>
     where
@@ -406,7 +406,7 @@ pub struct AuthMoreData<'a> {
     pub plugin_data: Cow<'a, [u8]>,
 }
 
-impl<'a> NewMySer for AuthMoreData<'a> {
+impl NewMySer for AuthMoreData<'_> {
     type Ser<'s>
         = MySerPackets<'s, 2>
     where

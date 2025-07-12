@@ -6,8 +6,10 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Const {
+    #[default]
+    Null,
     I64(i64),
     U64(u64),
     F64(ValidF64),
@@ -19,13 +21,6 @@ pub enum Const {
     String(Arc<str>),
     Bytes(Arc<[u8]>),
     Bool(bool),
-    Null,
-}
-
-impl Default for Const {
-    fn default() -> Self {
-        Const::Null
-    }
 }
 
 impl Typed for Const {
@@ -249,7 +244,7 @@ impl Eq for ValidF64 {}
 impl PartialOrd for ValidF64 {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
@@ -309,7 +304,7 @@ impl Eq for ValidF32 {}
 impl PartialOrd for ValidF32 {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 

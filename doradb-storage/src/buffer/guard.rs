@@ -221,7 +221,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn try_shared_either(mut self) -> Either<PageSharedGuard<T>, PageOptimisticGuard<T>> {
         match self.try_shared() {
             Valid(()) => Either::Left(PageSharedGuard {
-                bf: unsafe { mem::transmute(self.bf) },
+                bf: unsafe { mem::transmute::<UnsafePtr<BufferFrame>, &BufferFrame>(self.bf) },
                 guard: self.guard,
                 _marker: PhantomData,
             }),
@@ -310,22 +310,37 @@ impl<T: 'static> FacadePageGuard<T> {
         self.guard.state == GuardState::Shared
     }
 
+    /// Treat this guard as shared guard.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee this guard is shared.
     #[inline]
     pub unsafe fn as_shared(&self) -> &PageSharedGuard<T> {
-        mem::transmute(self)
+        unsafe { mem::transmute(self) }
     }
 
+    /// Treat this guard as exclusive guard.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee this guard is exclusive.
     #[inline]
     pub unsafe fn as_exclusive(&mut self) -> &mut PageExclusiveGuard<T> {
-        mem::transmute(self)
+        unsafe { mem::transmute(self) }
     }
 
     /// Returns page with optimistic read.
+    ///
+    /// # Safety
+    ///
     /// All values must be validated before use.
     #[inline]
     pub unsafe fn page_unchecked(&self) -> &T {
-        let page = (*self.bf.0).page;
-        &*(page as *mut T)
+        unsafe {
+            let page = (*self.bf.0).page;
+            &*(page as *mut T)
+        }
     }
 
     #[inline]
@@ -342,10 +357,17 @@ impl<T: 'static> FacadePageGuard<T> {
         self.guard.validate()
     }
 
+    /// Rollback version change by exclusive lock acquisition.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee the lock is in exclusive mode.
     #[inline]
     pub unsafe fn rollback_exclusive_version_change(self) {
-        debug_assert!(self.guard.state == GuardState::Exclusive);
-        self.guard.rollback_exclusive_bit();
+        unsafe {
+            debug_assert!(self.guard.state == GuardState::Exclusive);
+            self.guard.rollback_exclusive_bit();
+        }
     }
 }
 
@@ -403,11 +425,16 @@ impl<T> PageOptimisticGuard<T> {
     }
 
     /// Returns page with optimistic read.
+    ///
+    /// # Safety
+    ///
     /// All values must be validated before use.
     #[inline]
     pub unsafe fn page_unchecked(&self) -> &T {
-        let page = (*self.bf.0).page;
-        &*(page as *mut T)
+        unsafe {
+            let page = (*self.bf.0).page;
+            &*(page as *mut T)
+        }
     }
 
     /// Validates version not change.
@@ -471,7 +498,7 @@ impl<T: 'static> PageSharedGuard<T> {
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
-            bf: unsafe { mem::transmute(self.bf) },
+            bf: unsafe { mem::transmute::<&BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
             guard: self.guard.downgrade(),
             _marker: PhantomData,
         }
@@ -505,7 +532,7 @@ impl<T: 'static> PageSharedGuard<T> {
             self.bf.set_dirty(true);
         }
         FacadePageGuard {
-            bf: unsafe { mem::transmute(self.bf) },
+            bf: unsafe { mem::transmute::<&BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
             guard: self.guard,
             _marker: PhantomData,
         }
@@ -542,7 +569,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
-            bf: unsafe { mem::transmute(self.bf) },
+            bf: unsafe { mem::transmute::<&mut BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
             guard: self.guard.downgrade(),
             _marker: PhantomData,
         }
@@ -551,7 +578,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
     #[inline]
     pub fn downgrade_shared(self) -> PageSharedGuard<T> {
         PageSharedGuard {
-            bf: unsafe { mem::transmute(self.bf) },
+            bf: self.bf,
             guard: self.guard.downgrade_exclusive_to_shared(),
             _marker: PhantomData,
         }
@@ -573,13 +600,13 @@ impl<T: 'static> PageExclusiveGuard<T> {
     /// Returns current buffer frame.
     #[inline]
     pub fn bf(&self) -> &BufferFrame {
-        &self.bf
+        self.bf
     }
 
     /// Returns mutable buffer frame.
     #[inline]
     pub fn bf_mut(&mut self) -> &mut BufferFrame {
-        &mut self.bf
+        self.bf
     }
 
     /// Set next free page.
@@ -604,7 +631,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
             self.bf.set_dirty(true);
         }
         FacadePageGuard {
-            bf: unsafe { mem::transmute(self.bf) },
+            bf: unsafe { mem::transmute::<&mut BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
             guard: self.guard,
             _marker: PhantomData,
         }

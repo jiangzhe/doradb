@@ -214,14 +214,13 @@ impl QuerySet {
             qs: self,
             mapping: &mut mapping,
         };
-        sq.root.walk_mut(&mut upsert);
+        let _ = sq.root.walk_mut(&mut upsert);
         // update from aliases in subquery's scope
         for (_, query_id) in sq.scope.query_aliases.iter_mut() {
             if let Some(new_query_id) = mapping.get(query_id) {
                 *query_id = *new_query_id;
             }
         }
-        // self.insert(sq)
         let (qry_id, tgt) = self.insert_empty();
         *tgt = sq;
         qry_id
@@ -274,7 +273,7 @@ impl UpsertQuery<'_> {
     }
 }
 
-impl<'a> OpMutVisitor for UpsertQuery<'a> {
+impl OpMutVisitor for UpsertQuery<'_> {
     type Cont = ();
     type Break = ();
     #[inline]

@@ -104,7 +104,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl<'a> From<ErrPacket<'a>> for Error {
+impl From<ErrPacket<'_>> for Error {
     #[inline]
     fn from(src: ErrPacket) -> Self {
         let msg = match src.msg {

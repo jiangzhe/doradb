@@ -38,10 +38,16 @@ impl iocb {
     /// The returned pointer is leaked.
     /// That means caller can use Box::from_raw() to
     /// regain the ownership and drop it.
+    ///
+    /// # Safety
+    ///
+    /// Memory is manually allocated. Caller should
+    /// guarantee it's valid during syscall, and has
+    /// to release it once IO is done.
     #[inline]
     pub unsafe fn alloc<'a>() -> &'a mut Self {
-        const LAYOUT: Layout = Layout::new::<iocb>();
         unsafe {
+            const LAYOUT: Layout = Layout::new::<iocb>();
             let ptr = alloc(LAYOUT) as *mut Self;
             let this = &mut *ptr;
             this.init();
@@ -104,7 +110,7 @@ pub struct iovec {
 }
 
 #[link(name = "aio")]
-extern "C" {
+unsafe extern "C" {
     pub fn io_queue_init(maxevents: c_int, ctxp: *mut io_context_t) -> c_int;
 
     pub fn io_queue_release(ctx: io_context_t) -> c_int;

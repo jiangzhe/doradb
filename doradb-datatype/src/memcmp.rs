@@ -157,6 +157,7 @@ macro_rules! impl_mcf_for_varlen {
                 None
             }
 
+            #[allow(clippy::manual_div_ceil)]
             #[inline]
             fn enc_mcf_len(value: &Self) -> usize {
                 let n_segs = (value.len().max(1) + SEG_LEN - 1) / SEG_LEN;
@@ -201,7 +202,10 @@ fn attach_bytes(bs: &[u8], buf: &mut Vec<u8>) {
             buf.push(FIX_SEG_FLAG);
         }
         buf.extend_from_slice(chunks.remainder());
-        buf.extend(std::iter::repeat(0x00).take(SEG_LEN - chunks.remainder().len()));
+        buf.extend(std::iter::repeat_n(
+            0x00,
+            SEG_LEN - chunks.remainder().len(),
+        ));
         buf.push(chunks.remainder().len() as u8);
     }
 }
@@ -238,7 +242,8 @@ fn write_bytes(bs: &[u8], mut buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use rand::rngs::ThreadRng;
-    use rand::{distributions::Standard, prelude::Distribution, Rng};
+    use rand::Rng;
+    use rand_distr::{Distribution, StandardUniform};
 
     use super::*;
 
@@ -296,9 +301,9 @@ mod tests {
     fn run_test_mcf<T>()
     where
         T: NullableMemCmpFormat + Ord,
-        Standard: Distribution<T>,
+        StandardUniform: Distribution<T>,
     {
-        let mut r = rand::thread_rng();
+        let mut r = rand::rng();
         let mut input1 = gen_input::<T>(&mut r);
 
         check_mcf_length(&input1[0]);
@@ -320,14 +325,14 @@ mod tests {
     where
         T: NullableMemCmpFormat + Ord,
         U: NullableMemCmpFormat + Ord,
-        Standard: Distribution<T> + Distribution<U>,
+        StandardUniform: Distribution<T> + Distribution<U>,
     {
-        let mut r = rand::thread_rng();
+        let mut r = rand::rng();
 
         // mcf
         let mut input1 = Vec::<(T, U)>::with_capacity(1024);
         for _ in 0..1024 {
-            input1.push(r.gen());
+            input1.push(r.sample(StandardUniform));
         }
         let mut input2 = Vec::with_capacity(1024);
         for (t, u) in &input1 {
@@ -349,7 +354,7 @@ mod tests {
         // nmcf
         let mut input3 = Vec::<(T, U)>::with_capacity(1024);
         for _ in 0..1024 {
-            input3.push(r.gen());
+            input3.push(r.sample(StandardUniform));
         }
         let mut input4 = Vec::with_capacity(1024);
         for (t, v) in &input3 {
@@ -376,7 +381,7 @@ mod tests {
         F: Fn(&mut ThreadRng) -> U,
         F: Copy,
     {
-        let mut r = rand::thread_rng();
+        let mut r = rand::rng();
 
         let mut input1 = gen_varlen_input(&mut r, f);
 
@@ -421,11 +426,11 @@ mod tests {
 
     fn gen_input<T>(r: &mut ThreadRng) -> Vec<T>
     where
-        Standard: Distribution<T>,
+        StandardUniform: Distribution<T>,
     {
         let mut input = Vec::with_capacity(1024);
         for _ in 0..1024 {
-            input.push(r.gen());
+            input.push(r.sample(StandardUniform));
         }
         input
     }
@@ -558,27 +563,27 @@ mod tests {
     }
 
     fn gen_rand_str(r: &mut ThreadRng) -> String {
-        let len: u8 = r.gen();
+        let len: u8 = r.sample(StandardUniform);
         let mut s = String::with_capacity(len as usize);
         for _ in 0..len {
-            let ascii: u8 = r.gen();
+            let ascii: u8 = r.sample(StandardUniform);
             s.push((ascii & 0x7f) as char);
         }
         s
     }
 
     fn gen_rand_bytes(r: &mut ThreadRng) -> Vec<u8> {
-        let len: u8 = r.gen();
+        let len: u8 = r.sample(StandardUniform);
         let mut s = Vec::with_capacity(len as usize);
         for _ in 0..len {
-            s.push(r.gen());
+            s.push(r.sample(StandardUniform));
         }
         s
     }
 
-    impl Distribution<ValidF64> for Standard {
+    impl Distribution<ValidF64> for StandardUniform {
         fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> ValidF64 {
-            ValidF64::new(rng.gen()).unwrap()
+            ValidF64::new(rng.sample(StandardUniform)).unwrap()
         }
     }
 }

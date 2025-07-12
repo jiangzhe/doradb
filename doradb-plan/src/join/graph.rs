@@ -61,12 +61,12 @@ impl Graph {
     }
 
     #[inline]
-    pub fn vids(&self) -> impl Iterator<Item = VertexID> {
+    pub fn vids(&self) -> impl Iterator<Item = VertexID> + use<> {
         self.vs.into_iter()
     }
 
     #[inline]
-    pub fn rev_vids(&self) -> impl Iterator<Item = VertexID> {
+    pub fn rev_vids(&self) -> impl Iterator<Item = VertexID> + use<> {
         self.vs.rev_iter()
     }
 
@@ -101,7 +101,7 @@ impl Graph {
     }
 
     #[inline]
-    pub fn eids(&self) -> impl Iterator<Item = EdgeID> {
+    pub fn eids(&self) -> impl Iterator<Item = EdgeID> + use<> {
         (0..self.edge_arena.len()).map(|u| EdgeID(u as u16))
     }
 

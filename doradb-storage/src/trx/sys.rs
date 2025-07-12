@@ -27,12 +27,12 @@ pub const GC_BUCKETS: usize = 64;
 /// TransactionSystem controls lifecycle of all transactions.
 ///
 /// 1. Transaction begin:
-/// a) Generate STS and TrxID.
-/// b) Put it into active transaction list.
+///    a) Generate STS and TrxID.
+///    b) Put it into active transaction list.
 ///
 /// 2. Transaction pre-commmit:
-/// a) Generate CTS.
-/// b) Put it into precommit transaction list.
+///    a) Generate CTS.
+///    b) Put it into precommit transaction list.
 ///
 /// Note 1: Before pre-commit, the transaction should serialize its redo log to binary
 /// because group commit is single-threaded and the serialization may require
@@ -275,7 +275,7 @@ impl TransactionSystem {
     #[inline]
     pub(super) fn start_gc_threads(&'static self, gc_rxs: Vec<Receiver<GC>>) {
         for ((idx, partition), gc_rx) in self.log_partitions.iter().enumerate().zip(gc_rxs) {
-            let thread_name = format!("GC-Thread-{}", idx);
+            let thread_name = format!("GC-Thread-{idx}");
             let partition = &**partition;
             let purge_chan = self.purge_chan.clone();
             let handle =
@@ -289,7 +289,7 @@ impl TransactionSystem {
     pub(super) fn start_io_threads(&'static self) {
         // Start threads for all log partitions
         for (idx, partition) in self.log_partitions.iter().enumerate() {
-            let thread_name = format!("IO-Thread-{}", idx);
+            let thread_name = format!("IO-Thread-{idx}");
             let partition = &**partition;
             let handle = thread::spawn_named(thread_name, move || partition.io_loop(&self.config));
             *partition.io_thread.lock() = Some(handle);

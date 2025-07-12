@@ -54,6 +54,7 @@ pub struct HybridLatch {
 }
 
 impl HybridLatch {
+    #[allow(clippy::new_without_default)]
     #[inline]
     pub const fn new() -> Self {
         HybridLatch {
@@ -398,14 +399,19 @@ impl<'a> HybridGuard<'a> {
     }
 
     /// rollback exclusive bit set by exclusive lock.
+    ///
+    /// # Safety
+    ///
     /// Caller must make sure the exclusive lock is already acquired.
     #[inline]
     pub unsafe fn rollback_exclusive_bit(mut self) {
-        self.lock
-            .version
-            .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
-        self.lock.lock.unlock_exclusive();
-        self.state = GuardState::Optimistic;
+        unsafe {
+            self.lock
+                .version
+                .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+            self.lock.lock.unlock_exclusive();
+            self.state = GuardState::Optimistic;
+        }
     }
 
     #[inline]
@@ -433,7 +439,7 @@ impl<'a> HybridGuard<'a> {
     }
 }
 
-impl<'a> Drop for HybridGuard<'a> {
+impl Drop for HybridGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         match self.state {

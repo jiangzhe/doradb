@@ -405,7 +405,7 @@ fn match_builtin_keyword(token: &str) -> Option<BuiltinKeyword> {
 #[derive(Debug, Clone, Copy, Eq)]
 struct CastAsciiLowerCase<'a>(&'a str);
 
-impl<'a> std::hash::Hash for CastAsciiLowerCase<'a> {
+impl std::hash::Hash for CastAsciiLowerCase<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0
             .as_bytes()
@@ -414,7 +414,7 @@ impl<'a> std::hash::Hash for CastAsciiLowerCase<'a> {
     }
 }
 
-impl<'a> std::cmp::PartialEq for CastAsciiLowerCase<'a> {
+impl std::cmp::PartialEq for CastAsciiLowerCase<'_> {
     fn eq(&self, other: &Self) -> bool {
         if self.0.len() != other.0.len() {
             return false;
@@ -431,7 +431,7 @@ impl<'a> std::cmp::PartialEq for CastAsciiLowerCase<'a> {
 fn convert_simple_error<'a, I: ParseInput<'a>>(e: NomErr<NomError<I>>) -> Error {
     let err_msg = match e {
         NomErr::Incomplete(_) => "Incomplete input".to_string(),
-        NomErr::Error(e) | NomErr::Failure(e) => format!("{:?}", e),
+        NomErr::Error(e) | NomErr::Failure(e) => format!("{e:?}"),
     };
     Error::SyntaxError(Box::new(err_msg))
 }
@@ -704,7 +704,7 @@ fn is_ident_char(c: u8) -> bool {
 
 fn ident_tag<'a, I: ParseInput<'a>, E: ParseError<I>>(
     id: &'static str,
-) -> impl Fn(I) -> IResult<I, I, E> {
+) -> impl Fn(I) -> IResult<I, I, E> + use<I, E> {
     use std::cmp::Ordering;
     move |i: I| {
         let id = id.as_bytes();
@@ -730,7 +730,10 @@ fn ident_tag<'a, I: ParseInput<'a>, E: ParseError<I>>(
     }
 }
 
-fn preceded_tag<'a, O, I, F, E>(id: &'static str, mut f: F) -> impl FnMut(I) -> IResult<I, O, E>
+fn preceded_tag<'a, O, I, F, E>(
+    id: &'static str,
+    mut f: F,
+) -> impl FnMut(I) -> IResult<I, O, E> + use<O, I, F, E>
 where
     I: ParseInput<'a>,
     E: ParseError<I>,
@@ -745,7 +748,7 @@ where
 fn preceded_ident_tag<'a, O, I, F, E>(
     id: &'static str,
     mut f: F,
-) -> impl FnMut(I) -> IResult<I, O, E>
+) -> impl FnMut(I) -> IResult<I, O, E> + use<O, I, F, E>
 where
     I: ParseInput<'a>,
     E: ParseError<I>,
@@ -761,7 +764,7 @@ fn preceded_tag2_cut<'a, O, I, F, E>(
     id1: &'static str,
     id2: &'static str,
     mut f: F,
-) -> impl FnMut(I) -> IResult<I, O, E>
+) -> impl FnMut(I) -> IResult<I, O, E> + use<O, I, F, E>
 where
     I: ParseInput<'a>,
     E: ParseError<I>,
@@ -774,7 +777,7 @@ where
     }
 }
 
-fn paren_cut<'a, O, I, F, E>(mut f: F) -> impl FnMut(I) -> IResult<I, O, E>
+fn paren_cut<'a, O, I, F, E>(mut f: F) -> impl FnMut(I) -> IResult<I, O, E> + use<O, I, F, E>
 where
     I: ParseInput<'a>,
     E: ParseError<I>,

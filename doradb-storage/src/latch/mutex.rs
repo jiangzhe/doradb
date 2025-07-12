@@ -109,15 +109,16 @@ impl RawMutex {
     /// Returns false if lock can not be acquired.
     #[inline]
     pub fn try_lock(&self) -> bool {
-        let res = self.inner.try_lock();
-        res
+        self.inner.try_lock()
     }
 
     /// Unlock the mutex.
     #[inline]
     pub unsafe fn unlock(&self) {
-        self.inner.unlock();
-        self.event.notify(1usize.relaxed());
+        unsafe {
+            self.inner.unlock();
+            self.event.notify(1usize.relaxed());
+        }
     }
 
     /// Lock this mutex in async way.

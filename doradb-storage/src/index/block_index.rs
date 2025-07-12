@@ -447,10 +447,10 @@ impl BlockIndex {
         count: usize,
         metadata: &TableMetadata,
     ) -> PageSharedGuard<RowPage> {
-        match self.get_insert_page_from_free_list(buf_pool).await {
-            Ok(free_page) => return free_page,
-            _ => (), // we just ignore the free list error and latch error, and continue to get new page.
+        if let Ok(free_page) = self.get_insert_page_from_free_list(buf_pool).await {
+            return free_page;
         }
+        // we just ignore the free list error and latch error, and continue to get new page.
         let mut new_page = buf_pool.allocate_page::<RowPage>().await;
         self.insert_page_guard(count, metadata, &mut new_page).await;
         new_page.downgrade_shared()
@@ -464,13 +464,13 @@ impl BlockIndex {
         count: usize,
         metadata: &TableMetadata,
     ) -> PageExclusiveGuard<RowPage> {
-        match self
+        if let Ok(free_page) = self
             .get_insert_page_exclusive_from_free_list(buf_pool)
             .await
         {
-            Ok(free_page) => return free_page,
-            _ => (), // we just ignore the free list error and latch error, and continue to get new page.
+            return free_page;
         }
+        // we just ignore the free list error and latch error, and continue to get new page.
         let mut new_page = buf_pool.allocate_page::<RowPage>().await;
         self.insert_page_guard(count, metadata, &mut new_page).await;
         new_page
@@ -508,9 +508,7 @@ impl BlockIndex {
                 Valid((start_row_id, end_row_id)) => {
                     // initialize row page.
                     debug_assert!(end_row_id == start_row_id + count as u64);
-                    new_page
-                        .page_mut()
-                        .init(start_row_id, count as usize, metadata);
+                    new_page.page_mut().init(start_row_id, count, metadata);
                     // create and attach a new empty undo map.
                     new_page.bf_mut().init_undo_map(count);
 
@@ -916,7 +914,7 @@ pub struct BlockIndexCursor<'a> {
     child: Option<FacadePageGuard<BlockNode>>,
 }
 
-impl<'a> BlockIndexCursor<'a> {
+impl BlockIndexCursor<'_> {
     #[inline]
     pub async fn seek(&mut self, row_id: RowID) {
         loop {

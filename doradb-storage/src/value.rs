@@ -200,10 +200,7 @@ impl Layout {
 
     #[inline]
     pub fn is_fixed(&self) -> bool {
-        match self {
-            Layout::VarByte => false,
-            _ => true,
-        }
+        !matches!(self, Layout::VarByte)
     }
 }
 
@@ -228,7 +225,7 @@ impl From<u8> for ValCode {
 /// Val is value representation of row-store.
 /// The variable-length data may require new allocation
 /// because we cannot rely on page data.
-#[derive(Clone, Serialize, Default, Deserialize, Eq, Hash)]
+#[derive(Clone, Serialize, Default, Deserialize, Eq)]
 pub enum Val {
     #[default]
     Null,
@@ -253,6 +250,20 @@ impl PartialEq for Val {
             (Val::Byte8(l), Val::Byte8(r)) => l == r,
             (Val::VarByte(l), Val::VarByte(r)) => l.as_bytes() == r.as_bytes(),
             _ => false,
+        }
+    }
+}
+
+impl Hash for Val {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Val::Null => state.write_u64(0),
+            Val::Byte1(v) => state.write_u64(*v as u64),
+            Val::Byte2(v) => state.write_u64(*v as u64),
+            Val::Byte4(v) => state.write_u64(*v as u64),
+            Val::Byte8(v) => state.write_u64(*v),
+            Val::VarByte(var) => state.write(var.as_bytes()),
         }
     }
 }
@@ -547,7 +558,7 @@ impl Ser<'_> for Val {
 
 impl Deser for Val {
     #[inline]
-    fn deser<'a>(_ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(_ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let mut idx = start_idx;
         let code = ValCode::from(input[idx]);
         idx += 1;
@@ -578,115 +589,20 @@ impl Deser for Val {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum ValRef<'a> {
-    Byte1(Byte1Val),
-    Byte2(Byte2Val),
-    Byte4(Byte4Val),
-    Byte8(Byte8Val),
-    VarByte(&'a [u8]),
-}
-
-impl<'a> From<u8> for ValRef<'a> {
-    #[inline]
-    fn from(value: u8) -> Self {
-        ValRef::Byte1(value)
-    }
-}
-
-impl<'a> From<i8> for ValRef<'a> {
-    #[inline]
-    fn from(value: i8) -> Self {
-        ValRef::Byte1(value as u8)
-    }
-}
-
-impl<'a> From<u16> for ValRef<'a> {
-    #[inline]
-    fn from(value: u16) -> Self {
-        ValRef::Byte2(value)
-    }
-}
-
-impl<'a> From<i16> for ValRef<'a> {
-    #[inline]
-    fn from(value: i16) -> Self {
-        ValRef::Byte2(value as u16)
-    }
-}
-
-impl<'a> From<u32> for ValRef<'a> {
-    #[inline]
-    fn from(value: u32) -> Self {
-        ValRef::Byte4(value)
-    }
-}
-
-impl<'a> From<i32> for ValRef<'a> {
-    #[inline]
-    fn from(value: i32) -> Self {
-        ValRef::Byte4(value as u32)
-    }
-}
-
-impl<'a> From<f32> for ValRef<'a> {
-    #[inline]
-    fn from(value: f32) -> Self {
-        ValRef::Byte4(u32::from_ne_bytes(value.to_ne_bytes()))
-    }
-}
-
-impl<'a> From<u64> for ValRef<'a> {
-    #[inline]
-    fn from(value: u64) -> Self {
-        ValRef::Byte8(value)
-    }
-}
-
-impl<'a> From<i64> for ValRef<'a> {
-    #[inline]
-    fn from(value: i64) -> Self {
-        ValRef::Byte8(value as u64)
-    }
-}
-
-impl<'a> From<f64> for ValRef<'a> {
-    #[inline]
-    fn from(value: f64) -> Self {
-        ValRef::Byte8(u64::from_ne_bytes(value.to_ne_bytes()))
-    }
-}
-
-impl<'a> From<&'a [u8]> for ValRef<'a> {
-    #[inline]
-    fn from(value: &'a [u8]) -> Self {
-        ValRef::VarByte(value)
-    }
-}
-
-impl<'a> From<&'a str> for ValRef<'a> {
-    #[inline]
-    fn from(value: &'a str) -> Self {
-        ValRef::VarByte(value.as_bytes())
-    }
-}
-
 /// Value is a marker trait to represent
 /// fixed-length column value in row page.
-pub trait Value: Sized {
+pub(crate) trait Value: Sized {
     const LAYOUT: Layout;
 
+    /// Store self value into target position in atomic way.
+    ///
+    /// # Safety: This method is only used for atomic update on page.
     unsafe fn atomic_store(&self, ptr: *const u8);
 
+    /// Store self value into target position.
+    ///
+    /// # Safety: This method is only used for atomic update on page.
     unsafe fn store(&self, ptr: *mut u8);
-
-    unsafe fn atomic_load(ptr: *mut u8) -> Self;
-}
-
-pub trait ToValue {
-    type Target: Value;
-
-    fn to_val(&self) -> Self::Target;
 }
 
 pub type Byte1Val = u8;
@@ -700,19 +616,17 @@ impl Value for Byte1Val {
     const LAYOUT: Layout = Layout::Byte1;
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
-        let atom = AtomicU8::from_ptr(ptr as *mut _);
-        atom.store(*self, Ordering::Relaxed);
+        unsafe {
+            let atom = AtomicU8::from_ptr(ptr as *mut _);
+            atom.store(*self, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
-        *ptr = *self;
-    }
-
-    #[inline]
-    unsafe fn atomic_load(ptr: *mut u8) -> Self {
-        let atom = AtomicU8::from_ptr(ptr);
-        atom.load(Ordering::Relaxed)
+        unsafe {
+            *ptr = *self;
+        }
     }
 }
 
@@ -728,22 +642,6 @@ impl Byte1ValSlice for [Byte1Val] {
     }
 }
 
-impl ToValue for u8 {
-    type Target = Byte1Val;
-    #[inline]
-    fn to_val(&self) -> Self::Target {
-        *self
-    }
-}
-
-impl ToValue for i8 {
-    type Target = Byte1Val;
-    #[inline]
-    fn to_val(&self) -> Self::Target {
-        *self as u8
-    }
-}
-
 pub type Byte2Val = u16;
 pub trait Byte2ValSlice {
     fn as_i16s(&self) -> &[i16];
@@ -754,37 +652,18 @@ impl Value for Byte2Val {
     const LAYOUT: Layout = Layout::Byte2;
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
-        debug_assert!(ptr as usize % 2 == 0);
-        let atom = AtomicU16::from_ptr(ptr as *mut u8 as *mut u16);
-        atom.store(*self, Ordering::Relaxed);
+        unsafe {
+            debug_assert!(ptr as usize % 2 == 0);
+            let atom = AtomicU16::from_ptr(ptr as *mut u8 as *mut u16);
+            atom.store(*self, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
-        *(ptr as *mut u16) = *self;
-    }
-
-    #[inline]
-    unsafe fn atomic_load(ptr: *mut u8) -> Self {
-        debug_assert!(ptr as usize % 2 == 0);
-        let atom = AtomicU16::from_ptr(ptr as *mut _);
-        atom.load(Ordering::Relaxed)
-    }
-}
-
-impl ToValue for u16 {
-    type Target = Byte2Val;
-    #[inline]
-    fn to_val(&self) -> Self::Target {
-        *self
-    }
-}
-
-impl ToValue for i16 {
-    type Target = Byte2Val;
-    #[inline]
-    fn to_val(&self) -> Self::Target {
-        *self as u16
+        unsafe {
+            *(ptr as *mut u16) = *self;
+        }
     }
 }
 
@@ -815,21 +694,18 @@ impl Value for Byte4Val {
     const LAYOUT: Layout = Layout::Byte4;
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
-        debug_assert!(ptr as usize % 4 == 0);
-        let atom = AtomicU32::from_ptr(ptr as *mut u8 as *mut u32);
-        atom.store(*self, Ordering::Relaxed);
+        unsafe {
+            debug_assert!(ptr as usize % 4 == 0);
+            let atom = AtomicU32::from_ptr(ptr as *mut u8 as *mut u32);
+            atom.store(*self, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
-        *(ptr as *mut u32) = *self;
-    }
-
-    #[inline]
-    unsafe fn atomic_load(ptr: *mut u8) -> Self {
-        debug_assert!(ptr as usize % 4 == 0);
-        let atom = AtomicU32::from_ptr(ptr as *mut _);
-        atom.load(Ordering::Relaxed)
+        unsafe {
+            *(ptr as *mut u32) = *self;
+        }
     }
 }
 
@@ -855,22 +731,6 @@ impl Byte4ValSlice for [Byte4Val] {
     }
 }
 
-impl ToValue for u32 {
-    type Target = Byte4Val;
-    #[inline]
-    fn to_val(&self) -> Self::Target {
-        *self
-    }
-}
-
-impl ToValue for i32 {
-    type Target = Byte4Val;
-    #[inline]
-    fn to_val(&self) -> Self::Target {
-        *self as u32
-    }
-}
-
 pub type Byte8Val = u64;
 pub trait Byte8ValSlice {
     fn as_i64s(&self) -> &[i64];
@@ -886,37 +746,18 @@ impl Value for Byte8Val {
     const LAYOUT: Layout = Layout::Byte8;
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
-        debug_assert!(ptr as usize % 8 == 0);
-        let atom = AtomicU64::from_ptr(ptr as *mut u8 as *mut u64);
-        atom.store(*self, Ordering::Relaxed);
+        unsafe {
+            debug_assert!(ptr as usize % 8 == 0);
+            let atom = AtomicU64::from_ptr(ptr as *mut u8 as *mut u64);
+            atom.store(*self, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
-        *(ptr as *mut u64) = *self;
-    }
-
-    #[inline]
-    unsafe fn atomic_load(ptr: *mut u8) -> Self {
-        debug_assert!(ptr as usize % 8 == 0);
-        let atom = AtomicU64::from_ptr(ptr as *mut _);
-        atom.load(Ordering::Relaxed)
-    }
-}
-
-impl ToValue for u64 {
-    type Target = Byte8Val;
-    #[inline]
-    fn to_val(&self) -> Self::Target {
-        *self
-    }
-}
-
-impl ToValue for i64 {
-    type Target = Byte8Val;
-    #[inline]
-    fn to_val(&self) -> Self::Target {
-        *self as u64
+        unsafe {
+            *(ptr as *mut u64) = *self;
+        }
     }
 }
 
@@ -990,6 +831,7 @@ impl PageVar {
     }
 
     /// Returns length of the value.
+    #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
         unsafe { self.i.len as usize }
@@ -1022,13 +864,17 @@ impl PageVar {
     }
 
     /// Returns bytes.
+    ///
+    /// # Safety
+    ///
+    /// Caller should make sure ptr is valid.
     #[inline]
-    pub fn as_bytes(&self, ptr: *const u8) -> &[u8] {
-        let len = self.len();
-        if len <= PAGE_VAR_LEN_INLINE {
-            unsafe { &self.i.data[..len] }
-        } else {
-            unsafe {
+    pub unsafe fn as_bytes(&self, ptr: *const u8) -> &[u8] {
+        unsafe {
+            let len = self.len();
+            if len <= PAGE_VAR_LEN_INLINE {
+                &self.i.data[..len]
+            } else {
                 let data = ptr.add(self.o.offset as usize);
                 std::slice::from_raw_parts(data, len)
             }
@@ -1036,13 +882,17 @@ impl PageVar {
     }
 
     /// Returns mutable bytes.
+    ///
+    /// # Safety
+    ///
+    /// Caller should make sure ptr is valid.
     #[inline]
-    pub fn as_bytes_mut(&mut self, ptr: *mut u8) -> &mut [u8] {
-        let len = self.len();
-        if len <= PAGE_VAR_LEN_INLINE {
-            unsafe { &mut self.i.data[..len] }
-        } else {
-            unsafe {
+    pub unsafe fn as_bytes_mut(&mut self, ptr: *mut u8) -> &mut [u8] {
+        unsafe {
+            let len = self.len();
+            if len <= PAGE_VAR_LEN_INLINE {
+                &mut self.i.data[..len]
+            } else {
                 let data = ptr.add(self.o.offset as usize);
                 std::slice::from_raw_parts_mut(data, len)
             }
@@ -1050,13 +900,17 @@ impl PageVar {
     }
 
     /// Returns string.
+    ///
+    /// # Safety
+    ///
+    /// Caller should make sure ptr is valid.
     #[inline]
-    pub fn as_str(&self, ptr: *const u8) -> &str {
-        let len = self.len();
-        if len <= PAGE_VAR_LEN_INLINE {
-            unsafe { std::str::from_utf8_unchecked(&self.i.data[..len]) }
-        } else {
-            unsafe {
+    pub unsafe fn as_str(&self, ptr: *const u8) -> &str {
+        unsafe {
+            let len = self.len();
+            if len <= PAGE_VAR_LEN_INLINE {
+                std::str::from_utf8_unchecked(&self.i.data[..len])
+            } else {
                 let data = ptr.add(self.o.offset as usize);
                 let bytes = std::slice::from_raw_parts(data, len);
                 std::str::from_utf8_unchecked(bytes)
@@ -1065,13 +919,17 @@ impl PageVar {
     }
 
     /// Returns mutable string.
+    ///
+    /// # Safety
+    ///
+    /// Caller should make sure ptr is valid.
     #[inline]
-    pub fn as_str_mut(&mut self, ptr: *mut u8) -> &mut str {
-        let len = self.len();
-        if len <= PAGE_VAR_LEN_INLINE {
-            unsafe { std::str::from_utf8_unchecked_mut(&mut self.i.data[..len]) }
-        } else {
-            unsafe {
+    pub unsafe fn as_str_mut(&mut self, ptr: *mut u8) -> &mut str {
+        unsafe {
+            let len = self.len();
+            if len <= PAGE_VAR_LEN_INLINE {
+                std::str::from_utf8_unchecked_mut(&mut self.i.data[..len])
+            } else {
                 let data = ptr.add(self.o.offset as usize);
                 let bytes = std::slice::from_raw_parts_mut(data, len);
                 std::str::from_utf8_unchecked_mut(bytes)
@@ -1081,10 +939,15 @@ impl PageVar {
 
     /// In-place update with given value.
     /// Caller must ensure no extra space is required.
+    ///
+    /// # Safety
+    ///
+    /// Caller should make sure ptr is valid.
     #[inline]
-    pub fn update_in_place(&mut self, ptr: *mut u8, val: &[u8]) {
-        debug_assert!(val.len() <= PAGE_VAR_LEN_INLINE || val.len() <= self.len());
+    pub unsafe fn update_in_place(&mut self, ptr: *mut u8, val: &[u8]) {
         unsafe {
+            debug_assert!(val.len() <= PAGE_VAR_LEN_INLINE || val.len() <= self.len());
+
             if val.len() > PAGE_VAR_LEN_INLINE {
                 // all not inline, but original is longer or equal to input value.
                 debug_assert!(self.len() > PAGE_VAR_LEN_INLINE);
@@ -1170,6 +1033,7 @@ impl MemVar {
     }
 
     /// Returns length of the value.
+    #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
         unsafe { self.i.len as usize }
@@ -1306,7 +1170,7 @@ impl From<Vec<u8>> for MemVar {
 
 struct MemVarVisitor;
 
-impl<'de> Visitor<'de> for MemVarVisitor {
+impl Visitor<'_> for MemVarVisitor {
     type Value = MemVar;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -1406,7 +1270,7 @@ mod tests {
         let var1 = PageVar::inline(b"hello");
         assert!(var1.is_inlined());
         assert!(var1.len() == 5);
-        assert!(var1.as_bytes(std::ptr::null()) == b"hello");
+        assert!(unsafe { var1.as_bytes(std::ptr::null()) } == b"hello");
     }
 
     #[test]
@@ -1580,5 +1444,167 @@ mod tests {
         assert_eq!(next_pos, 6); // 应该前进2个字节
         assert_eq!(deserialized.kind, ValKind::I64);
         assert_eq!(deserialized.nullable, true);
+    }
+
+    #[test]
+    fn test_val_hash() {
+        use std::hash::DefaultHasher;
+        let hash1 = {
+            let v1 = Val::Byte1(1);
+            let mut h = DefaultHasher::new();
+            v1.hash(&mut h);
+            h.finish()
+        };
+        let hash2 = {
+            let v1 = Val::Byte2(1);
+            let mut h = DefaultHasher::new();
+            v1.hash(&mut h);
+            h.finish()
+        };
+        let hash3 = {
+            let v1 = Val::Byte4(1);
+            let mut h = DefaultHasher::new();
+            v1.hash(&mut h);
+            h.finish()
+        };
+        let hash4 = {
+            let v1 = Val::Byte8(1);
+            let mut h = DefaultHasher::new();
+            v1.hash(&mut h);
+            h.finish()
+        };
+        assert!(hash1 == hash2 && hash1 == hash3 && hash1 == hash4);
+
+        let hash5 = {
+            let v1 = Val::VarByte(MemVar::inline(b"hello"));
+            let mut h = DefaultHasher::new();
+            v1.hash(&mut h);
+            h.finish()
+        };
+        let hash6 = {
+            let v1 = Val::VarByte(MemVar::inline(b"hello  "));
+            let mut h = DefaultHasher::new();
+            v1.hash(&mut h);
+            h.finish()
+        };
+        assert!(hash5 != hash6);
+    }
+
+    #[test]
+    fn test_page_var_inline() {
+        let data = b"hello";
+        let var = PageVar::inline(data);
+        assert!(var.is_inlined());
+        assert_eq!(var.len(), data.len());
+        assert_eq!(unsafe { var.as_bytes(std::ptr::null()) }, data);
+        assert_eq!(var.offset(), None);
+    }
+
+    #[test]
+    fn test_page_var_outline() {
+        let data = b"a long string that needs outline storage";
+        let mut page_data = vec![0u8; 100];
+        let offset = 10;
+        let prefix = &data[..PAGE_VAR_LEN_PREFIX];
+
+        // Store data in page
+        page_data[offset..offset + data.len()].copy_from_slice(data);
+
+        let var = PageVar::outline(data.len() as u16, offset as u16, prefix);
+        assert!(!var.is_inlined());
+        assert_eq!(var.len(), data.len());
+        assert_eq!(var.offset(), Some(offset));
+        assert_eq!(unsafe { var.as_bytes(page_data.as_ptr()) }, data);
+    }
+
+    #[test]
+    fn test_page_var_len() {
+        let short_data = b"short";
+        let long_data = b"a long string that exceeds inline limit";
+
+        let short_var = PageVar::inline(short_data);
+        let long_var =
+            PageVar::outline(long_data.len() as u16, 0, &long_data[..PAGE_VAR_LEN_PREFIX]);
+
+        assert_eq!(short_var.len(), short_data.len());
+        assert_eq!(long_var.len(), long_data.len());
+    }
+
+    #[test]
+    fn test_page_var_is_inlined() {
+        let inline_data = b"inline";
+        let outline_data = b"this will be stored outline";
+
+        let inline_var = PageVar::inline(inline_data);
+        let outline_var = PageVar::outline(
+            outline_data.len() as u16,
+            0,
+            &outline_data[..PAGE_VAR_LEN_PREFIX],
+        );
+
+        assert!(inline_var.is_inlined());
+        assert!(!outline_var.is_inlined());
+    }
+
+    #[test]
+    fn test_page_var_outline_len() {
+        let inline_data = b"short";
+        let outline_data = b"a long string that needs outline storage";
+
+        assert_eq!(PageVar::outline_len(inline_data), 0);
+        assert_eq!(PageVar::outline_len(outline_data), outline_data.len());
+    }
+
+    #[test]
+    fn test_page_var_as_str() {
+        let inline_str = "hello";
+        let outline_str = "a longer string that requires outline storage";
+        let mut page_data = vec![0u8; 100];
+        let offset = 20;
+
+        // Store outline data
+        page_data[offset..offset + outline_str.len()].copy_from_slice(outline_str.as_bytes());
+
+        let inline_var = PageVar::inline(inline_str.as_bytes());
+        let outline_var = PageVar::outline(
+            outline_str.len() as u16,
+            offset as u16,
+            &outline_str.as_bytes()[..PAGE_VAR_LEN_PREFIX],
+        );
+
+        assert_eq!(unsafe { inline_var.as_str(std::ptr::null()) }, inline_str);
+        assert_eq!(
+            unsafe { outline_var.as_str(page_data.as_ptr()) },
+            outline_str
+        );
+    }
+
+    #[test]
+    fn test_page_var_update_in_place() {
+        let mut page_data = vec![0u8; 100];
+        let offset = 30;
+        let original_data = b"original data";
+        let updated_data = b"updated";
+        let short_data = b"short";
+
+        // Store original data
+        page_data[offset..offset + original_data.len()].copy_from_slice(original_data);
+
+        let mut var = PageVar::outline(
+            original_data.len() as u16,
+            offset as u16,
+            &original_data[..PAGE_VAR_LEN_PREFIX],
+        );
+
+        // Update with shorter data (should not switch to inline)
+        unsafe { var.update_in_place(page_data.as_mut_ptr(), updated_data) };
+        assert!(!var.is_inlined());
+        assert_eq!(var.len(), updated_data.len());
+        assert_eq!(unsafe { var.as_bytes(page_data.as_ptr()) }, updated_data);
+        // Update with shorter data (should not switch to inline)
+        unsafe { var.update_in_place(page_data.as_mut_ptr(), short_data) };
+        assert!(var.is_inlined());
+        assert_eq!(var.len(), short_data.len());
+        assert_eq!(unsafe { var.as_bytes(std::ptr::null()) }, short_data);
     }
 }

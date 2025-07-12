@@ -108,7 +108,7 @@ impl IndexUndoLogs {
     /// should be merged into transaction-level index undo buffer.
     #[inline]
     pub fn merge(&mut self, other: &mut Self) {
-        self.0.extend(other.0.drain(..));
+        self.0.append(&mut other.0);
     }
 
     /// Prepare index undo logs for GC.

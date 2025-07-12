@@ -381,7 +381,7 @@ impl Table {
         page_guard.set_dirty(); // mark as dirty page.
 
         if !disable_index {
-            let keys = self.metadata.keys_for_insert(&cols);
+            let keys = self.metadata.keys_for_insert(cols);
             for key in keys {
                 match self.recover_index_insert(buf_pool, key, row_id, cts).await {
                     RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
@@ -405,7 +405,7 @@ impl Table {
         let row_idx = page.row_idx(row_id);
         // Insert log should always be located to an empty slot.
         debug_assert!(ctx.recover().unwrap().is_vacant(row_idx));
-        let var_len = var_len_for_insert(&self.metadata, &cols);
+        let var_len = var_len_for_insert(&self.metadata, cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -1014,16 +1014,16 @@ impl Table {
     ///
     /// There are two cases:
     /// 1. The old row is deleted.
-    /// In this case, the old row must be committed and the DELETE undo
-    /// entry is not purged so some other transaction is still able to
-    /// see a non-deleted version.
-    /// We need to link new row(via undo head) to the DELETE entry.
+    ///    In this case, the old row must be committed and the DELETE undo
+    ///    entry is not purged so some other transaction is still able to
+    ///    see a non-deleted version.
+    ///    We need to link new row(via undo head) to the DELETE entry.
     ///
     /// 2. The old row is updated with another key but one of its
-    /// old versions matches the key.
-    /// In this case, the old row must be committed.
-    /// We need to find the key-match version, and can link new row
-    /// to it.
+    ///    old versions matches the key.
+    ///    In this case, the old row must be committed.
+    ///    We need to find the key-match version, and can link new row
+    ///    to it.
     #[inline]
     async fn link_for_unique_index<P: BufferPool>(
         &self,
@@ -1131,7 +1131,7 @@ impl Table {
         let mut access = page_guard.write_row(row_idx);
         access.lock_undo(stmt, &self.metadata, self.table_id(), page_id, row_id, None);
         // Apply insert
-        let mut new_row = page.new_row(row_idx as usize, var_offset);
+        let mut new_row = page.new_row(row_idx, var_offset);
         for v in &cols {
             match v {
                 Val::Null => new_row.add_null(),
@@ -1157,7 +1157,7 @@ impl Table {
             debug_assert!({ old_access.undo_head().is_some() });
             debug_assert!(stmt
                 .trx
-                .is_same_trx(&old_access.undo_head().as_ref().unwrap()));
+                .is_same_trx(old_access.undo_head().as_ref().unwrap()));
             // re-lock moved row and link new entry to it.
             let move_entry = old_access.first_undo_entry().unwrap();
             let new_entry = stmt.row_undo.last_mut().unwrap();
@@ -1233,8 +1233,8 @@ impl Table {
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
         match &mut lock_row {
-            LockRowForWrite::InvalidIndex => return UpdateRowInplace::RowNotFound,
-            LockRowForWrite::WriteConflict => return UpdateRowInplace::WriteConflict,
+            LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound,
+            LockRowForWrite::WriteConflict => UpdateRowInplace::WriteConflict,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
                 if access.row().is_deleted() {
@@ -1271,10 +1271,9 @@ impl Table {
                         // perform in-place update.
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
                         for uc in &mut update {
-                            if let Some((old, var_offset)) =
+                            if let Some((old_val, var_offset)) =
                                 row.different(&self.metadata, uc.idx, &uc.val)
                             {
-                                let old_val = Val::from(old);
                                 let new_val = mem::take(&mut uc.val);
                                 // we also check whether the value change is related to any index,
                                 // so we can update index later.
@@ -1336,8 +1335,8 @@ impl Table {
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
         match &mut lock_row {
-            LockRowForWrite::InvalidIndex => return DeleteInternal::NotFound,
-            LockRowForWrite::WriteConflict => return DeleteInternal::WriteConflict,
+            LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
+            LockRowForWrite::WriteConflict => DeleteInternal::WriteConflict,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
                 if access.row().is_deleted() {
@@ -1709,7 +1708,7 @@ impl Table {
             debug_assert!(index.is_unique() == index_schema.unique());
             if index_schema.unique() {
                 let key =
-                    read_latest_index_key(&self.metadata, index.index_no, &page_guard, new_row_id);
+                    read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
                 if index_key_is_changed(index_schema, index_change_cols) {
                     let old_key = index_key_replace(index_schema, &key, index_change_cols);
                     // key change and row id change.
@@ -1774,6 +1773,8 @@ impl Table {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
     async fn update_unique_index_key_and_row_id_change<P: BufferPool>(
         &self,
         buf_pool: &'static P,

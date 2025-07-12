@@ -20,6 +20,7 @@ pub const fn align_u128(v: usize) -> usize {
 ///
 /// The memory is leaked, and raw pointer is returned.
 /// Caller should always call free_aligned to release the memory.
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 pub(crate) fn alloc_aligned(cap: usize) -> (*mut u8, usize) {
     let cap = usize::max(16, cap);
@@ -30,6 +31,7 @@ pub(crate) fn alloc_aligned(cap: usize) -> (*mut u8, usize) {
     (array.as_mut_ptr() as *mut u8, cap)
 }
 
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 pub(crate) fn alloc_aligned_zeroes(cap: usize) -> (*mut u8, usize) {
     let cap = usize::max(16, cap);
@@ -40,6 +42,7 @@ pub(crate) fn alloc_aligned_zeroes(cap: usize) -> (*mut u8, usize) {
     (array.as_mut_ptr() as *mut u8, cap)
 }
 
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 pub(crate) fn alloc_aligned_ones(cap: usize) -> (*mut u8, usize) {
     let cap = usize::max(16, cap);
@@ -59,9 +62,11 @@ pub(crate) fn alloc_aligned_ones(cap: usize) -> (*mut u8, usize) {
 /// once. After this call, the memory must not be used.
 #[inline]
 pub(crate) unsafe fn free_aligned(ptr: *mut u8, cap: usize) {
-    assert!(cap % 16 == 0);
-    let cap_u128 = cap / 16;
-    let _ = Vec::<U128>::from_raw_parts(ptr as *mut U128, cap_u128, cap_u128);
+    unsafe {
+        assert!(cap % 16 == 0);
+        let cap_u128 = cap / 16;
+        let _ = Vec::<U128>::from_raw_parts(ptr as *mut U128, cap_u128, cap_u128);
+    }
 }
 
 /// RawArray is a safe abstraction of an aligned byte array.
@@ -160,8 +165,10 @@ impl RawArray {
     /// 3. Input type T must has aligned no more than 16.
     #[inline]
     pub unsafe fn cast_slice<T: ByteRepr>(&self, len: usize) -> &[T] {
-        debug_assert!(self.cap_u8 >= len * size_of::<T>());
-        std::slice::from_raw_parts(self.ptr.as_ptr() as *const T, len)
+        unsafe {
+            debug_assert!(self.cap_u8 >= len * size_of::<T>());
+            std::slice::from_raw_parts(self.ptr.as_ptr() as *const T, len)
+        }
     }
 
     /// Cast underlying byte slice to mutable slice of given type T.
@@ -173,8 +180,10 @@ impl RawArray {
     /// 3. Input type T must has aligned no more than 16.
     #[inline]
     pub unsafe fn cast_slice_mut<T: ByteRepr>(&mut self, len: usize) -> &mut [T] {
-        debug_assert!(self.cap_u8 >= len * size_of::<T>());
-        std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut T, len)
+        unsafe {
+            debug_assert!(self.cap_u8 >= len * size_of::<T>());
+            std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut T, len)
+        }
     }
 
     /// Reserve at least given number of bytes.
@@ -191,7 +200,7 @@ impl RawArray {
         unsafe {
             let new_slice = std::slice::from_raw_parts_mut(new_ptr, new_cap);
             new_slice[..self.cap_u8].copy_from_slice(self.as_slice());
-            free_aligned(self.ptr.as_ptr() as *mut u8, self.cap_u8);
+            free_aligned(self.ptr.as_ptr(), self.cap_u8);
         }
         self.ptr = NonNull::new(new_ptr).unwrap();
         self.cap_u8 = new_cap;

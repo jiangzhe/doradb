@@ -1,4 +1,4 @@
-use crate::mysql::error::{ensure_empty, Error, Result};
+use crate::mysql::error::{Error, Result, ensure_empty};
 use crate::mysql::serde::{LenEncInt, LenEncStr, SerdeCtx};
 
 /// Defines how to deserialize objects from bytes.
@@ -325,7 +325,7 @@ mod tests {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let mut buf = vec![0u8; 1024 * 1024 * 18];
-        let data: Vec<u8> = (0..1024 * 1024 * 17).map(|_| rng.gen()).collect();
+        let data: Vec<u8> = (0..1024 * 1024 * 17).map(|_| rng.r#gen()).collect();
         // serialize
         let ser_buf = &mut buf[..];
         let ser_buf = ser_buf.ser_le_f32(0.1);
@@ -340,7 +340,7 @@ mod tests {
         let ser_buf = ser_buf.ser_len_enc_str(LenEncStr::from(&data[..1024])); // u16 les
         let ser_buf = ser_buf.ser_len_enc_str(LenEncStr::from(&data[..1024 * 128])); // u24 les
         let _ = ser_buf.ser_len_enc_str(LenEncStr::from(&data[..1024 * 1024 * 17])); // u64 les
-                                                                                     // deserialize
+        // deserialize
         let de_buf = &mut &buf[..];
         let v = de_buf.try_deser_le_f32().unwrap();
         assert_eq!(v, 0.1);

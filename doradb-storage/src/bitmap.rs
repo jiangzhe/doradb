@@ -122,6 +122,7 @@ impl Bitmap for [u64] {
 }
 
 /// Create a new bitmap with all zeros.
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 pub fn new_bitmap(nbr_of_bits: usize) -> Box<[u64]> {
     let len = (nbr_of_bits + 63) / 64;
@@ -138,7 +139,7 @@ pub struct BitmapRangeIter<'a> {
     n: usize,             // previous repeat number
 }
 
-impl<'a> BitmapRangeIter<'a> {
+impl BitmapRangeIter<'_> {
     #[inline]
     fn break_falses_in_word(&mut self) {
         debug_assert!(self.prev);
@@ -194,7 +195,7 @@ impl<'a> BitmapRangeIter<'a> {
     }
 }
 
-impl<'a> Iterator for BitmapRangeIter<'a> {
+impl Iterator for BitmapRangeIter<'_> {
     type Item = (bool, usize);
     /// Returns bool value with its repeat number.
     /// The implementation scans the bitmap on two levels.
@@ -302,7 +303,7 @@ pub struct BitmapTrueIndexIter<'a> {
     end: usize,
 }
 
-impl<'a> Iterator for BitmapTrueIndexIter<'a> {
+impl Iterator for BitmapTrueIndexIter<'_> {
     type Item = usize;
     #[inline]
     fn next(&mut self) -> Option<usize> {

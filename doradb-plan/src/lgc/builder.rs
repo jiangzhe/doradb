@@ -356,6 +356,7 @@ impl<'c, C: Catalog> LgcBuilder<'c, C> {
     /// 5. translate HAVING clause
     /// 6. translate ORDER BY clause
     /// 7. translate LIMIT clause
+    ///
     /// The final operator tree will conditinally reorder and merge them.
     #[inline]
     fn setup_select_table<'a>(
@@ -597,20 +598,20 @@ impl<'c, C: Catalog> LgcBuilder<'c, C> {
     /// To expand asterisk, we need to consider of different scenarios:
     ///
     /// 1. Single source.
-    /// a). Table: "SELECT t.* FROM t"
-    /// Derive projection by looking up from catalog
-    ///
-    /// b). Subquery: "SELECT * FROM (SELECT c0 FROM t) t2"
-    /// Derive projection from output list.
+    ///    a). Table: "SELECT t.* FROM t"
+    ///    Derive projection by looking up from catalog.
+    ///    b). Subquery: "SELECT * FROM (SELECT c0 FROM t) t2"
+    ///    Derive projection from output list.
     ///
     /// 2. query from multiple sources, including explicit joins.
-    /// e.g.
-    /// "SELECT * FROM t0, t1"
-    /// "SELECT t0.* FROM t0 JOIN (SELECT * FROM t1) t2"
-    /// "SELECT * FROM t0, t0 as t1 WHERE t0.c0 = t1.c1"
-    /// In this case, we need to
-    /// a) Convert table to subquery, then derive projection from it.
-    /// b) For each subquery, derive its output.
+    ///    e.g.
+    ///    "SELECT * FROM t0, t1"
+    ///    "SELECT t0.* FROM t0 JOIN (SELECT * FROM t1) t2"
+    ///    "SELECT * FROM t0, t0 as t1 WHERE t0.c0 = t1.c1"
+    ///    In this case, we need to
+    ///    a) Convert table to subquery, then derive projection from it.
+    ///    b) For each subquery, derive its output.
+    ///
     /// NOTE: The order of output columns is important, because later we will
     ///       reorder the sources(join reorder).
     #[inline]
@@ -871,10 +872,7 @@ impl<'c, C: Catalog> LgcBuilder<'c, C> {
                         if let Some(t) = self.catalog.find_table_by_name(schema_id, &tbl_name) {
                             t.id
                         } else {
-                            return Err(Error::TableNotExists(format!(
-                                "{}.{}",
-                                schema_name, tbl_name
-                            )));
+                            return Err(Error::TableNotExists(format!("{schema_name}.{tbl_name}")));
                         };
                     // now manually construct a subquery to expose all columns in the table
                     self.table_to_subquery(schema_id, schema_name, table_id, tbl_name, colgen)?
@@ -959,8 +957,7 @@ impl<'c, C: Catalog> LgcBuilder<'c, C> {
         // placeholder for table query.
         let (qry_id, subquery) = self.qs.insert_empty();
         for c in all_cols {
-            let idx = ColIndex::from(c.idx);
-            let col = colgen.gen_tbl_col(table_id, idx, c.pty, c.name.clone());
+            let col = colgen.gen_tbl_col(table_id, c.idx, c.pty, c.name.clone());
             proj_cols.push(ProjCol::implicit_alias(col, c.name))
         }
         let scan = OpKind::table(schema_id, schema_name, table_id, table_name, proj_cols);
@@ -990,6 +987,7 @@ impl<'c, C: Catalog> LgcBuilder<'c, C> {
 /// 1. aggr-funcs are not allowed as group items in aggr.
 /// 2. all non-aggr expressions in proj must be group items in aggr.
 /// 3. proj can have constant values, can also eliminate group items in aggr.
+///
 /// Returns true if the aggregation is scalar aggregation.
 #[inline]
 fn validate_proj_aggr(proj_cols: &[ProjCol], aggr_groups: &[ExprKind]) -> Result<bool> {
@@ -1129,7 +1127,7 @@ fn validate_order(aggr_groups: &[ExprKind], scalar_aggr: bool, order: &[SortItem
 /// no-op resolver for row subquery.
 pub struct ResolveNone<'a, C: Catalog>(&'a C);
 
-impl<'a, C: Catalog> ExprResolve<C> for ResolveNone<'a, C> {
+impl<C: Catalog> ExprResolve<C> for ResolveNone<'_, C> {
     #[inline]
     fn catalog(&self) -> &C {
         self.0
@@ -1158,7 +1156,7 @@ pub struct ResolveProjOrFilt<'a, C> {
     query_aliases: &'a QueryAliases,
 }
 
-impl<'a, C: Catalog> ExprResolve<C> for ResolveProjOrFilt<'a, C> {
+impl<C: Catalog> ExprResolve<C> for ResolveProjOrFilt<'_, C> {
     #[inline]
     fn catalog(&self) -> &C {
         self.catalog

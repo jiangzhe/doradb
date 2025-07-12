@@ -81,7 +81,7 @@ impl Sel {
         match self {
             Sel::All(_) => Ok(true),
             Sel::None(_) => Ok(false),
-            Sel::Bitmap(b) => b.get(idx).map_err(Into::into),
+            Sel::Bitmap(b) => b.get(idx),
             Sel::Index { count, indexes, .. } => Ok(indexes[..*count as usize]
                 .iter()
                 .any(|i| idx == *i as usize)),
@@ -634,7 +634,7 @@ fn sel_indexes(attr: &Attr, sel: &[u16]) -> Result<Attr> {
     Ok(res)
 }
 
-impl<'a> TryFrom<&'a Attr> for Sel {
+impl TryFrom<&Attr> for Sel {
     type Error = Error;
     #[inline]
     fn try_from(src: &Attr) -> Result<Self> {

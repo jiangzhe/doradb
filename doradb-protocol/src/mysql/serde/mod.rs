@@ -305,8 +305,9 @@ pub(crate) mod tests {
     pub(crate) fn check_ser<T: NewMySer>(ctx: &mut SerdeCtx, val: &T, buf: &ByteBuffer) {
         // serialize
         ctx.reset_pkt_nr();
-        let (writable, _wg) = buf.writable().unwrap();
-        let w_len = val.new_my_ser(ctx).my_ser(ctx, writable, 0);
+        let mut wg = buf.writable().unwrap();
+        let w_len = val.new_my_ser(ctx).my_ser(ctx, &mut wg, 0);
+        drop(wg);
         buf.advance_w_idx(w_len).unwrap();
     }
 
@@ -315,9 +316,9 @@ pub(crate) mod tests {
     pub(crate) fn check_deser<'a, T: MyDeser<'a>>(ctx: &mut SerdeCtx, buf: &'a ByteBuffer) -> T {
         // deserialize
         ctx.reset_pkt_nr();
-        let (readable, rg) = buf.readable().unwrap();
-        let res = my_deser_packet(ctx, readable).unwrap();
-        rg.advance(readable.len());
+        let rg = buf.readable().unwrap();
+        let res = my_deser_packet(ctx, rg.all()).unwrap();
+        rg.advance_to_end();
         res
     }
 }

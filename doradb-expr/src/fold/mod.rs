@@ -46,7 +46,7 @@ impl Fold for ExprKind {
 
 struct FoldExpr<'a, F>(&'a F);
 
-impl<'a, F> FoldExpr<'a, F> {
+impl<F> FoldExpr<'_, F> {
     fn update(&mut self, res: Result<Option<Const>>, e: &mut ExprKind) -> ControlFlow<Error> {
         match res {
             Err(err) => ControlFlow::Break(err),
@@ -59,7 +59,7 @@ impl<'a, F> FoldExpr<'a, F> {
     }
 }
 
-impl<'a, F: Fn(&mut ExprKind)> ExprMutVisitor for FoldExpr<'a, F> {
+impl<F: Fn(&mut ExprKind)> ExprMutVisitor for FoldExpr<'_, F> {
     type Cont = ();
     type Break = Error;
     fn leave(&mut self, e: &mut ExprKind) -> ControlFlow<Error> {
@@ -72,7 +72,7 @@ impl<'a, F: Fn(&mut ExprKind)> ExprMutVisitor for FoldExpr<'a, F> {
                 FuncKind::Sub => self.update(fold_sub(&args[0], &args[1]), e),
                 _ => ControlFlow::Continue(()), // todo: fold more functions
             },
-            ExprKind::Pred(Pred::Not(arg)) => self.update(fold_not(&arg), e),
+            ExprKind::Pred(Pred::Not(arg)) => self.update(fold_not(arg), e),
             ExprKind::Pred(Pred::Func { kind, args }) => match kind {
                 PredFuncKind::Equal => self.update(fold_eq(&args[0], &args[1]), e),
                 PredFuncKind::Greater => self.update(fold_gt(&args[0], &args[1]), e),

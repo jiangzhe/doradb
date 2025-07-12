@@ -227,7 +227,7 @@ impl LogPartition {
     fn create_new_group(
         &self,
         mut trx: PrecommitTrx,
-        mut group_commit_g: MutexGuard<'_, GroupCommit>,
+        group_commit_g: &mut MutexGuard<'_, GroupCommit>,
     ) -> (Option<Session>, EventListener) {
         let cts = trx.cts;
         let serde_ctx = SerdeCtx::default();
@@ -240,7 +240,7 @@ impl LogPartition {
             Ok((offset, _)) => (log_file.as_raw_fd(), offset),
             Err(AIOError::OutOfRange) => {
                 // rotate log file and try again.
-                self.rotate_log_file(&mut group_commit_g)
+                self.rotate_log_file(group_commit_g)
                     .expect("rotate log file");
 
                 let new_log_file = group_commit_g.log_file.as_ref().unwrap();
@@ -264,11 +264,11 @@ impl LogPartition {
             serde_ctx,
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
-        drop(group_commit_g);
-
         (session, listener)
     }
 
+    // disable clippy lint due to false positive.
+    #[allow(clippy::await_holding_lock)]
     #[inline]
     pub(super) async fn commit(
         &self,
@@ -280,8 +280,9 @@ impl LogPartition {
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
-            let (session, listener) = self.create_new_group(precommit_trx, group_commit_g);
+            let (session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
             self.group_commit.notify_one(); // notify sync thread to work.
+            drop(group_commit_g);
             listener.await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
@@ -301,8 +302,9 @@ impl LogPartition {
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             return Ok(session);
         }
-        let (session, listener) = self.create_new_group(precommit_trx, group_commit_g);
+        let (session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
         self.group_commit.notify_one(); // notify sync thread to work.
+        drop(group_commit_g);
         listener.await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
         Ok(session)
@@ -747,7 +749,7 @@ fn shrink_inflight(
 
 #[inline]
 fn log_file_name(file_prefix: &str, log_no: usize, file_seq: u32) -> String {
-    format!("{}.{}.{:08x}", file_prefix, log_no, file_seq)
+    format!("{file_prefix}.{log_no}.{file_seq:08x}")
 }
 
 /// Create a new log file.
@@ -769,15 +771,16 @@ pub(super) fn create_log_file(
 
 #[inline]
 pub fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<PathBuf>> {
-    let pattern = format!("{}.{}.*", file_prefix, log_no);
+    let pattern = format!("{file_prefix}.{log_no}.*");
     let mut res = vec![];
     for entry in glob(&pattern).unwrap() {
         res.push(entry?);
     }
     if desc {
+        // reverse sort.
         res.sort_by(|a, b| b.cmp(a));
     } else {
-        res.sort_by(|a, b| a.cmp(b));
+        res.sort();
     }
     Ok(res)
 }
@@ -786,9 +789,9 @@ pub fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Ve
 pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
     let file_name = file_path
         .file_name()
-        .ok_or_else(|| Error::InvalidFormat)?
+        .ok_or(Error::InvalidFormat)?
         .to_str()
-        .ok_or_else(|| Error::InvalidFormat)?;
+        .ok_or(Error::InvalidFormat)?;
     if file_name.len() < 9 {
         return Err(Error::InvalidFormat);
     }
@@ -818,8 +821,8 @@ impl MmapLogReader {
 
         Ok(MmapLogReader {
             m,
-            page_size: page_size,
-            max_file_size: max_file_size,
+            page_size,
+            max_file_size,
             offset,
         })
     }
@@ -830,7 +833,7 @@ impl MmapLogReader {
             return ReadLog::SizeLimit; // file is exhausted.
         }
         // Always read multiple pages.
-        debug_assert!(self.offset as usize == align_to_sector_size(self.offset as usize));
+        debug_assert!(self.offset == align_to_sector_size(self.offset));
         // Try single page first.
         // This may fail as log is incomplete.
         if let Some(mut buf) = self.m.get(self.offset..self.offset + self.page_size) {
@@ -881,7 +884,7 @@ pub struct LogGroup<'a> {
 
 impl LogGroup<'_> {
     #[inline]
-    pub fn next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
+    pub fn try_next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
         if self.data.is_empty() {
             return Ok(None);
         }
@@ -915,7 +918,7 @@ impl LogPartitionStream {
                 match reader.read() {
                     ReadLog::DataCorrupted => return Err(Error::LogFileCorrupted),
                     ReadLog::Some(mut log_group) => {
-                        while let Some(res) = log_group.next()? {
+                        while let Some(res) = log_group.try_next()? {
                             self.buffer.push_back(res);
                         }
                         return Ok(());
@@ -937,11 +940,11 @@ impl LogPartitionStream {
 
     #[inline]
     pub fn fill_if_empty(&mut self) -> Result<bool> {
-        if self.len() > 0 {
+        if !self.is_empty() {
             return Ok(true);
         }
         self.fill_buffer()?;
-        Ok(self.len() > 0)
+        Ok(!self.is_empty())
     }
 
     #[inline]
@@ -992,20 +995,13 @@ impl PartialOrd for LogPartitionStream {
     }
 }
 
+#[derive(Default)]
 pub struct LogMerger {
     heap: BinaryHeap<LogPartitionStream>,
     finished: Vec<LogPartitionStream>,
 }
 
 impl LogMerger {
-    #[inline]
-    pub fn new() -> Self {
-        LogMerger {
-            heap: BinaryHeap::new(),
-            finished: vec![],
-        }
-    }
-
     #[inline]
     pub fn add_stream(&mut self, mut stream: LogPartitionStream) -> Result<()> {
         // before put the stream into priority queue, make sure there is
@@ -1020,7 +1016,7 @@ impl LogMerger {
     }
 
     #[inline]
-    pub fn next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
+    pub fn try_next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
         match self.heap.pop() {
             Some(mut stream) => {
                 let res = stream.pop()?;
@@ -1103,7 +1099,7 @@ mod tests {
                         ReadLog::DataCorrupted => unreachable!(),
                         ReadLog::DataEnd => break,
                         ReadLog::Some(mut group) => {
-                            while let Some(pod) = group.next().unwrap() {
+                            while let Some(pod) = group.try_next().unwrap() {
                                 println!("header={:?}, payload={:?}", pod.header, pod.payload);
                                 log_recs += 1;
                             }
@@ -1173,7 +1169,7 @@ mod tests {
                         ReadLog::DataCorrupted => unreachable!(),
                         ReadLog::DataEnd => break,
                         ReadLog::Some(mut group) => {
-                            while let Some(pod) = group.next().unwrap() {
+                            while let Some(pod) = group.try_next().unwrap() {
                                 println!("header={:?}, payload={:?}", pod.header, pod.payload);
                                 log_recs += 1;
                             }
@@ -1191,14 +1187,14 @@ mod tests {
                 .log_partitions(2)
                 .skip_recovery(true);
 
-            let mut log_merger = LogMerger::new();
+            let mut log_merger = LogMerger::default();
             for i in 0..trx_sys_config.log_partitions {
                 let initializer = trx_sys_config.log_partition_initializer(i).unwrap();
                 let stream = initializer.stream();
                 log_merger.add_stream(stream).unwrap();
             }
 
-            while let Some(log) = log_merger.next().unwrap() {
+            while let Some(log) = log_merger.try_next().unwrap() {
                 println!("header={:?}, payload={:?}", log.header, log.payload);
             }
             // remove log file

@@ -713,23 +713,23 @@ fn update_simplify_single<F: FnMut(&mut ExprKind) -> Result<()>>(
 /// Simplify function.
 ///
 /// 1. remove pair of negating, e.g.
-/// --e => e
+///    --e => e
 /// 2. compute negating constant, e.g.
-/// -c => new_c
+///    -c => new_c
 /// 3. compute addition of constants, e.g.
-/// 1+1 => 2
+///    1+1 => 2
 /// 4. remote adding zero, e.g.
-/// e+0 => e
+///    e+0 => e
 /// 5. swap order of variable in addtion, e.g.
-/// 1+e => e+1
+///    1+e => e+1
 /// 6. associative, e.g.
-/// (e+1)+2 => e+3
-/// Note: (1+e)+2 => e+3 -- won't happen after rule 5, only for add/mul
+///    (e+1)+2 => e+3
+///    Note: (1+e)+2 => e+3 -- won't happen after rule 5, only for add/mul
 /// 7. commutative and associative, e.g.
-/// 1+(e+2) => e+3
-/// Note: 1+(2+e) => e+3 -- won't happen after rule 5, only for add/mul
+///    1+(e+2) => e+3
+///    Note: 1+(2+e) => e+3 -- won't happen after rule 5, only for add/mul
 /// 8. commutative and associative, e.g.
-/// (e1+1)+(e2+2) => (e1+e2)+3
+///    (e1+1)+(e2+2) => (e1+e2)+3
 fn simplify_func(fkind: FuncKind, fargs: &mut [ExprKind]) -> Result<Option<ExprKind>> {
     let res =
         match fkind {
@@ -1192,22 +1192,22 @@ fn const_sub_expr(c: Const, e: ExprKind) -> ExprKind {
 /// Simplify predicate.
 ///
 /// 1. NOT
-/// 1.1. not Exists => NotExists
-/// 1.2. not NotExists => Exists
-/// 1.3. not In => NotIn
-/// 1.4. not NotIn => In
-/// 1.5. not cmp => logical flipped cmp
-/// 1.6. not const => new_const
-/// 1.7. not not e => cast(e as bool)
+///    1.1. not Exists => NotExists
+///    1.2. not NotExists => Exists
+///    1.3. not In => NotIn
+///    1.4. not NotIn => In
+///    1.5. not cmp => logical flipped cmp
+///    1.6. not const => new_const
+///    1.7. not not e => cast(e as bool)
 ///
 /// 2. Comparison
-/// 2.1. null cmp const1 => null, except for SafeEqual
-/// 2.2. const1 cmp const2 => new_const
-/// 2.3. e1 + c1 cmp c2 => e1 cmp new_c
-/// 2.4. c1 cmp e1 + c2 => new_c cmp e1 => e1 flip_cmp new_c
-/// 2.5. c1 cmp e1 => e1 flip_cmp c1
-/// 2.6. e1 + c1 cmp e2 + c2 => e1 cmp e2 + new_c
-/// Note: 2.3 ~ 2.6 requires cmp operator can be positional flipped.
+///    2.1. null cmp const1 => null, except for SafeEqual
+///    2.2. const1 cmp const2 => new_const
+///    2.3. e1 + c1 cmp c2 => e1 cmp new_c
+///    2.4. c1 cmp e1 + c2 => new_c cmp e1 => e1 flip_cmp new_c
+///    2.5. c1 cmp e1 => e1 flip_cmp c1
+///    2.6. e1 + c1 cmp e2 + c2 => e1 cmp e2 + new_c
+///    Note: 2.3 ~ 2.6 requires cmp operator can be positional flipped.
 ///
 /// 3. CNF
 ///

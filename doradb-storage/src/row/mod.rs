@@ -223,14 +223,14 @@ impl RowPage {
         // insert row does not include RowID, as RowID is auto-generated.
         debug_assert!(user_cols.len() == self.header.col_count as usize);
 
-        let var_len = var_len_for_insert(schema, &user_cols);
+        let var_len = var_len_for_insert(schema, user_cols);
         let (row_idx, var_offset) =
             if let Some((row_idx, var_offset)) = self.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
             } else {
                 return InsertRow::NoFreeSpaceOrRowID;
             };
-        let mut new_row = self.new_row(row_idx as usize, var_offset);
+        let mut new_row = self.new_row(row_idx, var_offset);
         for v in user_cols {
             match v {
                 Val::Null => new_row.add_null(),
@@ -370,7 +370,7 @@ impl RowPage {
     /// Returns mutable row by given index in page.
     #[inline]
     pub(crate) fn row_mut(&self, row_idx: usize, var_offset: usize, var_end: usize) -> RowMut {
-        debug_assert!(row_idx < self.header.row_count() as usize);
+        debug_assert!(row_idx < self.header.row_count());
         RowMut {
             page: self,
             row_idx,
@@ -397,47 +397,55 @@ impl RowPage {
     /// Returns all values of given column.
     #[inline]
     fn vals<V: Value>(&self, col_idx: usize) -> &[V] {
-        let len = self.header.row_count() as usize;
+        let len = self.header.row_count();
         unsafe { self.vals_unchecked(col_idx, len) }
     }
 
     /// Returns all mutable values of given column.
     #[inline]
     fn vals_mut<V: Value>(&mut self, col_idx: usize) -> &mut [V] {
-        let len = self.header.row_count() as usize;
+        let len = self.header.row_count();
         unsafe { self.vals_mut_unchecked(col_idx, len) }
     }
 
     #[inline]
     unsafe fn vals_unchecked<V: Value>(&self, col_idx: usize, len: usize) -> &[V] {
-        let offset = self.col_offset(col_idx) as usize;
-        let ptr = self.data_ptr().add(offset);
-        let data: *const V = mem::transmute(ptr);
-        std::slice::from_raw_parts(data, len)
+        unsafe {
+            let offset = self.col_offset(col_idx) as usize;
+            let ptr = self.data_ptr().add(offset);
+            let data: *const V = mem::transmute(ptr);
+            std::slice::from_raw_parts(data, len)
+        }
     }
 
     #[inline]
     unsafe fn vals_mut_unchecked<V: Value>(&mut self, col_idx: usize, len: usize) -> &mut [V] {
-        let offset = self.col_offset(col_idx) as usize;
-        let ptr = self.data_ptr_mut().add(offset);
-        let data: *mut V = mem::transmute(ptr);
-        std::slice::from_raw_parts_mut(data, len)
+        unsafe {
+            let offset = self.col_offset(col_idx) as usize;
+            let ptr = self.data_ptr_mut().add(offset);
+            let data: *mut V = mem::transmute(ptr);
+            std::slice::from_raw_parts_mut(data, len)
+        }
     }
 
     #[inline]
     unsafe fn val_unchecked<V: Value>(&self, row_idx: usize, col_idx: usize) -> &V {
-        let offset = self.col_offset(col_idx) as usize;
-        let ptr = self.data_ptr().add(offset);
-        let data: *const V = mem::transmute(ptr);
-        &*data.add(row_idx)
+        unsafe {
+            let offset = self.col_offset(col_idx) as usize;
+            let ptr = self.data_ptr().add(offset);
+            let data: *const V = mem::transmute(ptr);
+            &*data.add(row_idx)
+        }
     }
 
     #[inline]
     unsafe fn val_mut_unchecked<V: Value>(&mut self, row_idx: usize, col_idx: usize) -> &mut V {
-        let offset = self.col_offset(col_idx) as usize;
-        let ptr = self.data_ptr().add(offset);
-        let data: *mut V = mem::transmute(ptr);
-        &mut *data.add(row_idx)
+        unsafe {
+            let offset = self.col_offset(col_idx) as usize;
+            let ptr = self.data_ptr().add(offset);
+            let data: *mut V = mem::transmute(ptr);
+            &mut *data.add(row_idx)
+        }
     }
 
     #[inline]
@@ -450,10 +458,19 @@ impl RowPage {
         }
     }
 
+    // #[inline]
+    // pub(crate) fn update_val<V: ToValue>(&self, row_idx: usize, col_idx: usize, val: &V) {
+    //     unsafe {
+    //         let val = val.to_val();
+    //         let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
+    //         let ptr = self.data_ptr().add(offset);
+    //         val.atomic_store(ptr);
+    //     }
+    // }
+
     #[inline]
-    pub(crate) fn update_val<V: ToValue>(&self, row_idx: usize, col_idx: usize, val: &V) {
+    pub(crate) fn update_val<V: Value>(&self, row_idx: usize, col_idx: usize, val: V) {
         unsafe {
-            let val = val.to_val();
             let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
             let ptr = self.data_ptr().add(offset);
             val.atomic_store(ptr);
@@ -474,19 +491,19 @@ impl RowPage {
                 self.set_null(row_idx, col_idx, true);
             }
             Val::Byte1(v1) => {
-                self.update_val(row_idx, col_idx, v1);
+                self.update_val(row_idx, col_idx, *v1);
                 self.set_null(row_idx, col_idx, false);
             }
             Val::Byte2(v2) => {
-                self.update_val(row_idx, col_idx, v2);
+                self.update_val(row_idx, col_idx, *v2);
                 self.set_null(row_idx, col_idx, false);
             }
             Val::Byte4(v4) => {
-                self.update_val(row_idx, col_idx, v4);
+                self.update_val(row_idx, col_idx, *v4);
                 self.set_null(row_idx, col_idx, false);
             }
             Val::Byte8(v8) => {
-                self.update_val(row_idx, col_idx, v8);
+                self.update_val(row_idx, col_idx, *v8);
                 self.set_null(row_idx, col_idx, false);
             }
             Val::VarByte(var) => {
@@ -515,19 +532,19 @@ impl RowPage {
                 self.set_null_exclusive(row_idx, col_idx, true);
             }
             Val::Byte1(v1) => {
-                self.update_val_exclusive(row_idx, col_idx, v1);
+                self.update_val_exclusive(row_idx, col_idx, *v1);
                 self.set_null_exclusive(row_idx, col_idx, false);
             }
             Val::Byte2(v2) => {
-                self.update_val_exclusive(row_idx, col_idx, v2);
+                self.update_val_exclusive(row_idx, col_idx, *v2);
                 self.set_null_exclusive(row_idx, col_idx, false);
             }
             Val::Byte4(v4) => {
-                self.update_val_exclusive(row_idx, col_idx, v4);
+                self.update_val_exclusive(row_idx, col_idx, *v4);
                 self.set_null_exclusive(row_idx, col_idx, false);
             }
             Val::Byte8(v8) => {
-                self.update_val_exclusive(row_idx, col_idx, v8);
+                self.update_val_exclusive(row_idx, col_idx, *v8);
                 self.set_null_exclusive(row_idx, col_idx, false);
             }
             Val::VarByte(var) => {
@@ -593,14 +610,13 @@ impl RowPage {
     }
 
     #[inline]
-    pub(crate) fn update_val_exclusive<V: ToValue>(
+    pub(crate) fn update_val_exclusive<V: Value>(
         &mut self,
         row_idx: usize,
         col_idx: usize,
-        val: &V,
+        val: V,
     ) {
         unsafe {
-            let val = val.to_val();
             let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
             let ptr = self.data_ptr().add(offset);
             val.store(ptr as *mut _);
@@ -610,13 +626,17 @@ impl RowPage {
     #[inline]
     pub(crate) fn update_var(&self, row_idx: usize, col_idx: usize, var: PageVar) {
         debug_assert!(mem::size_of::<PageVar>() == mem::size_of::<u64>());
-        self.update_val::<u64>(row_idx, col_idx, unsafe { mem::transmute(&var) });
+        self.update_val::<u64>(row_idx, col_idx, unsafe {
+            mem::transmute::<PageVar, u64>(var)
+        });
     }
 
     #[inline]
     pub(crate) fn update_var_exclusive(&mut self, row_idx: usize, col_idx: usize, var: PageVar) {
         debug_assert!(mem::size_of::<PageVar>() == mem::size_of::<u64>());
-        self.update_val_exclusive::<u64>(row_idx, col_idx, unsafe { mem::transmute(&var) });
+        self.update_val_exclusive::<u64>(row_idx, col_idx, unsafe {
+            mem::transmute::<PageVar, u64>(var)
+        });
     }
 
     #[inline]
@@ -651,18 +671,22 @@ impl RowPage {
 
     #[inline]
     unsafe fn var_unchecked(&self, row_idx: usize, col_idx: usize) -> &PageVar {
-        let offset = self.col_offset(col_idx) as usize;
-        let ptr = self.data_ptr().add(offset);
-        let data: *const PageVar = mem::transmute(ptr);
-        &*data.add(row_idx)
+        unsafe {
+            let offset = self.col_offset(col_idx) as usize;
+            let ptr = self.data_ptr().add(offset);
+            let data: *const PageVar = mem::transmute(ptr);
+            &*data.add(row_idx)
+        }
     }
 
     #[inline]
     unsafe fn var_mut_unchecked(&mut self, row_idx: usize, col_idx: usize) -> &mut PageVar {
-        let offset = self.col_offset(col_idx) as usize;
-        let ptr = self.data_ptr().add(offset);
-        let data: *mut PageVar = mem::transmute(ptr);
-        &mut *data.add(row_idx)
+        unsafe {
+            let offset = self.col_offset(col_idx) as usize;
+            let ptr = self.data_ptr().add(offset);
+            let data: *mut PageVar = mem::transmute(ptr);
+            &mut *data.add(row_idx)
+        }
     }
 
     #[inline]
@@ -927,12 +951,12 @@ pub struct NewRow<'a> {
     row_id: RowID,
 }
 
-impl<'a> NewRow<'a> {
+impl NewRow<'_> {
     /// add one value to current row.
     #[inline]
-    pub fn add_val<V: ToValue>(&mut self, val: V) {
+    pub(crate) fn add_val<V: Value>(&mut self, val: V) {
         debug_assert!(self.col_idx < self.page.header.col_count as usize);
-        self.page.update_val(self.row_idx, self.col_idx, &val);
+        self.page.update_val(self.row_idx, self.col_idx, val);
         self.page.set_null(self.row_idx, self.col_idx, false);
         self.col_idx += 1;
     }
@@ -972,7 +996,7 @@ impl<'a> NewRow<'a> {
 }
 
 /// Common trait to read values from a row.
-pub trait RowRead {
+pub(crate) trait RowRead {
     /// Page of current row.
     fn page(&self) -> &RowPage;
 
@@ -1097,12 +1121,12 @@ pub trait RowRead {
                 let v = self.val::<Byte8Val>(col_idx);
                 (Val::from(*v), None)
             }
-            Layout::VarByte => {
-                let pv = unsafe { self.page().var_unchecked(self.row_idx(), col_idx) };
+            Layout::VarByte => unsafe {
+                let pv = self.page().var_unchecked(self.row_idx(), col_idx);
                 let v = pv.as_bytes(self.page().data_ptr());
                 let offset = pv.offset().map(|os| os as u16);
                 (Val::VarByte(MemVar::from(v)), offset)
-            }
+            },
         }
     }
 
@@ -1219,7 +1243,7 @@ pub struct Row<'a> {
     row_idx: usize,
 }
 
-impl<'a> RowRead for Row<'a> {
+impl RowRead for Row<'_> {
     #[inline]
     fn page(&self) -> &RowPage {
         self.page
@@ -1239,7 +1263,7 @@ pub struct RowMut<'a> {
     var_end: usize,
 }
 
-impl<'a> RowRead for RowMut<'a> {
+impl RowRead for RowMut<'_> {
     #[inline]
     fn page(&self) -> &RowPage {
         self.page
@@ -1251,7 +1275,7 @@ impl<'a> RowRead for RowMut<'a> {
     }
 }
 
-impl<'a> RowMut<'a> {
+impl RowMut<'_> {
     /// Update column by given index and value.
     #[inline]
     pub fn update_col(&mut self, col_idx: usize, value: &Val) {
@@ -1286,7 +1310,7 @@ pub struct RowMutExclusive<'a> {
     var_end: usize,
 }
 
-impl<'a> RowRead for RowMutExclusive<'a> {
+impl RowRead for RowMutExclusive<'_> {
     #[inline]
     fn page(&self) -> &RowPage {
         self.page
@@ -1298,7 +1322,7 @@ impl<'a> RowRead for RowMutExclusive<'a> {
     }
 }
 
-impl<'a> RowMutExclusive<'a> {
+impl RowMutExclusive<'_> {
     /// Update column by given index and value.
     #[inline]
     pub fn update_col(&mut self, col_idx: usize, value: &Val, old_exists: bool) {
@@ -1327,11 +1351,13 @@ impl<'a> RowMutExclusive<'a> {
     }
 }
 
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 const fn align8(len: usize) -> usize {
     (len + 7) / 8 * 8
 }
 
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 const fn align64(len: usize) -> usize {
     (len + 63) / 64 * 64
@@ -1363,6 +1389,7 @@ const fn col_inline_len(col: &Layout, row_count: usize) -> usize {
 
 /// Returns estimation of maximum row count of a new page with average row length
 /// equal to given row length.
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 pub const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
     let body_len = PAGE_SIZE

@@ -38,13 +38,13 @@ pub(crate) const LEN_ATTR_HDR: usize = 48;
 /// Lookup table:
 /// 1. Entry count: 2B with 6B padding.
 /// 2. Lookup ranges: 256 * 4 * 2 * N B. N is byte width of value. e.g. N of u16 is 2.
-///                   Key of lookup range is first non-zero byte. Range contains
-///                   start offset and end offset(exclusive). end offset = 0 means missing.
+///    Key of lookup range is first non-zero byte. Range contains
+///    start offset and end offset(exclusive). end offset = 0 means missing.
 ///
 /// Dict data:
 /// 1. Entry count: 4B with 4B padding.
 /// 2. Entry offsets: (N + 1) * 4 B, with padding to make multiple of 8.
-///                   Offset starts from first byte of "String data".
+///    Offset starts from first byte of "String data".
 ///
 /// Single Codec:
 /// 1. Number of bytes: 4B.
@@ -285,7 +285,7 @@ impl Attr {
                     buf.extend_from_slice(&(s.data.len() as u32).to_ne_bytes());
                     buf.extend_from_slice(&s.data);
                     // fill gap
-                    buf.extend(std::iter::repeat(0u8).take(align_u128(buf.len()) - buf.len()));
+                    buf.extend(std::iter::repeat_n(0u8, align_u128(buf.len()) - buf.len()));
                     writer.write_all(buf)?;
                     n += buf.len();
                 }
@@ -471,7 +471,7 @@ fn write_sma<W: io::Write>(sma: &SMA, writer: &mut W, buf: &mut Vec<u8>) -> Resu
     buf.push(sma.kind as u8);
     let padding = align_u128(buf.len()) - buf.len();
     if padding > 0 {
-        buf.extend(std::iter::repeat(0u8).take(padding));
+        buf.extend(std::iter::repeat_n(0u8, padding));
     }
     // kind
     writer.write_all(buf)?;
@@ -557,7 +557,7 @@ fn write_align_u128<W: io::Write>(bs: &[u8], writer: &mut W, buf: &mut Vec<u8>) 
     let total_bytes = align_u128(bs.len());
     if total_bytes > bs.len() {
         buf.clear();
-        buf.extend(std::iter::repeat(0u8).take(total_bytes - bs.len()));
+        buf.extend(std::iter::repeat_n(0u8, total_bytes - bs.len()));
         writer.write_all(buf)?;
     }
     Ok(total_bytes)

@@ -229,7 +229,7 @@ impl<'a> RowReadAccess<'a> {
         // Check page data first.
         let row = self.row();
         let deleted = row.is_deleted();
-        if !row.is_key_different(&metadata, key) && !deleted {
+        if !row.is_key_different(metadata, key) && !deleted {
             return false; // matched key found in page.
         }
         // Page data does not match, check version chain.
@@ -485,7 +485,7 @@ impl<'a> RowWriteAccess<'a> {
 
     #[inline]
     pub fn undo_head(&self) -> &Option<Box<RowUndoHead>> {
-        &*self.undo
+        &self.undo
     }
 
     /// Returns first undo entry on main branch of the chain.
@@ -623,10 +623,10 @@ impl<'a> RowWriteAccess<'a> {
     /// 2. The old row matches key and is not deleted. Just throw dup-key error.
     /// 3. The old row matches key and is deleted.
     ///    a) DELETE undo entry does not exists, mean no transaction can see the
-    ///       non-deleted version, so we just return none.
+    ///    non-deleted version, so we just return none.
     ///    b) DELELTE undo entry still exists, means some transaction still has
-    ///       access to non-deleted version, so we record new-to-old modifications
-    ///       and link new row to DELETE entry.
+    ///    access to non-deleted version, so we record new-to-old modifications
+    ///    and link new row to DELETE entry.
     /// 4. The old row does not match key and no old version with same key found.
     ///    Return none.
     /// 5. The old row does not match key but one old version with same key found.
@@ -751,7 +751,7 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub fn purge_undo_chain(&mut self, min_active_sts: TrxID) {
         match &mut *self.undo {
-            None => return,
+            None => (),
             Some(undo_head) => {
                 if undo_head.purge_ts >= min_active_sts {
                     // Another thread already prune this version chain.
@@ -761,18 +761,16 @@ impl<'a> RowWriteAccess<'a> {
 
                 // Check whether the head can be purged.
                 let ts = undo_head.ts();
-                if trx_is_committed(ts) {
-                    if ts < min_active_sts {
-                        // First entry is too old. That means page data is globally visible.
-                        // So we can remove the entire undo head.
-                        self.undo.take();
-                        // Update maybe_invisible because we remove the entire version chain.
-                        self.undo_map
-                            .maybe_invisible
-                            .fetch_sub(1, Ordering::Relaxed);
-                        return;
-                    } // first entry can not be purged.
-                } // uncommitted entry cannot be purged.
+                if trx_is_committed(ts) && ts < min_active_sts {
+                    // First entry is too old. That means page data is globally visible.
+                    // So we can remove the entire undo head.
+                    self.undo.take();
+                    // Update maybe_invisible because we remove the entire version chain.
+                    self.undo_map
+                        .maybe_invisible
+                        .fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
                 let mut entry = undo_head.next.main.entry.as_mut();
                 loop {
                     let mut entry_next = mem::take(&mut entry.next);
@@ -836,16 +834,16 @@ impl<'a> RowWriteAccess<'a> {
                             self.page.update_var(self.row_idx, uc.idx, pv);
                         }
                         Val::Byte1(v) => {
-                            self.page.update_val(self.row_idx, uc.idx, v);
+                            self.page.update_val(self.row_idx, uc.idx, *v);
                         }
                         Val::Byte2(v) => {
-                            self.page.update_val(self.row_idx, uc.idx, v);
+                            self.page.update_val(self.row_idx, uc.idx, *v);
                         }
                         Val::Byte4(v) => {
-                            self.page.update_val(self.row_idx, uc.idx, v);
+                            self.page.update_val(self.row_idx, uc.idx, *v);
                         }
                         Val::Byte8(v) => {
-                            self.page.update_val(self.row_idx, uc.idx, v);
+                            self.page.update_val(self.row_idx, uc.idx, *v);
                         }
                     }
                 }
@@ -878,7 +876,7 @@ impl<'a> RowWriteAccess<'a> {
     }
 }
 
-impl<'a> Drop for RowWriteAccess<'a> {
+impl Drop for RowWriteAccess<'_> {
     #[inline]
     fn drop(&mut self) {
         self.undo_map.version.fetch_add(1, Ordering::Release);

@@ -44,7 +44,7 @@ pub trait ParseInput<'a>:
 
 define_dialect!(Ansi);
 
-impl<'a> Dialect for Ansi<'a> {
+impl Dialect for Ansi<'_> {
     #[inline]
     fn ident_quote() -> char {
         '"'
@@ -60,7 +60,7 @@ impl<'a> ParseInput<'a> for Ansi<'a> {}
 
 define_dialect!(MySQL);
 
-impl<'a> Dialect for MySQL<'a> {
+impl Dialect for MySQL<'_> {
     #[inline]
     fn ident_quote() -> char {
         '`'

@@ -1,11 +1,12 @@
 use crate::buf::{ByteBuffer, ByteBufferReadGuard};
+use crate::mysql::ServerSpec;
 use crate::mysql::auth::{AuthPlugin, AuthPluginImpl};
 use crate::mysql::cmd::{CmdCode, ComFieldList, ComQuery};
 use crate::mysql::col::{ColumnDefinition, ColumnDefinitions};
-use crate::mysql::error::{ensure_empty, AccessDenied, Error, Result};
+use crate::mysql::error::{AccessDenied, Error, Result, ensure_empty};
 use crate::mysql::flag::{CapabilityFlags, StatusFlags};
 use crate::mysql::handshake::{
-    ConnectAttr, HandshakeCliResp41, HandshakeSvrResp, InitialHandshake, AUTH_PLUGIN_DATA_LEN1,
+    AUTH_PLUGIN_DATA_LEN1, ConnectAttr, HandshakeCliResp41, HandshakeSvrResp, InitialHandshake,
 };
 use crate::mysql::packet::{EofPacket, ErrPacket, OkPacket};
 use crate::mysql::principal::Principal;
@@ -13,11 +14,10 @@ use crate::mysql::resultset::TextRows;
 use crate::mysql::serde::{
     LenEncInt, MyDeser, MyDeserExt, MySer, MySerElem, MySerPackets, NewMySer, SerdeCtx,
 };
-use crate::mysql::ServerSpec;
 use async_io::Timer;
 use async_net::{AsyncToSocketAddrs, TcpStream};
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, FutureExt};
-use std::alloc::{alloc, Layout};
+use std::alloc::{Layout, alloc};
 use std::borrow::Cow;
 use std::fmt;
 use std::mem::{align_of, transmute};
@@ -328,10 +328,11 @@ impl<T: AsyncRead + Unpin> MyConn<T> {
                 //
                 // capacity is same as length, so it's safe.
                 unsafe { payload.set_len(expected) };
-                let (readable, rg) = buf.readable()?;
-                payload[..readable.len()].copy_from_slice(readable);
-                rg.advance(readable.len());
-                self.conn.read_exact(&mut payload[readable.len()..]).await?;
+                let rg = buf.readable()?;
+                let rl = rg.len();
+                payload[..rl].copy_from_slice(rg.all());
+                rg.advance_to_end();
+                self.conn.read_exact(&mut payload[rl..]).await?;
                 Ok((Cow::Owned(payload), buf.empty_read()))
             }
             Err(Error::PacketSplit()) => {
@@ -355,15 +356,15 @@ impl<T: AsyncRead + Unpin> MyConn<T> {
         }
         while buf.readable_len() < 4 {
             // todo: capacity may be less than 4
-            let (writable, _wg) = buf.writable()?;
-            let n = self.conn.read(writable).await?;
+            let mut wg = buf.writable()?;
+            let n = self.conn.read(&mut wg).await?;
             if n == 0 {
                 return Err(Error::UnexpectedEOF());
             }
             buf.advance_w_idx(n)?;
         }
-        let (readable, rg) = buf.readable()?;
-        let (payload_len, pkt_nr) = parse_payload_len_and_pkt_nr(readable);
+        let rg = buf.readable()?;
+        let (payload_len, pkt_nr) = parse_payload_len_and_pkt_nr(&rg);
         rg.advance(4);
         self.ctx.check_and_inc_pkt_nr(pkt_nr)?;
         // Now we know the length of payload, so we can check
@@ -380,19 +381,19 @@ impl<T: AsyncRead + Unpin> MyConn<T> {
             return Err(Error::BufferFull(payload_len));
         }
         // check if input contains a complete packet.
-        let (readable, rg) = buf.readable()?;
-        if readable.len() < payload_len {
-            let min_bytes_to_read = payload_len - readable.len();
+        let rg = buf.readable()?;
+        if rg.len() < payload_len {
+            let min_bytes_to_read = payload_len - rg.len();
             // continue to receive bytes until packet is complete.
-            let (writable, _wg) = buf.writable()?;
-            let n = read_at_least(&mut self.conn, writable, min_bytes_to_read).await?;
+            let mut wg = buf.writable()?;
+            let n = read_at_least(&mut self.conn, &mut wg, min_bytes_to_read).await?;
             buf.advance_w_idx(n)?;
             drop(rg); // drop previous read guard with length equal to zero.
-                      // now we acquire readable again for complete payload
-            let (readable, rg) = buf.readable()?;
-            return Ok((&readable[..payload_len], rg));
+            // now we acquire readable again for complete payload
+            let rg = buf.readable()?;
+            return Ok((rg.head(payload_len), rg));
         }
-        Ok((&readable[..payload_len], rg))
+        Ok((rg.head(payload_len), rg))
     }
 
     /// Receive split packets and compose to a single vector.
@@ -402,24 +403,24 @@ impl<T: AsyncRead + Unpin> MyConn<T> {
     #[allow(clippy::uninit_vec)]
     async fn recv_split(&mut self, prev_buf: &ByteBuffer) -> Result<Vec<u8>> {
         let max_payload_size = self.ctx.max_payload_size;
-        let (readable, rg) = prev_buf.readable()?;
+        let rg = prev_buf.readable()?;
         // we always allocate a new vector to concat splitted packets.
         let mut data = vec![];
         // first packet must be of max packet size
-        let mut last_payload_len = if readable.len() < max_payload_size {
+        let mut last_payload_len = if rg.len() < max_payload_size {
             data.reserve(max_payload_size);
             unsafe { data.set_len(max_payload_size) };
-            let idx = readable.len();
-            data[..idx].copy_from_slice(readable);
+            let idx = rg.len();
+            data[..idx].copy_from_slice(&rg);
             rg.advance(idx);
             self.conn.read_exact(&mut data[idx..]).await?;
             max_payload_size
         } else {
             // buffer contains more data than max packet size
-            data.extend_from_slice(&readable[..max_payload_size]);
+            data.extend_from_slice(rg.head(max_payload_size));
             let mut total_read_bytes = max_payload_size;
             let mut pp = PacketParser {
-                b: &readable[max_payload_size..],
+                b: rg.after_head(max_payload_size),
             };
             let last_payload_len = loop {
                 let pkt = pp.next();
@@ -505,7 +506,7 @@ impl<T: AsyncRead + Unpin> MyConn<T> {
     }
 
     /// Parse column definition packet.
-    async fn col_def<'a>(&mut self, buf: &'a ByteBuffer, vacuum: bool) -> Result<ColumnDefinition> {
+    async fn col_def(&mut self, buf: &ByteBuffer, vacuum: bool) -> Result<ColumnDefinition> {
         let (payload, rg) = self.recv(buf, vacuum).await?;
         self.col_def_from_payload(payload, rg)
     }
@@ -567,7 +568,7 @@ impl<T: AsyncRead + Unpin> MyConn<T> {
             rg.advance(pkt.len());
         }
         // finish column definition parsing
-        Ok((col_defs, buf.single_read()?))
+        Ok((col_defs, buf.readable()?))
     }
 }
 
@@ -576,11 +577,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MyConn<T> {
     /// should be called before any other commands
     /// this method will change the connect capability flags
     #[inline]
-    async fn client_handshake<'a>(
-        &mut self,
-        read_buf: &'a ByteBuffer,
-        opts: HandshakeOpts,
-    ) -> Result<()> {
+    async fn client_handshake(&mut self, read_buf: &ByteBuffer, opts: HandshakeOpts) -> Result<()> {
         read_buf.update()?.vacuum(); // vacuum before handshake
         self.ctx.reset_pkt_nr();
         let (pkt, rg) = self.recv(read_buf, true).await?;
@@ -744,7 +741,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MyConn<T> {
             let mut rng = rand::thread_rng();
             // fix 20 byte seed, with null end.
             for b in seed[..AUTH_PLUGIN_DATA_LEN - 1].iter_mut() {
-                *b = rng.gen();
+                *b = rng.r#gen();
             }
         }
         self.ctx.reset_pkt_nr();
@@ -866,7 +863,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MyConn<T> {
                 let (next, ok) = OkPacket::my_deser(&mut self.ctx, payload)?;
                 ensure_empty(next)?;
                 rg.advance(payload.len());
-                Ok((ExecResp::from(ok), read_buf.single_read()?))
+                Ok((ExecResp::from(ok), read_buf.readable()?))
             }
             0xff => {
                 let (next, err) = ErrPacket::my_deser(&mut self.ctx, payload)?;
@@ -911,7 +908,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MyConn<T> {
                     let (next, _eof) = OkPacket::my_deser(&mut self.ctx, &payload)?;
                     ensure_empty(next)?;
                     rg.advance(payload.len());
-                    return Ok((col_defs, read_buf.single_read()?));
+                    return Ok((col_defs, read_buf.readable()?));
                 }
                 _ => {
                     let col_def = self.col_def_from_payload(payload, rg)?;
@@ -930,9 +927,9 @@ impl<T> fmt::Debug for MyConn<T> {
 }
 
 #[inline]
-async fn read_at_least<'a, T: AsyncRead + Unpin>(
+async fn read_at_least<T: AsyncRead + Unpin>(
     rd: &mut T,
-    buf: &'a mut [u8],
+    buf: &mut [u8],
     min_bytes: usize,
 ) -> Result<usize> {
     let mut total_bytes = 0;
@@ -1068,7 +1065,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> RowStream<T> {
                                     },
                                     data: rows,
                                 };
-                                return Ok((rows, buf.single_read()?));
+                                return Ok((rows, buf.readable()?));
                             } else {
                                 let (next, eof) = EofPacket::my_deser(&mut self.0.ctx, row)?;
                                 if !next.is_empty() {
@@ -1088,7 +1085,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> RowStream<T> {
                                     },
                                     data: rows,
                                 };
-                                return Ok((rows, buf.single_read()?));
+                                return Ok((rows, buf.readable()?));
                             }
                         }
                         0xff => {
@@ -1126,7 +1123,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> RowStream<T> {
                         },
                         data: rows,
                     };
-                    return Ok((rows, buf.single_read()?));
+                    return Ok((rows, buf.readable()?));
                 }
                 Err(e) => return Err(e),
             }
@@ -1238,7 +1235,7 @@ mod tests {
             let (pkt, rg) = conn.recv(&buf, false).await.unwrap();
             rg.advance(pkt.len());
             rows.push(pkt);
-            buf.single_read().unwrap();
+            buf.readable().unwrap();
         });
     }
 
@@ -1348,7 +1345,7 @@ mod tests {
                 .unwrap();
             dbg!(resp);
             drop(rg);
-            assert!(unsafe { read_buf.readable_unchecked().is_empty() });
+            assert!(read_buf.readable().unwrap().is_empty());
             let (resp, rg) = conn.exec("use db1", &read_buf).await.unwrap();
             dbg!(resp);
             drop(rg);
