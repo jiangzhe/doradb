@@ -43,7 +43,7 @@ impl IndexUndoLogs {
     #[inline]
     pub async fn rollback<P: BufferPool>(&mut self, data_pool: &'static P, catalog: &Catalog) {
         while let Some(entry) = self.0.pop() {
-            let table = catalog.get_table(entry.table_id).unwrap();
+            let table = catalog.get_table(entry.table_id).await.unwrap();
             match entry.kind {
                 IndexUndoKind::InsertUnique(key) => {
                     let res = table.sec_idx[key.index_no]

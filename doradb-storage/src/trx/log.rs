@@ -1071,7 +1071,7 @@ mod tests {
                 .await
                 .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             let mut session = engine.new_session();
             {
@@ -1141,7 +1141,7 @@ mod tests {
                 .await
                 .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             let mut session = engine.new_session();
             {

@@ -163,7 +163,7 @@ async fn worker(
     stop: Arc<AtomicBool>,
     wg: WaitGroup,
 ) {
-    let table = engine.catalog().get_table(table_id).unwrap();
+    let table = engine.catalog().get_table(table_id).await.unwrap();
     let mut session = engine.new_session();
     let stop = &*stop;
     let mut id = id_start;
