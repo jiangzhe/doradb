@@ -128,7 +128,7 @@ impl Inner {
     fn create_table(&mut self, schema_id: SchemaID, table_spec: TableSpec) -> Result<TableID> {
         match self.find_schema(schema_id) {
             None => {
-                let s = format!("id={}", schema_id);
+                let s = format!("id={schema_id}");
                 Err(Error::SchemaNotExists(SemiStr::new(&s)))
             }
             Some(schema) => {
@@ -182,7 +182,7 @@ impl Inner {
     fn drop_table(&mut self, schema_id: SchemaID, table_name: &str) -> Result<()> {
         match self.find_schema(schema_id) {
             None => {
-                let s = format!("id={}", schema_id);
+                let s = format!("id={schema_id}");
                 Err(Error::SchemaNotExists(SemiStr::new(&s)))
             }
             Some(schema) => {
@@ -225,7 +225,7 @@ impl Inner {
     fn create_index(&mut self, table_id: TableID, index: IndexSpec) -> Result<()> {
         match self.table_details.get_mut(&table_id) {
             None => {
-                let s = format!("id={}", table_id);
+                let s = format!("id={table_id}");
                 Err(Error::TableNotExists(SemiStr::new(&s)))
             }
             Some(table_details) => {
@@ -253,7 +253,7 @@ impl Inner {
     fn drop_index(&mut self, table_id: TableID, index_name: &str) -> Result<()> {
         match self.table_details.get_mut(&table_id) {
             None => {
-                let s = format!("id={}", table_id);
+                let s = format!("id={table_id}");
                 Err(Error::TableNotExists(SemiStr::new(&s)))
             }
             Some(table_details) => {

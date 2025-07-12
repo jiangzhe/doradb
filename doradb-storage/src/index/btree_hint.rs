@@ -51,29 +51,31 @@ impl BTreeHints {
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
 unsafe fn search_hints_avx2(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
-    use std::arch::x86_64::*;
-    // 1. load data.
-    // xor msb to reserve ordering for u32 to i32 conversion.
-    let v_input = _mm256_loadu_si256(hints.as_ptr() as *const __m256i);
-    let v_xor_mask = _mm256_set1_epi32(0x80000000u32 as i32);
-    let v_hints = _mm256_xor_si256(v_input, v_xor_mask);
+    unsafe {
+        use std::arch::x86_64::*;
+        // 1. load data.
+        // xor msb to reserve ordering for u32 to i32 conversion.
+        let v_input = _mm256_loadu_si256(hints.as_ptr() as *const __m256i);
+        let v_xor_mask = _mm256_set1_epi32(0x80000000u32 as i32);
+        let v_hints = _mm256_xor_si256(v_input, v_xor_mask);
 
-    // 2. broadcast search key(after xor) to avx register.
-    let v_key = _mm256_set1_epi32((key_head ^ 0x80000000) as i32);
+        // 2. broadcast search key(after xor) to avx register.
+        let v_key = _mm256_set1_epi32((key_head ^ 0x80000000) as i32);
 
-    // 3. find lower bound i, first slot hints[i] >= key_head.
-    // a >= b can be calculated as !(b > a).
-    // perform b > a.
-    let v_lo = _mm256_cmpgt_epi32(v_key, v_hints);
-    let mask_lo = _mm256_movemask_epi8(v_lo) as u32;
-    // reverse mask.
-    let i = (!mask_lo).trailing_zeros() as usize / 4;
+        // 3. find lower bound i, first slot hints[i] >= key_head.
+        // a >= b can be calculated as !(b > a).
+        // perform b > a.
+        let v_lo = _mm256_cmpgt_epi32(v_key, v_hints);
+        let mask_lo = _mm256_movemask_epi8(v_lo) as u32;
+        // reverse mask.
+        let i = (!mask_lo).trailing_zeros() as usize / 4;
 
-    // 4. find upper bound j, first slot arr[j] > k.
-    let v_up = _mm256_cmpgt_epi32(v_hints, v_key);
-    let mask_up = _mm256_movemask_epi8(v_up) as u32;
-    let j = mask_up.trailing_zeros() as usize / 4;
-    (i, j)
+        // 4. find upper bound j, first slot arr[j] > k.
+        let v_up = _mm256_cmpgt_epi32(v_hints, v_key);
+        let mask_up = _mm256_movemask_epi8(v_up) as u32;
+        let j = mask_up.trailing_zeros() as usize / 4;
+        (i, j)
+    }
 }
 
 /// Search hints fallback method.

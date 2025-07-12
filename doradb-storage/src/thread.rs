@@ -4,7 +4,7 @@ use std::thread::{self, JoinHandle};
 #[inline]
 pub fn spawn<F: FnOnce() -> R + UnwindSafe + Send + 'static, R>(f: F) -> JoinHandle<()> {
     thread::spawn(|| {
-        if let Err(_) = catch_unwind(f) {
+        if catch_unwind(f).is_err() {
             let thd = thread::current();
             println!("thread[{:?}:{:?}] panic", thd.id(), thd.name());
         }
@@ -15,14 +15,14 @@ pub fn spawn<F: FnOnce() -> R + UnwindSafe + Send + 'static, R>(f: F) -> JoinHan
 pub fn spawn_named<S, F>(name: S, f: F) -> JoinHandle<()>
 where
     String: From<S>,
-    F: FnOnce() -> () + UnwindSafe + Send + 'static,
+    F: FnOnce() + UnwindSafe + Send + 'static,
 {
     let thread_name = String::from(name);
     thread::Builder::new()
         .name(thread_name)
         .spawn(|| {
             let thd = thread::current();
-            if let Err(_) = catch_unwind(f) {
+            if catch_unwind(f).is_err() {
                 eprintln!(
                     "thread[{:?}:{}] panic",
                     thd.id(),

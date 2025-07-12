@@ -1,6 +1,7 @@
-use std::alloc::{alloc, Layout};
+use std::alloc::{Layout, alloc};
 use std::cell::{Cell, UnsafeCell};
-use std::mem::{align_of, ManuallyDrop};
+use std::mem::{ManuallyDrop, align_of};
+use std::ops::{Deref, DerefMut};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -126,7 +127,7 @@ impl ByteBuffer {
             return;
         }
         // As we already own the mutability, we do not need to change read
-        let readable = self.readable_unchecked();
+        let readable = unsafe { self.readable_unchecked() };
         let new_cap = pow2_ge(readable.len() + len);
         let mut new_arena = alloc_arena(new_cap);
         let tgt = &mut *new_arena;
@@ -134,13 +135,13 @@ impl ByteBuffer {
         self.r_idx.set(0);
         self.w_idx.set(readable.len());
         self.vacuum_threshold.set(calc_vacuum_threshold(new_cap));
-        self.arena.get().swap(&mut new_arena);
+        unsafe { self.arena.get().swap(&mut new_arena) };
     }
 
     /// Returns capacity of current arena.
     #[inline]
     pub fn capacity(&self) -> usize {
-        unsafe { (*self.arena.get()).len() }
+        unsafe { self.arena.get().as_ref().unwrap().len() }
     }
 
     /// Renew the arena for future usage.
@@ -177,9 +178,23 @@ impl ByteBuffer {
     /// return a read guard to keep the read count more than zero,
     /// so that concurrent alloc/meta operation will fail.
     #[inline]
-    pub fn readable(&self) -> Result<(&[u8], ByteBufferReadGuard)> {
-        let rg = self.single_read()?;
-        Ok((unsafe { self.readable_unchecked() }, rg))
+    pub fn readable(&self) -> Result<ByteBufferReadGuard> {
+        let mask = self.mask.get();
+        if mask & MASK_UPDATE != 0 {
+            // conflict with update
+            return Err(Error::InvalidState);
+        }
+        self.mask.set(mask + (1 << SHL_BITS_READ));
+        // # Safety
+        //
+        // no conflict when reading the buffer.
+        let readable = unsafe { self.readable_unchecked() };
+        Ok(ByteBufferReadGuard {
+            inner: self,
+            readers: 1,
+            len: 0,
+            readable,
+        })
     }
 
     /// Returns immutable refernece of the readable area.
@@ -190,10 +205,10 @@ impl ByteBuffer {
     ///
     /// User must guarantee there are no concurrent conflict operations.
     #[inline]
-    pub unsafe fn readable_unchecked(&self) -> &[u8] {
+    unsafe fn readable_unchecked(&self) -> &[u8] {
         let w_idx = self.w_idx.get();
         let r_idx = self.r_idx.get();
-        &(**self.arena.get())[r_idx..w_idx]
+        unsafe { &(**self.arena.get())[r_idx..w_idx] }
     }
 
     /// Returns mutable reference of the readable area.
@@ -208,7 +223,7 @@ impl ByteBuffer {
     pub unsafe fn readable_mut(&self) -> &mut [u8] {
         let w_idx = self.w_idx.get();
         let r_idx = self.r_idx.get();
-        &mut (**self.arena.get())[r_idx..w_idx]
+        unsafe { &mut (**self.arena.get())[r_idx..w_idx] }
     }
 
     /// Convenient method to get readable length directly.
@@ -237,7 +252,7 @@ impl ByteBuffer {
     /// A write guard is returned to keep the write flag to true
     /// before dropping.
     #[inline]
-    pub fn writable(&self) -> Result<(&mut [u8], ByteBufferWriteGuard)> {
+    pub fn writable(&self) -> Result<ByteBufferWriteGuard> {
         let mask = self.mask.get();
         if mask & (MASK_UPDATE | MASK_WRITE) != 0 {
             // conflict with write and update
@@ -246,7 +261,10 @@ impl ByteBuffer {
         self.mask.set(mask | MASK_WRITE);
         let w_idx = self.w_idx.get();
         let writable = unsafe { &mut (**self.arena.get())[w_idx..] };
-        Ok((writable, ByteBufferWriteGuard { inner: self }))
+        Ok(ByteBufferWriteGuard {
+            inner: self,
+            writable,
+        })
     }
 
     /// The capacity of read operations, including
@@ -279,7 +297,7 @@ impl ByteBuffer {
     /// User should guarantee the pointer and length are valid.
     #[inline]
     pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
-        let arena = Vec::from_raw_parts(ptr, len, len).into_boxed_slice();
+        let arena = unsafe { Vec::from_raw_parts(ptr, len, len).into_boxed_slice() };
         ByteBuffer {
             arena: UnsafeCell::new(arena),
             r_idx: Cell::new(0),
@@ -293,30 +311,30 @@ impl ByteBuffer {
     /// Return reference and read guard.
     #[inline]
     pub fn add_str(&self, s: impl AsRef<str>) -> Result<(&str, ByteBufferReadGuard)> {
-        let (b, g) = self.add_bytes(s.as_ref().as_bytes())?;
+        let (l, g) = self.add_bytes(s.as_ref().as_bytes())?;
         // SAFETY
         //
         // the bytes is identical to original input so it's guaranteed to be valid string.
-        let s = unsafe { std::str::from_utf8_unchecked(b) };
+        let s = unsafe { std::str::from_utf8_unchecked(g.tail(l)) };
         Ok((s, g))
     }
 
     /// Add bytes to buffer.
     /// Return reference and read guard.
     #[inline]
-    pub fn add_bytes(&self, b: impl AsRef<[u8]>) -> Result<(&[u8], ByteBufferReadGuard)> {
+    pub fn add_bytes(&self, b: impl AsRef<[u8]>) -> Result<(usize, ByteBufferReadGuard)> {
         let b = b.as_ref();
         let rem_cap = self.remaining_capacity();
         if b.len() > rem_cap {
             return Err(Error::ExceedsCapacity(b.len() - rem_cap));
         }
-        let (writable, wg) = self.writable()?;
-        writable[..b.len()].copy_from_slice(b);
+        let mut wg = self.writable()?;
+        wg[..b.len()].copy_from_slice(b);
         self.w_idx.set(self.w_idx.get() + b.len()); // advance write index.
         drop(wg);
         // now it's safe to read the content that are just written.
-        let (readable, rg) = self.readable()?;
-        Ok((&readable[readable.len() - b.len()..], rg))
+        let rg = self.readable()?;
+        Ok((b.len(), rg))
     }
 
     /// Empty read guard.
@@ -327,22 +345,8 @@ impl ByteBuffer {
             inner: self,
             readers: 0,
             len: 0,
+            readable: &[],
         }
-    }
-
-    #[inline]
-    pub fn single_read(&self) -> Result<ByteBufferReadGuard> {
-        let mask = self.mask.get();
-        if mask & MASK_UPDATE != 0 {
-            // conflict with update
-            return Err(Error::InvalidState);
-        }
-        self.mask.set(mask + (1 << SHL_BITS_READ));
-        Ok(ByteBufferReadGuard {
-            inner: self,
-            readers: 1,
-            len: 0,
-        })
     }
 }
 
@@ -380,17 +384,52 @@ pub struct ByteBufferReadGuard<'a> {
     inner: &'a ByteBuffer,
     readers: usize,
     len: usize,
+    readable: &'a [u8],
 }
 
 impl<'a> ByteBufferReadGuard<'a> {
     /// Consume the read guard and advance read index of original buffer by given number.
+    /// read index update will happen when dropping the guard.
     #[inline]
     pub fn advance(mut self, len: usize) {
         self.len = len;
     }
+
+    #[inline]
+    pub fn advance_to_end(mut self) {
+        self.len = self.readable.len();
+    }
+
+    #[inline]
+    pub fn head(&self, len: usize) -> &'a [u8] {
+        &self.readable[..len]
+    }
+
+    #[inline]
+    pub fn after_head(&self, len: usize) -> &'a [u8] {
+        &self.readable[len..]
+    }
+
+    #[inline]
+    pub fn tail(&self, len: usize) -> &'a [u8] {
+        &self.readable[self.readable.len() - len..]
+    }
+
+    #[inline]
+    pub fn all(&self) -> &'a [u8] {
+        self.readable
+    }
 }
 
-impl<'a> Drop for ByteBufferReadGuard<'a> {
+impl Deref for ByteBufferReadGuard<'_> {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.readable
+    }
+}
+
+impl Drop for ByteBufferReadGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         if self.readers == 0 {
@@ -409,9 +448,25 @@ impl<'a> Drop for ByteBufferReadGuard<'a> {
 
 pub struct ByteBufferWriteGuard<'a> {
     inner: &'a ByteBuffer,
+    writable: &'a mut [u8],
 }
 
-impl<'a> Drop for ByteBufferWriteGuard<'a> {
+impl Deref for ByteBufferWriteGuard<'_> {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.writable
+    }
+}
+
+impl DerefMut for ByteBufferWriteGuard<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.writable
+    }
+}
+
+impl Drop for ByteBufferWriteGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         let mask = self.inner.mask.get();
@@ -483,11 +538,7 @@ fn alloc_arena(cap: usize) -> Box<[u8]> {
 #[inline]
 fn pow2_ge(n: usize) -> usize {
     let res = (1 << 63) >> n.leading_zeros();
-    if res == n {
-        res
-    } else {
-        res << 1
-    }
+    if res == n { res } else { res << 1 }
 }
 
 #[inline]
@@ -514,7 +565,7 @@ mod tests {
         drop(rg);
         let sa2 = sa.renew();
         let (b1, rg) = sa2.add_bytes(b"short").unwrap();
-        assert_eq!(b1, b"short");
+        assert_eq!(rg.tail(b1), b"short");
         drop(rg);
         let b2 = sa2.add_bytes(b"veryloooooooooooooooooooooog");
         assert!(b2.is_err());

@@ -5,7 +5,10 @@
 ///
 /// Use static lifetime can eliminate performance panalty
 /// on reference counter maintainance.
-/// But we must guarantee after the destruction, no thread
+///
+/// # Safety
+///
+/// We must guarantee after the destruction, no thread
 /// will access the leaked static reference.
 pub unsafe trait StaticLifetime: Sized {
     /// Create a leaked static reference from given instance.
@@ -14,12 +17,16 @@ pub unsafe trait StaticLifetime: Sized {
     }
 
     /// Drop the leaked reference as it's actually owned object.
+    ///
+    /// # Safety
+    ///
     /// This method is marked as unsafe because caller must guarantee
     /// No thread will access this reference after it's dropped.
-    ///
-    /// Note: if multiple objects of static lifetime has dependencies.
+    /// If multiple objects of static lifetime has dependencies.
     /// The drop order is important.
     unsafe fn drop_static(this: &'static Self) {
-        drop(Box::from_raw(this as *const Self as *mut Self));
+        unsafe {
+            drop(Box::from_raw(this as *const Self as *mut Self));
+        }
     }
 }

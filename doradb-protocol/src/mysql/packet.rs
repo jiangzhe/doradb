@@ -26,7 +26,7 @@ pub struct OkPacket<'a> {
     pub session_state_changes: Cow<'a, [u8]>,
 }
 
-impl<'a> NewMySer for OkPacket<'a> {
+impl NewMySer for OkPacket<'_> {
     type Ser<'s>
         = MySerPackets<'s, 7>
     where
@@ -152,7 +152,7 @@ pub struct ErrPacket<'a> {
     pub msg: Cow<'a, [u8]>,
 }
 
-impl<'a> NewMySer for ErrPacket<'a> {
+impl NewMySer for ErrPacket<'_> {
     type Ser<'s>
         = MySerPackets<'s, 3>
     where

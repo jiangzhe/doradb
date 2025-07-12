@@ -99,7 +99,7 @@ impl Explain for Op {
             OpKind::JoinGraph(graph) => graph.explain(f, conf),
             OpKind::Setop(setop) => setop.explain(f, conf),
             OpKind::Limit { start, end, .. } => {
-                write!(f, "Limit{{{}, {}}}", start, end)
+                write!(f, "Limit{{{start}, {end}}}")
             }
             OpKind::Attach(_, qry_id) => {
                 f.write_str("Attach{")?;
@@ -217,7 +217,7 @@ struct GraphEdge<'a> {
     e: &'a Edge,
 }
 
-impl<'a> Explain for GraphEdge<'a> {
+impl Explain for GraphEdge<'_> {
     fn explain<F: Write>(&self, f: &mut F, conf: &ExplainConf) -> fmt::Result {
         f.write_str(self.e.kind.to_lower())?;
         write!(
@@ -336,17 +336,17 @@ impl Explain for ExprKind {
 impl Explain for Const {
     fn explain<F: Write>(&self, f: &mut F, _conf: &ExplainConf) -> fmt::Result {
         match self {
-            Const::I64(v) => write!(f, "{}", v),
-            Const::U64(v) => write!(f, "{}", v),
+            Const::I64(v) => write!(f, "{v}"),
+            Const::U64(v) => write!(f, "{v}"),
             Const::F64(v) => write!(f, "{}", v.value()),
             Const::Decimal(v) => write!(f, "{}", v.to_string(-1)),
-            Const::Date(v) => write!(f, "date'{}'", v),
-            Const::Time(v) => write!(f, "time'{}'", v),
-            Const::Datetime(v) => write!(f, "timestamp'{}'", v),
+            Const::Date(v) => write!(f, "date'{v}'"),
+            Const::Time(v) => write!(f, "time'{v}'"),
+            Const::Datetime(v) => write!(f, "timestamp'{v}'"),
             Const::Interval(v) => write!(f, "interval'{}'{}", v.value, v.unit.to_lower()),
-            Const::String(s) => write!(f, "'{}'", s),
+            Const::String(s) => write!(f, "'{s}'"),
             Const::Bytes(_) => write!(f, "(bytes todo)"),
-            Const::Bool(b) => write!(f, "{}", b),
+            Const::Bool(b) => write!(f, "{b}"),
             Const::Null => f.write_str("null"),
         }
     }
@@ -444,15 +444,10 @@ impl Explain for Pred {
     }
 }
 
-fn write_refs<'i, F, E: 'i, I>(
-    f: &mut F,
-    exprs: I,
-    delimiter: &str,
-    conf: &ExplainConf,
-) -> fmt::Result
+fn write_refs<'i, F, E, I>(f: &mut F, exprs: I, delimiter: &str, conf: &ExplainConf) -> fmt::Result
 where
     F: Write,
-    E: Explain,
+    E: Explain + 'i,
     I: IntoIterator<Item = &'i E>,
 {
     let mut exprs = exprs.into_iter();
@@ -466,15 +461,10 @@ where
     Ok(())
 }
 
-fn write_objs<'i, F, E: 'i, I>(
-    f: &mut F,
-    exprs: I,
-    delimiter: &str,
-    conf: &ExplainConf,
-) -> fmt::Result
+fn write_objs<'i, F, E, I>(f: &mut F, exprs: I, delimiter: &str, conf: &ExplainConf) -> fmt::Result
 where
     F: Write,
-    E: Explain,
+    E: Explain + 'i,
     I: IntoIterator<Item = E>,
 {
     let mut exprs = exprs.into_iter();
@@ -502,7 +492,7 @@ struct QueryExplain<'a, F> {
     conf: &'a ExplainConf,
 }
 
-impl<'a, F: Write> QueryExplain<'a, F> {
+impl<F: Write> QueryExplain<'_, F> {
     // returns true if continue
     fn write_prefix(&mut self) -> fmt::Result {
         write_prefix(self.f, &self.spans)?;

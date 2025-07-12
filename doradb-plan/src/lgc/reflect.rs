@@ -1387,12 +1387,12 @@ fn transform_const<'a>(
     buf.clear();
     let res = match c {
         Const::I64(i) => {
-            write!(buf, "{}", i).unwrap();
+            write!(buf, "{i}").unwrap();
             let s = arena.add(&buf)?;
             Literal::Numeric(s)
         }
         Const::U64(u) => {
-            write!(buf, "{}", u).unwrap();
+            write!(buf, "{u}").unwrap();
             let s = arena.add(&buf)?;
             Literal::Numeric(s)
         }
@@ -1425,7 +1425,7 @@ fn transform_const<'a>(
         }
         Const::Interval(datatype::Interval { value, unit }) => {
             let unit = datetime_unit(*unit);
-            let value = format!("{}", value);
+            let value = format!("{value}");
             let value = arena.add(&value)?;
             Literal::Interval(Interval { unit, value })
         }

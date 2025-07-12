@@ -16,7 +16,7 @@ use super::log::list_log_files;
 
 pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
 pub const DEFAULT_LOG_IO_MAX_SIZE: Byte = Byte::from_u64(8192);
-pub const DEFAULT_LOG_FILE_PREFIX: &'static str = "redo.log";
+pub const DEFAULT_LOG_FILE_PREFIX: &str = "redo.log";
 pub const DEFAULT_LOG_PARTITIONS: usize = 1;
 pub const MAX_LOG_PARTITIONS: usize = 99; // big enough for log partitions, so fix two digits in file name.
 pub const DEFAULT_LOG_FILE_MAX_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // 1GB, sparse file will not occupy space until actual write.

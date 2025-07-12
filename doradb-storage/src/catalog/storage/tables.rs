@@ -16,15 +16,15 @@ use std::sync::OnceLock;
 
 pub const TABLE_ID_TABLES: TableID = 1;
 const COL_NO_TABLES_TABLE_ID: usize = 0;
-const COL_NAME_TABLES_TABLE_ID: &'static str = "table_id";
+const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
 const COL_NO_TABLES_SCHEMA_ID: usize = 1;
-const COL_NAME_TABLES_SCHEMA_ID: &'static str = "schema_id";
+const COL_NAME_TABLES_SCHEMA_ID: &str = "schema_id";
 const COL_NO_TABLES_TABLE_NAME: usize = 2;
-const COL_NAME_TABLES_TABLE_NAME: &'static str = "table_name";
+const COL_NAME_TABLES_TABLE_NAME: &str = "table_name";
 const INDEX_NO_TABLES_TABLE_ID: usize = 0;
-const INDEX_NAME_TABLES_TABLE_ID: &'static str = "idx_tables_table_id";
+const INDEX_NAME_TABLES_TABLE_ID: &str = "idx_tables_table_id";
 const INDEX_NO_TABLES_TABLE_NAME: usize = 1;
-const INDEX_NAME_TABLES_TABLE_NAME: &'static str = "idx_tables_table_name";
+const INDEX_NAME_TABLES_TABLE_NAME: &str = "idx_tables_table_name";
 
 pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();

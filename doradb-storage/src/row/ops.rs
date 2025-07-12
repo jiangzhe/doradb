@@ -26,7 +26,7 @@ impl SelectKey {
     }
 }
 
-impl<'a> Ser<'a> for SelectKey {
+impl Ser<'_> for SelectKey {
     #[inline]
     fn ser_len(&self, ctx: &SerdeCtx) -> usize {
         mem::size_of::<u32>() + self.vals.ser_len(ctx)
@@ -41,7 +41,7 @@ impl<'a> Ser<'a> for SelectKey {
 
 impl Deser for SelectKey {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let (idx, index_no) = ctx.deser_u32(input, start_idx)?;
         let (idx, vals) = <Vec<Val>>::deser(ctx, input, idx)?;
         Ok((idx, SelectKey::new(index_no as usize, vals)))
@@ -260,7 +260,7 @@ impl Ser<'_> for UpdateCol {
 
 impl Deser for UpdateCol {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let idx = start_idx;
         let (i, idx) = ctx.deser_u32(input, idx)?;
         let (i, val) = Val::deser(ctx, input, i)?;

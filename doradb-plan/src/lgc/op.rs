@@ -86,7 +86,7 @@ impl Op {
         loop {
             match &mut op.kind {
                 OpKind::Aggr(aggr) => return Some(&mut aggr.proj),
-                OpKind::Proj { cols, .. } => return Some(cols.as_mut()),
+                OpKind::Proj { cols, .. } => return Some(cols),
                 OpKind::Row(row) => return row.as_mut(),
                 OpKind::Sort { input, .. } => op = input.as_mut(),
                 OpKind::Limit { input, .. } => op = input.as_mut(),

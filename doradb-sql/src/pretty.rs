@@ -705,7 +705,7 @@ impl PrettyFormat for SelectTable<'_> {
                 f.write_char(' ')?;
                 f.write_str(offset_str)?;
                 f.write_char(' ')?;
-                write!(f, "{}", offset)?;
+                write!(f, "{offset}")?;
             }
         }
         Ok(())

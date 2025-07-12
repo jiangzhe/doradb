@@ -185,8 +185,8 @@ impl<N, E> DiGraph<N, E> {
     #[inline]
     unsafe fn raw_nodes2_mut(&mut self, idx1: usize, idx2: usize) -> (&mut Node<N>, &mut Node<N>) {
         let ptr = self.nodes.as_mut_ptr();
-        let n1 = &mut *ptr.add(idx1);
-        let n2 = &mut *ptr.add(idx2);
+        let n1 = unsafe { &mut *ptr.add(idx1) };
+        let n2 = unsafe { &mut *ptr.add(idx2) };
         (n1, n2)
     }
 }

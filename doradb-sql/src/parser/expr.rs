@@ -808,12 +808,12 @@ parse!(
 
 pub(crate) fn char_sp0<'a, I: ParseInput<'a>, E: ParseError<I>>(
     c: char,
-) -> impl Fn(I) -> IResult<I, char, E> {
+) -> impl Fn(I) -> IResult<I, char, E> + use<I, E> {
     move |input: I| terminated(char(c), spcmt0)(input)
 }
 
 pub(crate) fn sp0_char<'a, I: ParseInput<'a>, E: ParseError<I>>(
     c: char,
-) -> impl Fn(I) -> IResult<I, char, E> {
+) -> impl Fn(I) -> IResult<I, char, E> + use<I, E> {
     move |input: I| preceded(spcmt0, char(c))(input)
 }

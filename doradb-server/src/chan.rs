@@ -14,7 +14,7 @@ pub struct InputChannel {
 
 impl InputChannel {
     #[inline]
-    pub fn to_stream(&self, cancel: &Cancellation) -> impl Stream<Item = Result<Chunk>> {
+    pub fn to_stream(&self, cancel: &Cancellation) -> impl Stream<Item = Result<Chunk>> + use<> {
         let rx = self.rx.clone();
         cancel.select_stream(rx.into_stream())
     }

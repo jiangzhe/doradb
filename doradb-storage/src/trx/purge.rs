@@ -28,7 +28,7 @@ impl TransactionSystem {
             // single-threaded purger
             let handle = thread::spawn_named("Purge-Thread", move || {
                 let ex = LocalExecutor::new();
-                let mut purger = PurgeSingleThreaded::default();
+                let mut purger = PurgeSingleThreaded;
                 smol::block_on(ex.run(purger.purge_loop(buf_pool, &self.catalog, self, purge_chan)))
             });
             let mut g = self.purge_threads.lock();
@@ -78,9 +78,9 @@ impl TransactionSystem {
         for i in 0..self.config.purge_threads {
             let (tx, rx) = flume::unbounded();
             chans.push(tx);
-            let thread_name = format!("Purge-Executor-{}", i);
+            let thread_name = format!("Purge-Executor-{i}");
             let handle = thread::spawn_named(thread_name, move || {
-                let mut purger = PurgeExecutor::default();
+                let mut purger = PurgeExecutor;
                 let ex = LocalExecutor::new();
                 smol::block_on(ex.run(purger.purge_task_loop(buf_pool, catalog, self, rx)));
             });

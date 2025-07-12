@@ -54,11 +54,11 @@ impl JoinSpec for JoinKind {
 /// Initialize join graph.
 /// The process can be viewed as two actions:
 /// 1. detect joins.
-/// Traverse the operator tree down to find the first join operator.
-/// Then start the initialization.
+///    Traverse the operator tree down to find the first join operator.
+///    Then start the initialization.
 /// 2. initialize graph.
-/// From the topmost join operator, collect all queries to be joined.
-/// Then replace the topmost join with the generated graph.
+///    From the topmost join operator, collect all queries to be joined.
+///    Then replace the topmost join with the generated graph.
 #[inline]
 pub fn joingraph_initialize(qry_set: &mut QuerySet, qry_id: QueryID) -> Result<()> {
     init_joingraph(qry_set, qry_id)

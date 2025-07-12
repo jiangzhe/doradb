@@ -460,7 +460,7 @@ impl<'a> MySerElem<'a> {
                 idx: idx as u8,
                 data,
             };
-            return unsafe { transmute(ib) };
+            return unsafe { transmute::<InlineBytes, MySerElem<'_>>(ib) };
         }
         let slice = NullEndSlice {
             kind: MySerKind::NullEndSlice,
@@ -488,7 +488,7 @@ impl<'a> MySerElem<'a> {
                 idx: (idx - 1) as u8,
                 data,
             };
-            return unsafe { transmute(ib) };
+            return unsafe { transmute::<InlineBytes, MySerElem<'_>>(ib) };
         }
         let p1bs = Prefix1BSlice {
             kind: MySerKind::Prefix1BSlice,
@@ -627,7 +627,7 @@ impl<'a> MySerElem<'a> {
                         ptr: s.as_ptr(),
                         _marker: PhantomData,
                     };
-                    unsafe { transmute(les) }
+                    unsafe { transmute::<LenEncSlice3<'_>, MySerElem<'_>>(les) }
                 } else if s.len() <= 0xffff {
                     // LenEncStr::Len3
                     let les = LenEncSlice3 {
@@ -639,7 +639,7 @@ impl<'a> MySerElem<'a> {
                         ptr: s.as_ptr(),
                         _marker: PhantomData,
                     };
-                    unsafe { transmute(les) }
+                    unsafe { transmute::<LenEncSlice3<'_>, MySerElem<'_>>(les) }
                 } else if s.len() <= 0xffffff {
                     let les = LenEncSlice4 {
                         kind: MySerKind::LenEncSlice4,
@@ -649,7 +649,7 @@ impl<'a> MySerElem<'a> {
                         ptr: s.as_ptr(),
                         _marker: PhantomData,
                     };
-                    unsafe { transmute(les) }
+                    unsafe { transmute::<LenEncSlice4<'_>, MySerElem<'_>>(les) }
                 } else if s.len() <= 0xffffffff {
                     let les = LenEncSlice9 {
                         kind: MySerKind::LenEncSlice9,
@@ -659,7 +659,7 @@ impl<'a> MySerElem<'a> {
                         ptr: s.as_ptr(),
                         _marker: PhantomData,
                     };
-                    unsafe { transmute(les) }
+                    unsafe { transmute::<LenEncSlice9<'_>, MySerElem<'_>>(les) }
                 } else {
                     // currently do not support string longer than 4GB.
                     panic!("string to long")

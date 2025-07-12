@@ -195,7 +195,7 @@ impl Statement {
                 column_name: col_spec.column_name.clone(),
                 table_id,
                 column_no: col_no as u16,
-                column_type: col_spec.column_type.clone(),
+                column_type: col_spec.column_type,
                 column_attributes: col_spec.column_attributes,
             })
             .collect();

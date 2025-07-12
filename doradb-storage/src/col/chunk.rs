@@ -54,7 +54,7 @@ pub struct SerChunk<'a> {
     data: Vec<(&'a Attr, SerAttrHeader)>,
 }
 
-impl<'a> SerChunk<'a> {
+impl SerChunk<'_> {
     /// Create an empty serializable chunk.
     #[inline]
     pub fn empty(n_records: u16) -> Self {

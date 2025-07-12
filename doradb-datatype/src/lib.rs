@@ -17,11 +17,12 @@ use static_init::dynamic;
 use std::borrow::Cow;
 use std::io;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PreciseType {
     /// code=0
     /// Most expressions are initialized with unknown type.
     /// After type inference, the precise type will be assigned.
+    #[default]
     Unknown,
     /// code=1
     /// Only constant null will have null type.
@@ -59,12 +60,6 @@ pub enum PreciseType {
     /// code=12
     /// Compound type, currently not support.
     Compound,
-}
-
-impl Default for PreciseType {
-    fn default() -> Self {
-        PreciseType::Unknown
-    }
 }
 
 impl PreciseType {
@@ -227,22 +222,22 @@ impl PreciseType {
             PreciseType::Null => Cow::Borrowed("null"),
             PreciseType::Int(bytes, unsigned) => {
                 if *unsigned {
-                    Cow::Owned(format!("uint({})", bytes))
+                    Cow::Owned(format!("uint({bytes})"))
                 } else {
-                    Cow::Owned(format!("int({})", bytes))
+                    Cow::Owned(format!("int({bytes})"))
                 }
             }
             PreciseType::Decimal(max_prec, max_frac) => {
-                Cow::Owned(format!("decimal({}, {})", max_prec, max_frac))
+                Cow::Owned(format!("decimal({max_prec}, {max_frac})"))
             }
-            PreciseType::Float(bytes) => Cow::Owned(format!("float({})", bytes)),
+            PreciseType::Float(bytes) => Cow::Owned(format!("float({bytes})")),
             PreciseType::Bool => Cow::Borrowed("bool"),
             PreciseType::Date => Cow::Borrowed("date"),
-            PreciseType::Time(frac) => Cow::Owned(format!("time({})", frac)),
-            PreciseType::Datetime(frac) => Cow::Owned(format!("datetime({})", frac)),
+            PreciseType::Time(frac) => Cow::Owned(format!("time({frac})")),
+            PreciseType::Datetime(frac) => Cow::Owned(format!("datetime({frac})")),
             PreciseType::Interval => Cow::Borrowed("interval"),
-            PreciseType::Char(n, c) => Cow::Owned(format!("char({}, {:?})", n, c)),
-            PreciseType::Varchar(n, c) => Cow::Owned(format!("varchar({}, {:?})", n, c)),
+            PreciseType::Char(n, c) => Cow::Owned(format!("char({n}, {c:?})")),
+            PreciseType::Varchar(n, c) => Cow::Owned(format!("varchar({n}, {c:?})")),
             PreciseType::Compound => Cow::Borrowed("compound"),
         }
     }
@@ -276,7 +271,7 @@ impl PreciseType {
     }
 }
 
-impl<'a> TryFrom<&'a [u8]> for PreciseType {
+impl TryFrom<&[u8]> for PreciseType {
     type Error = Error;
     #[inline]
     fn try_from(src: &[u8]) -> Result<Self> {

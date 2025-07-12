@@ -62,7 +62,7 @@ impl OpVisitor for Collect<'_> {
         ControlFlow::Continue(())
     }
 }
-impl<'a> ExprVisitor<'a> for Collect<'_> {
+impl ExprVisitor<'_> for Collect<'_> {
     type Cont = ();
     type Break = ();
     #[inline]

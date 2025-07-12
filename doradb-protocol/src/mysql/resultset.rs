@@ -44,7 +44,7 @@ impl<'a> TryFrom<&'a [u8]> for TextRow<'a> {
     }
 }
 
-impl<'a> NewMySer for TextRow<'a> {
+impl NewMySer for TextRow<'_> {
     type Ser<'s>
         = MySerPackets<'s, 1>
     where

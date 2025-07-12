@@ -1,7 +1,7 @@
 [package]
 name = "doradb-protocol"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["jiangzhe <nju.jiangzhe@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "Protocol module of X-Engine"
@@ -16,7 +16,7 @@ futures-lite = "1.12"
 crypto = {version = "0.4", features = ["digest"] }
 sha1 = "0.10"
 sha2 = "0.10"
-rsa = "0.8"
+rsa = "0.9"
 spki = "0.6"
 rand = "0.8"
 log = "0.4"

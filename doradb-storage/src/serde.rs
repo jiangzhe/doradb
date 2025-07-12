@@ -174,7 +174,7 @@ pub trait Ser<'a> {
 /// different threads.
 pub trait Deser: Sized {
     /// Deserialize objects from input.
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)>;
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)>;
 }
 
 impl Ser<'_> for u64 {
@@ -191,7 +191,7 @@ impl Ser<'_> for u64 {
 
 impl Deser for u64 {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         ctx.deser_u64(input, start_idx)
     }
 }
@@ -210,7 +210,7 @@ impl Ser<'_> for i64 {
 
 impl Deser for i64 {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         ctx.deser_i64(input, start_idx)
     }
 }
@@ -229,7 +229,7 @@ impl Ser<'_> for u32 {
 
 impl Deser for u32 {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         ctx.deser_u32(input, start_idx)
     }
 }
@@ -248,7 +248,7 @@ impl Ser<'_> for u16 {
 
 impl Deser for u16 {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         ctx.deser_u16(input, start_idx)
     }
 }
@@ -267,7 +267,7 @@ impl Ser<'_> for u8 {
 
 impl Deser for u8 {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         ctx.deser_u8(input, start_idx)
     }
 }
@@ -286,7 +286,7 @@ impl Ser<'_> for i8 {
 
 impl Deser for i8 {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         ctx.deser_i8(input, start_idx)
     }
 }
@@ -305,7 +305,7 @@ impl Ser<'_> for bool {
 
 impl Deser for bool {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         ctx.deser_u8(input, start_idx).map(|(idx, v)| (idx, v != 0))
     }
 }
@@ -425,7 +425,7 @@ impl<'a, K: Ser<'a>, V: Ser<'a>> Ser<'a> for BTreeMap<K, V> {
 
 impl<K: Ord + Deser, V: Deser> Deser for BTreeMap<K, V> {
     #[inline]
-    fn deser<'a>(ctx: &mut SerdeCtx, input: &'a [u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let (mut idx, len) = ctx.deser_u64(input, start_idx)?;
         let mut map = BTreeMap::new();
         for _ in 0..len {
@@ -470,7 +470,7 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixSerView<'a, H, P> {
     }
 }
 
-impl<'a, H, P> LenPrefixSerView<'a, H, P> {
+impl<H, P> LenPrefixSerView<'_, H, P> {
     /// Get the length of the data.
     #[inline]
     pub fn data_len(&self) -> usize {

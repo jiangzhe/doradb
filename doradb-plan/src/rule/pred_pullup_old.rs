@@ -426,7 +426,7 @@ fn collect_non_aggr_qry_cols(e: &ExprKind, hs: &mut HashMap<QryCol, GlobalID>) {
 }
 struct CollectQryCols<'a>(&'a mut HashMap<QryCol, GlobalID>);
 
-impl<'a> ExprVisitor<'a> for CollectQryCols<'_> {
+impl ExprVisitor<'_> for CollectQryCols<'_> {
     type Cont = ();
     type Break = ();
     #[inline]

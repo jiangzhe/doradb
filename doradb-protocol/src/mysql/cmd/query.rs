@@ -35,7 +35,7 @@ impl<'a> ComQuery<'a> {
 
 impl_from_ref!(ComQuery: ; query);
 
-impl<'a> NewMySer for ComQuery<'a> {
+impl NewMySer for ComQuery<'_> {
     type Ser<'s>
         = MySerPackets<'s, 2>
     where

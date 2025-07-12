@@ -94,6 +94,7 @@ impl CatalogStorage {
             .collect()
     }
 
+    #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
         self.tables.len()

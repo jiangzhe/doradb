@@ -145,11 +145,9 @@ impl BTree {
             0 => {
                 // single-node tree.
                 self.pool.deallocate_page::<BTreeNode>(g);
-                return;
             }
             1 => {
                 self.deallocate_height1(g).await;
-                return;
             }
             _ => {
                 let mut stack = vec![];
@@ -242,7 +240,7 @@ impl BTree {
                     BTreeSplit::FullBranch(mut split) => loop {
                         match self
                             .try_split_top_down(
-                                &split.lower_fence_key(),
+                                split.lower_fence_key(),
                                 split.page_id,
                                 split.sep_key(),
                                 ts,
@@ -274,14 +272,11 @@ impl BTree {
         value: V,
         ts: TrxID,
     ) -> BTreeUpdate<V> {
-        loop {
-            let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
-            debug_assert!(g.page().is_leaf());
-            let node = g.page_mut();
-            return node
-                .mark_as_deleted(key, value)
-                .ok_then(|| node.update_ts(ts));
-        }
+        let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
+        debug_assert!(g.page().is_leaf());
+        let node = g.page_mut();
+        node.mark_as_deleted(key, value)
+            .ok_then(|| node.update_ts(ts))
     }
 
     /// Delete an existing key value pair from this tree.
@@ -293,17 +288,15 @@ impl BTree {
     /// to make the tree balanced.
     #[inline]
     pub async fn delete<V: BTreeValue>(&self, key: &[u8], value: V, ts: TrxID) -> BTreeDelete {
-        loop {
-            let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
-            debug_assert!(g.page().is_leaf());
-            let node = g.page_mut();
-            let res = node.delete(key, value);
-            if res.is_ok() {
-                node.update_hints();
-                node.update_ts(ts);
-            }
-            return res;
+        let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
+        debug_assert!(g.page().is_leaf());
+        let node = g.page_mut();
+        let res = node.delete(key, value);
+        if res.is_ok() {
+            node.update_hints();
+            node.update_ts(ts);
         }
+        res
     }
 
     /// Update an existing key value pair with new value
@@ -315,14 +308,11 @@ impl BTree {
         new_value: V,
         ts: TrxID,
     ) -> BTreeUpdate<V> {
-        loop {
-            let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
-            debug_assert!(g.page().is_leaf());
-            let node = g.page_mut();
-            return node
-                .update(key, old_value, new_value)
-                .ok_then(|| node.update_ts(ts));
-        }
+        let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
+        debug_assert!(g.page().is_leaf());
+        let node = g.page_mut();
+        node.update(key, old_value, new_value)
+            .ok_then(|| node.update_ts(ts))
     }
 
     /// Try to lookup a key in the tree, break if any of optimistic validation fails.
@@ -435,7 +425,7 @@ impl BTree {
                 if page_id == c_page_id {
                     // Tree structure remains the same.
                     // Check if parent is full.
-                    if !p_node.can_insert(&sep_key) {
+                    if !p_node.can_insert(sep_key) {
                         let p_page_id = p_guard.page_id();
                         if p_page_id != self.root {
                             // Parent is full, trigger top-down split of parent node.
@@ -443,7 +433,7 @@ impl BTree {
                             return Either::Right(BTreeSplit::full_branch(
                                 &p_lower_fence_key,
                                 p_page_id,
-                                &sep_key,
+                                sep_key,
                             ));
                         }
                         // Parent is root and full, just split.
@@ -577,7 +567,7 @@ impl BTree {
             &[],
             hints_enabled,
         );
-        right_node.extend_slots_from::<V>(root, sep_idx, root.count() as usize - sep_idx);
+        right_node.extend_slots_from::<V>(root, sep_idx, root.count() - sep_idx);
         right_node.update_hints();
         // Initialize temporary root node and insert separator key.
         let mut tmp_root = unsafe {
@@ -638,7 +628,7 @@ impl BTree {
         right_node.init(
             c_node.height() as u16,
             ts,
-            &sep_key,
+            sep_key,
             // For leaf node, lower fence value is meaningless.
             // For branch node, only the leftmost branch node has meaningful
             // lower fence value pointing to a valid child.
@@ -649,7 +639,7 @@ impl BTree {
             &c_upper_fence_key,
             c_node.header_hints_enabled(),
         );
-        right_node.extend_slots_from::<V>(c_node, sep_idx, c_node.count() as usize - sep_idx);
+        right_node.extend_slots_from::<V>(c_node, sep_idx, c_node.count() - sep_idx);
         right_node.update_hints();
         // Copy left node to current node.
         *c_node = tmp_left;
@@ -668,6 +658,7 @@ impl BTree {
     }
 
     /// Merge right node into left node, and update separtor key in parent node accordingly.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn merge_node<V: BTreeValue>(
         &self,
@@ -715,6 +706,7 @@ impl BTree {
     }
 
     /// Merge partial right node into left node.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn merge_partial<V: BTreeValue>(
         &self,
@@ -770,7 +762,7 @@ impl BTree {
                 ts,
                 sep_key,
                 lower_fence_value,
-                &upper_fence_key,
+                upper_fence_key,
                 r_node.header_hints_enabled(),
             );
             node.assume_init()
@@ -1106,6 +1098,7 @@ impl<S: LockStrategy<Page = BTreeNode>> BTreeCoupling<S>
 where
     S::Guard: PageGuard<BTreeNode>,
 {
+    #[allow(clippy::new_without_default)]
     #[inline]
     pub fn new() -> Self {
         BTreeCoupling {
@@ -1370,10 +1363,8 @@ pub struct BTreeCompactConfig {
 impl BTreeCompactConfig {
     #[inline]
     pub fn new(low_ratio: f64, high_ratio: f64) -> Result<Self> {
-        if low_ratio < 0.0
-            || low_ratio > 1.0
-            || high_ratio < 0.0
-            || high_ratio > 1.0
+        if !(0.0..=1.0).contains(&low_ratio)
+            || !(0.0..=1.0).contains(&high_ratio)
             || high_ratio < low_ratio
         {
             return Err(Error::InvalidArgument);

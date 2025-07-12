@@ -46,7 +46,7 @@ pub trait ExprMutVisitor {
 
 pub struct CollectQryIDs<'a>(pub &'a mut HashSet<QueryID>);
 
-impl<'a> ExprVisitor<'a> for CollectQryIDs<'_> {
+impl ExprVisitor<'_> for CollectQryIDs<'_> {
     type Cont = ();
     type Break = ();
     #[inline]
@@ -114,7 +114,7 @@ impl ExprExt for ExprKind {
             has_aggr: bool,
             cols: &'a mut Vec<Col>,
         }
-        impl<'a> ExprVisitor<'a> for Collect<'_> {
+        impl ExprVisitor<'_> for Collect<'_> {
             type Cont = ();
             type Break = ();
             #[inline]
@@ -154,7 +154,7 @@ impl ExprExt for ExprKind {
     #[inline]
     fn contains_aggr_func(&self) -> bool {
         struct Contains(bool);
-        impl<'a> ExprVisitor<'a> for Contains {
+        impl ExprVisitor<'_> for Contains {
             type Cont = ();
             type Break = ();
             #[inline]
@@ -178,7 +178,7 @@ impl ExprExt for ExprKind {
             has_non_aggr_cols: bool,
         }
 
-        impl<'a> ExprVisitor<'a> for Contains {
+        impl ExprVisitor<'_> for Contains {
             type Cont = ();
             type Break = ();
             #[inline]

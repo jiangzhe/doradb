@@ -10,10 +10,10 @@
 //!    this transaction will update CTS in its head.
 //! 4. When a transaction query a row in one page,
 //!    a) it first look at page-level UndoMap, if the map is empty, then all data on the page
-//!       are latest. So directly read data and return.
+//!    are latest. So directly read data and return.
 //!    b) otherwise, check if queried RowID exists in the map. if not, same as a).
 //!    c) If exists, check the timestamp in entry head. If it's larger than current STS, means
-//!       it's invisible, undo change and go to next version in the chain...
+//!    it's invisible, undo change and go to next version in the chain...
 //!    d) If less than current STS, return current version.
 pub mod group;
 pub mod log;

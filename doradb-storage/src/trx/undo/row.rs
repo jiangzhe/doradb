@@ -226,7 +226,7 @@ impl RowUndoLogs {
 
     #[inline]
     pub fn merge(&mut self, other: &mut Self) {
-        self.0.extend(other.0.drain(..));
+        self.0.append(&mut other.0);
     }
 
     #[inline]
@@ -272,14 +272,14 @@ impl Deref for OwnedRowUndo {
     type Target = RowUndo;
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }
 
 impl DerefMut for OwnedRowUndo {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.0
+        &mut self.0
     }
 }
 
@@ -384,12 +384,7 @@ impl NextRowUndo {
     /// Returns next index branch.
     #[inline]
     pub fn index_branch(&self, key: &SelectKey) -> Option<&IndexBranch> {
-        for ib in &self.indexes {
-            if &ib.key == key {
-                return Some(ib);
-            }
-        }
-        None
+        self.indexes.iter().find(|&ib| &ib.key == key)
     }
 }
 

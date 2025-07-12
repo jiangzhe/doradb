@@ -114,7 +114,7 @@ impl PredMap {
             Entry::Occupied(occ) => {
                 inner.merge(occ.remove());
             }
-            Entry::Vacant(vac) => (),
+            Entry::Vacant(_vac) => (),
         }
         inner
     }
@@ -145,7 +145,7 @@ impl PredMap {
         for eq_set in inner.eq_sets {
             let mut eq_set_iter = eq_set.into_iter();
             let l_gid = eq_set_iter.next().unwrap();
-            while let Some(r_gid) = eq_set_iter.next() {
+            for r_gid in eq_set_iter {
                 let e = self.cols_eq_pred(l_gid, r_gid);
                 dst.push(e);
             }
@@ -220,20 +220,20 @@ pub struct InnerSet {
     ///
     /// There are two kinds of functional dependencies:
     /// 1. from projection.
-    /// e.g. SELECT c1, c1+1 as c2 FROM t1
-    /// Here c2's value is determined by c1. so there is one dependency c2 -> c1+1
-    /// Such dependency is not important, because if we have a predicate on top of the tree,
-    /// when we push it down through query blocks, it will be converted to suitable one.
-    /// If we have a predicate at leaf of the tree, we can pull multiple derived predicates
-    /// due to the functional dependency.
-    /// e.g. SELECT c1, c1+1 as c2 FROM t1 WHERE c1+1 > 0
-    /// There are two possible predicates: [c1+1>0, c2>0]. Once we push them down to leaf,
-    /// the duplicates can be eliminated and only one remains: c1+1>0.
+    ///    e.g. SELECT c1, c1+1 as c2 FROM t1
+    ///    Here c2's value is determined by c1. so there is one dependency c2 -> c1+1
+    ///    Such dependency is not important, because if we have a predicate on top of the tree,
+    ///    when we push it down through query blocks, it will be converted to suitable one.
+    ///    If we have a predicate at leaf of the tree, we can pull multiple derived predicates
+    ///    due to the functional dependency.
+    ///    e.g. SELECT c1, c1+1 as c2 FROM t1 WHERE c1+1 > 0
+    ///    There are two possible predicates: [c1+1>0, c2>0]. Once we push them down to leaf,
+    ///    the duplicates can be eliminated and only one remains: c1+1>0.
     ///
     /// 2. from table constraints, such as primary key, unique key.
-    /// e.g. Table T has columns c1, c2, c3. c1 is primary key.
-    /// So values of c2, c3 are all determined by c1.
-    /// If there is a predicate c2 > 0, we can generate one dependency c2 -> col(T, 1, c1).
+    ///    e.g. Table T has columns c1, c2, c3. c1 is primary key.
+    ///    So values of c2, c3 are all determined by c1.
+    ///    If there is a predicate c2 > 0, we can generate one dependency c2 -> col(T, 1, c1).
     ///
     /// Here is one example of predicate move-around by using functional dependency.
     ///
@@ -369,8 +369,8 @@ impl OuterSet {
                     }
                     // left join
                     JoinSide::Right(_) => match (
-                        side.left(col_map[&gid1].kind.qry_id().unwrap()),
-                        side.left(col_map[&gid2].kind.qry_id().unwrap()),
+                        side.left(col_map[gid1].kind.qry_id().unwrap()),
+                        side.left(col_map[gid2].kind.qry_id().unwrap()),
                     ) {
                         (true, true) => {
                             // both left side
@@ -520,13 +520,9 @@ impl PredExpr {
                     None
                 }
             }
-            PredExpr::ColEqConst(gid, cst) => {
-                if let Some(c) = col_map.get(gid) {
-                    Some(PredExpr::ColEqConst(c.gid, cst.clone()))
-                } else {
-                    None
-                }
-            }
+            PredExpr::ColEqConst(gid, cst) => col_map
+                .get(gid)
+                .map(|c| PredExpr::ColEqConst(c.gid, cst.clone())),
             PredExpr::TwoColEq(gid1, gid2) => {
                 if let Some(c1) = col_map.get(gid1) {
                     if let Some(c2) = col_map.get(gid2) {
@@ -655,16 +651,12 @@ impl PredExpr {
                     None
                 }
             }
-            PredExpr::ColEqConst(gid, cst) => {
-                if let Some(c) = col_map.get(&gid) {
-                    Some(ExprKind::pred_func(
-                        PredFuncKind::Equal,
-                        vec![ExprKind::Col(c.clone()), ExprKind::Const(cst)],
-                    ))
-                } else {
-                    None
-                }
-            }
+            PredExpr::ColEqConst(gid, cst) => col_map.get(&gid).map(|c| {
+                ExprKind::pred_func(
+                    PredFuncKind::Equal,
+                    vec![ExprKind::Col(c.clone()), ExprKind::Const(cst)],
+                )
+            }),
             PredExpr::TwoColEq(gid1, gid2) => {
                 if let Some(c1) = col_map.get(&gid1) {
                     if let Some(c2) = col_map.get(&gid2) {
@@ -820,12 +812,10 @@ impl<C: Catalog> PredPullup<'_, C> {
                 Some(out_col.gid)
             } else if let Some(eq_set) = inner.eq_sets.iter().find(|s| s.contains(&tgt_gid)) {
                 // target not in output but has equal set.
-                if let Some(out_col) = eq_set.iter().find_map(|gid| col_out.get(gid)) {
-                    // at least one column in equal set is also in output.
-                    Some(out_col.gid)
-                } else {
-                    None
-                }
+                eq_set
+                    .iter()
+                    .find_map(|gid| col_out.get(gid))
+                    .map(|out_col| out_col.gid)
             } else {
                 None
             };
@@ -1013,7 +1003,6 @@ impl<C: Catalog> PredPullup<'_, C> {
         input_id: GlobalID,
         pred: Vec<ExprKind>,
     ) -> ControlFlow<Error, ()> {
-        let input_id = input_id;
         // pull up all preds and equal sets of child.
         let mut inner = self.pred_map.remove_inner(input_id);
         for e in pred {
@@ -1384,13 +1373,12 @@ impl<C: Catalog> OpMutVisitor for PredPullup<'_, C> {
         // collect potential functional dependencies of table
         match &op.kind {
             OpKind::Filt { pred, .. } => self.collect_dep_cols(pred),
-            OpKind::Join(join) => match &**join {
-                Join::Qualified(QualifiedJoin { cond, filt, .. }) => {
+            OpKind::Join(join) => {
+                if let Join::Qualified(QualifiedJoin { cond, filt, .. }) = &**join {
                     self.collect_dep_cols(cond);
                     self.collect_dep_cols(filt);
                 }
-                _ => (),
-            },
+            }
             OpKind::Aggr(aggr) => self.collect_dep_cols(&aggr.filt),
             OpKind::Query(qid) => {
                 if let Some(subq) = self.qry_set.get(qid) {
@@ -1519,13 +1507,10 @@ impl ExprMutVisitor for ReplaceCol<'_> {
 
     #[inline]
     fn leave(&mut self, e: &mut ExprKind) -> ControlFlow<(), ()> {
-        match e {
-            ExprKind::Col(Col { gid, .. }) => {
-                if *gid == self.0 {
-                    *e = self.1.clone();
-                }
+        if let ExprKind::Col(Col { gid, .. }) = e {
+            if *gid == self.0 {
+                *e = self.1.clone();
             }
-            _ => (),
         }
         ControlFlow::Continue(())
     }
@@ -1634,13 +1619,10 @@ impl<'a> ExprVisitor<'a> for AllColsIncluded<'a> {
 
     #[inline]
     fn leave(&mut self, e: &ExprKind) -> ControlFlow<(), ()> {
-        match e {
-            ExprKind::Col(Col { gid, .. }) => {
-                if !self.0.contains(gid) {
-                    return ControlFlow::Break(());
-                }
+        if let ExprKind::Col(Col { gid, .. }) = e {
+            if !self.0.contains(gid) {
+                return ControlFlow::Break(());
             }
-            _ => (),
         }
         ControlFlow::Continue(())
     }
@@ -1657,23 +1639,20 @@ impl<'a> ExprVisitor<'a> for CollectColMapping<'a> {
     type Break = ();
     #[inline]
     fn leave(&mut self, e: &ExprKind) -> ControlFlow<(), ()> {
-        match e {
-            ExprKind::Col(c @ Col { gid, idx, kind }) => {
-                self.col_map.insert(*gid, c.clone());
-                match kind {
-                    ColKind::Query(qid) | ColKind::Correlated(qid) => {
-                        self.qry_col_map.insert(QryCol(*qid, *idx), *gid);
-                    }
-                    ColKind::Table(table_id, ..) => {
-                        self.tbl_col_map
-                            .entry(TblCol(*table_id, *idx))
-                            .or_default()
-                            .insert(*gid);
-                    }
-                    _ => (),
+        if let ExprKind::Col(c @ Col { gid, idx, kind }) = e {
+            self.col_map.insert(*gid, c.clone());
+            match kind {
+                ColKind::Query(qid) | ColKind::Correlated(qid) => {
+                    self.qry_col_map.insert(QryCol(*qid, *idx), *gid);
                 }
+                ColKind::Table(table_id, ..) => {
+                    self.tbl_col_map
+                        .entry(TblCol(*table_id, *idx))
+                        .or_default()
+                        .insert(*gid);
+                }
+                _ => (),
             }
-            _ => (),
         }
         ControlFlow::Continue(())
     }
@@ -1711,8 +1690,8 @@ impl<'a> ExprVisitor<'a> for CollectDepCols<'a> {
     type Break = ();
     #[inline]
     fn leave(&mut self, e: &ExprKind) -> ControlFlow<(), ()> {
-        match e {
-            ExprKind::Col(Col { idx, kind, .. }) => match kind {
+        if let ExprKind::Col(Col { idx, kind, .. }) = e {
+            match kind {
                 ColKind::Query(qid) | ColKind::Correlated(qid) => {
                     self.0.qry.entry(*qid).or_default().insert(*idx);
                 }
@@ -1720,8 +1699,7 @@ impl<'a> ExprVisitor<'a> for CollectDepCols<'a> {
                     self.0.tbl.entry(*table_id).or_default().insert(*idx);
                 }
                 _ => (),
-            },
-            _ => (),
+            }
         }
         ControlFlow::Continue(())
     }

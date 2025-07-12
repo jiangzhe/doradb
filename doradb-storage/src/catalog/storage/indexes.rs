@@ -19,17 +19,17 @@ use std::sync::OnceLock;
 
 pub const TABLE_ID_INDEXES: TableID = 3;
 const COL_NO_INDEXES_INDEX_ID: usize = 0;
-const COL_NAME_INDEXES_INDEX_ID: &'static str = "index_id";
+const COL_NAME_INDEXES_INDEX_ID: &str = "index_id";
 const COL_NO_INDEXES_TABLE_ID: usize = 1;
-const COL_NAME_INDEXES_TABLE_ID: &'static str = "table_id";
+const COL_NAME_INDEXES_TABLE_ID: &str = "table_id";
 const COL_NO_INDEXES_INDEX_NAME: usize = 2;
-const COL_NAME_INDEXES_INDEX_NAME: &'static str = "index_name";
+const COL_NAME_INDEXES_INDEX_NAME: &str = "index_name";
 const COL_NO_INDEXES_INDEX_ATTRIBUTES: usize = 3;
-const COL_NAME_INDEXES_INDEX_ATTRIBUTES: &'static str = "index_attributes";
+const COL_NAME_INDEXES_INDEX_ATTRIBUTES: &str = "index_attributes";
 const INDEX_NO_INDEXES_INDEX_ID: usize = 0;
-const INDEX_NAME_INDEXES_INDEX_ID: &'static str = "idx_indexes_index_id";
+const INDEX_NAME_INDEXES_INDEX_ID: &str = "idx_indexes_index_id";
 const INDEX_NO_INDEXES_TABLE_ID: usize = 1;
-const INDEX_NAME_INDEXES_TABLE_ID: &'static str = "idx_indexes_table_id";
+const INDEX_NAME_INDEXES_TABLE_ID: &str = "idx_indexes_table_id";
 
 pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
@@ -147,18 +147,18 @@ impl<P: BufferPool> Indexes<'_, P> {
 
 pub const TABLE_ID_INDEX_COLUMNS: TableID = 4;
 const COL_NO_INDEX_COLUMNS_COLUMN_ID: usize = 0;
-const COL_NAME_INDEX_COLUMNS_COLUMN_ID: &'static str = "column_id";
+const COL_NAME_INDEX_COLUMNS_COLUMN_ID: &str = "column_id";
 const COL_NO_INDEX_COLUMNS_INDEX_ID: usize = 1;
-const COL_NAME_INDEX_COLUMNS_INDEX_ID: &'static str = "index_id";
+const COL_NAME_INDEX_COLUMNS_INDEX_ID: &str = "index_id";
 const COL_NO_INDEX_COLUMNS_COLUMN_NO: usize = 2;
-const COL_NAME_INDEX_COLUMNS_COLUMN_NO: &'static str = "column_no";
+const COL_NAME_INDEX_COLUMNS_COLUMN_NO: &str = "column_no";
 const COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO: usize = 3;
-const COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO: &'static str = "index_column_no";
+const COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO: &str = "index_column_no";
 
 const COL_NO_INDEX_COLUMNS_INDEX_ORDER: usize = 4;
-const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &'static str = "index_order";
+const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &str = "index_order";
 const INDEX_NO_INDEX_COLUMNS_INDEX_ID: usize = 0;
-const INDEX_NAME_INDEX_COLUMNS_INDEX_ID: &'static str = "idx_index_columns_index_id";
+const INDEX_NAME_INDEX_COLUMNS_INDEX_ID: &str = "idx_index_columns_index_id";
 
 pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();

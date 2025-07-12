@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const ROW_ID_COL_NAME: &'static str = "__row_id";
+pub const ROW_ID_COL_NAME: &str = "__row_id";
 
 /// Catalog contains metadata of user tables.
 pub struct Catalog {
@@ -195,6 +195,7 @@ pub struct CatalogCache {
 }
 
 impl CatalogCache {
+    #[allow(clippy::new_without_default)]
     #[inline]
     pub fn new() -> Self {
         CatalogCache {

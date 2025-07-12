@@ -16,13 +16,13 @@ use std::sync::OnceLock;
 
 pub const TABLE_ID_SCHEMAS: TableID = 0;
 const COL_NO_SCHEMAS_SCHEMA_ID: usize = 0;
-const COL_NAME_SCHEMAS_SCHEMA_ID: &'static str = "schema_id";
+const COL_NAME_SCHEMAS_SCHEMA_ID: &str = "schema_id";
 const COL_NO_SCHEMAS_SCHEMA_NAME: usize = 1;
-const COL_NAME_SCHEMAS_SCHEMA_NAME: &'static str = "schema_name";
+const COL_NAME_SCHEMAS_SCHEMA_NAME: &str = "schema_name";
 const INDEX_NO_SCHEMAS_SCHEMA_ID: usize = 0;
-const INDEX_NAME_SCHEMAS_SCHEMA_ID: &'static str = "idx_schemas_schema_id";
+const INDEX_NAME_SCHEMAS_SCHEMA_ID: &str = "idx_schemas_schema_id";
 const INDEX_NO_SCHEMAS_SCHEMA_NAME: usize = 1;
-const INDEX_NAME_SCHEMAS_SCHEMA_NAME: &'static str = "idx_schemas_schema_name";
+const INDEX_NAME_SCHEMAS_SCHEMA_NAME: &str = "idx_schemas_schema_name";
 
 pub fn catalog_definition_of_schemas() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
@@ -78,7 +78,7 @@ pub struct Schemas<'a, P: BufferPool> {
     pub(super) table: &'a Table,
 }
 
-impl<'a, P: BufferPool> Schemas<'a, P> {
+impl<P: BufferPool> Schemas<'_, P> {
     /// Find a schema by name.
     #[inline]
     pub async fn find_uncommitted_by_name(&self, name: &str) -> Option<SchemaObject> {

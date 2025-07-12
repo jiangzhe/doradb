@@ -144,7 +144,7 @@ impl<'a> ComFieldList<'a> {
     }
 }
 
-impl<'a> NewMySer for ComFieldList<'a> {
+impl NewMySer for ComFieldList<'_> {
     type Ser<'s>
         = MySerPackets<'s, 3>
     where

@@ -22,6 +22,7 @@ pub enum Bitmap {
 
 impl Bitmap {
     /// Create a new owned bitmap with given capacity.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn with_capacity(cap_u1: usize) -> Self {
         let cap_u8 = if cap_u1 == 0 { 1 } else { (cap_u1 + 7) / 8 };
@@ -34,6 +35,7 @@ impl Bitmap {
     /// Create a new owned bitmap with given length.
     /// The returned bitmap already has length same as input
     /// and all bits are zeroed.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn zeroes(len_u1: usize) -> Self {
         let cap_u8 = if len_u1 == 0 { 1 } else { (len_u1 + 7) / 8 };
@@ -46,6 +48,7 @@ impl Bitmap {
     /// Create a new owned bitmap with given length.
     /// The returned bitmap already has length same as input
     /// and all bits are ones.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn ones(len_u1: usize) -> Self {
         let cap_u8 = if len_u1 == 0 { 1 } else { (len_u1 + 7) / 8 };
@@ -56,6 +59,7 @@ impl Bitmap {
     }
 
     /// Create a new borrowed bitmap.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn new_borrowed(ptr: Arc<[u8]>, len_u1: usize, start_bytes: usize) -> Self {
         let end_bytes = align_u128(start_bytes + (len_u1 + 7) / 8);
@@ -126,6 +130,7 @@ impl Bitmap {
     /// Reserves given capacity.
     /// This method may allocate new memory if it's borrowed,
     /// or current capacity is not sufficient.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn reserve(&mut self, cap_u1: usize) {
         match self {
@@ -165,23 +170,26 @@ impl Bitmap {
     /// # Safety
     ///
     /// Caller must ensure length is within bound.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub unsafe fn u64s_unchecked(&self, len_u1: usize) -> (&[u64], usize) {
-        let len_u64 = (len_u1 + 63) / 64;
-        match self {
-            Bitmap::Owned { inner, len_u1 } => {
-                // # SAFETY
-                //
-                // Alignment and length are guaranteed to be valid.
-                let s = inner.cast_slice::<u64>(len_u64);
-                (s, *len_u1)
-            }
-            Bitmap::Borrowed { ptr, len_u1, .. } => {
-                // # SAFETY
-                //
-                // Alignment and length are guaranteed to be valid.
-                let s = std::slice::from_raw_parts(ptr.as_ptr() as *const u64, len_u64);
-                (s, *len_u1)
+        unsafe {
+            let len_u64 = (len_u1 + 63) / 64;
+            match self {
+                Bitmap::Owned { inner, len_u1 } => {
+                    // # SAFETY
+                    //
+                    // Alignment and length are guaranteed to be valid.
+                    let s = inner.cast_slice::<u64>(len_u64);
+                    (s, *len_u1)
+                }
+                Bitmap::Borrowed { ptr, len_u1, .. } => {
+                    // # SAFETY
+                    //
+                    // Alignment and length are guaranteed to be valid.
+                    let s = std::slice::from_raw_parts(ptr.as_ptr() as *const u64, len_u64);
+                    (s, *len_u1)
+                }
             }
         }
     }
@@ -201,18 +209,21 @@ impl Bitmap {
     /// # Safety
     ///
     /// Caller must ensure length is within bound.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub unsafe fn u64s_mut_unchecked(&mut self, len_u1: usize) -> (&mut [u64], usize) {
-        let len_u64 = (len_u1 + 63) / 64;
-        match self.to_mut() {
-            Bitmap::Owned { inner, len_u1 } => {
-                // # SAFETY
-                //
-                // Alignment and length are guaranteed to be valid.
-                let s = inner.cast_slice_mut::<u64>(len_u64);
-                (s, *len_u1)
+        unsafe {
+            let len_u64 = (len_u1 + 63) / 64;
+            match self.to_mut() {
+                Bitmap::Owned { inner, len_u1 } => {
+                    // # SAFETY
+                    //
+                    // Alignment and length are guaranteed to be valid.
+                    let s = inner.cast_slice_mut::<u64>(len_u64);
+                    (s, *len_u1)
+                }
+                Bitmap::Borrowed { .. } => unreachable!(),
             }
-            Bitmap::Borrowed { .. } => unreachable!(),
         }
     }
 
@@ -226,6 +237,7 @@ impl Bitmap {
     }
 
     /// Returns aligned byte slice and its bit number.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn u8s(&self, len_u1: usize) -> (&[u8], usize) {
         let len_u8 = (len_u1 + 7) / 8;
@@ -242,6 +254,7 @@ impl Bitmap {
 
     /// Returns aligned mutable byte slice and its bit number.
     /// This method will allocate new memory if it's borrowed.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn u8s_mut(&mut self, len_u1: usize) -> (&mut [u8], usize) {
         let len_u8 = (len_u1 + 7) / 8;
@@ -312,6 +325,7 @@ impl Bitmap {
 
     /// Convert the bitmap to owned.
     /// If it's already owned, this call is no-op.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn to_mut(&mut self) -> &mut Self {
         match self {
@@ -334,6 +348,7 @@ impl Bitmap {
     }
 
     /// Clone self to owned.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn to_owned(&self) -> Self {
         match self {
@@ -358,6 +373,7 @@ impl Bitmap {
     }
 
     /// Clone self to owned with atomic reference.
+    #[allow(clippy::manual_div_ceil)]
     #[inline]
     pub fn clone_to_owned(this: &Arc<Self>) -> Arc<Self> {
         match this.as_ref() {
@@ -663,7 +679,7 @@ pub struct BoolIter<'a> {
     idx: usize,
 }
 
-impl<'a> Iterator for BoolIter<'a> {
+impl Iterator for BoolIter<'_> {
     type Item = bool;
 
     #[inline]
@@ -773,7 +789,7 @@ pub struct RangeIter<'a> {
     n: usize,             // previous repeat number
 }
 
-impl<'a> RangeIter<'a> {
+impl RangeIter<'_> {
     #[inline]
     fn break_falses_in_word(&mut self) {
         debug_assert!(self.prev);
@@ -829,7 +845,7 @@ impl<'a> RangeIter<'a> {
     }
 }
 
-impl<'a> Iterator for RangeIter<'a> {
+impl Iterator for RangeIter<'_> {
     type Item = (bool, usize);
     /// Returns bool value with its repeat number.
     /// The implementation scans the bitmap on two levels.
@@ -937,7 +953,7 @@ pub struct TrueIndexIter<'a> {
     end: usize,
 }
 
-impl<'a> Iterator for TrueIndexIter<'a> {
+impl Iterator for TrueIndexIter<'_> {
     type Item = usize;
     #[inline]
     fn next(&mut self) -> Option<usize> {
@@ -973,6 +989,7 @@ pub fn bitmap_u8s_set(bm: &mut [u8], idx: usize, val: bool) {
     }
 }
 
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 fn bitmap_u64s_shift(bs: &mut [u64], len: usize, shift_bits: usize) {
     if shift_bits >= len || shift_bits == 0 {
@@ -1058,6 +1075,7 @@ fn bitmap_u64s_shift(bs: &mut [u64], len: usize, shift_bits: usize) {
     }
 }
 
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 fn bitmap_extend(dst: &mut [u64], dst_len: usize, src: &[u64], src_len: usize) {
     debug_assert!(src.len() * 64 >= src_len);
@@ -1102,6 +1120,7 @@ fn bitmap_extend(dst: &mut [u64], dst_len: usize, src: &[u64], src_len: usize) {
     }
 }
 
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 fn bitmap_extend_range(dst: &mut [u64], dst_len: usize, src: &[u64], range: Range<usize>) {
     debug_assert!(src.len() * 64 >= range.end);
@@ -1200,6 +1219,7 @@ fn bitmap_extend_range(dst: &mut [u64], dst_len: usize, src: &[u64], range: Rang
     }
 }
 
+#[allow(clippy::manual_div_ceil)]
 #[inline]
 fn bitmap_extend_const(dst: &mut [u8], dst_len: usize, src_val: bool, src_len: usize) {
     debug_assert!(dst.len() * 8 >= dst_len + src_len);
