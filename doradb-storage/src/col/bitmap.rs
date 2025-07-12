@@ -1501,7 +1501,7 @@ mod tests {
             rand_bitmap_count(i)
         }
         for _ in 0..256 {
-            rand_bitmap_count(rand::rng().gen_range(0..4096))
+            rand_bitmap_count(rand::rng().random_range(0..4096))
         }
         let bools1: Vec<bool> = vec![];
         let bm1 = Bitmap::from_iter(bools1);

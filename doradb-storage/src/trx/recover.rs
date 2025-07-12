@@ -154,7 +154,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
         // recover index with all data.
         // todo: integrate with checkpoint in future.
         for (table_id, pages) in &self.recovered_tables {
-            if let Some(table) = self.catalog.get_table(*table_id) {
+            if let Some(table) = self.catalog.get_table(*table_id).await {
                 for page_id in pages {
                     table
                         .populate_index_via_row_page(self.buf_pool, *page_id)
@@ -206,6 +206,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 let table = self
                     .catalog
                     .get_table(*table_id)
+                    .await
                     .ok_or(Error::TableNotFound)?;
                 let count = end_row_id - start_row_id;
                 let mut page_guard = table
@@ -257,6 +258,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             let table = self
                 .catalog
                 .get_table(table_id)
+                .await
                 .ok_or(Error::TableNotFound)?;
             self.replay_table_dml(&table, &table_dml.rows, cts, disable_index)
                 .await?;
@@ -274,6 +276,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             let table = self
                 .catalog
                 .get_table(table_id)
+                .await
                 .ok_or(Error::TableNotFound)?;
             self.replay_catalog_table_modifications(&table, &table_dml.rows)
                 .await;
@@ -475,7 +478,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(engine.catalog().get_table(table_id).is_some());
+            assert!(engine.catalog().get_table(table_id).await.is_some());
 
             drop(engine);
             let _ = std::fs::remove_file("databuffer_recover.bin");
@@ -543,7 +546,7 @@ mod tests {
             trx = stmt.succeed();
             session = trx.commit().await.unwrap();
 
-            let table = session.engine.catalog().get_table(table_id).unwrap();
+            let table = session.engine.catalog().get_table(table_id).await.unwrap();
 
             let s: String = std::iter::repeat_n('0', 200).collect();
             for i in 0..DML_SIZE {
@@ -580,7 +583,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine.catalog().get_table(table_id).unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut rows = 0usize;
             table
                 .scan_rows_uncommitted(engine.data_pool, |row| {

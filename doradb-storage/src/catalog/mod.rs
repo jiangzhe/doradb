@@ -8,11 +8,11 @@ pub use table::*;
 use crate::buffer::FixedBufferPool;
 use crate::error::{Error, Result};
 use crate::index::BlockIndex;
+use crate::latch::RwLock;
 use crate::lifetime::StaticLifetime;
 use crate::table::Table;
 use crate::trx::sys::TransactionSystem;
 use doradb_catalog::{ColumnSpec, IndexKey, IndexSpec, SchemaID, TableID};
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,8 +64,8 @@ impl Catalog {
     /// The catalog tables uses different buffer pool than data(user) tables.
     /// So no page creation should be persisted in redo log.
     #[inline]
-    pub fn enable_page_committer_for_tables(&self, trx_sys: &'static TransactionSystem) {
-        let tables_g = self.cache.tables.read();
+    pub async fn enable_page_committer_for_tables(&self, trx_sys: &'static TransactionSystem) {
+        let tables_g = self.cache.tables.read().await;
         for table in tables_g.values() {
             if self.is_user_table(table.table_id()) {
                 table.blk_idx.enable_page_committer(trx_sys);
@@ -86,12 +86,12 @@ impl Catalog {
             (true, Some(schema)) => {
                 let schema_id = schema.schema_id;
                 self.try_update_obj_id(schema_id);
-                let mut g = self.cache.schemas.write();
+                let mut g = self.cache.schemas.write().await;
                 let _ = g.insert(schema_id, schema);
                 Ok(())
             }
             (false, None) => {
-                let mut g = self.cache.schemas.write();
+                let mut g = self.cache.schemas.write().await;
                 let _ = g.remove(&schema_id);
                 Ok(())
             }
@@ -162,7 +162,7 @@ impl Catalog {
                 let blk_idx = BlockIndex::new(self.storage.meta_pool, table.table_id).await;
                 let table = Table::new(blk_idx, table_metadata);
                 // Update table into cache
-                let mut table_cache_g = self.cache.tables.write();
+                let mut table_cache_g = self.cache.tables.write().await;
                 let res = table_cache_g.insert(table_id, table);
                 assert!(res.is_none());
                 Ok(())
@@ -172,8 +172,8 @@ impl Catalog {
     }
 
     #[inline]
-    pub fn get_table(&self, table_id: TableID) -> Option<Table> {
-        let g = self.cache.tables.read();
+    pub async fn get_table(&self, table_id: TableID) -> Option<Table> {
+        let g = self.cache.tables.read().await;
         g.get(&table_id).cloned()
     }
 
@@ -220,11 +220,11 @@ impl<'a> TableCache<'a> {
     }
 
     #[inline]
-    pub fn get_table(&mut self, table_id: TableID) -> &Option<Table> {
+    pub async fn get_table(&mut self, table_id: TableID) -> &Option<Table> {
         if self.map.contains_key(&table_id) {
             return &self.map[&table_id];
         }
-        let table = self.catalog.get_table(table_id);
+        let table = self.catalog.get_table(table_id).await;
         self.map.entry(table_id).or_insert(table)
     }
 }

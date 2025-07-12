@@ -144,7 +144,7 @@ impl TransactionSystem {
         for trx in &trx_list {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
-                    if let Some(table) = table_cache.get_table(ip.table_id) {
+                    if let Some(table) = table_cache.get_table(ip.table_id).await {
                         // todo: index should stored in index pool, instead of data pool.
                         if table.delete_index(buf_pool, &ip.key, ip.row_id).await {
                             purge_index_count += 1;
@@ -587,7 +587,7 @@ mod tests {
                 .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
@@ -675,7 +675,7 @@ mod tests {
                 .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.

@@ -120,7 +120,7 @@ impl Statement {
             schema_name: SemiStr::new(schema_name),
         };
 
-        let mut schema_cache_g = engine.catalog().cache.schemas.write();
+        let mut schema_cache_g = engine.catalog().cache.schemas.write().await;
 
         let inserted = engine
             .catalog()
@@ -224,7 +224,7 @@ impl Statement {
             }
         }
 
-        let mut table_cache_g = engine.catalog().cache.tables.write();
+        let mut table_cache_g = engine.catalog().cache.tables.write().await;
 
         // Insert table object, column objects, index objects, index column objects.
 
