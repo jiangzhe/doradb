@@ -17,6 +17,7 @@ use doradb_catalog::TableID;
 use either::Either::{Left, Right};
 use parking_lot::Mutex;
 use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const BLOCK_PAGE_SIZE: usize = PAGE_SIZE;
 pub const BLOCK_HEADER_SIZE: usize = mem::size_of::<BlockNodeHeader>();
@@ -81,9 +82,9 @@ impl BlockNode {
     }
 
     #[inline]
-    pub fn init_empty(&mut self) {
-        self.header.height = 0;
-        self.header.start_row_id = 0;
+    pub fn init_empty(&mut self, height: u32, start_row_id: RowID) {
+        self.header.height = height;
+        self.header.start_row_id = start_row_id;
         self.header.end_row_id = INVALID_ROW_ID;
         self.header.count = 0;
     }
@@ -153,6 +154,14 @@ impl BlockNode {
         &self.branch_entries()[self.header.count as usize - 1]
     }
 
+    /// Returns mutable last entry in branch node.
+    #[inline]
+    pub fn branch_last_entry_mut(&mut self) -> &mut PageEntry {
+        debug_assert!(self.is_branch());
+        let idx = self.header.count as usize - 1;
+        &mut self.branch_entries_mut()[idx]
+    }
+
     /// Add a new entry in branch node.
     #[inline]
     pub fn branch_add_entry(&mut self, entry: PageEntry) {
@@ -165,7 +174,7 @@ impl BlockNode {
 
     /* leaf methods */
 
-    /// Returns whether the node is leaf.
+    /// Returns whether the leaf node is full.
     #[inline]
     pub fn leaf_is_full(&self) -> bool {
         debug_assert!(self.is_leaf());
@@ -196,8 +205,7 @@ impl BlockNode {
     /// Returns last block in leaf node.
     #[inline]
     pub fn leaf_last_block(&self) -> &Block {
-        debug_assert!(self.is_leaf());
-        &self.leaf_blocks()[self.header.count as usize - 1]
+        self.leaf_block(self.header.count as usize - 1)
     }
 
     /// Returns mutable last block in leaf node.
@@ -329,12 +337,6 @@ impl Block {
         unsafe { std::slice::from_raw_parts_mut(ptr, self.header.count as usize) }
     }
 
-    /// Returns last entry in row block.
-    #[inline]
-    pub fn row_last_entry(&self) -> &PageEntry {
-        &self.row_page_entries()[self.header.count as usize - 1]
-    }
-
     /// Add a new page entry in row block.
     #[inline]
     pub fn row_add_page(&mut self, count: u64, page_id: PageID) {
@@ -394,6 +396,7 @@ pub struct ColSegmentMeta {
 pub struct BlockIndex {
     pub table_id: TableID,
     root: PageID,
+    height: AtomicUsize,
     insert_free_list: Mutex<Vec<PageID>>,
     // Fixed buffer pool to hold block nodes.
     pool: &'static FixedBufferPool,
@@ -409,20 +412,21 @@ impl BlockIndex {
         let mut g = pool.allocate_page::<BlockNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
-        page.init_empty();
+        page.init_empty(0, 0);
         BlockIndex {
             table_id,
             root: page_id,
+            height: AtomicUsize::new(0),
             pool,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
             page_committer: Mutex::new(None),
         }
     }
 
-    /// Returns root page of this block index.
+    /// Returns height of block index.
     #[inline]
-    pub fn root_page(&self) -> PageID {
-        self.root
+    pub fn height(&self) -> usize {
+        self.height.load(Ordering::Relaxed)
     }
 
     /// Enable page committer by injecting transaction system for redo logging
@@ -597,6 +601,7 @@ impl BlockIndex {
         Ok(page_guard)
     }
 
+    /// Insert row page by splitting root.
     #[inline]
     async fn insert_row_page_split_root(
         &self,
@@ -610,13 +615,9 @@ impl BlockIndex {
             let p = p_guard.page();
             (p.is_leaf() && p.leaf_is_full()) || (p.is_branch() && p.branch_is_full())
         });
-        debug_assert!({
-            let p = p_guard.page();
-            p.is_leaf()
-                && (p.leaf_last_block().is_col() || p_guard.page().leaf_last_block().row_is_full())
-        });
-        let new_height = p_guard.page().header.height + 1;
-        let l_row_id = p_guard.page().header.start_row_id;
+        let root = p_guard.page();
+        let new_height = root.header.height + 1;
+        let l_row_id = root.header.start_row_id;
         let r_row_id = row_id;
         let max_row_id = r_row_id + count;
 
@@ -625,15 +626,19 @@ impl BlockIndex {
         let l_page_id = l_guard.page_id();
         l_guard.page_mut().clone_from(p_guard.page());
         l_guard.page_mut().header.end_row_id = row_id; // update original page's end row id
+        drop(l_guard);
 
-        // create right child, add one row block with one page entry.
-        let mut r_guard = self.pool.allocate_page::<BlockNode>().await;
-        let r_page_id = r_guard.page_id();
-        {
-            let r = r_guard.page_mut();
-            r.init(0, r_row_id, count, insert_page_id);
-            debug_assert!(r.header.end_row_id == INVALID_ROW_ID);
-        }
+        // We may need to create a sub-tree on the right side.
+        // Because we disable branch split. We have to always construct right tree
+        // as same height as left.
+        let r_page_id = if root.header.height == 0 {
+            let mut r_guard = self.pool.allocate_page::<BlockNode>().await;
+            r_guard.page_mut().init(0, r_row_id, count, insert_page_id);
+            r_guard.page_id()
+        } else {
+            self.create_sub_tree(root.header.height, r_row_id, count, insert_page_id)
+                .await
+        };
 
         // initialize parent again.
         {
@@ -652,8 +657,42 @@ impl BlockIndex {
                 row_id: r_row_id,
                 page_id: r_page_id,
             });
+            self.height.store(new_height as usize, Ordering::Relaxed);
         }
         (r_row_id, max_row_id)
+    }
+
+    #[inline]
+    async fn create_sub_tree(
+        &self,
+        mut height: u32,
+        start_row_id: RowID,
+        count: u64,
+        insert_page_id: PageID,
+    ) -> PageID {
+        debug_assert!(height > 0);
+        let mut p_g = self.pool.allocate_page::<BlockNode>().await;
+        let page_id = p_g.page_id();
+        p_g.page_mut().init_empty(height, start_row_id);
+        loop {
+            height -= 1;
+            let mut c_g = self.pool.allocate_page::<BlockNode>().await;
+            let c_page_id = c_g.page_id();
+            p_g.page_mut().branch_add_entry(PageEntry {
+                row_id: start_row_id,
+                page_id: c_page_id,
+            });
+            if height == 0 {
+                // insert row page to leaf.
+                c_g.page_mut()
+                    .init(height, start_row_id, count, insert_page_id);
+                break;
+            }
+            // initialize empty node.
+            c_g.page_mut().init_empty(height, start_row_id);
+            p_g = c_g;
+        }
+        page_id
     }
 
     #[inline]
@@ -691,22 +730,26 @@ impl BlockIndex {
             } // do not split branch node.
         }
         // create new leaf node with one insert page id
-        let mut leaf = self.pool.allocate_page::<BlockNode>().await;
-        let leaf_page_id = leaf.page_id();
-        {
-            let b: &mut BlockNode = leaf.page_mut();
-            b.init(0, row_id, count, insert_page_id);
-            debug_assert!(b.header.end_row_id == INVALID_ROW_ID);
-        }
-        // attach new leaf to parent
-        {
-            let p = p_guard.page_mut();
-            p.branch_add_entry(PageEntry::new(row_id, leaf_page_id));
-        }
+        // or subtree containing only insert page id.
+        let p_height = p_guard.page().header.height;
+        debug_assert!(p_height >= 1);
+        let c_page_id = if p_height == 1 {
+            let mut leaf = self.pool.allocate_page::<BlockNode>().await;
+            leaf.page_mut().init(0, row_id, count, insert_page_id);
+            debug_assert!(leaf.page_mut().header.end_row_id == INVALID_ROW_ID);
+            leaf.page_id()
+        } else {
+            self.create_sub_tree(p_height - 1, row_id, count, insert_page_id)
+                .await
+        };
+        p_guard
+            .page_mut()
+            .branch_add_entry(PageEntry::new(row_id, c_page_id));
         drop(c_guard);
         Valid((row_id, row_id + count))
     }
 
+    /// Insert row page id into block index.
     #[inline]
     async fn insert_row_page(
         &self,
@@ -724,7 +767,6 @@ impl BlockIndex {
             guard.must_exclusive()
         };
         debug_assert!(p_guard.page().is_leaf());
-        // only empty block index will have empty leaf.
         if p_guard.page().leaf_is_empty() {
             let start_row_id = p_guard.page().header.start_row_id;
             p_guard
@@ -789,14 +831,14 @@ impl BlockIndex {
         // optimistic mode, should always check version before using protected data.
         let mut pu = unsafe { p_guard.page_unchecked() };
         let height = pu.header.height;
-        let mut level = 1;
         while !pu.is_leaf() {
             let count = pu.header.count;
             let idx = 1.max(count as usize).min(NBR_ENTRIES_IN_BRANCH) - 1;
             let page_id = pu.branch_entries()[idx].page_id;
             // fields on page are read, validate them.
             verify!(p_guard.validate());
-            p_guard = if level == height {
+            debug_assert!(height >= 1);
+            p_guard = if height == 1 {
                 let g = self
                     .pool
                     .get_child_page::<BlockNode>(&p_guard, page_id, mode)
@@ -812,7 +854,6 @@ impl BlockIndex {
                 verify!(g)
             };
             pu = unsafe { p_guard.page_unchecked() };
-            level += 1;
         }
         Valid(p_guard)
     }
@@ -1037,6 +1078,7 @@ mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::engine::EngineConfig;
+    use crate::lifetime::StaticLifetime;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
     use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
@@ -1342,6 +1384,44 @@ mod tests {
 
             let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
+        })
+    }
+
+    #[test]
+    fn test_block_index_split() {
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            {
+                let blk_idx = BlockIndex::new(pool, 1).await;
+                assert!(!blk_idx.is_page_committer_enabled());
+                assert!(blk_idx.height() == 0);
+                for row_page_id in 0..10000 {
+                    blk_idx.insert_row_page(100, row_page_id).await;
+                }
+                assert!(blk_idx.height() == 1);
+                let mut root = pool
+                    .get_page_spin::<BlockNode>(blk_idx.root)
+                    .exclusive_async()
+                    .await;
+                // mark root as full to trigger split.
+                root.page_mut().header.count = NBR_ENTRIES_IN_BRANCH as u32;
+                // assign right-most leaf node
+                let mut r_g = pool.allocate_page::<BlockNode>().await;
+                r_g.page_mut().init(0, 50000, 10000, 10001);
+                r_g.page_mut().header.count = NBR_BLOCKS_IN_LEAF as u32;
+                r_g.page_mut().leaf_last_block_mut().header.kind = BlockKind::Row;
+                r_g.page_mut().leaf_last_block_mut().header.count = NBR_PAGES_IN_ROW_BLOCK as u32;
+                let r_page_id = r_g.page_id();
+                drop(r_g);
+                root.page_mut().branch_last_entry_mut().row_id = 50000;
+                root.page_mut().branch_last_entry_mut().page_id = r_page_id;
+                drop(root);
+                blk_idx.insert_row_page(100, 20000).await;
+                assert!(blk_idx.height() == 2);
+            }
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
         })
     }
 }
