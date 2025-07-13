@@ -218,7 +218,10 @@ impl TrxSysInitializer {
         let trx_sys = TransactionSystem::new(self.config, catalog, log_partitions, purge_chan);
         let trx_sys = StaticLifetime::new_static(trx_sys);
 
-        trx_sys.catalog.enable_page_committer_for_tables(trx_sys);
+        trx_sys
+            .catalog
+            .enable_page_committer_for_tables(trx_sys)
+            .await;
         trx_sys.start_io_threads();
         trx_sys.start_gc_threads(gc_rxs);
         trx_sys.start_purge_threads(data_pool, purge_rx);

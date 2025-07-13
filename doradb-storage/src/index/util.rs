@@ -3,6 +3,15 @@ use crate::row::RowID;
 use crate::trx::sys::TransactionSystem;
 use doradb_catalog::TableID;
 
+/// Statistics of space used by nodes.
+#[derive(Debug, Default)]
+pub struct SpaceStatistics {
+    pub nodes: usize,
+    pub total_space: usize,
+    pub used_space: usize,
+    pub effective_space: usize,
+}
+
 pub(super) struct ParentPosition<G> {
     pub(super) g: G,
     // -1 means lower fence in btree node.

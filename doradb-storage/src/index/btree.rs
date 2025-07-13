@@ -9,6 +9,7 @@ use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
 use crate::index::btree_node::{BTreeNode, KeyVec, LookupChild, SpaceEstimation};
 use crate::index::util::ParentPosition;
+use crate::index::util::SpaceStatistics;
 use crate::latch::LatchFallbackMode;
 use crate::trx::TrxID;
 use either::Either;
@@ -1688,15 +1689,6 @@ enum BTreeCompact {
     ChildDone,
     // parent is done.
     ParentDone,
-}
-
-/// Statistics of space used by nodes.
-#[derive(Debug, Default)]
-pub struct SpaceStatistics {
-    pub nodes: usize,
-    pub total_space: usize,
-    pub used_space: usize,
-    pub effective_space: usize,
 }
 
 #[cfg(test)]
