@@ -2,7 +2,8 @@ use crate::error::Result;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use doradb_datatype::konst::{ValidF32, ValidF64};
 use doradb_datatype::memcmp::{
-    attach_null, MemCmpFormat, NullableMemCmpFormat, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN,
+    BytesExtendable, MemCmpFormat, Null, NullableMemCmpFormat, SegmentedBytes, MIN_VAR_MCF_LEN,
+    MIN_VAR_NMCF_LEN,
 };
 use doradb_datatype::PreciseType;
 use serde::de::Visitor;
@@ -32,10 +33,16 @@ pub struct ValType {
 
 impl ValType {
     #[inline]
+    pub fn new(kind: ValKind, nullable: bool) -> Self {
+        ValType { kind, nullable }
+    }
+
+    #[inline]
     pub fn inline_len(self) -> usize {
         self.kind.inline_len()
     }
 
+    // todo: replace with MemCmpKey support.
     #[inline]
     pub fn memcmp_encoded_len(self) -> Option<usize> {
         if self.kind.is_fixed() {
@@ -45,6 +52,7 @@ impl ValType {
         None
     }
 
+    // todo: replace with MemCmpKey support.
     #[inline]
     pub fn memcmp_encoded_len_maybe_var(self) -> usize {
         if self.kind.is_fixed() {
@@ -339,7 +347,7 @@ impl Val {
     }
 
     #[inline]
-    pub fn as_f32(&self) -> Option<ValidF32> {
+    pub fn as_valid_f32(&self) -> Option<ValidF32> {
         match self {
             Val::Byte4(v) => ValidF32::new(f32::from_bits(*v)),
             _ => None,
@@ -347,9 +355,25 @@ impl Val {
     }
 
     #[inline]
-    pub fn as_f64(&self) -> Option<ValidF64> {
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Val::Byte4(v) => Some(f32::from_bits(*v)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_valid_f64(&self) -> Option<ValidF64> {
         match self {
             Val::Byte8(v) => ValidF64::new(f64::from_bits(*v)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Val::Byte8(v) => Some(f64::from_bits(*v)),
             _ => None,
         }
     }
@@ -380,40 +404,40 @@ impl Val {
     }
 
     #[inline]
-    fn encode_mcf(&self, kind: ValKind, buf: &mut Vec<u8>) {
+    fn encode_mcf<T: BytesExtendable>(&self, kind: ValKind, buf: &mut T) {
         match kind {
-            ValKind::I8 => MemCmpFormat::attach_mcf(&self.as_i8().unwrap(), buf),
-            ValKind::U8 => MemCmpFormat::attach_mcf(&self.as_u8().unwrap(), buf),
-            ValKind::I16 => MemCmpFormat::attach_mcf(&self.as_i16().unwrap(), buf),
-            ValKind::U16 => MemCmpFormat::attach_mcf(&self.as_u16().unwrap(), buf),
-            ValKind::I32 => MemCmpFormat::attach_mcf(&self.as_i32().unwrap(), buf),
-            ValKind::U32 => MemCmpFormat::attach_mcf(&self.as_u32().unwrap(), buf),
-            ValKind::I64 => MemCmpFormat::attach_mcf(&self.as_i64().unwrap(), buf),
-            ValKind::U64 => MemCmpFormat::attach_mcf(&self.as_u64().unwrap(), buf),
-            ValKind::F32 => MemCmpFormat::attach_mcf(&self.as_f32().unwrap(), buf),
-            ValKind::F64 => MemCmpFormat::attach_mcf(&self.as_f64().unwrap(), buf),
-            ValKind::VarByte => MemCmpFormat::attach_mcf(self.as_bytes().unwrap(), buf),
+            ValKind::I8 => self.as_i8().unwrap().extend_mcf_to(buf),
+            ValKind::U8 => self.as_u8().unwrap().extend_mcf_to(buf),
+            ValKind::I16 => self.as_i16().unwrap().extend_mcf_to(buf),
+            ValKind::U16 => self.as_u16().unwrap().extend_mcf_to(buf),
+            ValKind::I32 => self.as_i32().unwrap().extend_mcf_to(buf),
+            ValKind::U32 => self.as_u32().unwrap().extend_mcf_to(buf),
+            ValKind::I64 => self.as_i64().unwrap().extend_mcf_to(buf),
+            ValKind::U64 => self.as_u64().unwrap().extend_mcf_to(buf),
+            ValKind::F32 => self.as_f32().unwrap().extend_mcf_to(buf),
+            ValKind::F64 => self.as_f64().unwrap().extend_mcf_to(buf),
+            ValKind::VarByte => SegmentedBytes(self.as_bytes().unwrap()).extend_mcf_to(buf),
         }
     }
 
     #[inline]
-    fn encode_nmcf(&self, kind: ValKind, buf: &mut Vec<u8>) {
+    fn encode_nmcf<T: BytesExtendable>(&self, kind: ValKind, buf: &mut T) {
         if self.is_null() {
-            attach_null(buf);
+            Null.extend_nmcf_to(buf);
             return;
         }
         match kind {
-            ValKind::I8 => NullableMemCmpFormat::attach_nmcf(&self.as_i8().unwrap(), buf),
-            ValKind::U8 => NullableMemCmpFormat::attach_nmcf(&self.as_u8().unwrap(), buf),
-            ValKind::I16 => NullableMemCmpFormat::attach_nmcf(&self.as_i16().unwrap(), buf),
-            ValKind::U16 => NullableMemCmpFormat::attach_nmcf(&self.as_u16().unwrap(), buf),
-            ValKind::I32 => NullableMemCmpFormat::attach_nmcf(&self.as_i32().unwrap(), buf),
-            ValKind::U32 => NullableMemCmpFormat::attach_nmcf(&self.as_u32().unwrap(), buf),
-            ValKind::I64 => NullableMemCmpFormat::attach_nmcf(&self.as_i64().unwrap(), buf),
-            ValKind::U64 => NullableMemCmpFormat::attach_nmcf(&self.as_u64().unwrap(), buf),
-            ValKind::F32 => NullableMemCmpFormat::attach_nmcf(&self.as_f32().unwrap(), buf),
-            ValKind::F64 => NullableMemCmpFormat::attach_nmcf(&self.as_f64().unwrap(), buf),
-            ValKind::VarByte => NullableMemCmpFormat::attach_nmcf(self.as_bytes().unwrap(), buf),
+            ValKind::I8 => self.as_i8().unwrap().extend_nmcf_to(buf),
+            ValKind::U8 => self.as_u8().unwrap().extend_nmcf_to(buf),
+            ValKind::I16 => self.as_i16().unwrap().extend_nmcf_to(buf),
+            ValKind::U16 => self.as_u16().unwrap().extend_nmcf_to(buf),
+            ValKind::I32 => self.as_i32().unwrap().extend_nmcf_to(buf),
+            ValKind::U32 => self.as_u32().unwrap().extend_nmcf_to(buf),
+            ValKind::I64 => self.as_i64().unwrap().extend_nmcf_to(buf),
+            ValKind::U64 => self.as_u64().unwrap().extend_nmcf_to(buf),
+            ValKind::F32 => self.as_f32().unwrap().extend_nmcf_to(buf),
+            ValKind::F64 => self.as_f64().unwrap().extend_nmcf_to(buf),
+            ValKind::VarByte => SegmentedBytes(self.as_bytes().unwrap()).extend_nmcf_to(buf),
         }
     }
 }
@@ -481,9 +505,30 @@ impl From<i64> for Val {
     }
 }
 
+impl From<f32> for Val {
+    #[inline]
+    fn from(value: f32) -> Self {
+        Val::Byte4(value.to_bits())
+    }
+}
+
+impl From<f64> for Val {
+    #[inline]
+    fn from(value: f64) -> Self {
+        Val::Byte8(value.to_bits())
+    }
+}
+
 impl From<&[u8]> for Val {
     #[inline]
     fn from(value: &[u8]) -> Self {
+        Val::VarByte(MemVar::from(value))
+    }
+}
+
+impl<const LEN: usize> From<&[u8; LEN]> for Val {
+    #[inline]
+    fn from(value: &[u8; LEN]) -> Self {
         Val::VarByte(MemVar::from(value))
     }
 }
@@ -1149,6 +1194,18 @@ impl From<&[u8]> for MemVar {
     fn from(value: &[u8]) -> Self {
         debug_assert!(value.len() <= 0xffff);
         if value.len() <= MEM_VAR_LEN_INLINE {
+            Self::inline(value)
+        } else {
+            Self::outline(value)
+        }
+    }
+}
+
+impl<const LEN: usize> From<&[u8; LEN]> for MemVar {
+    #[inline]
+    fn from(value: &[u8; LEN]) -> Self {
+        debug_assert!(LEN <= 0xffff);
+        if LEN <= MEM_VAR_LEN_INLINE {
             Self::inline(value)
         } else {
             Self::outline(value)
