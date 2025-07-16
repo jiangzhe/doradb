@@ -1,4 +1,4 @@
-use crate::index::smart_key::SmartKey;
+use crate::index::btree_key::BTreeKey;
 use crate::row::RowID;
 use crate::value::{Val, ValKind, ValType};
 use doradb_catalog::IndexSpec;
@@ -66,7 +66,7 @@ impl SecondaryIndex {
                             IndexKind::unique(PartitionSingleKeyIndex::<ValidF64, false>::empty())
                         }
                         (ValKind::VarByte, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<SmartKey, false>::empty())
+                            IndexKind::unique(PartitionSingleKeyIndex::<BTreeKey, false>::empty())
                         }
                         _ => todo!("nullable index not supported"),
                     }
@@ -181,7 +181,7 @@ pub trait EncodeKeySelf {
     fn encode(key: &[Val]) -> Self;
 }
 
-macro_rules! impl_self_encode_int {
+macro_rules! impl_self_encode_number {
     ($ty:ty, $func:ident) => {
         impl EncodeKeySelf for $ty {
             #[inline]
@@ -192,35 +192,25 @@ macro_rules! impl_self_encode_int {
     };
 }
 
-impl_self_encode_int!(i8, as_i8);
-impl_self_encode_int!(u8, as_u8);
-impl_self_encode_int!(i16, as_i16);
-impl_self_encode_int!(u16, as_u16);
-impl_self_encode_int!(i32, as_i32);
-impl_self_encode_int!(u32, as_u32);
-impl_self_encode_int!(i64, as_i64);
-impl_self_encode_int!(u64, as_u64);
+impl_self_encode_number!(i8, as_i8);
+impl_self_encode_number!(u8, as_u8);
+impl_self_encode_number!(i16, as_i16);
+impl_self_encode_number!(u16, as_u16);
+impl_self_encode_number!(i32, as_i32);
+impl_self_encode_number!(u32, as_u32);
+impl_self_encode_number!(i64, as_i64);
+impl_self_encode_number!(u64, as_u64);
+impl_self_encode_number!(f32, as_f32);
+impl_self_encode_number!(f64, as_f64);
+impl_self_encode_number!(ValidF32, as_valid_f32);
+impl_self_encode_number!(ValidF64, as_valid_f64);
 
-macro_rules! impl_self_encode_float {
-    ($ty:ty, $func:ident) => {
-        impl EncodeKeySelf for $ty {
-            #[inline]
-            fn encode(key: &[Val]) -> Self {
-                key[0].$func().unwrap()
-            }
-        }
-    };
-}
-
-impl_self_encode_float!(ValidF32, as_f32);
-impl_self_encode_float!(ValidF64, as_f64);
-
-impl EncodeKeySelf for SmartKey {
+impl EncodeKeySelf for BTreeKey {
     #[inline]
     fn encode(key: &[Val]) -> Self {
         debug_assert!(key.len() == 1);
         let bs = key[0].as_bytes().unwrap();
-        SmartKey::from(bs)
+        BTreeKey::from(bs)
     }
 }
 
@@ -451,7 +441,7 @@ impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
 
 pub struct PartitionMultiKeyIndex {
     encoder: Either<FixLenEncoder, VarLenEncoder>,
-    index: PartitionSingleKeyIndex<SmartKey, false>,
+    index: PartitionSingleKeyIndex<BTreeKey, false>,
 }
 
 impl PartitionMultiKeyIndex {
