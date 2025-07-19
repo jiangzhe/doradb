@@ -248,7 +248,7 @@ pub mod tests {
         let trx = session.begin_trx();
         let mut stmt = trx.start_stmt();
 
-        let schema_id = stmt.create_schema("db1").await.unwrap();
+        let schema_id = stmt.create_schema("db1", true).await.unwrap();
 
         let trx = stmt.succeed();
         let session = trx.commit().await.unwrap();
@@ -320,6 +320,41 @@ pub mod tests {
                 },
                 vec![IndexSpec::new(
                     "idx_table2_id",
+                    vec![IndexKey::new(0)],
+                    IndexAttributes::PK,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let trx = stmt.succeed();
+        let session = trx.commit().await.unwrap();
+        drop(session);
+        table_id
+    }
+
+    /// Table3 has single string key column.
+    #[inline]
+    pub(crate) async fn table3(engine: &Engine) -> TableID {
+        let schema_id = db1(engine).await;
+
+        let session = engine.new_session();
+        let trx = session.begin_trx();
+        let mut stmt = trx.start_stmt();
+
+        let table_id = stmt
+            .create_table(
+                schema_id,
+                TableSpec {
+                    table_name: SemiStr::new("table3"),
+                    columns: vec![ColumnSpec {
+                        column_name: SemiStr::new("name"),
+                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_attributes: ColumnAttributes::empty(),
+                    }],
+                },
+                vec![IndexSpec::new(
+                    "idx_table3_name",
                     vec![IndexKey::new(0)],
                     IndexAttributes::PK,
                 )],

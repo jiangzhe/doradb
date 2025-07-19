@@ -257,7 +257,7 @@ pub(crate) async fn db1(engine: &Engine) -> SchemaID {
     let trx = session.begin_trx();
     let mut stmt = trx.start_stmt();
 
-    let schema_id = stmt.create_schema("db1").await.unwrap();
+    let schema_id = stmt.create_schema("db1", true).await.unwrap();
 
     let trx = stmt.succeed();
     let session = trx.commit().await.unwrap();

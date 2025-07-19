@@ -375,6 +375,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
 mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::engine::EngineConfig;
+    use crate::row::ops::{SelectKey, UpdateCol};
     use crate::row::RowRead;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
@@ -437,7 +438,7 @@ mod tests {
             let mut session = engine.new_session();
             let mut trx = session.begin_trx();
             let mut stmt = trx.start_stmt();
-            let schema_id = stmt.create_schema("db1").await.unwrap();
+            let schema_id = stmt.create_schema("db1", false).await.unwrap();
             trx = stmt.succeed();
             session = trx.commit().await.unwrap();
 
@@ -499,7 +500,10 @@ mod tests {
     #[test]
     fn test_log_recover_dml() {
         smol::block_on(async {
-            const DML_SIZE: usize = 5000;
+            const DML_SIZE: usize = 1000;
+            const INS_STEP: usize = 10;
+            const UPD_STEP: usize = 11;
+            const DEL_STEP: usize = 13;
 
             remove_files("recover3*");
             let engine = EngineConfig::default()
@@ -523,7 +527,7 @@ mod tests {
             let mut session = engine.new_session();
             let mut trx = session.begin_trx();
             let mut stmt = trx.start_stmt();
-            let schema_id = stmt.create_schema("db1").await.unwrap();
+            let schema_id = stmt.create_schema("db1", false).await.unwrap();
             trx = stmt.succeed();
             session = trx.commit().await.unwrap();
 
@@ -558,16 +562,42 @@ mod tests {
 
             let table = session.engine.catalog().get_table(table_id).await.unwrap();
 
-            let s: String = std::iter::repeat_n('0', 200).collect();
-            for i in 0..DML_SIZE {
+            let s: String = std::iter::repeat_n('0', 100).collect();
+            // insert
+            for i in (0..DML_SIZE).step_by(INS_STEP) {
+                let mut trx = session.begin_trx();
+                for j in i..i + INS_STEP {
+                    let mut stmt = trx.start_stmt();
+                    let res = stmt
+                        .insert_row(&table, vec![Val::from(j as u32), Val::from(&s[..])])
+                        .await;
+                    assert!(res.is_ok());
+                    trx = stmt.succeed();
+                }
+                session = trx.commit().await.unwrap();
+            }
+            // update
+            let s2: String = std::iter::repeat_n('2', 100).collect();
+            for i in (0..DML_SIZE).step_by(UPD_STEP) {
                 let trx = session.begin_trx();
                 let mut stmt = trx.start_stmt();
-                let res = stmt
-                    .insert_row(&table, vec![Val::from(i as u32), Val::from(&s[..])])
-                    .await;
+                let key = SelectKey::new(0, vec![Val::from(i as u32)]);
+                let uc = UpdateCol {
+                    idx: 1,
+                    val: Val::from(&s2[..]),
+                };
+                let res = stmt.update_row(&table, &key, vec![uc]).await;
                 assert!(res.is_ok());
-                let trx = stmt.succeed();
-                session = trx.commit().await.unwrap();
+                session = stmt.succeed().commit().await.unwrap();
+            }
+            // delete
+            for i in (0..DML_SIZE).step_by(DEL_STEP) {
+                let trx = session.begin_trx();
+                let mut stmt = trx.start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(i as u32)]);
+                let res = stmt.delete_row(&table, &key).await;
+                assert!(res.is_ok());
+                session = stmt.succeed().commit().await.unwrap();
             }
 
             drop(table);
@@ -598,11 +628,11 @@ mod tests {
             table
                 .scan_rows_uncommitted(engine.data_pool, |row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
-                    rows += 1;
+                    rows += if row.is_deleted() { 0 } else { 1 };
                     true
                 })
                 .await;
-            assert_eq!(rows, DML_SIZE);
+            assert_eq!(rows, DML_SIZE - (DML_SIZE / DEL_STEP + 1));
 
             drop(engine);
             let _ = std::fs::remove_file("databuffer_recover.bin");
