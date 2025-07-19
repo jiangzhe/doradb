@@ -1,10 +1,12 @@
 use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
-use crate::index::RowLocation;
+use crate::index::util::Maskable;
+use crate::index::{RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage, RowRead};
 use crate::table::TableID;
+use crate::trx::TrxID;
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -41,7 +43,12 @@ impl IndexUndoLogs {
     /// because other transaction can not update the same index entry
     /// concurrently.
     #[inline]
-    pub async fn rollback<P: BufferPool>(&mut self, data_pool: &'static P, catalog: &Catalog) {
+    pub async fn rollback<P: BufferPool>(
+        &mut self,
+        data_pool: &'static P,
+        catalog: &Catalog,
+        ts: TrxID,
+    ) {
         while let Some(entry) = self.0.pop() {
             let table = catalog.get_table(entry.table_id).await.unwrap();
             match entry.kind {
@@ -49,10 +56,23 @@ impl IndexUndoLogs {
                     let res = table.sec_idx[key.index_no]
                         .unique()
                         .unwrap()
-                        .compare_delete(&key.vals, entry.row_id);
+                        .compare_delete(&key.vals, entry.row_id, true, ts)
+                        .await;
                     assert!(res);
                 }
-                IndexUndoKind::UpdateUnique(key, old_row_id) => {
+                IndexUndoKind::UpdateUnique(key, old_row_id, deleted) => {
+                    if !deleted {
+                        // The version of previous row is not deleted, means current transaction
+                        // must own the lock of old row.
+                        // So directly rollback index should be fine.
+                        let new_row_id = entry.row_id;
+                        let index = table.sec_idx[key.index_no].unique().unwrap();
+                        let res = index
+                            .compare_exchange(&key.vals, new_row_id, old_row_id, ts)
+                            .await;
+                        debug_assert!(res.is_ok());
+                        return;
+                    }
                     // There is a race condition:
                     // Transaction A deleted a row{row_id=100, k=1} and committed.
                     // GC thread is trying to delete index entry.
@@ -80,25 +100,34 @@ impl IndexUndoLogs {
                             if access.row().is_deleted() && !access.any_old_version_exists() {
                                 // old row is invisible to all transactions.
                                 let new_row_id = entry.row_id;
-                                let res = table.sec_idx[key.index_no]
-                                    .unique()
-                                    .unwrap()
-                                    .compare_delete(&key.vals, new_row_id);
+                                let index = table.sec_idx[key.index_no].unique().unwrap();
+                                let res =
+                                    index.compare_delete(&key.vals, new_row_id, true, ts).await;
                                 assert!(res);
                             } else {
                                 // old row must be seen for one transaction.
-                                // rollback the index change.
+                                // rollback the index change and let other take care of
+                                // following GC.
                                 let new_row_id = entry.row_id;
-                                let res = table.sec_idx[key.index_no]
-                                    .unique()
-                                    .unwrap()
-                                    .compare_exchange(&key.vals, new_row_id, old_row_id);
+                                let index = table.sec_idx[key.index_no].unique().unwrap();
+                                let res = index
+                                    .compare_exchange(
+                                        &key.vals,
+                                        new_row_id,
+                                        old_row_id.deleted(),
+                                        ts,
+                                    )
+                                    .await;
                                 assert!(res.is_ok());
                             }
                         }
                     }
                 }
-                IndexUndoKind::DeferDelete(_) => (), // do nothing.
+                IndexUndoKind::DeferDelete(_) => {
+                    // Because we always mask index entry as deleted for each defer delete undo log.
+                    // We need to unmask it.
+                    todo!()
+                }
             }
         }
     }
@@ -187,8 +216,8 @@ pub struct IndexUndo {
 pub enum IndexUndoKind {
     /// Insert key.
     InsertUnique(SelectKey),
-    /// Update key and old row id.
-    UpdateUnique(SelectKey, RowID),
+    /// Update key, old row id, delete flag of old row.
+    UpdateUnique(SelectKey, RowID, bool),
     /// Delete is not included in index undo,
     /// because transaction thread does not perform index deletion,
     /// in order to support MVCC.
@@ -241,7 +270,7 @@ mod tests {
         log2.push(IndexUndo {
             table_id: 3,
             row_id: 3,
-            kind: IndexUndoKind::UpdateUnique(create_test_key(3), 4),
+            kind: IndexUndoKind::UpdateUnique(create_test_key(3), 4, false),
         });
 
         // Merge and verify
@@ -300,7 +329,7 @@ mod tests {
         logs.push(IndexUndo {
             table_id: 5,
             row_id: 5,
-            kind: IndexUndoKind::UpdateUnique(create_test_key(5), 6),
+            kind: IndexUndoKind::UpdateUnique(create_test_key(5), 6, false),
         });
 
         let original_len = logs.len();

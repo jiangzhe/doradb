@@ -145,6 +145,7 @@ impl EvictableBufferPool {
 
     /// Try to dispatch read IO on given page.
     /// This method may not succeed, and client should retry.
+    #[allow(clippy::await_holding_lock)]
     #[inline]
     async fn try_dispatch_io_read(&self, page_id: PageID) {
         // Use sync lock because the critical section is small.
@@ -166,11 +167,12 @@ impl EvictableBufferPool {
                             if !self.in_mem.try_inc() {
                                 // still no budget.
                                 // we can only wait for signal and retry.
-                                drop(page_guard);
-                                drop(g);
                                 // before waiting, notify evict thread to work.
                                 // this event may be ignored if evict thread is busy.
                                 self.in_mem.evict_ev.notify(1);
+                                // explicitly drop guards before await
+                                drop(page_guard);
+                                drop(g);
                                 listener.await;
                                 self.in_mem.load_ev.notify(1); // notify next reader to retry.
                                 return; // now retry.
@@ -185,7 +187,7 @@ impl EvictableBufferPool {
                         });
                         self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
                         self.file_io.request_read(page_guard);
-                        drop(g);
+                        drop(g); // explicitly drop guard before await
                         listener.await;
                     }
                 }
@@ -196,7 +198,7 @@ impl EvictableBufferPool {
                     IOKind::Read | IOKind::ReadWaitForWrite => {
                         // Wait for existing signal.
                         let listener = status.event.as_ref().unwrap().listen();
-                        drop(g);
+                        drop(g); // explicitly drop guard before await
                         listener.await;
                     }
                     IOKind::Write => {
@@ -204,7 +206,7 @@ impl EvictableBufferPool {
                         let event = Event::new();
                         let listener = event.listen();
                         status.event = Some(event);
-                        drop(g);
+                        drop(g); // explicitly drop guard before await
                         listener.await;
                     }
                 }
@@ -1415,6 +1417,7 @@ impl Default for InflightIO {
 }
 
 impl InflightIO {
+    #[allow(clippy::await_holding_lock)]
     #[inline]
     async fn wait_for_write(&self, page_id: PageID, frame: &BufferFrame) {
         let mut g = self.map.lock();
@@ -1433,7 +1436,7 @@ impl InflightIO {
                             kind: IOKind::ReadWaitForWrite,
                             event: Some(event),
                         });
-                        drop(g);
+                        drop(g); // explicit drop guard before await.
                         listener.await;
                     }
                     // In any other kind, we let caller retry.
@@ -1453,7 +1456,7 @@ impl InflightIO {
                 });
                 let event = occ.get_mut().event.get_or_insert_default();
                 let listener = event.listen();
-                drop(g);
+                drop(g); // explicitly drop guard before await.
                 listener.await;
             }
         }

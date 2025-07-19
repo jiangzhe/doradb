@@ -1,19 +1,24 @@
-use crate::index::btree_key::BTreeKey;
+use crate::buffer::guard::PageGuard;
+use crate::buffer::FixedBufferPool;
+use crate::index::btree::{BTree, BTreeDelete, BTreeInsert, BTreeUpdate};
+use crate::index::btree_key::{BTreeKey, BTreeKeyEncoder};
+use crate::index::btree_value::BTreeU64;
+use crate::index::util::Maskable;
 use crate::row::RowID;
-use crate::value::{Val, ValKind, ValType};
+use crate::trx::TrxID;
+use crate::value::{Val, ValType};
 use doradb_catalog::IndexSpec;
 use doradb_datatype::konst::{ValidF32, ValidF64};
 use either::Either;
+use futures::FutureExt;
 use parking_lot::RwLock;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
-pub const INDEX_KEY_MAX_LEN: usize = 255;
-
-#[derive(Clone)]
 pub struct SecondaryIndex {
     pub index_no: usize,
     pub kind: IndexKind,
@@ -21,66 +26,23 @@ pub struct SecondaryIndex {
 
 impl SecondaryIndex {
     #[inline]
-    pub fn new<F: Fn(usize) -> ValType>(
+    pub async fn new<F: Fn(usize) -> ValType>(
+        index_pool: &'static FixedBufferPool,
         index_no: usize,
         index_spec: &IndexSpec,
         ty_infer: F,
+        ts: TrxID,
     ) -> Self {
         debug_assert!(!index_spec.index_cols.is_empty());
         if index_spec.unique() {
-            // create unique index
-            let kind = match &index_spec.index_cols[..] {
-                [] => unreachable!(),
-                [key] => {
-                    // single-key index
-                    let key_ty = ty_infer(key.col_no as usize);
-                    match (key_ty.kind, key_ty.nullable) {
-                        (ValKind::I8, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<i8, false>::empty())
-                        }
-                        (ValKind::U8, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<u8, false>::empty())
-                        }
-                        (ValKind::I16, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<i16, false>::empty())
-                        }
-                        (ValKind::U16, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<u16, false>::empty())
-                        }
-                        (ValKind::I32, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<i32, false>::empty())
-                        }
-                        (ValKind::U32, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<u32, false>::empty())
-                        }
-                        (ValKind::I64, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<i64, false>::empty())
-                        }
-                        (ValKind::U64, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<u64, false>::empty())
-                        }
-                        (ValKind::F32, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<ValidF32, false>::empty())
-                        }
-                        (ValKind::F64, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<ValidF64, false>::empty())
-                        }
-                        (ValKind::VarByte, false) => {
-                            IndexKind::unique(PartitionSingleKeyIndex::<BTreeKey, false>::empty())
-                        }
-                        _ => todo!("nullable index not supported"),
-                    }
-                }
-                keys => {
-                    // multi-key index
-                    let types: Vec<_> = keys
-                        .iter()
-                        .map(|key| ty_infer(key.col_no as usize))
-                        .collect();
-                    let encoder = multi_key_encoder(types);
-                    IndexKind::unique(PartitionMultiKeyIndex::empty(encoder))
-                }
-            };
+            let types: Vec<_> = index_spec
+                .index_cols
+                .iter()
+                .map(|key| ty_infer(key.col_no as usize))
+                .collect();
+            let encoder = BTreeKeyEncoder::new(types);
+            let tree = BTree::new(index_pool, true, ts).await;
+            let kind = IndexKind::Unique(UniqueBTreeIndex { tree, encoder });
             SecondaryIndex { index_no, kind }
         } else {
             // create non-unique index
@@ -97,9 +59,9 @@ impl SecondaryIndex {
     }
 
     #[inline]
-    pub fn unique(&self) -> Option<&dyn UniqueIndex> {
+    pub fn unique(&self) -> Option<&UniqueBTreeIndex> {
         match &self.kind {
-            IndexKind::Unique(idx) => Some(&**idx),
+            IndexKind::Unique(idx) => Some(idx),
             _ => None,
         }
     }
@@ -113,18 +75,12 @@ impl SecondaryIndex {
     }
 }
 
-#[derive(Clone)]
 pub enum IndexKind {
-    Unique(Arc<dyn UniqueIndex>),
+    Unique(UniqueBTreeIndex),
     NonUnique(Arc<dyn NonUniqueIndex>),
 }
 
 impl IndexKind {
-    #[inline]
-    pub fn unique<T: UniqueIndex>(index: T) -> Self {
-        IndexKind::Unique(Arc::new(index))
-    }
-
     #[inline]
     pub fn non_unique<T: NonUniqueIndex>(index: T) -> Self {
         IndexKind::NonUnique(Arc::new(index))
@@ -132,13 +88,45 @@ impl IndexKind {
 }
 
 pub trait UniqueIndex: Send + Sync + 'static {
-    fn lookup(&self, key: &[Val]) -> Option<RowID>;
+    /// Lookup unique key in this index.
+    /// Return associated value and delete flag.
+    fn lookup(&self, key: &[Val], ts: TrxID) -> impl Future<Output = Option<(RowID, bool)>>;
 
-    fn insert(&self, key: &[Val], row_id: RowID) -> Option<RowID>;
+    /// Insert new key value pair into this index.
+    /// If same key exists, return old key and its delete flag.
+    fn insert_if_not_exists(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> impl Future<Output = Option<(RowID, bool)>>;
 
-    fn insert_if_not_exists(&self, key: &[Val], row_id: RowID) -> Option<RowID>;
+    /// Delete a given key if value matches input value.
+    /// For normal delete index operation, we always mark the entry as deleted
+    /// before actually delete it.
+    /// But in some scenarios, e.g. recovery or rollback, we would not mask the entry
+    /// as deleted, so we set ignore_del_mask to true to force the deletion.
+    ///
+    /// todo: return more information about ts comparison with page sts,
+    /// to support minimal cost of index GC.
+    fn compare_delete(
+        &self,
+        key: &[Val],
+        old_row_id: RowID,
+        ignore_del_mask: bool,
+        ts: TrxID,
+    ) -> impl Future<Output = bool>;
 
-    fn compare_delete(&self, key: &[Val], old_row_id: RowID) -> bool;
+    #[inline]
+    fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> impl Future<Output = bool> {
+        debug_assert!(!row_id.is_deleted());
+        let new_row_id = row_id.deleted();
+        self.compare_exchange(key, row_id, new_row_id, ts)
+            .map(|res| match res {
+                IndexCompareExchange::Ok => true,
+                IndexCompareExchange::Failure | IndexCompareExchange::NotExists => false,
+            })
+    }
 
     /// atomically update an existing value associated to given key to another value.
     /// if not exists, returns specified bool value.
@@ -147,9 +135,11 @@ pub trait UniqueIndex: Send + Sync + 'static {
         key: &[Val],
         old_row_id: RowID,
         new_row_id: RowID,
-    ) -> IndexCompareExchange;
+        ts: TrxID,
+    ) -> impl Future<Output = IndexCompareExchange>;
 
-    fn scan_values(&self, values: &mut Vec<RowID>);
+    /// Scan values into given collection.
+    fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> impl Future<Output = ()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +165,99 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
     fn delete(&self, key: &[Val], row_id: RowID) -> bool;
 
     fn update(&self, key: &[Val], old_row_id: RowID, new_row_id: RowID) -> bool;
+}
+
+pub struct UniqueBTreeIndex {
+    tree: BTree,
+    encoder: BTreeKeyEncoder,
+}
+
+impl UniqueIndex for UniqueBTreeIndex {
+    #[inline]
+    async fn lookup(&self, key: &[Val], _ts: TrxID) -> Option<(RowID, bool)> {
+        let k = self.encoder.encode(key);
+        self.tree
+            .lookup_optimistic::<BTreeU64>(k.as_bytes())
+            .await
+            .map(|res| (res.value().to_u64(), res.is_deleted()))
+    }
+
+    #[inline]
+    async fn insert_if_not_exists(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Option<(RowID, bool)> {
+        debug_assert!(!BTreeU64::from(row_id).is_deleted());
+        let k = self.encoder.encode(key);
+        match self
+            .tree
+            .insert::<BTreeU64>(k.as_bytes(), BTreeU64::from(row_id), ts)
+            .await
+        {
+            BTreeInsert::Ok => None,
+            BTreeInsert::DuplicateKey(res) => Some((res.value().to_u64(), res.is_deleted())),
+        }
+    }
+
+    #[inline]
+    async fn compare_delete(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        ignore_del_mask: bool,
+        ts: TrxID,
+    ) -> bool {
+        debug_assert!(!BTreeU64::from(row_id).is_deleted());
+        let k = self.encoder.encode(key);
+        match self
+            .tree
+            .delete(k.as_bytes(), BTreeU64::from(row_id), ignore_del_mask, ts)
+            .await
+        {
+            // Treat not found as success.
+            BTreeDelete::Ok | BTreeDelete::NotFound => true,
+            BTreeDelete::ValueMismatch => false,
+        }
+    }
+
+    #[inline]
+    async fn compare_exchange(
+        &self,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> IndexCompareExchange {
+        let k = self.encoder.encode(key);
+        match self
+            .tree
+            .update(
+                k.as_bytes(),
+                BTreeU64::from(old_row_id),
+                BTreeU64::from(new_row_id),
+                ts,
+            )
+            .await
+        {
+            BTreeUpdate::Ok(row_id) => {
+                debug_assert!(BTreeU64::from(old_row_id) == row_id);
+                IndexCompareExchange::Ok
+            }
+            BTreeUpdate::NotFound => IndexCompareExchange::NotExists,
+            BTreeUpdate::ValueMismatch(_) => IndexCompareExchange::Failure,
+        }
+    }
+
+    #[inline]
+    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) {
+        let mut cursor = self.tree.cursor(0);
+        cursor.seek(&[]).await;
+        while let Some(g) = cursor.next().await {
+            g.page().values(values, BTreeU64::to_u64);
+        }
+    }
 }
 
 pub trait EncodeKeySelf {
@@ -360,28 +443,36 @@ impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
     for PartitionSingleKeyIndex<T, false>
 {
     #[inline]
-    fn lookup(&self, key: &[Val]) -> Option<RowID> {
+    async fn lookup(&self, key: &[Val], _ts: TrxID) -> Option<(RowID, bool)> {
         let key = T::encode(key);
         let tree = self.select(&key);
         let g = tree.read();
-        g.get(&key).cloned()
+        g.get(&key).map(|res| {
+            (
+                BTreeU64::from(*res).value().to_u64(),
+                BTreeU64::from(*res).is_deleted(),
+            )
+        })
     }
 
     #[inline]
-    fn insert(&self, key: &[Val], row_id: RowID) -> Option<RowID> {
-        let key = T::encode(key);
-        let tree = self.select(&key);
-        let mut g = tree.write();
-        g.insert(key, row_id)
-    }
-
-    #[inline]
-    fn insert_if_not_exists(&self, key: &[Val], row_id: RowID) -> Option<RowID> {
+    async fn insert_if_not_exists(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        _ts: TrxID,
+    ) -> Option<(RowID, bool)> {
         let key = T::encode(key);
         let tree = self.select(&key);
         let mut g = tree.write();
         match g.entry(key) {
-            Entry::Occupied(occ) => Some(*occ.get()),
+            Entry::Occupied(occ) => {
+                let v = *occ.get();
+                Some((
+                    BTreeU64::from(v).value().to_u64(),
+                    BTreeU64::from(v).is_deleted(),
+                ))
+            }
             Entry::Vacant(vac) => {
                 vac.insert(row_id);
                 None
@@ -390,29 +481,37 @@ impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
     }
 
     #[inline]
-    fn compare_delete(&self, key: &[Val], old_row_id: RowID) -> bool {
+    async fn compare_delete(
+        &self,
+        key: &[Val],
+        old_row_id: RowID,
+        ignore_del_mask: bool,
+        _ts: TrxID,
+    ) -> bool {
         let key = T::encode(key);
         let tree = self.select(&key);
         let mut g = tree.write();
         match g.entry(key) {
             Entry::Occupied(occ) => {
-                if occ.get() == &old_row_id {
+                let index_row_id = *occ.get();
+                if index_row_id == old_row_id && (ignore_del_mask || index_row_id.is_deleted()) {
                     occ.remove();
                     true
                 } else {
                     false
                 }
             }
-            Entry::Vacant(_) => false,
+            Entry::Vacant(_) => true,
         }
     }
 
     #[inline]
-    fn compare_exchange(
+    async fn compare_exchange(
         &self,
         key: &[Val],
         old_row_id: RowID,
         new_row_id: RowID,
+        _ts: TrxID,
     ) -> IndexCompareExchange {
         let key = T::encode(key);
         let tree = self.select(&key);
@@ -431,7 +530,7 @@ impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
     }
 
     #[inline]
-    fn scan_values(&self, values: &mut Vec<RowID>) {
+    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) {
         for tree in &self.0 {
             let g = tree.read();
             values.extend(g.values());
@@ -462,48 +561,57 @@ impl PartitionMultiKeyIndex {
 
 impl UniqueIndex for PartitionMultiKeyIndex {
     #[inline]
-    fn lookup(&self, keys: &[Val]) -> Option<RowID> {
+    async fn lookup(&self, keys: &[Val], ts: TrxID) -> Option<(RowID, bool)> {
         let encoded = self.encode(keys);
         let key = std::slice::from_ref(&encoded);
-        self.index.lookup(key)
+        self.index.lookup(key, ts).await
     }
 
     #[inline]
-    fn insert(&self, key: &[Val], row_id: RowID) -> Option<RowID> {
+    async fn insert_if_not_exists(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Option<(RowID, bool)> {
         let key = self.encode(key);
         let key = std::slice::from_ref(&key);
-        self.index.insert(key, row_id)
+        self.index.insert_if_not_exists(key, row_id, ts).await
     }
 
     #[inline]
-    fn insert_if_not_exists(&self, key: &[Val], row_id: RowID) -> Option<RowID> {
+    async fn compare_delete(
+        &self,
+        key: &[Val],
+        old_row_id: RowID,
+        ignore_del_mask: bool,
+        ts: TrxID,
+    ) -> bool {
         let key = self.encode(key);
         let key = std::slice::from_ref(&key);
-        self.index.insert_if_not_exists(key, row_id)
+        self.index
+            .compare_delete(key, old_row_id, ignore_del_mask, ts)
+            .await
     }
 
     #[inline]
-    fn compare_delete(&self, key: &[Val], old_row_id: RowID) -> bool {
-        let key = self.encode(key);
-        let key = std::slice::from_ref(&key);
-        self.index.compare_delete(key, old_row_id)
-    }
-
-    #[inline]
-    fn compare_exchange(
+    async fn compare_exchange(
         &self,
         key: &[Val],
         old_row_id: RowID,
         new_row_id: RowID,
+        ts: TrxID,
     ) -> IndexCompareExchange {
         let key = self.encode(key);
         let key = std::slice::from_ref(&key);
-        self.index.compare_exchange(key, old_row_id, new_row_id)
+        self.index
+            .compare_exchange(key, old_row_id, new_row_id, ts)
+            .await
     }
 
     #[inline]
-    fn scan_values(&self, values: &mut Vec<RowID>) {
-        self.index.scan_values(values);
+    async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) {
+        self.index.scan_values(values, ts).await;
     }
 }
 
@@ -534,36 +642,112 @@ impl NonUniqueIndex for PartitionNonUniqueIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifetime::StaticLifetime;
+    use crate::value::{ValKind, ValType};
 
     #[test]
-    fn test_unique_index() {
+    fn test_single_key_partition_unique_index() {
+        smol::block_on(async {
+            let index = PartitionSingleKeyIndex::<i32, false>::empty();
+            run_test_suit_for_single_key_unique_index(&index).await;
+        });
+    }
+
+    #[test]
+    fn test_multi_key_partition_unique_index() {
+        smol::block_on(async {
+            let encoder = multi_key_encoder(vec![
+                ValType {
+                    kind: ValKind::VarByte,
+                    nullable: false,
+                },
+                ValType {
+                    kind: ValKind::I32,
+                    nullable: false,
+                },
+            ]);
+            let index = PartitionMultiKeyIndex::empty(encoder);
+            run_test_suit_for_multi_key_unique_index(&index).await;
+        })
+    }
+
+    #[test]
+    fn test_single_key_btree_unique_index() {
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            {
+                let index = UniqueBTreeIndex {
+                    tree: BTree::new(pool, false, 100).await,
+                    encoder: BTreeKeyEncoder::new(vec![ValType {
+                        kind: ValKind::I32,
+                        nullable: false,
+                    }]),
+                };
+                run_test_suit_for_single_key_unique_index(&index).await;
+            }
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        });
+    }
+
+    #[test]
+    fn test_multi_key_btree_unique_index() {
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            {
+                let index = UniqueBTreeIndex {
+                    tree: BTree::new(pool, false, 100).await,
+                    encoder: BTreeKeyEncoder::new(vec![
+                        ValType {
+                            kind: ValKind::VarByte,
+                            nullable: false,
+                        },
+                        ValType {
+                            kind: ValKind::I32,
+                            nullable: false,
+                        },
+                    ]),
+                };
+                run_test_suit_for_multi_key_unique_index(&index).await;
+            }
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        });
+    }
+
+    async fn run_test_suit_for_single_key_unique_index<T: UniqueIndex>(index: &T) {
         // 测试用例1：基本插入和查找操作
-        let index = PartitionSingleKeyIndex::<i32, false>::empty();
         let key = vec![Val::from(42i32)];
         let row_id = 100u64;
 
         // 测试插入
-        assert_eq!(index.insert(&key, row_id), None);
+        assert_eq!(index.insert_if_not_exists(&key, row_id, 100).await, None);
 
         // 测试查找
-        assert_eq!(index.lookup(&key), Some(row_id));
+        assert_eq!(index.lookup(&key, 100).await, Some((row_id, false)));
 
         // 测试不存在的键
         let non_existent_key = vec![Val::from(43i32)];
-        assert_eq!(index.lookup(&non_existent_key), None);
+        assert_eq!(index.lookup(&non_existent_key, 100).await, None);
 
         // 测试用例2：重复插入
         let new_row_id = 200u64;
-        let old_row_id = index.insert(&key, new_row_id);
-        assert_eq!(old_row_id, Some(row_id));
-        assert_eq!(index.lookup(&key), Some(new_row_id));
+        let old_row_id = index.insert_if_not_exists(&key, new_row_id, 100).await;
+        assert_eq!(old_row_id, Some((row_id, false)));
+        assert_eq!(index.lookup(&key, 100).await, old_row_id);
 
         // 测试用例3：删除操作
-        assert!(index.compare_delete(&key, new_row_id));
-        assert_eq!(index.lookup(&key), None);
+        assert!(
+            index
+                .compare_delete(&key, old_row_id.unwrap().0, true, 100)
+                .await
+        );
+        assert_eq!(index.lookup(&key, 100).await, None);
 
-        // 测试删除不存在的键
-        assert!(!index.compare_delete(&key, new_row_id));
+        // 测试删除不存在的键 still ok
+        assert!(index.compare_delete(&key, new_row_id, false, 100).await);
 
         // 测试用例4：compare_exchange 操作
         let key = vec![Val::from(100i32)];
@@ -571,18 +755,23 @@ mod tests {
         let row_id2 = 400u64;
 
         // 先插入一个值
-        assert_eq!(index.insert(&key, row_id1), None);
+        assert_eq!(index.insert_if_not_exists(&key, row_id1, 100).await, None);
 
         // 测试成功的 compare_exchange
-        assert!(index.compare_exchange(&key, row_id1, row_id2) == IndexCompareExchange::Ok);
-        assert_eq!(index.lookup(&key), Some(row_id2));
+        assert!(
+            index.compare_exchange(&key, row_id1, row_id2, 100).await == IndexCompareExchange::Ok
+        );
+        assert_eq!(index.lookup(&key, 100).await, Some((row_id2, false)));
 
         // 测试失败的 compare_exchange
-        assert!(index.compare_exchange(&key, row_id1, row_id2) == IndexCompareExchange::Failure);
+        assert!(
+            index.compare_exchange(&key, row_id1, row_id2, 100).await
+                == IndexCompareExchange::Failure
+        );
 
         // 测试用例5：scan_values 操作
         let mut values = Vec::new();
-        index.scan_values(&mut values);
+        index.scan_values(&mut values, 100).await;
         assert_eq!(values.len(), 1);
         assert_eq!(values[0], row_id2);
 
@@ -596,18 +785,101 @@ mod tests {
         let row_id3 = 700u64;
 
         // 插入多个键值对
-        assert_eq!(index.insert(&key1, row_id1), None);
-        assert_eq!(index.insert(&key2, row_id2), None);
-        assert_eq!(index.insert(&key3, row_id3), None);
+        assert_eq!(index.insert_if_not_exists(&key1, row_id1, 100).await, None);
+        assert_eq!(index.insert_if_not_exists(&key2, row_id2, 100).await, None);
+        assert_eq!(index.insert_if_not_exists(&key3, row_id3, 100).await, None);
 
         // 验证所有键都能正确查找
-        assert_eq!(index.lookup(&key1), Some(row_id1));
-        assert_eq!(index.lookup(&key2), Some(row_id2));
-        assert_eq!(index.lookup(&key3), Some(row_id3));
+        assert_eq!(index.lookup(&key1, 100).await, Some((row_id1, false)));
+        assert_eq!(index.lookup(&key2, 100).await, Some((row_id2, false)));
+        assert_eq!(index.lookup(&key3, 100).await, Some((row_id3, false)));
 
         // 验证 scan_values 包含所有值
         let mut values = Vec::new();
-        index.scan_values(&mut values);
+        index.scan_values(&mut values, 100).await;
+        assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
+    }
+
+    async fn run_test_suit_for_multi_key_unique_index<T: UniqueIndex>(index: &T) {
+        // 测试用例1：基本插入和查找操作
+        let key = vec![Val::from("hello"), Val::from(42i32)];
+        let row_id = 100u64;
+
+        // 测试插入
+        assert_eq!(index.insert_if_not_exists(&key, row_id, 100).await, None);
+
+        // 测试查找
+        assert_eq!(index.lookup(&key, 100).await, Some((row_id, false)));
+
+        // 测试不存在的键
+        let non_existent_key = vec![Val::from("hello"), Val::from(43i32)];
+        assert_eq!(index.lookup(&non_existent_key, 100).await, None);
+
+        // 测试用例2：重复插入
+        let new_row_id = 200u64;
+        let old_row_id = index.insert_if_not_exists(&key, new_row_id, 100).await;
+        assert_eq!(old_row_id, Some((row_id, false)));
+        assert_eq!(index.lookup(&key, 100).await, old_row_id);
+
+        // 测试用例3：删除操作
+        assert!(
+            index
+                .compare_delete(&key, old_row_id.unwrap().0, true, 100)
+                .await
+        );
+        assert_eq!(index.lookup(&key, 100).await, None);
+
+        // 测试删除不存在的键 still ok
+        assert!(index.compare_delete(&key, new_row_id, false, 100).await);
+
+        // 测试用例4：compare_exchange 操作
+        let key = vec![Val::from("hello"), Val::from(100i32)];
+        let row_id1 = 300u64;
+        let row_id2 = 400u64;
+
+        // 先插入一个值
+        assert_eq!(index.insert_if_not_exists(&key, row_id1, 100).await, None);
+
+        // 测试成功的 compare_exchange
+        assert!(
+            index.compare_exchange(&key, row_id1, row_id2, 100).await == IndexCompareExchange::Ok
+        );
+        assert_eq!(index.lookup(&key, 100).await, Some((row_id2, false)));
+
+        // 测试失败的 compare_exchange
+        assert!(
+            index.compare_exchange(&key, row_id1, row_id2, 100).await
+                == IndexCompareExchange::Failure
+        );
+
+        // 测试用例5：scan_values 操作
+        let mut values = Vec::new();
+        index.scan_values(&mut values, 100).await;
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], row_id2);
+
+        // 测试用例6：多分区操作
+        let key1 = vec![Val::from("world"), Val::from(1i32)];
+        let key2 = vec![Val::from("world"), Val::from(2i32)];
+        let key3 = vec![Val::from("world"), Val::from(3i32)];
+
+        let row_id1 = 500u64;
+        let row_id2 = 600u64;
+        let row_id3 = 700u64;
+
+        // 插入多个键值对
+        assert_eq!(index.insert_if_not_exists(&key1, row_id1, 100).await, None);
+        assert_eq!(index.insert_if_not_exists(&key2, row_id2, 100).await, None);
+        assert_eq!(index.insert_if_not_exists(&key3, row_id3, 100).await, None);
+
+        // 验证所有键都能正确查找
+        assert_eq!(index.lookup(&key1, 100).await, Some((row_id1, false)));
+        assert_eq!(index.lookup(&key2, 100).await, Some((row_id2, false)));
+        assert_eq!(index.lookup(&key3, 100).await, Some((row_id3, false)));
+
+        // 验证 scan_values 包含所有值
+        let mut values = Vec::new();
+        index.scan_values(&mut values, 100).await;
         assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
     }
 }

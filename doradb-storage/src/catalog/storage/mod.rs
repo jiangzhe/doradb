@@ -5,16 +5,16 @@ mod schemas;
 mod tables;
 
 use crate::buffer::FixedBufferPool;
-use crate::catalog::table::TableMetadata;
-use crate::index::BlockIndex;
-use crate::table::Table;
-use doradb_catalog::TableID;
-
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::schemas::*;
 use crate::catalog::storage::tables::*;
+use crate::catalog::table::TableMetadata;
+use crate::index::BlockIndex;
+use crate::table::Table;
+use crate::trx::MIN_SNAPSHOT_TS;
+use doradb_catalog::TableID;
 
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
@@ -23,7 +23,10 @@ pub struct CatalogStorage {
 
 impl CatalogStorage {
     #[inline]
-    pub async fn new(meta_pool: &'static FixedBufferPool) -> Self {
+    pub async fn new(
+        meta_pool: &'static FixedBufferPool,
+        index_pool: &'static FixedBufferPool,
+    ) -> Self {
         let mut cat: Vec<Table> = vec![];
         for CatalogDefinition { table_id, metadata } in [
             catalog_definition_of_schemas(),
@@ -36,7 +39,7 @@ impl CatalogStorage {
             assert_eq!(cat.len(), *table_id as usize);
             // catalog table with manually allocated page id.
             let blk_idx = BlockIndex::new(meta_pool, *table_id).await;
-            let table = Table::new(blk_idx, metadata.clone());
+            let table = Table::new(index_pool, blk_idx, metadata.clone(), MIN_SNAPSHOT_TS).await;
             cat.push(table);
         }
         CatalogStorage {

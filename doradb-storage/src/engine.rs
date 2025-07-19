@@ -41,7 +41,7 @@ impl Engine {
         Engine(EngineInner {
             trx_sys: self.0.trx_sys,
             meta_pool: self.0.meta_pool,
-            _index_pool: self.0._index_pool,
+            index_pool: self.0.index_pool,
             data_pool: self.0.data_pool,
             stop_all: false,
         })
@@ -54,7 +54,7 @@ pub struct EngineInner {
     pub meta_pool: &'static FixedBufferPool,
     // index pool is used for secondary index.
     // This pool will be optimized to support CoW B+tree index.
-    pub _index_pool: &'static FixedBufferPool,
+    pub index_pool: &'static FixedBufferPool,
     // data pool is used for data tables.
     pub data_pool: &'static EvictableBufferPool,
     // only one instance should have this flag to be true to
@@ -92,11 +92,11 @@ impl EngineInitializer {
         let trx_sys = self
             .trx_sys_config
             .build()
-            .init(self.meta_pool, self.data_pool)
+            .init(self.meta_pool, self.index_pool, self.data_pool)
             .await?;
         let engine = Engine(EngineInner {
             meta_pool: self.meta_pool,
-            _index_pool: self.index_pool,
+            index_pool: self.index_pool,
             data_pool: self.data_pool,
             trx_sys,
             stop_all: true,
@@ -106,11 +106,13 @@ impl EngineInitializer {
 }
 
 const DEFAULT_META_BUFFER: usize = 32 * 1024 * 1024;
+const DEFAULT_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     trx: TrxSysConfig,
     meta_buffer: Byte,
+    index_buffer: Byte,
     data_buffer: EvictableBufferPoolConfig,
 }
 
@@ -120,6 +122,7 @@ impl Default for EngineConfig {
         EngineConfig {
             trx: TrxSysConfig::default(),
             meta_buffer: Byte::from_u64(DEFAULT_META_BUFFER as u64),
+            index_buffer: Byte::from_u64(DEFAULT_INDEX_BUFFER as u64),
             data_buffer: EvictableBufferPoolConfig::default(),
         }
     }
@@ -139,6 +142,12 @@ impl EngineConfig {
     }
 
     #[inline]
+    pub fn index_buffer(mut self, index_buffer: impl Into<Byte>) -> Self {
+        self.index_buffer = index_buffer.into();
+        self
+    }
+
+    #[inline]
     pub fn data_buffer(mut self, data_buffer: EvictableBufferPoolConfig) -> Self {
         self.data_buffer = data_buffer;
         self
@@ -147,15 +156,16 @@ impl EngineConfig {
     #[inline]
     pub fn build(self) -> Result<EngineInitializer> {
         let meta_pool = FixedBufferPool::with_capacity_static(self.meta_buffer.as_u64() as usize)?;
-        // mock index pool using meta pool because index pool is not used.
         // todo: implement index pool
-        let (buf_pool, pool_start_ctx) = self.data_buffer.build()?;
-        let buf_pool = StaticLifetime::new_static(buf_pool);
-        buf_pool.start(pool_start_ctx);
+        let index_pool =
+            FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
+        let (data_pool, pool_start_ctx) = self.data_buffer.build()?;
+        let data_pool = StaticLifetime::new_static(data_pool);
+        data_pool.start(pool_start_ctx);
         Ok(EngineInitializer {
             meta_pool,
-            index_pool: meta_pool,
-            data_pool: buf_pool,
+            index_pool,
+            data_pool,
             trx_sys_config: self.trx,
         })
     }

@@ -11,7 +11,7 @@ use crate::table::Table;
 use crate::table::TableID;
 use crate::trx::redo::DDLRedo;
 use crate::trx::redo::RedoLogs;
-use crate::trx::undo::{IndexUndoLogs, RowUndoKind, RowUndoLogs};
+use crate::trx::undo::{IndexUndo, IndexUndoKind, IndexUndoLogs, RowUndoKind, RowUndoLogs};
 use crate::trx::ActiveTrx;
 use crate::value::Val;
 use doradb_catalog::{IndexSpec, SchemaID, TableSpec};
@@ -75,7 +75,7 @@ impl Statement {
         self.row_undo.rollback(engine.data_pool).await;
         // rollback index data.
         self.index_undo
-            .rollback(engine.data_pool, engine.catalog())
+            .rollback(engine.data_pool, engine.catalog(), self.trx.sts)
             .await;
         // clear redo logs.
         self.redo.clear();
@@ -269,7 +269,7 @@ impl Statement {
         // Prepare in-memory representation of new table
         let table_metadata = TableMetadata::new(table_spec.columns, index_specs);
         let blk_idx = BlockIndex::new(engine.meta_pool, table_id).await;
-        let table = Table::new(blk_idx, table_metadata);
+        let table = Table::new(engine.index_pool, blk_idx, table_metadata, self.trx.sts).await;
         // Enable page committer so all row pages can be recovered.
         table
             .blk_idx
@@ -325,5 +325,52 @@ impl Statement {
         table
             .update_row(engine.data_pool, self, key, update, false)
             .await
+    }
+
+    #[inline]
+    pub(crate) fn push_insert_unique_index_undo(
+        &mut self,
+        table_id: TableID,
+        row_id: RowID,
+        key: SelectKey,
+    ) {
+        let index_undo = IndexUndo {
+            table_id,
+            row_id,
+            kind: IndexUndoKind::InsertUnique(key),
+        };
+        self.index_undo.push(index_undo);
+    }
+
+    #[inline]
+    pub(crate) fn push_delete_index_undo(
+        &mut self,
+        table_id: TableID,
+        row_id: RowID,
+        key: SelectKey,
+    ) {
+        let index_undo = IndexUndo {
+            table_id,
+            row_id,
+            kind: IndexUndoKind::DeferDelete(key),
+        };
+        self.index_undo.push(index_undo);
+    }
+
+    #[inline]
+    pub(crate) fn push_update_unique_index_undo(
+        &mut self,
+        table_id: TableID,
+        old_row_id: RowID,
+        new_row_id: RowID,
+        key: SelectKey,
+        old_deleted: bool,
+    ) {
+        let index_undo = IndexUndo {
+            table_id,
+            row_id: new_row_id,
+            kind: IndexUndoKind::UpdateUnique(key, old_row_id, old_deleted),
+        };
+        self.index_undo.push(index_undo);
     }
 }

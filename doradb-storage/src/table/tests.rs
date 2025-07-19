@@ -178,6 +178,9 @@ fn test_mvcc_insert_link_unique_index() {
             let insert = vec![Val::from(1i32), Val::from("hello")];
             session = sys.new_trx_insert(session, insert).await;
 
+            // we must hold a transaction before the deletion,
+            // to prevent index GC.
+            let trx_to_prevent_gc = sys.new_session().begin_trx();
             // delete it
             let key = single_key(1i32);
             session = sys.new_trx_delete(session, &key).await;
@@ -185,6 +188,8 @@ fn test_mvcc_insert_link_unique_index() {
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("world")];
             session = sys.new_trx_insert(session, insert).await;
+
+            drop(trx_to_prevent_gc.rollback().await);
 
             // select 1 row
             let key = single_key(1i32);
@@ -306,6 +311,7 @@ fn test_mvcc_update_link_insert() {
             // insert 1 row: v1=1, v2=hello
             let insert = vec![Val::from(1i32), Val::from("hello")];
             session = sys.new_trx_insert(session, insert).await;
+            println!("debug-only insert finish");
 
             // open one session and trnasaction to see this row
             let sess1 = sys.new_session();
@@ -324,6 +330,7 @@ fn test_mvcc_update_link_insert() {
                 },
             ];
             session = sys.new_trx_update(session, &key, update).await;
+            println!("debug-only update finish");
 
             // open session and transaction to see row 2
             let sess2 = sys.new_session();
@@ -332,6 +339,7 @@ fn test_mvcc_update_link_insert() {
             // insert v1=5, v2=rust
             let insert = vec![Val::from(5i32), Val::from("rust")];
             session = sys.new_trx_insert(session, insert).await;
+            println!("debug-only insert2 finish");
 
             // update it: v1=1, v2=c++, trigger update+link
             let key = single_key(5i32);
@@ -346,6 +354,7 @@ fn test_mvcc_update_link_insert() {
                 },
             ];
             session = sys.new_trx_update(session, &key, update).await;
+            println!("debug-only update2 finish");
 
             // use transaction 1 to see version 1.
             let key = single_key(1i32);
@@ -436,6 +445,35 @@ fn test_mvcc_multi_update() {
                 })
                 .await;
             trx1.commit().await.unwrap();
+        }
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_non_index_varchar_updates() {
+    smol::block_on(async {
+        const COUNT: usize = 100;
+        const SIZE: usize = 500;
+        let sys = TestSys::new_evictable().await;
+        {
+            let mut session = sys.new_session();
+            let value = vec![1u8; SIZE];
+            let insert = vec![Val::from(1i32), Val::from(&[])];
+            session = sys.new_trx_insert(session, insert).await;
+            let key = SelectKey::new(0, vec![Val::from(1i32)]);
+            for i in SIZE - COUNT..SIZE {
+                session = sys
+                    .new_trx_update(
+                        session,
+                        &key,
+                        vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from(&value[..i]),
+                        }],
+                    )
+                    .await;
+            }
         }
         sys.clean_all();
     });

@@ -12,6 +12,7 @@ use crate::latch::RwLock;
 use crate::lifetime::StaticLifetime;
 use crate::table::Table;
 use crate::trx::sys::TransactionSystem;
+use crate::trx::MIN_SNAPSHOT_TS;
 use doradb_catalog::{ColumnSpec, IndexKey, IndexSpec, SchemaID, TableID};
 use std::collections::HashMap;
 use std::panic::{RefUnwindSafe, UnwindSafe};
@@ -100,7 +101,11 @@ impl Catalog {
         }
     }
 
-    pub async fn reload_create_table(&self, table_id: TableID) -> Result<()> {
+    pub async fn reload_create_table(
+        &self,
+        index_pool: &'static FixedBufferPool,
+        table_id: TableID,
+    ) -> Result<()> {
         // todo
         let res = self.storage.tables().find_uncommitted_by_id(table_id).await;
         match res {
@@ -160,7 +165,7 @@ impl Catalog {
 
                 let table_metadata = TableMetadata::new(column_specs, index_specs);
                 let blk_idx = BlockIndex::new(self.storage.meta_pool, table.table_id).await;
-                let table = Table::new(blk_idx, table_metadata);
+                let table = Table::new(index_pool, blk_idx, table_metadata, MIN_SNAPSHOT_TS).await;
                 // Update table into cache
                 let mut table_cache_g = self.cache.tables.write().await;
                 let res = table_cache_g.insert(table_id, table);

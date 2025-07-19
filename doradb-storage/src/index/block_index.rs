@@ -8,8 +8,7 @@ use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
 };
-use crate::index::util::ParentPosition;
-use crate::index::util::RedoLogPageCommitter;
+use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage, INVALID_ROW_ID};
 use crate::trx::sys::TransactionSystem;
@@ -535,6 +534,7 @@ impl BlockIndex {
     /// Find location of given row id, maybe in column file or row page.
     #[inline]
     pub async fn find_row(&self, row_id: RowID) -> RowLocation {
+        debug_assert!(!row_id.is_deleted());
         loop {
             let res = self.try_find_row(row_id).await;
             let res = verify_continue!(res);

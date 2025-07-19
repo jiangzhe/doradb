@@ -3,6 +3,7 @@ use doradb_datatype::memcmp::{
     BytesExtendable, MemCmpFormat, MemCmpKey, NormalBytes, Null, Nullable, NullableMemCmpFormat,
     SegmentedBytes,
 };
+use std::borrow::Borrow;
 
 pub type BTreeKey = MemCmpKey;
 
@@ -307,7 +308,7 @@ impl BTreeKeyEncoder {
         let prefix_key_len = prefix
             .iter()
             .map(|e| e.est_encode_len())
-            .fold(Some(0), |acc, elem| acc.and_then(|a| elem.map(|b| a + b)));
+            .try_fold(0, |acc, elem| elem.map(|b| acc + b));
         let suffix_key_len = suffix.est_encode_len();
         let encode_len = prefix_key_len.and_then(|p| suffix_key_len.map(|s| p + s));
         BTreeKeyEncoder::Multi {
@@ -319,11 +320,11 @@ impl BTreeKeyEncoder {
 
     /// Encode keys into a memory-comparable b-tree key.
     #[inline]
-    pub fn encode(&self, keys: &[Val]) -> BTreeKey {
+    pub fn encode<V: Borrow<Val>>(&self, keys: &[V]) -> BTreeKey {
         match self {
             BTreeKeyEncoder::Single(e) => {
                 debug_assert!(keys.len() == 1);
-                e.encode_single(&keys[0])
+                e.encode_single(keys[0].borrow())
             }
             BTreeKeyEncoder::Multi {
                 prefix,
@@ -338,9 +339,9 @@ impl BTreeKeyEncoder {
                 let encode_len: usize = prefix
                     .iter()
                     .zip(keys)
-                    .map(|(e, k)| e.encode_len(k))
+                    .map(|(e, k)| e.encode_len(k.borrow()))
                     .sum::<usize>()
-                    + suffix.encode_len(keys.last().unwrap());
+                    + suffix.encode_len(keys.last().unwrap().borrow());
                 encode_multi_keys(prefix, suffix, keys, encode_len)
             }
         }
@@ -348,19 +349,19 @@ impl BTreeKeyEncoder {
 }
 
 #[inline]
-fn encode_multi_keys(
+fn encode_multi_keys<V: Borrow<Val>>(
     prefix: &[PrefixKeyEncoder],
     suffix: &SingleKeyEncoder,
-    keys: &[Val],
+    keys: &[V],
     encode_len: usize,
 ) -> BTreeKey {
     let mut res = BTreeKey::zeroed(encode_len);
     let mut buf = res.modify_inplace();
     let mut start_idx = 0usize;
     for (encoder, key) in prefix.iter().zip(keys) {
-        start_idx = encoder.encode_copy(key, &mut buf, start_idx);
+        start_idx = encoder.encode_copy(key.borrow(), &mut buf, start_idx);
     }
-    let end_idx = suffix.encode_copy(keys.last().unwrap(), &mut buf, start_idx);
+    let end_idx = suffix.encode_copy(keys.last().unwrap().borrow(), &mut buf, start_idx);
     debug_assert!(end_idx == buf.len());
     drop(buf);
     res
