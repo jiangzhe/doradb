@@ -149,7 +149,7 @@ impl InsertRow {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InsertMvcc {
     // PageGuard is required if table has unique index and
     // we may need to linke a deleted version to the new version.

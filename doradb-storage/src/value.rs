@@ -847,15 +847,12 @@ impl PageVar {
     #[inline]
     pub fn inline(data: &[u8]) -> Self {
         debug_assert!(data.len() <= PAGE_VAR_LEN_INLINE);
-        let mut inline = MaybeUninit::<PageVarInline>::uninit();
-        unsafe {
-            let i = inline.assume_init_mut();
-            i.len = data.len() as u16;
-            i.data[..data.len()].copy_from_slice(data);
-            PageVar {
-                i: inline.assume_init(),
-            }
-        }
+        let mut i = PageVarInline {
+            len: data.len() as u16,
+            data: [0u8; PAGE_VAR_LEN_INLINE],
+        };
+        i.data[..data.len()].copy_from_slice(data);
+        PageVar { i }
     }
 
     /// Create a new PageVar with pointer info.
@@ -863,16 +860,13 @@ impl PageVar {
     #[inline]
     pub fn outline(len: u16, offset: u16, prefix: &[u8]) -> Self {
         debug_assert!(prefix.len() == PAGE_VAR_LEN_PREFIX);
-        let mut outline = MaybeUninit::<PageVarOutline>::uninit();
-        unsafe {
-            let p = outline.assume_init_mut();
-            p.len = len;
-            p.offset = offset;
-            p.prefix.copy_from_slice(prefix);
-            PageVar {
-                o: outline.assume_init(),
-            }
-        }
+        let mut o = PageVarOutline {
+            len,
+            offset,
+            prefix: [0u8; PAGE_VAR_LEN_PREFIX],
+        };
+        o.prefix.copy_from_slice(prefix);
+        PageVar { o }
     }
 
     /// Returns length of the value.
@@ -1148,7 +1142,9 @@ impl Clone for MemVar {
     fn clone(&self) -> Self {
         unsafe {
             if self.len() > MEM_VAR_LEN_INLINE {
-                MemVar { o: self.o.clone() }
+                MemVar {
+                    o: ManuallyDrop::new((*self.o).clone()),
+                }
             } else {
                 MemVar { i: self.i }
             }
@@ -1303,6 +1299,7 @@ impl Clone for MemVarOutline {
         unsafe {
             let layout = AllocLayout::from_size_align_unchecked(self.len as usize, 1);
             let ptr = alloc(layout);
+            std::ptr::copy_nonoverlapping(self.ptr, ptr, self.len as usize);
             MemVarOutline {
                 len: self.len,
                 prefix: self.prefix,
@@ -1663,5 +1660,14 @@ mod tests {
         assert!(var.is_inlined());
         assert_eq!(var.len(), short_data.len());
         assert_eq!(unsafe { var.as_bytes(std::ptr::null()) }, short_data);
+    }
+
+    #[test]
+    fn test_val_clone() {
+        let v1 = Val::from("000000000000000");
+        let v2 = v1.clone();
+        println!("v1={:?}", v1.as_bytes());
+        println!("v2={:?}", v2.as_bytes());
+        assert!(v1 == v2);
     }
 }

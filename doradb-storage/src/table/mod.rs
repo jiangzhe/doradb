@@ -1673,7 +1673,6 @@ impl Table {
                 if index_key_is_changed(index_schema, index_change_cols) {
                     let new_key =
                         read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
-
                     let old_key = index_key_replace(index_schema, &new_key, index_change_cols);
                     // First we need to insert new entry to index due to key change.
                     // There might be conflict we will try to fix (if old one is already deleted).

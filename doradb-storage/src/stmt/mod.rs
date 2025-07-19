@@ -99,17 +99,23 @@ impl Statement {
 
     /// Create a new schema.
     #[inline]
-    pub async fn create_schema(&mut self, schema_name: &str) -> Result<SchemaID> {
+    pub async fn create_schema(
+        &mut self,
+        schema_name: &str,
+        if_not_exists: bool,
+    ) -> Result<SchemaID> {
         let engine = self.trx.engine_weak().unwrap();
         // Check if schema exists
-        if engine
+        if let Some(schema) = engine
             .catalog()
             .storage
             .schemas()
             .find_uncommitted_by_name(schema_name)
             .await
-            .is_some()
         {
+            if if_not_exists {
+                return Ok(schema.schema_id);
+            }
             return Err(Error::SchemaAlreadyExists);
         }
 

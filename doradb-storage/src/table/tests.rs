@@ -2,6 +2,7 @@ use crate::buffer::EvictableBufferPoolConfig;
 use crate::engine::{Engine, EngineConfig};
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::session::Session;
+use crate::table::InsertMvcc;
 use crate::table::Table;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::tests::remove_files;
@@ -39,6 +40,57 @@ fn test_mvcc_insert_normal() {
                     .await;
             }
             let _ = trx.commit().await.unwrap();
+        }
+
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_mvcc_insert_dup_key() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        // dup key
+        {
+            // insert [1, "hello"]
+            let insert = vec![Val::from(1i32), Val::from("hello")];
+            let mut trx = session.begin_trx();
+            trx = sys.trx_insert(trx, insert).await;
+            session = trx.commit().await.unwrap();
+
+            // insert [1, "world"]
+            let insert = vec![Val::from(1i32), Val::from("world")];
+            let mut trx = session.begin_trx();
+            let mut stmt = trx.start_stmt();
+            let res = stmt.insert_row(&sys.table, insert).await;
+            assert!(res == InsertMvcc::DuplicateKey);
+            trx = stmt.fail().await;
+            session = trx.rollback().await;
+        }
+        // write conflict
+        {
+            // insert [2, "hello"], but not commit
+            let insert1 = vec![Val::from(2i32), Val::from("hello")];
+            let mut trx1 = session.begin_trx();
+            let mut stmt1 = trx1.start_stmt();
+            let res = stmt1.insert_row(&sys.table, insert1).await;
+            assert!(res.is_ok());
+            trx1 = stmt1.succeed();
+
+            // begin concurrent transaction and insert [2, "world"]
+            let mut session2 = sys.new_session();
+            let insert2 = vec![Val::from(2i32), Val::from("world")];
+            let trx2 = session2.begin_trx();
+            let mut stmt2 = trx2.start_stmt();
+            let res = stmt2.insert_row(&sys.table, insert2).await;
+            // still dup key because circuit breaker on index search.
+            assert!(res == InsertMvcc::DuplicateKey);
+            session2 = stmt2.fail().await.rollback().await;
+            drop(session2);
+
+            session = trx1.commit().await.unwrap();
+            drop(session);
         }
 
         sys.clean_all();
@@ -451,7 +503,7 @@ fn test_mvcc_multi_update() {
 }
 
 #[test]
-fn test_non_index_varchar_updates() {
+fn test_string_non_index_updates() {
     smol::block_on(async {
         const COUNT: usize = 100;
         const SIZE: usize = 500;
@@ -473,6 +525,43 @@ fn test_non_index_varchar_updates() {
                         }],
                     )
                     .await;
+            }
+        }
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_string_index_updates() {
+    use crate::catalog::tests::table3;
+    smol::block_on(async {
+        const COUNT: usize = 100;
+        const SIZE: usize = 500;
+        let sys = TestSys::new_evictable().await;
+        {
+            let table_id = table3(&sys.engine).await;
+            let table = sys.engine.catalog().get_table(table_id).await.unwrap();
+            let mut session = sys.new_session();
+            let s: String = std::iter::repeat_n('0', SIZE).collect();
+            // insert single row.
+            {
+                let insert = vec![Val::from(&s[..0])];
+                let mut stmt = session.begin_trx().start_stmt();
+                let res = stmt.insert_row(&table, insert).await;
+                assert!(res.is_ok());
+                session = stmt.succeed().commit().await.unwrap();
+            }
+            // perform updates.
+            for i in 0..COUNT {
+                let key = SelectKey::new(0, vec![Val::from(&s[..i])]);
+                let update = vec![UpdateCol {
+                    idx: 0,
+                    val: Val::from(&s[..i + 1]),
+                }];
+                let mut stmt = session.begin_trx().start_stmt();
+                let res = stmt.update_row(&table, &key, update).await;
+                assert!(res.is_ok());
+                session = stmt.succeed().commit().await.unwrap();
             }
         }
         sys.clean_all();
