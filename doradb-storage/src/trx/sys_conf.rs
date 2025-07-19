@@ -193,6 +193,7 @@ impl TrxSysInitializer {
     pub async fn init<P: BufferPool>(
         self,
         meta_pool: &'static FixedBufferPool,
+        index_pool: &'static FixedBufferPool,
         data_pool: &'static P,
     ) -> Result<&'static TransactionSystem> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
@@ -201,12 +202,13 @@ impl TrxSysInitializer {
             log_partition_initializers.push(initializer);
         }
 
-        let catalog_storage = CatalogStorage::new(meta_pool).await;
+        let catalog_storage = CatalogStorage::new(meta_pool, index_pool).await;
         let mut catalog = Catalog::new(catalog_storage);
 
         // Now we have an empty catalog, all log partitions and buffer pool.
         // Recover all committed data if required.
         let (log_partitions, gc_rxs) = log_recover(
+            index_pool,
             data_pool,
             &mut catalog,
             log_partition_initializers,

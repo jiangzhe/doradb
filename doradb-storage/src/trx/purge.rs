@@ -525,7 +525,7 @@ mod tests {
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::engine::EngineConfig;
-    use crate::index::RowLocation;
+    use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::ops::SelectKey;
     use crate::row::RowPage;
@@ -737,7 +737,7 @@ mod tests {
                 // see which one is not purged, and its cts.
                 let index = table.sec_idx[0].unique().unwrap();
                 let mut remained_row_ids = vec![];
-                index.scan_values(&mut remained_row_ids);
+                index.scan_values(&mut remained_row_ids, 100).await;
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
                 let location = table.blk_idx.find_row(row_id).await;

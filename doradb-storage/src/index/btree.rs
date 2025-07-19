@@ -7,71 +7,27 @@ use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
-use crate::index::btree_node::{BTreeNode, KeyVec, LookupChild, SpaceEstimation};
-use crate::index::util::ParentPosition;
-use crate::index::util::SpaceStatistics;
+use crate::index::btree_node::{BTreeNode, BTreeNodeBox, KeyVec, LookupChild, SpaceEstimation};
+use crate::index::btree_value::{BTreeU64, BTreeValue};
+use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
 use crate::trx::TrxID;
 use either::Either;
 use std::marker::PhantomData;
 use std::mem;
-use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type SharedStrategy = SharedLockStrategy<BTreeNode>;
 type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
 type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
 
-/// BTreeValue is the value type stored in leaf node.
-/// In branch node, the value type is always page id,
-/// which is a logical pointer to child node.
-///
-/// There are two implementations of BTreeValue.
-/// 1. RowID(u64), which supports unique index.
-/// 2. single byte(u8), which supports non-unique index.
-///    Non-unique index is a bit complicated.
-///    The key of non-unique index is user-defined
-///    key followed by RowID, to make it unique for
-///    B-tree operations(e.g. deletion).
-///    As a consequence, if we still use RowID as
-///    value type, it's waste of space.
-///    Instead, we can only store single byte as its
-///    value, in order to represent delete bit.
-///    If we want to retrieve value, we can always
-///    extract last 8 byte from key and convert it
-///    to RowID.
-pub trait BTreeValue: Copy + PartialEq + Eq {
-    const INVALID_VALUE: Self;
-
-    /// Marks given value as deleted.
-    fn deleted(self) -> Self;
-
-    /// Returns value except delete bit.
-    fn value(self) -> Self;
-
-    /// Returns whether this value is marked as deleted.
-    fn is_deleted(self) -> bool;
-}
-
-trait OkThen: Sized {
-    fn is_ok(&self) -> bool;
-
-    #[inline]
-    fn ok_then<F: FnOnce()>(self, f: F) -> Self {
-        if self.is_ok() {
-            f()
-        }
-        self
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BTreeInsert {
+pub enum BTreeInsert<V: BTreeValue> {
     Ok,
-    DuplicateKey,
+    DuplicateKey(V),
 }
 
-impl OkThen for BTreeInsert {
+impl<V: BTreeValue> BTreeInsert<V> {
     #[inline]
     fn is_ok(&self) -> bool {
         matches!(self, BTreeInsert::Ok)
@@ -85,7 +41,7 @@ pub enum BTreeDelete {
     ValueMismatch,
 }
 
-impl OkThen for BTreeDelete {
+impl BTreeDelete {
     #[inline]
     fn is_ok(&self) -> bool {
         matches!(self, BTreeDelete::Ok)
@@ -99,7 +55,7 @@ pub enum BTreeUpdate<V: BTreeValue> {
     ValueMismatch(V),
 }
 
-impl<V: BTreeValue> OkThen for BTreeUpdate<V> {
+impl<V: BTreeValue> BTreeUpdate<V> {
     #[inline]
     fn is_ok(&self) -> bool {
         matches!(self, BTreeUpdate::Ok(_))
@@ -123,7 +79,7 @@ impl BTree {
         let mut g = pool.allocate_page::<BTreeNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
-        page.init(0, ts, &[], PageID::INVALID_VALUE, &[], hints_enabled);
+        page.init(0, ts, &[], BTreeU64::INVALID_VALUE, &[], hints_enabled);
         BTree {
             root: page_id,
             height: AtomicUsize::new(0),
@@ -168,9 +124,9 @@ impl BTree {
                         continue;
                     }
                     let c_page_id = if pos.idx == -1 {
-                        p_node.lower_fence_value()
+                        p_node.lower_fence_value().to_u64()
                     } else {
-                        p_node.value::<PageID>(pos.idx as usize)
+                        p_node.value_as_page_id(pos.idx as usize)
                     };
                     let c_guard = self
                         .pool
@@ -199,7 +155,7 @@ impl BTree {
     /// This method does not care about delete bit, so a marked deleted value
     /// can also be returned and caller need to take care of it.
     #[inline]
-    pub async fn lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> BTreeLookup<V> {
+    pub async fn lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Option<V> {
         loop {
             let res = self.try_lookup_optimistic(key).await;
             let res = verify_continue!(res);
@@ -208,8 +164,9 @@ impl BTree {
     }
 
     /// Insert a new key value pair into the tree.
+    /// Returns old value if same key exists.
     #[inline]
-    pub async fn insert<V: BTreeValue>(&self, key: &[u8], value: V, ts: TrxID) -> BTreeInsert {
+    pub async fn insert<V: BTreeValue>(&self, key: &[u8], value: V, ts: TrxID) -> BTreeInsert<V> {
         // Stack holds the path from root to leaf.
         loop {
             let res = self
@@ -219,9 +176,10 @@ impl BTree {
             let node = c_guard.page_mut();
             let idx = match node.search_key(key) {
                 Err(idx) => idx,
-                Ok(..) => {
+                Ok(idx) => {
                     // Do not allow insert even if same key is marked as deleted.
-                    return BTreeInsert::DuplicateKey;
+                    let value = node.value::<V>(idx);
+                    return BTreeInsert::DuplicateKey(value);
                 }
             };
             if !node.can_insert(key) {
@@ -276,8 +234,11 @@ impl BTree {
         let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
-        node.mark_as_deleted(key, value)
-            .ok_then(|| node.update_ts(ts))
+        let res = node.mark_as_deleted(key, value);
+        if res.is_ok() {
+            node.update_ts(ts);
+        }
+        res
     }
 
     /// Delete an existing key value pair from this tree.
@@ -288,11 +249,17 @@ impl BTree {
     /// Instead a tree-level compact() method can be used periodically
     /// to make the tree balanced.
     #[inline]
-    pub async fn delete<V: BTreeValue>(&self, key: &[u8], value: V, ts: TrxID) -> BTreeDelete {
+    pub async fn delete<V: BTreeValue>(
+        &self,
+        key: &[u8],
+        value: V,
+        ignore_del_mask: bool,
+        ts: TrxID,
+    ) -> BTreeDelete {
         let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
-        let res = node.delete(key, value);
+        let res = node.delete(key, value, ignore_del_mask);
         if res.is_ok() {
             node.update_hints();
             node.update_ts(ts);
@@ -300,7 +267,7 @@ impl BTree {
         res
     }
 
-    /// Update an existing key value pair with new value
+    /// Update an existing key value pair with new value.
     #[inline]
     pub async fn update<V: BTreeValue>(
         &self,
@@ -312,27 +279,27 @@ impl BTree {
         let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
-        node.update(key, old_value, new_value)
-            .ok_then(|| node.update_ts(ts))
+        let res = node.update(key, old_value, new_value);
+        if res.is_ok() {
+            node.update_ts(ts);
+        }
+        res
     }
 
     /// Try to lookup a key in the tree, break if any of optimistic validation fails.
     #[inline]
-    async fn try_lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Validation<BTreeLookup<V>> {
+    async fn try_lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Validation<Option<V>> {
         let g = self.find_leaf::<OptimisticStrategy>(key).await;
         let leaf = unsafe { g.page_unchecked() };
         match leaf.search_key(key) {
             Ok(idx) => {
                 let value = leaf.value::<V>(idx);
                 verify!(g.validate());
-                if value.is_deleted() {
-                    return Valid(BTreeLookup::Deleted(value.value()));
-                }
-                Valid(BTreeLookup::Exists(value))
+                Valid(Some(value))
             }
             Err(_) => {
                 verify!(g.validate());
-                Valid(BTreeLookup::NotFound)
+                Valid(None)
             }
         }
     }
@@ -366,7 +333,7 @@ impl BTree {
                         return BTreeSplit::full_branch(&lower_fence_key, page_id, &sep_key);
                     }
                     // Parent is root and full, just split.
-                    self.split_root::<PageID>(p_guard.page_mut(), false, ts)
+                    self.split_root::<BTreeU64>(p_guard.page_mut(), false, ts)
                         .await;
                     return BTreeSplit::Ok;
                 }
@@ -393,9 +360,11 @@ impl BTree {
         };
         // Now parent and child locks are acquired exclusively, and parent has enough
         // space to insert separator key, so to actual split.
+        let r_guard = self.pool.allocate_page::<BTreeNode>().await;
         self.split_node::<V>(
             p_guard.page_mut(),
             c_guard.page_mut(),
+            r_guard,
             sep_idx,
             &sep_key,
             ts,
@@ -422,7 +391,7 @@ impl BTree {
         let p_node = p_guard.page();
         match p_node.search_key(&c_lower_fence_key) {
             Ok(idx) => {
-                let page_id = p_node.value::<PageID>(idx);
+                let page_id = p_node.value_as_page_id(idx);
                 if page_id == c_page_id {
                     // Tree structure remains the same.
                     // Check if parent is full.
@@ -438,7 +407,7 @@ impl BTree {
                             ));
                         }
                         // Parent is root and full, just split.
-                        self.split_root::<PageID>(p_guard.page_mut(), false, ts)
+                        self.split_root::<BTreeU64>(p_guard.page_mut(), false, ts)
                             .await;
                         return Either::Right(BTreeSplit::Ok);
                     }
@@ -512,14 +481,15 @@ impl BTree {
                                 );
                             }
                             // split root.
-                            self.split_root::<PageID>(p_node, false, ts).await;
+                            self.split_root::<BTreeU64>(p_node, false, ts).await;
                             if !p_node.can_insert(&sep_key) {
                                 return BTreeSplit::Inconsistent;
                             }
                         }
                         // now parent and child nodes are exclusively locked and parent has enough
                         // space to insert separator key, so do actual split.
-                        self.split_node::<PageID>(p_node, c_node, sep_idx, &sep_key, ts)
+                        let r_guard = self.pool.allocate_page::<BTreeNode>().await;
+                        self.split_node::<BTreeU64>(p_node, c_node, r_guard, sep_idx, &sep_key, ts)
                             .await;
                         BTreeSplit::Ok
                     }
@@ -564,7 +534,7 @@ impl BTree {
             height,
             ts,
             &sep_key,
-            PageID::INVALID_VALUE,
+            BTreeU64::INVALID_VALUE,
             &[],
             hints_enabled,
         );
@@ -577,13 +547,13 @@ impl BTree {
                 height + 1,
                 ts,
                 &lower_fence_key,
-                left_page_id,
+                BTreeU64::from(left_page_id),
                 &[],
                 hints_enabled,
             );
             new.assume_init()
         };
-        let slot_idx = tmp_root.insert(&sep_key, right_page_id);
+        let slot_idx = tmp_root.insert(&sep_key, BTreeU64::from(right_page_id));
         debug_assert!(slot_idx == 0);
         // Overwrite original root.
         *root = tmp_root;
@@ -596,6 +566,7 @@ impl BTree {
         &self,
         p_node: &mut BTreeNode,
         c_node: &mut BTreeNode,
+        mut r_guard: PageExclusiveGuard<BTreeNode>,
         sep_idx: usize,
         sep_key: &[u8],
         ts: TrxID,
@@ -607,24 +578,19 @@ impl BTree {
         let c_lower_fence_key = c_node.lower_fence_key();
         let c_upper_fence_key = c_node.upper_fence_key();
         // Create temporary node to store the left half data of child node.
-        let mut tmp_left = unsafe {
-            let mut new = std::mem::MaybeUninit::<BTreeNode>::zeroed();
-            new.assume_init_mut().init(
-                c_height,
-                ts,
-                &c_lower_fence_key,
-                c_node.lower_fence_value(),
-                sep_key,
-                c_node.header_hints_enabled(),
-            );
-            new.assume_init()
-        };
-        tmp_left.extend_slots_from::<V>(c_node, 0, sep_idx);
-        tmp_left.update_hints();
-        // Allocate right node.
-        let mut right_page = self.pool.allocate_page::<BTreeNode>().await;
-        let right_page_id = right_page.page_id();
-        let right_node = right_page.page_mut();
+        let mut tmp_l = BTreeNodeBox::alloc(
+            c_height,
+            ts,
+            &c_lower_fence_key,
+            c_node.lower_fence_value(),
+            sep_key,
+            c_node.header_hints_enabled(),
+        );
+        tmp_l.extend_slots_from::<V>(c_node, 0, sep_idx);
+        tmp_l.update_hints();
+        // Process right node.
+        let right_page_id = r_guard.page_id();
+        let right_node = r_guard.page_mut();
         // Initialize and copy key values to right node.
         right_node.init(
             c_node.height() as u16,
@@ -636,16 +602,17 @@ impl BTree {
             // Other branch nodes always have lower fence equal to the first
             // slot key.
             // So, right node does not need to copy lower fence value.
-            PageID::INVALID_VALUE,
+            BTreeU64::INVALID_VALUE,
             &c_upper_fence_key,
             c_node.header_hints_enabled(),
         );
         right_node.extend_slots_from::<V>(c_node, sep_idx, c_node.count() - sep_idx);
         right_node.update_hints();
         // Copy left node to current node.
-        *c_node = tmp_left;
+        c_node.clone_from(&tmp_l);
+        drop(tmp_l);
         // Insert right node into parent.
-        p_node.insert(sep_key, right_page_id);
+        p_node.insert(sep_key, BTreeU64::from(right_page_id));
     }
 
     /// Find leaf by given key.
@@ -683,24 +650,21 @@ impl BTree {
             estimation.total_space() <= mem::size_of::<BTreeNode>()
         });
         let ts = ts.max(l_node.ts()).max(r_node.ts()).max(p_node.ts());
-        let mut tmp_l = unsafe {
-            let mut node = MaybeUninit::<BTreeNode>::zeroed();
-            node.assume_init_mut().init(
-                l_node.height() as u16,
-                ts,
-                lower_fence_key,
-                l_node.lower_fence_value(),
-                upper_fence_key,
-                l_node.header_hints_enabled(),
-            );
-            node.assume_init()
-        };
+        let mut tmp_l = BTreeNodeBox::alloc(
+            l_node.height() as u16,
+            ts,
+            lower_fence_key,
+            l_node.lower_fence_value(),
+            upper_fence_key,
+            l_node.header_hints_enabled(),
+        );
         tmp_l.extend_slots_from::<V>(l_node, 0, l_node.count());
         if r_node.count() > 0 {
             tmp_l.extend_slots_from::<V>(r_node, 0, r_node.count());
         }
         tmp_l.update_hints();
-        *l_node = tmp_l;
+        l_node.clone_from(&tmp_l);
+        drop(tmp_l);
         p_node.delete_at(p_r_idx, value_size);
         p_node.update_hints();
         p_node.update_ts(ts);
@@ -734,45 +698,40 @@ impl BTree {
             estimation.total_space() <= mem::size_of::<BTreeNode>()
         });
         let ts = ts.max(l_node.ts()).max(r_node.ts()).max(p_node.ts());
-        let mut tmp_l = unsafe {
-            let mut node = MaybeUninit::<BTreeNode>::zeroed();
-            node.assume_init_mut().init(
-                l_node.height() as u16,
-                ts,
-                lower_fence_key,
-                l_node.lower_fence_value(),
-                sep_key,
-                l_node.header_hints_enabled(),
-            );
-            node.assume_init()
-        };
+        let mut tmp_l = BTreeNodeBox::alloc(
+            l_node.height() as u16,
+            ts,
+            lower_fence_key,
+            l_node.lower_fence_value(),
+            sep_key,
+            l_node.header_hints_enabled(),
+        );
         tmp_l.extend_slots_from::<V>(l_node, 0, l_node.count());
         tmp_l.extend_slots_from::<V>(r_node, 0, count);
         tmp_l.update_hints();
-        *l_node = tmp_l;
+        l_node.clone_from(&tmp_l);
+        drop(tmp_l);
 
-        let mut tmp_r = unsafe {
+        let mut tmp_r = {
             let lower_fence_value = if r_node.height() == 0 {
-                PageID::INVALID_VALUE
+                BTreeU64::INVALID_VALUE
             } else {
-                r_node.value::<PageID>(count)
+                r_node.value::<BTreeU64>(count)
             };
-            let mut node = MaybeUninit::<BTreeNode>::zeroed();
-            node.assume_init_mut().init(
+            BTreeNodeBox::alloc(
                 r_node.height() as u16,
                 ts,
                 sep_key,
                 lower_fence_value,
                 upper_fence_key,
                 r_node.header_hints_enabled(),
-            );
-            node.assume_init()
+            )
         };
         tmp_r.extend_slots_from::<V>(r_node, count, r_node.count() - count);
         tmp_r.update_hints();
-        *r_node = tmp_r;
-
-        p_node.update_key::<PageID>(p_r_idx, sep_key);
+        r_node.clone_from(&tmp_r);
+        drop(tmp_r);
+        p_node.update_key::<BTreeU64>(p_r_idx, sep_key);
         p_node.update_hint_if_needed(p_r_idx, sep_key);
         p_node.update_ts(ts);
     }
@@ -1003,7 +962,7 @@ impl BTree {
         // branch-to-root compaction.
         let mut h = 1usize;
         while h <= height {
-            self.compact::<PageID>(h, config)
+            self.compact::<BTreeU64>(h, config)
                 .run_to_end(&mut purge_list)
                 .await;
             h += 1;
@@ -1037,7 +996,7 @@ impl BTree {
             if root.height() == 0 || root.count() > 0 {
                 return;
             }
-            let c_page_id = root.lower_fence_value();
+            let c_page_id = root.lower_fence_value().to_u64();
             let mut c_guard = self
                 .pool
                 .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
@@ -1063,9 +1022,10 @@ impl BTree {
         // Deallocate child associated with lower fence key.
         // Only left-most node has lower fence child.
         if !p_node.lower_fence_value().is_deleted() {
+            let c_page_id = p_node.lower_fence_value().to_u64();
             let c_guard = self
                 .pool
-                .get_page::<BTreeNode>(p_node.lower_fence_value(), LatchFallbackMode::Exclusive)
+                .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .exclusive_async()
                 .await;
@@ -1073,7 +1033,7 @@ impl BTree {
         }
         // Deallocate all children.
         for i in 0..p_node.count() {
-            let c_page_id = p_node.value::<PageID>(i);
+            let c_page_id = p_node.value_as_page_id(i);
             let c_guard = self
                 .pool
                 .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
@@ -1182,30 +1142,6 @@ where
                 .await;
             p_guard = verify!(c_guard);
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BTreeLookup<V: BTreeValue> {
-    Exists(V),
-    Deleted(V),
-    NotFound,
-}
-
-impl<V: BTreeValue> BTreeLookup<V> {
-    #[inline]
-    pub fn exists(&self) -> bool {
-        matches!(self, BTreeLookup::Exists(_))
-    }
-
-    #[inline]
-    pub fn is_deleted(&self) -> bool {
-        matches!(self, BTreeLookup::Deleted(_))
-    }
-
-    #[inline]
-    pub fn not_found(&self) -> bool {
-        matches!(self, BTreeLookup::NotFound)
     }
 }
 
@@ -1333,7 +1269,7 @@ impl<'a> BTreeNodeCursor<'a> {
                 return None;
             }
             // Get next slot value, then child node
-            let c_page_id = p_node.value::<PageID>(next_idx);
+            let c_page_id = p_node.value_as_page_id(next_idx);
             self.coupling.parent.as_mut().unwrap().idx = next_idx as isize;
             let c_guard = self
                 .tree
@@ -1474,7 +1410,7 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
                     if self.height == 0 {
                         node.self_compact::<V>();
                     } else {
-                        node.self_compact::<PageID>();
+                        node.self_compact::<BTreeU64>();
                     }
                 }
             }
@@ -1563,7 +1499,7 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
                     let parent = self.coupling.parent.as_mut().unwrap();
                     let p_node = parent.g.page_mut();
                     // check if parent has enough space to update key.
-                    if !p_node.prepare_update_key::<PageID>(p_r_idx, &sep_key) {
+                    if !p_node.prepare_update_key::<BTreeU64>(p_r_idx, &sep_key) {
                         self.coupling.node.replace(r_guard);
                         self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
                         return BTreeCompact::OutOfSpace;
@@ -1613,7 +1549,7 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
                 self.seek(&upper_fence).await;
                 return true;
             }
-            let c_page_id = p_node.value::<PageID>(next_idx);
+            let c_page_id = p_node.value_as_page_id(next_idx);
             let c_guard = self
                 .tree
                 .pool
@@ -1637,7 +1573,7 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
             if next_idx == p_node.count() {
                 return None;
             }
-            let c_page_id = p_node.value::<PageID>(next_idx);
+            let c_page_id = p_node.value_as_page_id(next_idx);
             let c_guard = self
                 .tree
                 .pool
@@ -1658,9 +1594,9 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
         if let Some(parent) = self.coupling.parent.as_mut() {
             let p_node = parent.g.page();
             let c_page_id = if parent.idx == -1 {
-                p_node.lower_fence_value()
+                p_node.lower_fence_value().to_u64()
             } else {
-                p_node.value::<PageID>(parent.idx as usize)
+                p_node.value_as_page_id(parent.idx as usize)
             };
             let c_guard = self
                 .tree
@@ -1716,39 +1652,55 @@ mod tests {
             {
                 let tree = BTree::new(pool, false, 200).await;
                 // insert 1, 2, 3.
-                let res = tree.insert(&1u64.to_be_bytes(), 1, 210).await;
+                let one = BTreeU64::from(1);
+                let three = BTreeU64::from(3);
+                let five = BTreeU64::from(5);
+                let seven = BTreeU64::from(7);
+                let fifty = BTreeU64::from(50);
+                let seventy = BTreeU64::from(70);
+                let res = tree.insert(&1u64.to_be_bytes(), one, 210).await;
                 assert!(res.is_ok());
-                let res = tree.insert(&3u64.to_be_bytes(), 3, 220).await;
+                let res = tree.insert(&3u64.to_be_bytes(), three, 220).await;
                 assert!(res.is_ok());
-                let res = tree.insert(&5u64.to_be_bytes(), 5, 205).await;
+                let res = tree.insert(&5u64.to_be_bytes(), five, 205).await;
                 assert!(res.is_ok());
 
-                let res = tree.insert(&5u64.to_be_bytes(), 5, 230).await;
-                assert!(res == BTreeInsert::DuplicateKey);
+                let res = tree.insert(&5u64.to_be_bytes(), five, 230).await;
+                assert!(res == BTreeInsert::DuplicateKey(five));
 
                 // look up
-                let res = tree.lookup_optimistic::<u64>(&1u64.to_be_bytes()).await;
-                assert!(res.exists());
-                let res = tree.lookup_optimistic::<u64>(&4u64.to_be_bytes()).await;
-                assert!(res.not_found());
+                let res = tree
+                    .lookup_optimistic::<BTreeU64>(&1u64.to_be_bytes())
+                    .await;
+                assert!(res.is_some());
+                let res = tree
+                    .lookup_optimistic::<BTreeU64>(&4u64.to_be_bytes())
+                    .await;
+                assert!(res.is_none());
                 // mark as deleted
-                let res = tree.mark_as_deleted(&3u64.to_be_bytes(), 3, 230).await;
+                let res = tree.mark_as_deleted(&3u64.to_be_bytes(), three, 230).await;
                 assert!(res.is_ok());
-                let res = tree.mark_as_deleted(&5u64.to_be_bytes(), 5, 230).await;
+                let res = tree.mark_as_deleted(&5u64.to_be_bytes(), five, 230).await;
                 assert!(res.is_ok());
-                let res = tree.mark_as_deleted(&7u64.to_be_bytes(), 7, 235).await;
+                let res = tree.mark_as_deleted(&7u64.to_be_bytes(), seven, 235).await;
                 assert_eq!(res, BTreeUpdate::NotFound);
-                let res = tree.lookup_optimistic::<u64>(&5u64.to_be_bytes()).await;
-                assert_eq!(res, BTreeLookup::Deleted(5));
+                let res = tree
+                    .lookup_optimistic::<BTreeU64>(&5u64.to_be_bytes())
+                    .await;
+                assert_eq!(res, Some(five.deleted()));
                 // update
-                let res = tree.update(&5u64.to_be_bytes(), 5, 50, 240).await;
+                let res = tree
+                    .update(&5u64.to_be_bytes(), five.deleted(), fifty, 240)
+                    .await;
                 assert!(res.is_ok());
-                let res = tree.update(&5u64.to_be_bytes(), 5, 70, 245).await;
-                assert_eq!(res, BTreeUpdate::ValueMismatch(50));
+                let res = tree
+                    .update(&5u64.to_be_bytes(), five.deleted(), seventy, 245)
+                    .await;
+                assert_eq!(res, BTreeUpdate::ValueMismatch(fifty));
                 // delete
-                let res = tree.delete(&3u64.to_be_bytes(), 3, 250).await;
+                let res = tree.delete(&3u64.to_be_bytes(), three, true, 250).await;
                 assert!(res.is_ok());
-                let res = tree.delete(&5u64.to_be_bytes(), 5, 255).await;
+                let res = tree.delete(&5u64.to_be_bytes(), five, true, 255).await;
                 assert_eq!(res, BTreeDelete::ValueMismatch);
             }
 
@@ -1775,7 +1727,7 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, i, 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
                     assert!(res.is_ok());
                     if !printed1 && tree.height() == 1 {
                         printed1 = true;
@@ -1846,14 +1798,14 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, i, 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
                     assert!(res.is_ok());
                 }
 
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.delete(&key, i, 202).await;
+                    let res = tree.delete(&key, BTreeU64::from(i), true, 202).await;
                     assert!(res.is_ok());
                 }
 
@@ -1917,14 +1869,13 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, i, 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
                     assert!(res.is_ok());
                 }
 
                 for i in 0u64..ROWS {
-                    // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.delete(&key, i, 202).await;
+                    let res = tree.delete(&key, BTreeU64::from(i), true, 202).await;
                     assert!(res.is_ok());
                 }
 
@@ -1933,7 +1884,7 @@ mod tests {
                 println!("Before compaction, tree space statistics: {:?}", space_stat);
 
                 let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
-                let purge_list = tree.compact_all::<u64>(config).await;
+                let purge_list = tree.compact_all::<BTreeU64>(config).await;
 
                 let space_stat = tree.collect_space_statistics().await;
                 println!("After compaction, tree space statistics: {:?}", space_stat);
@@ -2000,7 +1951,9 @@ mod tests {
                 let mut rng = rand::rng();
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
-                    let res1 = tree.insert(&k.to_be_bytes(), i as u64, 201).await;
+                    let res1 = tree
+                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), 201)
+                        .await;
                     let res2 = map.entry(k).or_insert_with(|| i as u64);
                     assert!(res1.is_ok() == (*res2 == i as u64));
                 }
@@ -2010,12 +1963,12 @@ mod tests {
 
                 for _ in 0..ROWS {
                     let k = between.sample(&mut rng);
-                    let res1 = tree.lookup_optimistic::<u64>(&k.to_be_bytes()).await;
+                    let res1 = tree.lookup_optimistic::<BTreeU64>(&k.to_be_bytes()).await;
                     let res2 = map.get(&k);
                     if let Some(v) = res2 {
-                        assert!(res1 == BTreeLookup::Exists(*v));
+                        assert!(res1 == Some(BTreeU64::from(*v)));
                     } else {
-                        assert!(res1 == BTreeLookup::NotFound);
+                        assert!(res1.is_none());
                     }
                 }
             }
@@ -2045,7 +1998,9 @@ mod tests {
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
                     // println!("row k={}, i={} sampled", k, i);
-                    let res1 = tree.insert(&k.to_be_bytes(), i as u64, 201).await;
+                    let res1 = tree
+                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), 201)
+                        .await;
                     let res2 = map.entry(k).or_insert_with(|| i as u64);
                     assert!(res1.is_ok() == (*res2 == i as u64));
                     // println!("row k={}, i={} inserted", k, i);
@@ -2056,12 +2011,12 @@ mod tests {
 
                 for _ in 0..ROWS {
                     let k = between.sample(&mut rng);
-                    let res1 = tree.lookup_optimistic::<u64>(&k.to_be_bytes()).await;
+                    let res1 = tree.lookup_optimistic::<BTreeU64>(&k.to_be_bytes()).await;
                     let res2 = map.get(&k);
                     if let Some(v) = res2 {
-                        assert!(res1 == BTreeLookup::Exists(*v));
+                        assert!(res1 == Some(BTreeU64::from(*v)));
                     } else {
-                        assert!(res1 == BTreeLookup::NotFound);
+                        assert!(res1.is_none());
                     }
                 }
             }
@@ -2089,7 +2044,7 @@ mod tests {
                     let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
-                        tree.insert(&k.to_be_bytes(), i, 100).await;
+                        tree.insert(&k.to_be_bytes(), BTreeU64::from(i), 100).await;
                     }
                 }
                 let dur = start.elapsed();
@@ -2112,7 +2067,7 @@ mod tests {
                     let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
-                        tree.insert(&k.to_be_bytes(), i, 100).await;
+                        tree.insert(&k.to_be_bytes(), BTreeU64::from(i), 100).await;
                     }
                 }
 
@@ -2149,7 +2104,7 @@ mod tests {
                 let mut key = [0u8; 1000];
                 for i in 0u64..ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, i, 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
                     assert!(res.is_ok());
                 }
                 let event = Event::new();
@@ -2177,7 +2132,7 @@ mod tests {
                 listener.await;
                 println!("tree height {}", tree.height());
                 key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
-                let res = tree.insert(&key, 90088, 202).await;
+                let res = tree.insert(&key, BTreeU64::from(90088), 202).await;
                 assert!(res.is_ok());
                 println!("insert ok");
                 println!("tree height {}", tree.height());
@@ -2206,7 +2161,7 @@ mod tests {
                 let mut key = [0u8; 1000];
                 for i in 0u64..ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, i, 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
                     assert!(res.is_ok());
                 }
                 let event = Event::new();
@@ -2221,7 +2176,7 @@ mod tests {
 
                             listener.await;
 
-                            let res = tree.insert(&key, 90088, 202).await;
+                            let res = tree.insert(&key, BTreeU64::from(90088), 202).await;
                             assert!(res.is_ok());
                         })
                     });
@@ -2254,7 +2209,9 @@ mod tests {
                 let mut rng = rand::rng();
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
-                    let _ = tree.insert(&k.to_be_bytes(), i as u64, 201).await;
+                    let _ = tree
+                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), 201)
+                        .await;
                 }
                 let space_stat = tree.collect_space_statistics().await;
                 println!(
@@ -2264,7 +2221,7 @@ mod tests {
                 );
 
                 let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
-                tree.compact_all::<u64>(config).await;
+                tree.compact_all::<BTreeU64>(config).await;
 
                 let space_stat = tree.collect_space_statistics().await;
                 println!(
@@ -2295,7 +2252,7 @@ mod tests {
                 let mut key = vec![0u8; 1000];
                 for i in 0..H0_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, i, 201).await;
+                    tree.insert(&key, BTreeU64::from(i), 201).await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",
@@ -2311,7 +2268,7 @@ mod tests {
                 let mut key = vec![0u8; 1000];
                 for i in 0..H1_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, i, 201).await;
+                    tree.insert(&key, BTreeU64::from(i), 201).await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",
@@ -2327,7 +2284,7 @@ mod tests {
                 let mut key = vec![0u8; 1000];
                 for i in 0..H2_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, i, 201).await;
+                    tree.insert(&key, BTreeU64::from(i), 201).await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",

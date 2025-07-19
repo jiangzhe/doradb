@@ -215,6 +215,126 @@ impl<'a> RowReadAccess<'a> {
         }
     }
 
+    /// find one version of the old row that matches given key.
+    /// There are several scenarios:
+    /// 1. The old row is being modified.
+    ///    a) Modifier is another transaction, throws conflict error.
+    ///    b) Modifier is self, continue.
+    /// 2. The old row matches key and is not deleted. Just throw dup-key error.
+    /// 3. The old row matches key and is deleted.
+    ///    a) DELETE undo entry does not exists, mean no transaction can see the
+    ///    non-deleted version, so we just return none.
+    ///    b) DELELTE undo entry still exists, means some transaction still has
+    ///    access to non-deleted version, so we record new-to-old modifications
+    ///    and link new row to DELETE entry.
+    /// 4. The old row does not match key and no old version with same key found.
+    ///    Return none.
+    /// 5. The old row does not match key but one old version with same key found.
+    ///    Add record modifications and then link new row to that specific entry.
+    #[inline]
+    pub fn find_old_version_for_unique_key(
+        &self,
+        metadata: &TableMetadata,
+        key: &SelectKey,
+        trx: &ActiveTrx,
+    ) -> FindOldVersion {
+        let undo = match &self.state {
+            RowReadState::Recover(_) => unreachable!(),
+            RowReadState::Undo(undo) => undo,
+        };
+
+        match &**undo {
+            None => {
+                let row = self.row();
+                if !row.is_key_different(metadata, key) {
+                    if !row.is_deleted() {
+                        // Scenario #2
+                        return FindOldVersion::DuplicateKey;
+                    }
+                    // Scenario #3.a
+                    return FindOldVersion::None;
+                }
+                // Scenario #4
+                FindOldVersion::None
+            }
+            Some(undo_head) => {
+                let ts = undo_head.ts();
+                if !trx_is_committed(ts) && !trx.is_same_trx(undo_head) {
+                    // Scenario #1.a
+                    return FindOldVersion::WriteConflict;
+                }
+                let row = self.row();
+                // Old row matches key.
+                if !row.is_key_different(metadata, key) {
+                    if !row.is_deleted() {
+                        // Scenario #2
+                        return FindOldVersion::DuplicateKey;
+                    }
+                    // Scenario #3.b
+                    // The first undo entry must be DELETE as page data is deleted.
+                    // No chance to be MOVE because, if index points to a row which
+                    // is moved, this row must be in an ongoing transaction, not
+                    // a committed transaction(if committed, index should point to
+                    // the newest version).
+                    debug_assert!(matches!(
+                        undo_head.next.main.entry.as_ref().kind,
+                        RowUndoKind::Delete
+                    ));
+                    // Collect old row to calculate delta for link.
+                    let old_row = row.clone_vals(metadata);
+                    return FindOldVersion::Ok(old_row, ts, undo_head.next.main.entry.clone());
+                }
+                // Old row does not match key.
+                // Traverse version chain to find matched version.
+                let mut entry = undo_head.next.main.entry.clone();
+                let mut cts = ts;
+                let mut deleted = row.is_deleted();
+                let mut vals = row.clone_vals(metadata);
+                // Traverse version chain until oldest version.
+                // This is safe because we already lock the row and
+                // prevent GC thread from pruging old versions.
+                loop {
+                    match &entry.as_ref().kind {
+                        RowUndoKind::Lock => (), // do nothing.
+                        RowUndoKind::Insert => {
+                            debug_assert!(!deleted);
+                            deleted = true;
+                        }
+                        RowUndoKind::Update(undo_vals) => {
+                            debug_assert!(!deleted);
+                            for uc in undo_vals {
+                                vals[uc.idx] = uc.val.clone();
+                            }
+                        }
+                        RowUndoKind::Delete => {
+                            debug_assert!(deleted);
+                            deleted = false;
+                        }
+                        RowUndoKind::Move(del) => {
+                            deleted = *del;
+                        }
+                    }
+                    // Here we check if current version matches input key
+                    if !deleted && metadata.match_key(key, &vals) {
+                        return FindOldVersion::Ok(vals, cts, entry);
+                    }
+                    // We only need to go through main branch, because Index
+                    // branch won't have different key than those in main
+                    // branch.
+                    match entry.as_ref().next.as_ref() {
+                        None => {
+                            return FindOldVersion::None;
+                        }
+                        Some(next) => {
+                            cts = next.main.status.ts();
+                            entry = next.main.entry.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Check whether a same key can be found in version chain.
     /// This method is similar to read_row_mvcc() but some differences:
     /// 1. Uncommitted versions are also need to be considered.
@@ -611,119 +731,6 @@ impl<'a> RowWriteAccess<'a> {
                     return LockUndo::WriteConflict;
                 }
                 LockUndo::Preparing(undo_head.prepare_listener())
-            }
-        }
-    }
-
-    /// find one version of the old row that matches given key.
-    /// There are several scenarios:
-    /// 1. The old row is being modified.
-    ///    a) Modifier is another transaction, throws conflict error.
-    ///    b) Modifier is self, continue.
-    /// 2. The old row matches key and is not deleted. Just throw dup-key error.
-    /// 3. The old row matches key and is deleted.
-    ///    a) DELETE undo entry does not exists, mean no transaction can see the
-    ///    non-deleted version, so we just return none.
-    ///    b) DELELTE undo entry still exists, means some transaction still has
-    ///    access to non-deleted version, so we record new-to-old modifications
-    ///    and link new row to DELETE entry.
-    /// 4. The old row does not match key and no old version with same key found.
-    ///    Return none.
-    /// 5. The old row does not match key but one old version with same key found.
-    ///    Add record modifications and then link new row to that specific entry.
-    #[inline]
-    pub fn find_old_version_for_unique_key(
-        &self,
-        metadata: &TableMetadata,
-        key: &SelectKey,
-        trx: &ActiveTrx,
-    ) -> FindOldVersion {
-        match &*self.undo {
-            None => {
-                let row = self.row();
-                if !row.is_key_different(metadata, key) {
-                    if !row.is_deleted() {
-                        // Scenario #2
-                        return FindOldVersion::DuplicateKey;
-                    }
-                    // Scenario #3.a
-                    return FindOldVersion::None;
-                }
-                // Scenario #4
-                FindOldVersion::None
-            }
-            Some(undo_head) => {
-                let ts = undo_head.ts();
-                if !trx_is_committed(ts) && !trx.is_same_trx(undo_head) {
-                    // Scenario #1.a
-                    return FindOldVersion::WriteConflict;
-                }
-                let row = self.row();
-                // Old row matches key.
-                if !row.is_key_different(metadata, key) {
-                    if !row.is_deleted() {
-                        // Scenario #2
-                        return FindOldVersion::DuplicateKey;
-                    }
-                    // Scenario #3.b
-                    // The first undo entry must be DELETE as page data is deleted.
-                    // No chance to be MOVE because, if index points to a row which
-                    // is moved, this row must be in an ongoing transaction, not
-                    // a committed transaction(if committed, index should point to
-                    // the newest version).
-                    debug_assert!(matches!(
-                        undo_head.next.main.entry.as_ref().kind,
-                        RowUndoKind::Delete
-                    ));
-                    // Collect old row to calculate delta for link.
-                    let old_row = row.clone_vals(metadata);
-                    return FindOldVersion::Ok(old_row, ts, undo_head.next.main.entry.clone());
-                }
-                // Old row does not match key.
-                // Traverse version chain to find matched version.
-                let mut entry = undo_head.next.main.entry.clone();
-                let mut cts = ts;
-                let mut deleted = row.is_deleted();
-                let mut vals = row.clone_vals(metadata);
-                // Traverse version chain until oldest version.
-                loop {
-                    match &entry.as_ref().kind {
-                        RowUndoKind::Lock => (), // do nothing.
-                        RowUndoKind::Insert => {
-                            debug_assert!(!deleted);
-                            deleted = true;
-                        }
-                        RowUndoKind::Update(undo_vals) => {
-                            debug_assert!(!deleted);
-                            for uc in undo_vals {
-                                vals[uc.idx] = uc.val.clone();
-                            }
-                        }
-                        RowUndoKind::Delete => {
-                            debug_assert!(deleted);
-                            deleted = false;
-                        }
-                        RowUndoKind::Move(del) => {
-                            deleted = *del;
-                        }
-                    }
-                    // Here we check if current version matches input key
-                    if !deleted && metadata.match_key(key, &vals) {
-                        return FindOldVersion::Ok(vals, cts, entry);
-                    }
-                    // We only need to go through main branch, because Index
-                    // branch won't have different key than those in main
-                    // branch.
-                    match entry.as_ref().next.as_ref() {
-                        None => {
-                            return FindOldVersion::None;
-                        }
-                        Some(next) => {
-                            cts = next.main.status.ts();
-                            entry = next.main.entry.clone();
-                        }
-                    }
-                }
             }
         }
     }

@@ -4,9 +4,12 @@ mod tests;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::buffer::BufferPool;
+use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
-use crate::index::{BlockIndex, IndexCompareExchange, RowLocation, SecondaryIndex, UniqueIndex};
+use crate::index::util::Maskable;
+use crate::index::{
+    BlockIndex, IndexCompareExchange, RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
+};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex,
@@ -16,10 +19,8 @@ use crate::row::{estimate_max_row_count, var_len_for_insert, Row, RowID, RowPage
 use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo};
-use crate::trx::undo::{
-    IndexUndo, IndexUndoKind, MainBranch, NextRowUndo, RowUndoKind, UndoStatus,
-};
-use crate::trx::TrxID;
+use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoKind, UndoStatus};
+use crate::trx::{TrxID, MIN_SNAPSHOT_TS};
 use crate::value::{Val, PAGE_VAR_LEN_INLINE};
 use doradb_catalog::IndexSpec;
 use std::collections::HashMap;
@@ -71,16 +72,18 @@ pub struct Table {
 impl Table {
     /// Create a new table.
     #[inline]
-    pub fn new(blk_idx: BlockIndex, metadata: TableMetadata) -> Self {
-        let sec_idx: Vec<_> = metadata
-            .index_specs
-            .iter()
-            .enumerate()
-            .map(|(index_no, index_spec)| {
-                let ty_infer = |col_no: usize| metadata.col_type(col_no);
-                SecondaryIndex::new(index_no, index_spec, ty_infer)
-            })
-            .collect();
+    pub async fn new(
+        index_pool: &'static FixedBufferPool,
+        blk_idx: BlockIndex,
+        metadata: TableMetadata,
+        ts: TrxID,
+    ) -> Self {
+        let mut sec_idx = Vec::with_capacity(metadata.index_specs.len());
+        for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
+            let ty_infer = |col_no: usize| metadata.col_type(col_no);
+            let si = SecondaryIndex::new(index_pool, index_no, index_spec, ty_infer, ts).await;
+            sec_idx.push(si);
+        }
         Table {
             metadata: Arc::new(metadata),
             blk_idx: Arc::new(blk_idx),
@@ -150,10 +153,11 @@ impl Table {
             match self.sec_idx[key.index_no]
                 .unique()
                 .unwrap()
-                .lookup(&key.vals)
+                .lookup(&key.vals, stmt.trx.sts)
+                .await
             {
                 None => return SelectMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row(row_id).await {
+                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return SelectMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -199,10 +203,11 @@ impl Table {
             match self.sec_idx[key.index_no]
                 .unique()
                 .unwrap()
-                .lookup(&key.vals)
+                .lookup(&key.vals, MIN_SNAPSHOT_TS)
+                .await
             {
                 None => return None,
-                Some(row_id) => match self.blk_idx.find_row(row_id).await {
+                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return None,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -327,7 +332,8 @@ impl Table {
             let res = self.sec_idx[key.index_no]
                 .unique()
                 .unwrap()
-                .insert(&key.vals, row_id);
+                .insert_if_not_exists(&key.vals, row_id, MIN_SNAPSHOT_TS)
+                .await;
             assert!(res.is_none());
         } else {
             todo!()
@@ -355,7 +361,7 @@ impl Table {
     #[inline]
     pub async fn recover_row_insert<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         page_id: PageID,
         row_id: RowID,
         cols: &[Val],
@@ -370,7 +376,7 @@ impl Table {
         });
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
-        let mut page_guard = buf_pool
+        let mut page_guard = data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -383,7 +389,7 @@ impl Table {
         if !disable_index {
             let keys = self.metadata.keys_for_insert(cols);
             for key in keys {
-                match self.recover_index_insert(buf_pool, key, row_id, cts).await {
+                match self.recover_index_insert(data_pool, key, row_id, cts).await {
                     RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
                     RecoverIndex::DeleteOutdated => unreachable!(),
                 }
@@ -453,14 +459,14 @@ impl Table {
     #[inline]
     pub async fn recover_row_update<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         page_id: PageID,
         row_id: RowID,
         update: &[UpdateCol],
         cts: TrxID,
         disable_index: bool,
     ) {
-        let mut page_guard = buf_pool
+        let mut page_guard = data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -484,7 +490,7 @@ impl Table {
 
             if !index_change_cols.is_empty() {
                 // There is index change, we need to update index.
-                let page_guard = buf_pool
+                let page_guard = data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -504,7 +510,7 @@ impl Table {
                                 index_key_replace(index_schema, &new_key, &index_change_cols);
                             // insert new index entry.
                             match self
-                                .recover_index_insert(buf_pool, new_key, row_id, cts)
+                                .recover_index_insert(data_pool, new_key, row_id, cts)
                                 .await
                             {
                                 RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
@@ -599,13 +605,13 @@ impl Table {
     #[inline]
     pub async fn recover_row_delete<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         page_id: PageID,
         row_id: RowID,
         cts: TrxID,
         disable_index: bool,
     ) {
-        let mut page_guard = buf_pool
+        let mut page_guard = data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -696,9 +702,9 @@ impl Table {
         debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (page_guard, row_id) = loop {
-            match index.lookup(&key.vals) {
+            match index.lookup(&key.vals, stmt.trx.sts).await {
                 None => return UpdateMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row(row_id).await {
+                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return UpdateMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -771,9 +777,9 @@ impl Table {
                         UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
                     }
                 } else {
-                    let res = self.update_indexes_only_row_id_change(
-                        stmt, old_row_id, new_row_id, &new_guard,
-                    );
+                    let res = self
+                        .update_indexes_only_row_id_change(stmt, old_row_id, new_row_id, &new_guard)
+                        .await;
                     new_guard.set_dirty(); // mark as dirty page.
                     match res {
                         UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
@@ -806,9 +812,9 @@ impl Table {
         debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (page_guard, row_id) = loop {
-            match index.lookup(&key.vals) {
+            match index.lookup(&key.vals, stmt.trx.sts).await {
                 None => return DeleteMvcc::NotFound,
-                Some(row_id) => match self.blk_idx.find_row(row_id).await {
+                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
                     RowLocation::ColSegment(..) => todo!(),
                     RowLocation::RowPage(page_id) => {
@@ -832,7 +838,7 @@ impl Table {
             DeleteInternal::WriteConflict => DeleteMvcc::WriteConflict,
             DeleteInternal::Ok(page_guard) => {
                 // defer index deletion with index undo log.
-                self.defer_delete_indexes(stmt, row_id, &page_guard);
+                self.defer_delete_indexes(stmt, row_id, &page_guard).await;
                 page_guard.set_dirty(); // mark as dirty.
                 DeleteMvcc::Ok
             }
@@ -845,9 +851,9 @@ impl Table {
         debug_assert!(self.metadata.index_specs[key.index_no].unique());
         debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
-        let (mut page_guard, row_id) = match index.lookup(&key.vals) {
+        let (mut page_guard, row_id) = match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await {
             None => unreachable!(),
-            Some(row_id) => match self.blk_idx.find_row(row_id).await {
+            Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                 RowLocation::NotFound => unreachable!(),
                 RowLocation::ColSegment(..) => todo!(),
                 RowLocation::RowPage(page_id) => {
@@ -878,7 +884,9 @@ impl Table {
         let index_schema = &self.metadata.index_specs[key.index_no];
         if index_schema.unique() {
             let index = self.sec_idx[key.index_no].unique().unwrap();
-            return index.compare_delete(&key.vals, row_id);
+            return index
+                .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+                .await;
         }
         todo!()
     }
@@ -896,7 +904,7 @@ impl Table {
     #[inline]
     pub async fn delete_index<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         key: &SelectKey,
         row_id: RowID,
     ) -> bool {
@@ -904,7 +912,9 @@ impl Table {
         let index_schema = &self.metadata.index_specs[key.index_no];
         if index_schema.unique() {
             let index = self.sec_idx[key.index_no].unique().unwrap();
-            return self.delete_unique_index(buf_pool, index, key, row_id).await;
+            return self
+                .delete_unique_index(data_pool, index, key, row_id)
+                .await;
         }
         todo!()
     }
@@ -912,28 +922,32 @@ impl Table {
     #[inline]
     async fn delete_unique_index<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
-        index: &dyn UniqueIndex,
+        data_pool: &'static P,
+        index: &UniqueBTreeIndex,
         key: &SelectKey,
         row_id: RowID,
     ) -> bool {
         let (page_guard, row_id) = loop {
-            match index.lookup(&key.vals) {
+            match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await {
                 None => return false, // Another thread deleted this entry.
-                Some(index_row_id) => {
-                    if index_row_id != row_id {
-                        // Row id changed, means another transaction inserted
+                Some((index_row_id, deleted)) => {
+                    if !deleted || index_row_id != row_id {
+                        // 1. Delete flag is unset by other transaction,
+                        // so we skip to delete it.
+                        // 2. Row id changed, means another transaction inserted
                         // new row with same key and reused this index entry.
                         // So we skip to delete it.
                         return false;
                     }
                     match self.blk_idx.find_row(row_id).await {
                         RowLocation::NotFound => {
-                            return index.compare_delete(&key.vals, row_id);
+                            return index
+                                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                                .await;
                         }
                         RowLocation::ColSegment(..) => todo!(),
                         RowLocation::RowPage(page_id) => {
-                            let page_guard = buf_pool
+                            let page_guard = data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .shared_async()
@@ -951,7 +965,9 @@ impl Table {
         // no version with matched keys can be found in either page
         // data or version chain.
         if !access.any_version_matches_key(&self.metadata, key) {
-            return index.compare_delete(&key.vals, row_id);
+            return index
+                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                .await;
         }
         false
     }
@@ -1012,18 +1028,14 @@ impl Table {
     /// This is a special operation for unique index maintainance.
     /// It's triggered by duplicate key finding when updating index.
     ///
-    /// There are two cases:
-    /// 1. The old row is deleted.
-    ///    In this case, the old row must be committed and the DELETE undo
-    ///    entry is not purged so some other transaction is still able to
-    ///    see a non-deleted version.
-    ///    We need to link new row(via undo head) to the DELETE entry.
-    ///
-    /// 2. The old row is updated with another key but one of its
-    ///    old versions matches the key.
-    ///    In this case, the old row must be committed.
-    ///    We need to find the key-match version, and can link new row
-    ///    to it.
+    /// There are scenarios as below:
+    /// 1. The old row not found. Just skip it.
+    /// 2. The old row is being modified. Just throw write conflict.
+    /// 3. Then we search from row page through version chain,
+    ///    try to find one version that is not deleted and matches
+    ///    the index key.
+    ///    a) we find it, then link it.
+    ///    b) no version found, we skip this row.
     #[inline]
     async fn link_for_unique_index<P: BufferPool>(
         &self,
@@ -1053,7 +1065,7 @@ impl Table {
         };
         // The link process is to find one version of the old row that matches
         // given key and then link new row to it.
-        let old_access = old_guard.write_row_by_id(old_id);
+        let old_access = old_guard.read_row_by_id(old_id);
         match old_access.find_old_version_for_unique_key(&self.metadata, key, &stmt.trx) {
             FindOldVersion::None => LinkForUniqueIndex::None,
             FindOldVersion::DuplicateKey => LinkForUniqueIndex::DuplicateKey,
@@ -1441,15 +1453,6 @@ impl Table {
     }
 
     #[inline]
-    fn index_undo(&self, row_id: RowID, kind: IndexUndoKind) -> IndexUndo {
-        IndexUndo {
-            table_id: self.table_id(),
-            row_id,
-            kind,
-        }
-    }
-
-    #[inline]
     async fn insert_unique_index<P: BufferPool>(
         &self,
         buf_pool: &'static P,
@@ -1460,17 +1463,24 @@ impl Table {
     ) -> InsertIndex {
         let index = self.sec_idx[key.index_no].unique().unwrap();
         loop {
-            match index.insert_if_not_exists(&key.vals, row_id) {
+            match index
+                .insert_if_not_exists(&key.vals, row_id, stmt.trx.sts)
+                .await
+            {
                 None => {
                     // insert index success.
-                    let index_undo = self.index_undo(row_id, IndexUndoKind::InsertUnique(key));
-                    stmt.index_undo.push(index_undo);
+                    stmt.push_insert_unique_index_undo(self.table_id(), row_id, key);
                     return InsertIndex::Ok;
                 }
-                Some(old_row_id) => {
+                Some((old_row_id, deleted)) => {
                     // we found there is already one existing row with same key.
                     // so perform move+link.
                     debug_assert!(old_row_id != row_id);
+                    if !deleted {
+                        // As the key is not deleted, there must be an active row with same key.
+                        // todo: change logic if switch to lock-based protocol.
+                        return InsertIndex::DuplicateKey;
+                    }
                     match self
                         .link_for_unique_index(buf_pool, stmt, old_row_id, &key, row_id, page_guard)
                         .await
@@ -1485,14 +1495,24 @@ impl Table {
                             // but leave index not purged.
                             // The purge thread may delete the key before we apply the update.
                             // so our update can fail.
-                            match index.compare_exchange(&key.vals, old_row_id, row_id) {
+                            match index
+                                .compare_exchange(
+                                    &key.vals,
+                                    old_row_id.deleted(),
+                                    row_id,
+                                    stmt.trx.sts,
+                                )
+                                .await
+                            {
                                 IndexCompareExchange::Ok => {
                                     // If we rollback this transaction, we need to undo the index update.
-                                    let index_undo = self.index_undo(
+                                    stmt.push_update_unique_index_undo(
+                                        self.table_id(),
+                                        old_row_id,
                                         row_id,
-                                        IndexUndoKind::UpdateUnique(key, old_row_id),
+                                        key,
+                                        deleted,
                                     );
-                                    stmt.index_undo.push(index_undo);
                                     return InsertIndex::Ok;
                                 }
                                 IndexCompareExchange::NotExists => {
@@ -1510,13 +1530,23 @@ impl Table {
                             // key. Because we only search the matched version of old row but not add
                             // logical lock on it, it's possible that both transactions are trying to
                             // update the index. Only one should succeed and the other will fail.
-                            match index.compare_exchange(&key.vals, old_row_id, row_id) {
+                            match index
+                                .compare_exchange(
+                                    &key.vals,
+                                    old_row_id.deleted(),
+                                    row_id,
+                                    stmt.trx.sts,
+                                )
+                                .await
+                            {
                                 IndexCompareExchange::Ok => {
-                                    let index_undo = self.index_undo(
+                                    stmt.push_update_unique_index_undo(
+                                        self.table_id(),
+                                        old_row_id,
                                         row_id,
-                                        IndexUndoKind::UpdateUnique(key, old_row_id),
+                                        key,
+                                        deleted,
                                     );
-                                    stmt.index_undo.push(index_undo);
                                     return InsertIndex::Ok;
                                 }
                                 IndexCompareExchange::NotExists => {
@@ -1545,12 +1575,15 @@ impl Table {
     ) -> RecoverIndex {
         let index = self.sec_idx[key.index_no].unique().unwrap();
         loop {
-            match index.insert_if_not_exists(&key.vals, row_id) {
+            match index
+                .insert_if_not_exists(&key.vals, row_id, MIN_SNAPSHOT_TS)
+                .await
+            {
                 None => {
                     // insert index success.
                     return RecoverIndex::Ok;
                 }
-                Some(old_row_id) => {
+                Some((old_row_id, deleted)) => {
                     debug_assert!(old_row_id != row_id);
                     // Find CTS of old row.
                     match self.find_recover_cts_for_row_id(buf_pool, old_row_id).await {
@@ -1562,7 +1595,15 @@ impl Table {
                                 return RecoverIndex::InsertOutdated;
                             }
                             // Current row is newer, we should update the index entry.
-                            match index.compare_exchange(&key.vals, old_row_id, row_id) {
+                            let old_row_id = if deleted {
+                                old_row_id.deleted()
+                            } else {
+                                old_row_id
+                            };
+                            match index
+                                .compare_exchange(&key.vals, old_row_id, row_id, MIN_SNAPSHOT_TS)
+                                .await
+                            {
                                 IndexCompareExchange::Ok => {
                                     return RecoverIndex::Ok;
                                 }
@@ -1583,7 +1624,10 @@ impl Table {
     #[inline]
     async fn recover_unique_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
         let index = self.sec_idx[key.index_no].unique().unwrap();
-        if !index.compare_delete(&key.vals, row_id) {
+        if !index
+            .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+            .await
+        {
             // Another recover thread concurrently insert index entry with same key, probably with greater CTS.
             // We just skip this deletion.
             return RecoverIndex::DeleteOutdated;
@@ -1634,25 +1678,17 @@ impl Table {
                     // First we need to insert new entry to index due to key change.
                     // There might be conflict we will try to fix (if old one is already deleted).
                     // Once the insert is done, we also need to defer deletion of original key.
-                    match self
+                    return self
                         .update_unique_index_only_key_change(
                             buf_pool,
                             stmt,
                             index.unique().unwrap(),
+                            old_key,
                             new_key,
                             row_id,
                             page_guard,
                         )
-                        .await
-                    {
-                        UpdateIndex::Ok => {
-                            let index_undo =
-                                self.index_undo(row_id, IndexUndoKind::DeferDelete(old_key));
-                            stmt.index_undo.push(index_undo);
-                        }
-                        UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
-                        UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
-                    };
+                        .await;
                 } // otherwise, in-place update do not change row id, so we do nothing
             } else {
                 todo!();
@@ -1662,7 +1698,7 @@ impl Table {
     }
 
     #[inline]
-    fn update_indexes_only_row_id_change(
+    async fn update_indexes_only_row_id_change(
         &self,
         stmt: &mut Statement,
         old_row_id: RowID,
@@ -1675,13 +1711,16 @@ impl Table {
             if index_schema.unique() {
                 let key =
                     read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
-                match self.update_unique_index_only_row_id_change(
-                    stmt,
-                    index.unique().unwrap(),
-                    key,
-                    old_row_id,
-                    new_row_id,
-                ) {
+                match self
+                    .update_unique_index_only_row_id_change(
+                        stmt,
+                        index.unique().unwrap(),
+                        key,
+                        old_row_id,
+                        new_row_id,
+                    )
+                    .await
+                {
                     UpdateIndex::Ok => (),
                     UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                     UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
@@ -1717,6 +1756,7 @@ impl Table {
                             buf_pool,
                             stmt,
                             index.unique().unwrap(),
+                            old_key,
                             key,
                             old_row_id,
                             new_row_id,
@@ -1726,22 +1766,20 @@ impl Table {
                     {
                         UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
-                        UpdateIndex::Ok => {
-                            // defer delete index entry of old row.
-                            let index_undo =
-                                self.index_undo(old_row_id, IndexUndoKind::DeferDelete(old_key));
-                            stmt.index_undo.push(index_undo);
-                        }
+                        UpdateIndex::Ok => (),
                     }
                 } else {
                     // only row id change.
-                    match self.update_unique_index_only_row_id_change(
-                        stmt,
-                        index.unique().unwrap(),
-                        key,
-                        old_row_id,
-                        new_row_id,
-                    ) {
+                    match self
+                        .update_unique_index_only_row_id_change(
+                            stmt,
+                            index.unique().unwrap(),
+                            key,
+                            old_row_id,
+                            new_row_id,
+                        )
+                        .await
+                    {
                         UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
                         UpdateIndex::Ok => (),
@@ -1754,8 +1792,9 @@ impl Table {
         UpdateIndex::Ok
     }
 
+    /// Defer the actual deletion until GC happens, but mark the index as deleted.
     #[inline]
-    fn defer_delete_indexes(
+    async fn defer_delete_indexes(
         &self,
         stmt: &mut Statement,
         row_id: RowID,
@@ -1765,12 +1804,26 @@ impl Table {
             debug_assert!(index.is_unique() == index_schema.unique());
             if index_schema.unique() {
                 let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
-                let index_undo = self.index_undo(row_id, IndexUndoKind::DeferDelete(key));
-                stmt.index_undo.push(index_undo);
+                let index = index.unique().unwrap();
+                self.defer_delete_unique_index(stmt, index, row_id, key)
+                    .await;
             } else {
                 todo!();
             }
         }
+    }
+
+    #[inline]
+    async fn defer_delete_unique_index(
+        &self,
+        stmt: &mut Statement,
+        index: &UniqueBTreeIndex,
+        row_id: RowID,
+        key: SelectKey,
+    ) {
+        let res = index.mask_as_deleted(&key.vals, row_id, stmt.trx.sts).await;
+        debug_assert!(res); // should always succeed.
+        stmt.push_delete_index_undo(self.table_id(), row_id, key);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1779,23 +1832,37 @@ impl Table {
         &self,
         buf_pool: &'static P,
         stmt: &mut Statement,
-        index: &dyn UniqueIndex,
-        key: SelectKey,
+        index: &UniqueBTreeIndex,
+        old_key: SelectKey,
+        new_key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
         new_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
         loop {
-            match index.insert_if_not_exists(&key.vals, new_row_id) {
+            match index
+                .insert_if_not_exists(&new_key.vals, new_row_id, stmt.trx.sts)
+                .await
+            {
                 None => {
-                    let index_undo = self.index_undo(new_row_id, IndexUndoKind::InsertUnique(key));
-                    stmt.index_undo.push(index_undo);
+                    // New key insert succeed.
+                    stmt.push_insert_unique_index_undo(self.table_id(), new_row_id, new_key);
+                    // mark index of old row as deleted and defer delete.
+                    self.defer_delete_unique_index(stmt, index, old_row_id, old_key)
+                        .await;
                     return UpdateIndex::Ok;
                 }
-                Some(index_row_id) => {
+                Some((index_row_id, deleted)) => {
                     // new row id is the insert id so index value must not be the same.
                     debug_assert!(index_row_id != new_row_id);
+                    if !deleted {
+                        return UpdateIndex::DuplicateKey;
+                    }
+                    // todo: change the logic.
+                    // If we treat move-update just as delete and insert,
+                    // with an extra linking step. then, we don't need to
+                    // care about if index_row_id equal to old_row_id.
                     if index_row_id == old_row_id {
                         // This is possible.
                         // For example, transaction update row(RowID=100) key=1 to key=2.
@@ -1811,13 +1878,27 @@ impl Table {
                         // key=2 -> RowID=100 (old version)
                         //
                         // In this case, we can just update index to point to new version.
-                        match index.compare_exchange(&key.vals, old_row_id, new_row_id) {
+                        match index
+                            .compare_exchange(
+                                &new_key.vals,
+                                old_row_id.deleted(),
+                                new_row_id,
+                                stmt.trx.sts,
+                            )
+                            .await
+                        {
                             IndexCompareExchange::Ok => {
-                                let index_undo = self.index_undo(
+                                // New key update succeed.
+                                stmt.push_update_unique_index_undo(
+                                    self.table_id(),
+                                    old_row_id,
                                     new_row_id,
-                                    IndexUndoKind::UpdateUnique(key, old_row_id),
+                                    new_key,
+                                    deleted,
                                 );
-                                stmt.index_undo.push(index_undo);
+                                // mark index of old row as deleted and defer delete.
+                                self.defer_delete_unique_index(stmt, index, old_row_id, old_key)
+                                    .await;
                                 return UpdateIndex::Ok;
                             }
                             IndexCompareExchange::Failure => {
@@ -1829,12 +1910,15 @@ impl Table {
                             }
                         }
                     }
+                    // There is a conflict key pointing to another row.
+                    // We have to check the status of the old row.
+                    // See comments of method link_for_unique_index().
                     match self
                         .link_for_unique_index(
                             buf_pool,
                             stmt,
                             index_row_id,
-                            &key,
+                            &new_key,
                             new_row_id,
                             new_guard,
                         )
@@ -1843,15 +1927,31 @@ impl Table {
                         LinkForUniqueIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         LinkForUniqueIndex::WriteConflict => return UpdateIndex::WriteConflict,
                         LinkForUniqueIndex::None => {
-                            // move+update does not find old row.
+                            // No old version found.
                             // so we can update index to point to self
-                            match index.compare_exchange(&key.vals, index_row_id, new_row_id) {
+                            match index
+                                .compare_exchange(
+                                    &new_key.vals,
+                                    index_row_id,
+                                    new_row_id,
+                                    stmt.trx.sts,
+                                )
+                                .await
+                            {
                                 IndexCompareExchange::Ok => {
-                                    let index_undo = self.index_undo(
+                                    // New key update succeed.
+                                    stmt.push_update_unique_index_undo(
+                                        self.table_id(),
+                                        index_row_id,
                                         new_row_id,
-                                        IndexUndoKind::UpdateUnique(key, index_row_id),
+                                        new_key,
+                                        deleted,
                                     );
-                                    stmt.index_undo.push(index_undo);
+                                    // mark index of old row as deleted and defer delete.
+                                    self.defer_delete_unique_index(
+                                        stmt, index, old_row_id, old_key,
+                                    )
+                                    .await;
                                     return UpdateIndex::Ok;
                                 }
                                 IndexCompareExchange::Failure => {
@@ -1866,17 +1966,35 @@ impl Table {
                             }
                         }
                         LinkForUniqueIndex::Ok => {
-                            // Once move+update is done,
-                            // we already locked both old and new row, and make undo chain linked.
-                            // So any other transaction that want to modify the index with same key
-                            // should fail because lock can not be acquired by them.
-                            match index.compare_exchange(&key.vals, index_row_id, new_row_id) {
+                            // Old version found and linked.
+                            // Because in linking process, we checked the old row status.
+                            // The on-page version of old row must be deleted or being
+                            // modified by self transaction. That means no other transaction
+                            // can modify the new index key concurrently.
+                            // So below operation must succeed.
+                            match index
+                                .compare_exchange(
+                                    &new_key.vals,
+                                    index_row_id,
+                                    new_row_id,
+                                    stmt.trx.sts,
+                                )
+                                .await
+                            {
                                 IndexCompareExchange::Ok => {
-                                    let index_undo = self.index_undo(
+                                    // New key update succeeds.
+                                    stmt.push_update_unique_index_undo(
+                                        self.table_id(),
+                                        index_row_id,
                                         new_row_id,
-                                        IndexUndoKind::UpdateUnique(key, index_row_id),
+                                        new_key,
+                                        deleted,
                                     );
-                                    stmt.index_undo.push(index_undo);
+                                    // mark index of old row as deleted and defer delete.
+                                    self.defer_delete_unique_index(
+                                        stmt, index, old_row_id, old_key,
+                                    )
+                                    .await;
                                     return UpdateIndex::Ok;
                                 }
                                 IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
@@ -1891,20 +2009,27 @@ impl Table {
     }
 
     #[inline]
-    fn update_unique_index_only_row_id_change(
+    async fn update_unique_index_only_row_id_change(
         &self,
         stmt: &mut Statement,
-        index: &dyn UniqueIndex,
+        index: &UniqueBTreeIndex,
         key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        match index.compare_exchange(&key.vals, old_row_id, new_row_id) {
+        match index
+            .compare_exchange(&key.vals, old_row_id, new_row_id, stmt.trx.sts)
+            .await
+        {
             IndexCompareExchange::Ok => {
-                let index_undo =
-                    self.index_undo(new_row_id, IndexUndoKind::UpdateUnique(key, old_row_id));
-                stmt.index_undo.push(index_undo);
+                stmt.push_update_unique_index_undo(
+                    self.table_id(),
+                    old_row_id,
+                    new_row_id,
+                    key,
+                    false,
+                );
                 UpdateIndex::Ok
             }
             IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
@@ -1916,26 +2041,43 @@ impl Table {
     /// Update unique index due to key change.
     /// In this scenario, we only need to insert pair of new key and row id
     /// into index. Keep old index entry as is.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     async fn update_unique_index_only_key_change<P: BufferPool>(
         &self,
         buf_pool: &'static P,
         stmt: &mut Statement,
-        index: &dyn UniqueIndex,
+        index: &UniqueBTreeIndex,
+        old_key: SelectKey,
         new_key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         loop {
-            match index.insert_if_not_exists(&new_key.vals, row_id) {
+            match index
+                .insert_if_not_exists(&new_key.vals, row_id, stmt.trx.sts)
+                .await
+            {
                 None => {
-                    let index_undo = self.index_undo(row_id, IndexUndoKind::InsertUnique(new_key));
-                    stmt.index_undo.push(index_undo);
+                    // Insert new key success.
+                    stmt.push_insert_unique_index_undo(self.table_id(), row_id, new_key);
+                    // Defer delete old key.
+                    self.defer_delete_unique_index(stmt, index, row_id, old_key)
+                        .await;
                     return UpdateIndex::Ok;
                 }
-                Some(index_row_id) => {
+                Some((index_row_id, deleted)) => {
                     // There is already a row with same new key.
                     // We have to check its status.
+                    if !deleted {
+                        // As the key is not deleted, there must be an active row with same key.
+                        // this active row may be committed or uncommitted,
+                        // but we do not really care.
+                        // todo: if we change concurrency control to lock-based protocol,
+                        // we need to check and wait if other is modifying.
+                        return UpdateIndex::DuplicateKey;
+                    }
+
                     if index_row_id == row_id {
                         // This is possible.
                         // For example, transaction update row(RowID=100) key=1 to key=2.
@@ -1949,8 +2091,23 @@ impl Table {
                         // key=1 -> RowID=100 (latest version)
                         // key=2 -> RowID=100 (old version)
                         //
-                        // nothing to do in this case.
-                        return UpdateIndex::Ok;
+                        // We need to unmask the old entry.
+                        match index
+                            .compare_exchange(
+                                &new_key.vals,
+                                index_row_id.deleted(),
+                                row_id,
+                                stmt.trx.sts,
+                            )
+                            .await
+                        {
+                            IndexCompareExchange::Ok => {
+                                return UpdateIndex::Ok;
+                            }
+                            IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
+                                continue;
+                            }
+                        }
                     }
                     match self
                         .link_for_unique_index(
@@ -1967,13 +2124,27 @@ impl Table {
                         LinkForUniqueIndex::WriteConflict => return UpdateIndex::WriteConflict,
                         LinkForUniqueIndex::None => {
                             // no old row found.
-                            match index.compare_exchange(&new_key.vals, index_row_id, row_id) {
+                            match index
+                                .compare_exchange(
+                                    &new_key.vals,
+                                    index_row_id.deleted(),
+                                    row_id,
+                                    stmt.trx.sts,
+                                )
+                                .await
+                            {
                                 IndexCompareExchange::Ok => {
-                                    let index_undo = self.index_undo(
+                                    // Update new key succeeds.
+                                    stmt.push_update_unique_index_undo(
+                                        self.table_id(),
+                                        index_row_id,
                                         row_id,
-                                        IndexUndoKind::UpdateUnique(new_key, index_row_id),
+                                        new_key,
+                                        deleted,
                                     );
-                                    stmt.index_undo.push(index_undo);
+                                    // Defer delete old key.
+                                    self.defer_delete_unique_index(stmt, index, row_id, old_key)
+                                        .await;
                                     return UpdateIndex::Ok;
                                 }
                                 IndexCompareExchange::Failure => return UpdateIndex::WriteConflict,
@@ -1985,14 +2156,28 @@ impl Table {
                         }
                         LinkForUniqueIndex::Ok => {
                             // Both old row(index points to) and new row are locked.
-                            // we must succeed on updateing index.
-                            match index.compare_exchange(&new_key.vals, index_row_id, row_id) {
+                            // we must succeed on updating index.
+                            match index
+                                .compare_exchange(
+                                    &new_key.vals,
+                                    index_row_id.deleted(),
+                                    row_id,
+                                    stmt.trx.sts,
+                                )
+                                .await
+                            {
                                 IndexCompareExchange::Ok => {
-                                    let index_undo = self.index_undo(
+                                    // New key update succeeds.
+                                    stmt.push_update_unique_index_undo(
+                                        self.table_id(),
+                                        index_row_id,
                                         row_id,
-                                        IndexUndoKind::UpdateUnique(new_key, index_row_id),
+                                        new_key,
+                                        deleted,
                                     );
-                                    stmt.index_undo.push(index_undo);
+                                    // Defer delete old key.
+                                    self.defer_delete_unique_index(stmt, index, row_id, old_key)
+                                        .await;
                                     return UpdateIndex::Ok;
                                 }
                                 IndexCompareExchange::Failure => return UpdateIndex::WriteConflict,
@@ -2012,10 +2197,10 @@ impl Table {
     #[inline]
     pub async fn populate_index_via_row_page<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         page_id: PageID,
     ) {
-        let page_guard = buf_pool
+        let page_guard = data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
             .shared_async()
@@ -2032,7 +2217,9 @@ impl Table {
                     ReadRow::Ok(vals) => {
                         if index_spec.unique() {
                             let index = sec_idx.unique().unwrap();
-                            let res = index.insert_if_not_exists(&vals, row_id);
+                            let res = index
+                                .insert_if_not_exists(&vals, row_id, MIN_SNAPSHOT_TS)
+                                .await;
                             debug_assert!(res.is_none());
                         } else {
                             todo!()

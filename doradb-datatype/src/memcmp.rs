@@ -52,8 +52,8 @@ impl BytesExtendable for Vec<u8> {
 ///    Otherwise, flip all bits.
 /// 4. variable length bytes/string: keep as is.
 /// 5. component type.
-/// a) Fixed-size types: Use same encoding described above.
-/// b) Variable-size types: If it's last key, keep as is. Otherwise, use following encoding.
+///    a) Fixed-size types: Use same encoding described above.
+///    b) Variable-size types: If it's last key, keep as is. Otherwise, use following encoding.
 ///
 /// Variable-size type encoding:
 ///
@@ -497,7 +497,7 @@ impl MemCmpKey {
     /// Create a empty key.
     #[inline]
     pub fn empty() -> Self {
-        return MemCmpKey(Inner::inline_zeroed(0));
+        MemCmpKey(Inner::inline_zeroed(0))
     }
 
     /// Get mutable byte slice of the key.
@@ -542,7 +542,8 @@ impl<const LEN: usize> From<&[u8; LEN]> for MemCmpKey {
 impl From<Nullable<&[u8]>> for MemCmpKey {
     #[inline]
     fn from(value: Nullable<&[u8]>) -> Self {
-        if value.0.len() + 1 <= MEM_CMP_KEY_INLINE {
+        // Nullable has one byte prefix so here use less instead of less than.
+        if value.0.len() < MEM_CMP_KEY_INLINE {
             return MemCmpKey(Inner::inline_with_nullable_byte(value.0, NON_NULL_FLAG));
         }
         MemCmpKey(Inner::heap_with_nullable_byte(value.0, NON_NULL_FLAG))
@@ -728,7 +729,8 @@ impl Inner {
 
     #[inline]
     fn inline_with_nullable_byte(value: &[u8], b: u8) -> Inner {
-        debug_assert!(value.len() + 1 <= MEM_CMP_KEY_INLINE);
+        // length should plus 1 for single byte prefix, so replace le with lt.
+        debug_assert!(value.len() < MEM_CMP_KEY_INLINE);
         let mut i = [0u8; MEM_CMP_KEY_INLINE];
         i[0] = b;
         i[1..value.len() + 1].copy_from_slice(value);

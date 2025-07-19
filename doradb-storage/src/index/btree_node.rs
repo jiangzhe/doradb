@@ -2,14 +2,18 @@
 //! This module provide an implementation of B+Tree backed by buffer pool and hybrid latch.
 
 use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
-use crate::index::btree::{BTreeDelete, BTreeUpdate, BTreeValue};
+use crate::index::btree::{BTreeDelete, BTreeUpdate};
 use crate::index::btree_hint::{BTreeHints, BTREE_HINTS_LEN};
-use crate::row::{RowID, INVALID_ROW_ID};
+use crate::index::btree_value::{BTreeU64, BTreeValue};
+use crate::index::util::Maskable;
+use crate::row::RowID;
 use crate::trx::TrxID;
 use smallvec::SmallVec;
+use std::alloc::{alloc_zeroed, Layout};
 use std::cmp;
 use std::cmp::Ordering;
 use std::mem::{self, MaybeUninit};
+use std::ops::{Deref, DerefMut};
 
 const _: () = assert!(mem::size_of::<BTreeHeader>() % mem::size_of::<Slot>() == 0);
 
@@ -77,7 +81,7 @@ pub struct BTreeHeader {
     lower_fence: Slot,
     /// Value of lower fence, used only in branch node,
     /// which is child page id.
-    lower_fence_value: PageID,
+    lower_fence_value: BTreeU64,
     /// Upper fence key of this node, exclusive.
     /// If offset is zero, upper fence is None.
     upper_fence: Slot,
@@ -226,7 +230,7 @@ impl BTreeNode {
         height: u16,
         ts: TrxID,
         lower_fence: &[u8],
-        lower_fence_value: PageID,
+        lower_fence_value: BTreeU64,
         upper_fence: &[u8],
         hints_enabled: bool,
     ) {
@@ -389,11 +393,16 @@ impl BTreeNode {
     /// Delete an existing key value pair in current node.
     /// If key or value does not match, returns false.
     #[inline]
-    pub fn delete<V: BTreeValue>(&mut self, key: &[u8], value: V) -> BTreeDelete {
+    pub fn delete<V: BTreeValue>(
+        &mut self,
+        key: &[u8],
+        value: V,
+        ignore_del_mask: bool,
+    ) -> BTreeDelete {
         let idx = match self.search_key(key) {
             Ok(idx) => {
                 let old_v = self.value::<V>(idx);
-                if old_v.value() != value {
+                if old_v.value() != value || (!ignore_del_mask && !old_v.is_deleted()) {
                     return BTreeDelete::ValueMismatch;
                 }
                 idx
@@ -423,11 +432,7 @@ impl BTreeNode {
     }
 
     /// Update an existing key value pair in current node to new value.
-    /// The delete bit is ignored when comparing old values.
-    /// That means old value can be marked as deleted, any new value may be
-    /// an un-deleted one. In such case, we "undo" the deletion, which
-    /// is common when a transaction rollback all its changes including
-    /// modification on index.
+    /// Old value must match the one stored in the node.
     #[inline]
     pub fn update<V: BTreeValue>(
         &mut self,
@@ -438,7 +443,7 @@ impl BTreeNode {
         let idx = match self.search_key(key) {
             Ok(idx) => {
                 let old_v = self.value::<V>(idx);
-                if old_v.value() != old_value {
+                if old_v != old_value {
                     return BTreeUpdate::ValueMismatch(old_v);
                 }
                 idx
@@ -538,17 +543,17 @@ impl BTreeNode {
     pub fn lookup_child(&self, key: &[u8]) -> LookupChild {
         debug_assert!(!self.is_leaf());
         match self.search_key(key) {
-            Ok(idx) => LookupChild::Slot(idx, self.value(idx)),
+            Ok(idx) => LookupChild::Slot(idx, self.value::<BTreeU64>(idx).to_u64()),
             Err(idx) => {
                 if idx == 0 {
                     // key less than first key.
                     return if self.header.lower_fence_value.is_deleted() {
                         LookupChild::NotFound
                     } else {
-                        LookupChild::LowerFence(self.header.lower_fence_value)
+                        LookupChild::LowerFence(self.header.lower_fence_value.to_u64())
                     };
                 }
-                LookupChild::Slot(idx - 1, self.value(idx - 1))
+                LookupChild::Slot(idx - 1, self.value::<BTreeU64>(idx - 1).to_u64())
             }
         }
     }
@@ -936,7 +941,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn lower_fence_value(&self) -> PageID {
+    pub(super) fn lower_fence_value(&self) -> BTreeU64 {
         self.header.lower_fence_value
     }
 
@@ -989,6 +994,12 @@ impl BTreeNode {
         unsafe { self.slot_value(slot) }
     }
 
+    /// Convenient method to get value as page id.
+    #[inline]
+    pub(super) fn value_as_page_id(&self, idx: usize) -> PageID {
+        self.value::<BTreeU64>(idx).to_u64()
+    }
+
     #[inline]
     unsafe fn slot_value<V: BTreeValue>(&self, slot: &Slot) -> V {
         unsafe {
@@ -1006,11 +1017,11 @@ impl BTreeNode {
 
     /// Returns all values in this node.
     #[inline]
-    pub(super) fn values<V: BTreeValue>(&self) -> Vec<V> {
-        self.slots()
-            .iter()
-            .map(|slot| unsafe { self.slot_value(slot) })
-            .collect()
+    pub(super) fn values<V: BTreeValue, T, F: Fn(V) -> T>(&self, res: &mut Vec<T>, f: F) {
+        res.extend(self.slots().iter().map(|slot| {
+            let v = unsafe { self.slot_value::<V>(slot) };
+            f(v)
+        }));
     }
 
     #[inline]
@@ -1328,6 +1339,57 @@ impl BTreeNode {
     }
 }
 
+/// A boxed B-tree node allocated on heap.
+/// This is useful when structure change happens.
+/// Since async function in Rust is compiled to
+/// state machine with all local variables. it's
+/// dangerous to allocate large objects on stack,
+/// e.g. BTreeNode, especially through async
+/// function calls.
+#[repr(transparent)]
+pub struct BTreeNodeBox(Box<BTreeNode>);
+
+impl Deref for BTreeNodeBox {
+    type Target = BTreeNode;
+    #[inline]
+    fn deref(&self) -> &BTreeNode {
+        &self.0
+    }
+}
+
+impl DerefMut for BTreeNodeBox {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut BTreeNode {
+        &mut self.0
+    }
+}
+
+impl BTreeNodeBox {
+    #[inline]
+    pub fn alloc(
+        height: u16,
+        ts: TrxID,
+        lower_fence: &[u8],
+        lower_fence_value: BTreeU64,
+        upper_fence: &[u8],
+        hints_enabled: bool,
+    ) -> Self {
+        unsafe {
+            let ptr = alloc_zeroed(Layout::new::<BTreeNode>()) as *mut BTreeNode;
+            (*ptr).init(
+                height,
+                ts,
+                lower_fence,
+                lower_fence_value,
+                upper_fence,
+                hints_enabled,
+            );
+            let node = Box::from_raw(ptr);
+            BTreeNodeBox(node)
+        }
+    }
+}
+
 pub type SearchKey = std::result::Result<usize, usize>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1343,27 +1405,6 @@ pub(super) fn common_prefix_len(key1: &[u8], key2: &[u8]) -> usize {
     match key1.iter().zip(key2).position(|(a, b)| a != b) {
         Some(idx) => idx,
         None => l,
-    }
-}
-
-const BTREE_VALUE_U64_DELETE_BIT: u64 = 1u64 << 63;
-
-impl BTreeValue for RowID {
-    const INVALID_VALUE: Self = INVALID_ROW_ID;
-
-    #[inline]
-    fn deleted(self) -> Self {
-        self | BTREE_VALUE_U64_DELETE_BIT
-    }
-
-    #[inline]
-    fn value(self) -> Self {
-        self & !BTREE_VALUE_U64_DELETE_BIT
-    }
-
-    #[inline]
-    fn is_deleted(self) -> bool {
-        self & BTREE_VALUE_U64_DELETE_BIT != 0
     }
 }
 
@@ -1505,10 +1546,10 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[], false);
+                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
-                    let slot_idx = node.insert(&k, i);
+                    let slot_idx = node.insert(&k, BTreeU64::from(i));
                     println!("inserted, slot_idx={}", slot_idx);
                 }
 
@@ -1536,24 +1577,38 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[], false);
+                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
-                    node.insert(&k, i);
+                    node.insert(&k, BTreeU64::from(i));
                 }
 
                 // Test normal delete
-                assert_eq!(node.delete(&5u64.to_be_bytes(), 5), BTreeDelete::Ok);
+                assert_eq!(
+                    node.update(
+                        &5u64.to_be_bytes(),
+                        BTreeU64::from(5),
+                        BTreeU64::from(5).deleted()
+                    ),
+                    BTreeUpdate::Ok(BTreeU64::from(5))
+                );
+                assert_eq!(
+                    node.delete(&5u64.to_be_bytes(), BTreeU64::from(5), false),
+                    BTreeDelete::Ok
+                );
                 assert_eq!(node.search_key(&5u64.to_be_bytes()), Err(5));
 
                 // Test delete non-existent key
-                assert_eq!(node.delete(&15u64.to_be_bytes(), 15), BTreeDelete::NotFound);
+                assert_eq!(
+                    node.delete(&15u64.to_be_bytes(), BTreeU64::from(15), true),
+                    BTreeDelete::NotFound
+                );
 
                 // Test value mismatch
                 assert_eq!(
-                    node.delete(&6u64.to_be_bytes(), 7),
+                    node.delete(&6u64.to_be_bytes(), BTreeU64::from(7), true),
                     BTreeDelete::ValueMismatch
                 );
             }
@@ -1572,43 +1627,43 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[], false);
+                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
-                    node.insert(&k, i);
+                    node.insert(&k, BTreeU64::from(i));
                 }
 
                 // Test normal mark as deleted
                 assert_eq!(
-                    node.mark_as_deleted(&3u64.to_be_bytes(), 3),
-                    BTreeUpdate::Ok(3)
+                    node.mark_as_deleted(&3u64.to_be_bytes(), BTreeU64::from(3)),
+                    BTreeUpdate::Ok(BTreeU64::from(3))
                 );
                 match node.search_key(&3u64.to_be_bytes()) {
                     Ok(idx) => {
-                        let old_v = node.value::<u64>(idx);
-                        assert_eq!(old_v.value(), 3);
+                        let old_v = node.value::<BTreeU64>(idx);
+                        assert_eq!(old_v.value().to_u64(), 3);
                     }
                     _ => panic!("Expected EqualDeleted"),
                 };
 
                 // Test mark already deleted
                 assert_eq!(
-                    node.mark_as_deleted(&3u64.to_be_bytes(), 3),
-                    BTreeUpdate::Ok(3.deleted())
+                    node.mark_as_deleted(&3u64.to_be_bytes(), BTreeU64::from(3)),
+                    BTreeUpdate::Ok(BTreeU64::from(3).deleted())
                 );
 
                 // Test mark non-existent key
                 assert_eq!(
-                    node.mark_as_deleted(&15u64.to_be_bytes(), 15),
+                    node.mark_as_deleted(&15u64.to_be_bytes(), BTreeU64::from(15)),
                     BTreeUpdate::NotFound
                 );
 
                 // Test value mismatch
                 assert_eq!(
-                    node.mark_as_deleted(&4u64.to_be_bytes(), 5),
-                    BTreeUpdate::ValueMismatch(4)
+                    node.mark_as_deleted(&4u64.to_be_bytes(), BTreeU64::from(5)),
+                    BTreeUpdate::ValueMismatch(BTreeU64::from(4))
                 );
             }
 
@@ -1626,36 +1681,47 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[], false);
+                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
-                    node.insert(&k, i);
+                    node.insert(&k, BTreeU64::from(i));
                 }
 
                 // Test normal update
-                assert_eq!(node.update(&5u64.to_be_bytes(), 5, 50), BTreeUpdate::Ok(5));
+                assert_eq!(
+                    node.update(&5u64.to_be_bytes(), BTreeU64::from(5), BTreeU64::from(50)),
+                    BTreeUpdate::Ok(BTreeU64::from(5))
+                );
                 assert_eq!(node.search_key(&5u64.to_be_bytes()), Ok(5));
 
                 // Test update deleted entry
-                node.mark_as_deleted(&6u64.to_be_bytes(), 6);
+                node.mark_as_deleted(&6u64.to_be_bytes(), BTreeU64::from(6));
                 assert_eq!(
-                    node.update(&6u64.to_be_bytes(), 6, 60),
-                    BTreeUpdate::Ok(6.deleted())
+                    node.update(
+                        &6u64.to_be_bytes(),
+                        BTreeU64::from(6).deleted(),
+                        BTreeU64::from(60)
+                    ),
+                    BTreeUpdate::Ok(BTreeU64::from(6).deleted())
                 );
                 assert_eq!(node.search_key(&6u64.to_be_bytes()), Ok(6));
 
                 // Test update non-existent key
                 assert_eq!(
-                    node.update(&15u64.to_be_bytes(), 15, 150),
+                    node.update(
+                        &15u64.to_be_bytes(),
+                        BTreeU64::from(15),
+                        BTreeU64::from(150)
+                    ),
                     BTreeUpdate::NotFound
                 );
 
                 // Test old value mismatch
                 assert_eq!(
-                    node.update(&7u64.to_be_bytes(), 8, 70),
-                    BTreeUpdate::ValueMismatch(7)
+                    node.update(&7u64.to_be_bytes(), BTreeU64::from(8), BTreeU64::from(70)),
+                    BTreeUpdate::ValueMismatch(BTreeU64::from(7))
                 );
             }
 
@@ -1674,12 +1740,12 @@ mod tests {
                 // Create source leaf node with data
                 let mut src_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let src_node = src_guard.page_mut();
-                src_node.init(0, 1, &[], !0, &[], false);
+                src_node.init(0, 1, &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
-                    src_node.insert(&k, i);
+                    src_node.insert(&k, BTreeU64::from(i));
                 }
 
                 // Create empty destination node
@@ -1687,7 +1753,7 @@ mod tests {
                 let dst_node = dst_guard.page_mut();
 
                 // Compact source to destination
-                unsafe { src_node.compact_into::<u64>(dst_node) };
+                unsafe { src_node.compact_into::<BTreeU64>(dst_node) };
 
                 // Verify compaction results
                 assert_eq!(dst_node.height(), 0);
@@ -1703,7 +1769,7 @@ mod tests {
                 // Verify all slots are copied correctly
                 for i in 0..src_node.count() {
                     assert_eq!(dst_node.key(i), src_node.key(i));
-                    assert_eq!(dst_node.value::<u64>(i), src_node.value::<u64>(i));
+                    assert_eq!(dst_node.value::<BTreeU64>(i), src_node.value::<BTreeU64>(i));
                 }
             }
 
@@ -1722,14 +1788,14 @@ mod tests {
                 // Create empty source node
                 let mut src_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let src_node = src_guard.page_mut();
-                src_node.init(0, 3, &[], !0, &[], false);
+                src_node.init(0, 3, &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Create empty destination node
                 let mut dst_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let dst_node = dst_guard.page_mut();
 
                 // Compact source to destination
-                unsafe { src_node.compact_into::<u64>(dst_node) };
+                unsafe { src_node.compact_into::<BTreeU64>(dst_node) };
 
                 // Verify compaction results
                 assert_eq!(dst_node.height(), 0);
@@ -1767,12 +1833,19 @@ mod tests {
             {
                 let mut page1_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node1 = page1_guard.page_mut();
-                node1.init(1, 1, &[], RowID::INVALID_VALUE, &10u64.to_be_bytes(), false);
+                node1.init(
+                    1,
+                    1,
+                    &[],
+                    BTreeU64::INVALID_VALUE,
+                    &10u64.to_be_bytes(),
+                    false,
+                );
 
                 // Insert test data for node 1
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
-                    node1.insert(&k, i);
+                    node1.insert(&k, BTreeU64::from(i));
                 }
                 // prefix=0, lower_fence="", upper_fence=10u64.
                 assert_eq!(
@@ -1786,7 +1859,7 @@ mod tests {
                     1,
                     2,
                     &10u64.to_be_bytes(),
-                    RowID::INVALID_VALUE,
+                    BTreeU64::INVALID_VALUE,
                     &20u64.to_be_bytes(),
                     false,
                 );
@@ -1794,7 +1867,7 @@ mod tests {
                 // Insert test data for node 2
                 for i in 10u64..20 {
                     let k = i.to_be_bytes();
-                    node2.insert(&k, i);
+                    node2.insert(&k, BTreeU64::from(i));
                 }
                 assert_eq!(
                     node2.effective_space(),
@@ -1829,20 +1902,20 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[], false);
+                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data with short keys (<= KEY_HEAD_LEN)
                 for i in 0u64..5 {
                     // k00, k10, k20, k30, k40
                     let k = format!("k{}0", i);
-                    node.insert(k.as_bytes(), i);
+                    node.insert(k.as_bytes(), BTreeU64::from(i));
                 }
 
                 // Insert test data with long keys (> KEY_HEAD_LEN)
                 for i in 5u64..10 {
                     // long-key-50, long-key-60, long-key-70, long-key-80, long-key-90
                     let k = format!("long-key-{}0", i).into_bytes();
-                    node.insert(&k, i);
+                    node.insert(&k, BTreeU64::from(i));
                 }
                 println!("effective space {}", node.effective_space());
 
@@ -1853,10 +1926,10 @@ mod tests {
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice("k21".as_bytes());
-                    assert!(node.prepare_update_key::<u64>(idx, &new_key));
-                    node.update_key::<u64>(idx, &new_key);
+                    assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
+                    node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);
-                    assert_eq!(node.value::<u64>(idx), 2);
+                    assert_eq!(node.value::<BTreeU64>(idx), BTreeU64::from(2));
                 }
 
                 // Test 2: Update long key to another long key (same length)
@@ -1866,10 +1939,10 @@ mod tests {
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(format!("long-key-75").as_bytes());
-                    assert!(node.prepare_update_key::<u64>(idx, &new_key));
-                    node.update_key::<u64>(idx, &new_key);
+                    assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
+                    node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);
-                    assert_eq!(node.value::<u64>(idx), 7);
+                    assert_eq!(node.value::<BTreeU64>(idx), BTreeU64::from(7));
                 }
 
                 // Test 3: Update short key to long key
@@ -1879,10 +1952,10 @@ mod tests {
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(b"k100000000000000");
-                    assert!(node.prepare_update_key::<u64>(idx, &new_key));
-                    node.update_key::<u64>(idx, &new_key);
+                    assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
+                    node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);
-                    assert_eq!(node.value::<u64>(idx), 1);
+                    assert_eq!(node.value::<BTreeU64>(idx), BTreeU64::from(1));
                 }
 
                 // Test 4: Update long key to short key
@@ -1892,10 +1965,10 @@ mod tests {
                         _ => panic!("wrong search result"),
                     };
                     let new_key = KeyVec::from_slice(b"lon");
-                    assert!(node.prepare_update_key::<u64>(idx, &new_key));
-                    node.update_key::<u64>(idx, &new_key);
+                    assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
+                    node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);
-                    assert_eq!(node.value::<u64>(idx), 5);
+                    assert_eq!(node.value::<BTreeU64>(idx), BTreeU64::from(5));
                 }
 
                 // Test 5: Verify order is preserved after updates
@@ -1917,10 +1990,10 @@ mod tests {
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[], true);
+                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], true);
                 for i in 0u64..300 {
                     let k = i.to_be_bytes();
-                    let slot_idx = node.insert(&k, i);
+                    let slot_idx = node.insert(&k, BTreeU64::from(i));
                     node.update_hints();
                     println!("inserted, slot_idx={}", slot_idx);
                 }
@@ -1954,12 +2027,11 @@ mod tests {
                 let mut map = BTreeMap::new();
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], !0, &[], true);
+                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], true);
                 for _ in 0..COUNT {
-                    // let k = i.to_be_bytes();
                     let n = uniform.sample(&mut rng);
                     let key = n.to_be_bytes();
-                    let slot_idx = node.insert(&key, n);
+                    let slot_idx = node.insert(&key, BTreeU64::from(n));
                     node.update_hints();
                     println!("inserted, key={}, slot_idx={}", n, slot_idx);
                     map.insert(n, n);
@@ -1969,8 +2041,8 @@ mod tests {
                     let k = key.to_be_bytes();
                     let res = node.search_key(&k);
                     assert!(res.is_ok());
-                    let v = node.value::<u64>(res.unwrap());
-                    if v == value as u64 {
+                    let v = node.value::<BTreeU64>(res.unwrap());
+                    if v.to_u64() == value as u64 {
                         println!("debug-only match");
                     } else {
                         panic!("debug-only mismatch");

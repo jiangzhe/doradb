@@ -1,7 +1,7 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use doradb_storage::buffer::{BufferPool, FixedBufferPool};
-use doradb_storage::index::{BTree, BTreeCompactConfig};
+use doradb_storage::index::{BTree, BTreeCompactConfig, BTreeU64};
 use doradb_storage::lifetime::StaticLifetime;
 use rand_distr::{Distribution, Uniform};
 use std::collections::BTreeMap;
@@ -41,7 +41,7 @@ async fn single_thread_bench_btree(args: &Args) {
             "seq" => {
                 for i in 0..args.total_rows {
                     // trick to use lower 4 bytes as head
-                    tree.insert(&i.to_be_bytes(), i, 100).await;
+                    tree.insert(&i.to_be_bytes(), BTreeU64::from(i), 100).await;
                 }
             }
             "rand" => {
@@ -49,7 +49,7 @@ async fn single_thread_bench_btree(args: &Args) {
                 let mut thd_rng = rand::rng();
                 for i in 0..args.total_rows {
                     let k = between.sample(&mut thd_rng);
-                    tree.insert(&k.to_be_bytes(), i, 100).await;
+                    tree.insert(&k.to_be_bytes(), BTreeU64::from(i), 100).await;
                 }
             }
             _ => panic!("unknown mode"),
@@ -71,7 +71,7 @@ async fn single_thread_bench_btree(args: &Args) {
 
         if args.compact {
             let purge_list = tree
-                .compact_all::<u64>(BTreeCompactConfig::new(1.0, 1.0).unwrap())
+                .compact_all::<BTreeU64>(BTreeCompactConfig::new(1.0, 1.0).unwrap())
                 .await;
             for g in purge_list {
                 pool.deallocate_page(g);
@@ -89,7 +89,7 @@ async fn single_thread_bench_btree(args: &Args) {
         match &args.search_mode[..] {
             "seq" => {
                 for i in 0..args.total_rows {
-                    tree.lookup_optimistic::<u64>(&i.to_be_bytes()).await;
+                    tree.lookup_optimistic::<BTreeU64>(&i.to_be_bytes()).await;
                 }
             }
             "rand" => {
@@ -97,7 +97,7 @@ async fn single_thread_bench_btree(args: &Args) {
                 let mut thd_rng = rand::rng();
                 for _ in 0..args.total_rows {
                     let k = between.sample(&mut thd_rng);
-                    tree.lookup_optimistic::<u64>(&k.to_be_bytes()).await;
+                    tree.lookup_optimistic::<BTreeU64>(&k.to_be_bytes()).await;
                 }
             }
             _ => panic!("unknown search mode"),

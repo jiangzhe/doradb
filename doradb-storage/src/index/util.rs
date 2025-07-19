@@ -1,7 +1,42 @@
 use crate::buffer::page::PageID;
-use crate::row::RowID;
+use crate::row::{RowID, INVALID_ROW_ID};
 use crate::trx::sys::TransactionSystem;
 use doradb_catalog::TableID;
+
+/// Value that can be masked as deleted.
+pub trait Maskable: Copy + PartialEq + Eq {
+    const INVALID_VALUE: Self;
+
+    /// Mask given value as deleted.
+    fn deleted(self) -> Self;
+
+    /// Returns value without delete mask.
+    fn value(self) -> Self;
+
+    /// Returns whether this value is masked as deleted.
+    fn is_deleted(self) -> bool;
+}
+
+const U64_DELETE_BIT: u64 = 1u64 << 63;
+
+impl Maskable for RowID {
+    const INVALID_VALUE: Self = INVALID_ROW_ID;
+
+    #[inline]
+    fn deleted(self) -> Self {
+        self | U64_DELETE_BIT
+    }
+
+    #[inline]
+    fn value(self) -> Self {
+        self & !U64_DELETE_BIT
+    }
+
+    #[inline]
+    fn is_deleted(self) -> bool {
+        self & U64_DELETE_BIT != 0
+    }
+}
 
 /// Statistics of space used by nodes.
 #[derive(Debug, Default)]
