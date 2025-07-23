@@ -1520,7 +1520,7 @@ impl Table {
                                     // So try to insert index entry again.
                                     continue;
                                 }
-                                IndexCompareExchange::Failure => {
+                                IndexCompareExchange::Mismatch => {
                                     return InsertIndex::WriteConflict;
                                 }
                             }
@@ -1554,7 +1554,7 @@ impl Table {
                                     // In this case, we need to retry the insertion of index.
                                     continue;
                                 }
-                                IndexCompareExchange::Failure => {
+                                IndexCompareExchange::Mismatch => {
                                     return InsertIndex::WriteConflict;
                                 }
                             }
@@ -1608,8 +1608,8 @@ impl Table {
                                     return RecoverIndex::Ok;
                                 }
                                 // retry the insert.
-                                IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
-                                }
+                                IndexCompareExchange::Mismatch
+                                | IndexCompareExchange::NotExists => {}
                             }
                         }
                         None => {
@@ -1900,7 +1900,7 @@ impl Table {
                                     .await;
                                 return UpdateIndex::Ok;
                             }
-                            IndexCompareExchange::Failure => {
+                            IndexCompareExchange::Mismatch => {
                                 unreachable!();
                             }
                             IndexCompareExchange::NotExists => {
@@ -1953,7 +1953,7 @@ impl Table {
                                     .await;
                                     return UpdateIndex::Ok;
                                 }
-                                IndexCompareExchange::Failure => {
+                                IndexCompareExchange::Mismatch => {
                                     // This may happen when another transaction insert/update with same key.
                                     return UpdateIndex::WriteConflict;
                                 }
@@ -1996,7 +1996,8 @@ impl Table {
                                     .await;
                                     return UpdateIndex::Ok;
                                 }
-                                IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
+                                IndexCompareExchange::Mismatch
+                                | IndexCompareExchange::NotExists => {
                                     unreachable!()
                                 }
                             }
@@ -2031,7 +2032,7 @@ impl Table {
                 );
                 UpdateIndex::Ok
             }
-            IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
+            IndexCompareExchange::Mismatch | IndexCompareExchange::NotExists => {
                 unreachable!()
             }
         }
@@ -2103,7 +2104,7 @@ impl Table {
                             IndexCompareExchange::Ok => {
                                 return UpdateIndex::Ok;
                             }
-                            IndexCompareExchange::Failure | IndexCompareExchange::NotExists => {
+                            IndexCompareExchange::Mismatch | IndexCompareExchange::NotExists => {
                                 continue;
                             }
                         }
@@ -2146,7 +2147,9 @@ impl Table {
                                         .await;
                                     return UpdateIndex::Ok;
                                 }
-                                IndexCompareExchange::Failure => return UpdateIndex::WriteConflict,
+                                IndexCompareExchange::Mismatch => {
+                                    return UpdateIndex::WriteConflict
+                                }
                                 IndexCompareExchange::NotExists => {
                                     // re-insert
                                     continue;
@@ -2179,7 +2182,9 @@ impl Table {
                                         .await;
                                     return UpdateIndex::Ok;
                                 }
-                                IndexCompareExchange::Failure => return UpdateIndex::WriteConflict,
+                                IndexCompareExchange::Mismatch => {
+                                    return UpdateIndex::WriteConflict
+                                }
                                 IndexCompareExchange::NotExists => {
                                     // re-insert
                                     continue;

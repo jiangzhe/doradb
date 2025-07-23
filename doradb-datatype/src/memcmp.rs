@@ -491,7 +491,15 @@ impl MemCmpKey {
         if len <= MEM_CMP_KEY_INLINE {
             return MemCmpKey(Inner::inline_zeroed(len));
         }
-        MemCmpKey(Inner::heap_zeroed(len))
+        MemCmpKey(Inner::heap_alloc(len, true))
+    }
+
+    #[inline]
+    pub fn arbitrary(len: usize) -> Self {
+        if len <= MEM_CMP_KEY_INLINE {
+            return MemCmpKey(Inner::inline_zeroed(len));
+        }
+        MemCmpKey(Inner::heap_alloc(len, false))
     }
 
     /// Create a empty key.
@@ -759,10 +767,15 @@ impl Inner {
     }
 
     #[inline]
-    fn heap_zeroed(len: usize) -> Inner {
+    fn heap_alloc(len: usize, zeroed: bool) -> Inner {
         debug_assert!(len > MEM_CMP_KEY_INLINE);
         unsafe {
-            let ptr = alloc_zeroed(Layout::from_size_align_unchecked(len, 1));
+            let layout = Layout::from_size_align_unchecked(len, 1);
+            let ptr = if zeroed {
+                alloc_zeroed(layout)
+            } else {
+                alloc(layout)
+            };
             let data = Vec::from_raw_parts(ptr, len, len).into_boxed_slice();
             Inner {
                 len,

@@ -458,16 +458,6 @@ impl RowPage {
         }
     }
 
-    // #[inline]
-    // pub(crate) fn update_val<V: ToValue>(&self, row_idx: usize, col_idx: usize, val: &V) {
-    //     unsafe {
-    //         let val = val.to_val();
-    //         let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
-    //         let ptr = self.data_ptr().add(offset);
-    //         val.atomic_store(ptr);
-    //     }
-    // }
-
     #[inline]
     pub(crate) fn update_val<V: Value>(&self, row_idx: usize, col_idx: usize, val: V) {
         unsafe {
