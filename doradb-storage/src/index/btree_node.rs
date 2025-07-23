@@ -4,11 +4,12 @@
 use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
 use crate::index::btree::{BTreeDelete, BTreeUpdate};
 use crate::index::btree_hint::{BTreeHints, BTREE_HINTS_LEN};
+use crate::index::btree_key::BTreeKey;
 use crate::index::btree_value::{BTreeU64, BTreeValue};
 use crate::index::util::Maskable;
 use crate::row::RowID;
 use crate::trx::TrxID;
-use smallvec::SmallVec;
+use doradb_datatype::memcmp::BytesExtendable;
 use std::alloc::{alloc_zeroed, Layout};
 use std::cmp;
 use std::cmp::Ordering;
@@ -117,8 +118,6 @@ pub type KeyHeadInt = u32;
 pub type KeyHeadBytes = [u8; 4];
 
 const _: () = assert!(mem::size_of::<Slot>() == 8);
-
-pub type KeyVec = SmallVec<[u8; 16]>;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -720,7 +719,7 @@ impl BTreeNode {
 
     /// Returns slice of slots.
     #[inline]
-    fn slots(&self) -> &[Slot] {
+    pub(super) fn slots(&self) -> &[Slot] {
         let len = self.header.count as usize;
         unsafe { std::slice::from_raw_parts(self.body() as *const Slot, len) }
     }
@@ -734,7 +733,7 @@ impl BTreeNode {
 
     /// Returns reference to slot at given position.
     #[inline]
-    fn slot(&self, idx: usize) -> &Slot {
+    pub(super) fn slot(&self, idx: usize) -> &Slot {
         debug_assert!(idx < self.header.count as usize);
         unsafe { self.slot_unchecked(idx) }
     }
@@ -776,7 +775,7 @@ impl BTreeNode {
     /// Returns common prefix of all values in this node.
     /// The common prefix is stored at end of the node.
     #[inline]
-    fn common_prefix(&self) -> &[u8] {
+    pub fn common_prefix(&self) -> &[u8] {
         unsafe {
             let len = self.header.prefix_len as usize;
             if len == 0 {
@@ -899,10 +898,13 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn key(&self, idx: usize) -> KeyVec {
+    pub(super) fn key(&self, idx: usize) -> BTreeKey {
         debug_assert!(idx < self.header.count as usize);
-        let mut res = KeyVec::new();
-        self.extract_key(idx, &mut res);
+        let slot = self.slot(idx);
+        let mut res = BTreeKey::arbitrary((self.header.prefix_len + slot.len) as usize);
+        let mut g = res.modify_inplace();
+        self.copy_slot_key(slot, &mut g);
+        drop(g);
         res
     }
 
@@ -924,15 +926,18 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn lower_fence_key(&self) -> KeyVec {
-        let mut res = KeyVec::new();
-        self.extract_slot_key(&self.header.lower_fence, &mut res);
+    pub(super) fn lower_fence_key(&self) -> BTreeKey {
+        let slot = &self.header.lower_fence;
+        let mut res = BTreeKey::arbitrary((self.header.prefix_len + slot.len) as usize);
+        let mut g = res.modify_inplace();
+        self.copy_slot_key(&self.header.lower_fence, &mut g);
+        drop(g);
         res
     }
 
     #[inline]
-    pub(super) fn extract_lower_fence_key(&self, res: &mut KeyVec) {
-        self.extract_slot_key(&self.header.lower_fence, res);
+    pub(super) fn extend_lower_fence_key<T: BytesExtendable>(&self, res: &mut T) {
+        self.extend_slot_key(&self.header.lower_fence, res);
     }
 
     #[inline]
@@ -946,18 +951,26 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn upper_fence_key(&self) -> KeyVec {
+    pub(super) fn upper_fence_key(&self) -> BTreeKey {
         if self.has_no_upper_fence() {
-            return KeyVec::new();
+            return BTreeKey::empty();
         }
-        let mut res = KeyVec::new();
-        self.extract_slot_key(&self.header.upper_fence, &mut res);
+        let slot = &self.header.upper_fence;
+        let mut res = BTreeKey::arbitrary((self.header.prefix_len + slot.len) as usize);
+        let mut g = res.modify_inplace();
+        self.copy_slot_key(slot, &mut g);
+        drop(g);
         res
     }
 
     #[inline]
-    pub(super) fn extract_upper_fence_key(&self, res: &mut KeyVec) {
-        self.extract_slot_key(&self.header.upper_fence, res);
+    pub(super) fn upper_fence_slot(&self) -> &Slot {
+        &self.header.upper_fence
+    }
+
+    #[inline]
+    pub(super) fn extend_upper_fence_key<T: BytesExtendable>(&self, res: &mut T) {
+        self.extend_slot_key(&self.header.upper_fence, res);
     }
 
     #[inline]
@@ -965,25 +978,25 @@ impl BTreeNode {
         self.header.prefix_len + self.header.upper_fence.len
     }
 
-    /// Extract key into buffer.
-    /// Previous content in buffer is discarded.
     #[inline]
-    pub(super) fn extract_key(&self, idx: usize, res: &mut KeyVec) {
-        debug_assert!(idx < self.header.count as usize);
-        let slot = self.slot(idx);
-        self.extract_slot_key(slot, res);
+    pub(super) fn copy_slot_key(&self, slot: &Slot, res: &mut [u8]) {
+        debug_assert!((self.header.prefix_len + slot.len) as usize == res.len());
+        res[..self.header.prefix_len as usize].copy_from_slice(self.common_prefix());
+        if slot.len as usize <= KEY_HEAD_LEN {
+            res[self.header.prefix_len as usize..]
+                .copy_from_slice(&slot.head_bytes()[..slot.len as usize]);
+        } else {
+            res[self.header.prefix_len as usize..].copy_from_slice(self.long_key_suffix(slot))
+        }
     }
 
     #[inline]
-    fn extract_slot_key(&self, slot: &Slot, res: &mut KeyVec) {
-        let len = (self.header.prefix_len + slot.len) as usize;
-        res.clear();
-        res.reserve(len);
-        res.extend_from_slice(self.common_prefix());
+    pub(super) fn extend_slot_key<T: BytesExtendable>(&self, slot: &Slot, res: &mut T) {
+        res.extend_from_byte_slice(self.common_prefix());
         if slot.len as usize <= KEY_HEAD_LEN {
-            res.extend_from_slice(&slot.head_bytes()[..slot.len as usize]);
+            res.extend_from_byte_slice(&slot.head_bytes()[..slot.len as usize]);
         } else {
-            res.extend_from_slice(self.long_key_suffix(slot))
+            res.extend_from_byte_slice(self.long_key_suffix(slot))
         }
     }
 
@@ -1047,7 +1060,7 @@ impl BTreeNode {
     /// If truncate is set to true, will truncate unneccessary suffix to
     /// identify key at idx-1 and idx.
     #[inline]
-    pub fn create_sep_key(&self, idx: usize, truncate: bool) -> KeyVec {
+    pub fn create_sep_key(&self, idx: usize, truncate: bool) -> BTreeKey {
         debug_assert!(idx > 0);
         debug_assert!(idx < self.count());
         if !truncate {
@@ -1064,9 +1077,11 @@ impl BTreeNode {
                 .enumerate()
             {
                 if a != b {
-                    let mut res = KeyVec::with_capacity(self.header.prefix_len as usize + i);
-                    res.extend_from_slice(self.common_prefix());
-                    res.extend_from_slice(&s1.head_bytes()[..i + 1]);
+                    let mut res = BTreeKey::arbitrary(self.header.prefix_len as usize + i + 1);
+                    let mut g = res.modify_inplace();
+                    g[..self.header.prefix_len as usize].copy_from_slice(self.common_prefix());
+                    g[self.header.prefix_len as usize..].copy_from_slice(&s1.head_bytes()[..i + 1]);
+                    drop(g);
                     return res;
                 }
             }
@@ -1074,14 +1089,16 @@ impl BTreeNode {
             // s1 must be longer than s2.
             debug_assert!(s1.len > s2.len);
             let diff_len = l + 1;
-            let mut res = KeyVec::with_capacity(self.header.prefix_len as usize + diff_len);
-            res.extend_from_slice(self.common_prefix());
+            let mut res = BTreeKey::arbitrary(self.header.prefix_len as usize + diff_len);
+            let mut g = res.modify_inplace();
+            g[..self.header.prefix_len as usize].copy_from_slice(self.common_prefix());
             if diff_len <= KEY_HEAD_LEN {
-                res.extend_from_slice(&s1.head_bytes()[..diff_len]);
+                g[self.header.prefix_len as usize..].copy_from_slice(&s1.head_bytes()[..diff_len]);
             } else {
                 let src = unsafe { self.payload(s1.offset as usize, diff_len) };
-                res.extend_from_slice(src);
+                g[self.header.prefix_len as usize..].copy_from_slice(src);
             }
+            drop(g);
             return res;
         }
         // compare key without prefix.
@@ -1089,17 +1106,21 @@ impl BTreeNode {
         let k2 = self.long_key_suffix(s2);
         for (i, (a, b)) in k1[..l].iter().zip(&k2[..l]).enumerate() {
             if a != b {
-                let mut res = KeyVec::with_capacity(self.header.prefix_len as usize + i);
-                res.extend_from_slice(self.common_prefix());
-                res.extend_from_slice(&k1[..i + 1]);
+                let mut res = BTreeKey::arbitrary(self.header.prefix_len as usize + i + 1);
+                let mut g = res.modify_inplace();
+                g[..self.header.prefix_len as usize].copy_from_slice(self.common_prefix());
+                g[self.header.prefix_len as usize..].copy_from_slice(&k1[..i + 1]);
+                drop(g);
                 return res;
             }
         }
         debug_assert!(k1.len() > k2.len());
         let diff_len = l + 1;
-        let mut res = KeyVec::with_capacity(self.header.prefix_len as usize + diff_len);
-        res.extend_from_slice(self.common_prefix());
-        res.extend_from_slice(&k1[..diff_len]);
+        let mut res = BTreeKey::arbitrary(self.header.prefix_len as usize + diff_len);
+        let mut g = res.modify_inplace();
+        g[..self.header.prefix_len as usize].copy_from_slice(self.common_prefix());
+        g[self.header.prefix_len as usize..].copy_from_slice(&k1[..diff_len]);
+        drop(g);
         res
     }
 
@@ -1159,11 +1180,12 @@ impl BTreeNode {
             return;
         }
         // Slow path to copy key value one by one.
-        let mut key = KeyVec::new(); // key buffer
-        for idx in src_slot_idx..src_slot_idx + count {
-            src_node.extract_key(idx, &mut key);
-            let value = src_node.value::<V>(idx);
-            self.insert_at_end(&key, value);
+        let mut key_buf = Vec::new(); // key buffer
+        for slot in &src_node.slots()[src_slot_idx..src_slot_idx + count] {
+            key_buf.clear();
+            src_node.extend_slot_key(slot, &mut key_buf);
+            let value = unsafe { src_node.slot_value::<V>(slot) };
+            self.insert_at_end(&key_buf, value);
         }
     }
 
@@ -1336,6 +1358,19 @@ impl BTreeNode {
                 }
             }
         }
+    }
+
+    /// This method is used to check whether the slot key matches partial key prefix,
+    /// the common prefix of node is excluded in this check.
+    #[inline]
+    pub(super) fn slot_matches_k(&self, slot: &Slot, k: &[u8]) -> bool {
+        if (slot.len as usize) < k.len() {
+            return false;
+        }
+        if slot.len as usize <= KEY_HEAD_LEN {
+            return &slot.head_bytes()[..k.len()] == k;
+        }
+        &self.long_key_suffix(slot)[..k.len()] == k
     }
 }
 
@@ -1801,8 +1836,8 @@ mod tests {
                 assert_eq!(dst_node.height(), 0);
                 assert_eq!(dst_node.ts(), 3);
                 assert_eq!(dst_node.count(), 0);
-                assert_eq!(dst_node.lower_fence_key().as_slice(), &[0u8; 0][..]);
-                assert_eq!(dst_node.upper_fence_key().as_slice(), &[0u8; 0][..]);
+                assert_eq!(dst_node.lower_fence_key().as_bytes(), &[0u8; 0][..]);
+                assert_eq!(dst_node.upper_fence_key().as_bytes(), &[0u8; 0][..]);
                 assert_eq!(
                     dst_node.free_space(),
                     src_node.free_space_after_compaction()
@@ -1925,7 +1960,7 @@ mod tests {
                         Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
-                    let new_key = KeyVec::from_slice("k21".as_bytes());
+                    let new_key = BTreeKey::from("k21".as_bytes());
                     assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
                     node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);
@@ -1938,7 +1973,7 @@ mod tests {
                         Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
-                    let new_key = KeyVec::from_slice(format!("long-key-75").as_bytes());
+                    let new_key = BTreeKey::from(format!("long-key-75").as_bytes());
                     assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
                     node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);
@@ -1951,7 +1986,7 @@ mod tests {
                         Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
-                    let new_key = KeyVec::from_slice(b"k100000000000000");
+                    let new_key = BTreeKey::from(b"k100000000000000");
                     assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
                     node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);
@@ -1964,7 +1999,7 @@ mod tests {
                         Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
-                    let new_key = KeyVec::from_slice(b"lon");
+                    let new_key = BTreeKey::from(b"lon");
                     assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
                     node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);

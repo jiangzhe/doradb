@@ -7,7 +7,8 @@ use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
-use crate::index::btree_node::{BTreeNode, BTreeNodeBox, KeyVec, LookupChild, SpaceEstimation};
+use crate::index::btree_node::{BTreeNode, BTreeNodeBox, LookupChild, SpaceEstimation};
+use crate::index::btree_scan::{BTreePrefixScanner, BTreeSlotCallback};
 use crate::index::btree_value::{BTreeU64, BTreeValue};
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
@@ -17,9 +18,9 @@ use std::marker::PhantomData;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-type SharedStrategy = SharedLockStrategy<BTreeNode>;
-type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
-type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
+pub type SharedStrategy = SharedLockStrategy<BTreeNode>;
+pub type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
+pub type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BTreeInsert<V: BTreeValue> {
@@ -29,7 +30,7 @@ pub enum BTreeInsert<V: BTreeValue> {
 
 impl<V: BTreeValue> BTreeInsert<V> {
     #[inline]
-    fn is_ok(&self) -> bool {
+    pub fn is_ok(&self) -> bool {
         matches!(self, BTreeInsert::Ok)
     }
 }
@@ -43,7 +44,7 @@ pub enum BTreeDelete {
 
 impl BTreeDelete {
     #[inline]
-    fn is_ok(&self) -> bool {
+    pub fn is_ok(&self) -> bool {
         matches!(self, BTreeDelete::Ok)
     }
 }
@@ -57,7 +58,7 @@ pub enum BTreeUpdate<V: BTreeValue> {
 
 impl<V: BTreeValue> BTreeUpdate<V> {
     #[inline]
-    fn is_ok(&self) -> bool {
+    pub fn is_ok(&self) -> bool {
         matches!(self, BTreeUpdate::Ok(_))
     }
 }
@@ -104,7 +105,7 @@ impl BTree {
                 self.pool.deallocate_page::<BTreeNode>(g);
             }
             1 => {
-                self.deallocate_height1(g).await;
+                self.deallocate_h1(g).await;
             }
             _ => {
                 let mut stack = vec![];
@@ -114,7 +115,7 @@ impl BTree {
                     let p_node = pos.g.page();
                     if p_node.height() == 1 {
                         let g = stack.pop().unwrap().g;
-                        self.deallocate_height1(g).await;
+                        self.deallocate_h1(g).await;
                         continue;
                     }
                     if pos.idx == p_node.count() as isize {
@@ -231,6 +232,7 @@ impl BTree {
         value: V,
         ts: TrxID,
     ) -> BTreeUpdate<V> {
+        debug_assert!(!value.is_deleted());
         let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
@@ -256,6 +258,7 @@ impl BTree {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> BTreeDelete {
+        debug_assert!(!value.is_deleted());
         let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
@@ -284,6 +287,128 @@ impl BTree {
             node.update_ts(ts);
         }
         res
+    }
+
+    /// Create a cursor to iterator over nodes at given height.
+    /// Height equals to 0 means iterating over all leaf nodes.
+    #[inline]
+    pub fn cursor(&self, height: usize) -> BTreeNodeCursor {
+        BTreeNodeCursor::new(self, height)
+    }
+
+    /// Create a prefix scanner to scan keys.
+    #[inline]
+    pub fn prefix_scanner<C: BTreeSlotCallback>(&self, callback: C) -> BTreePrefixScanner<C> {
+        BTreePrefixScanner::new(self, callback)
+    }
+
+    /// Collect space statistics at given height.
+    #[inline]
+    pub async fn collect_space_statistics_at(&self, height: usize) -> SpaceStatistics {
+        let mut cursor = self.cursor(height);
+        cursor.seek(&[]).await;
+        let mut preview = SpaceStatistics::default();
+        while let Some(g) = cursor.next().await {
+            let node = g.page();
+            preview.nodes += 1;
+            preview.total_space += mem::size_of::<BTreeNode>();
+            preview.used_space += mem::size_of::<BTreeNode>() - node.free_space();
+            preview.effective_space += node.effective_space();
+        }
+        preview
+    }
+
+    /// Collect space statistics of the whole tree.
+    #[inline]
+    pub async fn collect_space_statistics(&self) -> SpaceStatistics {
+        let height = self.height();
+        let mut res = SpaceStatistics::default();
+        for h in 0..height + 1 {
+            let s = self.collect_space_statistics_at(h).await;
+            res.nodes += s.nodes;
+            res.total_space += s.total_space;
+            res.used_space += s.used_space;
+            res.effective_space += s.effective_space;
+        }
+        res
+    }
+
+    /// Create a compactor for all nodes at given height.
+    #[inline]
+    pub fn compact<V: BTreeValue>(
+        &self,
+        height: usize,
+        config: BTreeCompactConfig,
+    ) -> BTreeCompactor<V> {
+        BTreeCompactor::new(self, height, config)
+    }
+
+    /// Compact the whole tree.
+    #[inline]
+    pub async fn compact_all<V: BTreeValue>(
+        &self,
+        config: BTreeCompactConfig,
+    ) -> Vec<PageExclusiveGuard<BTreeNode>> {
+        let height = self.height();
+        let mut purge_list = vec![];
+        // leaf compaction.
+        self.compact::<V>(0, config)
+            .run_to_end(&mut purge_list)
+            .await;
+        // branch-to-root compaction.
+        let mut h = 1usize;
+        while h <= height {
+            self.compact::<BTreeU64>(h, config)
+                .run_to_end(&mut purge_list)
+                .await;
+            h += 1;
+        }
+        self.shrink(&mut purge_list).await;
+        purge_list
+    }
+
+    /// Try to shrink the tree height if root node has only one child.
+    #[inline]
+    pub async fn shrink(&self, purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>) {
+        // test if root has only one child with optimistic lock,
+        // to avoid block concurrent operations.
+        loop {
+            let g = self
+                .pool
+                .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
+                .await;
+            let pu = unsafe { g.page_unchecked() };
+            let height = pu.height();
+            let count = pu.count();
+            verify_continue!(g.validate());
+            if height == 0 || count > 0 {
+                return;
+            }
+            // should shrink tree height as there is no keys in root.
+            // The only child is associated with lower fence key.
+            let mut g = g.exclusive_async().await;
+            // re-check condition
+            let root = g.page_mut();
+            if root.height() == 0 || root.count() > 0 {
+                return;
+            }
+            let c_page_id = root.lower_fence_value().to_u64();
+            let mut c_guard = self
+                .pool
+                .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
+                .await
+                .exclusive_async()
+                .await;
+            let c_node = c_guard.page_mut();
+            debug_assert!(root.lower_fence_key() == c_node.lower_fence_key());
+            debug_assert!(root.has_no_upper_fence());
+            debug_assert!(c_node.has_no_upper_fence());
+            let ts = c_node.ts().max(root.ts());
+            root.clone_from(c_node);
+            root.update_ts(ts);
+            self.height.store(root.height(), Ordering::Release);
+            purge_list.push(c_guard);
+        }
     }
 
     /// Try to lookup a key in the tree, break if any of optimistic validation fails.
@@ -899,124 +1024,8 @@ impl BTree {
         }
     }
 
-    /// Create a cursor to iterator over nodes at given height.
-    /// Height equals to 0 means iterating over all leaf nodes.
     #[inline]
-    pub fn cursor(&self, height: usize) -> BTreeNodeCursor {
-        BTreeNodeCursor::new(self, height)
-    }
-
-    /// Collect space statistics at given height.
-    #[inline]
-    pub async fn collect_space_statistics_at(&self, height: usize) -> SpaceStatistics {
-        let mut cursor = self.cursor(height);
-        cursor.seek(&[]).await;
-        let mut preview = SpaceStatistics::default();
-        while let Some(g) = cursor.next().await {
-            let node = g.page();
-            preview.nodes += 1;
-            preview.total_space += mem::size_of::<BTreeNode>();
-            preview.used_space += mem::size_of::<BTreeNode>() - node.free_space();
-            preview.effective_space += node.effective_space();
-        }
-        preview
-    }
-
-    /// Collect space statistics of the whole tree.
-    #[inline]
-    pub async fn collect_space_statistics(&self) -> SpaceStatistics {
-        let height = self.height();
-        let mut res = SpaceStatistics::default();
-        for h in 0..height + 1 {
-            let s = self.collect_space_statistics_at(h).await;
-            res.nodes += s.nodes;
-            res.total_space += s.total_space;
-            res.used_space += s.used_space;
-            res.effective_space += s.effective_space;
-        }
-        res
-    }
-
-    /// Create a compactor for all nodes at given height.
-    #[inline]
-    pub fn compact<V: BTreeValue>(
-        &self,
-        height: usize,
-        config: BTreeCompactConfig,
-    ) -> BTreeCompactor<V> {
-        BTreeCompactor::new(self, height, config)
-    }
-
-    /// Compact the whole tree.
-    #[inline]
-    pub async fn compact_all<V: BTreeValue>(
-        &self,
-        config: BTreeCompactConfig,
-    ) -> Vec<PageExclusiveGuard<BTreeNode>> {
-        let height = self.height();
-        let mut purge_list = vec![];
-        // leaf compaction.
-        self.compact::<V>(0, config)
-            .run_to_end(&mut purge_list)
-            .await;
-        // branch-to-root compaction.
-        let mut h = 1usize;
-        while h <= height {
-            self.compact::<BTreeU64>(h, config)
-                .run_to_end(&mut purge_list)
-                .await;
-            h += 1;
-        }
-        self.shrink(&mut purge_list).await;
-        purge_list
-    }
-
-    /// Try to shrink the tree height if root node has only one child.
-    #[inline]
-    pub async fn shrink(&self, purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>) {
-        // test if root has only one child with optimistic lock,
-        // to avoid block concurrent operations.
-        loop {
-            let g = self
-                .pool
-                .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
-                .await;
-            let pu = unsafe { g.page_unchecked() };
-            let height = pu.height();
-            let count = pu.count();
-            verify_continue!(g.validate());
-            if height == 0 || count > 0 {
-                return;
-            }
-            // should shrink tree height as there is no keys in root.
-            // The only child is associated with lower fence key.
-            let mut g = g.exclusive_async().await;
-            // re-check condition
-            let root = g.page_mut();
-            if root.height() == 0 || root.count() > 0 {
-                return;
-            }
-            let c_page_id = root.lower_fence_value().to_u64();
-            let mut c_guard = self
-                .pool
-                .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
-                .await
-                .exclusive_async()
-                .await;
-            let c_node = c_guard.page_mut();
-            debug_assert!(root.lower_fence_key() == c_node.lower_fence_key());
-            debug_assert!(root.has_no_upper_fence());
-            debug_assert!(c_node.has_no_upper_fence());
-            let ts = c_node.ts().max(root.ts());
-            root.clone_from(c_node);
-            root.update_ts(ts);
-            self.height.store(root.height(), Ordering::Release);
-            purge_list.push(c_guard);
-        }
-    }
-
-    #[inline]
-    async fn deallocate_height1(&self, g: PageExclusiveGuard<BTreeNode>) {
+    async fn deallocate_h1(&self, g: PageExclusiveGuard<BTreeNode>) {
         let p_node = g.page();
         debug_assert!(p_node.height() == 1);
         // Deallocate child associated with lower fence key.
@@ -1051,8 +1060,8 @@ impl BTree {
 pub struct BTreeCoupling<S: LockStrategy> {
     // Parent position to locate target node.
     // can be optional.
-    parent: Option<ParentPosition<S::Guard>>,
-    node: Option<S::Guard>,
+    pub(super) parent: Option<ParentPosition<S::Guard>>,
+    pub(super) node: Option<S::Guard>,
 }
 
 impl<S: LockStrategy<Page = BTreeNode>> BTreeCoupling<S>
@@ -1364,8 +1373,8 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
 
     #[inline]
     pub async fn run_to_end(mut self, purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>) {
-        let mut lower_fence_key_buffer = KeyVec::new();
-        let mut upper_fence_key_buffer = KeyVec::new();
+        let mut lower_fence_key_buffer = Vec::new();
+        let mut upper_fence_key_buffer = Vec::new();
         self.seek(&[]).await;
         loop {
             let res = self
@@ -1396,8 +1405,8 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
     #[inline]
     async fn step(
         &mut self,
-        lower_fence_key_buffer: &mut KeyVec,
-        upper_fence_key_buffer: &mut KeyVec,
+        lower_fence_key_buffer: &mut Vec<u8>,
+        upper_fence_key_buffer: &mut Vec<u8>,
         purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>,
     ) -> BTreeCompact {
         if self.coupling.parent.is_none() {
@@ -1439,8 +1448,10 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
                     let l_node = self.coupling.node.as_mut().unwrap().page_mut();
                     let r_node = r_guard.page_mut();
                     // Estimate space after compaction.
-                    l_node.extract_lower_fence_key(lower_fence_key_buffer);
-                    r_node.extract_upper_fence_key(upper_fence_key_buffer);
+                    lower_fence_key_buffer.clear();
+                    l_node.extend_lower_fence_key(lower_fence_key_buffer);
+                    upper_fence_key_buffer.clear();
+                    r_node.extend_upper_fence_key(upper_fence_key_buffer);
                     let ts = l_node.ts().max(r_node.ts());
                     let mut estimation = SpaceEstimation::with_fences(
                         lower_fence_key_buffer,
@@ -1524,7 +1535,8 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
                     // We cache parent's upper fence key into buffer
                     // in order to search next parent node.
                     let p_node = self.coupling.parent.as_mut().unwrap().g.page_mut();
-                    p_node.extract_upper_fence_key(upper_fence_key_buffer);
+                    upper_fence_key_buffer.clear();
+                    p_node.extend_upper_fence_key(upper_fence_key_buffer);
                     self.coupling.reset();
                     return BTreeCompact::ParentDone;
                 }
