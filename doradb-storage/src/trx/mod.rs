@@ -32,7 +32,7 @@ use crate::serde::{LenPrefixPod, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
-use crate::trx::undo::{IndexPurge, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
+use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
 use event_listener::{Event, EventListener};
 use flume::{Receiver, Sender};
@@ -249,9 +249,7 @@ impl ActiveTrx {
             ))
         };
         let row_undo = mem::take(&mut self.row_undo);
-        let mut index_undo = mem::take(&mut self.index_undo);
-        index_undo.remove_unneccessary_purges();
-
+        let index_undo = mem::take(&mut self.index_undo);
         PreparedTrx {
             redo_bin,
             payload: Some(PreparedTrxPayload {
@@ -435,7 +433,7 @@ pub struct PrecommitTrxPayload {
     pub sts: TrxID,
     pub gc_no: usize,
     pub row_undo: RowUndoLogs,
-    pub index_gc: Vec<IndexPurge>,
+    pub index_gc: Vec<IndexPurgeEntry>,
 }
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
@@ -527,7 +525,7 @@ pub struct CommittedTrxPayload {
     pub sts: TrxID,
     pub gc_no: usize,
     pub row_undo: RowUndoLogs,
-    pub index_gc: Vec<IndexPurge>,
+    pub index_gc: Vec<IndexPurgeEntry>,
 }
 
 pub struct CommittedTrx {
@@ -554,7 +552,7 @@ impl CommittedTrx {
     }
 
     #[inline]
-    pub fn index_gc(&self) -> Option<&[IndexPurge]> {
+    pub fn index_gc(&self) -> Option<&[IndexPurgeEntry]> {
         self.payload.as_ref().map(|p| &p.index_gc[..])
     }
 }

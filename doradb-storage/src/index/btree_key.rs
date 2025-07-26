@@ -23,6 +23,7 @@ trait KeyEncoder {
     /// This method is not recommended, unless the keys are dynamically added.
     /// Otherwise, we can always create fixed-length container with encode_len()
     /// and then encode_copy() keys into it.
+    #[allow(dead_code)]
     fn encode_extend<T: BytesExtendable>(&self, key: &Val, buf: &mut T);
 }
 

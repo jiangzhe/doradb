@@ -5,7 +5,7 @@ use crate::catalog::table::TableMetadata;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
-use crate::table::Table;
+use crate::table::{Table, TableAccess};
 use crate::value::Val;
 use doradb_catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableID,
@@ -85,7 +85,7 @@ impl<P: BufferPool> Schemas<'_, P> {
         let name = Val::from(name);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_NAME, vec![name]);
         self.table
-            .select_row_uncommitted(self.buf_pool, &key, row_to_schema_object)
+            .index_lookup_unique_uncommitted(self.buf_pool, &key, row_to_schema_object)
             .await
     }
 
@@ -93,7 +93,7 @@ impl<P: BufferPool> Schemas<'_, P> {
     pub async fn find_uncommitted_by_id(&self, id: SchemaID) -> Option<SchemaObject> {
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![Val::from(id)]);
         self.table
-            .select_row_uncommitted(self.buf_pool, &key, row_to_schema_object)
+            .index_lookup_unique_uncommitted(self.buf_pool, &key, row_to_schema_object)
             .await
     }
 
@@ -105,7 +105,7 @@ impl<P: BufferPool> Schemas<'_, P> {
             Val::from(obj.schema_name.as_str()),
         ];
         self.table
-            .insert_row(self.buf_pool, stmt, cols)
+            .insert_mvcc(self.buf_pool, stmt, cols)
             .await
             .is_ok()
     }
@@ -115,7 +115,7 @@ impl<P: BufferPool> Schemas<'_, P> {
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: SchemaID) -> bool {
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![Val::from(id)]);
         self.table
-            .delete_row(self.buf_pool, stmt, &key, true)
+            .delete_unique_mvcc(self.buf_pool, stmt, &key, true)
             .await
             .is_ok()
     }

@@ -3,7 +3,7 @@ use crate::index::btree::{BTree, BTreeDelete, BTreeInsert, BTreeUpdate};
 use crate::index::btree_key::BTreeKeyEncoder;
 use crate::index::btree_value::BTreeU64;
 use crate::index::secondary_index::{
-    EncodeKeySelf, PartitionMultiKeyIndex, PartitionSingleKeyIndex,
+    EncodeKeySelf, IndexInsert, PartitionMultiKeyIndex, PartitionSingleKeyIndex,
 };
 use crate::index::util::Maskable;
 use crate::index::IndexCompareExchange;
@@ -23,12 +23,15 @@ pub trait UniqueIndex: Send + Sync + 'static {
 
     /// Insert new key value pair into this index.
     /// If same key exists, return old key and its delete flag.
+    /// merge_if_match_deleted flag is an optimization for key change on same row.
+    /// In this case, we can directly unset the delete flag to finish the insert.
     fn insert_if_not_exists(
         &self,
         key: &[Val],
         row_id: RowID,
+        merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> impl Future<Output = Option<(RowID, bool)>>;
+    ) -> impl Future<Output = IndexInsert>;
 
     /// Delete a given key if value matches input value.
     /// For normal delete index operation, we always mark the entry as deleted
@@ -46,6 +49,7 @@ pub trait UniqueIndex: Send + Sync + 'static {
         ts: TrxID,
     ) -> impl Future<Output = bool>;
 
+    /// Mask a given key value as deleted.
     #[inline]
     fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> impl Future<Output = bool> {
         debug_assert!(!row_id.is_deleted());
@@ -98,17 +102,25 @@ impl UniqueIndex for UniqueBTreeIndex {
         &self,
         key: &[Val],
         row_id: RowID,
+        merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> Option<(RowID, bool)> {
-        debug_assert!(!BTreeU64::from(row_id).is_deleted());
+    ) -> IndexInsert {
+        debug_assert!(!row_id.is_deleted());
         let k = self.encoder.encode(key);
         match self
             .tree
-            .insert::<BTreeU64>(k.as_bytes(), BTreeU64::from(row_id), ts)
+            .insert::<BTreeU64>(
+                k.as_bytes(),
+                BTreeU64::from(row_id),
+                merge_if_match_deleted,
+                ts,
+            )
             .await
         {
-            BTreeInsert::Ok => None,
-            BTreeInsert::DuplicateKey(res) => Some((res.value().to_u64(), res.is_deleted())),
+            BTreeInsert::Ok(merged) => IndexInsert::Ok(merged),
+            BTreeInsert::DuplicateKey(res) => {
+                IndexInsert::DuplicateKey(res.value().to_u64(), res.is_deleted())
+            }
         }
     }
 
@@ -120,7 +132,7 @@ impl UniqueIndex for UniqueBTreeIndex {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> bool {
-        debug_assert!(!BTreeU64::from(row_id).is_deleted());
+        debug_assert!(!row_id.is_deleted());
         let k = self.encoder.encode(key);
         match self
             .tree
@@ -192,22 +204,27 @@ impl<T: Hash + Ord + EncodeKeySelf + Send + Sync + 'static> UniqueIndex
         &self,
         key: &[Val],
         row_id: RowID,
+        merge_if_match_deleted: bool,
         _ts: TrxID,
-    ) -> Option<(RowID, bool)> {
+    ) -> IndexInsert {
         let key = T::encode(key);
         let tree = self.select(&key);
         let mut g = tree.write();
         match g.entry(key) {
-            Entry::Occupied(occ) => {
+            Entry::Occupied(mut occ) => {
                 let v = *occ.get();
-                Some((
+                if merge_if_match_deleted && v.is_deleted() && v.value() == row_id {
+                    *occ.get_mut() = row_id;
+                    return IndexInsert::Ok(true);
+                }
+                IndexInsert::DuplicateKey(
                     BTreeU64::from(v).value().to_u64(),
                     BTreeU64::from(v).is_deleted(),
-                ))
+                )
             }
             Entry::Vacant(vac) => {
                 vac.insert(row_id);
-                None
+                IndexInsert::Ok(false)
             }
         }
     }
@@ -283,11 +300,14 @@ impl UniqueIndex for PartitionMultiKeyIndex {
         &self,
         key: &[Val],
         row_id: RowID,
+        merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> Option<(RowID, bool)> {
+    ) -> IndexInsert {
         let key = self.encode(key);
         let key = std::slice::from_ref(&key);
-        self.index.insert_if_not_exists(key, row_id, ts).await
+        self.index
+            .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
+            .await
     }
 
     #[inline]
@@ -412,7 +432,10 @@ mod tests {
         let row_id = 100u64;
 
         // 测试插入
-        assert_eq!(index.insert_if_not_exists(&key, row_id, 100).await, None);
+        assert!(index
+            .insert_if_not_exists(&key, row_id, false, 100)
+            .await
+            .is_ok());
 
         // 测试查找
         assert_eq!(index.lookup(&key, 100).await, Some((row_id, false)));
@@ -423,16 +446,14 @@ mod tests {
 
         // 测试用例2：重复插入
         let new_row_id = 200u64;
-        let old_row_id = index.insert_if_not_exists(&key, new_row_id, 100).await;
-        assert_eq!(old_row_id, Some((row_id, false)));
-        assert_eq!(index.lookup(&key, 100).await, old_row_id);
+        let old_row_id = index
+            .insert_if_not_exists(&key, new_row_id, false, 100)
+            .await;
+        assert_eq!(old_row_id, IndexInsert::DuplicateKey(row_id, false));
+        assert_eq!(index.lookup(&key, 100).await.unwrap(), (row_id, false));
 
         // 测试用例3：删除操作
-        assert!(
-            index
-                .compare_delete(&key, old_row_id.unwrap().0, true, 100)
-                .await
-        );
+        assert!(index.compare_delete(&key, row_id, true, 100).await);
         assert_eq!(index.lookup(&key, 100).await, None);
 
         // 测试删除不存在的键 still ok
@@ -444,7 +465,10 @@ mod tests {
         let row_id2 = 400u64;
 
         // 先插入一个值
-        assert_eq!(index.insert_if_not_exists(&key, row_id1, 100).await, None);
+        assert!(index
+            .insert_if_not_exists(&key, row_id1, false, 100)
+            .await
+            .is_ok(),);
 
         // 测试成功的 compare_exchange
         assert!(
@@ -474,9 +498,18 @@ mod tests {
         let row_id3 = 700u64;
 
         // 插入多个键值对
-        assert_eq!(index.insert_if_not_exists(&key1, row_id1, 100).await, None);
-        assert_eq!(index.insert_if_not_exists(&key2, row_id2, 100).await, None);
-        assert_eq!(index.insert_if_not_exists(&key3, row_id3, 100).await, None);
+        assert!(index
+            .insert_if_not_exists(&key1, row_id1, false, 100)
+            .await
+            .is_ok());
+        assert!(index
+            .insert_if_not_exists(&key2, row_id2, false, 100)
+            .await
+            .is_ok());
+        assert!(index
+            .insert_if_not_exists(&key3, row_id3, false, 100)
+            .await
+            .is_ok());
 
         // 验证所有键都能正确查找
         assert_eq!(index.lookup(&key1, 100).await, Some((row_id1, false)));
@@ -495,7 +528,10 @@ mod tests {
         let row_id = 100u64;
 
         // 测试插入
-        assert_eq!(index.insert_if_not_exists(&key, row_id, 100).await, None);
+        assert!(index
+            .insert_if_not_exists(&key, row_id, false, 100)
+            .await
+            .is_ok());
 
         // 测试查找
         assert_eq!(index.lookup(&key, 100).await, Some((row_id, false)));
@@ -506,16 +542,14 @@ mod tests {
 
         // 测试用例2：重复插入
         let new_row_id = 200u64;
-        let old_row_id = index.insert_if_not_exists(&key, new_row_id, 100).await;
-        assert_eq!(old_row_id, Some((row_id, false)));
-        assert_eq!(index.lookup(&key, 100).await, old_row_id);
+        let old_row_id = index
+            .insert_if_not_exists(&key, new_row_id, false, 100)
+            .await;
+        assert_eq!(old_row_id, IndexInsert::DuplicateKey(row_id, false));
+        assert_eq!(index.lookup(&key, 100).await.unwrap(), (row_id, false));
 
         // 测试用例3：删除操作
-        assert!(
-            index
-                .compare_delete(&key, old_row_id.unwrap().0, true, 100)
-                .await
-        );
+        assert!(index.compare_delete(&key, row_id, true, 100).await);
         assert_eq!(index.lookup(&key, 100).await, None);
 
         // 测试删除不存在的键 still ok
@@ -527,7 +561,10 @@ mod tests {
         let row_id2 = 400u64;
 
         // 先插入一个值
-        assert_eq!(index.insert_if_not_exists(&key, row_id1, 100).await, None);
+        assert!(index
+            .insert_if_not_exists(&key, row_id1, false, 100)
+            .await
+            .is_ok());
 
         // 测试成功的 compare_exchange
         assert!(
@@ -557,9 +594,18 @@ mod tests {
         let row_id3 = 700u64;
 
         // 插入多个键值对
-        assert_eq!(index.insert_if_not_exists(&key1, row_id1, 100).await, None);
-        assert_eq!(index.insert_if_not_exists(&key2, row_id2, 100).await, None);
-        assert_eq!(index.insert_if_not_exists(&key3, row_id3, 100).await, None);
+        assert!(index
+            .insert_if_not_exists(&key1, row_id1, false, 100)
+            .await
+            .is_ok());
+        assert!(index
+            .insert_if_not_exists(&key2, row_id2, false, 100)
+            .await
+            .is_ok());
+        assert!(index
+            .insert_if_not_exists(&key3, row_id3, false, 100)
+            .await
+            .is_ok());
 
         // 验证所有键都能正确查找
         assert_eq!(index.lookup(&key1, 100).await, Some((row_id1, false)));
@@ -570,5 +616,16 @@ mod tests {
         let mut values = Vec::new();
         index.scan_values(&mut values, 100).await;
         assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
+
+        // 验证insert覆盖
+        let key4 = vec![Val::from("rust"), Val::from(97i32)];
+        let row_id4 = 800u64;
+        let inserted = index.insert_if_not_exists(&key4, row_id4, false, 100).await;
+        assert!(inserted.is_ok());
+        let masked = index.mask_as_deleted(&key4, row_id4, 100).await;
+        assert!(masked);
+        let inserted = index.insert_if_not_exists(&key4, row_id4, true, 100).await;
+        assert!(inserted.is_merged());
+        assert_eq!(index.lookup(&key4, 100).await, Some((row_id4, false)));
     }
 }

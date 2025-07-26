@@ -3,6 +3,7 @@ use crate::buffer::BufferPool;
 use crate::catalog::{Catalog, TableCache};
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
+use crate::table::TableAccess;
 use crate::thread;
 use crate::trx::log::LogPartition;
 use crate::trx::sys::TransactionSystem;
@@ -146,7 +147,10 @@ impl TransactionSystem {
                 for ip in index_gc {
                     if let Some(table) = table_cache.get_table(ip.table_id).await {
                         // todo: index should stored in index pool, instead of data pool.
-                        if table.delete_index(buf_pool, &ip.key, ip.row_id).await {
+                        if table
+                            .delete_index(buf_pool, &ip.key, ip.row_id, ip.unique)
+                            .await
+                        {
                             purge_index_count += 1;
                         }
                     }

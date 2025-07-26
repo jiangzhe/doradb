@@ -5,7 +5,9 @@ use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
 use crate::index::btree::{BTreeDelete, BTreeUpdate};
 use crate::index::btree_hint::{BTreeHints, BTREE_HINTS_LEN};
 use crate::index::btree_key::BTreeKey;
-use crate::index::btree_value::{BTreeU64, BTreeValue};
+use crate::index::btree_value::{
+    BTreeU64, BTreeValue, BTreeValuePackable, BTREE_VALUE_PACK_MAX_LEN,
+};
 use crate::index::util::Maskable;
 use crate::row::RowID;
 use crate::trx::TrxID;
@@ -16,7 +18,7 @@ use std::cmp::Ordering;
 use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 
-const _: () = assert!(mem::size_of::<BTreeHeader>() % mem::size_of::<Slot>() == 0);
+const _: () = assert!(mem::size_of::<BTreeHeader>() % mem::size_of::<BTreeSlot>() == 0);
 
 const _: () = assert!(mem::size_of::<BTreeNode>() == PAGE_SIZE);
 
@@ -79,13 +81,13 @@ pub struct BTreeHeader {
     /// 2. On root page, support Copy-on-Write batch inserts.
     ts: TrxID,
     /// Lower fence key of this node, inclusive.
-    lower_fence: Slot,
+    lower_fence: BTreeSlot,
     /// Value of lower fence, used only in branch node,
     /// which is child page id.
     lower_fence_value: BTreeU64,
     /// Upper fence key of this node, exclusive.
     /// If offset is zero, upper fence is None.
-    upper_fence: Slot,
+    upper_fence: BTreeSlot,
     /// Effective space used of b-tree node.
     /// It includes header space, slot space and payload space.
     /// In insert-only scenario, used space is equal to effective space.
@@ -117,17 +119,17 @@ const KEY_HEAD_LEN: usize = 4;
 pub type KeyHeadInt = u32;
 pub type KeyHeadBytes = [u8; 4];
 
-const _: () = assert!(mem::size_of::<Slot>() == 8);
+const _: () = assert!(mem::size_of::<BTreeSlot>() == 8);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct Slot {
+pub struct BTreeSlot {
     len: u16,
     offset: u16,
     head: KeyHeadInt,
 }
 
-impl Slot {
+impl BTreeSlot {
     /// Returns an inline slot.
     /// This can only be used to create upper fence, because
     /// all other slot will have at least 8-byte value and
@@ -135,7 +137,7 @@ impl Slot {
     #[inline]
     pub fn inline(k: &[u8]) -> Self {
         debug_assert!(k.len() <= KEY_HEAD_LEN);
-        Slot {
+        BTreeSlot {
             len: k.len() as u16,
             offset: 0,
             head: head_int(k),
@@ -248,7 +250,7 @@ impl BTreeNode {
         // 2. Assign lower fence and its value.
         let lf = &lower_fence[prefix_len..];
         if lf.len() <= KEY_HEAD_LEN {
-            self.header.lower_fence = Slot::inline(lf);
+            self.header.lower_fence = BTreeSlot::inline(lf);
         } else {
             self.header.lower_fence = self.new_slot_without_value(lower_fence);
         }
@@ -257,7 +259,7 @@ impl BTreeNode {
         // 3. Assign upper fence and its value.
         let uf = &upper_fence[prefix_len..];
         if uf.len() <= KEY_HEAD_LEN {
-            self.header.upper_fence = Slot::inline(uf);
+            self.header.upper_fence = BTreeSlot::inline(uf);
         } else {
             // for upper fence, we do not store any value for it.
             self.header.upper_fence = self.new_slot_without_value(upper_fence);
@@ -333,7 +335,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    fn cmp_key_without_prefix(&self, k: &[u8], slot: &Slot) -> Ordering {
+    fn cmp_key_without_prefix(&self, k: &[u8], slot: &BTreeSlot) -> Ordering {
         match head_int(k).cmp(&slot.head) {
             Ordering::Less => Ordering::Less,
             Ordering::Greater => Ordering::Greater,
@@ -494,18 +496,18 @@ impl BTreeNode {
         if idx + 1 < self.header.count as usize {
             // not last row, shift one slot left.
             unsafe {
-                let dst = (self.body_mut() as *mut Slot).add(idx);
+                let dst = (self.body_mut() as *mut BTreeSlot).add(idx);
                 let src = dst.add(1);
                 std::ptr::copy(src, dst, self.header.count as usize - idx - 1);
             }
         }
         self.header.count -= 1;
-        self.header.start_offset -= mem::size_of::<Slot>() as u16;
+        self.header.start_offset -= mem::size_of::<BTreeSlot>() as u16;
         // Note: we do not release payload of the deleted key, because
         // it requires relocate payloads of other keys.
         // But we decrease effective space so if we want more space,
         // we know exactly how much remains after compaction.
-        self.header.effective_space -= (payload_len + mem::size_of::<Slot>()) as u32;
+        self.header.effective_space -= (payload_len + mem::size_of::<BTreeSlot>()) as u32;
     }
 
     #[inline]
@@ -593,7 +595,7 @@ impl BTreeNode {
 
     /// Create a new slot with given key and value.
     #[inline]
-    fn new_slot_with_value<V: BTreeValue>(&mut self, key: &[u8], value: V) -> Slot {
+    fn new_slot_with_value<V: BTreeValue>(&mut self, key: &[u8], value: V) -> BTreeSlot {
         debug_assert!(key.len() >= self.header.prefix_len as usize);
         let k = &key[self.header.prefix_len as usize..];
         let head = head_int(k);
@@ -606,7 +608,7 @@ impl BTreeNode {
                     .write_unaligned(value);
             }
             self.header.effective_space += mem::size_of::<V>() as u32;
-            return Slot {
+            return BTreeSlot {
                 len: k.len() as u16,
                 offset: self.header.end_offset,
                 head,
@@ -622,7 +624,7 @@ impl BTreeNode {
             (dst as *mut V).write_unaligned(value);
         }
         self.header.effective_space += (k.len() + mem::size_of::<V>()) as u32;
-        Slot {
+        BTreeSlot {
             len: k.len() as u16,
             offset: self.header.end_offset,
             head,
@@ -630,13 +632,13 @@ impl BTreeNode {
     }
 
     #[inline]
-    fn new_slot_without_value(&mut self, key: &[u8]) -> Slot {
+    fn new_slot_without_value(&mut self, key: &[u8]) -> BTreeSlot {
         debug_assert!(key.len() >= self.header.prefix_len as usize);
         let k = &key[self.header.prefix_len as usize..];
         let head = head_int(k);
         if k.len() <= KEY_HEAD_LEN {
             // No value inserted to page.
-            return Slot {
+            return BTreeSlot {
                 len: k.len() as u16,
                 offset: self.header.end_offset,
                 head,
@@ -650,7 +652,7 @@ impl BTreeNode {
             std::ptr::copy_nonoverlapping(k.as_ptr(), dst, k.len());
         }
         self.header.effective_space += k.len() as u32;
-        Slot {
+        BTreeSlot {
             len: k.len() as u16,
             offset: self.header.end_offset,
             head,
@@ -694,7 +696,7 @@ impl BTreeNode {
         let klen = key.len() - self.header.prefix_len as usize;
         // We can inline key inside key head.
         // When extracting key, we need to maintain buffer to copy key out.
-        mem::size_of::<Slot>()
+        mem::size_of::<BTreeSlot>()
             + mem::size_of::<RowID>()
             + if klen <= KEY_HEAD_LEN { 0 } else { klen }
     }
@@ -719,55 +721,55 @@ impl BTreeNode {
 
     /// Returns slice of slots.
     #[inline]
-    pub(super) fn slots(&self) -> &[Slot] {
+    pub(super) fn slots(&self) -> &[BTreeSlot] {
         let len = self.header.count as usize;
-        unsafe { std::slice::from_raw_parts(self.body() as *const Slot, len) }
+        unsafe { std::slice::from_raw_parts(self.body() as *const BTreeSlot, len) }
     }
 
     #[inline]
-    pub(super) fn slots_and_hints(&mut self) -> (&[Slot], &mut BTreeHints) {
+    pub(super) fn slots_and_hints(&mut self) -> (&[BTreeSlot], &mut BTreeHints) {
         let len = self.header.count as usize;
-        let slots = unsafe { std::slice::from_raw_parts(self.body() as *const Slot, len) };
+        let slots = unsafe { std::slice::from_raw_parts(self.body() as *const BTreeSlot, len) };
         (slots, &mut self.header.hints)
     }
 
     /// Returns reference to slot at given position.
     #[inline]
-    pub(super) fn slot(&self, idx: usize) -> &Slot {
+    pub(super) fn slot(&self, idx: usize) -> &BTreeSlot {
         debug_assert!(idx < self.header.count as usize);
         unsafe { self.slot_unchecked(idx) }
     }
 
     #[inline]
-    unsafe fn slot_unchecked(&self, idx: usize) -> &Slot {
-        unsafe { &*(self.body() as *const Slot).add(idx) }
+    unsafe fn slot_unchecked(&self, idx: usize) -> &BTreeSlot {
+        unsafe { &*(self.body() as *const BTreeSlot).add(idx) }
     }
 
     #[inline]
-    fn slot_mut(&mut self, idx: usize) -> &mut Slot {
+    fn slot_mut(&mut self, idx: usize) -> &mut BTreeSlot {
         debug_assert!(idx < self.header.count as usize);
         unsafe { self.slot_mut_unchecked(idx) }
     }
 
     #[inline]
-    unsafe fn slot_mut_unchecked(&mut self, idx: usize) -> &mut Slot {
-        unsafe { &mut *(self.body_mut() as *mut Slot).add(idx) }
+    unsafe fn slot_mut_unchecked(&mut self, idx: usize) -> &mut BTreeSlot {
+        unsafe { &mut *(self.body_mut() as *mut BTreeSlot).add(idx) }
     }
 
     /// insert slot at given position.
     /// If overwrite is set to true, the old value is overwritten.
     #[inline]
-    unsafe fn insert_slot_at(&mut self, idx: usize, slot: Slot) {
+    unsafe fn insert_slot_at(&mut self, idx: usize, slot: BTreeSlot) {
         unsafe {
-            let dst = (self.body_mut() as *mut Slot).add(idx);
+            let dst = (self.body_mut() as *mut BTreeSlot).add(idx);
             if idx < self.header.count as usize {
                 // shift all elements starting from destination by one position.
                 let next = dst.add(1);
                 std::ptr::copy(dst, next, self.header.count as usize - idx);
             }
             self.header.count += 1;
-            self.header.start_offset += mem::size_of::<Slot>() as u16;
-            self.header.effective_space += mem::size_of::<Slot>() as u32;
+            self.header.start_offset += mem::size_of::<BTreeSlot>() as u16;
+            self.header.effective_space += mem::size_of::<BTreeSlot>() as u32;
             *dst = slot;
         }
     }
@@ -823,7 +825,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    fn search_slot(&self, slots: &[Slot], k: &[u8], head: KeyHeadInt) -> SearchKey {
+    fn search_slot(&self, slots: &[BTreeSlot], k: &[u8], head: KeyHeadInt) -> SearchKey {
         slots.binary_search_by(|s| match s.head.cmp(&head) {
             Ordering::Less => Ordering::Less,
             Ordering::Greater => Ordering::Greater,
@@ -909,7 +911,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    fn long_key_suffix(&self, slot: &Slot) -> &[u8] {
+    fn long_key_suffix(&self, slot: &BTreeSlot) -> &[u8] {
         debug_assert!(slot.len as usize > KEY_HEAD_LEN);
         unsafe { self.payload(slot.offset as usize, slot.len as usize) }
     }
@@ -964,7 +966,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn upper_fence_slot(&self) -> &Slot {
+    pub(super) fn upper_fence_slot(&self) -> &BTreeSlot {
         &self.header.upper_fence
     }
 
@@ -979,7 +981,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn copy_slot_key(&self, slot: &Slot, res: &mut [u8]) {
+    pub(super) fn copy_slot_key(&self, slot: &BTreeSlot, res: &mut [u8]) {
         debug_assert!((self.header.prefix_len + slot.len) as usize == res.len());
         res[..self.header.prefix_len as usize].copy_from_slice(self.common_prefix());
         if slot.len as usize <= KEY_HEAD_LEN {
@@ -991,13 +993,42 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn extend_slot_key<T: BytesExtendable>(&self, slot: &Slot, res: &mut T) {
+    pub(super) fn extend_slot_key<T: BytesExtendable>(&self, slot: &BTreeSlot, res: &mut T) {
         res.extend_from_byte_slice(self.common_prefix());
         if slot.len as usize <= KEY_HEAD_LEN {
             res.extend_from_byte_slice(&slot.head_bytes()[..slot.len as usize]);
         } else {
             res.extend_from_byte_slice(self.long_key_suffix(slot))
         }
+    }
+
+    /// This method is used to unpack value from end of key.
+    #[inline]
+    pub(super) fn unpack_value<V: BTreeValuePackable>(&self, slot: &BTreeSlot) -> V {
+        if slot.len as usize >= mem::size_of::<V>() {
+            // all bytes packed in the key suffix.
+            if slot.len as usize <= KEY_HEAD_LEN {
+                // This branch won't be touched because currently we only allow
+                // RowID to be packed into key, which is longer than key head.
+                let src = &slot.head_bytes()[..slot.len as usize];
+                return V::unpack(&src[src.len() - mem::size_of::<V>()..]);
+            }
+            let src = self.long_key_suffix(slot);
+            return V::unpack(&src[src.len() - mem::size_of::<V>()..]);
+        }
+        // we have to concat common prefix and key suffix
+        let mut src = [0u8; BTREE_VALUE_PACK_MAX_LEN];
+        let pl = mem::size_of::<V>() - slot.len as usize;
+        let prefix = self.common_prefix();
+        src[0..pl].copy_from_slice(&prefix[prefix.len() - pl..]);
+        if slot.len as usize <= KEY_HEAD_LEN {
+            let suffix = &slot.head_bytes()[..slot.len as usize];
+            src[pl..mem::size_of::<V>()].copy_from_slice(suffix);
+        } else {
+            let suffix = self.long_key_suffix(slot);
+            src[pl..mem::size_of::<V>()].copy_from_slice(suffix);
+        }
+        V::unpack(&src[..mem::size_of::<V>()])
     }
 
     #[inline]
@@ -1014,7 +1045,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    unsafe fn slot_value<V: BTreeValue>(&self, slot: &Slot) -> V {
+    unsafe fn slot_value<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
         unsafe {
             let offset = if slot.len as usize <= KEY_HEAD_LEN {
                 // key is inlined.
@@ -1038,7 +1069,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    fn update_value<V: BTreeValue>(&mut self, idx: usize, value: V) -> V {
+    pub(super) fn update_value<V: BTreeValue>(&mut self, idx: usize, value: V) -> V {
         debug_assert!(idx < self.header.count as usize);
         let slot = self.slot(idx);
         let offset = if slot.len as usize <= KEY_HEAD_LEN {
@@ -1137,12 +1168,12 @@ impl BTreeNode {
             let dst_slot_idx = self.header.count as usize;
             unsafe {
                 // fast path to memcpy slots.
-                let src_slot = (src_node.body() as *const Slot).add(src_slot_idx);
-                let dst_slot = (self.body_mut() as *mut Slot).add(dst_slot_idx);
+                let src_slot = (src_node.body() as *const BTreeSlot).add(src_slot_idx);
+                let dst_slot = (self.body_mut() as *mut BTreeSlot).add(dst_slot_idx);
                 std::ptr::copy_nonoverlapping(src_slot, dst_slot, count);
                 {
                     // update space and offset.
-                    let slot_space = mem::size_of::<Slot>() * count;
+                    let slot_space = mem::size_of::<BTreeSlot>() * count;
                     self.header.start_offset += slot_space as u16;
                     self.header.effective_space += slot_space as u32;
                 }
@@ -1363,7 +1394,7 @@ impl BTreeNode {
     /// This method is used to check whether the slot key matches partial key prefix,
     /// the common prefix of node is excluded in this check.
     #[inline]
-    pub(super) fn slot_matches_k(&self, slot: &Slot, k: &[u8]) -> bool {
+    pub(super) fn slot_matches_k(&self, slot: &BTreeSlot, k: &[u8]) -> bool {
         if (slot.len as usize) < k.len() {
             return false;
         }
@@ -1518,7 +1549,7 @@ impl SpaceEstimation {
             self.total_space += len as usize;
         }
         // slot and value space are always added.
-        self.total_space += mem::size_of::<Slot>() + self.value_size;
+        self.total_space += mem::size_of::<BTreeSlot>() + self.value_size;
         self.total_space
     }
 

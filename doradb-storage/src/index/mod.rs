@@ -15,5 +15,6 @@ pub use btree::*;
 pub use btree_key::*;
 pub use btree_node::*;
 pub use btree_value::*;
+pub use non_unique_index::*;
 pub use secondary_index::*;
 pub use unique_index::*;

@@ -24,7 +24,8 @@ async fn single_thread_bench_btree(args: &Args) {
         match &args.mode[..] {
             "seq" => {
                 for i in 0..args.total_rows {
-                    tree.insert(&i.to_be_bytes(), BTreeU64::from(i), 100).await;
+                    tree.insert(&i.to_be_bytes(), BTreeU64::from(i), false, 100)
+                        .await;
                 }
             }
             "rand" => {
@@ -32,7 +33,8 @@ async fn single_thread_bench_btree(args: &Args) {
                 let mut thd_rng = rand::rng();
                 for i in 0..args.total_rows {
                     let k = between.sample(&mut thd_rng);
-                    tree.insert(&k.to_be_bytes(), BTreeU64::from(i), 100).await;
+                    tree.insert(&k.to_be_bytes(), BTreeU64::from(i), false, 100)
+                        .await;
                 }
             }
             _ => panic!("unknown mode"),

@@ -5,7 +5,7 @@ use crate::catalog::table::TableMetadata;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
-use crate::table::Table;
+use crate::table::{Table, TableAccess};
 use crate::value::Val;
 use doradb_catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKey, IndexOrder, IndexSpec,
@@ -111,7 +111,7 @@ impl<P: BufferPool> Indexes<'_, P> {
             Val::from(obj.index_attributes.bits()),
         ];
         self.table
-            .insert_row(self.buf_pool, stmt, cols)
+            .insert_mvcc(self.buf_pool, stmt, cols)
             .await
             .is_ok()
     }
@@ -120,7 +120,7 @@ impl<P: BufferPool> Indexes<'_, P> {
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: IndexID) -> bool {
         let key = SelectKey::new(INDEX_NO_INDEXES_INDEX_ID, vec![Val::from(id)]);
         self.table
-            .delete_row(self.buf_pool, stmt, &key, true)
+            .delete_unique_mvcc(self.buf_pool, stmt, &key, true)
             .await
             .is_ok()
     }
@@ -129,7 +129,7 @@ impl<P: BufferPool> Indexes<'_, P> {
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<IndexObject> {
         let mut res = vec![];
         self.table
-            .scan_rows_uncommitted(self.buf_pool, |row| {
+            .table_scan_uncommitted(self.buf_pool, |row| {
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = *row.val::<TableID>(COL_NO_INDEXES_TABLE_ID);
                 if table_id_in_row == table_id {
@@ -242,7 +242,7 @@ impl<P: BufferPool> IndexColumns<'_, P> {
             Val::from(obj.index_order as u8),
         ];
         self.table
-            .insert_row(self.buf_pool, stmt, cols)
+            .insert_mvcc(self.buf_pool, stmt, cols)
             .await
             .is_ok()
     }
@@ -254,7 +254,7 @@ impl<P: BufferPool> IndexColumns<'_, P> {
     pub async fn list_uncommitted_by_index_id(&self, index_id: IndexID) -> Vec<IndexColumnObject> {
         let mut res = vec![];
         self.table
-            .scan_rows_uncommitted(self.buf_pool, |row| {
+            .table_scan_uncommitted(self.buf_pool, |row| {
                 let index_id_in_row = *row.val::<TableID>(COL_NO_INDEX_COLUMNS_INDEX_ID);
                 if index_id_in_row == index_id {
                     let obj = row_to_index_column_object(row);

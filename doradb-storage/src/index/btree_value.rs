@@ -1,6 +1,7 @@
 use crate::buffer::page::INVALID_PAGE_ID;
 use crate::index::util::Maskable;
 use crate::row::INVALID_ROW_ID;
+use std::mem;
 use std::ops::Deref;
 
 /// BTreeValue is the value type stored in leaf node.
@@ -25,6 +26,14 @@ use std::ops::Deref;
 ///    extract last 8 byte from key and convert it
 ///    to RowID.
 pub trait BTreeValue: Maskable {}
+
+pub const BTREE_VALUE_PACK_MAX_LEN: usize = 8;
+
+/// Defines how to unpack a value from key.
+pub trait BTreeValuePackable: BTreeValue {
+    /// Unpack the value from collection.
+    fn unpack(src: &[u8]) -> Self;
+}
 
 /// U64 value type to support both page id in branch node
 /// and row id in leaf node.
@@ -64,18 +73,57 @@ impl Maskable for BTreeU64 {
 
     #[inline]
     fn deleted(self) -> Self {
-        BTreeU64(*self | BTREE_VALUE_U64_DELETE_BIT)
+        BTreeU64(self.0 | BTREE_VALUE_U64_DELETE_BIT)
     }
 
     #[inline]
     fn value(self) -> Self {
-        BTreeU64(*self & !BTREE_VALUE_U64_DELETE_BIT)
+        BTreeU64(self.0 & !BTREE_VALUE_U64_DELETE_BIT)
     }
 
     #[inline]
     fn is_deleted(self) -> bool {
-        *self & BTREE_VALUE_U64_DELETE_BIT != 0
+        self.0 & BTREE_VALUE_U64_DELETE_BIT != 0
     }
 }
 
 impl BTreeValue for BTreeU64 {}
+
+impl BTreeValuePackable for BTreeU64 {
+    #[inline]
+    fn unpack(src: &[u8]) -> Self {
+        debug_assert!(src.len() == mem::size_of::<BTreeU64>());
+        let v = u64::from_be_bytes(src.try_into().unwrap());
+        BTreeU64::from(v)
+    }
+}
+
+/// U8 value type to support non-unique-index.
+/// Only one bit is used for delete flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct BTreeByte(u8);
+
+const BTREE_VALUE_BYTE_DELETE_BIT: u8 = 1;
+pub const BTREE_BYTE_ZERO: BTreeByte = BTreeByte(0);
+
+impl Maskable for BTreeByte {
+    const INVALID_VALUE: Self = BTreeByte(!0);
+
+    #[inline]
+    fn deleted(self) -> Self {
+        BTreeByte(self.0 | BTREE_VALUE_BYTE_DELETE_BIT)
+    }
+
+    #[inline]
+    fn value(self) -> Self {
+        BTreeByte(self.0 & !BTREE_VALUE_BYTE_DELETE_BIT)
+    }
+
+    #[inline]
+    fn is_deleted(self) -> bool {
+        self.0 & BTREE_VALUE_BYTE_DELETE_BIT != 0
+    }
+}
+
+impl BTreeValue for BTreeByte {}

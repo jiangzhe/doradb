@@ -7,10 +7,8 @@ use crate::error::{Error, Result};
 use crate::index::BlockIndex;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::RowID;
-use crate::table::Table;
-use crate::table::TableID;
-use crate::trx::redo::DDLRedo;
-use crate::trx::redo::RedoLogs;
+use crate::table::{Table, TableAccess, TableID};
+use crate::trx::redo::{DDLRedo, RedoLogs};
 use crate::trx::undo::{IndexUndo, IndexUndoKind, IndexUndoLogs, RowUndoKind, RowUndoLogs};
 use crate::trx::ActiveTrx;
 use crate::value::Val;
@@ -298,13 +296,15 @@ impl Statement {
     #[inline]
     pub async fn insert_row(&mut self, table: &Table, cols: Vec<Val>) -> InsertMvcc {
         let engine = self.trx.engine_weak().unwrap();
-        table.insert_row(engine.data_pool, self, cols).await
+        table.insert_mvcc(engine.data_pool, self, cols).await
     }
 
     #[inline]
     pub async fn delete_row(&mut self, table: &Table, key: &SelectKey) -> DeleteMvcc {
         let engine = self.trx.engine_weak().unwrap();
-        table.delete_row(engine.data_pool, self, key, false).await
+        table
+            .delete_unique_mvcc(engine.data_pool, self, key, false)
+            .await
     }
 
     #[inline]
@@ -316,7 +316,7 @@ impl Statement {
     ) -> SelectMvcc {
         let engine = self.trx.engine_weak().unwrap();
         table
-            .select_row_mvcc(engine.data_pool, self, key, user_read_set)
+            .index_lookup_unique_mvcc(engine.data_pool, self, key, user_read_set)
             .await
     }
 
@@ -329,7 +329,7 @@ impl Statement {
     ) -> UpdateMvcc {
         let engine = self.trx.engine_weak().unwrap();
         table
-            .update_row(engine.data_pool, self, key, update, false)
+            .update_unique_mvcc(engine.data_pool, self, key, update, false)
             .await
     }
 
@@ -339,11 +339,28 @@ impl Statement {
         table_id: TableID,
         row_id: RowID,
         key: SelectKey,
+        merge_old_deleted: bool,
     ) {
         let index_undo = IndexUndo {
             table_id,
             row_id,
-            kind: IndexUndoKind::InsertUnique(key),
+            kind: IndexUndoKind::InsertUnique(key, merge_old_deleted),
+        };
+        self.index_undo.push(index_undo);
+    }
+
+    #[inline]
+    pub(crate) fn push_insert_non_unique_index_undo(
+        &mut self,
+        table_id: TableID,
+        row_id: RowID,
+        key: SelectKey,
+        merge_old_deleted: bool,
+    ) {
+        let index_undo = IndexUndo {
+            table_id,
+            row_id,
+            kind: IndexUndoKind::InsertNonUnique(key, merge_old_deleted),
         };
         self.index_undo.push(index_undo);
     }
@@ -354,11 +371,12 @@ impl Statement {
         table_id: TableID,
         row_id: RowID,
         key: SelectKey,
+        unique: bool,
     ) {
         let index_undo = IndexUndo {
             table_id,
             row_id,
-            kind: IndexUndoKind::DeferDelete(key),
+            kind: IndexUndoKind::DeferDelete(key, unique),
         };
         self.index_undo.push(index_undo);
     }

@@ -8,7 +8,7 @@ use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
 use crate::index::btree_node::{BTreeNode, BTreeNodeBox, LookupChild, SpaceEstimation};
-use crate::index::btree_scan::{BTreePrefixScanner, BTreeSlotCallback};
+use crate::index::btree_scan::{BTreePrefixScan, BTreeSlotCallback};
 use crate::index::btree_value::{BTreeU64, BTreeValue};
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
@@ -24,14 +24,19 @@ pub type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BTreeInsert<V: BTreeValue> {
-    Ok,
+    Ok(bool),
     DuplicateKey(V),
 }
 
 impl<V: BTreeValue> BTreeInsert<V> {
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, BTreeInsert::Ok)
+        matches!(self, BTreeInsert::Ok(false))
+    }
+
+    #[inline]
+    pub fn is_merged(&self) -> bool {
+        matches!(self, BTreeInsert::Ok(true))
     }
 }
 
@@ -167,7 +172,13 @@ impl BTree {
     /// Insert a new key value pair into the tree.
     /// Returns old value if same key exists.
     #[inline]
-    pub async fn insert<V: BTreeValue>(&self, key: &[u8], value: V, ts: TrxID) -> BTreeInsert<V> {
+    pub async fn insert<V: BTreeValue>(
+        &self,
+        key: &[u8],
+        value: V,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> BTreeInsert<V> {
         // Stack holds the path from root to leaf.
         loop {
             let res = self
@@ -178,9 +189,18 @@ impl BTree {
             let idx = match node.search_key(key) {
                 Err(idx) => idx,
                 Ok(idx) => {
-                    // Do not allow insert even if same key is marked as deleted.
-                    let value = node.value::<V>(idx);
-                    return BTreeInsert::DuplicateKey(value);
+                    // Here we special handle the case that old value is same as input value
+                    // but already masked as deleted.
+                    // If merge_if_match_deleted set to true, we unset the delete flag
+                    // and make the insert success.
+                    let old_v = node.value::<V>(idx);
+                    if merge_if_match_deleted && old_v.value() == value && old_v.is_deleted() {
+                        // This check can be applied to both unique index and non-unique index.
+                        node.update_value(idx, value);
+                        node.update_ts(ts);
+                        return BTreeInsert::Ok(true);
+                    }
+                    return BTreeInsert::DuplicateKey(old_v);
                 }
             };
             if !node.can_insert(key) {
@@ -220,7 +240,7 @@ impl BTree {
             node.insert_at(idx, key, value);
             node.update_hints();
             node.update_ts(ts);
-            return BTreeInsert::Ok;
+            return BTreeInsert::Ok(false);
         }
     }
 
@@ -298,8 +318,8 @@ impl BTree {
 
     /// Create a prefix scanner to scan keys.
     #[inline]
-    pub fn prefix_scanner<C: BTreeSlotCallback>(&self, callback: C) -> BTreePrefixScanner<C> {
-        BTreePrefixScanner::new(self, callback)
+    pub fn prefix_scanner<C: BTreeSlotCallback>(&self, callback: C) -> BTreePrefixScan<C> {
+        BTreePrefixScan::new(self, callback)
     }
 
     /// Collect space statistics at given height.
@@ -1670,14 +1690,14 @@ mod tests {
                 let seven = BTreeU64::from(7);
                 let fifty = BTreeU64::from(50);
                 let seventy = BTreeU64::from(70);
-                let res = tree.insert(&1u64.to_be_bytes(), one, 210).await;
+                let res = tree.insert(&1u64.to_be_bytes(), one, false, 210).await;
                 assert!(res.is_ok());
-                let res = tree.insert(&3u64.to_be_bytes(), three, 220).await;
+                let res = tree.insert(&3u64.to_be_bytes(), three, false, 220).await;
                 assert!(res.is_ok());
-                let res = tree.insert(&5u64.to_be_bytes(), five, 205).await;
+                let res = tree.insert(&5u64.to_be_bytes(), five, false, 205).await;
                 assert!(res.is_ok());
 
-                let res = tree.insert(&5u64.to_be_bytes(), five, 230).await;
+                let res = tree.insert(&5u64.to_be_bytes(), five, false, 230).await;
                 assert!(res == BTreeInsert::DuplicateKey(five));
 
                 // look up
@@ -1739,7 +1759,7 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
                     assert!(res.is_ok());
                     if !printed1 && tree.height() == 1 {
                         printed1 = true;
@@ -1810,7 +1830,7 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
                     assert!(res.is_ok());
                 }
 
@@ -1881,7 +1901,7 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
                     assert!(res.is_ok());
                 }
 
@@ -1964,7 +1984,7 @@ mod tests {
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
                     let res1 = tree
-                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), 201)
+                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), false, 201)
                         .await;
                     let res2 = map.entry(k).or_insert_with(|| i as u64);
                     assert!(res1.is_ok() == (*res2 == i as u64));
@@ -2011,7 +2031,7 @@ mod tests {
                     let k = between.sample(&mut rng);
                     // println!("row k={}, i={} sampled", k, i);
                     let res1 = tree
-                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), 201)
+                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), false, 201)
                         .await;
                     let res2 = map.entry(k).or_insert_with(|| i as u64);
                     assert!(res1.is_ok() == (*res2 == i as u64));
@@ -2056,7 +2076,8 @@ mod tests {
                     let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
-                        tree.insert(&k.to_be_bytes(), BTreeU64::from(i), 100).await;
+                        tree.insert(&k.to_be_bytes(), BTreeU64::from(i), false, 100)
+                            .await;
                     }
                 }
                 let dur = start.elapsed();
@@ -2079,7 +2100,8 @@ mod tests {
                     let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
-                        tree.insert(&k.to_be_bytes(), BTreeU64::from(i), 100).await;
+                        tree.insert(&k.to_be_bytes(), BTreeU64::from(i), false, 100)
+                            .await;
                     }
                 }
 
@@ -2116,7 +2138,7 @@ mod tests {
                 let mut key = [0u8; 1000];
                 for i in 0u64..ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
                     assert!(res.is_ok());
                 }
                 let event = Event::new();
@@ -2144,7 +2166,7 @@ mod tests {
                 listener.await;
                 println!("tree height {}", tree.height());
                 key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
-                let res = tree.insert(&key, BTreeU64::from(90088), 202).await;
+                let res = tree.insert(&key, BTreeU64::from(90088), false, 202).await;
                 assert!(res.is_ok());
                 println!("insert ok");
                 println!("tree height {}", tree.height());
@@ -2173,7 +2195,7 @@ mod tests {
                 let mut key = [0u8; 1000];
                 for i in 0u64..ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), 201).await;
+                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
                     assert!(res.is_ok());
                 }
                 let event = Event::new();
@@ -2188,7 +2210,7 @@ mod tests {
 
                             listener.await;
 
-                            let res = tree.insert(&key, BTreeU64::from(90088), 202).await;
+                            let res = tree.insert(&key, BTreeU64::from(90088), false, 202).await;
                             assert!(res.is_ok());
                         })
                     });
@@ -2222,7 +2244,7 @@ mod tests {
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
                     let _ = tree
-                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), 201)
+                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), false, 201)
                         .await;
                 }
                 let space_stat = tree.collect_space_statistics().await;
@@ -2264,7 +2286,7 @@ mod tests {
                 let mut key = vec![0u8; 1000];
                 for i in 0..H0_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, BTreeU64::from(i), 201).await;
+                    tree.insert(&key, BTreeU64::from(i), false, 201).await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",
@@ -2280,7 +2302,7 @@ mod tests {
                 let mut key = vec![0u8; 1000];
                 for i in 0..H1_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, BTreeU64::from(i), 201).await;
+                    tree.insert(&key, BTreeU64::from(i), false, 201).await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",
@@ -2296,7 +2318,7 @@ mod tests {
                 let mut key = vec![0u8; 1000];
                 for i in 0..H2_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, BTreeU64::from(i), 201).await;
+                    tree.insert(&key, BTreeU64::from(i), false, 201).await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",

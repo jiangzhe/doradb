@@ -591,6 +591,12 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub fn update_row(&self, metadata: &TableMetadata, cols: &[UpdateCol]) -> UpdateRow {
         let var_len = self.row().var_len_for_update(cols);
+        if var_len == 0 {
+            // fast path, no change on var-length column.
+            let offset = self.page.header.var_field_offset();
+            let row = self.row_mut(offset, offset);
+            return UpdateRow::Ok(row);
+        }
         match self.page.request_free_space(var_len) {
             None => {
                 let old_row = self.row().clone_vals_with_var_offsets(metadata);
