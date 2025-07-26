@@ -16,7 +16,6 @@ use crate::trx::{
 };
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::path::Path;
@@ -73,7 +72,7 @@ pub struct TransactionSystem {
     /// Data associated with smaller timestamp will be always visible to all transactions.
     global_visible_sts: CachePadded<AtomicU64>,
     /// Round-robin partition id generator.
-    partition_id: CachePadded<AtomicUsize>,
+    rr_partition_id: CachePadded<AtomicUsize>,
     /// Multiple log partitions.
     pub(super) log_partitions: CachePadded<Box<[CachePadded<LogPartition>]>>,
     /// Transaction system configuration.
@@ -97,7 +96,7 @@ impl TransactionSystem {
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
             global_visible_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            partition_id: CachePadded::new(AtomicUsize::new(0)),
+            rr_partition_id: CachePadded::new(AtomicUsize::new(0)),
             log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
             config: CachePadded::new(config),
             catalog: CachePadded::new(catalog),
@@ -109,34 +108,39 @@ impl TransactionSystem {
     /// Create a new transaction.
     #[inline]
     pub fn begin_trx(&self, session: Session) -> ActiveTrx {
-        // Active transaction list is calculated by group committer thread
-        // so here we just generate STS and TrxID.
+        // Assign log partition index so current transaction will stick
+        // to certain log partition for commit.
+        let log_no = self.next_log_no();
+        let partition = &*self.log_partitions[log_no];
+        let gc_no = partition.next_gc_no();
+        let gc_bucket = &partition.gc_buckets[gc_no];
+        // Add to active sts list.
+        let mut g = gc_bucket.active_sts_list.lock();
+        // With bucket lock, we can make sure all transactions are ordered by STS.
         let sts = self.ts.fetch_add(1, Ordering::SeqCst);
         let trx_id = sts | (1 << 63);
         debug_assert!(sts < MAX_SNAPSHOT_TS);
         debug_assert!(trx_id >= MIN_ACTIVE_TRX_ID);
-        // Assign log partition index so current transaction will stick
-        // to certain log partititon for commit.
-        let log_no = if self.config.log_partitions == 1 {
+        g.insert(sts);
+        if g.len() == 1 {
+            // Only when the previous list is empty, we should update min_active_sts
+            // as STS of current transaction.
+            // In this case, current value of min_active_sts should be MAX.
+            debug_assert!(gc_bucket.min_active_sts.load(Ordering::Relaxed) == MAX_SNAPSHOT_TS);
+            gc_bucket.min_active_sts.store(sts, Ordering::Relaxed);
+        }
+        drop(g); // release bucket lock.
+        ActiveTrx::new(session, trx_id, sts, log_no, gc_no)
+    }
+
+    /// Returns next log(partition) number.
+    #[inline]
+    fn next_log_no(&self) -> usize {
+        if self.config.log_partitions == 1 {
             0
         } else {
-            self.partition_id.fetch_add(1, Ordering::Relaxed) % self.config.log_partitions
-        };
-        // Add to active sts list.
-        let gc_no = gc_no(sts);
-        {
-            let gc_bucket = &self.log_partitions[log_no].gc_buckets[gc_no];
-            let mut g = gc_bucket.active_sts_list.lock();
-            g.insert(sts);
-            if g.len() == 1 {
-                // Only when the previous list is empty, we should update min_active_sts
-                // as STS of current transaction.
-                // In this case, current value of min_active_sts should be MAX.
-                debug_assert!(gc_bucket.min_active_sts.load(Ordering::Relaxed) == MAX_SNAPSHOT_TS);
-                gc_bucket.min_active_sts.store(sts, Ordering::Relaxed);
-            }
+            self.rr_partition_id.fetch_add(1, Ordering::Relaxed) % self.config.log_partitions
         }
-        ActiveTrx::new(session, trx_id, sts, log_no, gc_no)
     }
 
     #[inline]
@@ -356,14 +360,6 @@ impl Drop for TransactionSystem {
             partition.aio_mgr.drop_sparse_file(log_file);
         }
     }
-}
-
-#[inline]
-fn gc_no(sts: TrxID) -> usize {
-    let mut hasher = DefaultHasher::default();
-    sts.hash(&mut hasher);
-    let value = hasher.finish();
-    value as usize % GC_BUCKETS
 }
 
 #[derive(Default)]
