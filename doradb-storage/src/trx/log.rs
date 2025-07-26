@@ -104,6 +104,7 @@ impl LogPartitionInitializer {
             LogPartition {
                 group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
                 persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+                rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
                 stats: CachePadded::new(LogPartitionStats::default()),
                 gc_chan,
                 gc_buckets: gc_info.into_boxed_slice(),
@@ -139,6 +140,8 @@ pub(super) struct LogPartition {
     pub(super) group_commit: CachePadded<MutexGroupCommit>,
     /// Maximum persisted CTS of this partition.
     pub(super) persisted_cts: CachePadded<AtomicU64>,
+    /// Round-robin GC number generator.
+    rr_gc_no: CachePadded<AtomicUsize>,
     /// Stats of transaction system.
     pub(super) stats: CachePadded<LogPartitionStats>,
     /// GC channel to send committed transactions to GC threads.
@@ -171,6 +174,12 @@ pub(super) struct LogPartition {
 }
 
 impl LogPartition {
+    /// Returns next GC number.
+    /// It is used to evenly dispatch transactions to all GC buckets.
+    pub fn next_gc_no(&self) -> usize {
+        self.rr_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
+    }
+
     /// Create a new log buffer to hold one transaction's redo log.
     #[inline]
     fn new_buf(&self, serde_ctx: &SerdeCtx, data: LenPrefixPod<RedoHeader, RedoLogs>) -> Buf {
