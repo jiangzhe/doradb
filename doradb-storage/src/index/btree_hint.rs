@@ -79,6 +79,7 @@ unsafe fn search_hints_avx2(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
 }
 
 /// Search hints fallback method.
+#[allow(dead_code)]
 #[inline]
 fn search_hints_scalar(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
     let i = hints.partition_point(|&h| h < key_head);

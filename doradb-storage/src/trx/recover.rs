@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
 use crate::serde::LenPrefixPod;
-use crate::table::{Table, TableID};
+use crate::table::{Table, TableAccess, TableID, TableRecover};
 use crate::trx::log::{LogMerger, LogPartition, LogPartitionInitializer, LogPartitionStream};
 use crate::trx::purge::GC;
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RowRedo, RowRedoKind, TableDML};
@@ -161,6 +161,8 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
     async fn recover_indexes_and_refresh_pages(&mut self) {
         // recover index with all data.
         // todo: integrate with checkpoint in future.
+        // Insert part is simple.
+        // Update and Delete require a robust consideration.
         for (table_id, pages) in &self.recovered_tables {
             if let Some(table) = self.catalog.get_table(*table_id).await {
                 for page_id in pages {
@@ -302,12 +304,12 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
-                    table
-                        .insert_row_no_trx(self.catalog.meta_pool(), vals)
-                        .await;
+                    table.insert_no_trx(self.catalog.meta_pool(), vals).await;
                 }
                 RowRedoKind::DeleteByUniqueKey(key) => {
-                    table.delete_row_no_trx(self.catalog.meta_pool(), key).await;
+                    table
+                        .delete_unique_no_trx(self.catalog.meta_pool(), key)
+                        .await;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     // updates of catalog are implemented as DeleteByUniqueKey and Insert.
@@ -377,6 +379,7 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::row::ops::{SelectKey, UpdateCol};
     use crate::row::RowRead;
+    use crate::table::TableAccess;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
     use crate::value::Val;
@@ -626,7 +629,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut rows = 0usize;
             table
-                .scan_rows_uncommitted(engine.data_pool, |row| {
+                .table_scan_uncommitted(engine.data_pool, |row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
                     rows += if row.is_deleted() { 0 } else { 1 };
                     true

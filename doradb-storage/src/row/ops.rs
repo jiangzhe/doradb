@@ -125,6 +125,8 @@ impl SelectResult for SelectMvcc {
     const NOT_FOUND: SelectMvcc = SelectMvcc::NotFound;
 }
 
+pub type ScanMvcc = Vec<Vec<Val>>;
+
 pub enum ReadRow {
     Ok(Vec<Val>),
     NotFound,
@@ -222,6 +224,13 @@ pub enum UpdateIndex {
     Ok,
     WriteConflict,
     DuplicateKey,
+}
+
+impl UpdateIndex {
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        matches!(self, UpdateIndex::Ok)
+    }
 }
 
 pub enum InsertIndex {

@@ -1,6 +1,10 @@
-// pub mod schema;
+mod access;
+mod recover;
 #[cfg(test)]
 mod tests;
+
+pub use access::*;
+pub use recover::*;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
@@ -8,14 +12,15 @@ use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::index::util::Maskable;
 use crate::index::{
-    BlockIndex, IndexCompareExchange, RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
+    BlockIndex, IndexCompareExchange, IndexInsert, NonUniqueBTreeIndex, NonUniqueIndex,
+    RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex,
-    SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
+    InsertIndex, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex, SelectKey, SelectMvcc,
+    UndoCol, UpdateCol, UpdateIndex, UpdateRow,
 };
-use crate::row::{estimate_max_row_count, var_len_for_insert, Row, RowID, RowPage, RowRead};
+use crate::row::{estimate_max_row_count, var_len_for_insert, RowID, RowPage, RowRead};
 use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo};
@@ -97,232 +102,34 @@ impl Table {
     }
 
     #[inline]
-    pub async fn scan_rows_uncommitted<P: BufferPool, F>(
+    async fn index_lookup_unique_row_mvcc<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
-        mut row_action: F,
-    ) where
-        F: for<'a> FnMut(Row<'a>) -> bool,
-    {
-        // With cursor, we lock two pages in block index and one row page
-        // when scanning rows.
-        let mut cursor = self.blk_idx.cursor();
-        cursor.seek(0).await;
-        while let Some(leaf) = cursor.next().await {
-            let g = leaf.shared_async().await;
-            debug_assert!(g.page().is_leaf());
-            let blocks = g.page().leaf_blocks();
-            for block in blocks {
-                for page_entry in block.row_page_entries() {
-                    let row_page: PageSharedGuard<RowPage> = buf_pool
-                        .get_page(page_entry.page_id, LatchFallbackMode::Shared)
-                        .await
-                        .shared_async()
-                        .await;
-                    for row_access in row_page.read_all_rows() {
-                        if !row_action(row_access.row()) {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Select row with unique index with MVCC.
-    /// Result should be no more than one row.
-    #[inline]
-    pub async fn select_row_mvcc<P: BufferPool>(
-        &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &Statement,
         key: &SelectKey,
         user_read_set: &[usize],
+        row_id: RowID,
     ) -> SelectMvcc {
-        debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
-        debug_assert!({
-            !user_read_set.is_empty()
-                && user_read_set
-                    .iter()
-                    .zip(user_read_set.iter().skip(1))
-                    .all(|(l, r)| l < r)
-        });
-        let (page_guard, row_id) = loop {
-            match self.sec_idx[key.index_no]
-                .unique()
-                .unwrap()
-                .lookup(&key.vals, stmt.trx.sts)
-                .await
-            {
-                None => return SelectMvcc::NotFound,
-                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
-                    RowLocation::NotFound => return SelectMvcc::NotFound,
-                    RowLocation::ColSegment(..) => todo!(),
-                    RowLocation::RowPage(page_id) => {
-                        let page_guard = buf_pool
-                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                            .await
-                            .shared_async()
-                            .await;
-                        if validate_page_id(&page_guard, page_id) {
-                            break (page_guard, row_id);
-                        }
-                    }
-                },
-            }
-        };
-        let page = page_guard.page();
-        if !page.row_id_in_valid_range(row_id) {
-            return SelectMvcc::NotFound;
-        }
-        // MVCC read does not require row lock.
-        let access = page_guard.read_row_by_id(row_id);
-        match access.read_row_mvcc(&stmt.trx, &self.metadata, user_read_set, key) {
-            ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
-            ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
-        }
-    }
-
-    /// Select row with unique index in uncommitted mode.
-    #[inline]
-    pub async fn select_row_uncommitted<P: BufferPool, R, F>(
-        &self,
-        buf_pool: &'static P,
-        key: &SelectKey,
-        row_action: F,
-    ) -> Option<R>
-    where
-        for<'a> F: FnOnce(Row<'a>) -> R,
-    {
-        debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
-        let (page_guard, row_id) = loop {
-            match self.sec_idx[key.index_no]
-                .unique()
-                .unwrap()
-                .lookup(&key.vals, MIN_SNAPSHOT_TS)
-                .await
-            {
-                None => return None,
-                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
-                    RowLocation::NotFound => return None,
-                    RowLocation::ColSegment(..) => todo!(),
-                    RowLocation::RowPage(page_id) => {
-                        let page_guard = buf_pool
-                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                            .await
-                            .shared_async()
-                            .await;
-                        if validate_page_id(&page_guard, page_id) {
-                            break (page_guard, row_id);
-                        }
-                    }
-                },
-            }
-        };
-        let page = page_guard.page();
-        if !page.row_id_in_valid_range(row_id) {
-            return None;
-        }
-        let access = page_guard.read_row_by_id(row_id);
-        let row = access.row();
-        // latest version in row page.
-        if row.is_deleted() {
-            return None;
-        }
-        if row.is_key_different(&self.metadata, key) {
-            return None;
-        }
-        Some(row_action(row))
-    }
-
-    /// Insert row with MVCC.
-    /// This method will also take care of index update.
-    #[inline]
-    pub async fn insert_row<P: BufferPool>(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement,
-        cols: Vec<Val>,
-    ) -> InsertMvcc {
-        debug_assert!(cols.len() == self.metadata.col_count());
-        debug_assert!({
-            cols.iter()
-                .enumerate()
-                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
-        });
-        let keys = self.metadata.keys_for_insert(&cols);
-        // insert row into page with undo log linked.
-        let (row_id, page_guard) = self
-            .insert_row_internal(buf_pool, stmt, cols, RowUndoKind::Insert, None)
-            .await;
-        // insert index
-        for key in keys {
-            match self
-                .insert_index(buf_pool, stmt, key, row_id, &page_guard)
-                .await
-            {
-                InsertIndex::Ok => (),
-                InsertIndex::DuplicateKey => {
-                    return InsertMvcc::DuplicateKey;
+        match self.blk_idx.find_row(row_id).await {
+            RowLocation::NotFound => SelectMvcc::NotFound,
+            RowLocation::ColSegment(..) => todo!(),
+            RowLocation::RowPage(page_id) => {
+                let page_guard = data_pool
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                let page = page_guard.page();
+                if !page.row_id_in_valid_range(row_id) {
+                    return SelectMvcc::NotFound;
                 }
-                InsertIndex::WriteConflict => {
-                    return InsertMvcc::WriteConflict;
+                // MVCC read does not require row lock.
+                let access = page_guard.read_row_by_id(row_id);
+                match access.read_row_mvcc(&stmt.trx, &self.metadata, user_read_set, key) {
+                    ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
+                    ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
                 }
             }
-        }
-        page_guard.set_dirty(); // mark as dirty page.
-        InsertMvcc::Ok(row_id)
-    }
-
-    #[inline]
-    pub async fn insert_row_no_trx<P: BufferPool>(&self, buf_pool: &'static P, cols: &[Val]) {
-        debug_assert!(cols.len() == self.metadata.col_count());
-        debug_assert!({
-            cols.iter()
-                .enumerate()
-                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
-        });
-        // prepare index keys.
-        let keys = self.metadata.keys_for_insert(cols);
-        // calculate row length.
-        let row_len = row_len(&self.metadata, cols);
-        // estimate max row count for insert page.
-        let row_count = estimate_max_row_count(row_len, self.metadata.col_count());
-        loop {
-            // acquire insert page from block index.
-            let mut page_guard = self
-                .blk_idx
-                .get_insert_page_exclusive(buf_pool, row_count, &self.metadata)
-                .await;
-            let page = page_guard.page_mut();
-            debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
-            debug_assert!(cols.len() == page.header.col_count as usize);
-            let var_len = var_len_for_insert(&self.metadata, cols);
-            let (row_idx, var_offset) =
-                if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
-                    (row_idx, var_offset)
-                } else {
-                    // we just ignore this page and retry.
-                    continue;
-                };
-            let row_id = page.header.start_row_id + row_idx as RowID;
-            let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
-            debug_assert!(row.is_deleted());
-            for (col_idx, user_col) in cols.iter().enumerate() {
-                row.update_col(col_idx, user_col, false);
-            }
-            // update index
-            for key in keys {
-                self.insert_index_no_trx(key, row_id).await;
-            }
-            row.finish_insert();
-            // Cache insert page.
-            self.blk_idx.cache_exclusive_insert_page(page_guard);
-            return;
         }
     }
 
@@ -332,68 +139,32 @@ impl Table {
             let res = self.sec_idx[key.index_no]
                 .unique()
                 .unwrap()
-                .insert_if_not_exists(&key.vals, row_id, MIN_SNAPSHOT_TS)
+                .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
-            assert!(res.is_none());
+            assert!(res.is_ok());
         } else {
-            todo!()
+            self.sec_idx[key.index_no]
+                .non_unique()
+                .unwrap()
+                .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                .await;
         }
     }
 
     #[inline]
-    pub async fn insert_index<P: BufferPool>(
+    async fn insert_index<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> InsertIndex {
         if self.metadata.index_specs[key.index_no].unique() {
-            self.insert_unique_index(buf_pool, stmt, key, row_id, page_guard)
+            self.insert_unique_index(data_pool, stmt, key, row_id, page_guard)
                 .await
         } else {
-            todo!()
-        }
-    }
-
-    /// Recover row insert from redo log.
-    #[inline]
-    pub async fn recover_row_insert<P: BufferPool>(
-        &self,
-        data_pool: &'static P,
-        page_id: PageID,
-        row_id: RowID,
-        cols: &[Val],
-        cts: TrxID,
-        disable_index: bool,
-    ) {
-        debug_assert!(cols.len() == self.metadata.col_count());
-        debug_assert!({
-            cols.iter()
-                .enumerate()
-                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
-        });
-        // Since we always dispatch rows of one page to same thread,
-        // we can just hold exclusive lock on this page and process all rows in it.
-        let mut page_guard = data_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
-            .await
-            .exclusive_async()
-            .await;
-
-        let res = self.recover_row_insert_to_page(&mut page_guard, row_id, cols, cts);
-        assert!(res.is_ok());
-        page_guard.set_dirty(); // mark as dirty page.
-
-        if !disable_index {
-            let keys = self.metadata.keys_for_insert(cols);
-            for key in keys {
-                match self.recover_index_insert(data_pool, key, row_id, cts).await {
-                    RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
-                    RecoverIndex::DeleteOutdated => unreachable!(),
-                }
-            }
+            self.insert_non_unique_index(stmt, key, row_id).await
         }
     }
 
@@ -431,102 +202,27 @@ impl Table {
     }
 
     #[inline]
-    pub async fn recover_index_insert<P: BufferPool>(
+    async fn recover_index_insert<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
     ) -> RecoverIndex {
         if self.metadata.index_specs[key.index_no].unique() {
-            self.recover_unique_index_insert(buf_pool, key, row_id, cts)
+            self.recover_unique_index_insert(data_pool, key, row_id, cts)
                 .await
         } else {
-            todo!()
+            self.recover_non_unique_index_insert(key, row_id).await
         }
     }
 
     #[inline]
-    pub async fn recover_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+    async fn recover_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
         if self.metadata.index_specs[key.index_no].unique() {
             self.recover_unique_index_delete(key, row_id).await
         } else {
-            todo!()
-        }
-    }
-
-    /// Recover row update.
-    #[inline]
-    pub async fn recover_row_update<P: BufferPool>(
-        &self,
-        data_pool: &'static P,
-        page_id: PageID,
-        row_id: RowID,
-        update: &[UpdateCol],
-        cts: TrxID,
-        disable_index: bool,
-    ) {
-        let mut page_guard = data_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
-            .await
-            .exclusive_async()
-            .await;
-
-        if disable_index {
-            let res = self.recover_row_update_to_page(&mut page_guard, row_id, update, cts, None);
-            assert!(res.is_ok());
-            page_guard.set_dirty(); // mark as dirty page.
-        } else {
-            let mut index_change_cols = HashMap::new();
-            let res = self.recover_row_update_to_page(
-                &mut page_guard,
-                row_id,
-                update,
-                cts,
-                Some(&mut index_change_cols),
-            );
-            assert!(res.is_ok());
-            page_guard.set_dirty(); // mark as dirty page.
-
-            if !index_change_cols.is_empty() {
-                // There is index change, we need to update index.
-                let page_guard = data_pool
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                    .await
-                    .shared_async()
-                    .await;
-
-                for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
-                    debug_assert!(index.is_unique() == index_schema.unique());
-                    if index_schema.unique() {
-                        if index_key_is_changed(index_schema, &index_change_cols) {
-                            let new_key = read_latest_index_key(
-                                &self.metadata,
-                                index.index_no,
-                                &page_guard,
-                                row_id,
-                            );
-                            let old_key =
-                                index_key_replace(index_schema, &new_key, &index_change_cols);
-                            // insert new index entry.
-                            match self
-                                .recover_index_insert(data_pool, new_key, row_id, cts)
-                                .await
-                            {
-                                RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
-                                RecoverIndex::DeleteOutdated => unreachable!(),
-                            }
-                            // delete old index entry.
-                            match self.recover_index_delete(old_key, row_id).await {
-                                RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
-                                RecoverIndex::InsertOutdated => unreachable!(),
-                            }
-                        }
-                    } else {
-                        todo!();
-                    }
-                }
-            }
+            self.recover_non_unique_index_delete(key, row_id).await
         }
     }
 
@@ -601,58 +297,6 @@ impl Table {
         }
     }
 
-    /// Recover row delete.
-    #[inline]
-    pub async fn recover_row_delete<P: BufferPool>(
-        &self,
-        data_pool: &'static P,
-        page_id: PageID,
-        row_id: RowID,
-        cts: TrxID,
-        disable_index: bool,
-    ) {
-        let mut page_guard = data_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
-            .await
-            .exclusive_async()
-            .await;
-
-        if disable_index {
-            let res = self.recover_row_delete_to_page(&mut page_guard, row_id, cts, None);
-            assert!(res.is_ok());
-            page_guard.set_dirty(); // mark as dirty page.
-        } else {
-            let mut index_cols = HashMap::new();
-            let res = self.recover_row_delete_to_page(
-                &mut page_guard,
-                row_id,
-                cts,
-                Some(&mut index_cols),
-            );
-            assert!(res.is_ok());
-            page_guard.set_dirty(); // mark as dirty page.
-
-            for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
-                debug_assert!(index.is_unique() == index_schema.unique());
-                if index_schema.unique() {
-                    let vals: Vec<Val> = index_schema
-                        .index_cols
-                        .iter()
-                        .map(|ik| index_cols[&(ik.col_no as usize)].clone())
-                        .collect();
-                    let key = SelectKey::new(index.index_no, vals);
-                    // delete old index entry.
-                    match self.recover_index_delete(key, row_id).await {
-                        RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
-                        RecoverIndex::InsertOutdated => unreachable!(),
-                    }
-                } else {
-                    todo!();
-                }
-            }
-        }
-    }
-
     #[inline]
     fn recover_row_delete_to_page(
         &self,
@@ -682,241 +326,22 @@ impl Table {
         Recover::Ok
     }
 
-    /// Update row with MVCC.
-    /// This method is for update based on unique index lookup.
-    /// It also takes care of index change.
-    ///
-    /// If parameter disable_inplace is set to true, update will be
-    /// converted to delete+insert.
-    #[inline]
-    pub async fn update_row<P: BufferPool>(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement,
-        key: &SelectKey,
-        update: Vec<UpdateCol>,
-        disable_inplace: bool,
-    ) -> UpdateMvcc {
-        debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
-        let index = self.sec_idx[key.index_no].unique().unwrap();
-        let (page_guard, row_id) = loop {
-            match index.lookup(&key.vals, stmt.trx.sts).await {
-                None => return UpdateMvcc::NotFound,
-                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
-                    RowLocation::NotFound => return UpdateMvcc::NotFound,
-                    RowLocation::ColSegment(..) => todo!(),
-                    RowLocation::RowPage(page_id) => {
-                        let page_guard = buf_pool
-                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                            .await
-                            .shared_async()
-                            .await;
-                        if validate_page_id(&page_guard, page_id) {
-                            break (page_guard, row_id);
-                        }
-                    }
-                },
-            }
-        };
-        if disable_inplace {
-            todo!()
-        }
-        let res = self
-            .update_row_inplace(stmt, page_guard, key, row_id, update)
-            .await;
-        match res {
-            UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
-                debug_assert!(row_id == new_row_id);
-                if !index_change_cols.is_empty() {
-                    // Index may change, we should check whether each index key change and update correspondingly.
-                    let res = self
-                        .update_indexes_only_key_change(
-                            buf_pool,
-                            stmt,
-                            row_id,
-                            &page_guard,
-                            &index_change_cols,
-                        )
-                        .await;
-                    page_guard.set_dirty(); // mark as dirty page.
-                    return match res {
-                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
-                    };
-                } // otherwise, do nothing
-                page_guard.set_dirty(); // mark as dirty page.
-                UpdateMvcc::Ok(row_id)
-            }
-            UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => UpdateMvcc::NotFound,
-            UpdateRowInplace::WriteConflict => UpdateMvcc::WriteConflict,
-            UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
-                // in-place update failed, we transfer update into
-                // move+update.
-                let (new_row_id, index_change_cols, new_guard) = self
-                    .move_update_for_space(buf_pool, stmt, old_row, update, old_row_id, old_guard)
-                    .await;
-                if !index_change_cols.is_empty() {
-                    let res = self
-                        .update_indexes_may_both_change(
-                            buf_pool,
-                            stmt,
-                            old_row_id,
-                            new_row_id,
-                            &index_change_cols,
-                            &new_guard,
-                        )
-                        .await;
-                    // old guard is already marked inside.
-                    new_guard.set_dirty(); // mark as dirty page.
-                    match res {
-                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
-                    }
-                } else {
-                    let res = self
-                        .update_indexes_only_row_id_change(stmt, old_row_id, new_row_id, &new_guard)
-                        .await;
-                    new_guard.set_dirty(); // mark as dirty page.
-                    match res {
-                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
-                    }
-                }
-            }
-        }
-    }
-
-    /// Delete row with MVCC.
-    /// This method is for delete based on unique index lookup.
-    ///
-    /// If the parameter log_by_key is set to true, the delete operation
-    /// is logged with (unique) key instead of row id.
-    /// Such type of log is used for catalog tables, which will have
-    /// inconsistent page_id/row_id among multiple restarts(recoveries)
-    /// of database.
-    #[inline]
-    pub async fn delete_row<P: BufferPool>(
-        &self,
-        buf_pool: &'static P,
-        stmt: &mut Statement,
-        key: &SelectKey,
-        log_by_key: bool,
-    ) -> DeleteMvcc {
-        debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
-        let index = self.sec_idx[key.index_no].unique().unwrap();
-        let (page_guard, row_id) = loop {
-            match index.lookup(&key.vals, stmt.trx.sts).await {
-                None => return DeleteMvcc::NotFound,
-                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
-                    RowLocation::NotFound => return DeleteMvcc::NotFound,
-                    RowLocation::ColSegment(..) => todo!(),
-                    RowLocation::RowPage(page_id) => {
-                        let page_guard = buf_pool
-                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                            .await
-                            .shared_async()
-                            .await;
-                        if validate_page_id(&page_guard, page_id) {
-                            break (page_guard, row_id);
-                        }
-                    }
-                },
-            }
-        };
-        match self
-            .delete_row_internal(stmt, page_guard, row_id, key, log_by_key)
-            .await
-        {
-            DeleteInternal::NotFound => DeleteMvcc::NotFound,
-            DeleteInternal::WriteConflict => DeleteMvcc::WriteConflict,
-            DeleteInternal::Ok(page_guard) => {
-                // defer index deletion with index undo log.
-                self.defer_delete_indexes(stmt, row_id, &page_guard).await;
-                page_guard.set_dirty(); // mark as dirty.
-                DeleteMvcc::Ok
-            }
-        }
-    }
-
-    #[inline]
-    pub async fn delete_row_no_trx<P: BufferPool>(&self, buf_pool: &'static P, key: &SelectKey) {
-        debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
-        let index = self.sec_idx[key.index_no].unique().unwrap();
-        let (mut page_guard, row_id) = match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await {
-            None => unreachable!(),
-            Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
-                RowLocation::NotFound => unreachable!(),
-                RowLocation::ColSegment(..) => todo!(),
-                RowLocation::RowPage(page_id) => {
-                    let page_guard = buf_pool
-                        .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
-                        .await
-                        .exclusive_async()
-                        .await;
-                    (page_guard, row_id)
-                }
-            },
-        };
-        let page = page_guard.page_mut();
-        let row_idx = page.row_idx(row_id);
-        debug_assert!(!page.is_deleted(row_idx));
-        let row = page.row(row_idx);
-        let keys = self.metadata.keys_for_delete(row);
-        // delete index immediately.
-        for key in keys {
-            let res = self.delete_index_directly(&key, row_id).await;
-            assert!(res);
-        }
-        page.set_deleted_exclusive(row_idx, true);
-    }
-
+    /// Directly delete a index entry.
+    /// It will ignore delete flag, and won't update page ts.
     #[inline]
     async fn delete_index_directly(&self, key: &SelectKey, row_id: RowID) -> bool {
         let index_schema = &self.metadata.index_specs[key.index_no];
         if index_schema.unique() {
             let index = self.sec_idx[key.index_no].unique().unwrap();
-            return index
+            index
                 .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
-                .await;
+                .await
+        } else {
+            let index = self.sec_idx[key.index_no].non_unique().unwrap();
+            index
+                .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+                .await
         }
-        todo!()
-    }
-
-    /// Delete index by purge threads.
-    /// This method will be only called by internal threads and don't maintain
-    /// transaction properties.
-    ///
-    /// It checks whether the index entry still points to valid row, and if not,
-    /// remove the entry.
-    ///
-    /// The validation is based on MVCC with minimum active STS. If the input
-    /// key is not found on the path of undo chain, it means the index entry can be
-    /// removed.
-    #[inline]
-    pub async fn delete_index<P: BufferPool>(
-        &self,
-        data_pool: &'static P,
-        key: &SelectKey,
-        row_id: RowID,
-    ) -> bool {
-        // todo: consider index drop.
-        let index_schema = &self.metadata.index_specs[key.index_no];
-        if index_schema.unique() {
-            let index = self.sec_idx[key.index_no].unique().unwrap();
-            return self
-                .delete_unique_index(data_pool, index, key, row_id)
-                .await;
-        }
-        todo!()
     }
 
     #[inline]
@@ -972,12 +397,68 @@ impl Table {
         false
     }
 
+    #[inline]
+    async fn delete_non_unique_index<P: BufferPool>(
+        &self,
+        data_pool: &'static P,
+        index: &NonUniqueBTreeIndex,
+        key: &SelectKey,
+        row_id: RowID,
+    ) -> bool {
+        let (page_guard, row_id) = loop {
+            match index
+                .lookup_unique(&key.vals, row_id, MIN_SNAPSHOT_TS)
+                .await
+            {
+                None => return false, // Another thread deleted this entry.
+                Some(deleted) => {
+                    if !deleted {
+                        // 1. Delete flag is unset by other transaction,
+                        // so we skip to delete it.
+                        // 2. Row id changed, means another transaction inserted
+                        // new row with same key and reused this index entry.
+                        // So we skip to delete it.
+                        return false;
+                    }
+                    match self.blk_idx.find_row(row_id).await {
+                        RowLocation::NotFound => {
+                            return index
+                                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                                .await;
+                        }
+                        RowLocation::ColSegment(..) => todo!(),
+                        RowLocation::RowPage(page_id) => {
+                            let page_guard = data_pool
+                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                                .await
+                                .shared_async()
+                                .await;
+                            if validate_page_row_range(&page_guard, page_id, row_id) {
+                                break (page_guard, row_id);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let access = page_guard.read_row_by_id(row_id);
+        // To safely delete an index entry, we need to make sure
+        // no version with matched keys can be found in either page
+        // data or version chain.
+        if !access.any_version_matches_key(&self.metadata, key) {
+            return index
+                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                .await;
+        }
+        false
+    }
+
     /// Move update is similar to a delete+insert.
     /// It's caused by no more space on current row page.
     #[inline]
     async fn move_update_for_space<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         old_row: Vec<(Val, Option<u16>)>,
         update: Vec<UpdateCol>,
@@ -1013,7 +494,7 @@ impl Table {
         };
         let (new_row_id, new_guard) = self
             .insert_row_internal(
-                buf_pool,
+                data_pool,
                 stmt,
                 new_row,
                 undo_kind,
@@ -1039,7 +520,7 @@ impl Table {
     #[inline]
     async fn link_for_unique_index<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &Statement,
         old_id: RowID,
         key: &SelectKey,
@@ -1052,7 +533,7 @@ impl Table {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::ColSegment(..) => todo!(),
                 RowLocation::RowPage(page_id) => {
-                    let old_guard = buf_pool
+                    let old_guard = data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .shared_async()
@@ -1083,7 +564,7 @@ impl Table {
     #[inline]
     async fn insert_row_internal<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
@@ -1092,7 +573,7 @@ impl Table {
         let row_len = row_len(&self.metadata, &insert);
         let row_count = estimate_max_row_count(row_len, self.metadata.col_count());
         loop {
-            let page_guard = self.get_insert_page(buf_pool, stmt, row_count).await;
+            let page_guard = self.get_insert_page(data_pool, stmt, row_count).await;
             let page_id = page_guard.page_id();
             match self.insert_row_to_page(stmt, page_guard, insert, undo_kind, move_entry) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
@@ -1379,12 +860,12 @@ impl Table {
     #[inline]
     async fn get_insert_page<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         row_count: usize,
     ) -> PageSharedGuard<RowPage> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
-            let page_guard = buf_pool
+            let page_guard = data_pool
                 .get_page(page_id, LatchFallbackMode::Shared)
                 .await
                 .shared_async()
@@ -1398,7 +879,7 @@ impl Table {
             }
         }
         self.blk_idx
-            .get_insert_page(buf_pool, row_count, &self.metadata)
+            .get_insert_page(data_pool, row_count, &self.metadata)
             .await
     }
 
@@ -1455,7 +936,7 @@ impl Table {
     #[inline]
     async fn insert_unique_index<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         key: SelectKey,
         row_id: RowID,
@@ -1464,15 +945,15 @@ impl Table {
         let index = self.sec_idx[key.index_no].unique().unwrap();
         loop {
             match index
-                .insert_if_not_exists(&key.vals, row_id, stmt.trx.sts)
+                .insert_if_not_exists(&key.vals, row_id, false, stmt.trx.sts)
                 .await
             {
-                None => {
+                IndexInsert::Ok(merged) => {
                     // insert index success.
-                    stmt.push_insert_unique_index_undo(self.table_id(), row_id, key);
+                    stmt.push_insert_unique_index_undo(self.table_id(), row_id, key, merged);
                     return InsertIndex::Ok;
                 }
-                Some((old_row_id, deleted)) => {
+                IndexInsert::DuplicateKey(old_row_id, deleted) => {
                     // we found there is already one existing row with same key.
                     // so perform move+link.
                     debug_assert!(old_row_id != row_id);
@@ -1482,7 +963,9 @@ impl Table {
                         return InsertIndex::DuplicateKey;
                     }
                     match self
-                        .link_for_unique_index(buf_pool, stmt, old_row_id, &key, row_id, page_guard)
+                        .link_for_unique_index(
+                            data_pool, stmt, old_row_id, &key, row_id, page_guard,
+                        )
                         .await
                     {
                         LinkForUniqueIndex::DuplicateKey => return InsertIndex::DuplicateKey,
@@ -1566,9 +1049,31 @@ impl Table {
     }
 
     #[inline]
+    async fn insert_non_unique_index(
+        &self,
+        stmt: &mut Statement,
+        key: SelectKey,
+        row_id: RowID,
+    ) -> InsertIndex {
+        let index = self.sec_idx[key.index_no].non_unique().unwrap();
+        // For non-unique index, it's guaranteed to be success.
+        match index
+            .insert_if_not_exists(&key.vals, row_id, false, stmt.trx.sts)
+            .await
+        {
+            IndexInsert::Ok(merged) => {
+                // insert index success.
+                stmt.push_insert_non_unique_index_undo(self.table_id(), row_id, key, merged);
+                InsertIndex::Ok
+            }
+            IndexInsert::DuplicateKey(..) => unreachable!(),
+        }
+    }
+
+    #[inline]
     async fn recover_unique_index_insert<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
@@ -1576,17 +1081,20 @@ impl Table {
         let index = self.sec_idx[key.index_no].unique().unwrap();
         loop {
             match index
-                .insert_if_not_exists(&key.vals, row_id, MIN_SNAPSHOT_TS)
+                .insert_if_not_exists(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await
             {
-                None => {
+                IndexInsert::Ok(_) => {
                     // insert index success.
                     return RecoverIndex::Ok;
                 }
-                Some((old_row_id, deleted)) => {
+                IndexInsert::DuplicateKey(old_row_id, deleted) => {
                     debug_assert!(old_row_id != row_id);
                     // Find CTS of old row.
-                    match self.find_recover_cts_for_row_id(buf_pool, old_row_id).await {
+                    match self
+                        .find_recover_cts_for_row_id(data_pool, old_row_id)
+                        .await
+                    {
                         Some(old_cts) => {
                             if cts < old_cts {
                                 // Current row has smaller CTS, that means this insert
@@ -1622,6 +1130,17 @@ impl Table {
     }
 
     #[inline]
+    async fn recover_non_unique_index_insert(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+        let index = self.sec_idx[key.index_no].non_unique().unwrap();
+        // The recovery should make sure no duplicate key.
+        let res = index
+            .insert_if_not_exists(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+            .await;
+        debug_assert!(matches!(res, IndexInsert::Ok(_)));
+        RecoverIndex::Ok
+    }
+
+    #[inline]
     async fn recover_unique_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
         let index = self.sec_idx[key.index_no].unique().unwrap();
         if !index
@@ -1636,16 +1155,28 @@ impl Table {
     }
 
     #[inline]
+    async fn recover_non_unique_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+        let index = self.sec_idx[key.index_no].non_unique().unwrap();
+        if !index
+            .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+            .await
+        {
+            return RecoverIndex::DeleteOutdated;
+        }
+        RecoverIndex::Ok
+    }
+
+    #[inline]
     async fn find_recover_cts_for_row_id<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         row_id: RowID,
     ) -> Option<TrxID> {
         match self.blk_idx.find_row(row_id).await {
             RowLocation::NotFound => None,
             RowLocation::ColSegment(..) => todo!(),
             RowLocation::RowPage(page_id) => {
-                let page_guard = buf_pool
+                let page_guard = data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -1661,7 +1192,7 @@ impl Table {
     #[inline]
     async fn update_indexes_only_key_change<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
@@ -1669,17 +1200,17 @@ impl Table {
     ) -> UpdateIndex {
         for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
-            if index_schema.unique() {
-                if index_key_is_changed(index_schema, index_change_cols) {
-                    let new_key =
-                        read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
-                    let old_key = index_key_replace(index_schema, &new_key, index_change_cols);
-                    // First we need to insert new entry to index due to key change.
-                    // There might be conflict we will try to fix (if old one is already deleted).
-                    // Once the insert is done, we also need to defer deletion of original key.
-                    return self
+            if index_key_is_changed(index_schema, index_change_cols) {
+                let new_key =
+                    read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
+                let old_key = index_key_replace(index_schema, &new_key, index_change_cols);
+                // First we need to insert new entry to index due to key change.
+                // There might be conflict we will try to fix (if old one is already deleted).
+                // Once the insert is done, we also need to defer deletion of original key.
+                if index_schema.unique() {
+                    match self
                         .update_unique_index_only_key_change(
-                            buf_pool,
+                            data_pool,
                             stmt,
                             index.unique().unwrap(),
                             old_key,
@@ -1687,11 +1218,25 @@ impl Table {
                             row_id,
                             page_guard,
                         )
+                        .await
+                    {
+                        UpdateIndex::Ok => (),
+                        UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
+                        UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
+                    }
+                } else {
+                    let res = self
+                        .update_non_unique_index_only_key_change(
+                            stmt,
+                            index.non_unique().unwrap(),
+                            old_key,
+                            new_key,
+                            row_id,
+                        )
                         .await;
-                } // otherwise, in-place update do not change row id, so we do nothing
-            } else {
-                todo!();
-            }
+                    assert!(res.is_ok());
+                }
+            } // otherwise, in-place update do not change row id, so we do nothing
         }
         UpdateIndex::Ok
     }
@@ -1707,10 +1252,9 @@ impl Table {
         debug_assert!(old_row_id != new_row_id);
         for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
+            let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
             if index_schema.unique() {
-                let key =
-                    read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
-                match self
+                let res = self
                     .update_unique_index_only_row_id_change(
                         stmt,
                         index.unique().unwrap(),
@@ -1718,14 +1262,19 @@ impl Table {
                         old_row_id,
                         new_row_id,
                     )
-                    .await
-                {
-                    UpdateIndex::Ok => (),
-                    UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
-                    UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
-                }
+                    .await;
+                assert!(res.is_ok());
             } else {
-                todo!();
+                let res = self
+                    .update_non_unique_index_only_row_id_change(
+                        stmt,
+                        index.non_unique().unwrap(),
+                        key,
+                        old_row_id,
+                        new_row_id,
+                    )
+                    .await;
+                assert!(res.is_ok());
             }
         }
         UpdateIndex::Ok
@@ -1734,7 +1283,7 @@ impl Table {
     #[inline]
     async fn update_indexes_may_both_change<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         old_row_id: RowID,
         new_row_id: RowID,
@@ -1744,15 +1293,14 @@ impl Table {
         debug_assert!(old_row_id != new_row_id);
         for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
-            if index_schema.unique() {
-                let key =
-                    read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
-                if index_key_is_changed(index_schema, index_change_cols) {
-                    let old_key = index_key_replace(index_schema, &key, index_change_cols);
-                    // key change and row id change.
+            let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
+            if index_key_is_changed(index_schema, index_change_cols) {
+                let old_key = index_key_replace(index_schema, &key, index_change_cols);
+                // key change and row id change.
+                if index_schema.unique() {
                     match self
                         .update_unique_index_key_and_row_id_change(
-                            buf_pool,
+                            data_pool,
                             stmt,
                             index.unique().unwrap(),
                             old_key,
@@ -1768,7 +1316,21 @@ impl Table {
                         UpdateIndex::Ok => (),
                     }
                 } else {
-                    // only row id change.
+                    let res = self
+                        .update_non_unique_index_key_and_row_id_change(
+                            stmt,
+                            index.non_unique().unwrap(),
+                            old_key,
+                            key,
+                            old_row_id,
+                            new_row_id,
+                        )
+                        .await;
+                    assert!(res.is_ok());
+                }
+            } else {
+                // only row id change.
+                if index_schema.unique() {
                     match self
                         .update_unique_index_only_row_id_change(
                             stmt,
@@ -1783,9 +1345,18 @@ impl Table {
                         UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
                         UpdateIndex::Ok => (),
                     }
+                } else {
+                    let res = self
+                        .update_non_unique_index_only_row_id_change(
+                            stmt,
+                            index.non_unique().unwrap(),
+                            key,
+                            old_row_id,
+                            new_row_id,
+                        )
+                        .await;
+                    assert!(res.is_ok());
                 }
-            } else {
-                todo!();
             }
         }
         UpdateIndex::Ok
@@ -1801,13 +1372,15 @@ impl Table {
     ) {
         for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
+            let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
             if index_schema.unique() {
-                let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
                 let index = index.unique().unwrap();
                 self.defer_delete_unique_index(stmt, index, row_id, key)
                     .await;
             } else {
-                todo!();
+                let index = index.non_unique().unwrap();
+                self.defer_delete_non_unique_index(stmt, index, row_id, key)
+                    .await;
             }
         }
     }
@@ -1822,14 +1395,27 @@ impl Table {
     ) {
         let res = index.mask_as_deleted(&key.vals, row_id, stmt.trx.sts).await;
         debug_assert!(res); // should always succeed.
-        stmt.push_delete_index_undo(self.table_id(), row_id, key);
+        stmt.push_delete_index_undo(self.table_id(), row_id, key, true);
+    }
+
+    #[inline]
+    async fn defer_delete_non_unique_index(
+        &self,
+        stmt: &mut Statement,
+        index: &NonUniqueBTreeIndex,
+        row_id: RowID,
+        key: SelectKey,
+    ) {
+        let res = index.mask_as_deleted(&key.vals, row_id, stmt.trx.sts).await;
+        debug_assert!(res);
+        stmt.push_delete_index_undo(self.table_id(), row_id, key, false);
     }
 
     #[allow(clippy::too_many_arguments)]
     #[inline]
     async fn update_unique_index_key_and_row_id_change<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         index: &UniqueBTreeIndex,
         old_key: SelectKey,
@@ -1840,19 +1426,21 @@ impl Table {
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
         loop {
+            // new_row_id is guaranteed to be not in the index.
             match index
-                .insert_if_not_exists(&new_key.vals, new_row_id, stmt.trx.sts)
+                .insert_if_not_exists(&new_key.vals, new_row_id, false, stmt.trx.sts)
                 .await
             {
-                None => {
+                IndexInsert::Ok(merged) => {
+                    debug_assert!(!merged);
                     // New key insert succeed.
-                    stmt.push_insert_unique_index_undo(self.table_id(), new_row_id, new_key);
+                    stmt.push_insert_unique_index_undo(self.table_id(), new_row_id, new_key, false);
                     // mark index of old row as deleted and defer delete.
                     self.defer_delete_unique_index(stmt, index, old_row_id, old_key)
                         .await;
                     return UpdateIndex::Ok;
                 }
-                Some((index_row_id, deleted)) => {
+                IndexInsert::DuplicateKey(index_row_id, deleted) => {
                     // new row id is the insert id so index value must not be the same.
                     debug_assert!(index_row_id != new_row_id);
                     if !deleted {
@@ -1877,6 +1465,10 @@ impl Table {
                         // key=2 -> RowID=100 (old version)
                         //
                         // In this case, we can just update index to point to new version.
+                        //
+                        // There can be an optimization to combine the update into insert.
+                        // e.g. add a new method BTree::insert_if_not_exists_or_merge_match_value().
+                        // But I think the case is rare so keep as is.
                         match index
                             .compare_exchange(
                                 &new_key.vals,
@@ -1914,7 +1506,7 @@ impl Table {
                     // See comments of method link_for_unique_index().
                     match self
                         .link_for_unique_index(
-                            buf_pool,
+                            data_pool,
                             stmt,
                             index_row_id,
                             &new_key,
@@ -2009,6 +1601,35 @@ impl Table {
     }
 
     #[inline]
+    async fn update_non_unique_index_key_and_row_id_change(
+        &self,
+        stmt: &mut Statement,
+        index: &NonUniqueBTreeIndex,
+        old_key: SelectKey,
+        new_key: SelectKey,
+        old_row_id: RowID,
+        new_row_id: RowID,
+    ) -> UpdateIndex {
+        debug_assert!(old_row_id != new_row_id);
+        // new_row_id is guaranteed to be not in the index.
+        match index
+            .insert_if_not_exists(&new_key.vals, new_row_id, false, stmt.trx.sts)
+            .await
+        {
+            IndexInsert::Ok(merged) => {
+                debug_assert!(!merged);
+                // New key insert succeed.
+                stmt.push_insert_non_unique_index_undo(self.table_id(), new_row_id, new_key, false);
+                // mark index of old row as deleted and defer delete.
+                self.defer_delete_non_unique_index(stmt, index, old_row_id, old_key)
+                    .await;
+                UpdateIndex::Ok
+            }
+            IndexInsert::DuplicateKey(..) => unreachable!(),
+        }
+    }
+
+    #[inline]
     async fn update_unique_index_only_row_id_change(
         &self,
         stmt: &mut Statement,
@@ -2038,6 +1659,28 @@ impl Table {
         }
     }
 
+    #[inline]
+    async fn update_non_unique_index_only_row_id_change(
+        &self,
+        stmt: &mut Statement,
+        index: &NonUniqueBTreeIndex,
+        key: SelectKey,
+        old_row_id: RowID,
+        new_row_id: RowID,
+    ) -> UpdateIndex {
+        debug_assert!(old_row_id != new_row_id);
+        // insert new entry.
+        let res = index
+            .insert_if_not_exists(&key.vals, new_row_id, false, stmt.trx.sts)
+            .await;
+        debug_assert!(res.is_ok());
+        stmt.push_insert_non_unique_index_undo(self.table_id(), new_row_id, key.clone(), false);
+        // defer delete old entry.
+        self.defer_delete_non_unique_index(stmt, index, old_row_id, key)
+            .await;
+        UpdateIndex::Ok
+    }
+
     /// Update unique index due to key change.
     /// In this scenario, we only need to insert pair of new key and row id
     /// into index. Keep old index entry as is.
@@ -2045,7 +1688,7 @@ impl Table {
     #[inline]
     async fn update_unique_index_only_key_change<P: BufferPool>(
         &self,
-        buf_pool: &'static P,
+        data_pool: &'static P,
         stmt: &mut Statement,
         index: &UniqueBTreeIndex,
         old_key: SelectKey,
@@ -2054,19 +1697,29 @@ impl Table {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         loop {
+            // This is case for one transaction or multiple transactions to update
+            // key of the same row back and forth.
+            // e.g. update k=1 to k=2, then update k=2 to k=1, ...
+            //
+            // Each update will mask old index entry as deleted, and try to insert a new
+            // entry, with same row id(Because it's the same row).
+            // And all old versions are also linked from the same row.
+            // That mean we can just merge the new index entry into the deleted entry(flip
+            // the delete flag) if key and row id all match.
+            // So we set merge_if_match_deleted to true.
             match index
-                .insert_if_not_exists(&new_key.vals, row_id, stmt.trx.sts)
+                .insert_if_not_exists(&new_key.vals, row_id, true, stmt.trx.sts)
                 .await
             {
-                None => {
+                IndexInsert::Ok(merged) => {
                     // Insert new key success.
-                    stmt.push_insert_unique_index_undo(self.table_id(), row_id, new_key);
+                    stmt.push_insert_unique_index_undo(self.table_id(), row_id, new_key, merged);
                     // Defer delete old key.
                     self.defer_delete_unique_index(stmt, index, row_id, old_key)
                         .await;
                     return UpdateIndex::Ok;
                 }
-                Some((index_row_id, deleted)) => {
+                IndexInsert::DuplicateKey(index_row_id, deleted) => {
                     // There is already a row with same new key.
                     // We have to check its status.
                     if !deleted {
@@ -2077,41 +1730,12 @@ impl Table {
                         // we need to check and wait if other is modifying.
                         return UpdateIndex::DuplicateKey;
                     }
-
-                    if index_row_id == row_id {
-                        // This is possible.
-                        // For example, transaction update row(RowID=100) key=1 to key=2.
-                        //
-                        // Then index has following entries:
-                        // key=1 -> RowID=100 (old version)
-                        // key=2 -> RowID=100 (latest version)
-                        //
-                        // Then we update key=2 to key=1 again.
-                        // Now we should have:
-                        // key=1 -> RowID=100 (latest version)
-                        // key=2 -> RowID=100 (old version)
-                        //
-                        // We need to unmask the old entry.
-                        match index
-                            .compare_exchange(
-                                &new_key.vals,
-                                index_row_id.deleted(),
-                                row_id,
-                                stmt.trx.sts,
-                            )
-                            .await
-                        {
-                            IndexCompareExchange::Ok => {
-                                return UpdateIndex::Ok;
-                            }
-                            IndexCompareExchange::Mismatch | IndexCompareExchange::NotExists => {
-                                continue;
-                            }
-                        }
-                    }
+                    // The assertion will always succeed because merge_if_match_deleted
+                    // is set to true.
+                    debug_assert!(index_row_id != row_id);
                     match self
                         .link_for_unique_index(
-                            buf_pool,
+                            data_pool,
                             stmt,
                             index_row_id,
                             &new_key,
@@ -2197,42 +1821,37 @@ impl Table {
         }
     }
 
-    /// Recover index with given page data.
     #[inline]
-    pub async fn populate_index_via_row_page<P: BufferPool>(
+    async fn update_non_unique_index_only_key_change(
         &self,
-        data_pool: &'static P,
-        page_id: PageID,
-    ) {
-        let page_guard = data_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+        stmt: &mut Statement,
+        index: &NonUniqueBTreeIndex,
+        old_key: SelectKey,
+        new_key: SelectKey,
+        row_id: RowID,
+    ) -> UpdateIndex {
+        // This is case for one transaction or multiple transactions to update
+        // key of the same row back and forth.
+        // e.g. update k=1 to k=2, then update k=2 to k=1, ...
+        //
+        // Each update will mask old index entry as deleted, and try to insert a new
+        // entry, with same row id(Because it's the same row).
+        // And all old versions are also linked from the same row.
+        // That mean we can just merge the new index entry into the deleted entry(flip
+        // the delete flag) if key and row id all match.
+        // So we set merge_if_match_deleted to true.
+        match index
+            .insert_if_not_exists(&new_key.vals, row_id, true, stmt.trx.sts)
             .await
-            .shared_async()
-            .await;
-        for (index_spec, sec_idx) in self.metadata.index_specs.iter().zip(&*self.sec_idx) {
-            let read_set: Vec<_> = index_spec
-                .index_cols
-                .iter()
-                .map(|c| c.col_no as usize)
-                .collect();
-            for row_access in page_guard.read_all_rows() {
-                let row_id = row_access.row().row_id();
-                match row_access.read_row_latest(&self.metadata, &read_set, None) {
-                    ReadRow::Ok(vals) => {
-                        if index_spec.unique() {
-                            let index = sec_idx.unique().unwrap();
-                            let res = index
-                                .insert_if_not_exists(&vals, row_id, MIN_SNAPSHOT_TS)
-                                .await;
-                            debug_assert!(res.is_none());
-                        } else {
-                            todo!()
-                        }
-                    }
-                    ReadRow::NotFound => (),
-                    ReadRow::InvalidIndex => unreachable!(),
-                }
+        {
+            IndexInsert::Ok(merged) => {
+                stmt.push_insert_non_unique_index_undo(self.table_id(), row_id, new_key, merged);
+                // Defer delete old key.
+                self.defer_delete_non_unique_index(stmt, index, row_id, old_key)
+                    .await;
+                UpdateIndex::Ok
             }
+            IndexInsert::DuplicateKey(..) => unreachable!(),
         }
     }
 }
@@ -2246,14 +1865,6 @@ impl Clone for Table {
             sec_idx: Arc::clone(&self.sec_idx),
         }
     }
-}
-
-#[inline]
-fn validate_page_id(page_guard: &PageSharedGuard<RowPage>, page_id: PageID) -> bool {
-    if page_guard.page_id() != page_id {
-        return false;
-    }
-    true
 }
 
 #[inline]

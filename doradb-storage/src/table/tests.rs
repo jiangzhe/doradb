@@ -1,9 +1,8 @@
 use crate::buffer::EvictableBufferPoolConfig;
 use crate::engine::{Engine, EngineConfig};
-use crate::row::ops::{SelectKey, UpdateCol};
+use crate::row::ops::{InsertMvcc, SelectKey, UpdateCol};
 use crate::session::Session;
-use crate::table::InsertMvcc;
-use crate::table::Table;
+use crate::table::{Table, TableAccess};
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::tests::remove_files;
 use crate::trx::ActiveTrx;
@@ -569,6 +568,46 @@ fn test_string_index_updates() {
 }
 
 #[test]
+fn test_mvcc_out_of_place_update() {
+    use crate::catalog::tests::table3;
+    smol::block_on(async {
+        const COUNT: usize = 60;
+        const DELTA: usize = 5;
+        const BASE: usize = 1000;
+        const SIZE: usize = 2000;
+        let sys = TestSys::new_evictable().await;
+        {
+            let table_id = table3(&sys.engine).await;
+            let table = sys.engine.catalog().get_table(table_id).await.unwrap();
+            let mut session = sys.new_session();
+            let s: String = std::iter::repeat_n('0', SIZE).collect();
+            // insert 60 rows
+            for i in 0usize..COUNT {
+                let insert = vec![Val::from(&s[..BASE + i])];
+                let mut stmt = session.begin_trx().start_stmt();
+                let res = stmt.insert_row(&table, insert).await;
+                assert!(res.is_ok());
+                session = stmt.succeed().commit().await.unwrap();
+            }
+            // perform updates to trigger out-of-place update.
+            // try to update k=s[..BASE+DELTA] to s[..BASE+COUNT+DELTA]
+            for i in 0..DELTA {
+                let key = SelectKey::new(0, vec![Val::from(&s[..BASE + i])]);
+                let update = vec![UpdateCol {
+                    idx: 0,
+                    val: Val::from(&s[..BASE + COUNT + i]),
+                }];
+                let mut stmt = session.begin_trx().start_stmt();
+                let res = stmt.update_row(&table, &key, update).await;
+                assert!(res.is_ok());
+                session = stmt.succeed().commit().await.unwrap();
+            }
+        }
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_evict_pool_insert_full() {
     smol::block_on(async {
         const SIZE: i32 = 800;
@@ -614,7 +653,7 @@ fn test_row_page_scan_rows_uncommitted() {
         {
             let mut res_len = 0usize;
             sys.table
-                .scan_rows_uncommitted(sys.engine.data_pool, |_row| {
+                .table_scan_uncommitted(sys.engine.data_pool, |_row| {
                     res_len += 1;
                     true
                 })

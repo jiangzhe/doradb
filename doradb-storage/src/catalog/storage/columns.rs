@@ -5,7 +5,7 @@ use crate::catalog::table::TableMetadata;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
-use crate::table::Table;
+use crate::table::{Table, TableAccess};
 use crate::value::Val;
 use doradb_catalog::{
     ColumnAttributes, ColumnID, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID,
@@ -130,7 +130,7 @@ impl<P: BufferPool> Columns<'_, P> {
             Val::from(obj.column_attributes.bits()),
         ];
         self.table
-            .insert_row(self.buf_pool, stmt, cols)
+            .insert_mvcc(self.buf_pool, stmt, cols)
             .await
             .is_ok()
     }
@@ -138,7 +138,7 @@ impl<P: BufferPool> Columns<'_, P> {
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<ColumnObject> {
         let mut res = vec![];
         self.table
-            .scan_rows_uncommitted(self.buf_pool, |row| {
+            .table_scan_uncommitted(self.buf_pool, |row| {
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = *row.val::<TableID>(COL_NO_COLUMNS_TABLE_ID);
                 if table_id_in_row == table_id {
@@ -155,7 +155,7 @@ impl<P: BufferPool> Columns<'_, P> {
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: ColumnID) -> bool {
         let key = SelectKey::new(INDEX_NO_COLUMNS_COLUMN_ID, vec![Val::from(id)]);
         self.table
-            .delete_row(self.buf_pool, stmt, &key, true)
+            .delete_unique_mvcc(self.buf_pool, stmt, &key, true)
             .await
             .is_ok()
     }

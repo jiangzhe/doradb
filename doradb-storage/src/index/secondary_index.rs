@@ -78,6 +78,28 @@ pub enum IndexKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+pub enum IndexInsert {
+    /// if flag set to true, means Old entry is masked as deleted,
+    /// value match and merge is enabled.
+    Ok(bool),
+    // Old row id and its delete flag.
+    DuplicateKey(RowID, bool),
+}
+
+impl IndexInsert {
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        matches!(self, IndexInsert::Ok(false))
+    }
+
+    #[inline]
+    pub fn is_merged(&self) -> bool {
+        matches!(self, IndexInsert::Ok(true))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum IndexCompareExchange {
     Ok,
     Mismatch,
@@ -283,5 +305,248 @@ impl PartitionMultiKeyIndex {
             Either::Left(fe) => fe.encode(key),
             Either::Right(ve) => ve.encode(key),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::EvictableBufferPoolConfig;
+    use crate::catalog::tests::table4;
+    use crate::engine::EngineConfig;
+    use crate::row::ops::{SelectKey, UpdateCol};
+    use crate::table::TableAccess;
+    use crate::trx::sys_conf::TrxSysConfig;
+    use crate::trx::tests::remove_files;
+
+    #[test]
+    fn test_secondary_index_common() {
+        smol::block_on(async {
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default().file_path("databuffer_secidx1.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_secidx1")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
+            let table_id = table4(&engine).await;
+            {
+                let table = engine.catalog().get_table(table_id).await.unwrap();
+
+                let mut session = engine.new_session();
+                let user_read_set = &[0usize, 1];
+                // insert row.
+                // 0,0; 1,1; 2,2; 3,3; 4,4
+                let mut stmt = session.begin_trx().start_stmt();
+                for i in 0i32..5i32 {
+                    let res = table
+                        .insert_mvcc(
+                            engine.data_pool,
+                            &mut stmt,
+                            vec![Val::from(i), Val::from(i)],
+                        )
+                        .await;
+                    assert!(res.is_ok());
+                }
+                session = stmt.succeed().commit().await.unwrap();
+                // select ... where id = 1
+                let stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let res = table
+                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .await;
+                session = stmt.succeed().commit().await.unwrap();
+                assert!(res.is_ok());
+                // select ... where val = 1
+                let stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(1, vec![Val::from(1i32)]);
+                let res = table
+                    .index_scan_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .await;
+                session = stmt.succeed().commit().await.unwrap();
+                assert!(res.len() == 1);
+                // update val = 0 where id = 1
+                let mut stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let update = vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from(0i32),
+                }];
+                let res = table
+                    .update_unique_mvcc(engine.data_pool, &mut stmt, &key, update, false)
+                    .await;
+                session = stmt.succeed().commit().await.unwrap();
+                assert!(res.is_ok());
+                // select ... where val = 0
+                let stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(1, vec![Val::from(0i32)]);
+                let res = table
+                    .index_scan_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .await;
+                session = stmt.succeed().commit().await.unwrap();
+                assert!(res.len() == 2);
+                // delete where id = 0
+                let mut stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(0i32)]);
+                let res = table
+                    .delete_unique_mvcc(engine.data_pool, &mut stmt, &key, false)
+                    .await;
+                session = stmt.succeed().commit().await.unwrap();
+                assert!(res.is_ok());
+                // select ... where val = 0
+                let stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(1, vec![Val::from(0i32)]);
+                let res = table
+                    .index_scan_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .await;
+                _ = stmt.succeed().commit().await.unwrap();
+                assert!(res.len() == 1);
+            }
+            drop(engine);
+            let _ = std::fs::remove_file("databuffer_secidx1.bin");
+            remove_files("redo_secidx1*");
+        })
+    }
+
+    #[test]
+    fn test_secondary_index_rollback() {
+        smol::block_on(async {
+            let engine = EngineConfig::default()
+                .data_buffer(
+                    EvictableBufferPoolConfig::default().file_path("databuffer_secidx2.bin"),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_secidx2")
+                        .skip_recovery(true),
+                )
+                .build()
+                .unwrap()
+                .init()
+                .await
+                .unwrap();
+            let table_id = table4(&engine).await;
+            {
+                let table = engine.catalog().get_table(table_id).await.unwrap();
+
+                let mut session = engine.new_session();
+                let user_read_set = &[0usize, 1];
+                // insert row.
+                // 0,0; 1,1; 2,2; 3,3; 4,4
+                let mut stmt = session.begin_trx().start_stmt();
+                for i in 0i32..5i32 {
+                    let res = table
+                        .insert_mvcc(
+                            engine.data_pool,
+                            &mut stmt,
+                            vec![Val::from(i), Val::from(i)],
+                        )
+                        .await;
+                    assert!(res.is_ok());
+                }
+                session = stmt.succeed().commit().await.unwrap();
+                // insert 5,5 and rollback
+                let mut stmt = session.begin_trx().start_stmt();
+                let res = table
+                    .insert_mvcc(
+                        engine.data_pool,
+                        &mut stmt,
+                        vec![Val::from(5i32), Val::from(5i32)],
+                    )
+                    .await;
+                assert!(res.is_ok());
+                session = stmt.succeed().rollback().await;
+                // select ... where id = 5
+                let stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(5i32)]);
+                let res = table
+                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .await;
+                session = stmt.succeed().commit().await.unwrap();
+                assert!(res.not_found());
+                // update val = 0 where id = 1
+                let mut stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let update = vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from(0i32),
+                }];
+                let res = table
+                    .update_unique_mvcc(engine.data_pool, &mut stmt, &key, update, false)
+                    .await;
+                assert!(res.is_ok());
+                session = stmt.succeed().rollback().await;
+                // select ... where id = 1
+                let stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let res = table
+                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .await;
+                session = stmt.succeed().commit().await.unwrap();
+                assert!(res.is_ok());
+                let vals = res.unwrap();
+                assert!(vals[0] == Val::from(1i32) && vals[1] == Val::from(1i32));
+                // delete where id = 0
+                let mut stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(0i32)]);
+                let res = table
+                    .delete_unique_mvcc(engine.data_pool, &mut stmt, &key, false)
+                    .await;
+                assert!(res.is_ok());
+                session = stmt.succeed().rollback().await;
+                // select ... where val = 0
+                let stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(0i32)]);
+                let res = table
+                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .await;
+                session = stmt.succeed().commit().await.unwrap();
+                assert!(res.is_ok());
+                let vals = res.unwrap();
+                assert!(vals[0] == Val::from(0i32) && vals[1] == Val::from(0i32));
+
+                // delete where id = 3, then insert 3,3, then rollback
+                let mut trx = session.begin_trx();
+                let key = SelectKey::new(0, vec![Val::from(3i32)]);
+                let mut stmt = trx.start_stmt();
+                let res = table
+                    .delete_unique_mvcc(engine.data_pool, &mut stmt, &key, false)
+                    .await;
+                assert!(res.is_ok());
+                trx = stmt.succeed();
+                stmt = trx.start_stmt();
+                let res = table
+                    .insert_mvcc(
+                        engine.data_pool,
+                        &mut stmt,
+                        vec![Val::from(3), Val::from(3)],
+                    )
+                    .await;
+                assert!(res.is_ok());
+                trx = stmt.succeed();
+                // manual rollback.
+                session = trx.rollback().await;
+                // select ... where id = 3
+                let stmt = session.begin_trx().start_stmt();
+                let key = SelectKey::new(0, vec![Val::from(3i32)]);
+                let res = table
+                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .await;
+                _ = stmt.succeed().commit().await.unwrap();
+                assert!(res.is_ok());
+                let vals = res.unwrap();
+                assert!(vals[0] == Val::from(3i32) && vals[1] == Val::from(3i32));
+            }
+            drop(engine);
+            let _ = std::fs::remove_file("databuffer_secidx2.bin");
+            remove_files("redo_secidx2*");
+        })
     }
 }

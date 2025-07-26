@@ -367,4 +367,57 @@ pub mod tests {
         drop(session);
         table_id
     }
+
+    /// Table4 has two i32 columns.
+    /// First is unique index.
+    /// Second is non-unique index.
+    #[inline]
+    pub(crate) async fn table4(engine: &Engine) -> TableID {
+        let schema_id = db1(engine).await;
+
+        let session = engine.new_session();
+        let trx = session.begin_trx();
+        let mut stmt = trx.start_stmt();
+
+        let table_id = stmt
+            .create_table(
+                schema_id,
+                TableSpec {
+                    table_name: SemiStr::new("table4"),
+                    columns: vec![
+                        ColumnSpec {
+                            column_name: SemiStr::new("id"),
+                            column_type: PreciseType::Int(4, false),
+                            column_attributes: ColumnAttributes::empty(),
+                        },
+                        ColumnSpec {
+                            column_name: SemiStr::new("val"),
+                            column_type: PreciseType::Int(4, false),
+                            column_attributes: ColumnAttributes::empty(),
+                        },
+                    ],
+                },
+                vec![
+                    IndexSpec::new(
+                        "idx_table4_id",
+                        vec![IndexKey::new(0)],
+                        // unique index.
+                        IndexAttributes::PK,
+                    ),
+                    IndexSpec::new(
+                        "idx_table4_val",
+                        vec![IndexKey::new(1)],
+                        // non-unique index.
+                        IndexAttributes::empty(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let trx = stmt.succeed();
+        let session = trx.commit().await.unwrap();
+        drop(session);
+        table_id
+    }
 }

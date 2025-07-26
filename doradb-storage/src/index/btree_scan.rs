@@ -1,6 +1,6 @@
 use crate::buffer::guard::PageGuard;
 use crate::index::btree::{BTree, BTreeNodeCursor};
-use crate::index::btree_node::{BTreeNode, Slot};
+use crate::index::btree_node::{BTreeNode, BTreeSlot};
 use std::ops::{Deref, DerefMut};
 
 /// Abstraction on processing B-Tree slot.
@@ -15,26 +15,27 @@ pub trait BTreeSlotCallback {
     /// caller should prevent dead-lock(recursively searching on the
     /// same tree should be avoided).
     /// Returns true if the scan should continue. Otherwise, stop.
-    fn apply(&mut self, node: &BTreeNode, slot: &Slot) -> bool;
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> bool;
 }
 
+/// Convenient blank implemtation of support scan callback.
 impl<F> BTreeSlotCallback for F
 where
-    F: FnMut(&BTreeNode, &Slot) -> bool,
+    F: FnMut(&BTreeNode, &BTreeSlot) -> bool,
 {
     #[inline]
-    fn apply(&mut self, node: &BTreeNode, slot: &Slot) -> bool {
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> bool {
         self(node, slot)
     }
 }
 
 /// Scan on B-tree with specific prefix.
-pub struct BTreePrefixScanner<'a, C> {
+pub struct BTreePrefixScan<'a, C> {
     cursor: BTreeNodeCursor<'a>,
     callback: C,
 }
 
-impl<C> Deref for BTreePrefixScanner<'_, C> {
+impl<C> Deref for BTreePrefixScan<'_, C> {
     type Target = C;
     #[inline]
     fn deref(&self) -> &C {
@@ -42,24 +43,24 @@ impl<C> Deref for BTreePrefixScanner<'_, C> {
     }
 }
 
-impl<C> DerefMut for BTreePrefixScanner<'_, C> {
+impl<C> DerefMut for BTreePrefixScan<'_, C> {
     #[inline]
     fn deref_mut(&mut self) -> &mut C {
         &mut self.callback
     }
 }
 
-impl<C> BTreePrefixScanner<'_, C> {
+impl<C> BTreePrefixScan<'_, C> {
     #[inline]
     pub fn into_callback(self) -> C {
         self.callback
     }
 }
 
-impl<'a, C: BTreeSlotCallback> BTreePrefixScanner<'a, C> {
+impl<'a, C: BTreeSlotCallback> BTreePrefixScan<'a, C> {
     #[inline]
     pub(super) fn new(tree: &'a BTree, callback: C) -> Self {
-        BTreePrefixScanner {
+        BTreePrefixScan {
             cursor: BTreeNodeCursor::new(tree, 0),
             callback,
         }
@@ -157,7 +158,7 @@ mod tests {
                 ];
                 for (idx, k) in keys.iter().enumerate() {
                     let res = tree
-                        .insert(k.as_bytes(), BTreeU64::from(idx as u64), 100)
+                        .insert(k.as_bytes(), BTreeU64::from(idx as u64), false, 100)
                         .await;
                     assert!(res.is_ok());
                 }
@@ -217,7 +218,9 @@ mod tests {
                 let mut map: HashMap<u8, usize> = HashMap::new();
                 for (idx, elem) in data.iter().enumerate() {
                     *map.entry(elem[0]).or_default() += 1;
-                    let res = tree.insert(elem, BTreeU64::from(idx as u64), 210).await;
+                    let res = tree
+                        .insert(elem, BTreeU64::from(idx as u64), false, 210)
+                        .await;
                     assert!(res.is_ok());
                 }
                 let mut scanner = tree.prefix_scanner(Count(0));
@@ -251,7 +254,7 @@ mod tests {
 
     impl BTreeSlotCallback for Count {
         #[inline]
-        fn apply(&mut self, _: &BTreeNode, _: &Slot) -> bool {
+        fn apply(&mut self, _: &BTreeNode, _: &BTreeSlot) -> bool {
             self.0 += 1;
             true
         }
