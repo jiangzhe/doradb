@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::join::{Join, JoinKind, JoinOp, QualifiedJoin};
 use crate::lgc::{Op, OpKind, OpMutVisitor, QuerySet, Setop, SetopKind};
-use crate::rule::expr_simplify::{update_simplify_nested, NullCoalesce};
 use crate::rule::RuleEffect;
+use crate::rule::expr_simplify::{NullCoalesce, update_simplify_nested};
 use doradb_expr::controlflow::{Branch, ControlFlow, Unbranch};
 use doradb_expr::{Col, ColKind, Const, ExprKind, QueryID, Setq};
 use std::collections::HashSet;
@@ -195,11 +195,9 @@ impl<'a> EliminateOp<'a> {
                         kind: ColKind::Query(qry_id),
                         ..
                     }) = e
-                    {
-                        if qs.contains(qry_id) {
+                        && qs.contains(qry_id) {
                             *e = ExprKind::const_null();
                         }
-                    }
                     Ok(())
                 })
                 .branch()?;
@@ -304,13 +302,12 @@ impl OpMutVisitor for EliminateOp<'_> {
         let mut eff = RuleEffect::empty();
         match &mut op.kind {
             OpKind::Query(qry_id) => {
-                if let Some(subq) = self.qry_set.get(qry_id) {
-                    if subq.root.is_empty() {
+                if let Some(subq) = self.qry_set.get(qry_id)
+                    && subq.root.is_empty() {
                         self.empty_qs.insert(*qry_id);
                         *op = Op::empty();
                         eff |= RuleEffect::OP;
                     }
-                }
             }
             OpKind::Scan(..) | OpKind::Row(_) => (),
             _ => {
@@ -335,7 +332,7 @@ fn pair_const_false(es: &[ExprKind]) -> (bool, bool) {
 mod tests {
     use super::*;
     use crate::lgc::tests::{assert_j_plan1, get_lvl_queries, j_catalog, print_plan};
-    use crate::lgc::{preorder, LgcPlan, OpTy};
+    use crate::lgc::{LgcPlan, OpTy, preorder};
 
     #[test]
     fn test_op_eliminate_false_pred() {
@@ -462,7 +459,7 @@ mod tests {
                 op_eliminate(&mut q.qry_set, q.root).unwrap();
                 print_plan(s, &q);
                 let subq = q.root_query().unwrap();
-                subq.root.walk(&mut preorder(|op| match &op.kind {
+                let _ = subq.root.walk(&mut preorder(|op| match &op.kind {
                     OpKind::Setop(_) => panic!("fail to eliminate setop"),
                     _ => (),
                 }));
@@ -475,7 +472,7 @@ mod tests {
                 op_eliminate(&mut q.qry_set, q.root).unwrap();
                 print_plan(s, &q);
                 let subq = q.root_query().unwrap();
-                subq.root.walk(&mut preorder(|op| match &op.kind {
+                let _ = subq.root.walk(&mut preorder(|op| match &op.kind {
                     OpKind::Setop(_) => panic!("fail to eliminate setop"),
                     _ => (),
                 }));
@@ -498,7 +495,7 @@ mod tests {
                 op_eliminate(&mut q.qry_set, q.root).unwrap();
                 print_plan(s, &q);
                 let subq = q.root_query().unwrap();
-                subq.root.walk(&mut preorder(|op| match &op.kind {
+                let _ = subq.root.walk(&mut preorder(|op| match &op.kind {
                     OpKind::Setop(_) => panic!("fail to eliminate setop"),
                     _ => (),
                 }));
@@ -521,7 +518,7 @@ mod tests {
                 op_eliminate(&mut q.qry_set, q.root).unwrap();
                 print_plan(s, &q);
                 let subq = q.root_query().unwrap();
-                subq.root.walk(&mut preorder(|op| match &op.kind {
+                let _ = subq.root.walk(&mut preorder(|op| match &op.kind {
                     OpKind::Setop(_) => panic!("fail to eliminate setop"),
                     _ => (),
                 }));
@@ -577,7 +574,7 @@ mod tests {
                 op_eliminate(&mut q.qry_set, q.root).unwrap();
                 print_plan(s, &q);
                 let subq = q.root_query().unwrap();
-                subq.root.walk(&mut preorder(|op| match &op.kind {
+                let _ = subq.root.walk(&mut preorder(|op| match &op.kind {
                     OpKind::Join(_) => panic!("fail to eliminate op"),
                     _ => (),
                 }));
@@ -601,7 +598,7 @@ mod tests {
                 op_eliminate(&mut q.qry_set, q.root).unwrap();
                 print_plan(s, &q);
                 let subq = q.root_query().unwrap();
-                subq.root.walk(&mut preorder(|op| match &op.kind {
+                let _ = subq.root.walk(&mut preorder(|op| match &op.kind {
                     OpKind::Join(_) => panic!("fail to eliminate op"),
                     _ => (),
                 }));
@@ -630,11 +627,11 @@ mod tests {
                 op_eliminate(&mut q.qry_set, q.root).unwrap();
                 print_plan(s, &q);
                 let subq = q.root_query().unwrap();
-                subq.root.walk(&mut preorder(|op| match &op.kind {
+                let _ = subq.root.walk(&mut preorder(|op| match &op.kind {
                     OpKind::Join(_) => panic!("fail to eliminate op"),
                     _ => (),
                 }));
-                if let OpKind::Proj{cols, ..} = &subq.root.kind {
+                if let OpKind::Proj { cols, .. } = &subq.root.kind {
                     assert_eq!(&cols[0].expr, &ExprKind::const_null());
                     assert_ne!(&cols[1].expr, &ExprKind::const_null());
                 } else {
@@ -649,11 +646,11 @@ mod tests {
                 op_eliminate(&mut q.qry_set, q.root).unwrap();
                 print_plan(s, &q);
                 let subq = q.root_query().unwrap();
-                subq.root.walk(&mut preorder(|op| match &op.kind {
+                let _ = subq.root.walk(&mut preorder(|op| match &op.kind {
                     OpKind::Join(_) => panic!("fail to eliminate op"),
                     _ => (),
                 }));
-                if let OpKind::Proj{cols, ..} = &subq.root.kind {
+                if let OpKind::Proj { cols, .. } = &subq.root.kind {
                     assert_ne!(&cols[0].expr, &ExprKind::const_null());
                     assert_eq!(&cols[1].expr, &ExprKind::const_null());
                 } else {

@@ -38,7 +38,7 @@ impl<'a> RowReadAccess<'a> {
     }
 
     #[inline]
-    pub fn row(&self) -> Row {
+    pub fn row(&self) -> Row<'_> {
         self.page.row(self.row_idx)
     }
 
@@ -573,7 +573,7 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn row_mut(&self, var_offset: usize, var_end: usize) -> RowMut {
+    pub fn row_mut(&self, var_offset: usize, var_end: usize) -> RowMut<'_> {
         self.page.row_mut(self.row_idx, var_offset, var_end)
     }
 
@@ -583,13 +583,13 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn row_and_undo_mut(&mut self) -> (Row, &mut Option<Box<RowUndoHead>>) {
+    pub fn row_and_undo_mut(&mut self) -> (Row<'_>, &mut Option<Box<RowUndoHead>>) {
         let row = self.page.row(self.row_idx);
         (row, &mut *self.undo)
     }
 
     #[inline]
-    pub fn update_row(&self, metadata: &TableMetadata, cols: &[UpdateCol]) -> UpdateRow {
+    pub fn update_row(&self, metadata: &TableMetadata, cols: &[UpdateCol]) -> UpdateRow<'_> {
         let var_len = self.row().var_len_for_update(cols);
         if var_len == 0 {
             // fast path, no change on var-length column.

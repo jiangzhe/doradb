@@ -49,7 +49,7 @@ impl CatalogStorage {
     }
 
     #[inline]
-    pub fn schemas(&self) -> Schemas<FixedBufferPool> {
+    pub fn schemas(&self) -> Schemas<'_, FixedBufferPool> {
         Schemas {
             buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_SCHEMAS as usize],
@@ -57,7 +57,7 @@ impl CatalogStorage {
     }
 
     #[inline]
-    pub fn tables(&self) -> Tables<FixedBufferPool> {
+    pub fn tables(&self) -> Tables<'_, FixedBufferPool> {
         Tables {
             buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_TABLES as usize],
@@ -65,7 +65,7 @@ impl CatalogStorage {
     }
 
     #[inline]
-    pub fn columns(&self) -> Columns<FixedBufferPool> {
+    pub fn columns(&self) -> Columns<'_, FixedBufferPool> {
         Columns {
             buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_COLUMNS as usize],
@@ -73,7 +73,7 @@ impl CatalogStorage {
     }
 
     #[inline]
-    pub fn indexes(&self) -> Indexes<FixedBufferPool> {
+    pub fn indexes(&self) -> Indexes<'_, FixedBufferPool> {
         Indexes {
             buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_INDEXES as usize],
@@ -81,7 +81,7 @@ impl CatalogStorage {
     }
 
     #[inline]
-    pub fn index_columns(&self) -> IndexColumns<FixedBufferPool> {
+    pub fn index_columns(&self) -> IndexColumns<'_, FixedBufferPool> {
         IndexColumns {
             buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_INDEX_COLUMNS as usize],

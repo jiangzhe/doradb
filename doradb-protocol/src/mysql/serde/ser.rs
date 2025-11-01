@@ -1,6 +1,6 @@
 use crate::mysql::serde::{LenEncInt, LenEncStr, SerdeCtx};
 use std::marker::PhantomData;
-use std::mem::{transmute, ManuallyDrop};
+use std::mem::{ManuallyDrop, transmute};
 
 /// Defines how to serialize self to bytes.
 /// The purpose of serialization is to transfer via network.
@@ -507,22 +507,22 @@ impl<'a> MySerElem<'a> {
     }
 
     #[inline]
-    fn as_slice(&self) -> &Slice {
+    fn as_slice(&self) -> &Slice<'_> {
         unsafe { transmute(self) }
     }
 
     #[inline]
-    fn as_les3(&self) -> &LenEncSlice3 {
+    fn as_les3(&self) -> &LenEncSlice3<'_> {
         unsafe { transmute(self) }
     }
 
     #[inline]
-    fn as_les4(&self) -> &LenEncSlice4 {
+    fn as_les4(&self) -> &LenEncSlice4<'_> {
         unsafe { transmute(self) }
     }
 
     #[inline]
-    fn as_les9(&self) -> &LenEncSlice9 {
+    fn as_les9(&self) -> &LenEncSlice9<'_> {
         unsafe { transmute(self) }
     }
 
@@ -532,12 +532,12 @@ impl<'a> MySerElem<'a> {
     }
 
     #[inline]
-    fn as_nes(&self) -> &NullEndSlice {
+    fn as_nes(&self) -> &NullEndSlice<'_> {
         unsafe { transmute(self) }
     }
 
     #[inline]
-    fn as_p1bs(&self) -> &Prefix1BSlice {
+    fn as_p1bs(&self) -> &Prefix1BSlice<'_> {
         unsafe { transmute(self) }
     }
 
@@ -552,22 +552,22 @@ impl<'a> MySerElem<'a> {
     }
 
     #[inline]
-    fn as_slice_mut(&mut self) -> &mut Slice {
+    fn as_slice_mut(&mut self) -> &mut Slice<'_> {
         unsafe { transmute(self) }
     }
 
     #[inline]
-    fn as_les3_mut(&mut self) -> &mut LenEncSlice3 {
+    fn as_les3_mut(&mut self) -> &mut LenEncSlice3<'_> {
         unsafe { transmute(self) }
     }
 
     #[inline]
-    fn as_les4_mut(&mut self) -> &mut LenEncSlice4 {
+    fn as_les4_mut(&mut self) -> &mut LenEncSlice4<'_> {
         unsafe { transmute(self) }
     }
 
     #[inline]
-    fn as_les9_mut(&mut self) -> &mut LenEncSlice9 {
+    fn as_les9_mut(&mut self) -> &mut LenEncSlice9<'_> {
         unsafe { transmute(self) }
     }
 
@@ -577,12 +577,12 @@ impl<'a> MySerElem<'a> {
     }
 
     #[inline]
-    fn as_nes_mut(&mut self) -> &mut NullEndSlice {
+    fn as_nes_mut(&mut self) -> &mut NullEndSlice<'_> {
         unsafe { transmute(self) }
     }
 
     #[inline]
-    fn as_p1bs_mut(&mut self) -> &mut Prefix1BSlice {
+    fn as_p1bs_mut(&mut self) -> &mut Prefix1BSlice<'_> {
         unsafe { transmute(self) }
     }
 
@@ -1669,7 +1669,9 @@ mod tests {
         pkts.my_ser(&mut ctx, &mut buf, 20);
         assert_eq!(
             &buf[..21],
-            &[4, 0, 0, 0, 1, 2, 3, 4, 4, 0, 0, 1, 5, 6, 7, 8, 1, 0, 0, 2, 9]
+            &[
+                4, 0, 0, 0, 1, 2, 3, 4, 4, 0, 0, 1, 5, 6, 7, 8, 1, 0, 0, 2, 9
+            ]
         );
     }
 }

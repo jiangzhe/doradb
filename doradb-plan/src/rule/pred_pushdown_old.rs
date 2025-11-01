@@ -719,12 +719,10 @@ impl ExprMutVisitor for RewriteOutExpr<'_> {
             idx,
             ..
         }) = e
-        {
-            if *qry_id == self.qry_id {
+            && *qry_id == self.qry_id {
                 let new_c = &self.out[idx.value() as usize];
                 *e = new_c.expr.clone();
             }
-        }
         ControlFlow::Continue(())
     }
 }

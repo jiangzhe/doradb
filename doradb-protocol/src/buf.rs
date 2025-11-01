@@ -178,7 +178,7 @@ impl ByteBuffer {
     /// return a read guard to keep the read count more than zero,
     /// so that concurrent alloc/meta operation will fail.
     #[inline]
-    pub fn readable(&self) -> Result<ByteBufferReadGuard> {
+    pub fn readable(&self) -> Result<ByteBufferReadGuard<'_>> {
         let mask = self.mask.get();
         if mask & MASK_UPDATE != 0 {
             // conflict with update
@@ -237,7 +237,7 @@ impl ByteBuffer {
     /// Acquire update lock.
     /// It will directly fail if the lock conflicts with other concurrent operations.
     #[inline]
-    pub fn update(&self) -> Result<ByteBufferUpdateGuard> {
+    pub fn update(&self) -> Result<ByteBufferUpdateGuard<'_>> {
         let mask = self.mask.get();
         if mask != 0 {
             // no reader, no writer, no update
@@ -252,7 +252,7 @@ impl ByteBuffer {
     /// A write guard is returned to keep the write flag to true
     /// before dropping.
     #[inline]
-    pub fn writable(&self) -> Result<ByteBufferWriteGuard> {
+    pub fn writable(&self) -> Result<ByteBufferWriteGuard<'_>> {
         let mask = self.mask.get();
         if mask & (MASK_UPDATE | MASK_WRITE) != 0 {
             // conflict with write and update
@@ -310,7 +310,7 @@ impl ByteBuffer {
     /// Add string to buffer.
     /// Return reference and read guard.
     #[inline]
-    pub fn add_str(&self, s: impl AsRef<str>) -> Result<(&str, ByteBufferReadGuard)> {
+    pub fn add_str(&self, s: impl AsRef<str>) -> Result<(&str, ByteBufferReadGuard<'_>)> {
         let (l, g) = self.add_bytes(s.as_ref().as_bytes())?;
         // SAFETY
         //
@@ -322,7 +322,7 @@ impl ByteBuffer {
     /// Add bytes to buffer.
     /// Return reference and read guard.
     #[inline]
-    pub fn add_bytes(&self, b: impl AsRef<[u8]>) -> Result<(usize, ByteBufferReadGuard)> {
+    pub fn add_bytes(&self, b: impl AsRef<[u8]>) -> Result<(usize, ByteBufferReadGuard<'_>)> {
         let b = b.as_ref();
         let rem_cap = self.remaining_capacity();
         if b.len() > rem_cap {
@@ -340,7 +340,7 @@ impl ByteBuffer {
     /// Empty read guard.
     /// It can be used as start point to combine multiple readers.
     #[inline]
-    pub fn empty_read(&self) -> ByteBufferReadGuard {
+    pub fn empty_read(&self) -> ByteBufferReadGuard<'_> {
         ByteBufferReadGuard {
             inner: self,
             readers: 0,

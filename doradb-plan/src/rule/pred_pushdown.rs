@@ -104,12 +104,11 @@ impl PredPushdown<'_> {
             OpKind::Query(qry_id) => self.push_query(*qry_id, inner),
             OpKind::Scan(scan) => self.apply_scan(scan.table_id, &scan.cols, &mut scan.filt, inner),
             OpKind::Aggr(aggr) => {
-                if let Some(new_inner) = self.push_aggr(aggr, inner)? {
-                    if !new_inner.is_empty() {
+                if let Some(new_inner) = self.push_aggr(aggr, inner)?
+                    && !new_inner.is_empty() {
                         let orig_op = mem::take(op);
                         *op = self.create_new_filt(orig_op, new_inner);
                     }
-                }
                 Ok(())
             }
             OpKind::Setop(so) => {

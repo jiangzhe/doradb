@@ -63,7 +63,7 @@ pub(crate) fn alloc_aligned_ones(cap: usize) -> (*mut u8, usize) {
 #[inline]
 pub(crate) unsafe fn free_aligned(ptr: *mut u8, cap: usize) {
     unsafe {
-        assert!(cap % 16 == 0);
+        assert!(cap.is_multiple_of(16));
         let cap_u128 = cap / 16;
         let _ = Vec::<U128>::from_raw_parts(ptr as *mut U128, cap_u128, cap_u128);
     }

@@ -79,14 +79,14 @@ impl DirectBuf {
     /// the page size.
     #[inline]
     pub fn page(page_size: usize) -> Self {
-        debug_assert!(page_size >= MIN_PAGE_SIZE && page_size % MIN_PAGE_SIZE == 0);
+        debug_assert!(page_size >= MIN_PAGE_SIZE && page_size.is_multiple_of(MIN_PAGE_SIZE));
         Self::uninit(page_size - Self::LEN_BYTES)
     }
 
     /// Create a new page with all zeroed bytes.
     #[inline]
     pub fn page_zeroed(page_size: usize) -> Self {
-        debug_assert!(page_size >= MIN_PAGE_SIZE && page_size % MIN_PAGE_SIZE == 0);
+        debug_assert!(page_size >= MIN_PAGE_SIZE && page_size.is_multiple_of(MIN_PAGE_SIZE));
         Self::zeroed(page_size - Self::LEN_BYTES)
     }
 

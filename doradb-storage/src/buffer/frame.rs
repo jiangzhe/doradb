@@ -5,12 +5,12 @@ use crate::trx::undo::UndoMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 const _: () = assert!(
-    { std::mem::size_of::<BufferFrame>() % 64 == 0 },
+    { std::mem::size_of::<BufferFrame>().is_multiple_of(64) },
     "Size of BufferFrame must be multiply of 64"
 );
 
 const _: () = assert!(
-    { std::mem::align_of::<BufferFrame>() % 64 == 0 },
+    { std::mem::align_of::<BufferFrame>().is_multiple_of(64) },
     "Align of BufferFrame must be multiply of 64"
 );
 

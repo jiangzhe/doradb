@@ -175,8 +175,8 @@ impl<E: Estimate> DPhyp<E> {
         let nbs = neighbors(graph, s2, exclude);
         for nb_edge in &nbs {
             let vs = s2 | VertexSet::from(nb_edge.vid);
-            if best_plans.contains_key(&vs) {
-                if let Some((l_vset, r_vset, edge)) =
+            if best_plans.contains_key(&vs)
+                && let Some((l_vset, r_vset, edge)) =
                     graph.hyper_edge_refs().iter().find_map(|her| {
                         if s1.includes(her.l_vset) && vs.includes(her.r_vset) {
                             Some((s1, vs, graph.edge(her.eid)))
@@ -186,12 +186,9 @@ impl<E: Estimate> DPhyp<E> {
                             None
                         }
                     })
-                {
-                    if !skip_csg_cmp(best_plans, l_vset, r_vset) {
+                    && !skip_csg_cmp(best_plans, l_vset, r_vset) {
                         self.emit_csg_cmp(graph, best_plans, l_vset, r_vset, edge)?;
                     }
-                }
-            }
         }
         // Recursive call with extended s2
         for nb_edge in &nbs {
