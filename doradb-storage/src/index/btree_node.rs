@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 
-const _: () = assert!(mem::size_of::<BTreeHeader>() % mem::size_of::<BTreeSlot>() == 0);
+const _: () = assert!(mem::size_of::<BTreeHeader>().is_multiple_of(mem::size_of::<BTreeSlot>()));
 
 const _: () = assert!(mem::size_of::<BTreeNode>() == PAGE_SIZE);
 
@@ -1278,7 +1278,7 @@ impl BTreeNode {
     #[inline]
     fn position_in_hints(&self, idx: usize) -> Option<usize> {
         let window = self.count() / (BTREE_HINTS_LEN + 1);
-        if idx != 0 && idx % window == 0 {
+        if idx != 0 && idx.is_multiple_of(window) {
             return Some(idx / window);
         }
         None

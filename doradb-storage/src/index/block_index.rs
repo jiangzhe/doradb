@@ -553,7 +553,7 @@ impl BlockIndex {
 
     /// Returns the cursor for range scan.
     #[inline]
-    pub fn cursor(&self) -> BlockIndexCursor {
+    pub fn cursor(&self) -> BlockIndexCursor<'_> {
         BlockIndexCursor {
             blk_idx: self,
             parent: None,

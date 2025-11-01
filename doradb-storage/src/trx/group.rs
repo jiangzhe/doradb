@@ -30,7 +30,7 @@ impl MutexGroupCommit {
     /// Acquire lock.
     /// Return lock guard of group commit.
     #[inline]
-    pub fn lock(&self) -> MutexGuard<GroupCommit> {
+    pub fn lock(&self) -> MutexGuard<'_, GroupCommit> {
         self.mu.lock()
     }
 

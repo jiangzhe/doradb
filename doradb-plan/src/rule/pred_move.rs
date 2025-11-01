@@ -524,11 +524,10 @@ impl PredExpr {
                 .get(gid)
                 .map(|c| PredExpr::ColEqConst(c.gid, cst.clone())),
             PredExpr::TwoColEq(gid1, gid2) => {
-                if let Some(c1) = col_map.get(gid1) {
-                    if let Some(c2) = col_map.get(gid2) {
+                if let Some(c1) = col_map.get(gid1)
+                    && let Some(c2) = col_map.get(gid2) {
                         return Some(PredExpr::TwoColEq(c1.gid, c2.gid));
                     }
-                }
                 None
             }
             PredExpr::Other(e) => {
@@ -573,15 +572,14 @@ impl PredExpr {
                 None
             }
             PredExpr::TwoColEq(gid1, gid2) => {
-                if let Some(c1) = c2c.get(gid1) {
-                    if let Some(c2) = c2c.get(gid2) {
+                if let Some(c1) = c2c.get(gid1)
+                    && let Some(c2) = c2c.get(gid2) {
                         let new_e = ExprKind::pred_func(
                             PredFuncKind::Equal,
                             vec![ExprKind::Col(c1.clone()), ExprKind::Col(c2.clone())],
                         );
                         return Some(new_e.into());
                     }
-                }
                 None
             }
         }
@@ -612,13 +610,12 @@ impl PredExpr {
                 None
             }
             PredExpr::TwoColEq(gid1, gid2) => {
-                if let Some(e1) = c2e.get(gid1) {
-                    if let Some(e2) = c2e.get(gid2) {
+                if let Some(e1) = c2e.get(gid1)
+                    && let Some(e2) = c2e.get(gid2) {
                         let new_e =
                             ExprKind::pred_func(PredFuncKind::Equal, vec![e1.clone(), e2.clone()]);
                         return Some(new_e.into());
                     }
-                }
                 None
             }
         }
@@ -658,14 +655,13 @@ impl PredExpr {
                 )
             }),
             PredExpr::TwoColEq(gid1, gid2) => {
-                if let Some(c1) = col_map.get(&gid1) {
-                    if let Some(c2) = col_map.get(&gid2) {
+                if let Some(c1) = col_map.get(&gid1)
+                    && let Some(c2) = col_map.get(&gid2) {
                         return Some(ExprKind::pred_func(
                             PredFuncKind::Equal,
                             vec![ExprKind::Col(c1.clone()), ExprKind::Col(c2.clone())],
                         ));
                     }
-                }
                 None
             }
             PredExpr::Other(e) => {
@@ -1507,11 +1503,10 @@ impl ExprMutVisitor for ReplaceCol<'_> {
 
     #[inline]
     fn leave(&mut self, e: &mut ExprKind) -> ControlFlow<(), ()> {
-        if let ExprKind::Col(Col { gid, .. }) = e {
-            if *gid == self.0 {
+        if let ExprKind::Col(Col { gid, .. }) = e
+            && *gid == self.0 {
                 *e = self.1.clone();
             }
-        }
         ControlFlow::Continue(())
     }
 }
@@ -1529,11 +1524,10 @@ impl ExprVisitor<'_> for IncludeCol {
     type Break = ();
     #[inline]
     fn leave(&mut self, e: &ExprKind) -> ControlFlow<(), ()> {
-        if let ExprKind::Col(Col { gid, .. }) = e {
-            if *gid == self.0 {
+        if let ExprKind::Col(Col { gid, .. }) = e
+            && *gid == self.0 {
                 return ControlFlow::Break(());
             }
-        }
         ControlFlow::Continue(())
     }
 }
@@ -1602,11 +1596,10 @@ impl ExprMutVisitor for RewriteExprIn<'_> {
 
     #[inline]
     fn leave(&mut self, e: &mut ExprKind) -> ControlFlow<(), ()> {
-        if let ExprKind::Col(Col { gid, .. }) = e {
-            if let Some(new_e) = self.0.get(gid) {
+        if let ExprKind::Col(Col { gid, .. }) = e
+            && let Some(new_e) = self.0.get(gid) {
                 *e = new_e.clone();
             }
-        }
         ControlFlow::Continue(())
     }
 }
@@ -1619,11 +1612,10 @@ impl<'a> ExprVisitor<'a> for AllColsIncluded<'a> {
 
     #[inline]
     fn leave(&mut self, e: &ExprKind) -> ControlFlow<(), ()> {
-        if let ExprKind::Col(Col { gid, .. }) = e {
-            if !self.0.contains(gid) {
+        if let ExprKind::Col(Col { gid, .. }) = e
+            && !self.0.contains(gid) {
                 return ControlFlow::Break(());
             }
-        }
         ControlFlow::Continue(())
     }
 }
@@ -1737,11 +1729,10 @@ fn collect_group_out_cols(group: &[ExprKind], proj: &[ProjCol]) -> HashSet<Globa
     }
     let mut res = HashSet::new();
     for p in proj {
-        if let ExprKind::Col(Col { gid, .. }) = &p.expr {
-            if in_group.contains(gid) {
+        if let ExprKind::Col(Col { gid, .. }) = &p.expr
+            && in_group.contains(gid) {
                 res.insert(*gid);
             }
-        }
     }
     res
 }

@@ -312,13 +312,13 @@ impl BTree {
     /// Create a cursor to iterator over nodes at given height.
     /// Height equals to 0 means iterating over all leaf nodes.
     #[inline]
-    pub fn cursor(&self, height: usize) -> BTreeNodeCursor {
+    pub fn cursor(&self, height: usize) -> BTreeNodeCursor<'_> {
         BTreeNodeCursor::new(self, height)
     }
 
     /// Create a prefix scanner to scan keys.
     #[inline]
-    pub fn prefix_scanner<C: BTreeSlotCallback>(&self, callback: C) -> BTreePrefixScan<C> {
+    pub fn prefix_scanner<C: BTreeSlotCallback>(&self, callback: C) -> BTreePrefixScan<'_, C> {
         BTreePrefixScan::new(self, callback)
     }
 
@@ -359,7 +359,7 @@ impl BTree {
         &self,
         height: usize,
         config: BTreeCompactConfig,
-    ) -> BTreeCompactor<V> {
+    ) -> BTreeCompactor<'_, V> {
         BTreeCompactor::new(self, height, config)
     }
 
@@ -834,7 +834,7 @@ impl BTree {
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
-        debug_assert!(count > 0 && count + 1 < r_node.count());
+        debug_assert!(count > 0 && count < r_node.count());
         debug_assert!(&r_node.create_sep_key(count, r_node.height() == 0)[..] == sep_key);
         debug_assert!({
             let mut estimation = SpaceEstimation::with_fences(lower_fence_key, sep_key, value_size);

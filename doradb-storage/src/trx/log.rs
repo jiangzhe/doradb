@@ -342,7 +342,7 @@ impl LogPartition {
     }
 
     #[inline]
-    fn file_processor(&self, config: &TrxSysConfig) -> FileProcessor {
+    fn file_processor(&self, config: &TrxSysConfig) -> FileProcessor<'_> {
         let syncer = { self.group_commit.lock().log_file.as_ref().unwrap().syncer() };
 
         FileProcessor::new(self, config, syncer)
@@ -837,7 +837,7 @@ impl MmapLogReader {
     }
 
     #[inline]
-    pub fn read(&mut self) -> ReadLog {
+    pub fn read(&mut self) -> ReadLog<'_> {
         if self.offset >= self.max_file_size {
             return ReadLog::SizeLimit; // file is exhausted.
         }

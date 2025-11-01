@@ -13,7 +13,7 @@ pub type RowID = u64;
 pub const INVALID_ROW_ID: RowID = !0;
 
 const _: () = assert!(
-    { std::mem::size_of::<RowPageHeader>() % 8 == 0 },
+    { std::mem::size_of::<RowPageHeader>().is_multiple_of(8) },
     "RowPageHeader should have size align to 8 bytes"
 );
 
@@ -153,7 +153,7 @@ impl RowPage {
     }
 
     #[inline]
-    pub fn row_by_id(&self, row_id: RowID) -> Option<Row> {
+    pub fn row_by_id(&self, row_id: RowID) -> Option<Row<'_>> {
         if !self.row_id_in_valid_range(row_id) {
             return None;
         }
@@ -311,7 +311,7 @@ impl RowPage {
 
     /// Select single row by row id.
     #[inline]
-    pub fn select(&self, row_id: RowID) -> Select {
+    pub fn select(&self, row_id: RowID) -> Select<'_> {
         if !self.row_id_in_valid_range(row_id) {
             return Select::NotFound;
         }
@@ -346,7 +346,7 @@ impl RowPage {
 
     /// Creates a new row in page.
     #[inline]
-    pub(crate) fn new_row(&self, row_idx: usize, var_offset: usize) -> NewRow {
+    pub(crate) fn new_row(&self, row_idx: usize, var_offset: usize) -> NewRow<'_> {
         let row_id = self.row_id(row_idx);
         NewRow {
             page: self,
@@ -359,7 +359,7 @@ impl RowPage {
 
     /// Returns row by given index in page.
     #[inline]
-    pub(crate) fn row(&self, row_idx: usize) -> Row {
+    pub(crate) fn row(&self, row_idx: usize) -> Row<'_> {
         debug_assert!(row_idx < self.header.max_row_count as usize);
         Row {
             page: self,
@@ -369,7 +369,7 @@ impl RowPage {
 
     /// Returns mutable row by given index in page.
     #[inline]
-    pub(crate) fn row_mut(&self, row_idx: usize, var_offset: usize, var_end: usize) -> RowMut {
+    pub(crate) fn row_mut(&self, row_idx: usize, var_offset: usize, var_end: usize) -> RowMut<'_> {
         debug_assert!(row_idx < self.header.row_count());
         RowMut {
             page: self,
@@ -385,7 +385,7 @@ impl RowPage {
         row_idx: usize,
         var_offset: usize,
         var_end: usize,
-    ) -> RowMutExclusive {
+    ) -> RowMutExclusive<'_> {
         RowMutExclusive {
             page: self,
             row_idx,

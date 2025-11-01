@@ -698,7 +698,7 @@ impl Value for Byte2Val {
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
         unsafe {
-            debug_assert!(ptr as usize % 2 == 0);
+            debug_assert!((ptr as usize).is_multiple_of(2));
             let atom = AtomicU16::from_ptr(ptr as *mut u8 as *mut u16);
             atom.store(*self, Ordering::Relaxed);
         }
@@ -740,7 +740,7 @@ impl Value for Byte4Val {
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
         unsafe {
-            debug_assert!(ptr as usize % 4 == 0);
+            debug_assert!((ptr as usize).is_multiple_of(4));
             let atom = AtomicU32::from_ptr(ptr as *mut u8 as *mut u32);
             atom.store(*self, Ordering::Relaxed);
         }
@@ -792,7 +792,7 @@ impl Value for Byte8Val {
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
         unsafe {
-            debug_assert!(ptr as usize % 8 == 0);
+            debug_assert!((ptr as usize).is_multiple_of(8));
             let atom = AtomicU64::from_ptr(ptr as *mut u8 as *mut u64);
             atom.store(*self, Ordering::Relaxed);
         }

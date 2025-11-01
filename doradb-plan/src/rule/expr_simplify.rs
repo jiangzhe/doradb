@@ -146,8 +146,8 @@ pub(crate) fn update_simplify_nested<F: FnMut(&mut ExprKind) -> Result<()>>(
 // normalize considers
 #[inline]
 pub(crate) fn normalize_single(e: &mut ExprKind) {
-    if let ExprKind::Pred(Pred::Func { kind, args }) = e {
-        if let Some(flipped_kind) = kind.pos_flip() {
+    if let ExprKind::Pred(Pred::Func { kind, args }) = e
+        && let Some(flipped_kind) = kind.pos_flip() {
             match &mut args[..] {
                 [e1 @ ExprKind::Const(_), e2] => {
                     // "const cmp expr" => "expr cmp const"
@@ -165,7 +165,6 @@ pub(crate) fn normalize_single(e: &mut ExprKind) {
                 _ => (),
             }
         }
-    }
 }
 
 /// Simplify single expression.

@@ -152,8 +152,8 @@ impl<'a> PredPullup<'a> {
     ) -> Vec<(GlobalID, QueryID, ColIndex, PartialExpr)> {
         let mut res = vec![];
         for c in conds {
-            if let ExprKind::Pred(Pred::Func { kind, args }) = c {
-                if let (
+            if let ExprKind::Pred(Pred::Func { kind, args }) = c
+                && let (
                     PredFuncKind::Equal,
                     [ExprKind::Col(Col {
                         gid: l_gid,
@@ -179,7 +179,6 @@ impl<'a> PredPullup<'a> {
                         }
                     }
                 }
-            }
         }
         res
     }

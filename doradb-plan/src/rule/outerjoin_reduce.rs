@@ -237,11 +237,9 @@ pub(crate) fn reject_null_single(expr: &ExprKind, qry_id: QueryID) -> Result<boo
                 kind: ColKind::Query(qid),
                 ..
             }) = e
-            {
-                if *qid == qry_id {
+                && *qid == qry_id {
                     *e = ExprKind::const_null();
                 }
-            }
         })
         .map_err(Into::into)
 }
@@ -267,13 +265,11 @@ impl ExprMutVisitor for TransformCollectSimplify<'_> {
             idx,
             ..
         }) = e
-        {
-            if *qry_id == self.old {
+            && *qry_id == self.old {
                 let mut new_e = self.mapping[idx.value() as usize].expr.clone();
                 simplify_single(&mut new_e, NullCoalesce::Null).branch()?;
                 *e = new_e;
             }
-        }
         ControlFlow::Continue(())
     }
 

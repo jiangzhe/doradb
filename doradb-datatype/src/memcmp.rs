@@ -481,7 +481,7 @@ impl MemCmpKey {
 
     /// Create a guard for in-place modification.
     #[inline]
-    pub fn modify_inplace(&mut self) -> ModifyInplaceGuard {
+    pub fn modify_inplace(&mut self) -> ModifyInplaceGuard<'_> {
         ModifyInplaceGuard(self)
     }
 

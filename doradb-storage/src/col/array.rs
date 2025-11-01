@@ -46,7 +46,7 @@ impl Array {
     /// Create a borrowed array.
     #[inline]
     pub fn new_borrowed<T: ByteRepr>(ptr: Arc<[u8]>, len: usize, start_bytes: usize) -> Self {
-        debug_assert!((ptr.as_ptr() as usize + start_bytes) % std::mem::align_of::<T>() == 0); // check alignement
+        debug_assert!((ptr.as_ptr() as usize + start_bytes).is_multiple_of(std::mem::align_of::<T>())); // check alignement
         let end_bytes = align_u128(start_bytes + std::mem::size_of::<T>() * len);
         debug_assert!(end_bytes <= ptr.len());
         Array::Borrowed {
