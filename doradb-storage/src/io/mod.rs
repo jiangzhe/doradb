@@ -1,18 +1,17 @@
 mod buf;
+mod file;
 mod free_list;
 mod libaio_abi;
 
-use libc::{
-    c_long, close, fdatasync, fsync, ftruncate, open, EAGAIN, EINTR, O_CREAT, O_DIRECT, O_RDWR,
-    O_TRUNC,
-};
+use libc::{c_long, close, ftruncate, open, EAGAIN, EINTR, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
 use std::ffi::CString;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use thiserror::Error;
 
 pub use buf::*;
+pub use file::*;
 pub use free_list::*;
 pub use libaio_abi::*;
 
@@ -225,11 +224,7 @@ impl AIOManager {
                 return Err(AIOError::OpenFileError);
             }
             self.register_fd(fd);
-            Ok(SparseFile {
-                fd,
-                offset: AtomicUsize::new(0),
-                max_len,
-            })
+            Ok(SparseFile::new(fd, 0, max_len))
         }
     }
 
@@ -252,16 +247,13 @@ impl AIOManager {
                 return Err(AIOError::OpenFileError);
             }
             self.register_fd(fd);
-            Ok(SparseFile {
-                fd,
-                offset: AtomicUsize::new(0),
-                max_len,
-            })
+            Ok(SparseFile::new(fd, 0, max_len))
         }
     }
 
+    /// Forget give file.
     #[inline]
-    pub fn drop_sparse_file(&self, file: SparseFile) {
+    pub fn forget_sparse_file(&self, file: SparseFile) {
         self.deregister_fd(file.as_raw_fd());
     }
 
@@ -420,216 +412,6 @@ impl Default for AIOManagerConfig {
     }
 }
 
-pub struct SparseFile {
-    fd: RawFd,
-    offset: AtomicUsize,
-    max_len: usize,
-}
-
-impl AsRawFd for SparseFile {
-    #[inline]
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
-impl SparseFile {
-    /// Allocate enough space for data of given length to persist
-    /// at end of the file.
-    #[inline]
-    pub fn alloc(&self, len: usize) -> Result<(usize, usize), AIOError> {
-        let size = align_to_sector_size(len);
-        loop {
-            let offset = self.offset.load(Ordering::Relaxed);
-            let new_offset = offset + size;
-            if new_offset > self.max_len {
-                return Err(AIOError::OutOfRange);
-            }
-            if self
-                .offset
-                .compare_exchange_weak(offset, new_offset, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok((offset, new_offset));
-            }
-        }
-    }
-
-    /// Returns a pread IO request.
-    /// User should make sure key is unique.
-    #[inline]
-    pub fn pread_direct(&self, key: AIOKey, offset: usize, len: usize) -> AIO {
-        pread_direct(key, self.fd, offset, len)
-    }
-
-    /// Returns a pread IO request.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee the pointer is valid during
-    /// syscall, and pointer is correctly aligned.
-    #[inline]
-    pub unsafe fn pread_unchecked(
-        &self,
-        key: AIOKey,
-        offset: usize,
-        ptr: *mut u8,
-        len: usize,
-    ) -> UnsafeAIO {
-        unsafe { pread_unchecked(key, self.fd, offset, ptr, len) }
-    }
-
-    /// Returns a pwrite IO request.
-    /// User should make sure key is unique.
-    #[inline]
-    pub fn pwrite_direct(&self, key: AIOKey, offset: usize, buf: DirectBuf) -> AIO {
-        pwrite_direct(key, self.fd, offset, buf)
-    }
-
-    /// Returns a pwrite IO request.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee the pointer is valid during
-    /// syscall, and pointer is correctly aligned.
-    #[inline]
-    pub unsafe fn pwrite_unchecked(
-        &self,
-        key: AIOKey,
-        offset: usize,
-        ptr: *mut u8,
-        len: usize,
-    ) -> UnsafeAIO {
-        unsafe { pwrite_unchecked(key, self.fd, offset, ptr, len) }
-    }
-
-    /// Returns the file syncer.
-    #[inline]
-    pub fn syncer(&self) -> FileSyncer {
-        FileSyncer(self.fd)
-    }
-}
-
-impl Drop for SparseFile {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            close(self.fd);
-        }
-    }
-}
-
-/// FileSyncer is a simple wrapper to provide functionality
-/// of fsync() and fdatasync().
-pub struct FileSyncer(RawFd);
-
-impl FileSyncer {
-    #[inline]
-    pub fn fsync(&self) {
-        unsafe {
-            fsync(self.0);
-        }
-    }
-
-    #[inline]
-    pub fn fdatasync(&self) {
-        unsafe {
-            fdatasync(self.0);
-        }
-    }
-}
-
-#[inline]
-pub fn pread_direct(key: AIOKey, fd: RawFd, offset: usize, len: usize) -> AIO {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    let buf = DirectBuf::uninit(len);
-    AIO::new(
-        key,
-        fd,
-        offset,
-        Buf::Direct(buf),
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PREAD,
-    )
-}
-
-/// pread.
-///
-/// # Safety
-///
-/// Caller must guarantee the pointer is valid during
-/// syscall, and pointer is correctly aligned.
-#[inline]
-pub unsafe fn pread_unchecked(
-    key: AIOKey,
-    fd: RawFd,
-    offset: usize,
-    ptr: *mut u8,
-    len: usize,
-) -> UnsafeAIO {
-    unsafe {
-        const PRIORITY: u16 = 0;
-        const FLAGS: u32 = 0;
-        UnsafeAIO::new(
-            key,
-            fd,
-            offset,
-            ptr,
-            len,
-            PRIORITY,
-            FLAGS,
-            io_iocb_cmd::IO_CMD_PREAD,
-        )
-    }
-}
-
-#[inline]
-pub fn pwrite_direct(key: AIOKey, fd: RawFd, offset: usize, buf: DirectBuf) -> AIO {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    AIO::new(
-        key,
-        fd,
-        offset,
-        Buf::Direct(buf),
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PWRITE,
-    )
-}
-
-/// pwrite.
-///
-/// # Safety
-///
-/// Caller must guarantee the pointer is valid during
-/// syscall, and pointer is correctly aligned.
-#[inline]
-pub unsafe fn pwrite_unchecked(
-    key: AIOKey,
-    fd: RawFd,
-    offset: usize,
-    ptr: *mut u8,
-    len: usize,
-) -> UnsafeAIO {
-    unsafe {
-        const PRIORITY: u16 = 0;
-        const FLAGS: u32 = 0;
-        UnsafeAIO::new(
-            key,
-            fd,
-            offset,
-            ptr,
-            len,
-            PRIORITY,
-            FLAGS,
-            io_iocb_cmd::IO_CMD_PWRITE,
-        )
-    }
-}
-
 /// mlock.
 ///
 /// # Safety
@@ -713,7 +495,9 @@ mod tests {
     #[test]
     fn test_aio_file_ops() {
         let aio_mgr = AIOManagerConfig::default().max_events(16).build().unwrap();
-        let file = aio_mgr.create_sparse_file("test.txt", 1024 * 1024).unwrap();
+        let file = aio_mgr
+            .create_sparse_file("aio_file1.txt", 1024 * 1024)
+            .unwrap();
         let buf = DirectBuf::with_data(b"hello, world");
         let (offset, _) = file.alloc(buf.capacity()).unwrap();
         let aio = file.pwrite_direct(100, offset, buf);
@@ -725,8 +509,28 @@ mod tests {
         aio_mgr.wait_at_least(&mut events, 1, |key, res| {
             println!("key={}, res={:?}", key, res);
         });
-        aio_mgr.drop_sparse_file(file);
+        aio_mgr.forget_sparse_file(file);
         // for test, we just remove this file
-        let _ = std::fs::remove_file("test.txt");
+        let _ = std::fs::remove_file("aio_file1.txt");
+    }
+
+    #[test]
+    fn test_aio_file_extend() {
+        let aio_mgr = AIOManagerConfig::default().max_events(16).build().unwrap();
+        let file = aio_mgr
+            .create_sparse_file("aio_file2.txt", 1024 * 1024)
+            .unwrap();
+        let (logical_size, allocated_size) = file.size().unwrap();
+        println!("file created, logical size={logical_size}, allocated size={allocated_size}");
+        assert_eq!(logical_size, 1024 * 1024);
+        assert_eq!(allocated_size, 0);
+        file.extend_to(1024 * 1024 * 2).unwrap();
+        let (logical_size, allocated_size) = file.size().unwrap();
+        println!("file grown, logical size={logical_size}, allocated_size={allocated_size}");
+        assert_eq!(logical_size, 2 * 1024 * 1024);
+        assert_eq!(allocated_size, 0);
+        aio_mgr.forget_sparse_file(file);
+        // for test, we just remove this file
+        let _ = std::fs::remove_file("aio_file2.txt");
     }
 }

@@ -76,7 +76,7 @@ fn worker(id: usize, aio_mgr: &'static AIOManager, args: Args, stop: Arc<AtomicB
             syncer.fdatasync();
         }
     }
-    aio_mgr.drop_sparse_file(file);
+    aio_mgr.forget_sparse_file(file);
     log_bytes
 }
 
