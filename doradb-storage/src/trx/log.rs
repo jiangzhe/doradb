@@ -365,7 +365,7 @@ impl LogPartition {
                 // e.g. DDL start/end pages, min/max transaction CTS.
 
                 // Close file explicitly.
-                self.aio_mgr.drop_sparse_file(ended_log_file);
+                self.aio_mgr.forget_sparse_file(ended_log_file);
             }
             if fp.shutdown {
                 return;
