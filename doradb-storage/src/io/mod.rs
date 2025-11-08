@@ -2,6 +2,7 @@ mod buf;
 mod file;
 mod free_list;
 mod libaio_abi;
+mod table_file;
 
 use libc::{c_long, close, ftruncate, open, EAGAIN, EINTR, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
 use std::ffi::CString;

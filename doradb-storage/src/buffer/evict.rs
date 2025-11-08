@@ -1,8 +1,9 @@
+use crate::bitmap::AllocMap;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, Page, PageID, PageIO, INVALID_PAGE_ID, PAGE_SIZE};
 use crate::buffer::util::{
-    init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate, AllocMap,
+    init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate,
 };
 use crate::buffer::{BufferPool, BufferRequest};
 use crate::error::Validation::Valid;

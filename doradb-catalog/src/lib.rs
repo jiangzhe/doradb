@@ -113,7 +113,7 @@ impl ColumnSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSpec {
     pub index_name: SemiStr,
     pub index_cols: Vec<IndexKey>,

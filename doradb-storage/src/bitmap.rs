@@ -1,3 +1,7 @@
+use parking_lot::Mutex;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 /// Trait to extend u64 slice with bitmap functionalities.
 /// To avoid naming conflicts, all methods are prefixed with "bitmap_".
 pub trait Bitmap {
@@ -22,6 +26,9 @@ pub trait Bitmap {
     /// Set the first zero bit to true within given range.
     #[inline]
     fn bitmap_set_first(&mut self, unit_start_idx: usize, unit_end_idx: usize) -> Option<usize> {
+        if unit_start_idx >= unit_end_idx {
+            return None;
+        }
         let mut unit_idx = unit_start_idx;
         for v in &mut self.bitmap_units_mut()[unit_start_idx..unit_end_idx] {
             let bit_idx = (*v).trailing_ones();
@@ -329,9 +336,144 @@ impl Iterator for BitmapTrueIndexIter<'_> {
     }
 }
 
+#[derive(Clone)]
+pub struct FreeBitmap {
+    free_unit_idx: usize,
+    bitmap: Box<[u64]>,
+}
+
+/// AllocMap is an allocation controller backed by bitmap.
+pub struct AllocMap {
+    inner: Mutex<FreeBitmap>,
+    len: usize,
+    allocated: AtomicUsize,
+}
+
+impl AllocMap {
+    /// Create a new AllocMap.
+    #[inline]
+    pub fn new(len: usize) -> Self {
+        AllocMap {
+            inner: Mutex::new(FreeBitmap {
+                free_unit_idx: 0,
+                bitmap: new_bitmap(len),
+            }),
+            len,
+            allocated: AtomicUsize::new(0),
+        }
+    }
+
+    /// Returns number of maximum allocations.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns number of allocated objects.
+    #[inline]
+    pub fn allocated(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed)
+    }
+
+    /// Try to allocate a new object, returns index of object.
+    #[allow(clippy::manual_div_ceil)]
+    #[inline]
+    pub fn try_allocate(&self) -> Option<usize> {
+        let unit_end_idx = (self.len + 63) / 64;
+        let mut g = self.inner.lock();
+        let unit_start_idx = g.free_unit_idx;
+        if let Some(idx) = g.bitmap.bitmap_set_first(unit_start_idx, unit_end_idx) {
+            if idx < self.len {
+                if idx / 64 != g.free_unit_idx {
+                    // free unit exhausted.
+                    g.free_unit_idx = idx / 64;
+                }
+
+                self.allocated.fetch_add(1, Ordering::Relaxed);
+                return Some(idx);
+            }
+        }
+        // Because when deallocating, free unit index is always moved
+        // to the smallest free position, it's impossible to have free
+        // bit among [0..free_unit_idx]
+        None
+    }
+
+    /// Deallocate a object with its index.
+    #[inline]
+    pub fn deallocate(&self, idx: usize) -> bool {
+        debug_assert!(idx < self.len);
+        let unit_idx = idx / 64;
+
+        let mut g = self.inner.lock();
+        if g.bitmap.bitmap_unset(idx) {
+            if g.free_unit_idx > unit_idx {
+                g.free_unit_idx = unit_idx;
+            }
+            self.allocated.fetch_sub(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Allocate a new object at given index.
+    #[inline]
+    pub fn allocate_at(&self, idx: usize) -> bool {
+        if idx >= self.len {
+            return false;
+        }
+        let mut g = self.inner.lock();
+        if g.bitmap.bitmap_set(idx) {
+            // Do not update free_unit_idx.
+            self.allocated.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Returns whether the object at given position is allocated.
+    #[inline]
+    pub fn is_allocated(&self, idx: usize) -> bool {
+        let g = self.inner.lock();
+        g.bitmap.bitmap_get(idx)
+    }
+
+    /// Returns allocated ranges.
+    #[inline]
+    pub fn allocated_ranges(&self) -> Vec<Range<usize>> {
+        let mut res = vec![];
+        let g = self.inner.lock();
+        let mut idx = 0usize;
+        for (flag, count) in g.bitmap.bitmap_range_iter(self.len) {
+            if flag {
+                res.push(idx..idx + count);
+            }
+            idx += count;
+        }
+        res
+    }
+}
+
+impl Clone for AllocMap {
+    #[inline]
+    fn clone(&self) -> Self {
+        let g = self.inner.lock();
+        let inner = g.clone();
+        let len = self.len;
+        let allocated = self.allocated.load(Ordering::Relaxed);
+        AllocMap {
+            inner: Mutex::new(inner),
+            len,
+            allocated: AtomicUsize::new(allocated),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn test_bitmap_new() {
@@ -592,5 +734,42 @@ mod tests {
         bm.bitmap_set(99);
         let iter = bm.bitmap_true_index_iter(100);
         assert_eq!(iter.collect::<Vec<_>>(), vec![0, 99]);
+    }
+
+    #[test]
+    fn test_alloc_map_concurrent() {
+        let bitmap = Arc::new(AllocMap::new(128));
+        let mut handles = vec![];
+
+        for i in 0..64 {
+            let bitmap = Arc::clone(&bitmap);
+            handles.push(thread::spawn(move || {
+                assert!(bitmap.allocate_at(i * 2));
+                assert!(bitmap.is_allocated(i * 2));
+                assert!(bitmap.deallocate(i * 2));
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_alloc_map_ops() {
+        let alloc_map = AllocMap::new(1024);
+        for _ in 0..1000 {
+            assert!(alloc_map.try_allocate().is_some());
+        }
+        assert!(!alloc_map.deallocate(1000));
+        assert!(alloc_map.deallocate(500));
+        for _ in 0..25 {
+            assert!(alloc_map.try_allocate().is_some());
+        }
+        assert!(alloc_map.deallocate(500));
+        assert!(alloc_map.try_allocate().is_some());
+
+        assert!(!alloc_map.allocate_at(2000));
+        assert!(!alloc_map.allocate_at(100));
     }
 }
