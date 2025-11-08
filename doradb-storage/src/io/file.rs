@@ -10,6 +10,10 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// SparseFile is file with metadata describing empty blocks
+/// instead of writing them.
+/// The logical size of sparse file can be very large, but the
+/// real allocated blocks can be only a few.
 pub struct SparseFile {
     fd: RawFd,
     offset: AtomicUsize,

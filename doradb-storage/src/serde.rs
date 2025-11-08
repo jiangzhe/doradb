@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
-use doradb_catalog::{IndexKey, IndexOrder};
+use doradb_catalog::{IndexAttributes, IndexKey, IndexOrder, IndexSpec};
+use semistr::SemiStr;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
@@ -310,6 +311,29 @@ impl Deser for bool {
     }
 }
 
+impl<const N: usize> Ser<'_> for [u8; N] {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        N
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        debug_assert!(out.len() >= start_idx + N);
+        out[start_idx..start_idx + N].copy_from_slice(&self[..]);
+        start_idx + N
+    }
+}
+
+impl<const N: usize> Deser for [u8; N] {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let mut res = [0u8; N];
+        res.copy_from_slice(&input[start_idx..start_idx + N]);
+        Ok((start_idx + N, res))
+    }
+}
+
 impl<'a, T: Ser<'a>> Ser<'a> for [T] {
     #[inline]
     fn ser_len(&self, ctx: &SerdeCtx) -> usize {
@@ -436,6 +460,128 @@ impl<K: Ord + Deser, V: Deser> Deser for BTreeMap<K, V> {
             map.insert(k, v);
         }
         Ok((idx, map))
+    }
+}
+
+impl Ser<'_> for SemiStr {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u32>() + self.as_bytes().len()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let idx = ctx.ser_u32(out, start_idx, self.len() as u32);
+        debug_assert!(idx + self.len() <= out.len());
+        let end_idx = idx + self.len();
+        out[idx..end_idx].copy_from_slice(self.as_bytes());
+        end_idx
+    }
+}
+
+impl Deser for SemiStr {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, len) = ctx.deser_u32(input, start_idx)?;
+        let end_idx = idx + len as usize;
+        // here we always validate utf-8 encoding.
+        let s = str::from_utf8(&input[idx..end_idx])?;
+        Ok((end_idx, SemiStr::new(s)))
+    }
+}
+
+impl Ser<'_> for IndexOrder {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u8>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        ctx.ser_u8(out, start_idx, *self as u8)
+    }
+}
+
+impl Deser for IndexOrder {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, v) = ctx.deser_u8(input, start_idx)?;
+        Ok((idx, IndexOrder::from(v)))
+    }
+}
+
+impl Ser<'_> for IndexKey {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u16>() + mem::size_of::<u8>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let start_idx = ctx.ser_u16(out, start_idx, self.col_no);
+        self.order.ser(ctx, out, start_idx)
+    }
+}
+
+impl Deser for IndexKey {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, col_no) = ctx.deser_u16(input, start_idx)?;
+        let (idx, order) = IndexOrder::deser(ctx, input, idx)?;
+        Ok((idx, IndexKey { col_no, order }))
+    }
+}
+
+impl Ser<'_> for IndexAttributes {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u32>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        ctx.ser_u32(out, start_idx, self.bits())
+    }
+}
+
+impl Deser for IndexAttributes {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, v) = ctx.deser_u32(input, start_idx)?;
+        Ok((idx, IndexAttributes::from_bits_truncate(v)))
+    }
+}
+
+impl Ser<'_> for IndexSpec {
+    #[inline]
+    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+        self.index_name.ser_len(ctx)
+            + self.index_cols.ser_len(ctx)
+            + self.index_attributes.ser_len(ctx)
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let idx = self.index_name.ser(ctx, out, start_idx);
+        let idx = self.index_cols.ser(ctx, out, idx);
+        self.index_attributes.ser(ctx, out, idx)
+    }
+}
+
+impl Deser for IndexSpec {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, index_name) = SemiStr::deser(ctx, input, start_idx)?;
+        let (idx, index_cols) = <Vec<IndexKey>>::deser(ctx, input, idx)?;
+        let (idx, index_attributes) = IndexAttributes::deser(ctx, input, idx)?;
+        Ok((
+            idx,
+            IndexSpec {
+                index_name,
+                index_cols,
+                index_attributes,
+            },
+        ))
     }
 }
 
@@ -605,35 +751,6 @@ impl<H: Deser, P: Deser> Deser for LenPrefixPod<H, P> {
     }
 }
 
-impl Ser<'_> for IndexKey {
-    #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
-        mem::size_of::<u16>() + mem::size_of::<u8>()
-    }
-
-    #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let mut idx = start_idx;
-        idx = ctx.ser_u16(out, idx, self.col_no);
-        ctx.ser_u8(out, idx, self.order as u8)
-    }
-}
-
-impl Deser for IndexKey {
-    #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, col_no) = ctx.deser_u16(input, start_idx)?;
-        let (idx, order) = ctx.deser_u8(input, idx)?;
-        Ok((
-            idx,
-            IndexKey {
-                col_no,
-                order: IndexOrder::from(order),
-            },
-        ))
-    }
-}
-
 impl Ser<'_> for () {
     #[inline]
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
@@ -725,6 +842,53 @@ mod tests {
         let (idx, val) = BTreeMap::<u64, TestStruct>::deser(&mut ctx, &out, 0).unwrap();
         assert_eq!(idx, out.len());
         assert_eq!(val, map);
+    }
+
+    #[test]
+    fn test_index_spec_serde() {
+        let mut ctx = SerdeCtx::default();
+        let index_name = SemiStr::new("index1");
+        println!("index_name ser_len={}", index_name.ser_len(&ctx));
+        let index_cols = vec![
+            IndexKey::new(0),
+            IndexKey {
+                col_no: 1,
+                order: IndexOrder::Desc,
+            },
+        ];
+        println!("index_cols ser_len={}", index_cols.ser_len(&ctx));
+        let index_attributes = IndexAttributes::PK;
+        println!(
+            "index_attributes ser_len={}",
+            index_attributes.ser_len(&ctx)
+        );
+        let spec = IndexSpec {
+            index_name,
+            index_cols,
+            index_attributes,
+        };
+        let len = spec.ser_len(&ctx);
+        println!("index_spec ser_len={}", len);
+        let mut vec = vec![0u8; len];
+        let idx = spec.ser(&ctx, &mut vec, 0);
+        assert_eq!(idx, len);
+        let (idx, parsed) = IndexSpec::deser(&mut ctx, &vec, 0).unwrap();
+        assert_eq!(idx, len);
+        assert_eq!(parsed, spec);
+    }
+
+    #[test]
+    fn test_array_serde() {
+        let array = [0u8, 1, 2, 3, 4];
+        let mut ctx = SerdeCtx::default();
+        let len = array.ser_len(&ctx);
+        assert_eq!(len, 5);
+        let mut vec = vec![0u8; len];
+        let idx = array.ser(&ctx, &mut vec, 0);
+        assert_eq!(idx, len);
+        let (idx, res) = <[u8; 5]>::deser(&mut ctx, &vec, 0).unwrap();
+        assert_eq!(idx, 5);
+        assert_eq!(res, array);
     }
 
     #[derive(Debug, PartialEq, Eq)]
