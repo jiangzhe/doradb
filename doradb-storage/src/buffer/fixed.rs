@@ -196,11 +196,6 @@ impl BufferPool for FixedBufferPool {
         debug_assert!(res);
     }
 
-    #[inline]
-    fn evict_page<T: BufferPage>(&'static self, _g: PageExclusiveGuard<T>) {
-        panic!("FixedBufferPool does not support page eviction")
-    }
-
     /// Get child page by page id provided by parent page.
     /// The parent page guard should be provided because other thread may change page
     /// id concurrently, and the input page id may not be valid through the function

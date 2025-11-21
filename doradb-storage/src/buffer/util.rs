@@ -1,4 +1,3 @@
-use crate::bitmap::{new_bitmap, Bitmap};
 use crate::buffer::frame::BufferFrame;
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::BufferPage;
@@ -8,9 +7,6 @@ use libc::{
     c_void, madvise, mmap, munmap, MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MADV_REMOVE,
     MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE,
 };
-use parking_lot::Mutex;
-use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[inline]
 pub(super) fn init_bf_exclusive_guard<T: BufferPage>(

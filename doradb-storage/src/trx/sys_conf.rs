@@ -2,7 +2,7 @@ use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::Catalog;
 use crate::error::Result;
-use crate::io::{align_to_sector_size, AIOManagerConfig};
+use crate::io::{align_to_sector_size, AIOContext};
 use crate::lifetime::StaticLifetime;
 use crate::trx::log::{LogPartitionInitializer, LogPartitionMode, LogSync, LOG_HEADER_PAGES};
 use crate::trx::recover::log_recover;
@@ -123,9 +123,7 @@ impl TrxSysConfig {
 
     #[inline]
     pub fn log_partition_initializer(&self, log_no: usize) -> Result<LogPartitionInitializer> {
-        let aio_mgr = AIOManagerConfig::default()
-            .max_events(self.io_depth_per_log)
-            .build()?;
+        let ctx = AIOContext::new(self.io_depth_per_log)?;
 
         // determine whether we should recovery from previous logs.
         let mode = if self.skip_recovery {
@@ -139,7 +137,7 @@ impl TrxSysConfig {
             }
         };
         Ok(LogPartitionInitializer {
-            aio_mgr,
+            ctx,
             mode,
             file_prefix: self.log_file_prefix.clone(),
             file_max_size: self.log_file_max_size.as_u64() as usize,

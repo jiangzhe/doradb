@@ -1,11 +1,13 @@
-use crate::io::align_to_sector_size;
-use crate::io::buf::{Buf, DirectBuf};
+use crate::io::buf::Buf;
 use crate::io::libaio_abi::io_iocb_cmd;
-use crate::io::{AIOError, AIOKey, UnsafeAIO, AIO};
-use libc::{close, fdatasync, fstat, fsync, ftruncate, stat};
+use crate::io::{align_to_sector_size, AIOError, AIOKey, AIOResult, UnsafeAIO, AIO};
+use libc::{
+    close, fdatasync, fstat, fsync, ftruncate, open, stat, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC,
+};
 use parking_lot::lock_api::RawMutex as RawMutexAPI;
 use parking_lot::RawMutex;
 use scopeguard::defer;
+use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,9 +32,50 @@ impl AsRawFd for SparseFile {
 }
 
 impl SparseFile {
+    /// Create a sparse file with given maximum length.
+    /// Note that space is allocated only when data is written to this file.
+    #[inline]
+    pub fn create(file_path: impl AsRef<str>, max_len: usize) -> AIOResult<SparseFile> {
+        unsafe {
+            let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
+            let fd = open(
+                c_string.as_ptr(),
+                O_CREAT | O_RDWR | O_TRUNC | O_DIRECT,
+                0o644,
+            );
+            if fd < 0 {
+                return Err(AIOError::OpenFileError);
+            }
+            let ret = ftruncate(fd, max_len as i64);
+            if ret < 0 {
+                let _ = close(fd); // close file descriptor if truncate fail.
+                return Err(AIOError::OpenFileError);
+            }
+            Ok(SparseFile::new(fd, 0, max_len))
+        }
+    }
+
+    /// Open an existing sparse file with given maximum length.
+    #[inline]
+    pub fn open(file_path: impl AsRef<str>, max_len: usize) -> AIOResult<SparseFile> {
+        unsafe {
+            let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
+            let fd = open(c_string.as_ptr(), O_RDWR | O_DIRECT, 0o644);
+            if fd < 0 {
+                return Err(AIOError::OpenFileError);
+            }
+            let ret = ftruncate(fd, max_len as i64);
+            if ret < 0 {
+                let _ = close(fd); // close file descriptor if truncate fail.
+                return Err(AIOError::OpenFileError);
+            }
+            Ok(SparseFile::new(fd, 0, max_len))
+        }
+    }
+
     /// Create a new sparse file.
     #[inline]
-    pub fn new(fd: RawFd, offset: usize, max_len: usize) -> Self {
+    fn new(fd: RawFd, offset: usize, max_len: usize) -> Self {
         SparseFile {
             fd,
             offset: AtomicUsize::new(offset),
@@ -65,8 +108,8 @@ impl SparseFile {
     /// Returns a pread IO request.
     /// User should make sure key is unique.
     #[inline]
-    pub fn pread_direct(&self, key: AIOKey, offset: usize, len: usize) -> AIO {
-        pread_direct(key, self.fd, offset, len)
+    pub fn pread_direct(&self, key: AIOKey, offset: usize, buf: Buf) -> AIO {
+        pread_direct(key, self.fd, offset, buf)
     }
 
     /// Returns a pread IO request.
@@ -89,7 +132,7 @@ impl SparseFile {
     /// Returns a pwrite IO request.
     /// User should make sure key is unique.
     #[inline]
-    pub fn pwrite_direct(&self, key: AIOKey, offset: usize, buf: DirectBuf) -> AIO {
+    pub fn pwrite_direct(&self, key: AIOKey, offset: usize, buf: Buf) -> AIO {
         pwrite_direct(key, self.fd, offset, buf)
     }
 
@@ -183,15 +226,14 @@ impl FileSyncer {
 }
 
 #[inline]
-pub fn pread_direct(key: AIOKey, fd: RawFd, offset: usize, len: usize) -> AIO {
+pub fn pread_direct(key: AIOKey, fd: RawFd, offset: usize, buf: Buf) -> AIO {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
-    let buf = DirectBuf::uninit(len);
     AIO::new(
         key,
         fd,
         offset,
-        Buf::Direct(buf),
+        buf,
         PRIORITY,
         FLAGS,
         io_iocb_cmd::IO_CMD_PREAD,
@@ -229,14 +271,14 @@ pub unsafe fn pread_unchecked(
 }
 
 #[inline]
-pub fn pwrite_direct(key: AIOKey, fd: RawFd, offset: usize, buf: DirectBuf) -> AIO {
+pub fn pwrite_direct(key: AIOKey, fd: RawFd, offset: usize, buf: Buf) -> AIO {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
     AIO::new(
         key,
         fd,
         offset,
-        Buf::Direct(buf),
+        buf,
         PRIORITY,
         FLAGS,
         io_iocb_cmd::IO_CMD_PWRITE,
@@ -270,5 +312,21 @@ pub unsafe fn pwrite_unchecked(
             FLAGS,
             io_iocb_cmd::IO_CMD_PWRITE,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sparse_file_open_and_create() {
+        let res = SparseFile::open("sparsefile1.bin", 1024 * 1024);
+        assert!(res.is_err());
+        let file = SparseFile::create("sparsefile1.bin", 1024 * 1024).unwrap();
+        drop(file);
+        let file = SparseFile::open("sparsefile1.bin", 1024 * 1024).unwrap();
+        drop(file);
+        let _ = std::fs::remove_file("sparsefile1.bin");
     }
 }

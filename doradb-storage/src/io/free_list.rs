@@ -1,8 +1,12 @@
+use crate::notify::EventNotifyOnDrop;
+use event_listener::{listener, Listener};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+/// Simple FreeList backed by linked list.
 pub struct FreeList<T> {
     head: AtomicPtr<FreeElem<T>>,
+    ev: EventNotifyOnDrop,
 }
 
 impl<T> FreeList<T> {
@@ -30,6 +34,7 @@ impl<T> FreeList<T> {
                 .compare_exchange_weak(ptr, new, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
+                self.ev.notify(1);
                 return;
             }
         }
@@ -41,7 +46,7 @@ impl<T> FreeList<T> {
         self.pop_elem().map(|elem| elem.into_inner())
     }
 
-    /// Pop an an element from free list.
+    /// Pop an element from free list.
     #[inline]
     pub fn pop_elem(&self) -> Option<Box<FreeElem<T>>> {
         loop {
@@ -57,8 +62,39 @@ impl<T> FreeList<T> {
             {
                 let elem = unsafe { Box::from_raw(ptr) };
                 elem.next.store(std::ptr::null_mut(), Ordering::Relaxed);
+                self.ev.notify(1);
                 return Some(elem);
             }
+        }
+    }
+
+    /// Pop an element from free list and block if empty.
+    #[inline]
+    pub fn pop_elem_blocking(&self) -> Box<FreeElem<T>> {
+        loop {
+            if let Some(elem) = self.pop_elem() {
+                return elem;
+            }
+            listener!(self.ev => listener);
+            if let Some(elem) = self.pop_elem() {
+                return elem;
+            }
+            listener.wait();
+        }
+    }
+
+    /// Pop an element in async way, yield if list is empty.
+    #[inline]
+    pub async fn pop_elem_async(&self) -> Box<FreeElem<T>> {
+        loop {
+            if let Some(elem) = self.pop_elem() {
+                return elem;
+            }
+            listener!(self.ev => listener);
+            if let Some(elem) = self.pop_elem() {
+                return elem;
+            }
+            listener.await;
         }
     }
 }
@@ -68,6 +104,7 @@ impl<T> Default for FreeList<T> {
     fn default() -> Self {
         FreeList {
             head: AtomicPtr::new(std::ptr::null_mut()),
+            ev: EventNotifyOnDrop::new(),
         }
     }
 }
@@ -78,6 +115,17 @@ impl<T> Drop for FreeList<T> {
         while let Some(elem) = self.pop() {
             drop(elem);
         }
+    }
+}
+
+impl<T> FromIterator<T> for FreeList<T> {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let res = FreeList::default();
+        for v in iter {
+            res.push(v);
+        }
+        res
     }
 }
 
@@ -190,6 +238,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_free_list_basic() {
@@ -245,5 +294,39 @@ mod tests {
         let elem = FreeElem::new(100);
         assert_eq!(*elem, 100);
         assert_eq!(elem.into_inner(), 100);
+    }
+
+    #[test]
+    fn test_free_list_blocking() {
+        let free_list = Arc::new(FreeList::<i32>::default());
+        let handle = {
+            let free_list = Arc::clone(&free_list);
+            thread::spawn(move || {
+                let elem = free_list.pop_elem_blocking();
+                println!("elem is {:?}", **elem);
+            })
+        };
+        thread::sleep(Duration::from_millis(100));
+        free_list.push(42);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_free_list_async() {
+        smol::block_on(async {
+            let free_list = Arc::new(FreeList::<i32>::default());
+            {
+                let free_list = Arc::clone(&free_list);
+                smol::spawn(async move {
+                    let elem = free_list.pop_elem_async().await;
+                    println!("elem is {:?}", **elem);
+                })
+                .detach();
+            }
+
+            smol::Timer::after(Duration::from_millis(100)).await;
+            free_list.push(42);
+            smol::Timer::after(Duration::from_millis(100)).await;
+        })
     }
 }

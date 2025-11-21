@@ -318,7 +318,7 @@ impl<const N: usize> Ser<'_> for [u8; N] {
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser(&self, _ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
         debug_assert!(out.len() >= start_idx + N);
         out[start_idx..start_idx + N].copy_from_slice(&self[..]);
         start_idx + N
@@ -327,7 +327,7 @@ impl<const N: usize> Ser<'_> for [u8; N] {
 
 impl<const N: usize> Deser for [u8; N] {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser(_ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let mut res = [0u8; N];
         res.copy_from_slice(&input[start_idx..start_idx + N]);
         Ok((start_idx + N, res))
