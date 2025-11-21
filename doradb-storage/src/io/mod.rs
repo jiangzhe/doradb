@@ -4,11 +4,19 @@ mod free_list;
 mod libaio_abi;
 mod table_file;
 
-use libc::{c_long, close, ftruncate, open, EAGAIN, EINTR, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
-use std::ffi::CString;
+use crate::lifetime::StaticLifetime;
+use crate::thread;
+use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
+use libc::{c_long, EAGAIN, EINTR};
+use std::collections::VecDeque;
 use std::ops::Deref;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::os::unix::io::RawFd;
+use std::panic::UnwindSafe;
+use std::result::Result as StdResult;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Instant;
 use thiserror::Error;
 
 pub use buf::*;
@@ -38,37 +46,146 @@ pub enum AIOError {
     OutOfRange,
 }
 
-pub struct AIOContext(io_context_t);
+pub type AIOResult<T> = StdResult<T, AIOError>;
+
+pub struct AIOContext {
+    ctx: io_context_t,
+    max_events: usize,
+}
 
 unsafe impl Sync for AIOContext {}
 unsafe impl Send for AIOContext {}
 
-impl Deref for AIOContext {
-    type Target = io_context_t;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 impl AIOContext {
+    /// Create a new AIO context with max events(io depth).
     #[inline]
-    fn new(maxevents: u32) -> Result<Self, AIOError> {
+    pub fn new(max_events: usize) -> AIOResult<Self> {
+        debug_assert!(max_events < isize::MAX as usize);
         let mut ctx = std::ptr::null_mut();
         unsafe {
-            match io_setup(maxevents as i32, &mut ctx) {
-                0 => Ok(AIOContext(ctx)),
+            match io_setup(max_events as i32, &mut ctx) {
+                0 => Ok(AIOContext { ctx, max_events }),
                 _ => Err(AIOError::SetupError),
             }
         }
     }
+
+    /// Create a default AIO context.
+    #[inline]
+    pub fn try_default() -> AIOResult<Self> {
+        AIOContext::new(DEFAULT_AIO_MAX_EVENTS)
+    }
+
+    /// Returns maximum events.
+    #[inline]
+    pub fn max_events(&self) -> usize {
+        self.max_events
+    }
+
+    /// Create a heap-allocated event array for IO submit and wait.
+    #[inline]
+    pub fn events(&self) -> Box<[io_event]> {
+        vec![io_event::default(); self.max_events].into_boxed_slice()
+    }
+
+    /// Submit IO requests with limit.
+    /// Submit count will be returned, and caller need to take
+    /// care of cleaning the input slice.
+    #[inline]
+    pub fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> usize {
+        if reqs.is_empty() || limit == 0 {
+            return 0;
+        }
+        let batch_size = limit.min(reqs.len());
+        let ret = unsafe { io_submit(self.ctx, batch_size as c_long, reqs.as_ptr() as *mut _) };
+        // See https://man7.org/linux/man-pages/man2/io_submit.2.html
+        // for the details of return value of io_submit().
+        // if success, non-negative value indicates how many IO submitted.
+        // if error, negative value of error code.
+        // if ret < 0 && -ret != EAGAIN {
+        if ret < 0 {
+            panic!("io_submit returns error code {ret}: batch_size={batch_size}");
+        }
+        ret as usize
+    }
+
+    /// Wait until given number of IO finishes, and execute callback for each.
+    /// Returns number of finished events.
+    #[inline]
+    pub fn wait_at_least<F>(
+        &self,
+        events: &mut [io_event],
+        min_nr: usize,
+        mut callback: F,
+    ) -> (usize, usize)
+    where
+        F: FnMut(AIOKey, StdResult<usize, std::io::Error>) -> AIOKind,
+    {
+        let max_nwait = events.len();
+        let count = loop {
+            let ret = unsafe {
+                io_getevents(
+                    self.ctx,
+                    min_nr as c_long,
+                    max_nwait as c_long,
+                    events.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ret < 0 {
+                let errcode = -ret;
+                if errcode == EINTR {
+                    // retry if interrupt
+                    continue;
+                }
+                panic!("io_getevents returns error code {errcode}");
+            }
+            break ret as usize;
+        };
+        assert!(
+            count != 0,
+            "io_getevents with min_nr=1 and timeout=None should not return 0"
+        );
+        let mut read_count = 0;
+        let mut write_count = 0;
+        for ev in &events[..count] {
+            let key = ev.data;
+            let res = if ev.res >= 0 {
+                Ok(ev.res as usize)
+            } else {
+                let err = std::io::Error::from_raw_os_error(-ev.res as i32);
+                Err(err)
+            };
+            match callback(key, res) {
+                AIOKind::Read => read_count += 1,
+                AIOKind::Write => write_count += 1,
+            }
+        }
+        (read_count, write_count)
+    }
+
+    /// Build a event loop.
+    #[inline]
+    pub fn event_loop<T>(self) -> (AIOEventLoop<T>, AIOClient<T>) {
+        const DEFAULT_AIO_EVENT_LOOP_BACKLOG: usize = 10;
+        let (tx, rx) = flume::bounded(DEFAULT_AIO_EVENT_LOOP_BACKLOG);
+        let el = AIOEventLoop {
+            ctx: self,
+            rx,
+            submitted: 0,
+            shutdown: false,
+        };
+        (el, AIOClient(tx))
+    }
 }
+
+unsafe impl StaticLifetime for AIOContext {}
 
 impl Drop for AIOContext {
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            assert_eq!(io_destroy(self.0), 0);
+            assert_eq!(io_destroy(self.ctx), 0);
         }
     }
 }
@@ -190,228 +307,355 @@ impl UnsafeAIO {
     }
 }
 
+pub enum AIOKind {
+    Read,
+    Write,
+}
+
+pub enum AIOMessage<T> {
+    Shutdown,
+    Req(T),
+}
+
+impl<T> AIOMessage<T> {
+    #[inline]
+    pub fn req(self) -> Option<T> {
+        match self {
+            AIOMessage::Req(r) => Some(r),
+            AIOMessage::Shutdown => None,
+        }
+    }
+}
+
+pub struct IOQueue<T> {
+    // aligned with AIO interface.
+    iocbs: Vec<IocbRawPtr>,
+    reqs: VecDeque<T>,
+}
+
+impl<T> IOQueue<T> {
+    /// Create a new IO queue with given capacity.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        IOQueue {
+            iocbs: Vec::with_capacity(capacity),
+            reqs: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    /// Returns length of the queue.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.iocbs.len()
+    }
+
+    /// Returns whether the queue is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn iocbs(&self) -> &[IocbRawPtr] {
+        &self.iocbs
+    }
+
+    #[inline]
+    pub fn drain_to(&mut self, n: usize) -> Vec<T> {
+        self.iocbs.drain(0..n);
+        let reqs = self.reqs.drain(0..n).collect();
+        reqs
+    }
+
+    /// Checks consistency of this queue.
+    #[inline]
+    pub fn consistent(&self) -> bool {
+        self.reqs.len() == self.iocbs.len()
+    }
+
+    #[inline]
+    pub fn push(&mut self, iocb: IocbRawPtr, req: T) {
+        self.iocbs.push(iocb);
+        self.reqs.push_back(req);
+    }
+}
+
 /// AIOKey represents the unique key of any AIO request.
 pub type AIOKey = u64;
 
-/// AIOManager controls all AIO operations.
-pub struct AIOManager {
-    ctx: AIOContext,
-    fd_count: AtomicU64,
-    max_events: usize,
+#[derive(Debug)]
+pub struct AIOStats {
+    pub queuing: usize,
+    pub running: usize,
+    pub finished_reads: usize,
+    pub finished_writes: usize,
+    pub io_submit_count: usize,
+    pub io_submit_nanos: usize,
+    pub io_wait_count: usize,
+    pub io_wait_nanos: usize,
 }
 
-impl AIOManager {
-    /// Create a sparse file with given maximum length.
-    /// Note that space is allocated only when data is written to this file.
-    #[inline]
-    pub fn create_sparse_file(
-        &self,
-        file_path: impl AsRef<str>,
-        max_len: usize,
-    ) -> Result<SparseFile, AIOError> {
-        unsafe {
-            let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
-            let fd = open(
-                c_string.as_ptr(),
-                O_CREAT | O_RDWR | O_TRUNC | O_DIRECT,
-                0o644,
-            );
-            if fd < 0 {
-                return Err(AIOError::OpenFileError);
-            }
-            let ret = ftruncate(fd, max_len as i64);
-            if ret < 0 {
-                let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(AIOError::OpenFileError);
-            }
-            self.register_fd(fd);
-            Ok(SparseFile::new(fd, 0, max_len))
-        }
-    }
+/// Fixed size buffer free list hold a given number of
+/// buffer pages.
+/// It's used to reuse pages in heavy IO environment.
+#[derive(Clone)]
+pub struct FixedSizeBufferFreeList(Arc<FreeList<DirectBuf>>);
 
-    /// Open an existing sparse file with given maximum length.
+impl FixedSizeBufferFreeList {
+    /// Create a new buffer free list with given number of
+    /// pre-allocated buffer pages.
     #[inline]
-    pub fn open_sparse_file(
-        &self,
-        file_path: impl AsRef<str>,
-        max_len: usize,
-    ) -> Result<SparseFile, AIOError> {
-        unsafe {
-            let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
-            let fd = open(c_string.as_ptr(), O_RDWR | O_DIRECT, 0o644);
-            if fd < 0 {
-                return Err(AIOError::OpenFileError);
-            }
-            let ret = ftruncate(fd, max_len as i64);
-            if ret < 0 {
-                let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(AIOError::OpenFileError);
-            }
-            self.register_fd(fd);
-            Ok(SparseFile::new(fd, 0, max_len))
-        }
-    }
-
-    /// Forget give file.
-    #[inline]
-    pub fn forget_sparse_file(&self, file: SparseFile) {
-        self.deregister_fd(file.as_raw_fd());
-    }
-
-    #[inline]
-    pub fn register_fd(&self, _fd: RawFd) {
-        self.fd_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn deregister_fd(&self, _fd: RawFd) {
-        self.fd_count.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn max_events(&self) -> usize {
-        self.max_events
-    }
-
-    #[inline]
-    pub fn events(&self) -> Box<[io_event]> {
-        vec![io_event::default(); self.max_events].into_boxed_slice()
-    }
-
-    #[inline]
-    pub fn submit(&self, reqs: &mut Vec<*mut iocb>) -> usize {
-        if reqs.is_empty() {
-            return 0;
-        }
-        let batch_size = reqs.len();
-        let ret = unsafe { io_submit(*self.ctx, batch_size as c_long, reqs.as_mut_ptr()) };
-        // See https://man7.org/linux/man-pages/man2/io_submit.2.html
-        // for the details of return value of io_submit().
-        // if success, non-negative value indicates how many IO submitted.
-        // if error, negative value of error code.
-        if ret < 0 && -ret != EAGAIN {
-            panic!("io_submit returns error code {ret}: batch_size={batch_size}");
-        }
-        reqs.clear();
-        ret.max(0) as usize
-    }
-
-    #[inline]
-    pub fn submit_limit(&self, reqs: &mut Vec<*mut iocb>, limit: usize) -> usize {
-        if reqs.is_empty() || limit == 0 {
-            return 0;
-        }
-        let batch_size = limit.min(reqs.len());
-        let ret = unsafe { io_submit(*self.ctx, batch_size as c_long, reqs.as_mut_ptr()) };
-        // See https://man7.org/linux/man-pages/man2/io_submit.2.html
-        // for the details of return value of io_submit().
-        // if success, non-negative value indicates how many IO submitted.
-        // if error, negative value of error code.
-        // if ret < 0 && -ret != EAGAIN {
-        if ret < 0 {
-            panic!("io_submit returns error code {ret}: batch_size={batch_size}");
-        }
-        let submit_count = ret as usize;
-        reqs.drain(..submit_count);
-        submit_count
-    }
-
-    /// Wait until given number of IO finishes, and execute callback for each.
-    /// Returns number of finished events.
-    #[inline]
-    pub fn wait_at_least<F>(&self, events: &mut [io_event], min_nr: usize, mut callback: F) -> usize
-    where
-        F: FnMut(AIOKey, Result<usize, std::io::Error>),
-    {
-        let max_nwait = events.len();
-        let count = loop {
-            let ret = unsafe {
-                io_getevents(
-                    *self.ctx,
-                    min_nr as c_long,
-                    max_nwait as c_long,
-                    events.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if ret < 0 {
-                let errcode = -ret;
-                if errcode == EINTR {
-                    // retry if interrupt
-                    continue;
-                }
-                panic!("io_getevents returns error code {errcode}");
-            }
-            break ret as usize;
-        };
-        assert!(
-            count != 0,
-            "io_getevents with min_nr=1 and timeout=None should not return 0"
-        );
-        for ev in &events[..count] {
-            let key = ev.data;
-            let res = if ev.res >= 0 {
-                Ok(ev.res as usize)
-            } else {
-                let err = std::io::Error::from_raw_os_error(-ev.res as i32);
-                Err(err)
-            };
-            callback(key, res);
-        }
-        count
+    pub fn new(page_size: usize, count: usize) -> Self {
+        debug_assert!(page_size.is_multiple_of(MIN_PAGE_SIZE));
+        debug_assert!(count > 0);
+        let free_list: FreeList<_> = (0..count)
+            .map(|_| DirectBuf::page_zeroed(page_size))
+            .collect();
+        FixedSizeBufferFreeList(Arc::new(free_list))
     }
 }
 
-impl Drop for AIOManager {
+impl Deref for FixedSizeBufferFreeList {
+    type Target = FreeList<DirectBuf>;
     #[inline]
-    fn drop(&mut self) {
-        // check if there are any remained file descriptors remain opened.
-        let fd_count = self.fd_count.load(Ordering::Relaxed);
-        if fd_count != 0 {
-            panic!("{fd_count} files remain opened when shutdown AIOManager");
-        }
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-unsafe impl Send for AIOManager {}
-unsafe impl Sync for AIOManager {}
+/// AIOEventListener defines
+/// how to process with IO requests and responses.
+pub trait AIOEventListener {
+    type Request;
+    type Submission;
 
-pub struct AIOManagerConfig {
-    max_events: usize,
+    /// Called when sending request to AIO event loop.
+    /// Implementor should convert the request to submission and put it in the queue.
+    fn on_request(&mut self, req: Self::Request, queue: &mut IOQueue<Self::Submission>);
+
+    /// Called when submitted to AIO context.
+    fn on_submit(&mut self, sub: Self::Submission);
+
+    /// Called when AIO is completed.
+    /// The result contains number of bytes read/write, or the IO error.
+    /// It's caller's responsibility to store intermediate result (especially
+    /// buffer allocation) and map it via AIOKey in on_complete() function.
+    /// In such way, the caller always keeps the buffer in valid state.
+    fn on_complete(&mut self, key: AIOKey, res: std::io::Result<usize>) -> AIOKind;
+
+    /// Called when multiple IOs completed.
+    fn on_batch_complete(&mut self, read_count: usize, write_count: usize);
+
+    /// Called when stats is collected.
+    fn on_stats(&mut self, stats: &AIOStats);
+
+    /// Called when event loop is ended.
+    fn end_loop(self, ctx: &AIOContext);
 }
 
-impl AIOManagerConfig {
+/// Client of AIO event loop, can submit IO request
+/// or shutdown the execution loop.``
+pub struct AIOClient<T>(Sender<AIOMessage<T>>);
+
+impl<T> AIOClient<T> {
+    /// Shutdown the event loop and wait for graceful stop.
     #[inline]
-    pub fn max_events(mut self, max_events: usize) -> Self {
-        self.max_events = max_events;
-        self
+    pub fn shutdown(&self) {
+        // Someone might already sent shutdown message via the channel,
+        // so we ignore send error.
+        let _ = self.0.send(AIOMessage::Shutdown);
     }
 
+    /// Send IO request to AIO executor.
     #[inline]
-    pub fn build(self) -> Result<AIOManager, AIOError> {
-        let ctx = AIOContext::new(self.max_events as u32)?;
-        Ok(AIOManager {
-            ctx,
-            fd_count: AtomicU64::new(0),
-            max_events: self.max_events,
+    pub fn send(&self, req: T) -> StdResult<(), SendError<T>> {
+        self.0
+            .send(AIOMessage::Req(req))
+            .map_err(|e| SendError(e.0.req().unwrap()))
+    }
+
+    /// Try send IO request to AIO executor.
+    #[inline]
+    pub fn try_send(&self, req: T) -> StdResult<(), TrySendError<T>> {
+        self.0.try_send(AIOMessage::Req(req)).map_err(|e| match e {
+            TrySendError::Full(v) => TrySendError::Full(v.req().unwrap()),
+            TrySendError::Disconnected(v) => TrySendError::Disconnected(v.req().unwrap()),
         })
     }
 
+    /// Send IO request to AIO executor in async way.
     #[inline]
-    pub fn build_static(self) -> Result<&'static AIOManager, AIOError> {
-        let aio_mgr = self.build()?;
-        Ok(Box::leak(Box::new(aio_mgr)))
+    pub async fn send_async(&self, req: T) -> StdResult<(), SendError<T>> {
+        self.0
+            .send_async(AIOMessage::Req(req))
+            .await
+            .map_err(|e| SendError(e.0.req().unwrap()))
     }
 }
 
-impl Default for AIOManagerConfig {
+impl<T> Clone for AIOClient<T> {
     #[inline]
-    fn default() -> Self {
-        AIOManagerConfig {
-            max_events: DEFAULT_AIO_MAX_EVENTS,
-        }
+    fn clone(&self) -> Self {
+        AIOClient(self.0.clone())
     }
 }
+
+/// Event loop of AIO.
+pub struct AIOEventLoop<T> {
+    ctx: AIOContext,
+    /// channel of IO requests.
+    rx: Receiver<AIOMessage<T>>,
+    // Total number of IO submitted.
+    submitted: usize,
+    // flag to stop the event loop.
+    shutdown: bool,
+}
+
+impl<T> AIOEventLoop<T> {
+    /// Start a separate thread for AIO event loop.
+    pub fn start_thread<L>(self, listener: L) -> JoinHandle<()>
+    where
+        L: AIOEventListener<Request = T> + Send + 'static + UnwindSafe,
+        L::Request: Send + 'static + UnwindSafe,
+    {
+        thread::spawn_named("AIOEventLoop", move || self.run(listener))
+    }
+
+    #[inline]
+    fn io_depth(&self) -> usize {
+        self.ctx.max_events()
+    }
+
+    #[inline]
+    fn fetch_reqs<L: AIOEventListener<Request = T>>(
+        &mut self,
+        listener: &mut L,
+        queue: &mut IOQueue<L::Submission>,
+        mut min_reqs: usize,
+    ) {
+        let mut msg = if min_reqs > 0 {
+            // won't fail because we always send Shutdown message before
+            // we close sender side.
+            self.rx.recv().unwrap()
+        } else {
+            match self.rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => unreachable!(),
+            }
+        };
+        min_reqs = min_reqs.saturating_sub(1);
+        loop {
+            match msg {
+                AIOMessage::Shutdown => {
+                    self.shutdown = true;
+                    return;
+                }
+                AIOMessage::Req(req) => {
+                    listener.on_request(req, queue);
+                }
+            }
+            // collapse continuous messages
+            msg = if min_reqs > 0 {
+                // block until next message
+                // won't fail
+                self.rx.recv().unwrap()
+            } else {
+                match self.rx.try_recv() {
+                    Ok(m) => m,
+                    Err(TryRecvError::Empty) => {
+                        // no more messages
+                        return;
+                    }
+                    Err(TryRecvError::Disconnected) => unreachable!(),
+                }
+            };
+            min_reqs = min_reqs.saturating_sub(1);
+        }
+    }
+
+    #[inline]
+    fn run<L: AIOEventListener<Request = T>>(mut self, mut listener: L) {
+        // IO results.
+        let mut results = self.ctx.events();
+        // IO queue
+        let mut queue: IOQueue<L::Submission> = IOQueue::with_capacity(self.io_depth());
+        loop {
+            debug_assert!(
+                queue.consistent(),
+                "pending IO number equals to pending request number"
+            );
+            // We only accept request if shutdown flag is false.
+            if !self.shutdown {
+                if queue.len() + self.submitted == 0 {
+                    // there is no IO operation running.
+                    self.fetch_reqs(&mut listener, &mut queue, 1);
+                } else if queue.len() < self.io_depth() {
+                    self.fetch_reqs(&mut listener, &mut queue, 0);
+                } // otherwise, do not fetch
+            }
+            // Event if shutdown flag is set to true, we still process queued requests.
+            let (io_submit_count, io_submit_nanos) = if !queue.is_empty() {
+                let start = Instant::now();
+                // Try to submit as many IO requests as possible
+                debug_assert!(self.io_depth() >= self.submitted);
+                let limit = self.io_depth() - self.submitted;
+                let submit_count = self.ctx.submit_limit(queue.iocbs(), limit);
+                // Add requests to inflight tree.
+                for sub in queue.drain_to(submit_count) {
+                    listener.on_submit(sub);
+                }
+                debug_assert!(queue.consistent());
+                self.submitted += submit_count;
+                debug_assert!(self.submitted <= self.io_depth());
+                (1, start.elapsed().as_nanos() as usize)
+            } else {
+                (0, 0)
+            };
+
+            // wait for any request to be done.
+            // Note: even if we received shutdown message, we should wait all submitted IO finish before quiting.
+            // This will prevent kernel from accessing a freed memory via async IO processing.
+            let (io_wait_count, io_wait_nanos, finished_reads, finished_writes) = if self.submitted
+                != 0
+            {
+                let start = Instant::now();
+                let (read_count, write_count) =
+                    self.ctx
+                        .wait_at_least(&mut results, 1, |key, res| listener.on_complete(key, res));
+                listener.on_batch_complete(read_count, write_count);
+                self.submitted -= read_count + write_count;
+                (
+                    1,
+                    start.elapsed().as_nanos() as usize,
+                    read_count,
+                    write_count,
+                )
+            } else {
+                (0, 0, 0, 0)
+            };
+
+            listener.on_stats(&AIOStats {
+                queuing: queue.len(),
+                running: self.submitted,
+                finished_reads,
+                finished_writes,
+                io_submit_count,
+                io_submit_nanos,
+                io_wait_count,
+                io_wait_nanos,
+            });
+            // only quit when shutdown flag is set and no submitted tasks.
+            // all queued tasks are ignored. (is it safe???)
+            if self.shutdown && self.submitted == 0 {
+                break;
+            }
+        }
+        listener.end_loop(&self.ctx);
+    }
+}
+
+impl<T> UnwindSafe for AIOEventLoop<T> {}
 
 /// mlock.
 ///
@@ -492,35 +736,33 @@ pub fn pwrite(key: AIOKey, fd: RawFd, offset: usize, buf: Buf) -> AIO {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::file::SparseFile;
+    use std::collections::HashMap;
 
     #[test]
     fn test_aio_file_ops() {
-        let aio_mgr = AIOManagerConfig::default().max_events(16).build().unwrap();
-        let file = aio_mgr
-            .create_sparse_file("aio_file1.txt", 1024 * 1024)
-            .unwrap();
+        let ctx = AIOContext::try_default().unwrap();
+        let file = SparseFile::create("aio_file1.txt", 1024 * 1024).unwrap();
         let buf = DirectBuf::with_data(b"hello, world");
         let (offset, _) = file.alloc(buf.capacity()).unwrap();
-        let aio = file.pwrite_direct(100, offset, buf);
+        let aio = file.pwrite_direct(100, offset, Buf::Direct(buf));
         let mut reqs = vec![aio.iocb.load(Ordering::Relaxed)];
         let limit = reqs.len();
-        let submit_count = aio_mgr.submit_limit(&mut reqs, limit);
+        let submit_count = ctx.submit_limit(&mut reqs, limit);
         println!("submit_count={}", submit_count);
-        let mut events = aio_mgr.events();
-        aio_mgr.wait_at_least(&mut events, 1, |key, res| {
+        let mut events = ctx.events();
+        ctx.wait_at_least(&mut events, 1, |key, res| {
             println!("key={}, res={:?}", key, res);
+            AIOKind::Write
         });
-        aio_mgr.forget_sparse_file(file);
+        drop(file);
         // for test, we just remove this file
         let _ = std::fs::remove_file("aio_file1.txt");
     }
 
     #[test]
     fn test_aio_file_extend() {
-        let aio_mgr = AIOManagerConfig::default().max_events(16).build().unwrap();
-        let file = aio_mgr
-            .create_sparse_file("aio_file2.txt", 1024 * 1024)
-            .unwrap();
+        let file = SparseFile::create("aio_file2.txt", 1024 * 1024).unwrap();
         let (logical_size, allocated_size) = file.size().unwrap();
         println!("file created, logical size={logical_size}, allocated size={allocated_size}");
         assert_eq!(logical_size, 1024 * 1024);
@@ -530,8 +772,142 @@ mod tests {
         println!("file grown, logical size={logical_size}, allocated_size={allocated_size}");
         assert_eq!(logical_size, 2 * 1024 * 1024);
         assert_eq!(allocated_size, 0);
-        aio_mgr.forget_sparse_file(file);
+        drop(file);
         // for test, we just remove this file
         let _ = std::fs::remove_file("aio_file2.txt");
+    }
+
+    #[test]
+    fn test_aio_event_loop() {
+        let ctx = AIOContext::new(16).unwrap();
+
+        let file = SparseFile::create("aio_file3.txt", 1024 * 1024).unwrap();
+
+        let buf_free_list = FixedSizeBufferFreeList::new(4096, 4);
+        let listener = SimpleListener {
+            file,
+            map: HashMap::new(),
+            key: 0,
+        };
+        let (event_loop, client) = ctx.event_loop();
+        let handle = event_loop.start_thread(listener);
+
+        let mut elem = buf_free_list.pop_elem_blocking();
+        elem.reset();
+        elem.extend_from_slice(b"hello, world");
+
+        let _ = client
+            .send(Request {
+                kind: AIOKind::Write,
+                offset: 0,
+                buf: elem,
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut elem2 = buf_free_list.pop_elem_blocking();
+        elem2.reset();
+        let _ = client.send(Request {
+            kind: AIOKind::Read,
+            offset: 0,
+            buf: elem2,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // IO operations here
+
+        client.shutdown();
+        // wait for executor to quit.
+        handle.join().unwrap();
+
+        let _ = std::fs::remove_file("aio_file3.txt");
+    }
+
+    struct Request {
+        kind: AIOKind,
+        offset: usize,
+        buf: CacheBuf,
+    }
+    struct Submission {
+        kind: AIOKind,
+        aio: AIO,
+    }
+    struct SimpleListener {
+        file: SparseFile,
+        map: HashMap<AIOKey, Submission>,
+        key: AIOKey,
+    }
+    impl AIOEventListener for SimpleListener {
+        type Request = Request;
+        type Submission = Submission;
+
+        fn on_request(&mut self, req: Request, queue: &mut IOQueue<Submission>) {
+            // auto-generated AIO key.
+            let key = self.key;
+            self.key += 1;
+            let (iocb, aio) = match req.kind {
+                AIOKind::Read => {
+                    let aio = self.file.pread_direct(key, req.offset, Buf::Reuse(req.buf));
+                    let iocb = aio.iocb().load(Ordering::Relaxed);
+                    (iocb, aio)
+                }
+                AIOKind::Write => {
+                    let aio = self
+                        .file
+                        .pwrite_direct(key, req.offset, Buf::Reuse(req.buf));
+                    let iocb = aio.iocb().load(Ordering::Relaxed);
+                    (iocb, aio)
+                }
+            };
+            queue.push(
+                iocb,
+                Submission {
+                    kind: req.kind,
+                    aio,
+                },
+            )
+        }
+
+        fn on_submit(&mut self, sub: Submission) {
+            // here we must hold the IO buffer until syscall returns.
+            let res = self.map.insert(sub.aio.key, sub);
+            debug_assert!(res.is_none());
+        }
+
+        fn on_complete(&mut self, key: AIOKey, res: std::io::Result<usize>) -> AIOKind {
+            match res {
+                Ok(len) => {
+                    let sub = self.map.remove(&key).unwrap();
+                    match sub.kind {
+                        AIOKind::Read => {
+                            println!("read {} bytes", len);
+                        }
+                        AIOKind::Write => {
+                            println!("write {} bytes", len);
+                        }
+                    }
+                    let buf = sub.aio.buf.as_ref().unwrap();
+                    println!("leading 20 bytes: {:?}", &buf.raw_data()[..20]);
+                    // Here we just drop the buffer.
+                    // In actual implementation, we should send the result buffer back
+                    // to client.
+                    drop(sub.aio);
+                    sub.kind
+                }
+                Err(err) => {
+                    panic!("{:?}", err);
+                }
+            }
+        }
+
+        fn on_batch_complete(&mut self, read_count: usize, write_count: usize) {
+            println!("reads {}, writes {}", read_count, write_count);
+        }
+
+        fn on_stats(&mut self, stats: &AIOStats) {
+            println!("stats: {:?}", stats);
+        }
+
+        fn end_loop(self, _ctx: &AIOContext) {
+            drop(self.file);
+        }
     }
 }

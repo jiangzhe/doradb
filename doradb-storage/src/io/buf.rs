@@ -1,7 +1,7 @@
 use crate::io::free_list::FreeElem;
 use crate::io::{align_to_sector_size, MIN_PAGE_SIZE, STORAGE_SECTOR_SIZE};
 use crate::serde::{Ser, SerdeCtx};
-use std::alloc::{alloc, Layout};
+use std::alloc::{alloc, alloc_zeroed, Layout};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
@@ -12,6 +12,24 @@ use std::ops::{Deref, DerefMut};
 pub enum Buf {
     Reuse(CacheBuf),
     Direct(DirectBuf),
+}
+
+impl Buf {
+    #[inline]
+    pub fn direct(self) -> Option<DirectBuf> {
+        match self {
+            Buf::Direct(d) => Some(d),
+            Buf::Reuse(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn reuse(self) -> Option<CacheBuf> {
+        match self {
+            Buf::Reuse(c) => Some(c),
+            Buf::Direct(_) => None,
+        }
+    }
 }
 
 impl Deref for Buf {
@@ -68,9 +86,18 @@ impl DirectBuf {
     /// Create a new buffer for DirectIO with all data initialized to zero.
     #[inline]
     pub fn zeroed(data_len: usize) -> Self {
-        let mut buf = Self::uninit(data_len);
-        buf.data_mut().fill(0);
-        buf
+        debug_assert!(data_len <= (u32::MAX - 4u32) as usize);
+        let size = align_to_sector_size(data_len + mem::size_of::<u32>());
+        unsafe {
+            let layout = Layout::from_size_align_unchecked(size, STORAGE_SECTOR_SIZE);
+            let ptr = alloc_zeroed(layout);
+            let vec = Vec::from_raw_parts(ptr, size, size);
+            let mut buf = DirectBuf {
+                data: vec.into_boxed_slice(),
+            };
+            buf.set_data_len(data_len);
+            buf
+        }
     }
 
     /// Create a new page.
@@ -122,7 +149,7 @@ impl DirectBuf {
 
     #[inline]
     pub fn data_len(&self) -> usize {
-        buf_data_len(&self.data)
+        Self::data_len_from(&self.data)
     }
 
     #[inline]
@@ -148,9 +175,8 @@ impl DirectBuf {
     }
 
     #[inline]
-    pub fn raw_data_mut(&mut self) -> &mut [u8] {
-        let raw_len = self.raw_len();
-        &mut self.data[..raw_len]
+    pub fn raw_data(&self) -> &[u8] {
+        &self.data
     }
 
     #[inline]
@@ -164,6 +190,7 @@ impl DirectBuf {
         self.set_data_len(len - mem::size_of::<u32>());
     }
 
+    /// Extend slice to end of data.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
         debug_assert!(self.raw_len() + data.len() <= self.capacity());
@@ -173,6 +200,7 @@ impl DirectBuf {
         self.set_raw_len(new_len);
     }
 
+    /// Serialize data to end of data.
     #[inline]
     pub fn extend_ser<'a, T: Ser<'a>>(&mut self, data: &T, ctx: &SerdeCtx) {
         let ser_len = data.ser_len(ctx);
@@ -190,6 +218,29 @@ impl DirectBuf {
         self.data.fill(0);
         self.set_data_len(0);
     }
+
+    /// Extract data length from a direct buffer.
+    #[inline]
+    pub fn data_len_from(buf: &[u8]) -> usize {
+        debug_assert!(buf.len() >= mem::size_of::<u32>());
+        let len_bytes: [u8; 4] = buf[..mem::size_of::<u32>()].try_into().unwrap();
+        u32::from_le_bytes(len_bytes) as usize
+    }
+
+    /// Extract raw length from a direct buffer.
+    /// It includes length number at the beginning
+    /// (4 bytes).
+    #[inline]
+    pub fn raw_len_from(buf: &[u8]) -> usize {
+        Self::data_len_from(buf) + mem::size_of::<u32>()
+    }
+
+    /// Returns the actual data in buffer.
+    #[inline]
+    pub fn data_from(buf: &[u8]) -> &[u8] {
+        let data_len = Self::data_len_from(buf);
+        &buf[mem::size_of::<u32>()..mem::size_of::<u32>() + data_len]
+    }
 }
 
 impl From<&[u8]> for DirectBuf {
@@ -203,30 +254,26 @@ impl From<&[u8]> for DirectBuf {
 
 pub type CacheBuf = Box<FreeElem<DirectBuf>>;
 
-/// Extract data length from a direct buffer.
-#[inline]
-pub fn buf_data_len(buf: &[u8]) -> usize {
-    debug_assert!(buf.len() >= mem::size_of::<u32>());
-    let len_bytes: [u8; 4] = buf[..mem::size_of::<u32>()].try_into().unwrap();
-    u32::from_le_bytes(len_bytes) as usize
-}
-
-/// Extract raw length from a direct buffer.
-#[inline]
-pub fn buf_raw_len(buf: &[u8]) -> usize {
-    buf_data_len(buf) + mem::size_of::<u32>()
-}
-
-#[inline]
-pub fn buf_data(buf: &[u8]) -> &[u8] {
-    let data_len = buf_data_len(buf);
-    &buf[mem::size_of::<u32>()..mem::size_of::<u32>() + data_len]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::{MIN_PAGE_SIZE, STORAGE_SECTOR_SIZE};
+
+    #[test]
+    fn test_buf() {
+        let d = DirectBuf::page_zeroed(4096);
+        let buf = Buf::Direct(d);
+        assert!(buf.direct().is_some());
+        let d = DirectBuf::page_zeroed(4096);
+        let buf = Buf::Direct(d);
+        assert!(buf.reuse().is_none());
+        let c = Box::new(FreeElem::new(DirectBuf::page_zeroed(4096)));
+        let buf = Buf::Reuse(c);
+        assert!(buf.direct().is_none());
+        let c = Box::new(FreeElem::new(DirectBuf::page_zeroed(4096)));
+        let buf = Buf::Reuse(c);
+        assert!(buf.reuse().is_some());
+    }
 
     #[test]
     fn test_direct_buf_uninit() {

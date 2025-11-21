@@ -357,7 +357,7 @@ impl Drop for TransactionSystem {
         for partition in log_partitions {
             let mut group_commit_g = partition.group_commit.lock();
             let log_file = group_commit_g.log_file.take().unwrap();
-            partition.aio_mgr.forget_sparse_file(log_file);
+            drop(log_file);
         }
     }
 }

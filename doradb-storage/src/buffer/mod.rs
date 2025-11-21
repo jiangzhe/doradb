@@ -9,7 +9,7 @@ pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use fixed::FixedBufferPool;
 
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, Page, PageID};
+use crate::buffer::page::{BufferPage, PageID};
 use crate::error::Result;
 use crate::error::Validation;
 use crate::latch::LatchFallbackMode;
@@ -48,11 +48,6 @@ pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + StaticLifetime 
     /// Deallocate page.
     fn deallocate_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>);
 
-    /// Evict page.
-    /// Implementor should take care of maintainance of page data.
-    /// For example, persist to disk before evict it.
-    fn evict_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>);
-
     /// Get child page.
     /// This method is used for tree-like data structure with lock coupling support.
     /// The implementation has to validate the parent page when child page is returned,
@@ -63,10 +58,4 @@ pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + StaticLifetime 
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send;
-}
-
-pub enum BufferRequest {
-    Read(PageExclusiveGuard<Page>),
-    BatchWrite(Vec<PageExclusiveGuard<Page>>),
-    Shutdown,
 }

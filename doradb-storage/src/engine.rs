@@ -159,9 +159,8 @@ impl EngineConfig {
         // todo: implement index pool
         let index_pool =
             FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
-        let (data_pool, pool_start_ctx) = self.data_buffer.build()?;
+        let data_pool = self.data_buffer.build()?;
         let data_pool = StaticLifetime::new_static(data_pool);
-        data_pool.start(pool_start_ctx);
         Ok(EngineInitializer {
             meta_pool,
             index_pool,

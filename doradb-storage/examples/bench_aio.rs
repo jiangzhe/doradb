@@ -1,5 +1,6 @@
 use clap::Parser;
-use doradb_storage::io::{AIOManager, AIOManagerConfig, DirectBuf};
+use doradb_storage::io::{AIOContext, AIOKind, Buf, DirectBuf, SparseFile};
+use doradb_storage::lifetime::StaticLifetime;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,16 +11,14 @@ use std::time::{Duration, Instant};
 fn main() {
     let args = Args::parse();
     let stop = Arc::new(AtomicBool::new(false));
-    let aio_mgr = AIOManagerConfig::default()
-        .max_events(args.io_depth)
-        .build_static()
-        .unwrap();
+    let ctx = AIOContext::new(args.io_depth).unwrap();
+    let ctx = StaticLifetime::new_static(ctx);
     let mut handles = vec![];
     let start = Instant::now();
     for id in 0..args.log_partitions {
         let args = args.clone();
         let stop = Arc::clone(&stop);
-        let handle = thread::spawn(move || worker(id, &aio_mgr, args, stop));
+        let handle = thread::spawn(move || worker(id, &ctx, args, stop));
         handles.push(handle);
     }
 
@@ -37,14 +36,16 @@ fn main() {
         dur.as_millis(),
         log_bytes as f64 / dur.as_micros() as f64
     );
+
+    unsafe {
+        StaticLifetime::drop_static(ctx);
+    }
 }
 
-fn worker(id: usize, aio_mgr: &'static AIOManager, args: Args, stop: Arc<AtomicBool>) -> usize {
+fn worker(id: usize, aio_mgr: &'static AIOContext, args: Args, stop: Arc<AtomicBool>) -> usize {
     let file_name = format!("{}.{}", &args.log_file_prefix, id);
 
-    let file = aio_mgr
-        .create_sparse_file(&file_name, args.log_file_max_size)
-        .unwrap();
+    let file = SparseFile::create(&file_name, args.log_file_max_size).unwrap();
     let syncer = file.syncer();
 
     let log_io_depth = args.io_depth / args.log_partitions;
@@ -62,21 +63,22 @@ fn worker(id: usize, aio_mgr: &'static AIOManager, args: Args, stop: Arc<AtomicB
             id += 1;
             let buf = DirectBuf::uninit(args.max_io_size);
             let (offset, _) = file.alloc(buf.capacity()).unwrap();
-            let aio = file.pwrite_direct(id, offset, buf);
+            let aio = file.pwrite_direct(id, offset, Buf::Direct(buf));
             reqs.push(aio.iocb().load(Ordering::Relaxed));
             inflight.insert(aio.key, aio);
         }
-        aio_mgr.submit(&mut reqs);
-        let finish_count = aio_mgr.wait_at_least(&mut events, 1, |key, res| {
+        let submit_count = aio_mgr.submit_limit(&reqs, usize::MAX);
+        reqs.drain(..submit_count);
+        let (read_count, write_count) = aio_mgr.wait_at_least(&mut events, 1, |key, res| {
             assert!(res.is_ok());
             log_bytes += res.unwrap();
             inflight.remove(&key);
+            AIOKind::Write
         });
-        if args.sync != 0 && finish_count >= args.sync {
+        if args.sync != 0 && read_count + write_count >= args.sync {
             syncer.fdatasync();
         }
     }
-    aio_mgr.forget_sparse_file(file);
     log_bytes
 }
 

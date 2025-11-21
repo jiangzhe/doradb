@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::io::{
-    align_to_sector_size, buf_data, buf_raw_len, io_event, AIOError, AIOManager, Buf, DirectBuf,
-    FileSyncer, FreeListWithFactory, IocbRawPtr, SparseFile, AIO,
+    align_to_sector_size, io_event, AIOContext, AIOError, AIOKind, Buf, DirectBuf, FileSyncer,
+    FreeListWithFactory, IocbRawPtr, SparseFile, AIO,
 };
 // use crate::latch::{Mutex, MutexGuard};
 use crate::notify::EventNotifyOnDrop;
@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 pub const LOG_HEADER_PAGES: usize = 2;
 
 pub struct LogPartitionInitializer {
-    pub(super) aio_mgr: AIOManager,
+    pub(super) ctx: AIOContext,
     pub(super) mode: LogPartitionMode,
     pub(super) file_prefix: String,
     pub(super) file_max_size: usize,
@@ -85,7 +85,6 @@ impl LogPartitionInitializer {
     pub(super) fn finish(self) -> Result<(LogPartition, Receiver<GC>)> {
         let mut file_seq = self.file_seq.unwrap_or(0);
         let log_file = create_log_file(
-            &self.aio_mgr,
             &self.file_prefix,
             self.log_no,
             file_seq,
@@ -108,7 +107,7 @@ impl LogPartitionInitializer {
                 stats: CachePadded::new(LogPartitionStats::default()),
                 gc_chan,
                 gc_buckets: gc_info.into_boxed_slice(),
-                aio_mgr: self.aio_mgr,
+                aio_ctx: self.ctx,
                 log_no: self.log_no,
                 max_io_size: self.page_size,
                 file_prefix: self.file_prefix,
@@ -151,7 +150,7 @@ pub(super) struct LogPartition {
     /// Split into multiple buckets in order to avoid bottleneck of global synchronization.
     pub(super) gc_buckets: Box<[GCBucket]>,
     /// AIO manager to handle async IO with libaio.
-    pub(super) aio_mgr: AIOManager,
+    pub(super) aio_ctx: AIOContext,
     /// Index of log partition in total partitions, starts from 0.
     pub(super) log_no: usize,
     /// Maximum IO size of each group.
@@ -222,7 +221,6 @@ impl LogPartition {
     fn create_log_file(&self) -> Result<SparseFile> {
         let file_seq = self.file_seq.fetch_add(1, Ordering::SeqCst);
         create_log_file(
-            &self.aio_mgr,
             &self.file_prefix,
             self.log_no,
             file_seq,
@@ -365,7 +363,7 @@ impl LogPartition {
                 // e.g. DDL start/end pages, min/max transaction CTS.
 
                 // Close file explicitly.
-                self.aio_mgr.forget_sparse_file(ended_log_file);
+                drop(ended_log_file);
             }
             if fp.shutdown {
                 return;
@@ -466,7 +464,7 @@ impl<'a> FileProcessor<'a> {
             in_progress: 0,
             io_reqs: vec![],
             sync_groups: VecDeque::new(),
-            events: partition.aio_mgr.events(),
+            events: partition.aio_ctx.events(),
             written: vec![],
             syncer,
             log_sync: config.log_sync,
@@ -686,10 +684,9 @@ impl<'a> FileProcessor<'a> {
             let start = Instant::now();
             // try to submit as many IO requests as possible
             let limit = self.io_depth - self.in_progress;
-            let submit_count = self
-                .partition
-                .aio_mgr
-                .submit_limit(&mut self.io_reqs, limit);
+            let submit_count = self.partition.aio_ctx.submit_limit(&self.io_reqs, limit);
+            // remove io requests after submission.
+            self.io_reqs.drain(0..submit_count);
             // add sync groups to inflight tree.
             for sync_group in self.sync_groups.drain(..submit_count) {
                 let res = self.inflight.insert(sync_group.max_cts, sync_group);
@@ -708,14 +705,16 @@ impl<'a> FileProcessor<'a> {
         if self.in_progress != 0 {
             let start = Instant::now();
             let wait_count = if all { self.in_progress } else { 1 };
-            let finish_count =
+            let (read_count, write_count) =
                 self.partition
-                    .aio_mgr
+                    .aio_ctx
                     .wait_at_least(&mut self.events, wait_count, |cts, res| match res {
                         Ok(len) => {
                             let sg = self.inflight.get_mut(&cts).expect("finish inflight IO");
                             debug_assert!(sg.aio.buf().unwrap().capacity() == len);
                             sg.finished = true;
+                            // only write IO
+                            AIOKind::Write
                         }
                         Err(err) => {
                             let sg = self.inflight.remove(&cts).unwrap();
@@ -727,7 +726,7 @@ impl<'a> FileProcessor<'a> {
                             )
                         }
                     });
-            self.in_progress -= finish_count;
+            self.in_progress -= read_count + write_count;
             self.io_wait_count = 1;
             self.io_wait_nanos = start.elapsed().as_nanos() as usize;
         }
@@ -764,7 +763,6 @@ fn log_file_name(file_prefix: &str, log_no: usize, file_seq: u32) -> String {
 /// Create a new log file.
 #[inline]
 pub(super) fn create_log_file(
-    aio_mgr: &AIOManager,
     file_prefix: &str,
     log_no: usize,
     file_seq: u32,
@@ -772,7 +770,7 @@ pub(super) fn create_log_file(
     file_header_size: usize,
 ) -> Result<SparseFile> {
     let file_name = log_file_name(file_prefix, log_no, file_seq);
-    let log_file = aio_mgr.create_sparse_file(&file_name, file_max_size)?;
+    let log_file = SparseFile::create(&file_name, file_max_size)?;
     // todo: Add two pages as file header.
     let _ = log_file.alloc(file_header_size)?;
     Ok(log_file)
@@ -846,7 +844,7 @@ impl MmapLogReader {
         // Try single page first.
         // This may fail as log is incomplete.
         if let Some(mut buf) = self.m.get(self.offset..self.offset + self.page_size) {
-            let raw_len = buf_raw_len(buf);
+            let raw_len = DirectBuf::raw_len_from(buf);
             // Log file is truncated to certain size, and if no data is written, the header of page
             // will always be zeroed. This is the default behavior on Linux.
             // Raw length is always data length plus 4.
@@ -866,7 +864,7 @@ impl MmapLogReader {
                 self.offset += self.page_size;
             }
             return ReadLog::Some(LogGroup {
-                data: buf_data(buf),
+                data: DirectBuf::data_from(buf),
                 ctx: SerdeCtx::default(),
             });
         }
