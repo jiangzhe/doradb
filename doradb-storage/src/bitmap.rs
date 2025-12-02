@@ -1,4 +1,7 @@
+use crate::error::Result;
+use crate::serde::{Deser, Ser, SerdeCtx};
 use parking_lot::Mutex;
+use std::mem;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -336,17 +339,18 @@ impl Iterator for BitmapTrueIndexIter<'_> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreeBitmap {
     free_unit_idx: usize,
     bitmap: Box<[u64]>,
 }
 
 /// AllocMap is an allocation controller backed by bitmap.
+#[derive(Debug)]
 pub struct AllocMap {
-    inner: Mutex<FreeBitmap>,
     len: usize,
     allocated: AtomicUsize,
+    inner: Mutex<FreeBitmap>,
 }
 
 impl AllocMap {
@@ -470,9 +474,74 @@ impl Clone for AllocMap {
     }
 }
 
+impl Ser<'_> for AllocMap {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u64>() // len
+            + mem::size_of::<u64>() // allocated
+            + mem::size_of::<u64>() // free_unit_idx
+            + self.len.div_ceil(64) * mem::size_of::<u64>() // bitmap
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let idx = ctx.ser_u64(out, start_idx, self.len as u64);
+        let idx = ctx.ser_u64(out, idx, self.allocated.load(Ordering::Relaxed) as u64);
+        let g = self.inner.lock();
+        let mut idx = ctx.ser_u64(out, idx, g.free_unit_idx as u64);
+        for u in &g.bitmap {
+            idx = ctx.ser_u64(out, idx, *u);
+        }
+        idx
+    }
+}
+
+impl Deser for AllocMap {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, len) = ctx.deser_u64(input, start_idx)?;
+        let (idx, allocated) = ctx.deser_u64(input, idx)?;
+        let (mut idx, free_unit_idx) = ctx.deser_u64(input, idx)?;
+        let n = (len as usize).div_ceil(64);
+        let mut vec: Vec<u64> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (idx0, v) = ctx.deser_u64(input, idx)?;
+            idx = idx0;
+            vec.push(v);
+        }
+        let res = AllocMap {
+            len: len as usize,
+            allocated: AtomicUsize::new(allocated as usize),
+            inner: Mutex::new(FreeBitmap {
+                free_unit_idx: free_unit_idx as usize,
+                bitmap: vec.into_boxed_slice(),
+            }),
+        };
+        Ok((idx, res))
+    }
+}
+
+impl PartialEq for AllocMap {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        if self.allocated.load(Ordering::Relaxed) != other.allocated.load(Ordering::Relaxed) {
+            return false;
+        }
+        let g1 = self.inner.lock();
+        let g2 = other.inner.lock();
+        *g1 == *g2
+    }
+}
+
+impl Eq for AllocMap {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
     use std::sync::Arc;
     use std::thread;
 
@@ -772,5 +841,31 @@ mod tests {
 
         assert!(!alloc_map.allocate_at(2000));
         assert!(!alloc_map.allocate_at(100));
+    }
+
+    #[test]
+    fn test_alloc_map_serde() {
+        let alloc_map = AllocMap::new(1024);
+        let mut rng = rand::rng();
+        for _ in 0..20 {
+            let idx = rng.next_u64() as usize % 1024;
+            let _ = alloc_map.allocate_at(idx);
+        }
+        let mut ctx = SerdeCtx::default();
+        let ser_len = alloc_map.ser_len(&ctx);
+        let mut data = vec![0u8; ser_len];
+        let res_idx = alloc_map.ser(&ctx, &mut data, 0);
+        assert!(res_idx == ser_len);
+
+        let (res_idx, alloc_map2) = AllocMap::deser(&mut ctx, &data, 0).unwrap();
+        assert!(res_idx == ser_len);
+        assert!(alloc_map2.len == alloc_map.len);
+        assert!(
+            alloc_map2.allocated.load(Ordering::Relaxed)
+                == alloc_map.allocated.load(Ordering::Relaxed)
+        );
+        let g1 = alloc_map.inner.lock();
+        let g2 = alloc_map2.inner.lock();
+        assert!(&*g1 == &*g2);
     }
 }

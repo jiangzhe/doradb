@@ -8,9 +8,10 @@ use crate::buffer::util::{
 use crate::buffer::BufferPool;
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
+use crate::file::SparseFile;
 use crate::io::{
     AIOClient, AIOContext, AIOEventListener, AIOEventLoop, AIOKey, AIOKind, AIOStats, IOQueue,
-    SparseFile, UnsafeAIO,
+    UnsafeAIO,
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::lifetime::StaticLifetime;
@@ -24,7 +25,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::ops::{Range, RangeFrom, RangeTo};
-use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -385,8 +385,6 @@ impl BufferPool for EvictableBufferPool {
     }
 }
 
-impl RefUnwindSafe for EvictableBufferPool {}
-
 impl Drop for EvictableBufferPool {
     #[inline]
     fn drop(&mut self) {
@@ -427,8 +425,6 @@ unsafe impl Send for EvictableBufferPool {}
 unsafe impl Sync for EvictableBufferPool {}
 
 unsafe impl StaticLifetime for EvictableBufferPool {}
-
-impl UnwindSafe for EvictableBufferPool {}
 
 struct BufferFrames(*mut BufferFrame);
 
@@ -645,8 +641,6 @@ impl AIOEventListener for EvictableBufferPoolListener {
     }
 }
 
-impl UnwindSafe for EvictableBufferPoolListener {}
-
 pub struct BufferPoolEvictor {
     frames: BufferFrames,
     in_mem: Arc<InMemPageSet>,
@@ -841,7 +835,6 @@ impl BufferPoolEvictor {
 }
 
 unsafe impl Send for BufferPoolEvictor {}
-impl UnwindSafe for BufferPoolEvictor {}
 
 struct InMemPageSet {
     // Current page number held in memory.
@@ -1409,8 +1402,6 @@ pub enum PoolRequest {
     Read(PageExclusiveGuard<Page>),
     BatchWrite(Vec<PageExclusiveGuard<Page>>),
 }
-
-impl UnwindSafe for PoolRequest {}
 
 #[cfg(test)]
 mod tests {

@@ -15,7 +15,6 @@ use crate::trx::sys::TransactionSystem;
 use crate::trx::MIN_SNAPSHOT_TS;
 use doradb_catalog::{ColumnSpec, IndexKey, IndexSpec, SchemaID, TableID};
 use std::collections::HashMap;
-use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ROW_ID_COL_NAME: &str = "__row_id";
@@ -191,8 +190,6 @@ impl Catalog {
 unsafe impl Send for Catalog {}
 unsafe impl Sync for Catalog {}
 unsafe impl StaticLifetime for Catalog {}
-impl UnwindSafe for Catalog {}
-impl RefUnwindSafe for Catalog {}
 
 pub struct CatalogCache {
     pub schemas: RwLock<HashMap<SchemaID, SchemaObject>>,

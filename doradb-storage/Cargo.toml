@@ -34,6 +34,7 @@ memmap2 = "0.9"
 async-lock = "3"
 futures = "0.3"
 scopeguard = "1.2"
+blake3 = "1.8"
 
 [features]
 default = []

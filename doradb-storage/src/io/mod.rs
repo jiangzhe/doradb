@@ -1,37 +1,28 @@
 mod buf;
-mod file;
-mod free_list;
 mod libaio_abi;
-mod table_file;
 
 use crate::lifetime::StaticLifetime;
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
-use libc::{c_long, EAGAIN, EINTR};
+use libc::{c_long, EINTR};
 use std::collections::VecDeque;
-use std::ops::Deref;
 use std::os::unix::io::RawFd;
-use std::panic::UnwindSafe;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 use thiserror::Error;
 
 pub use buf::*;
-pub use file::*;
-pub use free_list::*;
 pub use libaio_abi::*;
 
 pub const MIN_PAGE_SIZE: usize = 4096;
 pub const STORAGE_SECTOR_SIZE: usize = 4096;
 
 /// Align given input length to storage sector size.
-#[allow(clippy::manual_div_ceil)]
 #[inline]
 pub fn align_to_sector_size(len: usize) -> usize {
-    (len + STORAGE_SECTOR_SIZE - 1) / STORAGE_SECTOR_SIZE * STORAGE_SECTOR_SIZE
+    len.max(STORAGE_SECTOR_SIZE).div_ceil(STORAGE_SECTOR_SIZE) * STORAGE_SECTOR_SIZE
 }
 
 const DEFAULT_AIO_MAX_EVENTS: usize = 32;
@@ -44,6 +35,8 @@ pub enum AIOError {
     OpenFileError,
     #[error("AIO out of range")]
     OutOfRange,
+    #[error("AIO file stat error")]
+    StatError,
 }
 
 pub type AIOResult<T> = StdResult<T, AIOError>;
@@ -194,21 +187,21 @@ pub type IocbPtr = AtomicPtr<iocb>;
 pub type IocbRawPtr = *mut iocb;
 
 /// AIO backed by an owned aligned buffer.
-pub struct AIO {
+pub struct AIO<T> {
     iocb: IocbPtr,
     // this is essential because libaio requires the pointer
     // to buffer keep valid during async processing.
-    buf: Option<Buf>,
+    buf: Option<T>,
     pub key: AIOKey,
 }
 
-impl AIO {
+impl<T: AIOBuf> AIO<T> {
     #[inline]
     pub fn new(
         key: AIOKey,
         fd: RawFd,
         offset: usize,
-        mut buf: Buf,
+        mut buf: T,
         priority: u16,
         flags: u32,
         opcode: io_iocb_cmd,
@@ -217,8 +210,8 @@ impl AIO {
         iocb.aio_fildes = fd as u32;
         iocb.aio_lio_opcode = opcode as u16;
         iocb.aio_reqprio = priority;
-        iocb.buf = buf.raw_ptr_mut();
-        iocb.count = buf.capacity() as u64;
+        iocb.buf = buf.as_bytes_mut().as_mut_ptr();
+        iocb.count = buf.as_bytes().len() as u64;
         iocb.offset = offset as u64;
         iocb.flags = flags;
         iocb.data = key; // store and send back via io_event
@@ -235,17 +228,17 @@ impl AIO {
     }
 
     #[inline]
-    pub fn take_buf(&mut self) -> Option<Buf> {
+    pub fn take_buf(&mut self) -> Option<T> {
         self.buf.take()
     }
 
     #[inline]
-    pub fn buf(&self) -> Option<&Buf> {
+    pub fn buf(&self) -> Option<&T> {
         self.buf.as_ref()
     }
 }
 
-impl Drop for AIO {
+impl<T> Drop for AIO<T> {
     #[inline]
     fn drop(&mut self) {
         unsafe {
@@ -383,7 +376,7 @@ impl<T> IOQueue<T> {
 /// AIOKey represents the unique key of any AIO request.
 pub type AIOKey = u64;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct AIOStats {
     pub queuing: usize,
     pub running: usize,
@@ -395,31 +388,17 @@ pub struct AIOStats {
     pub io_wait_nanos: usize,
 }
 
-/// Fixed size buffer free list hold a given number of
-/// buffer pages.
-/// It's used to reuse pages in heavy IO environment.
-#[derive(Clone)]
-pub struct FixedSizeBufferFreeList(Arc<FreeList<DirectBuf>>);
-
-impl FixedSizeBufferFreeList {
-    /// Create a new buffer free list with given number of
-    /// pre-allocated buffer pages.
+impl AIOStats {
     #[inline]
-    pub fn new(page_size: usize, count: usize) -> Self {
-        debug_assert!(page_size.is_multiple_of(MIN_PAGE_SIZE));
-        debug_assert!(count > 0);
-        let free_list: FreeList<_> = (0..count)
-            .map(|_| DirectBuf::page_zeroed(page_size))
-            .collect();
-        FixedSizeBufferFreeList(Arc::new(free_list))
-    }
-}
-
-impl Deref for FixedSizeBufferFreeList {
-    type Target = FreeList<DirectBuf>;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    pub fn merge(&mut self, other: &AIOStats) {
+        self.queuing += other.queuing;
+        self.running += other.running;
+        self.finished_reads += other.finished_reads;
+        self.finished_writes += other.finished_writes;
+        self.io_submit_count += other.io_submit_count;
+        self.io_submit_nanos += other.io_submit_nanos;
+        self.io_wait_count += other.io_wait_count;
+        self.io_wait_nanos += other.io_wait_nanos;
     }
 }
 
@@ -515,8 +494,8 @@ impl<T> AIOEventLoop<T> {
     /// Start a separate thread for AIO event loop.
     pub fn start_thread<L>(self, listener: L) -> JoinHandle<()>
     where
-        L: AIOEventListener<Request = T> + Send + 'static + UnwindSafe,
-        L::Request: Send + 'static + UnwindSafe,
+        L: AIOEventListener<Request = T> + Send + 'static,
+        L::Request: Send + 'static,
     {
         thread::spawn_named("AIOEventLoop", move || self.run(listener))
     }
@@ -655,8 +634,6 @@ impl<T> AIOEventLoop<T> {
     }
 }
 
-impl<T> UnwindSafe for AIOEventLoop<T> {}
-
 /// mlock.
 ///
 /// # Safety
@@ -704,7 +681,7 @@ pub unsafe fn munlock(_ptr: *mut u8, _len: usize) -> bool {
 }
 
 #[inline]
-pub fn pread(key: AIOKey, fd: RawFd, offset: usize, buf: Buf) -> AIO {
+pub fn pread<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
     AIO::new(
@@ -719,7 +696,7 @@ pub fn pread(key: AIOKey, fd: RawFd, offset: usize, buf: Buf) -> AIO {
 }
 
 #[inline]
-pub fn pwrite(key: AIOKey, fd: RawFd, offset: usize, buf: Buf) -> AIO {
+pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
     AIO::new(
@@ -736,7 +713,8 @@ pub fn pwrite(key: AIOKey, fd: RawFd, offset: usize, buf: Buf) -> AIO {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::file::SparseFile;
+    use crate::file::table_file::FixedSizeBufferFreeList;
+    use crate::file::SparseFile;
     use std::collections::HashMap;
 
     #[test]
@@ -745,7 +723,7 @@ mod tests {
         let file = SparseFile::create("aio_file1.txt", 1024 * 1024).unwrap();
         let buf = DirectBuf::with_data(b"hello, world");
         let (offset, _) = file.alloc(buf.capacity()).unwrap();
-        let aio = file.pwrite_direct(100, offset, Buf::Direct(buf));
+        let aio = file.pwrite_direct(100, offset, buf);
         let mut reqs = vec![aio.iocb.load(Ordering::Relaxed)];
         let limit = reqs.len();
         let submit_count = ctx.submit_limit(&mut reqs, limit);
@@ -783,7 +761,7 @@ mod tests {
 
         let file = SparseFile::create("aio_file3.txt", 1024 * 1024).unwrap();
 
-        let buf_free_list = FixedSizeBufferFreeList::new(4096, 4);
+        let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
         let listener = SimpleListener {
             file,
             map: HashMap::new(),
@@ -792,19 +770,19 @@ mod tests {
         let (event_loop, client) = ctx.event_loop();
         let handle = event_loop.start_thread(listener);
 
-        let mut elem = buf_free_list.pop_elem_blocking();
-        elem.reset();
-        elem.extend_from_slice(b"hello, world");
+        let mut buf = buf_free_list.pop(false);
+        buf.reset();
+        buf.extend_from_slice(b"hello, world");
 
         let _ = client
             .send(Request {
                 kind: AIOKind::Write,
                 offset: 0,
-                buf: elem,
+                buf,
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let mut elem2 = buf_free_list.pop_elem_blocking();
+        let mut elem2 = buf_free_list.pop(false);
         elem2.reset();
         let _ = client.send(Request {
             kind: AIOKind::Read,
@@ -824,11 +802,11 @@ mod tests {
     struct Request {
         kind: AIOKind,
         offset: usize,
-        buf: CacheBuf,
+        buf: DirectBuf,
     }
     struct Submission {
         kind: AIOKind,
-        aio: AIO,
+        aio: AIO<DirectBuf>,
     }
     struct SimpleListener {
         file: SparseFile,
@@ -845,14 +823,12 @@ mod tests {
             self.key += 1;
             let (iocb, aio) = match req.kind {
                 AIOKind::Read => {
-                    let aio = self.file.pread_direct(key, req.offset, Buf::Reuse(req.buf));
+                    let aio = self.file.pread_direct(key, req.offset, req.buf);
                     let iocb = aio.iocb().load(Ordering::Relaxed);
                     (iocb, aio)
                 }
                 AIOKind::Write => {
-                    let aio = self
-                        .file
-                        .pwrite_direct(key, req.offset, Buf::Reuse(req.buf));
+                    let aio = self.file.pwrite_direct(key, req.offset, req.buf);
                     let iocb = aio.iocb().load(Ordering::Relaxed);
                     (iocb, aio)
                 }
@@ -885,7 +861,8 @@ mod tests {
                         }
                     }
                     let buf = sub.aio.buf.as_ref().unwrap();
-                    println!("leading 20 bytes: {:?}", &buf.raw_data()[..20]);
+                    let n = buf.data().len().min(20);
+                    println!("leading {} bytes: {:?}", n, &buf.data()[..n]);
                     // Here we just drop the buffer.
                     // In actual implementation, we should send the result buffer back
                     // to client.

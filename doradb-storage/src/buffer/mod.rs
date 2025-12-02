@@ -15,12 +15,11 @@ use crate::error::Validation;
 use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
 use std::future::Future;
-use std::panic::{RefUnwindSafe, UnwindSafe};
 
 /// Abstraction of buffer pool.
 /// The implementation should be a static pointer providing
 /// pooling functionality.
-pub trait BufferPool: Send + Sync + UnwindSafe + RefUnwindSafe + StaticLifetime + 'static {
+pub trait BufferPool: Send + Sync + StaticLifetime + 'static {
     /// Returns the maximum number of pages that can be allocated.
     fn capacity(&self) -> usize;
 

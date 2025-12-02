@@ -92,6 +92,18 @@ impl SerdeCtx {
         slice.ser(self, out, idx)
     }
 
+    #[inline]
+    pub fn ser_byte_array<const N: usize>(
+        &self,
+        out: &mut [u8],
+        idx: usize,
+        val: &[u8; N],
+    ) -> usize {
+        debug_assert!(idx + N <= out.len());
+        out[idx..idx + N].copy_from_slice(val);
+        idx + N
+    }
+
     /// Deserialize a u64 value from a byte slice.
     #[inline]
     pub fn deser_u64(&self, input: &[u8], idx: usize) -> Result<(usize, u64)> {
@@ -152,6 +164,18 @@ impl SerdeCtx {
     pub fn deser_i8(&self, input: &[u8], idx: usize) -> Result<(usize, i8)> {
         debug_assert!(idx + mem::size_of::<i8>() <= input.len());
         Ok((idx + mem::size_of::<i8>(), input[idx] as i8))
+    }
+
+    #[inline]
+    pub fn deser_byte_array<const N: usize>(
+        &self,
+        input: &[u8],
+        idx: usize,
+    ) -> Result<(usize, [u8; N])> {
+        debug_assert!(idx + N <= input.len());
+        let mut res = [0u8; N];
+        res.copy_from_slice(&input[idx..idx + N]);
+        Ok((idx + N, res))
     }
 }
 
@@ -663,8 +687,16 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixSerView<'a, H, P> {
     }
 }
 
+#[inline]
+pub fn len_prefix_pod_size(data: &[u8]) -> usize {
+    debug_assert!(data.len() >= mem::size_of::<u32>() * 2);
+    let len = u32::from_le_bytes(data[..mem::size_of::<u32>()].try_into().unwrap());
+    len as usize + mem::size_of::<u32>() * 2
+}
+
 pub struct LenPrefixPod<H, P> {
-    data_len: u32,
+    len: u32,
+    checksum: u32,
     pub header: H,
     pub payload: P,
 }
@@ -685,10 +717,11 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixPod<H, P> {
     pub fn new(header: H, payload: P, ctx: &SerdeCtx) -> Self {
         let header_len = header.ser_len(ctx);
         let payload_len = payload.ser_len(ctx);
-        let data_len = header_len + payload_len;
-        assert!(data_len <= u32::MAX as usize);
+        let len = header_len + payload_len;
+        assert!(len <= u32::MAX as usize);
         Self {
-            data_len: data_len as u32,
+            len: len as u32,
+            checksum: 0,
             header,
             payload,
         }
@@ -698,17 +731,15 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixPod<H, P> {
 impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixPod<H, P> {
     #[inline]
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
-        mem::size_of::<u32>() + mem::size_of::<u32>() + self.data_len as usize
+        self.len as usize + mem::size_of::<u32>() * 2
     }
 
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        debug_assert!(
-            self.data_len as usize == self.header.ser_len(ctx) + self.payload.ser_len(ctx)
-        );
+        debug_assert!(self.len as usize == self.header.ser_len(ctx) + self.payload.ser_len(ctx));
         debug_assert!(start_idx + self.ser_len(ctx) <= out.len());
         let mut idx = start_idx;
-        idx = ctx.ser_u32(out, idx, self.data_len);
+        idx = ctx.ser_u32(out, idx, self.len);
         // Leave space for checksum
         let checksum_start_idx = idx;
         let checksum_end_idx = idx + mem::size_of::<u32>();
@@ -725,10 +756,10 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixPod<H, P> {
 impl<H: Deser, P: Deser> Deser for LenPrefixPod<H, P> {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, data_len) = ctx.deser_u32(input, start_idx)?;
+        let (idx, len) = ctx.deser_u32(input, start_idx)?;
         let (idx, checksum) = ctx.deser_u32(input, idx)?;
         let (idx, header, payload) = if ctx.validate_checksum {
-            let calculated_checksum = crc32fast::hash(&input[idx..idx + data_len as usize]);
+            let calculated_checksum = crc32fast::hash(&input[idx..idx + len as usize]);
             if calculated_checksum != checksum {
                 return Err(Error::ChecksumMismatch);
             }
@@ -743,7 +774,8 @@ impl<H: Deser, P: Deser> Deser for LenPrefixPod<H, P> {
         Ok((
             idx,
             LenPrefixPod {
-                data_len,
+                len,
+                checksum,
                 header,
                 payload,
             },

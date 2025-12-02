@@ -1,11 +1,11 @@
 use crate::error::{Error, Result};
+use crate::file::{FileSyncer, SparseFile};
+use crate::free_list::FreeList;
 use crate::io::{
-    align_to_sector_size, io_event, AIOContext, AIOError, AIOKind, Buf, DirectBuf, FileSyncer,
-    FreeListWithFactory, IocbRawPtr, SparseFile, AIO,
+    align_to_sector_size, io_event, AIOContext, AIOError, AIOKind, DirectBuf, IocbRawPtr, AIO,
 };
-// use crate::latch::{Mutex, MutexGuard};
 use crate::notify::EventNotifyOnDrop;
-use crate::serde::{Deser, LenPrefixPod, Ser, SerdeCtx};
+use crate::serde::{len_prefix_pod_size, Deser, LenPrefixPod, Ser, SerdeCtx};
 use crate::session::{IntoSession, Session};
 use crate::trx::group::{Commit, CommitGroup, GroupCommit, MutexGroupCommit};
 use crate::trx::purge::{GCBucket, GC};
@@ -26,7 +26,6 @@ use std::fs::File;
 use std::mem;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
-use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -113,11 +112,11 @@ impl LogPartitionInitializer {
                 file_prefix: self.file_prefix,
                 file_seq: AtomicU32::new(file_seq),
                 file_max_size: self.file_max_size,
-                buf_free_list: FreeListWithFactory::prefill(self.io_depth_per_log, move || {
-                    let mut buf = DirectBuf::page_zeroed(self.page_size);
-                    buf.set_data_len(0);
-                    buf
-                }),
+                buf_free_list: FreeList::new(
+                    self.io_depth_per_log,
+                    self.io_depth_per_log * 2,
+                    move || DirectBuf::zeroed(self.page_size),
+                ),
                 io_thread: Mutex::new(None),
                 gc_thread: Mutex::new(None),
             },
@@ -163,7 +162,7 @@ pub(super) struct LogPartition {
     pub(super) file_max_size: usize,
     /// Free list of page buffer, which is used by commit group to concat
     /// redo logs.
-    pub(super) buf_free_list: FreeListWithFactory<DirectBuf>,
+    pub(super) buf_free_list: FreeList<DirectBuf>,
     /// Standalone thread to handle transaction commit.
     /// Including submit IO requests, wait IO responses
     /// and do fsync().
@@ -181,20 +180,25 @@ impl LogPartition {
 
     /// Create a new log buffer to hold one transaction's redo log.
     #[inline]
-    fn new_buf(&self, serde_ctx: &SerdeCtx, data: LenPrefixPod<RedoHeader, RedoLogs>) -> Buf {
-        let len = data.ser_len(serde_ctx);
-        if len > self.max_io_size {
-            let mut buf = DirectBuf::zeroed(len);
-            buf.set_data_len(0);
+    fn new_buf(&self, serde_ctx: &SerdeCtx, data: LenPrefixPod<RedoHeader, RedoLogs>) -> DirectBuf {
+        let ser_len = data.ser_len(serde_ctx);
+        if ser_len > self.max_io_size {
+            // data is longer than single page, we need to
+            let mut buf = DirectBuf::zeroed(ser_len);
+            buf.truncate(0);
             buf.extend_ser(&data, serde_ctx);
-            Buf::Direct(buf)
-        } else {
-            let mut buf = self.buf_free_list.pop_elem_or_new();
-            // freed buffer should be always empty.
-            debug_assert!(buf.data_len() == 0);
-            buf.extend_ser(&data, serde_ctx);
-            Buf::Reuse(buf)
+            return buf;
         }
+        if let Some(mut buf) = self.buf_free_list.try_pop(true) {
+            // freed buffer should be always empty.
+            buf.truncate(0);
+            buf.extend_ser(&data, serde_ctx);
+            return buf;
+        }
+        let mut buf = DirectBuf::zeroed(ser_len);
+        buf.truncate(0);
+        buf.extend_ser(&data, serde_ctx);
+        buf
     }
 
     #[inline]
@@ -377,14 +381,11 @@ impl LogPartition {
     }
 }
 
-impl UnwindSafe for LogPartition {}
-impl RefUnwindSafe for LogPartition {}
-
 pub(super) struct SyncGroup {
     pub(super) trx_list: Vec<PrecommitTrx>,
     pub(super) max_cts: TrxID,
     pub(super) log_bytes: usize,
-    pub(super) aio: AIO,
+    pub(super) aio: AIO<DirectBuf>,
     // Signal to notify transaction threads.
     // This field won't be used, until the group is dropped.
     #[allow(dead_code)]
@@ -439,6 +440,7 @@ impl FromStr for LogSync {
 struct FileProcessor<'a> {
     partition: &'a LogPartition,
     io_depth: usize,
+    max_io_size: usize,
     inflight: BTreeMap<TrxID, SyncGroup>,
     in_progress: usize,
     io_reqs: Vec<IocbRawPtr>,
@@ -460,6 +462,7 @@ impl<'a> FileProcessor<'a> {
         FileProcessor {
             partition,
             io_depth: config.io_depth_per_log,
+            max_io_size: config.max_io_size.as_u64() as usize,
             inflight: BTreeMap::new(),
             in_progress: 0,
             io_reqs: vec![],
@@ -617,9 +620,11 @@ impl<'a> FileProcessor<'a> {
 
             // Put IO buffer back into free list.
             for mut sync_group in self.written.drain(..) {
-                if let Some(Buf::Reuse(mut elem)) = sync_group.aio.take_buf() {
-                    elem.reset(); // reset buffer to zero
-                    self.partition.buf_free_list.push_elem(elem); // return buf to free list for future reuse
+                if let Some(mut buf) = sync_group.aio.take_buf() {
+                    if buf.capacity() == self.max_io_size {
+                        buf.reset(); // reset buffer to zero
+                        self.partition.buf_free_list.push(buf); // return buf to free list for future reuse
+                    }
                 }
                 // commit transactions to let waiting read operations to continue
                 let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
@@ -844,16 +849,16 @@ impl MmapLogReader {
         // Try single page first.
         // This may fail as log is incomplete.
         if let Some(mut buf) = self.m.get(self.offset..self.offset + self.page_size) {
-            let raw_len = DirectBuf::raw_len_from(buf);
+            let pod_len = len_prefix_pod_size(buf);
             // Log file is truncated to certain size, and if no data is written, the header of page
             // will always be zeroed. This is the default behavior on Linux.
-            // Raw length is always data length plus 4.
-            if raw_len == mem::size_of::<u32>() {
+            // pod length equals to 8, means all bytes in current page are zeroed.
+            if pod_len == 8 {
                 return ReadLog::DataEnd; // empty data means end of file.
             }
-            if raw_len > buf.len() {
+            if pod_len > buf.len() {
                 // log occupies more than one page, so read more.
-                let new_len = align_to_sector_size(raw_len);
+                let new_len = align_to_sector_size(pod_len);
                 if let Some(new_buf) = self.m.get(self.offset..self.offset + new_len) {
                     buf = new_buf;
                 } else {
@@ -864,7 +869,7 @@ impl MmapLogReader {
                 self.offset += self.page_size;
             }
             return ReadLog::Some(LogGroup {
-                data: DirectBuf::data_from(buf),
+                data: &buf[..pod_len],
                 ctx: SerdeCtx::default(),
             });
         }
@@ -890,6 +895,11 @@ pub struct LogGroup<'a> {
 }
 
 impl LogGroup<'_> {
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        self.data
+    }
+
     #[inline]
     pub fn try_next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
         if self.data.is_empty() {
@@ -1106,8 +1116,12 @@ mod tests {
                         ReadLog::DataCorrupted => unreachable!(),
                         ReadLog::DataEnd => break,
                         ReadLog::Some(mut group) => {
+                            let data_len = group.data().len();
                             while let Some(pod) = group.try_next().unwrap() {
-                                println!("header={:?}, payload={:?}", pod.header, pod.payload);
+                                println!(
+                                    "log {}, len={}, header={:?}, payload={:?}",
+                                    log_recs, data_len, pod.header, pod.payload
+                                );
                                 log_recs += 1;
                             }
                         }
