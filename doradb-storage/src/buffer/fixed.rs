@@ -10,7 +10,6 @@ use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
 use crate::ptr::UnsafePtr;
 use std::mem;
-use std::panic::{RefUnwindSafe, UnwindSafe};
 
 pub const SAFETY_PAGES: usize = 10;
 
@@ -252,10 +251,6 @@ unsafe impl Send for FixedBufferPool {}
 unsafe impl Sync for FixedBufferPool {}
 
 unsafe impl StaticLifetime for FixedBufferPool {}
-
-impl UnwindSafe for FixedBufferPool {}
-
-impl RefUnwindSafe for FixedBufferPool {}
 
 #[cfg(test)]
 mod tests {

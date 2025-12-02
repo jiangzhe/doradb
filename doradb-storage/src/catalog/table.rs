@@ -11,7 +11,7 @@ use std::collections::HashSet;
 /// index specifications.
 /// Constraints and other advanced configurations are
 /// not implemented.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMetadata {
     pub(crate) col_names: Vec<SemiStr>,
     pub(crate) col_types: Vec<ValType>,

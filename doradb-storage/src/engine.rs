@@ -12,7 +12,6 @@ use crate::trx::sys_conf::TrxSysConfig;
 use byte_unit::Byte;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
-use std::panic::{RefUnwindSafe, UnwindSafe};
 
 /// Storage engine of DoraDB.
 pub struct Engine(EngineInner);
@@ -76,8 +75,6 @@ impl Drop for EngineInner {
 
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
-impl UnwindSafe for Engine {}
-impl RefUnwindSafe for Engine {}
 
 pub struct EngineInitializer {
     meta_pool: &'static FixedBufferPool,

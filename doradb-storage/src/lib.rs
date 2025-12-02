@@ -6,6 +6,8 @@ pub mod error;
 pub mod buffer;
 pub mod catalog;
 pub mod engine;
+pub mod file;
+pub mod free_list;
 pub mod index;
 pub mod latch;
 pub mod lifetime;

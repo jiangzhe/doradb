@@ -17,7 +17,6 @@ use crate::trx::{
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
 use std::mem;
-use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -317,10 +316,6 @@ impl TransactionSystem {
 }
 
 unsafe impl StaticLifetime for TransactionSystem {}
-
-impl UnwindSafe for TransactionSystem {}
-
-impl RefUnwindSafe for TransactionSystem {}
 
 impl Drop for TransactionSystem {
     #[inline]

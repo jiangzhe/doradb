@@ -1,4 +1,5 @@
-use crate::io::{pwrite, Buf, IocbRawPtr, SparseFile};
+use crate::file::SparseFile;
+use crate::io::{pwrite, DirectBuf, IocbRawPtr};
 use crate::notify::EventNotifyOnDrop;
 use crate::serde::{Ser, SerdeCtx};
 use crate::session::{IntoSession, Session};
@@ -79,7 +80,7 @@ pub(super) struct CommitGroup {
     pub(super) max_cts: TrxID,
     pub(super) fd: RawFd,
     pub(super) offset: usize,
-    pub(super) log_buf: Buf,
+    pub(super) log_buf: DirectBuf,
     pub(super) sync_ev: EventNotifyOnDrop,
     pub(super) serde_ctx: SerdeCtx,
 }

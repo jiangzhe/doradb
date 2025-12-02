@@ -1,5 +1,6 @@
 use clap::Parser;
-use doradb_storage::io::{AIOContext, AIOKind, Buf, DirectBuf, SparseFile};
+use doradb_storage::file::SparseFile;
+use doradb_storage::io::{AIOContext, AIOKind, DirectBuf};
 use doradb_storage::lifetime::StaticLifetime;
 use rand::RngCore;
 use std::collections::HashMap;
@@ -61,9 +62,9 @@ fn worker(id: usize, aio_mgr: &'static AIOContext, args: Args, stop: Arc<AtomicB
         let batch_size = (thd_rng.next_u32() as usize % log_io_depth) + 1;
         for _ in 0..batch_size {
             id += 1;
-            let buf = DirectBuf::uninit(args.max_io_size);
+            let buf = DirectBuf::zeroed(args.max_io_size);
             let (offset, _) = file.alloc(buf.capacity()).unwrap();
-            let aio = file.pwrite_direct(id, offset, Buf::Direct(buf));
+            let aio = file.pwrite_direct(id, offset, buf);
             reqs.push(aio.iocb().load(Ordering::Relaxed));
             inflight.insert(aio.key, aio);
         }

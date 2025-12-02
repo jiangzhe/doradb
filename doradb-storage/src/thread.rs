@@ -1,37 +1,24 @@
-use std::panic::{catch_unwind, UnwindSafe};
 use std::thread::{self, JoinHandle};
-
-#[inline]
-pub fn spawn<F: FnOnce() -> R + UnwindSafe + Send + 'static, R>(f: F) -> JoinHandle<()> {
-    thread::spawn(|| {
-        if catch_unwind(f).is_err() {
-            let thd = thread::current();
-            println!("thread[{:?}:{:?}] panic", thd.id(), thd.name());
-        }
-    })
-}
 
 #[inline]
 pub fn spawn_named<S, F>(name: S, f: F) -> JoinHandle<()>
 where
     String: From<S>,
-    F: FnOnce() + UnwindSafe + Send + 'static,
+    F: FnOnce() + Send + 'static,
 {
     let thread_name = String::from(name);
     thread::Builder::new()
         .name(thread_name)
         .spawn(|| {
             let thd = thread::current();
-            if catch_unwind(f).is_err() {
-                eprintln!(
-                    "thread[{:?}:{}] panic",
-                    thd.id(),
-                    thd.name().unwrap_or("unknown")
-                );
-                return;
-            }
             eprintln!(
-                "thread[{:?}:{}] exit",
+                "thread[{:?}:{}] started",
+                thd.id(),
+                thd.name().unwrap_or("unknown")
+            );
+            f();
+            eprintln!(
+                "thread[{:?}:{}] finished",
                 thd.id(),
                 thd.name().unwrap_or("unknown")
             );

@@ -39,9 +39,6 @@ pub enum Error {
     EmptyFreeListOfBufferPool,
     #[error("buffer pool size is too small")]
     BufferPoolSizeTooSmall,
-    // latch errors
-    // #[error("retry latch")]
-    // RetryLatch,
     // row action errors
     #[error("row not found")]
     RowNotFound,
@@ -69,6 +66,10 @@ pub enum Error {
     GlobError,
     #[error("log file corrupted")]
     LogFileCorrupted,
+    #[error("channel send error")]
+    SendError,
+    #[error("torn write on file")]
+    TornWrite,
 }
 
 impl From<TryFromSliceError> for Error {
