@@ -11,14 +11,14 @@ use crate::trx::undo::{
     IndexBranch, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRef,
     UndoMap, UndoStatus,
 };
-use crate::trx::{trx_is_committed, ActiveTrx, SharedTrxStatus, TrxID};
+use crate::trx::{ActiveTrx, SharedTrxStatus, TrxID, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
 use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub struct RowReadAccess<'a> {
     page: &'a RowPage,
@@ -70,10 +70,10 @@ impl<'a> RowReadAccess<'a> {
         if row.is_deleted() {
             return ReadRow::NotFound;
         }
-        if let Some(key) = key {
-            if row.is_key_different(metadata, key) {
-                return ReadRow::InvalidIndex;
-            }
+        if let Some(key) = key
+            && row.is_key_different(metadata, key)
+        {
+            return ReadRow::InvalidIndex;
         }
         let vals = row.clone_vals_for_read_set(metadata, user_read_set);
         ReadRow::Ok(vals)
@@ -473,10 +473,10 @@ impl RowVersion {
             if self.read_set.contains(&u.idx()) {
                 self.undo_vals.insert(u.idx(), u.val().clone());
             }
-            if let Some(undo_key) = self.undo_key.as_mut() {
-                if let Some(pos) = self.user_key_idx_map.get(&u.idx()) {
-                    undo_key.vals[*pos] = u.val().clone();
-                }
+            if let Some(undo_key) = self.undo_key.as_mut()
+                && let Some(pos) = self.user_key_idx_map.get(&u.idx())
+            {
+                undo_key.vals[*pos] = u.val().clone();
             }
         }
     }
@@ -715,10 +715,10 @@ impl<'a> RowWriteAccess<'a> {
                     // todo: A further optimization for this scenario is to traverse through
                     // undo chain and check whether the same key exists in any old versions.
                     // If not exists, we do not need to build the version chain.
-                    if let Some(key) = key {
-                        if row.is_key_different(metadata, key) {
-                            return LockUndo::InvalidIndex;
-                        }
+                    if let Some(key) = key
+                        && row.is_key_different(metadata, key)
+                    {
+                        return LockUndo::InvalidIndex;
                     }
                     let mut entry = OwnedRowUndo::new(table_id, page_id, row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {

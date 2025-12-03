@@ -4,7 +4,7 @@ mod libaio_abi;
 use crate::lifetime::StaticLifetime;
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
-use libc::{c_long, EINTR};
+use libc::{EINTR, c_long};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
@@ -356,8 +356,7 @@ impl<T> IOQueue<T> {
     #[inline]
     pub fn drain_to(&mut self, n: usize) -> Vec<T> {
         self.iocbs.drain(0..n);
-        let reqs = self.reqs.drain(0..n).collect();
-        reqs
+        self.reqs.drain(0..n).collect()
     }
 
     /// Checks consistency of this queue.
@@ -713,8 +712,8 @@ pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::table_file::FixedSizeBufferFreeList;
     use crate::file::SparseFile;
+    use crate::file::table_file::FixedSizeBufferFreeList;
     use std::collections::HashMap;
 
     #[test]
