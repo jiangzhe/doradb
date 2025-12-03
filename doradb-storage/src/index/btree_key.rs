@@ -374,11 +374,11 @@ impl BTreeKeyEncoder {
                 prefix, encode_len, ..
             } => {
                 debug_assert!(key.len() <= prefix.len());
-                if let Some(encode_len) = encode_len {
-                    if let Some(suffix_len) = suffix_len {
-                        debug_assert!(*encode_len >= suffix_len);
-                        return encode_key_prefix(prefix, key, *encode_len - suffix_len);
-                    }
+                if let Some(encode_len) = encode_len
+                    && let Some(suffix_len) = suffix_len
+                {
+                    debug_assert!(*encode_len >= suffix_len);
+                    return encode_key_prefix(prefix, key, *encode_len - suffix_len);
                 }
                 let encode_len = prefix
                     .iter()
@@ -694,7 +694,9 @@ mod tests {
         let key = encoder.encode(&[Val::from(b"segmented"), Val::Null]);
         assert_eq!(
             key.as_bytes(),
-            &[b's', b'e', b'g', b'm', b'e', b'n', b't', b'e', b'd', 0, 0, 0, 0, 0, 0, 9, 0x01]
+            &[
+                b's', b'e', b'g', b'm', b'e', b'n', b't', b'e', b'd', 0, 0, 0, 0, 0, 0, 9, 0x01
+            ]
         );
         let key = encoder.encode(&[Val::from(b"a very long key with three segments"), Val::Null]);
         assert_eq!(

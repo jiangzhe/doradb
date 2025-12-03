@@ -1,11 +1,11 @@
 use crate::bitmap::AllocMap;
+use crate::buffer::BufferPool;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, IOKind, Page, PageID, PageIO, INVALID_PAGE_ID, PAGE_SIZE};
+use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, IOKind, PAGE_SIZE, Page, PageID, PageIO};
 use crate::buffer::util::{
     init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate,
 };
-use crate::buffer::BufferPool;
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -18,15 +18,15 @@ use crate::lifetime::StaticLifetime;
 use crate::ptr::UnsafePtr;
 use crate::thread;
 use byte_unit::Byte;
-use event_listener::{listener, Event, Listener};
+use event_listener::{Event, Listener, listener};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::ops::{Range, RangeFrom, RangeTo};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -431,14 +431,18 @@ struct BufferFrames(*mut BufferFrame);
 impl BufferFrames {
     #[inline]
     unsafe fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        let bf_ptr = self.0.offset(page_id as isize);
-        UnsafePtr(bf_ptr)
+        unsafe {
+            let bf_ptr = self.0.offset(page_id as isize);
+            UnsafePtr(bf_ptr)
+        }
     }
 
     #[inline]
     unsafe fn frame(&self, page_id: PageID) -> &BufferFrame {
-        let bf_ptr = self.frame_ptr(page_id);
-        &*bf_ptr.0
+        unsafe {
+            let bf_ptr = self.frame_ptr(page_id);
+            &*bf_ptr.0
+        }
     }
 
     #[inline]
@@ -451,13 +455,15 @@ impl BufferFrames {
 
     #[inline]
     unsafe fn init_page<T: BufferPage>(&'static self, page_id: PageID) -> PageExclusiveGuard<T> {
-        let bf = self.frame_ptr(page_id);
-        let frame = &mut *bf.0;
-        T::init_frame(frame);
-        frame.next_free = INVALID_PAGE_ID;
-        let mut guard = init_bf_exclusive_guard::<T>(bf);
-        guard.page_mut().zero();
-        guard
+        unsafe {
+            let bf = self.frame_ptr(page_id);
+            let frame = &mut *bf.0;
+            T::init_frame(frame);
+            frame.next_free = INVALID_PAGE_ID;
+            let mut guard = init_bf_exclusive_guard::<T>(bf);
+            guard.page_mut().zero();
+            guard
+        }
     }
 
     #[inline]
@@ -1549,7 +1555,7 @@ mod tests {
 
     #[test]
     fn test_evict_buffer_pool_multi_threads() {
-        use rand::{prelude::IndexedRandom, Rng};
+        use rand::{Rng, prelude::IndexedRandom};
         // max pages 2k, max in-mem 1k
         let pool = EvictableBufferPoolConfig::default()
             .max_mem_size(64u64 * 1024 * 1024)

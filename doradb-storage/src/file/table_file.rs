@@ -15,8 +15,8 @@ use crate::trx::TrxID;
 use std::mem;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread::JoinHandle;
 
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
@@ -192,10 +192,10 @@ impl TableFile {
         let (fio, promise) =
             FileIO::prepare(AIOKind::Write, self.file.as_raw_fd(), offset, buf, recycle);
         if let Err(err) = self.io_client.send_async(fio).await {
-            if let Some(buf) = err.into_inner().take_buf() {
-                if recycle {
-                    self.buf_list.recycle(buf);
-                }
+            if let Some(buf) = err.into_inner().take_buf()
+                && recycle
+            {
+                self.buf_list.recycle(buf);
             }
             return Err(Error::SendError);
         }

@@ -387,16 +387,16 @@ impl AllocMap {
         let unit_end_idx = (self.len + 63) / 64;
         let mut g = self.inner.lock();
         let unit_start_idx = g.free_unit_idx;
-        if let Some(idx) = g.bitmap.bitmap_set_first(unit_start_idx, unit_end_idx) {
-            if idx < self.len {
-                if idx / 64 != g.free_unit_idx {
-                    // free unit exhausted.
-                    g.free_unit_idx = idx / 64;
-                }
-
-                self.allocated.fetch_add(1, Ordering::Relaxed);
-                return Some(idx);
+        if let Some(idx) = g.bitmap.bitmap_set_first(unit_start_idx, unit_end_idx)
+            && idx < self.len
+        {
+            if idx / 64 != g.free_unit_idx {
+                // free unit exhausted.
+                g.free_unit_idx = idx / 64;
             }
+
+            self.allocated.fetch_add(1, Ordering::Relaxed);
+            return Some(idx);
         }
         // Because when deallocating, free unit index is always moved
         // to the smallest free position, it's impossible to have free
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn test_bitmap_range_iter_mixed() {
         let mut bm = new_bitmap(192); // 3 words
-                                      // First word: all true
+        // First word: all true
         for i in 0..64 {
             bm.bitmap_set(i);
         }
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn test_bitmap_range_iter_partial() {
         let mut bm = new_bitmap(100); // Not multiple of 64
-                                      // Set first and last bits
+        // Set first and last bits
         bm.bitmap_set(0);
         bm.bitmap_set(99);
         let mut iter = bm.bitmap_range_iter(100);

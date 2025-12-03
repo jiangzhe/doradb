@@ -2,18 +2,18 @@ use crate::error::{Error, Result};
 use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
 use crate::io::{
-    align_to_sector_size, io_event, AIOContext, AIOError, AIOKind, DirectBuf, IocbRawPtr, AIO,
+    AIO, AIOContext, AIOError, AIOKind, DirectBuf, IocbRawPtr, align_to_sector_size, io_event,
 };
 use crate::notify::EventNotifyOnDrop;
-use crate::serde::{len_prefix_pod_size, Deser, LenPrefixPod, Ser, SerdeCtx};
+use crate::serde::{Deser, LenPrefixPod, Ser, SerdeCtx, len_prefix_pod_size};
 use crate::session::{IntoSession, Session};
+use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{Commit, CommitGroup, GroupCommit, MutexGroupCommit};
-use crate::trx::purge::{GCBucket, GC};
+use crate::trx::purge::{GC, GCBucket};
 use crate::trx::redo::{RedoHeader, RedoLogs};
 use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys_conf::TrxSysConfig;
-use crate::trx::MIN_SNAPSHOT_TS;
-use crate::trx::{CommittedTrx, PrecommitTrx, PreparedTrx, TrxID, MAX_COMMIT_TS, MAX_SNAPSHOT_TS};
+use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx, TrxID};
 use crossbeam_utils::CachePadded;
 use event_listener::EventListener;
 use flume::{Receiver, Sender};
@@ -620,11 +620,11 @@ impl<'a> FileProcessor<'a> {
 
             // Put IO buffer back into free list.
             for mut sync_group in self.written.drain(..) {
-                if let Some(mut buf) = sync_group.aio.take_buf() {
-                    if buf.capacity() == self.max_io_size {
-                        buf.reset(); // reset buffer to zero
-                        self.partition.buf_free_list.push(buf); // return buf to free list for future reuse
-                    }
+                if let Some(mut buf) = sync_group.aio.take_buf()
+                    && buf.capacity() == self.max_io_size
+                {
+                    buf.reset(); // reset buffer to zero
+                    self.partition.buf_free_list.push(buf); // return buf to free list for future reuse
                 }
                 // commit transactions to let waiting read operations to continue
                 let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
