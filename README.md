@@ -12,6 +12,10 @@ Current development focus on storage engine.
 
 Fast on both transactional and analytical processing.
 
+## Design 
+
+- [Storage Architecture](./doradb-storage/docs/architecture.md)
+
 ## License
 
 This project is licensed under either of
