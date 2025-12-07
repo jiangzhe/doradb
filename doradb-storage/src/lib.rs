@@ -5,6 +5,7 @@ pub mod io;
 pub mod error;
 pub mod buffer;
 pub mod catalog;
+pub mod compression;
 pub mod engine;
 pub mod file;
 pub mod free_list;
