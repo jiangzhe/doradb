@@ -1,14 +1,15 @@
 use crate::file::SparseFile;
-use crate::io::{pwrite, DirectBuf, IocbRawPtr};
+use crate::io::{DirectBuf, IocbRawPtr, pwrite};
 use crate::notify::EventNotifyOnDrop;
 use crate::serde::{Ser, SerdeCtx};
-use crate::session::{IntoSession, Session};
+use crate::session::SessionState;
 use crate::trx::log::SyncGroup;
 use crate::trx::{PrecommitTrx, TrxID};
 use event_listener::EventListener;
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -95,13 +96,16 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn join(&mut self, mut trx: PrecommitTrx) -> (Option<Session>, EventListener) {
+    pub(super) fn join(
+        &mut self,
+        mut trx: PrecommitTrx,
+    ) -> (Option<Arc<SessionState>>, EventListener) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
             self.log_buf.extend_ser(&redo_bin, &self.serde_ctx);
         }
         self.max_cts = trx.cts;
-        let session = trx.split_session();
+        let session = trx.take_session();
         self.trx_list.push(trx);
         (session, self.sync_ev.listen())
     }

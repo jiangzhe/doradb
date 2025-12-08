@@ -1,9 +1,9 @@
-use event_listener::{listener, Event, Listener};
+use event_listener::{Event, Listener, listener};
+use parking_lot::RawMutex;
 use parking_lot::lock_api::{
     GuardSend, RawMutex as RawMutexApi, RawRwLock as RawRwLockApi,
     RawRwLockDowngrade as RawRwLockDowngradeApi,
 };
-use parking_lot::RawMutex;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -86,18 +86,16 @@ impl RawRwLock {
                 return;
             }
             // slow path: setup listener and wait for no_readers signal.
+            let rb = WriteGuardRollback(self);
             loop {
                 listener!(self.no_readers => listener);
                 let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
                 if new_state & !WRITER_BIT == 0 {
+                    // cancel rollback action as we acquire the lock successfully.
+                    mem::forget(rb);
                     return;
                 }
-                // Here we already acquired mutex.
-                // If async runtime drop the future at yield point,
-                // we need to make sure the mutex is unlocked.
-                let du = DeferUnlock(&self.mu);
                 listener.await;
-                mem::forget(du);
             }
         }
         // Waiting for writer to quit.
@@ -108,15 +106,15 @@ impl RawRwLock {
                 if new_state & !WRITER_BIT == 0 {
                     return;
                 }
+                let rb = WriteGuardRollback(self);
                 loop {
                     listener!(self.no_readers => listener);
                     let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
                     if new_state & !WRITER_BIT == 0 {
+                        mem::forget(rb);
                         return;
                     }
-                    let du = DeferUnlock(&self.mu);
                     listener.await;
-                    mem::forget(du);
                 }
             }
             no_writer.await;
@@ -124,13 +122,18 @@ impl RawRwLock {
     }
 }
 
-struct DeferUnlock<'a>(&'a RawMutex);
+struct WriteGuardRollback<'a>(&'a RawRwLock);
 
-impl Drop for DeferUnlock<'_> {
+impl Drop for WriteGuardRollback<'_> {
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            self.0.unlock();
+            // rollback writer bit.
+            self.0.state.fetch_and(!WRITER_BIT, Ordering::SeqCst);
+            // notify other writer
+            self.0.no_writer.notify(1);
+            // release mutex
+            self.0.mu.unlock();
         }
     }
 }
@@ -243,8 +246,8 @@ unsafe impl RawRwLockDowngradeApi for RawRwLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::lock_api::RawRwLock as RawRwLockApi;
     use parking_lot::RawRwLock as ParkingLotRawRwLock;
+    use parking_lot::lock_api::RawRwLock as RawRwLockApi;
     use std::cell::UnsafeCell;
     use std::sync::Arc;
     use std::time::{Duration, Instant};

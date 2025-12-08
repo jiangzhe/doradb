@@ -1,5 +1,5 @@
-use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
+use crate::buffer::page::PageID;
 use crate::catalog::{Catalog, TableCache};
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
@@ -7,7 +7,7 @@ use crate::table::TableAccess;
 use crate::thread;
 use crate::trx::log::LogPartition;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::{CommittedTrx, TrxID, MAX_SNAPSHOT_TS};
+use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, TrxID};
 use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
 use doradb_catalog::TableID;
@@ -526,13 +526,13 @@ impl PurgeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::EvictableBufferPoolConfig;
+    use crate::buffer::guard::PageSharedGuard;
     use crate::engine::EngineConfig;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
-    use crate::row::ops::SelectKey;
     use crate::row::RowPage;
+    use crate::row::ops::SelectKey;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
     use crate::value::Val;
@@ -585,8 +585,6 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
 
@@ -601,18 +599,17 @@ mod tests {
             let mut session = engine.new_session();
             // insert
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx();
+                let mut trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let res = stmt.insert_row(&table, vec![Val::from(i as i32)]).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
-                session = res.unwrap();
             }
             // delete
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx();
+                let mut trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = stmt.delete_row(&table, &key).await;
@@ -620,7 +617,6 @@ mod tests {
                 trx = stmt.succeed();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
-                session = res.unwrap();
             }
 
             // wait for GC.
@@ -646,10 +642,12 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
+            drop(session);
             drop(engine);
 
             let _ = std::fs::remove_file("databuffer_purge.bin");
             remove_files("redo_purge*");
+            remove_files("*.tbl");
         });
     }
 
@@ -673,8 +671,6 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
 
@@ -689,18 +685,17 @@ mod tests {
             let mut session = engine.new_session();
             // insert
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx();
+                let mut trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let res = stmt.insert_row(&table, vec![Val::from(i as i32)]).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
-                session = res.unwrap();
             }
             // delete
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx();
+                let mut trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = stmt.delete_row(&table, &key).await;
@@ -708,7 +703,6 @@ mod tests {
                 trx = stmt.succeed();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
-                session = res.unwrap();
             }
 
             // wait for GC.
@@ -763,10 +757,12 @@ mod tests {
                 "final min_active_sts={}",
                 engine.trx_sys.global_visible_sts()
             );
+            drop(session);
             drop(engine);
 
             let _ = std::fs::remove_file("databuffer_purge.bin");
             remove_files("redo_purge*");
+            remove_files("*.tbl");
         });
     }
 }

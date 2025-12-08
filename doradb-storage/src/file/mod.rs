@@ -1,16 +1,19 @@
 pub mod super_page;
 pub mod table_file;
+pub mod table_fs;
 
-use crate::io::io_iocb_cmd;
+use crate::free_list::FreeList;
 use crate::io::DirectBuf;
+use crate::io::io_iocb_cmd;
 use crate::io::{
-    align_to_sector_size, AIOBuf, AIOContext, AIOError, AIOEventListener, AIOKey, AIOKind,
-    AIOResult, AIOStats, IOQueue, UnsafeAIO, AIO,
+    AIO, AIOBuf, AIOContext, AIOError, AIOEventListener, AIOKey, AIOKind, AIOResult, AIOStats,
+    IOQueue, STORAGE_SECTOR_SIZE, UnsafeAIO, align_to_sector_size,
 };
 use crate::notify::EventNotifyOnDrop;
 use event_listener::{EventListener, Listener};
 use libc::{
-    close, fdatasync, fstat, fsync, ftruncate, open, stat, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC,
+    O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
+    stat,
 };
 use parking_lot::lock_api::RawMutex as RawMutexAPI;
 use parking_lot::{Mutex, RawMutex};
@@ -18,11 +21,11 @@ use scopeguard::defer;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use table_file::FixedSizeBufferFreeList;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// SparseFile is file with metadata describing empty blocks
 /// instead of writing them.
@@ -44,24 +47,49 @@ impl AsRawFd for SparseFile {
 }
 
 impl SparseFile {
-    /// Create a sparse file with given maximum length.
+    /// Create a sparse file and truncate if file already exists.
     /// Note that space is allocated only when data is written to this file.
     #[inline]
-    pub fn create(file_path: impl AsRef<str>, max_size: usize) -> AIOResult<SparseFile> {
+    pub fn create_or_trunc(file_path: impl AsRef<str>, max_size: usize) -> AIOResult<SparseFile> {
         unsafe {
-            let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
+            let c_string =
+                CString::new(file_path.as_ref()).map_err(|_| AIOError::CreateFileError)?;
             let fd = open(
                 c_string.as_ptr(),
                 O_CREAT | O_RDWR | O_TRUNC | O_DIRECT,
                 0o644,
             );
             if fd < 0 {
-                return Err(AIOError::OpenFileError);
+                return Err(AIOError::CreateFileError);
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
                 let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(AIOError::OpenFileError);
+                return Err(AIOError::TruncFileError);
+            }
+            Ok(SparseFile::new(fd, 0, max_size))
+        }
+    }
+
+    /// Create a sparse file and fail if file already exists.
+    /// Note that space is allocated only when data is written to this file.
+    #[inline]
+    pub fn create_or_fail(file_path: impl AsRef<str>, max_size: usize) -> AIOResult<SparseFile> {
+        unsafe {
+            let c_string =
+                CString::new(file_path.as_ref()).map_err(|_| AIOError::CreateFileError)?;
+            let fd = open(
+                c_string.as_ptr(),
+                O_CREAT | O_RDWR | O_EXCL | O_DIRECT,
+                0o644,
+            );
+            if fd < 0 {
+                return Err(AIOError::CreateFileError);
+            }
+            let ret = ftruncate(fd, max_size as i64);
+            if ret < 0 {
+                let _ = close(fd); // close file descriptor if truncate fail.
+                return Err(AIOError::TruncFileError);
             }
             Ok(SparseFile::new(fd, 0, max_size))
         }
@@ -452,6 +480,43 @@ impl FileSyncer {
     }
 }
 
+/// Fixed size buffer free list hold a given number of
+/// buffer pages.
+/// It's used to reuse pages in heavy IO environment.
+#[derive(Clone)]
+pub struct FixedSizeBufferFreeList(Arc<FreeList<DirectBuf>>);
+
+impl FixedSizeBufferFreeList {
+    /// Create a new buffer free list with given number of
+    /// pre-allocated buffer pages.
+    #[inline]
+    pub fn new(page_size: usize, init_pages: usize, max_pages: usize) -> Self {
+        debug_assert!(page_size.is_multiple_of(STORAGE_SECTOR_SIZE));
+        let free_list: FreeList<_> = FreeList::new(init_pages, max_pages, move || {
+            let mut buf = DirectBuf::zeroed(page_size);
+            buf.truncate(0);
+            buf
+        });
+        FixedSizeBufferFreeList(Arc::new(free_list))
+    }
+
+    /// Recycle the buffer for future use.
+    #[inline]
+    pub fn recycle(&self, mut buf: DirectBuf) {
+        buf.reset();
+        buf.truncate(0);
+        self.push(buf);
+    }
+}
+
+impl Deref for FixedSizeBufferFreeList {
+    type Target = FreeList<DirectBuf>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[inline]
 pub fn pread_direct<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
     const PRIORITY: u16 = 0;
@@ -550,7 +615,7 @@ mod tests {
     fn test_sparse_file_open_and_create() {
         let res = SparseFile::open("sparsefile1.bin");
         assert!(res.is_err());
-        let file = SparseFile::create("sparsefile1.bin", 1024 * 1024).unwrap();
+        let file = SparseFile::create_or_trunc("sparsefile1.bin", 1024 * 1024).unwrap();
         drop(file);
         let file = SparseFile::open("sparsefile1.bin").unwrap();
         drop(file);

@@ -5,6 +5,7 @@
 use crate::buffer::{EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
 use crate::catalog::Catalog;
 use crate::error::Result;
+use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
 use crate::lifetime::StaticLifetime;
 use crate::session::Session;
 use crate::trx::sys::TransactionSystem;
@@ -12,9 +13,10 @@ use crate::trx::sys_conf::TrxSysConfig;
 use byte_unit::Byte;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
+use std::sync::Arc;
 
 /// Storage engine of DoraDB.
-pub struct Engine(EngineInner);
+pub struct Engine(Arc<EngineInner>);
 
 impl Deref for Engine {
     type Target = EngineInner;
@@ -27,7 +29,7 @@ impl Deref for Engine {
 impl Engine {
     #[inline]
     pub fn new_session(&self) -> Session {
-        Session::new(self.weak())
+        Session::new(self.new_ref())
     }
 
     #[inline]
@@ -36,14 +38,48 @@ impl Engine {
     }
 
     #[inline]
-    pub fn weak(&self) -> Self {
-        Engine(EngineInner {
-            trx_sys: self.0.trx_sys,
-            meta_pool: self.0.meta_pool,
-            index_pool: self.0.index_pool,
-            data_pool: self.0.data_pool,
-            stop_all: false,
-        })
+    pub fn new_ref(&self) -> EngineRef {
+        EngineRef(Arc::clone(&self.0))
+    }
+}
+
+impl Drop for Engine {
+    #[inline]
+    fn drop(&mut self) {
+        // Engine is supposed to be last one to drop.
+        if Arc::strong_count(&self.0) != 1 {
+            panic!("fatal: engine ref is leaked");
+        }
+        unsafe {
+            StaticLifetime::drop_static(self.trx_sys);
+            StaticLifetime::drop_static(self.data_pool);
+            StaticLifetime::drop_static(self.meta_pool);
+            StaticLifetime::drop_static(self.index_pool);
+            StaticLifetime::drop_static(self.table_fs);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct EngineRef(Arc<EngineInner>);
+
+impl Deref for EngineRef {
+    type Target = EngineInner;
+    #[inline]
+    fn deref(&self) -> &EngineInner {
+        &self.0
+    }
+}
+
+impl EngineRef {
+    #[inline]
+    pub fn new_session(&self) -> Session {
+        Session::new(self.clone())
+    }
+
+    #[inline]
+    pub fn catalog(&self) -> &Catalog {
+        &self.trx_sys.catalog
     }
 }
 
@@ -56,51 +92,12 @@ pub struct EngineInner {
     pub index_pool: &'static FixedBufferPool,
     // data pool is used for data tables.
     pub data_pool: &'static EvictableBufferPool,
-    // only one instance should have this flag to be true to
-    // stop the engine.
-    stop_all: bool,
-}
-
-impl Drop for EngineInner {
-    #[inline]
-    fn drop(&mut self) {
-        if self.stop_all {
-            unsafe {
-                StaticLifetime::drop_static(self.trx_sys);
-                StaticLifetime::drop_static(self.data_pool);
-            }
-        }
-    }
+    // Table file system to handle async IO of files on disk.
+    pub table_fs: &'static TableFileSystem,
 }
 
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
-
-pub struct EngineInitializer {
-    meta_pool: &'static FixedBufferPool,
-    index_pool: &'static FixedBufferPool,
-    data_pool: &'static EvictableBufferPool,
-    trx_sys_config: TrxSysConfig,
-}
-
-impl EngineInitializer {
-    #[inline]
-    pub async fn init(self) -> Result<Engine> {
-        let trx_sys = self
-            .trx_sys_config
-            .build()
-            .init(self.meta_pool, self.index_pool, self.data_pool)
-            .await?;
-        let engine = Engine(EngineInner {
-            meta_pool: self.meta_pool,
-            index_pool: self.index_pool,
-            data_pool: self.data_pool,
-            trx_sys,
-            stop_all: true,
-        });
-        Ok(engine)
-    }
-}
 
 const DEFAULT_META_BUFFER: usize = 32 * 1024 * 1024;
 const DEFAULT_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
@@ -111,6 +108,7 @@ pub struct EngineConfig {
     meta_buffer: Byte,
     index_buffer: Byte,
     data_buffer: EvictableBufferPoolConfig,
+    file: TableFileSystemConfig,
 }
 
 impl Default for EngineConfig {
@@ -121,6 +119,7 @@ impl Default for EngineConfig {
             meta_buffer: Byte::from_u64(DEFAULT_META_BUFFER as u64),
             index_buffer: Byte::from_u64(DEFAULT_INDEX_BUFFER as u64),
             data_buffer: EvictableBufferPoolConfig::default(),
+            file: TableFileSystemConfig::default(),
         }
     }
 }
@@ -151,19 +150,33 @@ impl EngineConfig {
     }
 
     #[inline]
-    pub fn build(self) -> Result<EngineInitializer> {
+    pub fn file(mut self, file: TableFileSystemConfig) -> Self {
+        self.file = file;
+        self
+    }
+
+    #[inline]
+    pub async fn build(self) -> Result<Engine> {
+        let table_fs = self.file.build()?;
+        let table_fs = StaticLifetime::new_static(table_fs);
+        // todo: avoid resource leak when errors occur.
         let meta_pool = FixedBufferPool::with_capacity_static(self.meta_buffer.as_u64() as usize)?;
         // todo: implement index pool
         let index_pool =
             FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
         let data_pool = self.data_buffer.build()?;
         let data_pool = StaticLifetime::new_static(data_pool);
-        Ok(EngineInitializer {
+        let trx_sys = self
+            .trx
+            .build_static(meta_pool, index_pool, data_pool, table_fs)
+            .await?;
+        Ok(Engine(Arc::new(EngineInner {
+            trx_sys,
             meta_pool,
             index_pool,
             data_pool,
-            trx_sys_config: self.trx,
-        })
+            table_fs,
+        })))
     }
 }
 

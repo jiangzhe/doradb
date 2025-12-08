@@ -1,14 +1,14 @@
-use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
+use crate::buffer::page::PageID;
 use crate::index::{IndexInsert, NonUniqueIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::table::{
-    index_key_is_changed, index_key_replace, read_latest_index_key, RecoverIndex, Table,
+    RecoverIndex, Table, index_key_is_changed, index_key_replace, read_latest_index_key,
 };
-use crate::trx::TrxID;
 use crate::trx::MIN_SNAPSHOT_TS;
+use crate::trx::TrxID;
 use crate::value::Val;
 use std::collections::HashMap;
 use std::future::Future;
@@ -64,11 +64,11 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) {
-        debug_assert!(cols.len() == self.metadata.col_count());
+        debug_assert!(cols.len() == self.metadata().col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
         });
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
@@ -83,7 +83,7 @@ impl TableRecover for Table {
         page_guard.set_dirty(); // mark as dirty page.
 
         if !disable_index {
-            let keys = self.metadata.keys_for_insert(cols);
+            let keys = self.metadata().keys_for_insert(cols);
             for key in keys {
                 match self.recover_index_insert(data_pool, key, row_id, cts).await {
                     RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
@@ -132,15 +132,12 @@ impl TableRecover for Table {
                     .shared_async()
                     .await;
 
-                for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+                let metadata = self.metadata();
+                for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
                     debug_assert!(index.is_unique() == index_schema.unique());
                     if index_key_is_changed(index_schema, &index_change_cols) {
-                        let new_key = read_latest_index_key(
-                            &self.metadata,
-                            index.index_no,
-                            &page_guard,
-                            row_id,
-                        );
+                        let new_key =
+                            read_latest_index_key(metadata, index.index_no, &page_guard, row_id);
                         let old_key = index_key_replace(index_schema, &new_key, &index_change_cols);
                         // insert new index entry.
                         match self
@@ -189,7 +186,7 @@ impl TableRecover for Table {
             );
             assert!(res.is_ok());
             page_guard.set_dirty(); // mark as dirty page.
-            for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+            for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata().index_specs) {
                 debug_assert!(index.is_unique() == index_schema.unique());
                 let vals: Vec<Val> = index_schema
                     .index_cols
@@ -215,7 +212,8 @@ impl TableRecover for Table {
             .await
             .shared_async()
             .await;
-        for (index_spec, sec_idx) in self.metadata.index_specs.iter().zip(&*self.sec_idx) {
+        let metadata = self.metadata();
+        for (index_spec, sec_idx) in metadata.index_specs.iter().zip(&*self.sec_idx) {
             let read_set: Vec<_> = index_spec
                 .index_cols
                 .iter()
@@ -223,7 +221,7 @@ impl TableRecover for Table {
                 .collect();
             for row_access in page_guard.read_all_rows() {
                 let row_id = row_access.row().row_id();
-                match row_access.read_row_latest(&self.metadata, &read_set, None) {
+                match row_access.read_row_latest(metadata, &read_set, None) {
                     ReadRow::Ok(vals) => {
                         if index_spec.unique() {
                             let index = sec_idx.unique().unwrap();

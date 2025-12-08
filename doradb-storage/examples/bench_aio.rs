@@ -4,8 +4,8 @@ use doradb_storage::io::{AIOContext, AIOKind, DirectBuf};
 use doradb_storage::lifetime::StaticLifetime;
 use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,7 @@ fn main() {
 fn worker(id: usize, aio_mgr: &'static AIOContext, args: Args, stop: Arc<AtomicBool>) -> usize {
     let file_name = format!("{}.{}", &args.log_file_prefix, id);
 
-    let file = SparseFile::create(&file_name, args.log_file_max_size).unwrap();
+    let file = SparseFile::create_or_trunc(&file_name, args.log_file_max_size).unwrap();
     let syncer = file.syncer();
 
     let log_io_depth = args.io_depth / args.log_partitions;

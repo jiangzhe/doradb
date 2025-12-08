@@ -1,19 +1,19 @@
 use crate::error::Result;
 use crate::serde::{Deser, Ser, SerdeCtx};
+use doradb_datatype::PreciseType;
 use doradb_datatype::konst::{ValidF32, ValidF64};
 use doradb_datatype::memcmp::{
-    BytesExtendable, MemCmpFormat, Null, NullableMemCmpFormat, SegmentedBytes, MIN_VAR_MCF_LEN,
-    MIN_VAR_NMCF_LEN,
+    BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
+    SegmentedBytes,
 };
-use doradb_datatype::PreciseType;
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
-use std::alloc::{alloc, dealloc, Layout as AllocLayout};
+use std::alloc::{Layout as AllocLayout, alloc, dealloc};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 pub const PAGE_VAR_HEADER: usize = 8;
 pub const PAGE_VAR_LEN_INLINE: usize = 6;

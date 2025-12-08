@@ -1,4 +1,4 @@
-use crate::col::attr::{Attr, SerAttrHeader, LEN_ATTR_HDR};
+use crate::col::attr::{Attr, LEN_ATTR_HDR, SerAttrHeader};
 use crate::error::{Error, Result};
 use std::io::{Cursor, Write};
 use std::sync::Arc;

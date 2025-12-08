@@ -4,8 +4,8 @@ use crate::buffer::page::BufferPage;
 use crate::error::{Error, Result};
 use crate::ptr::UnsafePtr;
 use libc::{
-    c_void, madvise, mmap, munmap, MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MADV_REMOVE,
-    MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE,
+    MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MADV_REMOVE, MAP_ANONYMOUS, MAP_FAILED,
+    MAP_PRIVATE, PROT_READ, PROT_WRITE, c_void, madvise, mmap, munmap,
 };
 
 #[inline]

@@ -1,7 +1,7 @@
 use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
 };
-use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
+use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::error::{
@@ -10,7 +10,7 @@ use crate::error::{
 };
 use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
 use crate::latch::LatchFallbackMode;
-use crate::row::{RowID, RowPage, INVALID_ROW_ID};
+use crate::row::{INVALID_ROW_ID, RowID, RowPage};
 use crate::trx::sys::TransactionSystem;
 use doradb_catalog::TableID;
 use either::Either::{Left, Right};
@@ -1088,6 +1088,7 @@ mod tests {
     #[test]
     fn test_block_index_free_list() {
         smol::block_on(async {
+            remove_files("*.tbl");
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -1101,8 +1102,6 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             {
@@ -1132,12 +1131,14 @@ mod tests {
 
             let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
+            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_block_index_insert_row_page() {
         smol::block_on(async {
+            remove_files("*.tbl");
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -1151,8 +1152,6 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             {
@@ -1182,12 +1181,14 @@ mod tests {
 
             let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
+            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_block_index_cursor_shared() {
         smol::block_on(async {
+            remove_files("*.tbl");
             let row_pages = 10240usize;
             // allocate 1GB buffer pool is enough: 10240 pages ~= 640MB
             let engine = EngineConfig::default()
@@ -1203,8 +1204,6 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             {
@@ -1259,6 +1258,7 @@ mod tests {
 
             let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
+            remove_files("*.tbl");
         })
     }
 
@@ -1269,6 +1269,7 @@ mod tests {
     #[test]
     fn test_block_index_search() {
         smol::block_on(async {
+            remove_files("*.tbl");
             let row_pages = 10240usize;
             let rows_per_page = 100usize;
             let engine = EngineConfig::default()
@@ -1284,8 +1285,6 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             {
@@ -1340,12 +1339,14 @@ mod tests {
 
             let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
+            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_block_index_log() {
         smol::block_on(async {
+            remove_files("*.tbl");
             let rows_per_page = 100;
             let engine = EngineConfig::default()
                 .data_buffer(
@@ -1360,8 +1361,6 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             {
@@ -1384,12 +1383,14 @@ mod tests {
 
             let _ = std::fs::remove_file("databuffer_bi.bin");
             remove_files("redo_bi*");
+            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_block_index_split() {
         smol::block_on(async {
+            remove_files("*.tbl");
             let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
             {
                 let blk_idx = BlockIndex::new(pool, 1).await;

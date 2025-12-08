@@ -106,7 +106,7 @@ impl<'a, C: BTreeSlotCallback> BTreePrefixScan<'a, C> {
             return; // mismatch
         }
         drop(first_g); // release lock on first node.
-                       // try next node.
+        // try next node.
         while let Some(g) = self.cursor.next().await {
             let node = g.page();
             // As node changes, common prefix may also change.

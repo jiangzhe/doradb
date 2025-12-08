@@ -1,14 +1,14 @@
 use crate::buffer::page::PageID;
 use crate::error::Result;
-use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::RowID;
+use crate::row::ops::{SelectKey, UpdateCol};
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::table::TableID;
 use crate::trx::TrxID;
 use crate::value::Val;
 use doradb_catalog::{IndexID, SchemaID};
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::mem;
 
 /// Defines the code of redo operation on a row.

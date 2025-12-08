@@ -1,5 +1,5 @@
 use libc::{c_int, c_long, timespec};
-use std::alloc::{alloc, Layout};
+use std::alloc::{Layout, alloc};
 
 #[allow(non_camel_case_types)]
 pub enum io_iocb_cmd {

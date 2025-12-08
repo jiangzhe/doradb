@@ -31,8 +31,12 @@ const DEFAULT_AIO_MAX_EVENTS: usize = 32;
 pub enum AIOError {
     #[error("AIO setup error")]
     SetupError,
-    #[error("AIO open file error")]
+    #[error("create file error")]
+    CreateFileError,
+    #[error("open file error")]
     OpenFileError,
+    #[error("truncate file error")]
+    TruncFileError,
     #[error("AIO out of range")]
     OutOfRange,
     #[error("AIO file stat error")]
@@ -712,14 +716,13 @@ pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::SparseFile;
-    use crate::file::table_file::FixedSizeBufferFreeList;
+    use crate::file::{FixedSizeBufferFreeList, SparseFile};
     use std::collections::HashMap;
 
     #[test]
     fn test_aio_file_ops() {
         let ctx = AIOContext::try_default().unwrap();
-        let file = SparseFile::create("aio_file1.txt", 1024 * 1024).unwrap();
+        let file = SparseFile::create_or_trunc("aio_file1.txt", 1024 * 1024).unwrap();
         let buf = DirectBuf::with_data(b"hello, world");
         let (offset, _) = file.alloc(buf.capacity()).unwrap();
         let aio = file.pwrite_direct(100, offset, buf);
@@ -739,7 +742,7 @@ mod tests {
 
     #[test]
     fn test_aio_file_extend() {
-        let file = SparseFile::create("aio_file2.txt", 1024 * 1024).unwrap();
+        let file = SparseFile::create_or_trunc("aio_file2.txt", 1024 * 1024).unwrap();
         let (logical_size, allocated_size) = file.size().unwrap();
         println!("file created, logical size={logical_size}, allocated size={allocated_size}");
         assert_eq!(logical_size, 1024 * 1024);
@@ -758,7 +761,7 @@ mod tests {
     fn test_aio_event_loop() {
         let ctx = AIOContext::new(16).unwrap();
 
-        let file = SparseFile::create("aio_file3.txt", 1024 * 1024).unwrap();
+        let file = SparseFile::create_or_trunc("aio_file3.txt", 1024 * 1024).unwrap();
 
         let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
         let listener = SimpleListener {

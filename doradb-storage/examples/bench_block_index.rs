@@ -12,8 +12,8 @@ use perfcnt::{AbstractPerfCounter, PerfCounter};
 use rand::RngCore;
 use semistr::SemiStr;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -31,8 +31,6 @@ fn main() {
             )
             .trx(TrxSysConfig::default().skip_recovery(true))
             .build()
-            .unwrap()
-            .init()
             .await
             .unwrap();
         {
@@ -84,17 +82,28 @@ fn main() {
             let qps = total_count as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
             let op_nanos =
                 perf_stats.dur.as_nanos() as f64 * args.threads as f64 / total_count as f64;
-            println!("block_index: threads={}, dur={}ms, total_count={}, sum_page_id={}, qps={:.2}, op={:.2}ns", args.threads, perf_stats.dur.as_millis(), total_count, total_sum_page_id, qps, op_nanos);
-            println!("block_index: cache_refs={:.2}, cache_misses={:.2}, cycles={:.2}, instructions={:.2}, branch_misses={:.2}", 
+            println!(
+                "block_index: threads={}, dur={}ms, total_count={}, sum_page_id={}, qps={:.2}, op={:.2}ns",
+                args.threads,
+                perf_stats.dur.as_millis(),
+                total_count,
+                total_sum_page_id,
+                qps,
+                op_nanos
+            );
+            println!(
+                "block_index: cache_refs={:.2}, cache_misses={:.2}, cycles={:.2}, instructions={:.2}, branch_misses={:.2}",
                 perf_stats.cache_refs as f64,
                 perf_stats.cache_misses as f64,
                 perf_stats.cycles as f64,
                 perf_stats.instructions as f64,
-                perf_stats.branch_misses as f64);
+                perf_stats.branch_misses as f64
+            );
         }
         drop(engine);
 
         let _ = std::fs::remove_file("databuffer_bench1.bin");
+        remove_files("*.tbl");
     });
 
     bench_btreemap(args);
@@ -143,12 +152,14 @@ fn bench_btreemap(args: Args) {
             qps,
             op_nanos
         );
-        println!("btreemap: cache_refs={:.2}, cache_misses={:.2}, cycles={:.2}, instructions={:.2}, branch_misses={:.2}", 
+        println!(
+            "btreemap: cache_refs={:.2}, cache_misses={:.2}, cycles={:.2}, instructions={:.2}, branch_misses={:.2}",
             perf_stats.cache_refs as f64,
             perf_stats.cache_misses as f64,
             perf_stats.cycles as f64,
             perf_stats.instructions as f64,
-            perf_stats.branch_misses as f64);
+            perf_stats.branch_misses as f64
+        );
     }
     unsafe {
         drop(Box::from_raw(
@@ -357,4 +368,18 @@ struct Args {
     /// query count per thread
     #[arg(long, default_value = "1000000")]
     count: usize,
+}
+
+fn remove_files(file_pattern: &str) {
+    let files = glob::glob(file_pattern);
+    if files.is_err() {
+        return;
+    }
+    for f in files.unwrap() {
+        if f.is_err() {
+            continue;
+        }
+        let fp = f.unwrap();
+        let _ = std::fs::remove_file(&fp);
+    }
 }

@@ -5,13 +5,13 @@ use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
 use doradb_storage::buffer::EvictableBufferPoolConfig;
-use doradb_storage::engine::{Engine, EngineConfig};
+use doradb_storage::engine::{EngineConfig, EngineRef};
 use doradb_storage::trx::log::LogSync;
 use doradb_storage::trx::sys_conf::TrxSysConfig;
 use easy_parallel::Parallel;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -38,8 +38,6 @@ fn main() {
                     .skip_recovery(true),
             )
             .build()
-            .unwrap()
-            .init()
             .await
             .unwrap();
         {
@@ -52,7 +50,7 @@ fn main() {
             for _ in 0..args.sessions {
                 let wg = wg.clone();
                 let stop = Arc::clone(&stop);
-                let engine = engine.weak();
+                let engine = engine.new_ref();
                 ex.spawn(worker(engine, stop, wg)).detach();
             }
             // start system threads.
@@ -81,39 +79,53 @@ fn main() {
             let io_wait_count = stats.io_wait_count;
             let io_wait_nanos = stats.io_wait_nanos;
             println!(
-            "threads={},dur={},total_trx={},groups={},sync={},sync_dur={:.2}us,io_submit={},io_submit_dur={:.2}us,io_wait={},io_wait_dur={:.2}us,trx/grp={:.2},trx/s={:.0},log/s={:.2}MB",
-            args.threads,
-            dur.as_micros(),
-            total_trx_count,
-            commit_count,
-            sync_count,
-            if sync_count == 0 { 0f64 } else { sync_nanos as f64 / 1000f64 / sync_count as f64 },
-            io_submit_count,
-            if io_submit_count == 0 { 0f64 } else { io_submit_nanos as f64 / 1000f64 / io_submit_count as f64 },
-            io_wait_count,
-            if io_wait_count == 0 { 0f64 } else { io_wait_nanos as f64 / 1000f64 / io_wait_count as f64 },
-            if commit_count == 0 { 0f64 } else { total_trx_count as f64 / commit_count as f64 },
-            total_trx_count as f64 * 1_000_000_000f64 / dur.as_nanos() as f64,
-            log_bytes as f64 / dur.as_micros() as f64,
-        );
+                "threads={},dur={},total_trx={},groups={},sync={},sync_dur={:.2}us,io_submit={},io_submit_dur={:.2}us,io_wait={},io_wait_dur={:.2}us,trx/grp={:.2},trx/s={:.0},log/s={:.2}MB",
+                args.threads,
+                dur.as_micros(),
+                total_trx_count,
+                commit_count,
+                sync_count,
+                if sync_count == 0 {
+                    0f64
+                } else {
+                    sync_nanos as f64 / 1000f64 / sync_count as f64
+                },
+                io_submit_count,
+                if io_submit_count == 0 {
+                    0f64
+                } else {
+                    io_submit_nanos as f64 / 1000f64 / io_submit_count as f64
+                },
+                io_wait_count,
+                if io_wait_count == 0 {
+                    0f64
+                } else {
+                    io_wait_nanos as f64 / 1000f64 / io_wait_count as f64
+                },
+                if commit_count == 0 {
+                    0f64
+                } else {
+                    total_trx_count as f64 / commit_count as f64
+                },
+                total_trx_count as f64 * 1_000_000_000f64 / dur.as_nanos() as f64,
+                log_bytes as f64 / dur.as_micros() as f64,
+            );
         }
         drop(engine);
 
         let _ = std::fs::remove_file("databuffer_bench3.bin");
+        remove_files("*.tbl");
     })
 }
 
 #[inline]
-async fn worker(engine: Engine, stop: Arc<AtomicBool>, wg: WaitGroup) {
+async fn worker(engine: EngineRef, stop: Arc<AtomicBool>, wg: WaitGroup) {
     let mut session = engine.new_session();
     let stop = &*stop;
     while !stop.load(Ordering::Relaxed) {
-        let mut trx = session.begin_trx();
+        let mut trx = session.begin_trx().unwrap();
         trx.add_pseudo_redo_log_entry();
-        match trx.commit().await {
-            Ok(s) => session = s,
-            Err(_) => return,
-        }
+        trx.commit().await.unwrap();
     }
     drop(wg);
 }
@@ -160,4 +172,18 @@ struct Args {
 #[inline]
 fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
     Byte::parse_str(input, true).map(|b| b.as_u64() as usize)
+}
+
+fn remove_files(file_pattern: &str) {
+    let files = glob::glob(file_pattern);
+    if files.is_err() {
+        return;
+    }
+    for f in files.unwrap() {
+        if f.is_err() {
+            continue;
+        }
+        let fp = f.unwrap();
+        let _ = std::fs::remove_file(&fp);
+    }
 }

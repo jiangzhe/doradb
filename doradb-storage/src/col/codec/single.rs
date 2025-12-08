@@ -1,5 +1,5 @@
 use crate::col::repr::ByteRepr;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 /// Single codec encodes single value as bytes in case all
 /// values of that attribute are identical.

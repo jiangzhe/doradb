@@ -1188,7 +1188,7 @@ impl EvictableBufferPoolConfig {
         let io_ctx = AIOContext::new(self.max_io_depth)?;
         let (event_loop, io_client) = io_ctx.event_loop();
 
-        let file = SparseFile::create(&self.file_path, max_file_size)?;
+        let file = SparseFile::create_or_trunc(&self.file_path, max_file_size)?;
         let file_io = SingleFileIO::new(file);
 
         // 4. Initialize frames.

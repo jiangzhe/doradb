@@ -7,7 +7,7 @@ use crate::value::*;
 use std::fmt;
 use std::mem;
 use std::slice;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 pub type RowID = u64;
 pub const INVALID_ROW_ID: RowID = !0;

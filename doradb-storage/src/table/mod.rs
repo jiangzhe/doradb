@@ -10,6 +10,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
+use crate::file::table_file::TableFile;
 use crate::index::util::Maskable;
 use crate::index::{
     BlockIndex, IndexCompareExchange, IndexInsert, NonUniqueBTreeIndex, NonUniqueIndex,
@@ -20,13 +21,13 @@ use crate::row::ops::{
     InsertIndex, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex, SelectKey, SelectMvcc,
     UndoCol, UpdateCol, UpdateIndex, UpdateRow,
 };
-use crate::row::{estimate_max_row_count, var_len_for_insert, RowID, RowPage, RowRead};
+use crate::row::{RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo};
 use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoKind, UndoStatus};
-use crate::trx::{TrxID, MIN_SNAPSHOT_TS};
-use crate::value::{Val, PAGE_VAR_LEN_INLINE};
+use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use doradb_catalog::IndexSpec;
 use std::collections::HashMap;
 use std::mem;
@@ -69,7 +70,7 @@ pub use doradb_catalog::TableID;
 /// index does not contain version information, and out-of-date index entry
 /// should ignored if visible data version does not match index key.
 pub struct Table {
-    pub metadata: Arc<TableMetadata>,
+    pub file: Arc<TableFile>,
     pub blk_idx: Arc<BlockIndex>,
     pub sec_idx: Arc<[SecondaryIndex]>,
 }
@@ -80,17 +81,24 @@ impl Table {
     pub async fn new(
         index_pool: &'static FixedBufferPool,
         blk_idx: BlockIndex,
-        metadata: TableMetadata,
-        ts: TrxID,
+        file: Arc<TableFile>,
     ) -> Self {
-        let mut sec_idx = Vec::with_capacity(metadata.index_specs.len());
-        for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
-            let ty_infer = |col_no: usize| metadata.col_type(col_no);
-            let si = SecondaryIndex::new(index_pool, index_no, index_spec, ty_infer, ts).await;
+        let active_root = file.active_root();
+        let mut sec_idx = Vec::with_capacity(active_root.metadata.index_specs.len());
+        for (index_no, index_spec) in active_root.metadata.index_specs.iter().enumerate() {
+            let ty_infer = |col_no: usize| active_root.metadata.col_type(col_no);
+            let si = SecondaryIndex::new(
+                index_pool,
+                index_no,
+                index_spec,
+                ty_infer,
+                active_root.trx_id,
+            )
+            .await;
             sec_idx.push(si);
         }
         Table {
-            metadata: Arc::new(metadata),
+            file,
             blk_idx: Arc::new(blk_idx),
             sec_idx: Arc::from(sec_idx.into_boxed_slice()),
         }
@@ -125,7 +133,7 @@ impl Table {
                 }
                 // MVCC read does not require row lock.
                 let access = page_guard.read_row_by_id(row_id);
-                match access.read_row_mvcc(&stmt.trx, &self.metadata, user_read_set, key) {
+                match access.read_row_mvcc(&stmt.trx, self.metadata(), user_read_set, key) {
                     ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
                     ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
                 }
@@ -135,7 +143,7 @@ impl Table {
 
     #[inline]
     async fn insert_index_no_trx(&self, key: SelectKey, row_id: RowID) {
-        if self.metadata.index_specs[key.index_no].unique() {
+        if self.metadata().index_specs[key.index_no].unique() {
             let res = self.sec_idx[key.index_no]
                 .unique()
                 .unwrap()
@@ -160,7 +168,7 @@ impl Table {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> InsertIndex {
-        if self.metadata.index_specs[key.index_no].unique() {
+        if self.metadata().index_specs[key.index_no].unique() {
             self.insert_unique_index(data_pool, stmt, key, row_id, page_guard)
                 .await
         } else {
@@ -177,12 +185,12 @@ impl Table {
         cts: TrxID,
     ) -> Recover {
         let (ctx, page) = page_guard.ctx_and_page_mut();
-        debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
+        debug_assert!(self.metadata().col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
         let row_idx = page.row_idx(row_id);
         // Insert log should always be located to an empty slot.
         debug_assert!(ctx.recover().unwrap().is_vacant(row_idx));
-        let var_len = var_len_for_insert(&self.metadata, cols);
+        let var_len = var_len_for_insert(self.metadata(), cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -209,7 +217,7 @@ impl Table {
         row_id: RowID,
         cts: TrxID,
     ) -> RecoverIndex {
-        if self.metadata.index_specs[key.index_no].unique() {
+        if self.metadata().index_specs[key.index_no].unique() {
             self.recover_unique_index_insert(data_pool, key, row_id, cts)
                 .await
         } else {
@@ -219,7 +227,7 @@ impl Table {
 
     #[inline]
     async fn recover_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
-        if self.metadata.index_specs[key.index_no].unique() {
+        if self.metadata().index_specs[key.index_no].unique() {
             self.recover_unique_index_delete(key, row_id).await
         } else {
             self.recover_non_unique_index_delete(key, row_id).await
@@ -281,12 +289,13 @@ impl Table {
             row.finish_update()
         } else {
             // collect index change columns.
+            let metadata = self.metadata();
             let index_change_cols = index_change_cols.unwrap();
             for uc in cols {
-                if let Some((old_val, _)) = row.different(&self.metadata, uc.idx, &uc.val) {
+                if let Some((old_val, _)) = row.different(metadata, uc.idx, &uc.val) {
                     // we also check whether the value change is related to any index,
                     // so we can update index later.
-                    if self.metadata.index_cols.contains(&uc.idx) {
+                    if metadata.index_cols.contains(&uc.idx) {
                         index_change_cols.insert(uc.idx, old_val);
                     }
                     // actual update
@@ -315,11 +324,12 @@ impl Table {
         }
         ctx.recover_mut().unwrap().update_at(row_idx, cts);
         page.set_deleted_exclusive(row_idx, true);
+        let metadata = self.metadata();
         if let Some(index_cols) = index_cols {
             // save index columns for index update.
             let row = page.row(row_idx);
-            for idx_col_no in &self.metadata.index_cols {
-                let val = row.clone_val(&self.metadata, *idx_col_no);
+            for idx_col_no in &metadata.index_cols {
+                let val = row.clone_val(metadata, *idx_col_no);
                 index_cols.insert(*idx_col_no, val);
             }
         }
@@ -330,7 +340,7 @@ impl Table {
     /// It will ignore delete flag, and won't update page ts.
     #[inline]
     async fn delete_index_directly(&self, key: &SelectKey, row_id: RowID) -> bool {
-        let index_schema = &self.metadata.index_specs[key.index_no];
+        let index_schema = &self.metadata().index_specs[key.index_no];
         if index_schema.unique() {
             let index = self.sec_idx[key.index_no].unique().unwrap();
             index
@@ -389,7 +399,7 @@ impl Table {
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
         // data or version chain.
-        if !access.any_version_matches_key(&self.metadata, key) {
+        if !access.any_version_matches_key(self.metadata(), key) {
             return index
                 .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
@@ -445,7 +455,7 @@ impl Table {
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
         // data or version chain.
-        if !access.any_version_matches_key(&self.metadata, key) {
+        if !access.any_version_matches_key(self.metadata(), key) {
             return index
                 .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
@@ -474,11 +484,12 @@ impl Table {
                 row.push(v);
                 var_offsets.push(var_offset);
             }
+            let metadata = self.metadata();
             let mut undo_cols = vec![];
             for mut uc in update {
                 let old_val = &mut row[uc.idx];
                 if old_val != &uc.val {
-                    if self.metadata.index_cols.contains(&uc.idx) {
+                    if metadata.index_cols.contains(&uc.idx) {
                         index_change_cols.insert(uc.idx, old_val.clone());
                     }
                     // swap old value and new value, then put into undo columns
@@ -547,14 +558,15 @@ impl Table {
         // The link process is to find one version of the old row that matches
         // given key and then link new row to it.
         let old_access = old_guard.read_row_by_id(old_id);
-        match old_access.find_old_version_for_unique_key(&self.metadata, key, &stmt.trx) {
+        let metadata = self.metadata();
+        match old_access.find_old_version_for_unique_key(metadata, key, &stmt.trx) {
             FindOldVersion::None => LinkForUniqueIndex::None,
             FindOldVersion::DuplicateKey => LinkForUniqueIndex::DuplicateKey,
             FindOldVersion::WriteConflict => LinkForUniqueIndex::WriteConflict,
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
                 let mut new_access = new_guard.write_row_by_id(new_id);
-                let undo_vals = new_access.row().calc_delta(&self.metadata, &old_row);
+                let undo_vals = new_access.row().calc_delta(metadata, &old_row);
                 new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
                 LinkForUniqueIndex::Ok
             }
@@ -570,8 +582,9 @@ impl Table {
         mut undo_kind: RowUndoKind,
         mut move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
     ) -> (RowID, PageSharedGuard<RowPage>) {
-        let row_len = row_len(&self.metadata, &insert);
-        let row_count = estimate_max_row_count(row_len, self.metadata.col_count());
+        let metadata = self.metadata();
+        let row_len = row_len(metadata, &insert);
+        let row_count = estimate_max_row_count(row_len, metadata.col_count());
         loop {
             let page_guard = self.get_insert_page(data_pool, stmt, row_count).await;
             let page_id = page_guard.page_id();
@@ -606,13 +619,13 @@ impl Table {
             (matches!(undo_kind, RowUndoKind::Insert) && move_entry.is_none())
                 || (matches!(undo_kind, RowUndoKind::Update(_)) && move_entry.is_some())
         });
-
+        let metadata = self.metadata();
         let page_id = page_guard.page_id();
         let page = page_guard.page();
-        debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
+        debug_assert!(metadata.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
 
-        let var_len = var_len_for_insert(&self.metadata, &cols);
+        let var_len = var_len_for_insert(metadata, &cols);
         let (row_idx, var_offset) =
             if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
@@ -622,7 +635,7 @@ impl Table {
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
         let mut access = page_guard.write_row(row_idx);
-        access.lock_undo(stmt, &self.metadata, self.table_id(), page_id, row_id, None);
+        access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
         for v in &cols {
@@ -648,9 +661,10 @@ impl Table {
             // not very sure if this will cause dead-lock.
             let old_access = old_guard.write_row_by_id(old_id);
             debug_assert!({ old_access.undo_head().is_some() });
-            debug_assert!(stmt
-                .trx
-                .is_same_trx(old_access.undo_head().as_ref().unwrap()));
+            debug_assert!(
+                stmt.trx
+                    .is_same_trx(old_access.undo_head().as_ref().unwrap())
+            );
             // re-lock moved row and link new entry to it.
             let move_entry = old_access.first_undo_entry().unwrap();
             let new_entry = stmt.row_undo.last_mut().unwrap();
@@ -725,6 +739,7 @@ impl Table {
         let mut lock_row = self
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
+        let metadata = self.metadata();
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound,
             LockRowForWrite::WriteConflict => UpdateRowInplace::WriteConflict,
@@ -733,7 +748,7 @@ impl Table {
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }
-                match access.update_row(&self.metadata, &update) {
+                match access.update_row(metadata, &update) {
                     UpdateRow::NoFreeSpace(old_row) => {
                         // Page does not have enough space for update, we need to switch
                         // to out-of-place update mode, which will add a MOVE undo entry
@@ -765,12 +780,12 @@ impl Table {
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
                         for uc in &mut update {
                             if let Some((old_val, var_offset)) =
-                                row.different(&self.metadata, uc.idx, &uc.val)
+                                row.different(metadata, uc.idx, &uc.val)
                             {
                                 let new_val = mem::take(&mut uc.val);
                                 // we also check whether the value change is related to any index,
                                 // so we can update index later.
-                                if self.metadata.index_cols.contains(&uc.idx) {
+                                if metadata.index_cols.contains(&uc.idx) {
                                     index_change_cols.insert(uc.idx, old_val.clone());
                                 }
                                 // actual update
@@ -879,7 +894,7 @@ impl Table {
             }
         }
         self.blk_idx
-            .get_insert_page(data_pool, row_count, &self.metadata)
+            .get_insert_page(data_pool, row_count, self.metadata())
             .await
     }
 
@@ -896,7 +911,7 @@ impl Table {
             let mut access = page_guard.write_row_by_id(row_id);
             let lock_undo = access.lock_undo(
                 stmt,
-                &self.metadata,
+                self.metadata(),
                 self.table_id(),
                 page_guard.page_id(),
                 row_id,
@@ -1198,11 +1213,11 @@ impl Table {
         page_guard: &PageSharedGuard<RowPage>,
         index_change_cols: &HashMap<usize, Val>,
     ) -> UpdateIndex {
-        for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+        let metadata = self.metadata();
+        for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
             if index_key_is_changed(index_schema, index_change_cols) {
-                let new_key =
-                    read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
+                let new_key = read_latest_index_key(metadata, index.index_no, page_guard, row_id);
                 let old_key = index_key_replace(index_schema, &new_key, index_change_cols);
                 // First we need to insert new entry to index due to key change.
                 // There might be conflict we will try to fix (if old one is already deleted).
@@ -1250,9 +1265,10 @@ impl Table {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+        let metadata = self.metadata();
+        for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
-            let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
+            let key = read_latest_index_key(metadata, index.index_no, page_guard, new_row_id);
             if index_schema.unique() {
                 let res = self
                     .update_unique_index_only_row_id_change(
@@ -1291,9 +1307,10 @@ impl Table {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
-        for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+        let metadata = self.metadata();
+        for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
-            let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, new_row_id);
+            let key = read_latest_index_key(metadata, index.index_no, page_guard, new_row_id);
             if index_key_is_changed(index_schema, index_change_cols) {
                 let old_key = index_key_replace(index_schema, &key, index_change_cols);
                 // key change and row id change.
@@ -1370,9 +1387,10 @@ impl Table {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) {
-        for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata.index_specs) {
+        let metadata = self.metadata();
+        for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
-            let key = read_latest_index_key(&self.metadata, index.index_no, page_guard, row_id);
+            let key = read_latest_index_key(metadata, index.index_no, page_guard, row_id);
             if index_schema.unique() {
                 let index = index.unique().unwrap();
                 self.defer_delete_unique_index(stmt, index, row_id, key)
@@ -1772,7 +1790,7 @@ impl Table {
                                     return UpdateIndex::Ok;
                                 }
                                 IndexCompareExchange::Mismatch => {
-                                    return UpdateIndex::WriteConflict
+                                    return UpdateIndex::WriteConflict;
                                 }
                                 IndexCompareExchange::NotExists => {
                                     // re-insert
@@ -1807,7 +1825,7 @@ impl Table {
                                     return UpdateIndex::Ok;
                                 }
                                 IndexCompareExchange::Mismatch => {
-                                    return UpdateIndex::WriteConflict
+                                    return UpdateIndex::WriteConflict;
                                 }
                                 IndexCompareExchange::NotExists => {
                                     // re-insert
@@ -1854,13 +1872,18 @@ impl Table {
             IndexInsert::DuplicateKey(..) => unreachable!(),
         }
     }
+
+    #[inline]
+    pub fn metadata(&self) -> &TableMetadata {
+        &self.file.active_root().metadata
+    }
 }
 
 impl Clone for Table {
     #[inline]
     fn clone(&self) -> Self {
         Table {
-            metadata: Arc::clone(&self.metadata),
+            file: Arc::clone(&self.file),
             blk_idx: Arc::clone(&self.blk_idx),
             sec_idx: Arc::clone(&self.sec_idx),
         }

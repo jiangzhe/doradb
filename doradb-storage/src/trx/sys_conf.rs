@@ -1,16 +1,16 @@
 use crate::buffer::{BufferPool, FixedBufferPool};
-use crate::catalog::storage::CatalogStorage;
 use crate::catalog::Catalog;
+use crate::catalog::storage::CatalogStorage;
 use crate::error::Result;
-use crate::io::{align_to_sector_size, AIOContext};
+use crate::file::table_fs::TableFileSystem;
+use crate::io::{AIOContext, align_to_sector_size};
 use crate::lifetime::StaticLifetime;
-use crate::trx::log::{LogPartitionInitializer, LogPartitionMode, LogSync, LOG_HEADER_PAGES};
+use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
 use crate::trx::recover::log_recover;
 use crate::trx::sys::TransactionSystem;
 use byte_unit::Byte;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::ops::Deref;
 
 use super::log::list_log_files;
 
@@ -149,9 +149,47 @@ impl TrxSysConfig {
         })
     }
 
-    #[inline]
-    pub fn build(self) -> TrxSysInitializer {
-        TrxSysInitializer { config: self }
+    pub async fn build_static<P: BufferPool>(
+        self,
+        meta_pool: &'static FixedBufferPool,
+        index_pool: &'static FixedBufferPool,
+        data_pool: &'static P,
+        table_fs: &'static TableFileSystem,
+    ) -> Result<&'static TransactionSystem> {
+        let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
+        for idx in 0..self.log_partitions {
+            let initializer = self.log_partition_initializer(idx)?;
+            log_partition_initializers.push(initializer);
+        }
+
+        let catalog_storage = CatalogStorage::new(meta_pool, index_pool, table_fs).await?;
+        let mut catalog = Catalog::new(catalog_storage);
+
+        // Now we have an empty catalog, all log partitions and buffer pool.
+        // Recover all committed data if required.
+        let (log_partitions, gc_rxs) = log_recover(
+            index_pool,
+            data_pool,
+            table_fs,
+            &mut catalog,
+            log_partition_initializers,
+            self.skip_recovery,
+        )
+        .await?;
+
+        let (purge_chan, purge_rx) = flume::unbounded();
+        let trx_sys = TransactionSystem::new(self, catalog, log_partitions, purge_chan);
+        let trx_sys = StaticLifetime::new_static(trx_sys);
+
+        trx_sys
+            .catalog
+            .enable_page_committer_for_tables(trx_sys)
+            .await;
+        trx_sys.start_io_threads();
+        trx_sys.start_gc_threads(gc_rxs);
+        trx_sys.start_purge_threads(data_pool, purge_rx);
+
+        Ok(trx_sys)
     }
 }
 
@@ -168,64 +206,5 @@ impl Default for TrxSysConfig {
             purge_threads: DEFAULT_PURGE_THREADS,
             skip_recovery: DEFAULT_SKIP_RECOVERY,
         }
-    }
-}
-
-/// TrxSysInitializer initializes transaction system
-/// with catalog initialization, log initialization
-/// and log recovery.
-/// todo: chceckpoint recovery.
-pub struct TrxSysInitializer {
-    config: TrxSysConfig,
-}
-
-impl Deref for TrxSysInitializer {
-    type Target = TrxSysConfig;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.config
-    }
-}
-
-impl TrxSysInitializer {
-    pub async fn init<P: BufferPool>(
-        self,
-        meta_pool: &'static FixedBufferPool,
-        index_pool: &'static FixedBufferPool,
-        data_pool: &'static P,
-    ) -> Result<&'static TransactionSystem> {
-        let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
-        for idx in 0..self.log_partitions {
-            let initializer = self.log_partition_initializer(idx)?;
-            log_partition_initializers.push(initializer);
-        }
-
-        let catalog_storage = CatalogStorage::new(meta_pool, index_pool).await;
-        let mut catalog = Catalog::new(catalog_storage);
-
-        // Now we have an empty catalog, all log partitions and buffer pool.
-        // Recover all committed data if required.
-        let (log_partitions, gc_rxs) = log_recover(
-            index_pool,
-            data_pool,
-            &mut catalog,
-            log_partition_initializers,
-            self.skip_recovery,
-        )
-        .await?;
-
-        let (purge_chan, purge_rx) = flume::unbounded();
-        let trx_sys = TransactionSystem::new(self.config, catalog, log_partitions, purge_chan);
-        let trx_sys = StaticLifetime::new_static(trx_sys);
-
-        trx_sys
-            .catalog
-            .enable_page_committer_for_tables(trx_sys)
-            .await;
-        trx_sys.start_io_threads();
-        trx_sys.start_gc_threads(gc_rxs);
-        trx_sys.start_purge_threads(data_pool, purge_rx);
-
-        Ok(trx_sys)
     }
 }

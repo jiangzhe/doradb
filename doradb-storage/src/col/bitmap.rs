@@ -1,8 +1,8 @@
-use crate::col::alloc::{align_u128, RawArray};
+use crate::col::alloc::{RawArray, align_u128};
 use crate::col::sel::Sel;
 use crate::col::slice_ext::{OffsetPairMut, OffsetTripleMut, PairSliceExt};
 use crate::error::{Error, Result};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -661,11 +661,7 @@ where
             }
             // remove exhausted iterator
             let _ = self.0.take();
-            if idx == 0 {
-                None
-            } else {
-                Some((word, idx))
-            }
+            if idx == 0 { None } else { Some((word, idx)) }
         } else {
             None
         }

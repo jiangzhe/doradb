@@ -1,18 +1,18 @@
+use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
-use crate::buffer::BufferPool;
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
 use crate::table::TableID;
-use crate::trx::{trx_is_committed, SharedTrxStatus, TrxID, MIN_SNAPSHOT_TS};
+use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 pub struct UndoMap {
     entries: Box<[RwLock<Option<Box<RowUndoHead>>>]>,

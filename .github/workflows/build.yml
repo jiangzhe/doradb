@@ -35,7 +35,7 @@ jobs:
         LLVM_PROFILE_FILE: "coverage-%p-%m.profraw"
       run: |
         cargo build --verbose --all
-        cargo test --verbose --all --jobs 1
+        cargo test --verbose --all -- --test-threads=1
     - name: Generate coverage report
       run: |
         grcov . --binary-path ./target/debug/ -s . -t lcov \

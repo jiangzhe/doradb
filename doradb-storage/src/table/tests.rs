@@ -3,9 +3,9 @@ use crate::engine::{Engine, EngineConfig};
 use crate::row::ops::{InsertMvcc, SelectKey, UpdateCol};
 use crate::session::Session;
 use crate::table::{Table, TableAccess};
+use crate::trx::ActiveTrx;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::tests::remove_files;
-use crate::trx::ActiveTrx;
 use crate::value::Val;
 
 #[test]
@@ -17,16 +17,16 @@ fn test_mvcc_insert_normal() {
 
         let mut session = sys.new_session();
         {
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
             }
-            session = trx.commit().await.unwrap();
+            trx.commit().await.unwrap();
         }
         {
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             for i in 16..SIZE {
                 let key = SelectKey::new(0, vec![Val::from(i)]);
                 trx = sys
@@ -41,6 +41,7 @@ fn test_mvcc_insert_normal() {
             let _ = trx.commit().await.unwrap();
         }
 
+        drop(session);
         sys.clean_all();
     });
 }
@@ -54,24 +55,24 @@ fn test_mvcc_insert_dup_key() {
         {
             // insert [1, "hello"]
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             trx = sys.trx_insert(trx, insert).await;
-            session = trx.commit().await.unwrap();
+            trx.commit().await.unwrap();
 
             // insert [1, "world"]
             let insert = vec![Val::from(1i32), Val::from("world")];
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             let mut stmt = trx.start_stmt();
             let res = stmt.insert_row(&sys.table, insert).await;
             assert!(res == InsertMvcc::DuplicateKey);
             trx = stmt.fail().await;
-            session = trx.rollback().await;
+            trx.rollback().await;
         }
         // write conflict
         {
             // insert [2, "hello"], but not commit
             let insert1 = vec![Val::from(2i32), Val::from("hello")];
-            let mut trx1 = session.begin_trx();
+            let mut trx1 = session.begin_trx().unwrap();
             let mut stmt1 = trx1.start_stmt();
             let res = stmt1.insert_row(&sys.table, insert1).await;
             assert!(res.is_ok());
@@ -80,15 +81,15 @@ fn test_mvcc_insert_dup_key() {
             // begin concurrent transaction and insert [2, "world"]
             let mut session2 = sys.new_session();
             let insert2 = vec![Val::from(2i32), Val::from("world")];
-            let trx2 = session2.begin_trx();
+            let trx2 = session2.begin_trx().unwrap();
             let mut stmt2 = trx2.start_stmt();
             let res = stmt2.insert_row(&sys.table, insert2).await;
             // still dup key because circuit breaker on index search.
             assert!(res == InsertMvcc::DuplicateKey);
-            session2 = stmt2.fail().await.rollback().await;
+            stmt2.fail().await.rollback().await;
             drop(session2);
 
-            session = trx1.commit().await.unwrap();
+            trx1.commit().await.unwrap();
             drop(session);
         }
 
@@ -105,16 +106,16 @@ fn test_mvcc_update_normal() {
         {
             let mut session = sys.new_session();
             // insert 1000 rows
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
             }
-            session = trx.commit().await.unwrap();
+            trx.commit().await.unwrap();
 
             // update 1 row with short value
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             let k1 = single_key(1i32);
             let s1 = "hello";
             let update1 = vec![UpdateCol {
@@ -122,10 +123,10 @@ fn test_mvcc_update_normal() {
                 val: Val::from(s1),
             }];
             trx = sys.trx_update(trx, &k1, update1).await;
-            session = trx.commit().await.unwrap();
+            trx.commit().await.unwrap();
 
             // update 1 row with long value
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             let k2 = single_key(100i32);
             let s2: String = (0..50_000).map(|_| '1').collect();
             let update2 = vec![UpdateCol {
@@ -143,10 +144,10 @@ fn test_mvcc_update_normal() {
                 })
                 .await;
 
-            session = trx.commit().await.unwrap();
+            trx.commit().await.unwrap();
 
             // lookup with a new transaction
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             trx = sys
                 .trx_select(trx, &k2, |row| {
                     assert!(row.len() == 2);
@@ -171,25 +172,25 @@ fn test_mvcc_delete_normal() {
             let mut session = sys.new_session();
             // insert 1000 rows
             // let mut trx = session.begin_trx(trx_sys);
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
             }
-            session = trx.commit().await.unwrap();
+            trx.commit().await.unwrap();
 
             // delete 1 row
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             let k1 = single_key(1i32);
             trx = sys.trx_delete(trx, &k1).await;
 
             // lookup row in same transaction
             trx = sys.trx_select_not_found(trx, &k1).await;
-            session = trx.commit().await.unwrap();
+            trx.commit().await.unwrap();
 
             // lookup row in new transaction
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             let k1 = single_key(1i32);
             trx = sys.trx_select_not_found(trx, &k1).await;
             let _ = trx.commit().await.unwrap();
@@ -205,15 +206,15 @@ fn test_mvcc_rollback_insert_normal() {
         {
             let mut session = sys.new_session();
             // insert 1 row
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             let insert = vec![Val::from(1i32), Val::from("hello")];
             trx = sys.trx_insert(trx, insert).await;
             // explicit rollback
-            session = trx.rollback().await;
+            trx.rollback().await;
 
             // select 1 row
             let key = single_key(1i32);
-            _ = sys.new_trx_select_not_found(session, &key).await;
+            _ = sys.new_trx_select_not_found(&mut session, &key).await;
         }
         sys.clean_all();
     });
@@ -227,25 +228,25 @@ fn test_mvcc_insert_link_unique_index() {
             let mut session = sys.new_session();
             // insert 1 row
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
 
             // we must hold a transaction before the deletion,
             // to prevent index GC.
-            let trx_to_prevent_gc = sys.new_session().begin_trx();
+            let trx_to_prevent_gc = sys.new_session().begin_trx().unwrap();
             // delete it
             let key = single_key(1i32);
-            session = sys.new_trx_delete(session, &key).await;
+            sys.new_trx_delete(&mut session, &key).await;
 
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("world")];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
 
-            drop(trx_to_prevent_gc.rollback().await);
+            trx_to_prevent_gc.rollback().await;
 
             // select 1 row
             let key = single_key(1i32);
             _ = sys
-                .new_trx_select(session, &key, |vals| {
+                .new_trx_select(&mut session, &key, |vals| {
                     assert!(vals[0] == Val::from(1i32));
                     assert!(vals[1] == Val::from("world"));
                 })
@@ -263,22 +264,22 @@ fn test_mvcc_rollback_insert_link_unique_index() {
             let mut session = sys.new_session();
             // insert 1 row
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
 
             // delete it
             let key = single_key(1i32);
-            session = sys.new_trx_delete(session, &key).await;
+            sys.new_trx_delete(&mut session, &key).await;
 
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("world")];
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             trx = sys.trx_insert(trx, insert).await;
             // explicit rollback
-            session = trx.rollback().await;
+            trx.rollback().await;
 
             // select 1 row
             let key = single_key(1i32);
-            _ = sys.new_trx_select_not_found(session, &key).await;
+            _ = sys.new_trx_select_not_found(&mut session, &key).await;
         }
         sys.clean_all();
     });
@@ -292,11 +293,11 @@ fn test_mvcc_insert_link_update() {
             let mut session = sys.new_session();
             // insert 1 row: v1=1, v2=hello
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
 
             // open one session and trnasaction to see this row
-            let sess1 = sys.new_session();
-            let mut trx1 = sess1.begin_trx();
+            let mut sess1 = sys.new_session();
+            let mut trx1 = sess1.begin_trx().unwrap();
 
             // update it: v1=2, v2=world
             let key = single_key(1i32);
@@ -310,15 +311,15 @@ fn test_mvcc_insert_link_update() {
                     val: Val::from("world"),
                 },
             ];
-            session = sys.new_trx_update(session, &key, update).await;
+            sys.new_trx_update(&mut session, &key, update).await;
 
             // open session and transaction to see row 2
-            let sess2 = sys.new_session();
-            let mut trx2 = sess2.begin_trx();
+            let mut sess2 = sys.new_session();
+            let mut trx2 = sess2.begin_trx().unwrap();
 
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("rust")];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
 
             // use transaction 1 to see version 1.
             let key = single_key(1i32);
@@ -343,7 +344,7 @@ fn test_mvcc_insert_link_update() {
             // use new transaction to see version 3.
             let key = single_key(1i32);
             _ = sys
-                .new_trx_select(session, &key, |vals| {
+                .new_trx_select(&mut session, &key, |vals| {
                     assert!(vals[0] == Val::from(1i32));
                     assert!(vals[1] == Val::from("rust"));
                 })
@@ -361,12 +362,12 @@ fn test_mvcc_update_link_insert() {
             let mut session = sys.new_session();
             // insert 1 row: v1=1, v2=hello
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
             println!("debug-only insert finish");
 
             // open one session and trnasaction to see this row
-            let sess1 = sys.new_session();
-            let mut trx1 = sess1.begin_trx();
+            let mut sess1 = sys.new_session();
+            let mut trx1 = sess1.begin_trx().unwrap();
 
             // update it: v1=2, v2=world
             let key = single_key(1i32);
@@ -380,16 +381,16 @@ fn test_mvcc_update_link_insert() {
                     val: Val::from("world"),
                 },
             ];
-            session = sys.new_trx_update(session, &key, update).await;
+            sys.new_trx_update(&mut session, &key, update).await;
             println!("debug-only update finish");
 
             // open session and transaction to see row 2
-            let sess2 = sys.new_session();
-            let mut trx2 = sess2.begin_trx();
+            let mut sess2 = sys.new_session();
+            let mut trx2 = sess2.begin_trx().unwrap();
 
             // insert v1=5, v2=rust
             let insert = vec![Val::from(5i32), Val::from("rust")];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
             println!("debug-only insert2 finish");
 
             // update it: v1=1, v2=c++, trigger update+link
@@ -404,7 +405,7 @@ fn test_mvcc_update_link_insert() {
                     val: Val::from("c++"),
                 },
             ];
-            session = sys.new_trx_update(session, &key, update).await;
+            sys.new_trx_update(&mut session, &key, update).await;
             println!("debug-only update2 finish");
 
             // use transaction 1 to see version 1.
@@ -429,7 +430,7 @@ fn test_mvcc_update_link_insert() {
 
             // use new transaction to see version 3.
             let key = single_key(1i32);
-            _ = sys.new_trx_select(session, &key, |vals| {
+            _ = sys.new_trx_select(&mut session, &key, |vals| {
                 assert!(vals[0] == Val::from(1i32));
                 assert!(vals[1] == Val::from("c++"));
             })
@@ -446,13 +447,13 @@ fn test_mvcc_multi_update() {
             let mut session = sys.new_session();
             // insert: v1
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
 
             // transaction to see version 1
-            let sess1 = sys.new_session();
-            let mut trx1 = sess1.begin_trx();
+            let mut sess1 = sys.new_session();
+            let mut trx1 = sess1.begin_trx().unwrap();
 
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             // update 1: v2
             let key = single_key(1i32);
             let update = vec![UpdateCol {
@@ -511,19 +512,18 @@ fn test_string_non_index_updates() {
             let mut session = sys.new_session();
             let value = vec![1u8; SIZE];
             let insert = vec![Val::from(1i32), Val::from(&[])];
-            session = sys.new_trx_insert(session, insert).await;
+            sys.new_trx_insert(&mut session, insert).await;
             let key = SelectKey::new(0, vec![Val::from(1i32)]);
             for i in SIZE - COUNT..SIZE {
-                session = sys
-                    .new_trx_update(
-                        session,
-                        &key,
-                        vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from(&value[..i]),
-                        }],
-                    )
-                    .await;
+                sys.new_trx_update(
+                    &mut session,
+                    &key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from(&value[..i]),
+                    }],
+                )
+                .await;
             }
         }
         sys.clean_all();
@@ -545,10 +545,10 @@ fn test_string_index_updates() {
             // insert single row.
             {
                 let insert = vec![Val::from(&s[..0])];
-                let mut stmt = session.begin_trx().start_stmt();
+                let mut stmt = session.begin_trx().unwrap().start_stmt();
                 let res = stmt.insert_row(&table, insert).await;
                 assert!(res.is_ok());
-                session = stmt.succeed().commit().await.unwrap();
+                stmt.succeed().commit().await.unwrap();
             }
             // perform updates.
             for i in 0..COUNT {
@@ -557,10 +557,10 @@ fn test_string_index_updates() {
                     idx: 0,
                     val: Val::from(&s[..i + 1]),
                 }];
-                let mut stmt = session.begin_trx().start_stmt();
+                let mut stmt = session.begin_trx().unwrap().start_stmt();
                 let res = stmt.update_row(&table, &key, update).await;
                 assert!(res.is_ok());
-                session = stmt.succeed().commit().await.unwrap();
+                stmt.succeed().commit().await.unwrap();
             }
         }
         sys.clean_all();
@@ -584,10 +584,10 @@ fn test_mvcc_out_of_place_update() {
             // insert 60 rows
             for i in 0usize..COUNT {
                 let insert = vec![Val::from(&s[..BASE + i])];
-                let mut stmt = session.begin_trx().start_stmt();
+                let mut stmt = session.begin_trx().unwrap().start_stmt();
                 let res = stmt.insert_row(&table, insert).await;
                 assert!(res.is_ok());
-                session = stmt.succeed().commit().await.unwrap();
+                stmt.succeed().commit().await.unwrap();
             }
             // perform updates to trigger out-of-place update.
             // try to update k=s[..BASE+DELTA] to s[..BASE+COUNT+DELTA]
@@ -597,10 +597,10 @@ fn test_mvcc_out_of_place_update() {
                     idx: 0,
                     val: Val::from(&s[..BASE + COUNT + i]),
                 }];
-                let mut stmt = session.begin_trx().start_stmt();
+                let mut stmt = session.begin_trx().unwrap().start_stmt();
                 let res = stmt.update_row(&table, &key, update).await;
                 assert!(res.is_ok());
-                session = stmt.succeed().commit().await.unwrap();
+                stmt.succeed().commit().await.unwrap();
             }
         }
         sys.clean_all();
@@ -615,14 +615,13 @@ fn test_evict_pool_insert_full() {
         // in-mem ~1000 pages, on-disk 2000 pages.
         let sys = TestSys::new_evictable().await;
         {
-            let session = sys.new_session();
+            let mut session = sys.new_session();
             // insert 1000 rows
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 // make string 1KB long, so a page can only hold about 60 rows.
                 // if page is full, 17 pages are required.
                 // if page is half full, 35 pages are required.
-                println!("debug-only insert {}", i);
                 let s: String = (0..1000).map(|_| 'a').collect();
                 let insert = vec![Val::from(i), Val::from(&s[..])];
                 trx = sys.trx_insert(trx, insert).await;
@@ -640,9 +639,9 @@ fn test_row_page_scan_rows_uncommitted() {
 
         let sys = TestSys::new_evictable().await;
 
-        let session = sys.new_session();
+        let mut session = sys.new_session();
         {
-            let mut trx = session.begin_trx();
+            let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
@@ -662,6 +661,7 @@ fn test_row_page_scan_rows_uncommitted() {
             assert!(res_len == SIZE as usize);
         }
 
+        drop(session);
         sys.clean_all();
     });
 }
@@ -689,8 +689,6 @@ impl TestSys {
                     .skip_recovery(true),
             )
             .build()
-            .unwrap()
-            .init()
             .await
             .unwrap();
         let table_id = table2(&engine).await;
@@ -706,13 +704,14 @@ impl TestSys {
 
         let _ = std::fs::remove_file("databuffer_testsys.bin");
         remove_files("redo_testsys*");
+        remove_files("*.tbl");
     }
 
     #[inline]
-    async fn new_trx_insert(&self, session: Session, insert: Vec<Val>) -> Session {
-        let mut trx = session.begin_trx();
+    async fn new_trx_insert(&self, session: &mut Session, insert: Vec<Val>) {
+        let mut trx = session.begin_trx().unwrap();
         trx = self.trx_insert(trx, insert).await;
-        trx.commit().await.unwrap()
+        trx.commit().await.unwrap();
     }
 
     #[inline]
@@ -727,10 +726,10 @@ impl TestSys {
     }
 
     #[inline]
-    async fn new_trx_delete(&self, session: Session, key: &SelectKey) -> Session {
-        let mut trx = session.begin_trx();
+    async fn new_trx_delete(&self, session: &mut Session, key: &SelectKey) {
+        let mut trx = session.begin_trx().unwrap();
         trx = self.trx_delete(trx, key).await;
-        trx.commit().await.unwrap()
+        trx.commit().await.unwrap();
     }
 
     #[inline]
@@ -745,15 +744,10 @@ impl TestSys {
     }
 
     #[inline]
-    async fn new_trx_update(
-        &self,
-        session: Session,
-        key: &SelectKey,
-        update: Vec<UpdateCol>,
-    ) -> Session {
-        let mut trx = session.begin_trx();
+    async fn new_trx_update(&self, session: &mut Session, key: &SelectKey, update: Vec<UpdateCol>) {
+        let mut trx = session.begin_trx().unwrap();
         trx = self.trx_update(trx, key, update).await;
-        trx.commit().await.unwrap()
+        trx.commit().await.unwrap();
     }
 
     #[inline]
@@ -775,20 +769,20 @@ impl TestSys {
     #[inline]
     async fn new_trx_select<F: FnOnce(Vec<Val>)>(
         &self,
-        session: Session,
+        session: &mut Session,
         key: &SelectKey,
         action: F,
-    ) -> Session {
-        let mut trx = session.begin_trx();
+    ) {
+        let mut trx = session.begin_trx().unwrap();
         trx = self.trx_select(trx, key, action).await;
-        trx.commit().await.unwrap()
+        trx.commit().await.unwrap();
     }
 
     #[inline]
-    async fn new_trx_select_not_found(&self, session: Session, key: &SelectKey) -> Session {
-        let mut trx = session.begin_trx();
+    async fn new_trx_select_not_found(&self, session: &mut Session, key: &SelectKey) {
+        let mut trx = session.begin_trx().unwrap();
         trx = self.trx_select_not_found(trx, key).await;
-        trx.commit().await.unwrap()
+        trx.commit().await.unwrap();
     }
 
     #[inline]
