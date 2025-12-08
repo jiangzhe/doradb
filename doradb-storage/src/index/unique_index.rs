@@ -1,4 +1,5 @@
 use crate::buffer::guard::PageGuard;
+use crate::index::IndexCompareExchange;
 use crate::index::btree::{BTree, BTreeDelete, BTreeInsert, BTreeUpdate};
 use crate::index::btree_key::BTreeKeyEncoder;
 use crate::index::btree_value::BTreeU64;
@@ -6,7 +7,6 @@ use crate::index::secondary_index::{
     EncodeKeySelf, IndexInsert, PartitionMultiKeyIndex, PartitionSingleKeyIndex,
 };
 use crate::index::util::Maskable;
-use crate::index::IndexCompareExchange;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use crate::value::Val;
@@ -432,10 +432,12 @@ mod tests {
         let row_id = 100u64;
 
         // 测试插入
-        assert!(index
-            .insert_if_not_exists(&key, row_id, false, 100)
-            .await
-            .is_ok());
+        assert!(
+            index
+                .insert_if_not_exists(&key, row_id, false, 100)
+                .await
+                .is_ok()
+        );
 
         // 测试查找
         assert_eq!(index.lookup(&key, 100).await, Some((row_id, false)));
@@ -465,10 +467,12 @@ mod tests {
         let row_id2 = 400u64;
 
         // 先插入一个值
-        assert!(index
-            .insert_if_not_exists(&key, row_id1, false, 100)
-            .await
-            .is_ok(),);
+        assert!(
+            index
+                .insert_if_not_exists(&key, row_id1, false, 100)
+                .await
+                .is_ok(),
+        );
 
         // 测试成功的 compare_exchange
         assert!(
@@ -498,18 +502,24 @@ mod tests {
         let row_id3 = 700u64;
 
         // 插入多个键值对
-        assert!(index
-            .insert_if_not_exists(&key1, row_id1, false, 100)
-            .await
-            .is_ok());
-        assert!(index
-            .insert_if_not_exists(&key2, row_id2, false, 100)
-            .await
-            .is_ok());
-        assert!(index
-            .insert_if_not_exists(&key3, row_id3, false, 100)
-            .await
-            .is_ok());
+        assert!(
+            index
+                .insert_if_not_exists(&key1, row_id1, false, 100)
+                .await
+                .is_ok()
+        );
+        assert!(
+            index
+                .insert_if_not_exists(&key2, row_id2, false, 100)
+                .await
+                .is_ok()
+        );
+        assert!(
+            index
+                .insert_if_not_exists(&key3, row_id3, false, 100)
+                .await
+                .is_ok()
+        );
 
         // 验证所有键都能正确查找
         assert_eq!(index.lookup(&key1, 100).await, Some((row_id1, false)));
@@ -528,10 +538,12 @@ mod tests {
         let row_id = 100u64;
 
         // 测试插入
-        assert!(index
-            .insert_if_not_exists(&key, row_id, false, 100)
-            .await
-            .is_ok());
+        assert!(
+            index
+                .insert_if_not_exists(&key, row_id, false, 100)
+                .await
+                .is_ok()
+        );
 
         // 测试查找
         assert_eq!(index.lookup(&key, 100).await, Some((row_id, false)));
@@ -561,10 +573,12 @@ mod tests {
         let row_id2 = 400u64;
 
         // 先插入一个值
-        assert!(index
-            .insert_if_not_exists(&key, row_id1, false, 100)
-            .await
-            .is_ok());
+        assert!(
+            index
+                .insert_if_not_exists(&key, row_id1, false, 100)
+                .await
+                .is_ok()
+        );
 
         // 测试成功的 compare_exchange
         assert!(
@@ -594,18 +608,24 @@ mod tests {
         let row_id3 = 700u64;
 
         // 插入多个键值对
-        assert!(index
-            .insert_if_not_exists(&key1, row_id1, false, 100)
-            .await
-            .is_ok());
-        assert!(index
-            .insert_if_not_exists(&key2, row_id2, false, 100)
-            .await
-            .is_ok());
-        assert!(index
-            .insert_if_not_exists(&key3, row_id3, false, 100)
-            .await
-            .is_ok());
+        assert!(
+            index
+                .insert_if_not_exists(&key1, row_id1, false, 100)
+                .await
+                .is_ok()
+        );
+        assert!(
+            index
+                .insert_if_not_exists(&key2, row_id2, false, 100)
+                .await
+                .is_ok()
+        );
+        assert!(
+            index
+                .insert_if_not_exists(&key3, row_id3, false, 100)
+                .await
+                .is_ok()
+        );
 
         // 验证所有键都能正确查找
         assert_eq!(index.lookup(&key1, 100).await, Some((row_id1, false)));

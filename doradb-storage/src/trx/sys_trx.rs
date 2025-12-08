@@ -1,8 +1,8 @@
 use crate::buffer::page::PageID;
 use crate::row::RowID;
 use crate::serde::{LenPrefixPod, SerdeCtx};
-use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::trx::PreparedTrx;
+use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use doradb_catalog::TableID;
 use std::mem;
 

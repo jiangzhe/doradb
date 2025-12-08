@@ -26,10 +26,10 @@ pub mod sys_conf;
 pub mod sys_trx;
 pub mod undo;
 
-use crate::engine::Engine;
+use crate::engine::EngineRef;
 use crate::error::Result;
 use crate::serde::{LenPrefixPod, SerdeCtx};
-use crate::session::{IntoSession, Session};
+use crate::session::SessionState;
 use crate::stmt::Statement;
 use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
@@ -38,8 +38,8 @@ use event_listener::{Event, EventListener};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub type TrxID = u64;
 pub const INVALID_TRX_ID: TrxID = !0;
@@ -129,7 +129,7 @@ pub fn trx_must_not_see_even_if_prepare(sts: TrxID, ts: TrxID) -> bool {
 }
 
 pub struct ActiveTrx {
-    pub(crate) session: Option<Session>,
+    pub(crate) session: Option<Arc<SessionState>>,
     // Status of the transaction.
     // Every undo log will refer to this object on heap.
     // There are nested pointers to allow atomic update on status when
@@ -152,7 +152,13 @@ pub struct ActiveTrx {
 impl ActiveTrx {
     /// Create a new transaction.
     #[inline]
-    pub fn new(session: Session, trx_id: TrxID, sts: TrxID, log_no: usize, gc_no: usize) -> Self {
+    pub fn new(
+        session: Arc<SessionState>,
+        trx_id: TrxID,
+        sts: TrxID,
+        log_no: usize,
+        gc_no: usize,
+    ) -> Self {
         ActiveTrx {
             session: Some(session),
             status: Arc::new(SharedTrxStatus::new(trx_id)),
@@ -167,14 +173,8 @@ impl ActiveTrx {
 
     /// Returns reference of the storage engine.
     #[inline]
-    pub fn engine_ref(&self) -> Option<&Engine> {
-        self.session.as_ref().map(|s| &s.engine)
-    }
-
-    /// Returns a weak clone of the storage engine.
-    #[inline]
-    pub fn engine_weak(&self) -> Option<Engine> {
-        self.session.as_ref().map(|s| s.engine.weak())
+    pub fn engine(&self) -> Option<&EngineRef> {
+        self.session.as_ref().map(|s| s.engine())
     }
 
     #[inline]
@@ -266,15 +266,15 @@ impl ActiveTrx {
 
     /// Commit the transaction.
     #[inline]
-    pub async fn commit(self) -> Result<Session> {
-        let engine = self.engine_weak().unwrap();
+    pub async fn commit(self) -> Result<TrxID> {
+        let engine = self.engine().cloned().unwrap();
         engine.trx_sys.commit(self, engine.data_pool).await
     }
 
     /// Rollback the transaction.
     #[inline]
-    pub async fn rollback(self) -> Session {
-        let engine = self.engine_weak().unwrap();
+    pub async fn rollback(self) {
+        let engine = self.engine().cloned().unwrap();
         engine.trx_sys.rollback(self, engine.data_pool).await
     }
 
@@ -312,18 +312,6 @@ impl Drop for ActiveTrx {
     }
 }
 
-impl IntoSession for ActiveTrx {
-    #[inline]
-    fn into_session(mut self) -> Option<Session> {
-        self.session.take()
-    }
-
-    #[inline]
-    fn split_session(&mut self) -> Option<Session> {
-        self.session.take()
-    }
-}
-
 static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
 static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
@@ -340,13 +328,13 @@ pub struct PreparedTrxPayload {
 pub struct PreparedTrx {
     redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
     payload: Option<PreparedTrxPayload>,
-    session: Option<Session>,
+    session: Option<Arc<SessionState>>,
 }
 
 impl PreparedTrx {
     #[inline]
-    pub fn engine(&self) -> Option<&Engine> {
-        self.session.as_ref().map(|s| &s.engine)
+    pub fn engine(&self) -> Option<&EngineRef> {
+        self.session.as_ref().map(|s| s.engine())
     }
 
     #[inline]
@@ -407,18 +395,6 @@ impl PreparedTrx {
     }
 }
 
-impl IntoSession for PreparedTrx {
-    #[inline]
-    fn into_session(mut self) -> Option<Session> {
-        self.session.take()
-    }
-
-    #[inline]
-    fn split_session(&mut self) -> Option<Session> {
-        self.session.take()
-    }
-}
-
 impl Drop for PreparedTrx {
     #[inline]
     fn drop(&mut self) {
@@ -446,17 +422,22 @@ pub struct PrecommitTrx {
     pub redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
     // Payload is only for user transaction
     pub payload: Option<PrecommitTrxPayload>,
-    pub session: Option<Session>,
+    session: Option<Arc<SessionState>>,
 }
 
 impl PrecommitTrx {
+    #[inline]
+    pub fn take_session(&mut self) -> Option<Arc<SessionState>> {
+        self.session.take()
+    }
+
     /// Commit this transaction.
     /// The method should be invoked when redo logs have been persisted to disk.
     /// It will update backfill commit timestamp and update status to committed.
     #[inline]
     pub fn commit(mut self) -> CommittedTrx {
         assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
-                                          // release the prepare notifier in transaction status
+        // release the prepare notifier in transaction status
         match self.payload.take() {
             Some(PrecommitTrxPayload {
                 status,
@@ -476,6 +457,9 @@ impl PrecommitTrx {
                     let mut g = status.prepare_ev.lock();
                     drop(g.take());
                 }
+                if let Some(s) = self.session.take() {
+                    s.commit(self.cts);
+                }
                 CommittedTrx {
                     cts: self.cts,
                     payload: Some(CommittedTrxPayload {
@@ -484,7 +468,6 @@ impl PrecommitTrx {
                         row_undo,
                         index_gc,
                     }),
-                    session: self.session.take(),
                 }
             }
             None => {
@@ -493,7 +476,6 @@ impl PrecommitTrx {
                 CommittedTrx {
                     cts: self.cts,
                     payload: None,
-                    session: None,
                 }
             }
         }
@@ -509,18 +491,6 @@ impl Drop for PrecommitTrx {
     }
 }
 
-impl IntoSession for PrecommitTrx {
-    #[inline]
-    fn into_session(mut self) -> Option<Session> {
-        self.session.take()
-    }
-
-    #[inline]
-    fn split_session(&mut self) -> Option<Session> {
-        self.session.take()
-    }
-}
-
 pub struct CommittedTrxPayload {
     pub sts: TrxID,
     pub gc_no: usize,
@@ -531,7 +501,6 @@ pub struct CommittedTrxPayload {
 pub struct CommittedTrx {
     pub cts: TrxID,
     pub payload: Option<CommittedTrxPayload>,
-    session: Option<Session>,
 }
 
 impl CommittedTrx {
@@ -554,18 +523,6 @@ impl CommittedTrx {
     #[inline]
     pub fn index_gc(&self) -> Option<&[IndexPurgeEntry]> {
         self.payload.as_ref().map(|p| &p.index_gc[..])
-    }
-}
-
-impl IntoSession for CommittedTrx {
-    #[inline]
-    fn into_session(mut self) -> Option<Session> {
-        self.session.take()
-    }
-
-    #[inline]
-    fn split_session(&mut self) -> Option<Session> {
-        self.session.take()
     }
 }
 

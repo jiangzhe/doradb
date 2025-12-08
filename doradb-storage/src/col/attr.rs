@@ -228,7 +228,7 @@ impl Attr {
             }
             Codec::Array(a) => {
                 let mut fields = SerFields::VALID; // always serialize validity
-                                                   // 1. validity
+                // 1. validity
                 let (offset_valid, offset) = ser_validity_offset(&self.validity, offset);
                 // 2. data
                 // array codec does not support dict and string
@@ -534,7 +534,7 @@ fn load_array(
 #[inline]
 fn load_fixed_len_sma(raw: &Arc<[u8]>, ty: PreciseType, start_bytes: usize) -> Result<SMA> {
     let val_len = ty.val_len().unwrap(); // won't fail
-                                         // read min value
+    // read min value
     let mut min = SmallVec::with_capacity(val_len);
     let start = start_bytes;
     let end = start + val_len;

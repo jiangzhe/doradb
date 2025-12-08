@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::row::{RowID, INVALID_ROW_ID};
+use crate::row::{INVALID_ROW_ID, RowID};
 use crate::trx::sys::TransactionSystem;
 use doradb_catalog::TableID;
 

@@ -3,7 +3,7 @@ use crate::index::btree::{BTree, BTreeDelete, BTreeInsert, BTreeUpdate};
 use crate::index::btree_key::BTreeKeyEncoder;
 use crate::index::btree_node::{BTreeNode, BTreeSlot};
 use crate::index::btree_scan::BTreeSlotCallback;
-use crate::index::btree_value::{BTreeByte, BTreeU64, BTREE_BYTE_ZERO};
+use crate::index::btree_value::{BTREE_BYTE_ZERO, BTreeByte, BTreeU64};
 use crate::index::secondary_index::IndexInsert;
 use crate::index::util::Maskable;
 use crate::row::RowID;

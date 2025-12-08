@@ -11,6 +11,8 @@ pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::schemas::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
+use crate::error::Result;
+use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::table::Table;
 use crate::trx::MIN_SNAPSHOT_TS;
@@ -26,7 +28,8 @@ impl CatalogStorage {
     pub async fn new(
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
-    ) -> Self {
+        table_fs: &'static TableFileSystem,
+    ) -> Result<Self> {
         let mut cat: Vec<Table> = vec![];
         for CatalogDefinition { table_id, metadata } in [
             catalog_definition_of_schemas(),
@@ -39,13 +42,18 @@ impl CatalogStorage {
             assert_eq!(cat.len(), *table_id as usize);
             // catalog table with manually allocated page id.
             let blk_idx = BlockIndex::new(meta_pool, *table_id).await;
-            let table = Table::new(index_pool, blk_idx, metadata.clone(), MIN_SNAPSHOT_TS).await;
+            // todo: when we implement checkpoint, we need to open the old file
+            // and load checkpoint data, followed by recovery.
+            let table_file = table_fs.create_table_file(*table_id, metadata.clone(), true)?;
+            let (table_file, old_root) = table_file.commit(MIN_SNAPSHOT_TS, false).await?;
+            debug_assert!(old_root.is_none());
+            let table = Table::new(index_pool, blk_idx, table_file).await;
             cat.push(table);
         }
-        CatalogStorage {
+        Ok(CatalogStorage {
             meta_pool,
             tables: cat.into_boxed_slice(),
-        }
+        })
     }
 
     #[inline]

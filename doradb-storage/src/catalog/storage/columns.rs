@@ -1,6 +1,6 @@
 use crate::buffer::BufferPool;
-use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::storage::CatalogDefinition;
+use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::TableMetadata;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};

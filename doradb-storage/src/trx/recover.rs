@@ -17,14 +17,15 @@ use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
+use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
 use crate::serde::LenPrefixPod;
 use crate::table::{Table, TableAccess, TableID, TableRecover};
+use crate::trx::TrxID;
 use crate::trx::log::{LogMerger, LogPartition, LogPartitionInitializer, LogPartitionStream};
 use crate::trx::purge::GC;
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RowRedo, RowRedoKind, TableDML};
-use crate::trx::TrxID;
 use crossbeam_utils::CachePadded;
 use flume::Receiver;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -71,6 +72,7 @@ impl RecoverMap {
 pub(super) async fn log_recover<P: BufferPool>(
     index_pool: &'static FixedBufferPool,
     data_pool: &'static P,
+    table_fs: &'static TableFileSystem,
     catalog: &mut Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
@@ -85,7 +87,7 @@ pub(super) async fn log_recover<P: BufferPool>(
             let stream = initializer.stream();
             log_merger.add_stream(stream)?;
         }
-        let log_recovery = LogRecovery::new(index_pool, data_pool, catalog, log_merger);
+        let log_recovery = LogRecovery::new(index_pool, data_pool, table_fs, catalog, log_merger);
         let log_streams = log_recovery.recover_all().await?;
         log_partition_initializers = log_streams
             .into_iter()
@@ -107,6 +109,7 @@ pub(super) async fn log_recover<P: BufferPool>(
 pub struct LogRecovery<'a, P: BufferPool> {
     index_pool: &'static FixedBufferPool,
     data_pool: &'static P,
+    table_fs: &'static TableFileSystem,
     catalog: &'a mut Catalog,
     log_merger: LogMerger,
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
@@ -117,12 +120,14 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
     pub fn new(
         index_pool: &'static FixedBufferPool,
         data_pool: &'static P,
+        table_fs: &'static TableFileSystem,
         catalog: &'a mut Catalog,
         log_merger: LogMerger,
     ) -> Self {
         LogRecovery {
             index_pool,
             data_pool,
+            table_fs,
             catalog,
             log_merger,
             recovered_tables: HashMap::new(),
@@ -204,7 +209,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             DDLRedo::CreateTable(table_id) => {
                 self.replay_catalog_modifications(dml).await?;
                 self.catalog
-                    .reload_create_table(self.index_pool, *table_id)
+                    .reload_create_table(self.index_pool, self.table_fs, *table_id)
                     .await?;
             }
             DDLRedo::CreateRowPage {
@@ -223,7 +228,12 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 let count = end_row_id - start_row_id;
                 let mut page_guard = table
                     .blk_idx
-                    .allocate_row_page_at(self.data_pool, count as usize, &table.metadata, *page_id)
+                    .allocate_row_page_at(
+                        self.data_pool,
+                        count as usize,
+                        table.metadata(),
+                        *page_id,
+                    )
                     .await;
                 // Here we switch row page to recover mode.
                 page_guard.bf_mut().init_recover_map();
@@ -377,8 +387,8 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
 mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::engine::EngineConfig;
-    use crate::row::ops::{SelectKey, UpdateCol};
     use crate::row::RowRead;
+    use crate::row::ops::{SelectKey, UpdateCol};
     use crate::table::TableAccess;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
@@ -391,6 +401,7 @@ mod tests {
     #[test]
     fn test_log_recover_empty() {
         smol::block_on(async {
+            remove_files("*.tbl");
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -404,8 +415,6 @@ mod tests {
                         .skip_recovery(false),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
 
@@ -413,12 +422,14 @@ mod tests {
 
             let _ = std::fs::remove_file("databuffer_recover.bin");
             remove_files("recover1*");
+            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_log_recover_ddl() {
         smol::block_on(async {
+            remove_files("*.tbl");
             remove_files("recover2*");
             let engine = EngineConfig::default()
                 .data_buffer(
@@ -433,20 +444,12 @@ mod tests {
                         .skip_recovery(false),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
 
             let mut session = engine.new_session();
-            let mut trx = session.begin_trx();
-            let mut stmt = trx.start_stmt();
-            let schema_id = stmt.create_schema("db1", false).await.unwrap();
-            trx = stmt.succeed();
-            session = trx.commit().await.unwrap();
+            let schema_id = session.create_schema("db1", false).await.unwrap();
 
-            let mut trx = session.begin_trx();
-            let mut stmt = trx.start_stmt();
             let table_spec = TableSpec::new(
                 "t1",
                 vec![
@@ -455,7 +458,7 @@ mod tests {
                 ],
             );
 
-            let table_id = stmt
+            let table_id = session
                 .create_table(
                     schema_id,
                     table_spec,
@@ -467,8 +470,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            trx = stmt.succeed();
-            session = trx.commit().await.unwrap();
 
             drop(session);
             drop(engine);
@@ -487,8 +488,6 @@ mod tests {
                         .skip_recovery(false),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
 
@@ -497,6 +496,7 @@ mod tests {
             drop(engine);
             let _ = std::fs::remove_file("databuffer_recover.bin");
             remove_files("recover2*");
+            remove_files("*.tbl");
         })
     }
 
@@ -508,6 +508,7 @@ mod tests {
             const UPD_STEP: usize = 11;
             const DEL_STEP: usize = 13;
 
+            remove_files("*.tbl");
             remove_files("recover3*");
             let engine = EngineConfig::default()
                 .data_buffer(
@@ -522,20 +523,12 @@ mod tests {
                         .skip_recovery(false),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
 
             let mut session = engine.new_session();
-            let mut trx = session.begin_trx();
-            let mut stmt = trx.start_stmt();
-            let schema_id = stmt.create_schema("db1", false).await.unwrap();
-            trx = stmt.succeed();
-            session = trx.commit().await.unwrap();
+            let schema_id = session.create_schema("db1", false).await.unwrap();
 
-            let mut trx = session.begin_trx();
-            let mut stmt = trx.start_stmt();
             let table_spec = TableSpec::new(
                 "t1",
                 vec![
@@ -548,7 +541,7 @@ mod tests {
                 ],
             );
 
-            let table_id = stmt
+            let table_id = session
                 .create_table(
                     schema_id,
                     table_spec,
@@ -560,15 +553,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            trx = stmt.succeed();
-            session = trx.commit().await.unwrap();
 
-            let table = session.engine.catalog().get_table(table_id).await.unwrap();
+            let table = session
+                .engine()
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
 
             let s: String = std::iter::repeat_n('0', 100).collect();
             // insert
             for i in (0..DML_SIZE).step_by(INS_STEP) {
-                let mut trx = session.begin_trx();
+                let mut trx = session.begin_trx().unwrap();
                 for j in i..i + INS_STEP {
                     let mut stmt = trx.start_stmt();
                     let res = stmt
@@ -577,12 +573,12 @@ mod tests {
                     assert!(res.is_ok());
                     trx = stmt.succeed();
                 }
-                session = trx.commit().await.unwrap();
+                trx.commit().await.unwrap();
             }
             // update
             let s2: String = std::iter::repeat_n('2', 100).collect();
             for i in (0..DML_SIZE).step_by(UPD_STEP) {
-                let trx = session.begin_trx();
+                let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as u32)]);
                 let uc = UpdateCol {
@@ -591,16 +587,16 @@ mod tests {
                 };
                 let res = stmt.update_row(&table, &key, vec![uc]).await;
                 assert!(res.is_ok());
-                session = stmt.succeed().commit().await.unwrap();
+                stmt.succeed().commit().await.unwrap();
             }
             // delete
             for i in (0..DML_SIZE).step_by(DEL_STEP) {
-                let trx = session.begin_trx();
+                let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as u32)]);
                 let res = stmt.delete_row(&table, &key).await;
                 assert!(res.is_ok());
-                session = stmt.succeed().commit().await.unwrap();
+                stmt.succeed().commit().await.unwrap();
             }
 
             drop(table);
@@ -621,8 +617,6 @@ mod tests {
                         .skip_recovery(false),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
 
@@ -640,6 +634,7 @@ mod tests {
             drop(engine);
             let _ = std::fs::remove_file("databuffer_recover.bin");
             remove_files("recover3*");
+            remove_files("*.tbl");
         })
     }
 }

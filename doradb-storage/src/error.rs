@@ -60,8 +60,6 @@ pub enum Error {
     TableNotDeleted,
     #[error("table already exists")]
     TableAlreadyExists,
-    #[error("user session missing")]
-    UserSessionMissing,
     #[error("glob error")]
     GlobError,
     #[error("log file corrupted")]
@@ -70,6 +68,8 @@ pub enum Error {
     SendError,
     #[error("torn write on file")]
     TornWrite,
+    #[error("{0} not supported")]
+    NotSupported(&'static str),
 }
 
 impl From<TryFromSliceError> for Error {

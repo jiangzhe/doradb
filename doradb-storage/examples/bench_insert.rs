@@ -9,7 +9,7 @@ use doradb_catalog::{
 };
 use doradb_datatype::{Collation, PreciseType};
 use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig};
-use doradb_storage::engine::{Engine, EngineConfig};
+use doradb_storage::engine::{Engine, EngineConfig, EngineRef};
 use doradb_storage::table::TableID;
 use doradb_storage::trx::log::LogSync;
 use doradb_storage::trx::sys_conf::TrxSysConfig;
@@ -17,8 +17,8 @@ use doradb_storage::value::Val;
 use easy_parallel::Parallel;
 use semistr::SemiStr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -51,8 +51,6 @@ fn main() {
                     .skip_recovery(true),
             )
             .build()
-            .unwrap()
-            .init()
             .await
             .unwrap();
         println!("buffer pool size is {}", engine.data_pool.capacity());
@@ -69,7 +67,7 @@ fn main() {
             for sess_id in 0..args.sessions {
                 let wg = wg.clone();
                 let stop = Arc::clone(&stop);
-                let engine = engine.weak();
+                let engine = engine.new_ref();
                 ex.spawn(worker(
                     engine,
                     table_id,
@@ -151,12 +149,13 @@ fn main() {
         drop(engine);
 
         let _ = std::fs::remove_file("databuffer_bench1.bin");
+        remove_files("*.tbl");
     })
 }
 
 #[inline]
 async fn worker(
-    engine: Engine,
+    engine: EngineRef,
     table_id: TableID,
     id_start: i32,
     id_step: i32,
@@ -177,7 +176,7 @@ async fn worker(
         pad.iter_mut().for_each(|b| {
             *b = fastrand::alphabetic() as u8;
         });
-        let mut trx = session.begin_trx();
+        let trx = session.begin_trx().unwrap();
         let mut stmt = trx.start_stmt();
         let res = stmt
             .insert_row(
@@ -191,11 +190,7 @@ async fn worker(
             )
             .await;
         assert!(res.is_ok());
-        trx = stmt.succeed();
-        match trx.commit().await {
-            Ok(s) => session = s,
-            Err(_) => return,
-        }
+        stmt.succeed().commit().await.unwrap();
         id += id_step;
     }
     drop(wg);
@@ -253,14 +248,9 @@ fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
 
 #[inline]
 pub(crate) async fn db1(engine: &Engine) -> SchemaID {
-    let session = engine.new_session();
-    let trx = session.begin_trx();
-    let mut stmt = trx.start_stmt();
+    let mut session = engine.new_session();
+    let schema_id = session.create_schema("db1", true).await.unwrap();
 
-    let schema_id = stmt.create_schema("db1", true).await.unwrap();
-
-    let trx = stmt.succeed();
-    let session = trx.commit().await.unwrap();
     drop(session);
     schema_id
 }
@@ -270,11 +260,9 @@ pub(crate) async fn db1(engine: &Engine) -> SchemaID {
 pub async fn sbtest(engine: &Engine) -> TableID {
     let schema_id = db1(engine).await;
 
-    let session = engine.new_session();
-    let trx = session.begin_trx();
-    let mut stmt = trx.start_stmt();
+    let mut session = engine.new_session();
 
-    let table_id = stmt
+    let table_id = session
         .create_table(
             schema_id,
             TableSpec {
@@ -314,8 +302,20 @@ pub async fn sbtest(engine: &Engine) -> TableID {
         .await
         .unwrap();
 
-    let trx = stmt.succeed();
-    let session = trx.commit().await.unwrap();
     drop(session);
     table_id
+}
+
+fn remove_files(file_pattern: &str) {
+    let files = glob::glob(file_pattern);
+    if files.is_err() {
+        return;
+    }
+    for f in files.unwrap() {
+        if f.is_err() {
+            continue;
+        }
+        let fp = f.unwrap();
+        let _ = std::fs::remove_file(&fp);
+    }
 }

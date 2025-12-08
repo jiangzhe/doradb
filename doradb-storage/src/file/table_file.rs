@@ -1,30 +1,33 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::page::PageID;
+use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::catalog::table::TableMetadata;
 use crate::error::{Error, Result};
+use crate::file::FixedSizeBufferFreeList;
 use crate::file::super_page::{
     SuperPage, SuperPageAlloc, SuperPageBody, SuperPageBodySerView, SuperPageFooter,
     SuperPageHeader, SuperPageMeta, SuperPageSerView,
 };
-use crate::file::{FileIO, FileIOListener, FileIOResult, SparseFile};
-use crate::free_list::FreeList;
+use crate::file::{FileIO, FileIOResult, SparseFile};
 use crate::io::DirectBuf;
-use crate::io::{AIOBuf, AIOClient, AIOContext, AIOKind, STORAGE_SECTOR_SIZE};
+use crate::io::{AIOBuf, AIOClient, AIOKind};
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::trx::TrxID;
+use std::fs;
 use std::mem;
-use std::ops::Deref;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::thread::JoinHandle;
 
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
 
-/// Page size of table file is 256KB.
-pub const TABLE_FILE_PAGE_SIZE: usize = 256 * 1024;
-/// Super page size of table file is 128KB.
-pub const TABLE_FILE_SUPER_PAGE_SIZE: usize = 128 * 1024;
+/// Initial size of new table file.
+pub const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
+/// Page size of table file is 64KB.
+/// This is equivalent to page size of in-memory row store
+/// (row page and secondary index page).
+pub const TABLE_FILE_PAGE_SIZE: usize = PAGE_SIZE;
+/// Super page size of table file is 32KB.
+pub const TABLE_FILE_SUPER_PAGE_SIZE: usize = TABLE_FILE_PAGE_SIZE / 2;
 /// Super page blake3 checksum size is 32B.
 pub const TABLE_FILE_SUPER_PAGE_HEADER_SIZE: usize = mem::size_of::<SuperPageHeader>();
 /// Super page footer: blake3 checksum + trx id.
@@ -32,72 +35,6 @@ pub const TABLE_FILE_SUPER_PAGE_FOOTER_SIZE: usize = mem::size_of::<SuperPageFoo
 /// Super page data size.
 pub const TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET: usize =
     TABLE_FILE_SUPER_PAGE_SIZE - TABLE_FILE_SUPER_PAGE_FOOTER_SIZE;
-
-/// TableFileSystem provides functionalities including
-/// creating, opening, closing and removing table files.
-pub struct TableFileSystem {
-    io_client: AIOClient<FileIO>,
-    handle: Option<JoinHandle<()>>,
-    buf_list: FixedSizeBufferFreeList,
-}
-
-impl TableFileSystem {
-    /// Create a new table file system.
-    #[inline]
-    pub fn new(io_depth: usize) -> Result<Self> {
-        let ctx = AIOContext::new(io_depth)?;
-        let buf_list = FixedSizeBufferFreeList::new(TABLE_FILE_PAGE_SIZE, io_depth, io_depth * 2);
-        let (event_loop, io_client) = ctx.event_loop();
-        let listener = FileIOListener::new(buf_list.clone());
-        let handle = event_loop.start_thread(listener);
-        Ok(TableFileSystem {
-            io_client,
-            handle: Some(handle),
-            buf_list,
-        })
-    }
-
-    /// Create a new table file.
-    #[inline]
-    pub fn create_table_file(
-        &self,
-        path: impl AsRef<str>,
-        max_size: usize,
-        trx_id: TrxID,
-        metadata: TableMetadata,
-    ) -> Result<MutableTableFile> {
-        let table_file = TableFile::new(
-            path,
-            max_size,
-            self.io_client.clone(),
-            self.buf_list.clone(),
-        )?;
-        let initial_pages = max_size / TABLE_FILE_PAGE_SIZE;
-        let active_root = ActiveRoot::new(trx_id, initial_pages, metadata);
-        Ok(MutableTableFile {
-            table_file: Arc::new(table_file),
-            active_root,
-        })
-    }
-
-    /// Open an existing table file.
-    #[inline]
-    pub async fn open_table_file(&self, path: impl AsRef<str>) -> Result<Arc<TableFile>> {
-        let table_file = TableFile::open(path, self.io_client.clone(), self.buf_list.clone())?;
-        let active_root = table_file.load_active_root().await?;
-        let old_root = table_file.swap_active_root(active_root);
-        debug_assert!(old_root.is_none());
-        Ok(Arc::new(table_file))
-    }
-}
-
-impl Drop for TableFileSystem {
-    #[inline]
-    fn drop(&mut self) {
-        self.io_client.shutdown();
-        self.handle.take().unwrap().join().unwrap();
-    }
-}
 
 /// Table file is a wrapper of file, IO channel and cache.
 pub struct TableFile {
@@ -116,14 +53,19 @@ pub struct TableFile {
 impl TableFile {
     /// Create a table file.
     #[inline]
-    fn new(
+    pub(super) fn create(
         file_path: impl AsRef<str>,
         initial_size: usize,
         io_client: AIOClient<FileIO>,
         buf_list: FixedSizeBufferFreeList,
+        trunc: bool,
     ) -> Result<Self> {
         debug_assert!(initial_size.is_multiple_of(TABLE_FILE_PAGE_SIZE));
-        let file = SparseFile::create(file_path, initial_size)?;
+        let file = if trunc {
+            SparseFile::create_or_trunc(file_path, initial_size)
+        } else {
+            SparseFile::create_or_fail(file_path, initial_size)
+        }?;
         Ok(TableFile {
             file,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
@@ -133,7 +75,7 @@ impl TableFile {
     }
 
     #[inline]
-    fn open(
+    pub(super) fn open(
         file_path: impl AsRef<str>,
         io_client: AIOClient<FileIO>,
         buf_list: FixedSizeBufferFreeList,
@@ -292,6 +234,11 @@ impl TableFile {
     pub fn fsync(&self) {
         self.file.syncer().fsync();
     }
+
+    #[inline]
+    pub fn delete(self) {
+        let _ = remove_file_by_fd(self.file.as_raw_fd());
+    }
 }
 
 impl Drop for TableFile {
@@ -315,12 +262,21 @@ pub struct MutableTableFile {
 }
 
 impl MutableTableFile {
+    /// Create new mutable table file.
+    #[inline]
+    pub fn new(table_file: Arc<TableFile>, active_root: ActiveRoot) -> Self {
+        MutableTableFile {
+            table_file,
+            active_root,
+        }
+    }
+
     /// Fork the whole table file with a new root.
     #[inline]
-    pub fn fork(table_file: &Arc<TableFile>, trx_id: TrxID) -> Self {
+    pub fn fork(table_file: &Arc<TableFile>) -> Self {
         MutableTableFile {
             table_file: Arc::clone(table_file),
-            active_root: table_file.active_root().fork(trx_id),
+            active_root: table_file.active_root().flip(),
         }
     }
 
@@ -328,11 +284,17 @@ impl MutableTableFile {
     /// Returns the new table file and previous
     /// active root if exists.
     #[inline]
-    pub async fn commit(self) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+    pub async fn commit(
+        self,
+        trx_id: TrxID,
+        try_delete_if_fail: bool,
+    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         let MutableTableFile {
             table_file,
-            active_root,
+            mut active_root,
         } = self;
+        debug_assert!(active_root.trx_id == 0 || active_root.trx_id < trx_id);
+        active_root.trx_id = trx_id;
 
         // serialize header and body of super page.
         let super_page = active_root.ser_view();
@@ -361,7 +323,15 @@ impl MutableTableFile {
 
         // write page down.
         let offset = super_page.header.page_no as usize * TABLE_FILE_SUPER_PAGE_SIZE;
-        table_file.write(offset, buf, false).await?;
+        match table_file.write(offset, buf, false).await {
+            Ok(_) => {}
+            Err(e) => {
+                if try_delete_if_fail && let Some(f) = Arc::into_inner(table_file) {
+                    f.delete();
+                }
+                return Err(e);
+            }
+        }
 
         // fsync for persistence.
         table_file.fsync();
@@ -371,42 +341,14 @@ impl MutableTableFile {
 
         Ok((table_file, old_root))
     }
-}
 
-/// Fixed size buffer free list hold a given number of
-/// buffer pages.
-/// It's used to reuse pages in heavy IO environment.
-#[derive(Clone)]
-pub struct FixedSizeBufferFreeList(Arc<FreeList<DirectBuf>>);
-
-impl FixedSizeBufferFreeList {
-    /// Create a new buffer free list with given number of
-    /// pre-allocated buffer pages.
     #[inline]
-    pub fn new(page_size: usize, init_pages: usize, max_pages: usize) -> Self {
-        debug_assert!(page_size.is_multiple_of(STORAGE_SECTOR_SIZE));
-        let free_list: FreeList<_> = FreeList::new(init_pages, max_pages, move || {
-            let mut buf = DirectBuf::zeroed(page_size);
-            buf.truncate(0);
-            buf
-        });
-        FixedSizeBufferFreeList(Arc::new(free_list))
-    }
-
-    /// Recycle the buffer for future use.
-    #[inline]
-    pub fn recycle(&self, mut buf: DirectBuf) {
-        buf.reset();
-        buf.truncate(0);
-        self.push(buf);
-    }
-}
-
-impl Deref for FixedSizeBufferFreeList {
-    type Target = FreeList<DirectBuf>;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    pub fn try_delete(self) -> bool {
+        if let Some(table_file) = Arc::into_inner(self.table_file) {
+            table_file.delete();
+            return true;
+        }
+        false
     }
 }
 
@@ -462,9 +404,8 @@ impl ActiveRoot {
     }
 
     #[inline]
-    pub fn fork(&self, trx_id: TrxID) -> Self {
+    pub fn flip(&self) -> Self {
         let mut new = self.clone();
-        new.trx_id = trx_id;
         // flip the page number.
         new.page_no = 1 - self.page_no;
         new
@@ -485,9 +426,17 @@ impl Drop for OldRoot {
 
 unsafe impl Send for OldRoot {}
 
+#[inline]
+fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
+    let proc_path = format!("/proc/self/fd/{}", fd);
+    let real_path = fs::read_link(&proc_path)?;
+    fs::remove_file(real_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
     use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use doradb_datatype::PreciseType;
@@ -495,7 +444,7 @@ mod tests {
     #[test]
     fn test_table_file() {
         smol::block_on(async {
-            let fs = TableFileSystem::new(32).unwrap();
+            let fs = TableFileSystemConfig::default().build().unwrap();
             let metadata = TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", PreciseType::Int(4, true), ColumnAttributes::empty()),
@@ -507,10 +456,8 @@ mod tests {
                     IndexAttributes::PK,
                 )],
             );
-            let table_file = fs
-                .create_table_file("table_file1.tbl", 64 * 1024 * 1024, 1, metadata)
-                .unwrap();
-            let (table_file, old_root) = table_file.commit().await.unwrap();
+            let table_file = fs.create_table_file(41, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root().page_no, 0);
             assert_eq!(table_file.active_root().trx_id, 1);
@@ -528,11 +475,11 @@ mod tests {
 
             drop(table_file);
 
-            let table_file2 = fs.open_table_file("table_file1.tbl").await.unwrap();
+            let table_file2 = fs.open_table_file(41).await.unwrap();
             assert_eq!(table_file2.active_root().trx_id, 1);
 
-            let mutable = MutableTableFile::fork(&table_file2, 2);
-            let (table_file3, old_root) = mutable.commit().await.unwrap();
+            let mutable = MutableTableFile::fork(&table_file2);
+            let (table_file3, old_root) = mutable.commit(2, false).await.unwrap();
             drop(old_root);
             let active_root = table_file3.load_active_root().await.unwrap();
             assert_eq!(active_root.page_no, 1);
@@ -541,14 +488,14 @@ mod tests {
             drop(table_file3);
 
             drop(fs);
-            let _ = std::fs::remove_file("table_file1.tbl");
+            let _ = std::fs::remove_file("41.tbl");
         });
     }
 
     #[test]
     fn test_table_file_system() {
         smol::block_on(async {
-            let fs = TableFileSystem::new(32).unwrap();
+            let fs = TableFileSystemConfig::default().build().unwrap();
             let metadata = TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", PreciseType::Int(4, true), ColumnAttributes::empty()),
@@ -560,10 +507,8 @@ mod tests {
                     IndexAttributes::PK,
                 )],
             );
-            let table_file = fs
-                .create_table_file("table_file2.tbl", 64 * 1024 * 1024, 1, metadata)
-                .unwrap();
-            let (table_file, old_root) = table_file.commit().await.unwrap();
+            let table_file = fs.create_table_file(42, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root().page_no, 0);
             assert_eq!(table_file.active_root().trx_id, 1);
@@ -576,7 +521,7 @@ mod tests {
             assert!(res.is_err());
 
             drop(table_file);
-            let _ = std::fs::remove_file("table_file2.tbl");
+            let _ = std::fs::remove_file("42.tbl");
         });
     }
 }

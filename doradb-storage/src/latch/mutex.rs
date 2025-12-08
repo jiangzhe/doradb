@@ -1,6 +1,6 @@
-use event_listener::{listener, Event, IntoNotification};
-use parking_lot::lock_api::RawMutex as ParkingLotRawMutexAPI;
+use event_listener::{Event, IntoNotification, listener};
 use parking_lot::RawMutex as ParkingLotRawMutex;
+use parking_lot::lock_api::RawMutex as ParkingLotRawMutexAPI;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::marker::PhantomData;

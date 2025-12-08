@@ -1,6 +1,6 @@
-use crate::io::{align_to_sector_size, STORAGE_SECTOR_SIZE};
+use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::serde::{Ser, SerdeCtx};
-use std::alloc::{alloc, alloc_zeroed, Layout};
+use std::alloc::{Layout, alloc, alloc_zeroed};
 
 /// AIOBuf represents AIO buffer used for Linux direct IO(currently via libaio).
 pub trait AIOBuf: Send + 'static {

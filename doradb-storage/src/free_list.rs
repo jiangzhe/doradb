@@ -1,5 +1,5 @@
 use crate::notify::EventNotifyOnDrop;
-use event_listener::{listener, Listener};
+use event_listener::{Listener, listener};
 use parking_lot::Mutex;
 
 /// Simple FreeList backed by linked list.

@@ -1,18 +1,18 @@
 //! B+Tree index is the most commonly used data structure for database indexing.
 //! This module provide an implementation of B+Tree backed by buffer pool and hybrid latch.
 
-use crate::buffer::page::{BufferPage, PageID, PAGE_SIZE};
+use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
 use crate::index::btree::{BTreeDelete, BTreeUpdate};
-use crate::index::btree_hint::{BTreeHints, BTREE_HINTS_LEN};
+use crate::index::btree_hint::{BTREE_HINTS_LEN, BTreeHints};
 use crate::index::btree_key::BTreeKey;
 use crate::index::btree_value::{
-    BTreeU64, BTreeValue, BTreeValuePackable, BTREE_VALUE_PACK_MAX_LEN,
+    BTREE_VALUE_PACK_MAX_LEN, BTreeU64, BTreeValue, BTreeValuePackable,
 };
 use crate::index::util::Maskable;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use doradb_datatype::memcmp::BytesExtendable;
-use std::alloc::{alloc_zeroed, Layout};
+use std::alloc::{Layout, alloc_zeroed};
 use std::cmp;
 use std::cmp::Ordering;
 use std::mem::{self, MaybeUninit};

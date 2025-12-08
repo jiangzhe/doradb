@@ -78,6 +78,7 @@ pub fn b1_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
 
 /// Pack with FrameOfReference (bits=1).
 /// Improve performance with Superword-Level Parallelism.
+#[allow(clippy::needless_range_loop)]
 #[inline]
 pub fn for_b1_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 8);
@@ -105,7 +106,7 @@ pub fn for_b1_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
         let src: &[T; 8] = src.try_into().unwrap();
         let mut packed_byte: u8 = 0;
         for i in 0..8 {
-            let bit = (src[i].sub_to_u8(min) & 1) as u8;
+            let bit = src[i].sub_to_u8(min) & 1;
             packed_byte |= bit << i;
         }
         if let Some(b) = res.get_mut(out_idx) {
@@ -137,6 +138,7 @@ pub fn b1_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
 
 /// FOR unpack (bits=1).
 /// Compressed element count is supposed to be greater or equal to result count.
+#[allow(clippy::needless_range_loop)]
 #[inline]
 pub fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 8 >= res.len());
@@ -163,7 +165,7 @@ pub fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
         let packed = input[input_idx];
         input_idx += 1;
         for i in 0..8 {
-            let delta = ((packed >> i) & 1) as u8;
+            let delta = (packed >> i) & 1;
             tgt[i] = min.add_from_u8(delta);
         }
     }
@@ -172,7 +174,7 @@ pub fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     if out_idx < res.len() {
         let packed = input[input_idx];
         for (i, tgt) in res[out_idx..].iter_mut().enumerate() {
-            let delta = ((packed >> i) & 1) as u8;
+            let delta = (packed >> i) & 1;
             *tgt = min.add_from_u8(delta);
         }
     }
@@ -187,6 +189,7 @@ pub fn b2_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
 
 /// Pack with FrameOfReference (bits=2).
 /// Improve performance with Superword-Level Parallelism.
+#[allow(clippy::needless_range_loop)]
 #[inline]
 pub fn for_b2_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 4);
@@ -245,6 +248,7 @@ pub fn b2_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
 
 /// FOR unpack (bits=2).
 /// Compressed element count is supposed to be greater or equal to result count.
+#[allow(clippy::needless_range_loop)]
 #[inline]
 pub fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 4 >= res.len());
@@ -271,7 +275,7 @@ pub fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
         let packed = input[input_idx];
         input_idx += 1;
         for i in 0..4 {
-            let delta = ((packed >> (i * 2)) & 3) as u8;
+            let delta = (packed >> (i * 2)) & 3;
             tgt[i] = min.add_from_u8(delta);
         }
     }
@@ -280,7 +284,7 @@ pub fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     if out_idx < res.len() {
         let packed = input[input_idx];
         for (i, tgt) in res[out_idx..].iter_mut().enumerate() {
-            let delta = ((packed >> (i * 2)) & 3) as u8;
+            let delta = (packed >> (i * 2)) & 3;
             *tgt = min.add_from_u8(delta);
         }
     }
@@ -295,6 +299,7 @@ pub fn b4_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
 
 /// Pack with FrameOfReference (bits=4).
 /// Improve performance with Superword-Level Parallelism.
+#[allow(clippy::needless_range_loop)]
 #[inline]
 pub fn for_b4_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 2);
@@ -332,10 +337,10 @@ pub fn for_b4_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
                 shift = 0;
             }
         }
-        if shift > 0 {
-            if let Some(b) = res.get_mut(out_idx) {
-                *b = packed_byte;
-            }
+        if shift > 0
+            && let Some(b) = res.get_mut(out_idx)
+        {
+            *b = packed_byte;
         }
     }
 }
@@ -349,6 +354,7 @@ pub fn b4_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
 
 /// FOR unpack (bits=4).
 /// Compressed element count is supposed to be greater or equal to result count.
+#[allow(clippy::needless_range_loop)]
 #[inline]
 pub fn for_b4_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 2 >= res.len());

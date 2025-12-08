@@ -1,4 +1,4 @@
-use crate::buffer::page::{Page, PageID, INVALID_PAGE_ID};
+use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID};
 use crate::latch::HybridLatch;
 use crate::trx::recover::RecoverMap;
 use crate::trx::undo::UndoMap;

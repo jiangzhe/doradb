@@ -1,23 +1,24 @@
 use crate::buffer::BufferPool;
 use crate::catalog::Catalog;
-use crate::error::{Error, Result};
-use crate::latch::Mutex;
+use crate::error::Result;
 use crate::lifetime::StaticLifetime;
-use crate::session::{IntoSession, Session};
+use crate::session::SessionState;
 use crate::thread;
 use crate::trx::group::Commit;
-use crate::trx::log::{LogPartition, MmapLogReader, LOG_HEADER_PAGES};
-use crate::trx::purge::{Purge, GC};
+use crate::trx::log::{LOG_HEADER_PAGES, LogPartition, MmapLogReader};
+use crate::trx::purge::{GC, Purge};
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
-    ActiveTrx, PreparedTrx, TrxID, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS,
+    ActiveTrx, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, TrxID,
 };
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
+use parking_lot::Mutex;
 use std::mem;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 pub const GC_BUCKETS: usize = 64;
@@ -106,7 +107,7 @@ impl TransactionSystem {
 
     /// Create a new transaction.
     #[inline]
-    pub fn begin_trx(&self, session: Session) -> ActiveTrx {
+    pub fn begin_trx(&self, session_state: Arc<SessionState>) -> ActiveTrx {
         // Assign log partition index so current transaction will stick
         // to certain log partition for commit.
         let log_no = self.next_log_no();
@@ -129,7 +130,7 @@ impl TransactionSystem {
             gc_bucket.min_active_sts.store(sts, Ordering::Relaxed);
         }
         drop(g); // release bucket lock.
-        ActiveTrx::new(session, trx_id, sts, log_no, gc_no)
+        ActiveTrx::new(session_state, trx_id, sts, log_no, gc_no)
     }
 
     /// Returns next log(partition) number.
@@ -160,7 +161,7 @@ impl TransactionSystem {
         &self,
         trx: ActiveTrx,
         buf_pool: &'static P,
-    ) -> Result<Session> {
+    ) -> Result<TrxID> {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_no];
@@ -178,14 +179,11 @@ impl TransactionSystem {
             // page-level undo maps.
             // In such case, we can just rollback this transaction because it actually
             // do nothing.
-            let session = self.rollback_prepared(prepared_trx, buf_pool).await;
-            return Ok(session);
+            self.rollback_prepared(prepared_trx, buf_pool).await;
+            return Ok(0);
         }
         // start group commit
-        partition
-            .commit(prepared_trx, &self.ts)
-            .await
-            .and_then(|res| res.ok_or(Error::UserSessionMissing))
+        partition.commit(prepared_trx, &self.ts).await
     }
 
     #[inline]
@@ -204,18 +202,16 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub async fn rollback<P: BufferPool>(
-        &self,
-        mut trx: ActiveTrx,
-        buf_pool: &'static P,
-    ) -> Session {
+    pub async fn rollback<P: BufferPool>(&self, mut trx: ActiveTrx, buf_pool: &'static P) {
         trx.index_undo
             .rollback(buf_pool, &self.catalog, trx.sts)
             .await;
         trx.row_undo.rollback(buf_pool).await;
         trx.redo.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
-        trx.into_session().unwrap()
+        if let Some(s) = trx.session.take() {
+            s.rollback();
+        }
     }
 
     /// Rollback prepared transaction.
@@ -223,11 +219,7 @@ impl TransactionSystem {
     /// In such case, we do not need to go through entire commit process but just
     /// rollback the transaction, because it actually do nothing.
     #[inline]
-    async fn rollback_prepared<P: BufferPool>(
-        &self,
-        mut trx: PreparedTrx,
-        buf_pool: &'static P,
-    ) -> Session {
+    async fn rollback_prepared<P: BufferPool>(&self, mut trx: PreparedTrx, buf_pool: &'static P) {
         debug_assert!(trx.redo_bin.is_none());
         // Note: rollback can only happens to user transaction, so payload is always non-empty.
         let mut payload = trx.payload.take().unwrap();
@@ -239,7 +231,9 @@ impl TransactionSystem {
         trx.redo_bin.take();
         self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
             .gc_analyze_rollback(payload.sts);
-        trx.into_session().unwrap()
+        if let Some(s) = trx.session.take() {
+            s.rollback();
+        }
     }
 
     /// Returns statistics of group commit.
@@ -389,19 +383,20 @@ mod tests {
     use crate::value::Val;
     use crossbeam_utils::CachePadded;
     use parking_lot::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Instant;
 
     #[test]
     fn test_transaction_system() {
         smol::block_on(async {
+            remove_files("*.tbl");
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024)
-                        .file_path("databuffer_rotate.bin"),
+                        .file_path("databuffer_sys.bin"),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -409,24 +404,30 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
-            let session = engine.new_session();
+            let mut session = engine.new_session();
             {
-                let trx = session.begin_trx();
+                let trx = session.begin_trx().unwrap();
                 let _ = smol::block_on(trx.commit());
             }
-            std::thread::spawn(move || {
-                let session = engine.new_session();
-                let trx = session.begin_trx();
-                let _ = smol::block_on(trx.commit());
-            })
-            .join()
-            .unwrap();
+            {
+                let engine = engine.new_ref();
+                std::thread::spawn(move || {
+                    let mut session = engine.new_session();
+                    let trx = session.begin_trx().unwrap();
+                    let _ = smol::block_on(trx.commit());
+                })
+                .join()
+                .unwrap();
+            }
 
+            drop(session);
+            drop(engine);
+
+            let _ = std::fs::remove_file("databuffer_sys.bin");
             remove_files("redo_trx*");
+            remove_files("*.tbl");
         })
     }
 
@@ -562,6 +563,7 @@ mod tests {
     fn test_single_thread_trx_begin_and_commit() {
         const COUNT: usize = 1000000;
         smol::block_on(async {
+            remove_files("*.tbl");
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -575,17 +577,14 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             let mut session = engine.new_session();
             let start = Instant::now();
             for _ in 0..COUNT {
-                let trx = session.begin_trx();
+                let trx = session.begin_trx().unwrap();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
-                session = res.unwrap();
             }
             let dur = start.elapsed();
             println!(
@@ -594,11 +593,12 @@ mod tests {
                 dur.as_micros(),
                 COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
             );
-
+            drop(session);
             drop(engine);
 
             let _ = std::fs::remove_file("databuffer_trx.bin");
             remove_files("redo_trx*");
+            remove_files("*.tbl");
         });
     }
 
@@ -611,6 +611,7 @@ mod tests {
         // be higher and produce more files.
         const COUNT: usize = 10000;
         smol::block_on(async {
+            remove_files("*.tbl");
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -626,8 +627,6 @@ mod tests {
                         .skip_recovery(true),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             let table_id = table2(&engine).await;
@@ -636,19 +635,20 @@ mod tests {
             let mut session = engine.new_session();
             let s = vec![1u8; 120];
             for i in 0..COUNT {
-                let trx = session.begin_trx();
+                let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let insert = vec![Val::from(i as i32), Val::from(&s[..])];
                 let res = stmt.insert_row(&table, insert).await;
                 assert!(res.is_ok());
                 let trx = stmt.succeed();
-                session = trx.commit().await.unwrap();
+                trx.commit().await.unwrap();
             }
-
+            drop(session);
             drop(engine);
 
             let _ = std::fs::remove_file("databuffer_rotate.bin");
             remove_files("redo_rotate*");
+            remove_files("*.tbl");
         });
     }
 }

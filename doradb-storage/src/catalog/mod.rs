@@ -7,12 +7,12 @@ pub use table::*;
 
 use crate::buffer::FixedBufferPool;
 use crate::error::{Error, Result};
+use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::latch::RwLock;
 use crate::lifetime::StaticLifetime;
 use crate::table::Table;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::MIN_SNAPSHOT_TS;
 use doradb_catalog::{ColumnSpec, IndexKey, IndexSpec, SchemaID, TableID};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,6 +103,7 @@ impl Catalog {
     pub async fn reload_create_table(
         &self,
         index_pool: &'static FixedBufferPool,
+        table_fs: &'static TableFileSystem,
         table_id: TableID,
     ) -> Result<()> {
         // todo
@@ -161,10 +162,14 @@ impl Catalog {
                         index.index_attributes,
                     ));
                 }
+                let table_file = table_fs.open_table_file(table.table_id).await?;
+                // todo: refine recovery of corrupted file.
+                let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
+                let metadata_in_file = &table_file.active_root().metadata;
+                debug_assert_eq!(&metadata_in_catalog, metadata_in_file);
 
-                let table_metadata = TableMetadata::new(column_specs, index_specs);
                 let blk_idx = BlockIndex::new(self.storage.meta_pool, table.table_id).await;
-                let table = Table::new(index_pool, blk_idx, table_metadata, MIN_SNAPSHOT_TS).await;
+                let table = Table::new(index_pool, blk_idx, table_file).await;
                 // Update table into cache
                 let mut table_cache_g = self.cache.tables.write().await;
                 let res = table_cache_g.insert(table_id, table);
@@ -241,14 +246,8 @@ pub mod tests {
 
     #[inline]
     pub(crate) async fn db1(engine: &Engine) -> SchemaID {
-        let session = engine.new_session();
-        let trx = session.begin_trx();
-        let mut stmt = trx.start_stmt();
-
-        let schema_id = stmt.create_schema("db1", true).await.unwrap();
-
-        let trx = stmt.succeed();
-        let session = trx.commit().await.unwrap();
+        let mut session = engine.new_session();
+        let schema_id = session.create_schema("db1", true).await.unwrap();
         drop(session);
         schema_id
     }
@@ -258,11 +257,8 @@ pub mod tests {
     pub(crate) async fn table1(engine: &Engine) -> TableID {
         let schema_id = db1(engine).await;
 
-        let session = engine.new_session();
-        let trx = session.begin_trx();
-        let mut stmt = trx.start_stmt();
-
-        let table_id = stmt
+        let mut session = engine.new_session();
+        let table_id = session
             .create_table(
                 schema_id,
                 TableSpec {
@@ -282,8 +278,6 @@ pub mod tests {
             .await
             .unwrap();
 
-        let trx = stmt.succeed();
-        let session = trx.commit().await.unwrap();
         drop(session);
         table_id
     }
@@ -293,11 +287,8 @@ pub mod tests {
     pub(crate) async fn table2(engine: &Engine) -> TableID {
         let schema_id = db1(engine).await;
 
-        let session = engine.new_session();
-        let trx = session.begin_trx();
-        let mut stmt = trx.start_stmt();
-
-        let table_id = stmt
+        let mut session = engine.new_session();
+        let table_id = session
             .create_table(
                 schema_id,
                 TableSpec {
@@ -324,8 +315,6 @@ pub mod tests {
             .await
             .unwrap();
 
-        let trx = stmt.succeed();
-        let session = trx.commit().await.unwrap();
         drop(session);
         table_id
     }
@@ -335,11 +324,9 @@ pub mod tests {
     pub(crate) async fn table3(engine: &Engine) -> TableID {
         let schema_id = db1(engine).await;
 
-        let session = engine.new_session();
-        let trx = session.begin_trx();
-        let mut stmt = trx.start_stmt();
+        let mut session = engine.new_session();
 
-        let table_id = stmt
+        let table_id = session
             .create_table(
                 schema_id,
                 TableSpec {
@@ -359,8 +346,6 @@ pub mod tests {
             .await
             .unwrap();
 
-        let trx = stmt.succeed();
-        let session = trx.commit().await.unwrap();
         drop(session);
         table_id
     }
@@ -372,11 +357,9 @@ pub mod tests {
     pub(crate) async fn table4(engine: &Engine) -> TableID {
         let schema_id = db1(engine).await;
 
-        let session = engine.new_session();
-        let trx = session.begin_trx();
-        let mut stmt = trx.start_stmt();
+        let mut session = engine.new_session();
 
-        let table_id = stmt
+        let table_id = session
             .create_table(
                 schema_id,
                 TableSpec {
@@ -412,8 +395,6 @@ pub mod tests {
             .await
             .unwrap();
 
-        let trx = stmt.succeed();
-        let session = trx.commit().await.unwrap();
         drop(session);
         table_id
     }

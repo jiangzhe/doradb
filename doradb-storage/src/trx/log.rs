@@ -6,7 +6,7 @@ use crate::io::{
 };
 use crate::notify::EventNotifyOnDrop;
 use crate::serde::{Deser, LenPrefixPod, Ser, SerdeCtx, len_prefix_pod_size};
-use crate::session::{IntoSession, Session};
+use crate::session::SessionState;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{Commit, CommitGroup, GroupCommit, MutexGroupCommit};
 use crate::trx::purge::{GC, GCBucket};
@@ -28,6 +28,7 @@ use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -239,7 +240,7 @@ impl LogPartition {
         &self,
         mut trx: PrecommitTrx,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
-    ) -> (Option<Session>, EventListener) {
+    ) -> (Option<Arc<SessionState>>, EventListener) {
         let cts = trx.cts;
         let serde_ctx = SerdeCtx::default();
         let redo_bin = trx.redo_bin.take().unwrap();
@@ -262,7 +263,7 @@ impl LogPartition {
             }
             Err(_) => unreachable!(),
         };
-        let session = trx.split_session();
+        let session = trx.take_session();
         let sync_ev = EventNotifyOnDrop::new();
         let listener = sync_ev.listen();
         let new_group = CommitGroup {
@@ -281,22 +282,21 @@ impl LogPartition {
     // disable clippy lint due to false positive.
     #[allow(clippy::await_holding_lock)]
     #[inline]
-    pub(super) async fn commit(
-        &self,
-        trx: PreparedTrx,
-        global_ts: &AtomicU64,
-    ) -> Result<Option<Session>> {
+    pub(super) async fn commit(&self, trx: PreparedTrx, global_ts: &AtomicU64) -> Result<TrxID> {
         let mut group_commit_g = self.group_commit.lock();
         let cts = global_ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
-            let (session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
+            let (mut session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
             self.group_commit.notify_one(); // notify sync thread to work.
             drop(group_commit_g);
             listener.await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
-            return Ok(session);
+            if let Some(s) = session.as_mut() {
+                s.commit(cts);
+            }
+            return Ok(cts);
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
             Commit::Shutdown => return Err(Error::TransactionSystemShutdown),
@@ -307,18 +307,24 @@ impl LogPartition {
             }
         };
         if last_group.can_join(&precommit_trx) {
-            let (session, listener) = last_group.join(precommit_trx);
+            let (mut session, listener) = last_group.join(precommit_trx);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
             listener.await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
-            return Ok(session);
+            if let Some(s) = session.as_mut() {
+                s.commit(cts);
+            }
+            return Ok(cts);
         }
-        let (session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
+        let (mut session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
         self.group_commit.notify_one(); // notify sync thread to work.
         drop(group_commit_g);
         listener.await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
-        Ok(session)
+        if let Some(s) = session.as_mut() {
+            s.commit(cts);
+        }
+        Ok(cts)
     }
 
     #[inline]
@@ -775,7 +781,7 @@ pub(super) fn create_log_file(
     file_header_size: usize,
 ) -> Result<SparseFile> {
     let file_name = log_file_name(file_prefix, log_no, file_seq);
-    let log_file = SparseFile::create(&file_name, file_max_size)?;
+    let log_file = SparseFile::create_or_fail(&file_name, file_max_size)?;
     // todo: Add two pages as file header.
     let _ = log_file.alloc(file_header_size)?;
     Ok(log_file)
@@ -1083,8 +1089,6 @@ mod tests {
                         .file_path("databuffer_mmap.bin"),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             let table_id = table2(&engine).await;
@@ -1093,14 +1097,14 @@ mod tests {
             let mut session = engine.new_session();
             {
                 for i in 0..SIZE {
-                    let mut trx = session.begin_trx();
+                    let mut trx = session.begin_trx().unwrap();
                     let mut stmt = trx.start_stmt();
                     let s = format!("{}", i);
                     let insert = vec![Val::from(i), Val::from(&s[..])];
                     let res = stmt.insert_row(&table, insert).await;
                     debug_assert!(res.is_ok());
                     trx = stmt.succeed();
-                    session = trx.commit().await.unwrap();
+                    trx.commit().await.unwrap();
                 }
             }
             drop(session);
@@ -1135,6 +1139,7 @@ mod tests {
             // remove log file
             let _ = std::fs::remove_file("databuffer_mmap.bin");
             remove_files("*mmap_log_reader_redo.log.*");
+            remove_files("*.tbl");
         });
     }
 
@@ -1157,8 +1162,6 @@ mod tests {
                         .file_path("databuffer_mmap.bin"),
                 )
                 .build()
-                .unwrap()
-                .init()
                 .await
                 .unwrap();
             let table_id = table2(&engine).await;
@@ -1167,14 +1170,14 @@ mod tests {
             let mut session = engine.new_session();
             {
                 for i in 0..SIZE {
-                    let mut trx = session.begin_trx();
+                    let mut trx = session.begin_trx().unwrap();
                     let mut stmt = trx.start_stmt();
                     let s = format!("{}", i);
                     let insert = vec![Val::from(i), Val::from(&s[..])];
                     let res = stmt.insert_row(&table, insert).await;
                     debug_assert!(res.is_ok());
                     trx = stmt.succeed();
-                    session = trx.commit().await.unwrap();
+                    trx.commit().await.unwrap();
                 }
             }
             drop(session);
@@ -1221,6 +1224,7 @@ mod tests {
             // remove log file
             let _ = std::fs::remove_file("databuffer_mmap.bin");
             remove_files("redo_merger*");
+            remove_files("*.tbl");
         });
     }
 }

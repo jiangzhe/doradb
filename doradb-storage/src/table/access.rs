@@ -1,16 +1,16 @@
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::BufferPool;
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateIndex,
     UpdateMvcc,
 };
-use crate::row::{estimate_max_row_count, var_len_for_insert, Row, RowID, RowPage, RowRead};
+use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::stmt::Statement;
-use crate::table::{row_len, DeleteInternal, Table, UpdateRowInplace};
-use crate::trx::undo::RowUndoKind;
+use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
+use crate::trx::undo::RowUndoKind;
 use crate::value::Val;
 use std::future::Future;
 
@@ -170,8 +170,8 @@ impl TableAccess for Table {
         user_read_set: &[usize],
     ) -> SelectMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
         debug_assert!({
             !user_read_set.is_empty()
                 && user_read_set
@@ -203,8 +203,8 @@ impl TableAccess for Table {
         for<'a> F: FnOnce(Row<'a>) -> R,
     {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
         let (page_guard, row_id) = match self.sec_idx[key.index_no]
             .unique()
             .unwrap()
@@ -235,7 +235,7 @@ impl TableAccess for Table {
         if row.is_deleted() {
             return None;
         }
-        if row.is_key_different(&self.metadata, key) {
+        if row.is_key_different(self.metadata(), key) {
             return None;
         }
         Some(row_action(row))
@@ -251,8 +251,8 @@ impl TableAccess for Table {
         debug_assert!(key.index_no < self.sec_idx.len());
         // Index scan should be applied to non-unique index.
         // todo: support partial key scan on unique index.
-        debug_assert!(!self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(!self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
         debug_assert!({
             !user_read_set.is_empty()
                 && user_read_set
@@ -288,13 +288,13 @@ impl TableAccess for Table {
         stmt: &mut Statement,
         cols: Vec<Val>,
     ) -> InsertMvcc {
-        debug_assert!(cols.len() == self.metadata.col_count());
+        debug_assert!(cols.len() == self.metadata().col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
         });
-        let keys = self.metadata.keys_for_insert(&cols);
+        let keys = self.metadata().keys_for_insert(&cols);
         // insert row into page with undo log linked.
         let (row_id, page_guard) = self
             .insert_row_internal(data_pool, stmt, cols, RowUndoKind::Insert, None)
@@ -319,28 +319,29 @@ impl TableAccess for Table {
     }
 
     async fn insert_no_trx<P: BufferPool>(&self, data_pool: &'static P, cols: &[Val]) {
-        debug_assert!(cols.len() == self.metadata.col_count());
+        debug_assert!(cols.len() == self.metadata().col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata.col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
         });
+        let metadata = self.metadata();
         // prepare index keys.
-        let keys = self.metadata.keys_for_insert(cols);
+        let keys = metadata.keys_for_insert(cols);
         // calculate row length.
-        let row_len = row_len(&self.metadata, cols);
+        let row_len = row_len(metadata, cols);
         // estimate max row count for insert page.
-        let row_count = estimate_max_row_count(row_len, self.metadata.col_count());
+        let row_count = estimate_max_row_count(row_len, metadata.col_count());
         loop {
             // acquire insert page from block index.
             let mut page_guard = self
                 .blk_idx
-                .get_insert_page_exclusive(data_pool, row_count, &self.metadata)
+                .get_insert_page_exclusive(data_pool, row_count, metadata)
                 .await;
             let page = page_guard.page_mut();
-            debug_assert!(self.metadata.col_count() == page.header.col_count as usize);
+            debug_assert!(metadata.col_count() == page.header.col_count as usize);
             debug_assert!(cols.len() == page.header.col_count as usize);
-            let var_len = var_len_for_insert(&self.metadata, cols);
+            let var_len = var_len_for_insert(metadata, cols);
             let (row_idx, var_offset) =
                 if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                     (row_idx, var_offset)
@@ -374,8 +375,8 @@ impl TableAccess for Table {
         disable_inplace: bool,
     ) -> UpdateMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
             None => return UpdateMvcc::NotFound,
@@ -471,8 +472,8 @@ impl TableAccess for Table {
         log_by_key: bool,
     ) -> DeleteMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
             None => return DeleteMvcc::NotFound,
@@ -506,8 +507,8 @@ impl TableAccess for Table {
 
     async fn delete_unique_no_trx<P: BufferPool>(&self, data_pool: &'static P, key: &SelectKey) {
         debug_assert!(key.index_no < self.sec_idx.len());
-        debug_assert!(self.metadata.index_specs[key.index_no].unique());
-        debug_assert!(self.metadata.index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (mut page_guard, row_id) = match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await {
             None => unreachable!(),
@@ -528,7 +529,7 @@ impl TableAccess for Table {
         let row_idx = page.row_idx(row_id);
         debug_assert!(!page.is_deleted(row_idx));
         let row = page.row(row_idx);
-        let keys = self.metadata.keys_for_delete(row);
+        let keys = self.metadata().keys_for_delete(row);
         // delete index immediately.
         for key in keys {
             let res = self.delete_index_directly(&key, row_id).await;
@@ -545,7 +546,7 @@ impl TableAccess for Table {
         unique: bool,
     ) -> bool {
         // todo: consider index drop.
-        let index_schema = &self.metadata.index_specs[key.index_no];
+        let index_schema = &self.metadata().index_specs[key.index_no];
         debug_assert_eq!(unique, index_schema.unique());
         if unique {
             let index = self.sec_idx[key.index_no].unique().unwrap();
