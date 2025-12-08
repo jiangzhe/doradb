@@ -70,6 +70,8 @@ pub enum Error {
     TornWrite,
     #[error("{0} not supported")]
     NotSupported(&'static str),
+    #[error("invalid compressed data")]
+    InvalidCompressedData,
 }
 
 impl From<TryFromSliceError> for Error {

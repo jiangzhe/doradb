@@ -69,6 +69,38 @@ macro_rules! impl_bit_packable {
 
 impl_bit_packable!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
 
+/// Returns number of bits and minimum value on input data.
+/// Returns None if not available.
+#[inline]
+pub fn prepare_for_bitpacking<T: BitPackable + Ord>(input: &[T]) -> Option<(usize, T)> {
+    if input.is_empty() {
+        return None;
+    }
+    let mut min = input[0];
+    let mut max = input[0];
+    input.iter().for_each(|v| {
+        min = min.min(*v);
+        max = max.max(*v);
+    });
+    let delta = max.sub_to_u64(min);
+    let n_bits = if delta < (1 << 1) {
+        1
+    } else if delta < (1 << 2) {
+        2
+    } else if delta < (1 << 4) {
+        4
+    } else if delta < (1 << 8) {
+        8
+    } else if delta < (1 << 16) {
+        16
+    } else if delta < (1 << 32) {
+        32
+    } else {
+        return None;
+    };
+    Some((n_bits, min))
+}
+
 /// Pack (bits=1).
 /// User has to guarantee all values are not out of range.
 #[inline]
@@ -377,14 +409,12 @@ pub fn for_b4_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     // layer 2: scalar (0..15 elements)
     if out_idx < res.len() {
         let mut shift = 0usize;
-        let mut packed_byte = input[input_idx];
         for tgt in &mut res[out_idx..] {
-            let delta = (packed_byte >> shift) & 15;
+            let delta = (input[input_idx] >> shift) & 15;
             *tgt = min.add_from_u8(delta);
             shift += 4;
             if shift == 8 {
                 input_idx += 1;
-                packed_byte = input[input_idx];
                 shift = 0;
             }
         }

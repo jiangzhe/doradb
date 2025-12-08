@@ -4,7 +4,7 @@ use crate::catalog::table::TableMetadata;
 use crate::error::{Error, Result};
 use crate::file::FixedSizeBufferFreeList;
 use crate::file::super_page::{
-    SuperPage, SuperPageAlloc, SuperPageBody, SuperPageBodySerView, SuperPageFooter,
+    SuperPage, SuperPageAlloc, SuperPageBody, SuperPageBodySerView, SuperPageFooter, SuperPageFree,
     SuperPageHeader, SuperPageMeta, SuperPageSerView,
 };
 use crate::file::{FileIO, FileIOResult, SparseFile};
@@ -171,7 +171,11 @@ impl TableFile {
         self.buf_list.push(buf);
         let alloc_map = match super_page.body.alloc {
             SuperPageAlloc::Inline(alloc) => alloc,
-            SuperPageAlloc::PageNo(_) => todo!("standalone alloc page"),
+            SuperPageAlloc::PageNo(_) => todo!("standalone alloc map page"),
+        };
+        let free_list = match super_page.body.free {
+            SuperPageFree::Inline(free) => free,
+            SuperPageFree::PageNo(_) => todo!("standalone free list page"),
         };
         let metadata = match super_page.body.meta {
             SuperPageMeta::Inline(meta) => meta,
@@ -181,6 +185,7 @@ impl TableFile {
             page_no: super_page.header.page_no,
             trx_id: super_page.header.trx_id,
             alloc_map,
+            free_list,
             metadata,
         })
     }
@@ -360,10 +365,14 @@ pub struct ActiveRoot {
     /// root page number.
     /// Can be either 0 or 1.
     pub page_no: u64,
-    /// Version of this table file.
+    /// Version/Transaction ID of this table file.
     pub trx_id: TrxID,
     /// Page allocation map.
     pub alloc_map: AllocMap,
+    /// Pages that are freed by this transaction(T).
+    /// These pages can be actually freed/reused only
+    /// when all transactions before T finished.
+    pub free_list: Vec<PageID>,
     /// Metadata of this table.
     pub metadata: TableMetadata,
     // page index (todo): this is two-layer index, persistent block index
@@ -387,6 +396,7 @@ impl ActiveRoot {
             page_no: DEFALT_ROOT_PAGE_NO,
             trx_id,
             alloc_map,
+            free_list: vec![],
             metadata,
         }
     }
@@ -399,7 +409,11 @@ impl ActiveRoot {
                 page_no: self.page_no,
                 trx_id: self.trx_id,
             },
-            body: SuperPageBodySerView::new(&self.alloc_map, self.metadata.ser_view()),
+            body: SuperPageBodySerView::new(
+                &self.alloc_map,
+                &self.free_list,
+                self.metadata.ser_view(),
+            ),
         }
     }
 
