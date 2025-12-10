@@ -228,12 +228,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 let count = end_row_id - start_row_id;
                 let mut page_guard = table
                     .blk_idx
-                    .allocate_row_page_at(
-                        self.data_pool,
-                        count as usize,
-                        table.metadata(),
-                        *page_id,
-                    )
+                    .allocate_row_page_at(self.data_pool, count as usize, *page_id)
                     .await;
                 // Here we switch row page to recover mode.
                 page_guard.bf_mut().init_recover_map();

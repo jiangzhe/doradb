@@ -4,12 +4,13 @@ use crate::catalog::table::TableMetadata;
 use crate::error::{Error, Result};
 use crate::file::FixedSizeBufferFreeList;
 use crate::file::super_page::{
-    SuperPage, SuperPageAlloc, SuperPageBody, SuperPageBodySerView, SuperPageFooter, SuperPageFree,
-    SuperPageHeader, SuperPageMeta, SuperPageSerView,
+    SuperPage, SuperPageAlloc, SuperPageBlockIndex, SuperPageBody, SuperPageBodySerView,
+    SuperPageFooter, SuperPageFree, SuperPageHeader, SuperPageMeta, SuperPageSerView,
 };
 use crate::file::{FileIO, FileIOResult, SparseFile};
 use crate::io::DirectBuf;
 use crate::io::{AIOBuf, AIOClient, AIOKind};
+use crate::row::RowID;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::trx::TrxID;
 use std::fs;
@@ -101,6 +102,15 @@ impl TableFile {
         unsafe { &*ptr }
     }
 
+    /// Returns copy of active root.
+    /// The returned pointer cannot outlive the root object,
+    /// which is guaranteed by GC logic.
+    #[inline]
+    pub fn active_root_ptr(&self) -> AtomicPtr<ActiveRoot> {
+        let ptr = self.active_root.load(Ordering::Relaxed);
+        AtomicPtr::new(ptr)
+    }
+
     #[inline]
     pub async fn read_page(&self, page_id: PageID) -> Result<DirectBuf> {
         let buf = self.buf_list.pop_async(true).await;
@@ -181,12 +191,18 @@ impl TableFile {
             SuperPageMeta::Inline(meta) => meta,
             SuperPageMeta::PageNo(_) => todo!("standalone metadata page"),
         };
+        let block_index = match super_page.body.block_index {
+            SuperPageBlockIndex::Inline(block_index) => block_index,
+            SuperPageBlockIndex::PageNo(_) => todo!("standalone block index page"),
+        };
         Ok(ActiveRoot {
             page_no: super_page.header.page_no,
             trx_id: super_page.header.trx_id,
+            row_id_bound: super_page.header.row_id_bound,
             alloc_map,
             free_list,
             metadata,
+            block_index,
         })
     }
 
@@ -367,6 +383,14 @@ pub struct ActiveRoot {
     pub page_no: u64,
     /// Version/Transaction ID of this table file.
     pub trx_id: TrxID,
+    /// Upper bound of row id in this file.
+    /// There might be gap between data in file and the bound.
+    /// For example, user might insert a lot of data then
+    /// delete most of them. This will cause very few rows
+    /// to be transfered to LWC(LightWeight Columnar) pages, and
+    /// maximum row id might be small. The upper bound is large
+    /// according the first row page which is not transfered.
+    pub row_id_bound: RowID,
     /// Page allocation map.
     pub alloc_map: AllocMap,
     /// Pages that are freed by this transaction(T).
@@ -375,6 +399,8 @@ pub struct ActiveRoot {
     pub free_list: Vec<PageID>,
     /// Metadata of this table.
     pub metadata: TableMetadata,
+    /// Block index array.
+    pub block_index: BlockIndexArray,
     // page index (todo): this is two-layer index, persistent block index
     //                    + intra-block page index
     // secondary index (todo)
@@ -395,9 +421,11 @@ impl ActiveRoot {
         ActiveRoot {
             page_no: DEFALT_ROOT_PAGE_NO,
             trx_id,
+            row_id_bound: 0,
             alloc_map,
             free_list: vec![],
             metadata,
+            block_index: BlockIndexArray::builder().build(),
         }
     }
 
@@ -408,11 +436,13 @@ impl ActiveRoot {
                 magic_word: TABLE_FILE_MAGIC_WORD,
                 page_no: self.page_no,
                 trx_id: self.trx_id,
+                row_id_bound: self.row_id_bound,
             },
             body: SuperPageBodySerView::new(
                 &self.alloc_map,
                 &self.free_list,
                 self.metadata.ser_view(),
+                &self.block_index,
             ),
         }
     }
@@ -439,6 +469,92 @@ impl Drop for OldRoot {
 }
 
 unsafe impl Send for OldRoot {}
+
+/// BlockIndexArray
+///
+/// Flatten array for mapping between rowid range
+/// and pages.
+/// it uses struct of array instead of array of struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockIndexArray {
+    pub(super) starts: Box<[RowID]>,
+    pub(super) deltas: Box<[RowID]>,
+    pub(super) pages: Box<[PageID]>,
+}
+
+impl BlockIndexArray {
+    /// Binary search the given row id.
+    #[inline]
+    pub fn binary_search(&self, row_id: RowID) -> Option<usize> {
+        match self.starts.binary_search(&row_id) {
+            Ok(idx) => {
+                // equal to start row id.
+                Some(idx)
+            }
+            Err(0) => {
+                // less than start row id.
+                None
+            }
+            Err(idx) => {
+                // check if given row id less than last end row id.
+                let idx = idx - 1;
+                if row_id < self.starts[idx] + self.deltas[idx] {
+                    Some(idx)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// get row id range and page id at given position.
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<(RowID, RowID, PageID)> {
+        match (
+            self.starts.get(idx),
+            self.deltas.get(idx),
+            self.pages.get(idx),
+        ) {
+            (Some(&start), Some(&delta), Some(&page)) => Some((start, start + delta, page)),
+            _ => None,
+        }
+    }
+
+    /// create a builder to build new array.
+    #[inline]
+    pub fn builder() -> BlockIndexArrayBuilder {
+        BlockIndexArrayBuilder::default()
+    }
+}
+
+#[derive(Default)]
+pub struct BlockIndexArrayBuilder(Vec<(RowID, RowID, PageID)>);
+
+impl BlockIndexArrayBuilder {
+    #[inline]
+    pub fn push(&mut self, start: RowID, end: RowID, page: PageID) {
+        debug_assert!(start < end);
+        debug_assert!({ self.0.is_empty() || (self.0.last().unwrap().2 <= start) });
+        self.0.push((start, end - start, page));
+    }
+
+    #[inline]
+    pub fn build(self) -> BlockIndexArray {
+        let mut starts: Vec<RowID> = Vec::with_capacity(self.0.len());
+        let mut deltas: Vec<RowID> = Vec::with_capacity(self.0.len());
+        let mut pages: Vec<PageID> = Vec::with_capacity(self.0.len());
+        for (start, delta, page) in self.0 {
+            starts.push(start);
+            deltas.push(delta);
+            pages.push(page);
+        }
+        BlockIndexArray {
+            starts: starts.into_boxed_slice(),
+            deltas: deltas.into_boxed_slice(),
+            pages: pages.into_boxed_slice(),
+        }
+    }
+}
 
 #[inline]
 fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
@@ -537,5 +653,118 @@ mod tests {
             drop(table_file);
             let _ = std::fs::remove_file("42.tbl");
         });
+    }
+
+    #[test]
+    fn test_block_index_array_builder() {
+        // Test empty builder
+        let builder = BlockIndexArrayBuilder::default();
+        let array = builder.build();
+        assert!(array.starts.is_empty());
+        assert!(array.deltas.is_empty());
+        assert!(array.pages.is_empty());
+
+        // Test single entry
+        let mut builder = BlockIndexArrayBuilder::default();
+        builder.push(0, 100, 1);
+        let array = builder.build();
+        assert_eq!(array.starts.len(), 1);
+        assert_eq!(array.deltas.len(), 1);
+        assert_eq!(array.pages.len(), 1);
+        assert_eq!(array.starts[0], 0);
+        assert_eq!(array.deltas[0], 100);
+        assert_eq!(array.pages[0], 1);
+
+        // Test multiple entries
+        let mut builder = BlockIndexArrayBuilder::default();
+        builder.push(0, 100, 1);
+        builder.push(100, 200, 2);
+        builder.push(200, 300, 3);
+        let array = builder.build();
+        assert_eq!(array.starts.len(), 3);
+        assert_eq!(array.deltas.len(), 3);
+        assert_eq!(array.pages.len(), 3);
+        assert_eq!(array.starts[0], 0);
+        assert_eq!(array.deltas[0], 100);
+        assert_eq!(array.pages[0], 1);
+        assert_eq!(array.starts[1], 100);
+        assert_eq!(array.deltas[1], 100);
+        assert_eq!(array.pages[1], 2);
+        assert_eq!(array.starts[2], 200);
+        assert_eq!(array.deltas[2], 100);
+        assert_eq!(array.pages[2], 3);
+    }
+
+    #[test]
+    fn test_block_index_array() {
+        // Build a test array
+        let mut builder = BlockIndexArrayBuilder::default();
+        builder.push(0, 100, 1);
+        builder.push(100, 200, 2);
+        builder.push(200, 300, 3);
+        let array = builder.build();
+
+        // Test get method
+        assert_eq!(array.get(0), Some((0, 100, 1)));
+        assert_eq!(array.get(1), Some((100, 200, 2)));
+        assert_eq!(array.get(2), Some((200, 300, 3)));
+        assert_eq!(array.get(3), None);
+        assert_eq!(array.get(usize::MAX), None);
+
+        // Test binary_search method
+        // Exact match with start
+        assert_eq!(array.binary_search(0), Some(0));
+        assert_eq!(array.binary_search(100), Some(1));
+        assert_eq!(array.binary_search(200), Some(2));
+
+        // Within range
+        assert_eq!(array.binary_search(50), Some(0));
+        assert_eq!(array.binary_search(150), Some(1));
+        assert_eq!(array.binary_search(250), Some(2));
+
+        // Edge cases: end-1
+        assert_eq!(array.binary_search(99), Some(0));
+        assert_eq!(array.binary_search(199), Some(1));
+        assert_eq!(array.binary_search(299), Some(2));
+
+        // Edge cases: equal to end (not in range)
+        assert_eq!(array.binary_search(100), Some(1)); // 100 is start of second range
+        assert_eq!(array.binary_search(200), Some(2)); // 200 is start of third range
+        assert_eq!(array.binary_search(300), None); // 300 is end of third range, not in range
+
+        // Out of range
+        assert_eq!(array.binary_search(300), None); // equal to end
+        assert_eq!(array.binary_search(400), None); // greater than all
+        assert_eq!(array.binary_search(u64::MAX), None); // maximum value
+
+        // Test empty array
+        let empty_builder = BlockIndexArrayBuilder::default();
+        let empty_array = empty_builder.build();
+        assert_eq!(empty_array.binary_search(0), None);
+        assert_eq!(empty_array.binary_search(100), None);
+        assert_eq!(empty_array.binary_search(u64::MAX), None);
+
+        // Test with non-contiguous ranges
+        let mut builder2 = BlockIndexArrayBuilder::default();
+        builder2.push(0, 50, 1);
+        builder2.push(100, 150, 2); // gap between 50 and 100
+        builder2.push(200, 250, 3); // gap between 150 and 200
+        let array2 = builder2.build();
+
+        assert_eq!(array2.binary_search(0), Some(0));
+        assert_eq!(array2.binary_search(25), Some(0));
+        assert_eq!(array2.binary_search(49), Some(0));
+        assert_eq!(array2.binary_search(50), None); // equal to end, not in range
+        assert_eq!(array2.binary_search(75), None); // in gap
+        assert_eq!(array2.binary_search(100), Some(1));
+        assert_eq!(array2.binary_search(125), Some(1));
+        assert_eq!(array2.binary_search(149), Some(1));
+        assert_eq!(array2.binary_search(150), None); // equal to end
+        assert_eq!(array2.binary_search(175), None); // in gap
+        assert_eq!(array2.binary_search(200), Some(2));
+        assert_eq!(array2.binary_search(225), Some(2));
+        assert_eq!(array2.binary_search(249), Some(2));
+        assert_eq!(array2.binary_search(250), None); // equal to end
+        assert_eq!(array2.binary_search(300), None); // beyond all ranges
     }
 }

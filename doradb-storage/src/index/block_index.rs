@@ -8,15 +8,18 @@ use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
 };
+use crate::file::table_file::ActiveRoot;
 use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
+use crate::latch::HybridLatch;
 use crate::latch::LatchFallbackMode;
 use crate::row::{INVALID_ROW_ID, RowID, RowPage};
 use crate::trx::sys::TransactionSystem;
 use doradb_catalog::TableID;
-use either::Either::{Left, Right};
+use either::Either::{self, Left, Right};
 use parking_lot::Mutex;
+use std::cell::UnsafeCell;
 use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub const BLOCK_PAGE_SIZE: usize = PAGE_SIZE;
 pub const BLOCK_HEADER_SIZE: usize = mem::size_of::<BlockNodeHeader>();
@@ -394,7 +397,7 @@ pub struct ColSegmentMeta {
 ///
 pub struct BlockIndex {
     pub table_id: TableID,
-    root: PageID,
+    root: BlockIndexRoot,
     height: AtomicUsize,
     insert_free_list: Mutex<Vec<PageID>>,
     // Fixed buffer pool to hold block nodes.
@@ -407,14 +410,20 @@ pub struct BlockIndex {
 impl BlockIndex {
     /// Create a new block index backed by buffer pool.
     #[inline]
-    pub async fn new(pool: &'static FixedBufferPool, table_id: TableID) -> Self {
+    pub async fn new(
+        pool: &'static FixedBufferPool,
+        table_id: TableID,
+        boundary: RowID,
+        file_root: AtomicPtr<ActiveRoot>,
+    ) -> Self {
         let mut g = pool.allocate_page::<BlockNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init_empty(0, 0);
+        let root = BlockIndexRoot::new(page_id, boundary, file_root);
         BlockIndex {
             table_id,
-            root: page_id,
+            root,
             height: AtomicUsize::new(0),
             pool,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
@@ -448,14 +457,13 @@ impl BlockIndex {
         &self,
         buf_pool: &'static P,
         count: usize,
-        metadata: &TableMetadata,
     ) -> PageSharedGuard<RowPage> {
         if let Ok(free_page) = self.get_insert_page_from_free_list(buf_pool).await {
             return free_page;
         }
         // we just ignore the free list error and latch error, and continue to get new page.
         let mut new_page = buf_pool.allocate_page::<RowPage>().await;
-        self.insert_page_guard(count, metadata, &mut new_page).await;
+        self.insert_page_guard(count, &mut new_page).await;
         new_page.downgrade_shared()
     }
 
@@ -465,7 +473,6 @@ impl BlockIndex {
         &self,
         buf_pool: &'static P,
         count: usize,
-        metadata: &TableMetadata,
     ) -> PageExclusiveGuard<RowPage> {
         if let Ok(free_page) = self
             .get_insert_page_exclusive_from_free_list(buf_pool)
@@ -475,7 +482,7 @@ impl BlockIndex {
         }
         // we just ignore the free list error and latch error, and continue to get new page.
         let mut new_page = buf_pool.allocate_page::<RowPage>().await;
-        self.insert_page_guard(count, metadata, &mut new_page).await;
+        self.insert_page_guard(count, &mut new_page).await;
         new_page
     }
 
@@ -486,25 +493,20 @@ impl BlockIndex {
         &self,
         buf_pool: &'static P,
         count: usize,
-        metadata: &TableMetadata,
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
         let mut new_page = buf_pool
             .allocate_page_at::<RowPage>(page_id)
             .await
             .expect("allocate page with specific page id failed");
-        self.insert_page_guard(count, metadata, &mut new_page).await;
+        self.insert_page_guard(count, &mut new_page).await;
         new_page
     }
 
     #[inline]
-    async fn insert_page_guard(
-        &self,
-        count: usize,
-        metadata: &TableMetadata,
-        new_page: &mut PageExclusiveGuard<RowPage>,
-    ) {
+    async fn insert_page_guard(&self, count: usize, new_page: &mut PageExclusiveGuard<RowPage>) {
         let new_page_id = new_page.page_id();
+        let metadata = self.root.metadata().unwrap();
         loop {
             match self.insert_row_page(count as u64, new_page_id).await {
                 Invalid => (),
@@ -538,7 +540,20 @@ impl BlockIndex {
         loop {
             let res = self.try_find_row(row_id).await;
             let res = verify_continue!(res);
-            return res;
+            match res {
+                RowLocation::NotFound => {
+                    // If not found in row store, re-check if transfered
+                    // to column store.
+                    match self
+                        .root
+                        .try_file(row_id, |_| todo!("search row id in file"))
+                    {
+                        Some(page_id) => return RowLocation::LwcPage(page_id),
+                        None => return RowLocation::NotFound,
+                    }
+                }
+                found => return found,
+            }
         }
     }
 
@@ -553,8 +568,8 @@ impl BlockIndex {
 
     /// Returns the cursor for range scan.
     #[inline]
-    pub fn cursor(&self) -> BlockIndexCursor<'_> {
-        BlockIndexCursor {
+    pub fn cursor(&self) -> BlockIndexMemCursor<'_> {
+        BlockIndexMemCursor {
             blk_idx: self,
             parent: None,
             child: None,
@@ -610,7 +625,7 @@ impl BlockIndex {
         count: u64,
         insert_page_id: PageID,
     ) -> (RowID, RowID) {
-        debug_assert!(p_guard.page_id() == self.root);
+        debug_assert!(p_guard.page_id() == self.root.mem);
         debug_assert!({
             let p = p_guard.page();
             (p.is_leaf() && p.leaf_is_full()) || (p.is_branch() && p.branch_is_full())
@@ -826,7 +841,7 @@ impl BlockIndex {
     ) -> Validation<FacadePageGuard<BlockNode>> {
         let mut p_guard = self
             .pool
-            .get_page::<BlockNode>(self.root, LatchFallbackMode::Spin)
+            .get_page::<BlockNode>(self.root.mem, LatchFallbackMode::Spin)
             .await;
         // optimistic mode, should always check version before using protected data.
         let mut pu = unsafe { p_guard.page_unchecked() };
@@ -860,9 +875,13 @@ impl BlockIndex {
 
     #[inline]
     async fn try_find_row(&self, row_id: RowID) -> Validation<RowLocation> {
+        let root = match self.root.guide(row_id) {
+            Left(_) => todo!("search row id in file"),
+            Right(mem) => mem,
+        };
         let mut g = self
             .pool
-            .get_page::<BlockNode>(self.root, LatchFallbackMode::Spin)
+            .get_page::<BlockNode>(root, LatchFallbackMode::Spin)
             .await;
         loop {
             let pu = unsafe { g.page_unchecked() };
@@ -940,27 +959,116 @@ impl BlockIndex {
 }
 
 unsafe impl Send for BlockIndex {}
+unsafe impl Sync for BlockIndex {}
+
+pub struct BlockIndexRoot {
+    /// Root of in-memory rows.
+    mem: PageID,
+    /// latch to protect below fields.
+    latch: HybridLatch,
+    /// minimum row id of row pages.
+    /// If row id is less than this value, it
+    /// goes to column store.
+    bound: UnsafeCell<RowID>,
+    /// Root of in-file rows.
+    /// This can be changed if compaction (conversion
+    /// from row to col) happens.
+    file: AtomicPtr<ActiveRoot>,
+}
+
+impl BlockIndexRoot {
+    #[inline]
+    pub fn new(mem: PageID, boundary: RowID, file: AtomicPtr<ActiveRoot>) -> Self {
+        BlockIndexRoot {
+            mem,
+            latch: HybridLatch::new(),
+            bound: UnsafeCell::new(boundary),
+            file,
+        }
+    }
+
+    /// Guide the search path of given row id.
+    /// The search path can be determined by comparison
+    /// to row id boundary.
+    #[inline]
+    pub fn guide(&self, row_id: RowID) -> Either<&ActiveRoot, PageID> {
+        loop {
+            unsafe {
+                let g = self.latch.optimistic_spin();
+                let boundary = *self.bound.get();
+                if row_id < boundary {
+                    // go to file
+                    let file_root = self.file.load(Ordering::Acquire);
+                    if g.validate() {
+                        // safe to dereference if version is unchanged.
+                        return Left(&*file_root);
+                    } else {
+                        continue; // retry
+                    }
+                }
+                // go to mem
+                if g.validate() {
+                    return Right(self.mem);
+                }
+            }
+        }
+    }
+
+    /// Try to serach row id in file if row id within boundary.
+    #[inline]
+    pub fn try_file<T, F: Fn(&ActiveRoot) -> Option<T>>(&self, row_id: RowID, f: F) -> Option<T> {
+        loop {
+            unsafe {
+                let g = self.latch.optimistic_spin();
+                let bound = *self.bound.get();
+                if row_id < bound {
+                    // go to file
+                    let file_root = self.file.load(Ordering::Acquire);
+                    if g.validate() {
+                        // safe to dereference if version is unchanged.
+                        return f(&*file_root);
+                    } else {
+                        continue; // retry
+                    }
+                }
+                return None;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn metadata(&self) -> Option<&TableMetadata> {
+        let ptr = self.file.load(Ordering::Relaxed);
+        if ptr.is_null() {
+            None
+        } else {
+            unsafe { Some(&(*ptr).metadata) }
+        }
+    }
+}
 
 pub enum RowLocation {
-    ColSegment(u64, u64),
+    // Lightweight columnar page.
+    LwcPage(PageID),
+    // Row page.
     RowPage(PageID),
     NotFound,
 }
 
-/// A cursor to read all leaf values.
-pub struct BlockIndexCursor<'a> {
+/// A cursor to read all in-mem leaf values.
+pub struct BlockIndexMemCursor<'a> {
     blk_idx: &'a BlockIndex,
     // The parent node of current located
     parent: Option<ParentPosition<FacadePageGuard<BlockNode>>>,
     child: Option<FacadePageGuard<BlockNode>>,
 }
 
-impl BlockIndexCursor<'_> {
+impl BlockIndexMemCursor<'_> {
     #[inline]
     pub async fn seek(&mut self, row_id: RowID) {
         loop {
             self.reset();
-            let res = self.try_find_leaf_with_parent(row_id).await;
+            let res = self.try_find_leaf_with_parent_in_mem(row_id).await;
             verify_continue!(res);
             return;
         }
@@ -987,7 +1095,7 @@ impl BlockIndexCursor<'_> {
                     return None;
                 }
                 // otherwise, we rerun the search on given row id to get next leaf.
-                while let Invalid = self.try_find_leaf_with_parent(row_id).await {
+                while let Invalid = self.try_find_leaf_with_parent_in_mem(row_id).await {
                     self.reset();
                 }
                 let child = self.child.take().unwrap();
@@ -1016,12 +1124,12 @@ impl BlockIndexCursor<'_> {
     }
 
     #[inline]
-    async fn try_find_leaf_with_parent(&mut self, row_id: RowID) -> Validation<()> {
+    async fn try_find_leaf_with_parent_in_mem(&mut self, row_id: RowID) -> Validation<()> {
         debug_assert!(row_id != INVALID_ROW_ID); // every row id other than MAX_ROW_ID can find a leaf.
         let mut g = self
             .blk_idx
             .pool
-            .get_page::<BlockNode>(self.blk_idx.root, LatchFallbackMode::Shared)
+            .get_page::<BlockNode>(self.blk_idx.root.mem, LatchFallbackMode::Shared)
             .await;
         'SEARCH: loop {
             let pu = unsafe { g.page_unchecked() };
@@ -1113,17 +1221,21 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
-                let p1 = blk_idx
-                    .get_insert_page(engine.data_pool, 100, &metadata)
-                    .await;
+                let table_id = 101;
+                let uninit_table_file = engine
+                    .table_fs
+                    .create_table_file(table_id, metadata, true)
+                    .unwrap();
+                let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
+                let blk_idx =
+                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
+                        .await;
+                let p1 = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.cache_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
-                let p2 = blk_idx
-                    .get_insert_page(engine.data_pool, 100, &metadata)
-                    .await;
+                let p2 = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
@@ -1163,17 +1275,21 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
-                let p1 = blk_idx
-                    .get_insert_page(engine.data_pool, 100, &metadata)
-                    .await;
+                let table_id = 101;
+                let uninit_table_file = engine
+                    .table_fs
+                    .create_table_file(table_id, metadata, true)
+                    .unwrap();
+                let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
+                let blk_idx =
+                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
+                        .await;
+                let p1 = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.cache_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
-                let p2 = blk_idx
-                    .get_insert_page(engine.data_pool, 100, &metadata)
-                    .await;
+                let p2 = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
@@ -1215,11 +1331,17 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
-                for _ in 0..row_pages {
-                    let _ = blk_idx
-                        .get_insert_page(engine.data_pool, 100, &metadata)
+                let table_id = 101;
+                let uninit_table_file = engine
+                    .table_fs
+                    .create_table_file(table_id, metadata, true)
+                    .unwrap();
+                let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
+                let blk_idx =
+                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
                         .await;
+                for _ in 0..row_pages {
+                    let _ = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 }
                 let mut count = 0usize;
                 let mut cursor = blk_idx.cursor();
@@ -1296,16 +1418,24 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
+                let table_id = 101;
+                let uninit_table_file = engine
+                    .table_fs
+                    .create_table_file(table_id, metadata, true)
+                    .unwrap();
+                let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
+                let blk_idx =
+                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
+                        .await;
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(engine.data_pool, rows_per_page, &metadata)
+                        .get_insert_page(engine.data_pool, rows_per_page)
                         .await;
                 }
                 {
                     let res = engine
                         .meta_pool
-                        .get_page::<BlockNode>(blk_idx.root, LatchFallbackMode::Spin)
+                        .get_page::<BlockNode>(blk_idx.root.mem, LatchFallbackMode::Spin)
                         .await;
                     let p = res.shared_async().await;
                     let bn = p.page();
@@ -1372,10 +1502,18 @@ mod tests {
                     }],
                     vec![first_i32_unique_index()],
                 );
-                let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
+                let table_id = 101;
+                let uninit_table_file = engine
+                    .table_fs
+                    .create_table_file(table_id, metadata, true)
+                    .unwrap();
+                let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
+                let blk_idx =
+                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
+                        .await;
                 // create a new page for rowid=0..100
                 let _ = blk_idx
-                    .get_insert_page(engine.data_pool, rows_per_page, &metadata)
+                    .get_insert_page(engine.data_pool, rows_per_page)
                     .await;
                 // todo: analyze log to see the log is persisted.
             }
@@ -1393,7 +1531,8 @@ mod tests {
             remove_files("*.tbl");
             let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
             {
-                let blk_idx = BlockIndex::new(pool, 1).await;
+                let blk_idx =
+                    BlockIndex::new(pool, 1, 0, AtomicPtr::new(std::ptr::null_mut())).await;
                 assert!(!blk_idx.is_page_committer_enabled());
                 assert!(blk_idx.height() == 0);
                 for row_page_id in 0..10000 {
@@ -1401,7 +1540,7 @@ mod tests {
                 }
                 assert!(blk_idx.height() == 1);
                 let mut root = pool
-                    .get_page_spin::<BlockNode>(blk_idx.root)
+                    .get_page_spin::<BlockNode>(blk_idx.root.mem)
                     .exclusive_async()
                     .await;
                 // mark root as full to trigger split.

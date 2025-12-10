@@ -2,6 +2,8 @@
 //!
 //! Current implementation only support bits=1, 2, 4, 8, 16, 32.
 
+use std::mem;
+
 /// Data type that supports bitpacking.
 /// constant ZERO is used to unify both bitpacking and FOR+bitpacking.
 pub trait BitPackable: Copy {
@@ -90,10 +92,20 @@ pub fn prepare_for_bitpacking<T: BitPackable + Ord>(input: &[T]) -> Option<(usiz
     } else if delta < (1 << 4) {
         4
     } else if delta < (1 << 8) {
+        if mem::size_of::<T>() <= 1 {
+            // compression is meaningless.
+            return None;
+        }
         8
     } else if delta < (1 << 16) {
+        if mem::size_of::<T>() <= 2 {
+            return None;
+        }
         16
     } else if delta < (1 << 32) {
+        if mem::size_of::<T>() <= 4 {
+            return None;
+        }
         32
     } else {
         return None;

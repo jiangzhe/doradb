@@ -46,13 +46,25 @@ fn main() {
                     IndexAttributes::PK,
                 )],
             );
-            let blk_idx = BlockIndex::new(engine.meta_pool, 101).await;
+            let table_id = 101;
+            let uninit_table_file = engine
+                .table_fs
+                .create_table_file(table_id, metadata, true)
+                .unwrap();
+            let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
+            let blk_idx = BlockIndex::new(
+                engine.meta_pool,
+                table_id,
+                table_file.active_root().row_id_bound,
+                table_file.active_root_ptr(),
+            )
+            .await;
             let blk_idx = Box::leak(Box::new(blk_idx));
             blk_idx.enable_page_committer(engine.trx_sys);
 
             for _ in 0..args.pages {
                 let _ = blk_idx
-                    .get_insert_page(engine.data_pool, args.rows_per_page, &metadata)
+                    .get_insert_page(engine.data_pool, args.rows_per_page)
                     .await;
             }
             let mut perf_monitor = PerfMonitor::new();

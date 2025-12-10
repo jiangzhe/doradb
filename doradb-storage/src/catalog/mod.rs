@@ -163,12 +163,20 @@ impl Catalog {
                     ));
                 }
                 let table_file = table_fs.open_table_file(table.table_id).await?;
+                let active_root = table_file.active_root();
                 // todo: refine recovery of corrupted file.
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
-                let metadata_in_file = &table_file.active_root().metadata;
+                let metadata_in_file = &active_root.metadata;
                 debug_assert_eq!(&metadata_in_catalog, metadata_in_file);
+                let row_id_bound = active_root.row_id_bound;
 
-                let blk_idx = BlockIndex::new(self.storage.meta_pool, table.table_id).await;
+                let blk_idx = BlockIndex::new(
+                    self.storage.meta_pool,
+                    table.table_id,
+                    row_id_bound,
+                    table_file.active_root_ptr(),
+                )
+                .await;
                 let table = Table::new(index_pool, blk_idx, table_file).await;
                 // Update table into cache
                 let mut table_cache_g = self.cache.tables.write().await;
