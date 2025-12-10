@@ -214,7 +214,7 @@ impl TableAccess for Table {
             None => return None,
             Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                 RowLocation::NotFound => return None,
-                RowLocation::ColSegment(..) => todo!(),
+                RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -336,7 +336,7 @@ impl TableAccess for Table {
             // acquire insert page from block index.
             let mut page_guard = self
                 .blk_idx
-                .get_insert_page_exclusive(data_pool, row_count, metadata)
+                .get_insert_page_exclusive(data_pool, row_count)
                 .await;
             let page = page_guard.page_mut();
             debug_assert!(metadata.col_count() == page.header.col_count as usize);
@@ -382,7 +382,7 @@ impl TableAccess for Table {
             None => return UpdateMvcc::NotFound,
             Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                 RowLocation::NotFound => return UpdateMvcc::NotFound,
-                RowLocation::ColSegment(..) => todo!(),
+                RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -479,7 +479,7 @@ impl TableAccess for Table {
             None => return DeleteMvcc::NotFound,
             Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                 RowLocation::NotFound => return DeleteMvcc::NotFound,
-                RowLocation::ColSegment(..) => todo!(),
+                RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -514,7 +514,7 @@ impl TableAccess for Table {
             None => unreachable!(),
             Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                 RowLocation::NotFound => unreachable!(),
-                RowLocation::ColSegment(..) => todo!(),
+                RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)

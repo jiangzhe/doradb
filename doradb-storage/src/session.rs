@@ -289,7 +289,13 @@ impl Session {
         debug_assert!(old_root.is_none());
 
         // 10. Prepare in-memory representation of new table
-        let blk_idx = BlockIndex::new(engine.meta_pool, table_id).await;
+        let blk_idx = BlockIndex::new(
+            engine.meta_pool,
+            table_id,
+            table_file.active_root().row_id_bound,
+            table_file.active_root_ptr(),
+        )
+        .await;
         let table = Table::new(engine.index_pool, blk_idx, table_file).await;
         // Enable page committer so all row pages can be recovered.
         table.blk_idx.enable_page_committer(engine.trx_sys);

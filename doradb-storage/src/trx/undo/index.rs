@@ -105,7 +105,7 @@ impl IndexUndoLogs {
                     // index entry if it is deleted and does not have any old version (already GCed).
                     match table.blk_idx.find_row(old_row_id).await {
                         RowLocation::NotFound => unreachable!(),
-                        RowLocation::ColSegment(..) => todo!(),
+                        RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let page_guard = data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)

@@ -1,10 +1,10 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PageID;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
-use crate::compression::bitpacking::*;
-use crate::error::{Error, Result};
-use crate::file::table_file::TABLE_FILE_SUPER_PAGE_FOOTER_SIZE;
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::error::Result;
+use crate::file::table_file::{BlockIndexArray, TABLE_FILE_SUPER_PAGE_FOOTER_SIZE};
+use crate::row::RowID;
+use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, SerdeCtx};
 use crate::trx::TrxID;
 use std::mem;
 
@@ -14,7 +14,10 @@ pub struct SuperPageHeader {
     pub magic_word: [u8; 8],
     /// Page number of this super page.
     pub page_no: PageID,
+    /// transaction id of this super page.
     pub trx_id: TrxID,
+    /// upper bound of row id.
+    pub row_id_bound: RowID,
 }
 
 impl Ser<'_> for SuperPageHeader {
@@ -23,13 +26,15 @@ impl Ser<'_> for SuperPageHeader {
         mem::size_of::<[u8; 8]>() // magic word
             + mem::size_of::<PageID>() // page no
             + mem::size_of::<TrxID>() // transaction id
+            + mem::size_of::<RowID>() // row id bound
     }
 
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
         let idx = ctx.ser_byte_array(out, start_idx, &self.magic_word);
         let idx = ctx.ser_u64(out, idx, self.page_no);
-        ctx.ser_u64(out, idx, self.trx_id)
+        let idx = ctx.ser_u64(out, idx, self.trx_id);
+        ctx.ser_u64(out, idx, self.row_id_bound)
     }
 }
 
@@ -39,10 +44,12 @@ impl Deser for SuperPageHeader {
         let (idx, magic_word) = ctx.deser_byte_array::<8>(input, start_idx)?;
         let (idx, page_no) = ctx.deser_u64(input, idx)?;
         let (idx, trx_id) = ctx.deser_u64(input, idx)?;
+        let (idx, row_id_bound) = ctx.deser_u64(input, idx)?;
         let res = SuperPageHeader {
             magic_word,
             page_no,
             trx_id,
+            row_id_bound,
         };
         Ok((idx, res))
     }
@@ -53,6 +60,7 @@ pub struct SuperPageBody {
     pub alloc: SuperPageAlloc,
     pub free: SuperPageFree,
     pub meta: SuperPageMeta,
+    pub block_index: SuperPageBlockIndex,
 }
 
 impl Deser for SuperPageBody {
@@ -69,7 +77,7 @@ impl Deser for SuperPageBody {
         // free list
         let (idx, free_page_no) = ctx.deser_u64(input, idx)?;
         let (idx, free) = if free_page_no == 0 {
-            let (idx, free_list) = SuperPageFreeDeser::deser(ctx, input, idx)?;
+            let (idx, free_list) = ForBitpackingDeser::<PageID>::deser(ctx, input, idx)?;
             (idx, SuperPageFree::Inline(free_list.0))
         } else {
             (idx, SuperPageFree::PageNo(free_page_no))
@@ -82,8 +90,23 @@ impl Deser for SuperPageBody {
         } else {
             (idx, SuperPageMeta::PageNo(meta_page_no))
         };
-
-        Ok((idx, SuperPageBody { alloc, free, meta }))
+        // block index
+        let (idx, block_index_page_no) = ctx.deser_u64(input, idx)?;
+        let (idx, block_index) = if block_index_page_no == 0 {
+            let (idx, block_index) = SuperPageBlockIndexDeser::deser(ctx, input, idx)?;
+            (idx, SuperPageBlockIndex::Inline(block_index.into()))
+        } else {
+            (idx, SuperPageBlockIndex::PageNo(block_index_page_no))
+        };
+        Ok((
+            idx,
+            SuperPageBody {
+                alloc,
+                free,
+                meta,
+                block_index,
+            },
+        ))
     }
 }
 
@@ -134,42 +157,15 @@ pub enum SuperPageFree {
     PageNo(PageID),
 }
 
-pub struct SuperPageFreeDeser(Vec<PageID>);
-
-impl Deser for SuperPageFreeDeser {
-    #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, n_bits) = ctx.deser_u8(input, start_idx)?;
-        if n_bits == 0 {
-            return Ok((idx, SuperPageFreeDeser(vec![])));
-        }
-        if n_bits == 64 {
-            let (idx, data) = <Vec<PageID>>::deser(ctx, input, idx)?;
-            return Ok((idx, SuperPageFreeDeser(data)));
-        }
-        let (idx, n_elems) = ctx.deser_u64(input, idx)?;
-        let (idx, min) = ctx.deser_u64(input, idx)?;
-        let n_bytes = (n_elems as usize * n_bits as usize).div_ceil(8);
-        if idx + n_bytes > input.len() {
-            return Err(Error::InvalidCompressedData);
-        }
-        let mut data = vec![0u64; n_elems as usize];
-        match n_bits {
-            1 => for_b1_unpack(&input[idx..idx + n_bytes], min, &mut data),
-            2 => for_b2_unpack(&input[idx..idx + n_bytes], min, &mut data),
-            4 => for_b4_unpack(&input[idx..idx + n_bytes], min, &mut data),
-            8 => for_b8_unpack(&input[idx..idx + n_bytes], min, &mut data),
-            16 => for_b16_unpack(&input[idx..idx + n_bytes], min, &mut data),
-            32 => for_b32_unpack(&input[idx..idx + n_bytes], min, &mut data),
-            _ => return Err(Error::InvalidCompressedData),
-        };
-        Ok((idx + n_bytes, SuperPageFreeDeser(data)))
-    }
-}
-
 #[derive(PartialEq, Eq)]
 pub enum SuperPageMeta {
     Inline(TableMetadata),
+    PageNo(PageID),
+}
+
+#[derive(PartialEq, Eq)]
+pub enum SuperPageBlockIndex {
+    Inline(BlockIndexArray),
     PageNo(PageID),
 }
 
@@ -193,8 +189,9 @@ impl<'a> Ser<'a> for SuperPageSerView<'a> {
 
 pub struct SuperPageBodySerView<'a> {
     pub alloc: SuperPageAllocSerView<'a>,
-    pub free: SuperPageFreeBitpacking<'a>,
+    pub free: SuperPageFreeSerView<'a>,
     pub meta: SuperPageMetaSerView<'a>,
+    pub block_index: SuperPageBlockIndexSerView<'a>,
 }
 
 impl<'a> SuperPageBodySerView<'a> {
@@ -203,11 +200,13 @@ impl<'a> SuperPageBodySerView<'a> {
         alloc: &'a AllocMap,
         free: &'a [PageID],
         meta: TableBriefMetadataSerView<'a>,
+        block_index: &'a BlockIndexArray,
     ) -> Self {
         SuperPageBodySerView {
             alloc: SuperPageAllocSerView::Inline(alloc),
-            free: SuperPageFreeBitpacking::new(free),
+            free: SuperPageFreeSerView::new(free),
             meta: SuperPageMetaSerView::Inline(meta),
+            block_index: SuperPageBlockIndexSerView::new(block_index),
         }
     }
 }
@@ -215,14 +214,18 @@ impl<'a> SuperPageBodySerView<'a> {
 impl<'a> Ser<'a> for SuperPageBodySerView<'a> {
     #[inline]
     fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        self.alloc.ser_len(ctx) + self.free.ser_len(ctx) + self.meta.ser_len(ctx)
+        self.alloc.ser_len(ctx)
+            + self.free.ser_len(ctx)
+            + self.meta.ser_len(ctx)
+            + self.block_index.ser_len(ctx)
     }
 
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
         let idx = self.alloc.ser(ctx, out, start_idx);
         let idx = self.free.ser(ctx, out, idx);
-        self.meta.ser(ctx, out, idx)
+        let idx = self.meta.ser(ctx, out, idx);
+        self.block_index.ser(ctx, out, idx)
     }
 }
 
@@ -256,74 +259,40 @@ impl<'a> Ser<'a> for SuperPageAllocSerView<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SuperPageFreeBitpacking<'a> {
-    Inline {
-        data: &'a [PageID],
-        info: Option<(usize, PageID)>,
-    },
+pub enum SuperPageFreeSerView<'a> {
+    Inline(ForBitpackingSer<'a, PageID>),
     PageNo(PageID),
 }
 
-impl<'a> SuperPageFreeBitpacking<'a> {
+impl<'a> SuperPageFreeSerView<'a> {
     #[inline]
     pub fn new(data: &'a [PageID]) -> Self {
-        let info = prepare_for_bitpacking(data);
-        SuperPageFreeBitpacking::Inline { data, info }
+        SuperPageFreeSerView::Inline(ForBitpackingSer::new(data))
     }
 }
 
-impl<'a> Ser<'a> for SuperPageFreeBitpacking<'a> {
+impl<'a> Ser<'a> for SuperPageFreeSerView<'a> {
     #[inline]
     fn ser_len(&self, ctx: &SerdeCtx) -> usize {
         match self {
-            SuperPageFreeBitpacking::Inline { data, info } => {
+            SuperPageFreeSerView::Inline(bp) => {
                 mem::size_of::<PageID>() // always 0
-                    + mem::size_of::<u8>() // number of bits: 0 means empty; 64 means no packing.
-                    + if data.is_empty() {
-                        0
-                    } else if let Some((n_bits, _)) = info {
-                        mem::size_of::<u64>() // total number of page
-                            + mem::size_of::<PageID>() // minimum page id
-                            + (n_bits * data.len()).div_ceil(8) // packed bytes
-                    } else {
-                        // follow serialization rule of &[u64].
-                        data.ser_len(ctx)
-                    }
+                    + bp.ser_len(ctx)
             }
-            SuperPageFreeBitpacking::PageNo(_) => mem::size_of::<PageID>(),
+            SuperPageFreeSerView::PageNo(_) => mem::size_of::<PageID>(),
         }
     }
 
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
         match self {
-            SuperPageFreeBitpacking::PageNo(page_id) => {
+            SuperPageFreeSerView::PageNo(page_id) => {
                 debug_assert!(*page_id != 0);
                 ctx.ser_u64(out, start_idx, *page_id)
             }
-            SuperPageFreeBitpacking::Inline { data, info } => {
+            SuperPageFreeSerView::Inline(bp) => {
                 let idx = ctx.ser_u64(out, start_idx, 0);
-                if data.is_empty() {
-                    ctx.ser_u8(out, idx, 0)
-                } else if let Some((n_bits, min)) = info {
-                    let idx = ctx.ser_u8(out, idx, *n_bits as u8);
-                    let idx = ctx.ser_u64(out, idx, data.len() as u64);
-                    let idx = ctx.ser_u64(out, idx, *min);
-                    let packed_len = (n_bits * data.len()).div_ceil(8);
-                    match *n_bits {
-                        1 => for_b1_pack(data, *min, &mut out[idx..idx + packed_len]),
-                        2 => for_b2_pack(data, *min, &mut out[idx..idx + packed_len]),
-                        4 => for_b4_pack(data, *min, &mut out[idx..idx + packed_len]),
-                        8 => for_b8_pack(data, *min, &mut out[idx..idx + packed_len]),
-                        16 => for_b16_pack(data, *min, &mut out[idx..idx + packed_len]),
-                        32 => for_b32_pack(data, *min, &mut out[idx..idx + packed_len]),
-                        _ => unreachable!("unexpected number bits of FOR bitpacking"),
-                    }
-                    idx + packed_len
-                } else {
-                    let idx = ctx.ser_u8(out, idx, 64);
-                    data.ser(ctx, out, idx)
-                }
+                bp.ser(ctx, out, idx)
             }
         }
     }
@@ -355,6 +324,91 @@ impl<'a> Ser<'a> for SuperPageMetaSerView<'a> {
             }
             SuperPageMetaSerView::PageNo(page_no) => ctx.ser_u64(out, start_idx, *page_no),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuperPageBlockIndexSerView<'a> {
+    Inline {
+        s: ForBitpackingSer<'a, RowID>,
+        d: ForBitpackingSer<'a, RowID>,
+        p: ForBitpackingSer<'a, PageID>,
+    },
+    PageNo(PageID),
+}
+
+impl<'a> SuperPageBlockIndexSerView<'a> {
+    #[inline]
+    pub fn new(block_index: &'a BlockIndexArray) -> Self {
+        let s = ForBitpackingSer::new(&block_index.starts);
+        let d = ForBitpackingSer::new(&block_index.deltas);
+        let p = ForBitpackingSer::new(&block_index.pages);
+        SuperPageBlockIndexSerView::Inline { s, d, p }
+    }
+}
+
+impl<'a> Ser<'a> for SuperPageBlockIndexSerView<'a> {
+    #[inline]
+    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+        match self {
+            SuperPageBlockIndexSerView::Inline { s, d, p } => {
+                mem::size_of::<PageID>() // always 0
+                    + s.ser_len(ctx) // start row ids
+                    + d.ser_len(ctx) // deltas
+                    + p.ser_len(ctx) // pages
+            }
+            SuperPageBlockIndexSerView::PageNo(_) => mem::size_of::<PageID>(),
+        }
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        match self {
+            SuperPageBlockIndexSerView::PageNo(page_id) => {
+                debug_assert!(*page_id != 0);
+                ctx.ser_u64(out, start_idx, *page_id)
+            }
+            SuperPageBlockIndexSerView::Inline { s, d, p } => {
+                let idx = ctx.ser_u64(out, start_idx, 0);
+                let idx = s.ser(ctx, out, idx);
+                let idx = d.ser(ctx, out, idx);
+                p.ser(ctx, out, idx)
+            }
+        }
+    }
+}
+
+pub struct SuperPageBlockIndexDeser {
+    s: Vec<RowID>,
+    d: Vec<RowID>,
+    p: Vec<PageID>,
+}
+
+impl From<SuperPageBlockIndexDeser> for BlockIndexArray {
+    #[inline]
+    fn from(value: SuperPageBlockIndexDeser) -> Self {
+        BlockIndexArray {
+            starts: value.s.into_boxed_slice(),
+            deltas: value.d.into_boxed_slice(),
+            pages: value.p.into_boxed_slice(),
+        }
+    }
+}
+
+impl Deser for SuperPageBlockIndexDeser {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, s) = ForBitpackingDeser::<RowID>::deser(ctx, input, start_idx)?;
+        let (idx, d) = ForBitpackingDeser::<RowID>::deser(ctx, input, idx)?;
+        let (idx, p) = ForBitpackingDeser::<PageID>::deser(ctx, input, idx)?;
+        Ok((
+            idx,
+            SuperPageBlockIndexDeser {
+                s: s.0,
+                d: d.0,
+                p: p.0,
+            },
+        ))
     }
 }
 
@@ -406,32 +460,6 @@ mod tests {
             assert_eq!(metadata, &active_root.metadata);
         } else {
             panic!("invalid super page");
-        }
-    }
-
-    #[test]
-    fn test_super_page_free_serde() {
-        for input in vec![
-            vec![],
-            vec![1u64],
-            vec![1, 1 << 1],
-            vec![1, 1 << 1, 1 << 2],
-            vec![1, 1 << 1, 1 << 2, 1 << 4],
-            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8],
-            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16],
-            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32],
-            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32, 1 << 50],
-        ] {
-            let mut ctx = SerdeCtx::default();
-            let bp = SuperPageFreeBitpacking::new(&input);
-            let mut res = vec![0u8; bp.ser_len(&ctx)];
-            let ser_idx = bp.ser(&ctx, &mut res, 0);
-            assert_eq!(ser_idx, res.len());
-            let (idx, page_no) = ctx.deser_u64(&res, 0).unwrap();
-            assert!(page_no == 0);
-            let (de_idx, decompressed) = SuperPageFreeDeser::deser(&mut ctx, &res, idx).unwrap();
-            assert_eq!(de_idx, res.len());
-            assert_eq!(decompressed.0, input);
         }
     }
 }

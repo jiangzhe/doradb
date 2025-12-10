@@ -1,3 +1,4 @@
+use crate::compression::bitpacking::*;
 use crate::error::{Error, Result};
 use doradb_catalog::{IndexAttributes, IndexKey, IndexOrder, IndexSpec};
 use semistr::SemiStr;
@@ -802,6 +803,97 @@ impl Deser for () {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForBitpackingSer<'a, T> {
+    data: &'a [T],
+    info: Option<(usize, T)>,
+}
+
+impl<'a, T: BitPackable + Ord> ForBitpackingSer<'a, T> {
+    #[inline]
+    pub fn new(data: &'a [T]) -> Self {
+        let info = prepare_for_bitpacking(data);
+        ForBitpackingSer { data, info }
+    }
+}
+
+impl<'a, T: BitPackable + Ord + Ser<'a>> Ser<'a> for ForBitpackingSer<'a, T> {
+    #[inline]
+    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u8>() // number of bits: 0 means empty; 0xFF means no packing.
+        + if self.data.is_empty() {
+                        0
+                    } else if let Some((n_bits, _)) = self.info {
+                        mem::size_of::<u64>() // total number of elements
+                            + mem::size_of::<T>() // minimum value of all elements
+                            + (n_bits * self.data.len()).div_ceil(8) // packed bytes
+                    } else {
+                        // follow serialization rule of &[u64].
+                        self.data.ser_len(ctx)
+                    }
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let idx = start_idx;
+        if self.data.is_empty() {
+            ctx.ser_u8(out, idx, 0)
+        } else if let Some((n_bits, min)) = self.info {
+            let idx = ctx.ser_u8(out, idx, n_bits as u8);
+            let idx = ctx.ser_u64(out, idx, self.data.len() as u64);
+            let idx = min.ser(ctx, out, idx);
+            let packed_len = (n_bits * self.data.len()).div_ceil(8);
+            match n_bits {
+                1 => for_b1_pack(self.data, min, &mut out[idx..idx + packed_len]),
+                2 => for_b2_pack(self.data, min, &mut out[idx..idx + packed_len]),
+                4 => for_b4_pack(self.data, min, &mut out[idx..idx + packed_len]),
+                8 => for_b8_pack(self.data, min, &mut out[idx..idx + packed_len]),
+                16 => for_b16_pack(self.data, min, &mut out[idx..idx + packed_len]),
+                32 => for_b32_pack(self.data, min, &mut out[idx..idx + packed_len]),
+                _ => unreachable!("unexpected number bits of FOR bitpacking"),
+            }
+            idx + packed_len
+        } else {
+            let idx = ctx.ser_u8(out, idx, 0xFF);
+            self.data.ser(ctx, out, idx)
+        }
+    }
+}
+
+/// FOR+bitpacking decompression on u64s.
+pub struct ForBitpackingDeser<T>(pub Vec<T>);
+
+impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, n_bits) = ctx.deser_u8(input, start_idx)?;
+        if n_bits == 0 {
+            return Ok((idx, ForBitpackingDeser(vec![])));
+        }
+        if n_bits == 0xFF {
+            let (idx, data) = <Vec<T>>::deser(ctx, input, idx)?;
+            return Ok((idx, ForBitpackingDeser(data)));
+        }
+        let (idx, n_elems) = ctx.deser_u64(input, idx)?;
+        let (idx, min) = T::deser(ctx, input, idx)?;
+        let n_bytes = (n_elems as usize * n_bits as usize).div_ceil(8);
+        if idx + n_bytes > input.len() {
+            return Err(Error::InvalidCompressedData);
+        }
+        let mut data = vec![T::ZERO; n_elems as usize];
+        match n_bits {
+            1 => for_b1_unpack(&input[idx..idx + n_bytes], min, &mut data),
+            2 => for_b2_unpack(&input[idx..idx + n_bytes], min, &mut data),
+            4 => for_b4_unpack(&input[idx..idx + n_bytes], min, &mut data),
+            8 => for_b8_unpack(&input[idx..idx + n_bytes], min, &mut data),
+            16 => for_b16_unpack(&input[idx..idx + n_bytes], min, &mut data),
+            32 => for_b32_unpack(&input[idx..idx + n_bytes], min, &mut data),
+            _ => return Err(Error::InvalidCompressedData),
+        };
+        Ok((idx + n_bytes, ForBitpackingDeser(data)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,6 +1053,31 @@ mod tests {
             let (idx, d) = ctx.deser_u8(input, idx)?;
             let res = TestStruct { a, b, c, d };
             Ok((idx, res))
+        }
+    }
+
+    #[test]
+    fn test_for_bitpacking_serde() {
+        for input in vec![
+            vec![],
+            vec![1u64],
+            vec![1, 1 << 1],
+            vec![1, 1 << 1, 1 << 2],
+            vec![1, 1 << 1, 1 << 2, 1 << 4],
+            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8],
+            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16],
+            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32],
+            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32, 1 << 50],
+        ] {
+            let mut ctx = SerdeCtx::default();
+            let bp = ForBitpackingSer::new(&input);
+            let mut res = vec![0u8; bp.ser_len(&ctx)];
+            let ser_idx = bp.ser(&ctx, &mut res, 0);
+            assert_eq!(ser_idx, res.len());
+            let (de_idx, decompressed) =
+                ForBitpackingDeser::<u64>::deser(&mut ctx, &res, 0).unwrap();
+            assert_eq!(de_idx, res.len());
+            assert_eq!(decompressed.0, input);
         }
     }
 }

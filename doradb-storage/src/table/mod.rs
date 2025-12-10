@@ -120,7 +120,7 @@ impl Table {
     ) -> SelectMvcc {
         match self.blk_idx.find_row(row_id).await {
             RowLocation::NotFound => SelectMvcc::NotFound,
-            RowLocation::ColSegment(..) => todo!(),
+            RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
                 let page_guard = data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -380,7 +380,7 @@ impl Table {
                                 .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
                         }
-                        RowLocation::ColSegment(..) => todo!(),
+                        RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let page_guard = data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -436,7 +436,7 @@ impl Table {
                                 .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
                         }
-                        RowLocation::ColSegment(..) => todo!(),
+                        RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let page_guard = data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -542,7 +542,7 @@ impl Table {
         let (old_guard, old_id) = loop {
             match self.blk_idx.find_row(old_id).await {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
-                RowLocation::ColSegment(..) => todo!(),
+                RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let old_guard = data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -893,9 +893,7 @@ impl Table {
                 return page_guard;
             }
         }
-        self.blk_idx
-            .get_insert_page(data_pool, row_count, self.metadata())
-            .await
+        self.blk_idx.get_insert_page(data_pool, row_count).await
     }
 
     // lock row will check write conflict on given row and lock it.
@@ -1189,7 +1187,7 @@ impl Table {
     ) -> Option<TrxID> {
         match self.blk_idx.find_row(row_id).await {
             RowLocation::NotFound => None,
-            RowLocation::ColSegment(..) => todo!(),
+            RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
                 let page_guard = data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)

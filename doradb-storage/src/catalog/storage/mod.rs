@@ -41,12 +41,17 @@ impl CatalogStorage {
             // make sure table id matches.
             assert_eq!(cat.len(), *table_id as usize);
             // catalog table with manually allocated page id.
-            let blk_idx = BlockIndex::new(meta_pool, *table_id).await;
-            // todo: when we implement checkpoint, we need to open the old file
-            // and load checkpoint data, followed by recovery.
             let table_file = table_fs.create_table_file(*table_id, metadata.clone(), true)?;
             let (table_file, old_root) = table_file.commit(MIN_SNAPSHOT_TS, false).await?;
             debug_assert!(old_root.is_none());
+            debug_assert!(metadata == &table_file.active_root().metadata);
+            let blk_idx = BlockIndex::new(
+                meta_pool,
+                *table_id,
+                table_file.active_root().row_id_bound,
+                table_file.active_root_ptr(),
+            )
+            .await;
             let table = Table::new(index_pool, blk_idx, table_file).await;
             cat.push(table);
         }
