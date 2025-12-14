@@ -1,10 +1,11 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PageID;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
+use crate::compression::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::error::Result;
 use crate::file::table_file::{BlockIndexArray, TABLE_FILE_SUPER_PAGE_FOOTER_SIZE};
 use crate::row::RowID;
-use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::trx::TrxID;
 use std::mem;
 
@@ -77,7 +78,7 @@ impl Deser for SuperPageBody {
         // free list
         let (idx, free_page_no) = ctx.deser_u64(input, idx)?;
         let (idx, free) = if free_page_no == 0 {
-            let (idx, free_list) = ForBitpackingDeser::<PageID>::deser(ctx, input, idx)?;
+            let (idx, free_list) = LwcPrimitiveDeser::<PageID>::deser(ctx, input, idx)?;
             (idx, SuperPageFree::Inline(free_list.0))
         } else {
             (idx, SuperPageFree::PageNo(free_page_no))
@@ -260,14 +261,14 @@ impl<'a> Ser<'a> for SuperPageAllocSerView<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SuperPageFreeSerView<'a> {
-    Inline(ForBitpackingSer<'a, PageID>),
+    Inline(LwcPrimitiveSer<'a>),
     PageNo(PageID),
 }
 
 impl<'a> SuperPageFreeSerView<'a> {
     #[inline]
     pub fn new(data: &'a [PageID]) -> Self {
-        SuperPageFreeSerView::Inline(ForBitpackingSer::new(data))
+        SuperPageFreeSerView::Inline(LwcPrimitiveSer::new_u64(data))
     }
 }
 
@@ -275,9 +276,9 @@ impl<'a> Ser<'a> for SuperPageFreeSerView<'a> {
     #[inline]
     fn ser_len(&self, ctx: &SerdeCtx) -> usize {
         match self {
-            SuperPageFreeSerView::Inline(bp) => {
+            SuperPageFreeSerView::Inline(encoder) => {
                 mem::size_of::<PageID>() // always 0
-                    + bp.ser_len(ctx)
+                    + encoder.ser_len(ctx)
             }
             SuperPageFreeSerView::PageNo(_) => mem::size_of::<PageID>(),
         }
@@ -330,9 +331,9 @@ impl<'a> Ser<'a> for SuperPageMetaSerView<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SuperPageBlockIndexSerView<'a> {
     Inline {
-        s: ForBitpackingSer<'a, RowID>,
-        d: ForBitpackingSer<'a, RowID>,
-        p: ForBitpackingSer<'a, PageID>,
+        s: LwcPrimitiveSer<'a>,
+        d: LwcPrimitiveSer<'a>,
+        p: LwcPrimitiveSer<'a>,
     },
     PageNo(PageID),
 }
@@ -340,9 +341,9 @@ pub enum SuperPageBlockIndexSerView<'a> {
 impl<'a> SuperPageBlockIndexSerView<'a> {
     #[inline]
     pub fn new(block_index: &'a BlockIndexArray) -> Self {
-        let s = ForBitpackingSer::new(&block_index.starts);
-        let d = ForBitpackingSer::new(&block_index.deltas);
-        let p = ForBitpackingSer::new(&block_index.pages);
+        let s = LwcPrimitiveSer::new_u64(&block_index.starts);
+        let d = LwcPrimitiveSer::new_u64(&block_index.deltas);
+        let p = LwcPrimitiveSer::new_u64(&block_index.pages);
         SuperPageBlockIndexSerView::Inline { s, d, p }
     }
 }
@@ -398,9 +399,9 @@ impl From<SuperPageBlockIndexDeser> for BlockIndexArray {
 impl Deser for SuperPageBlockIndexDeser {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, s) = ForBitpackingDeser::<RowID>::deser(ctx, input, start_idx)?;
-        let (idx, d) = ForBitpackingDeser::<RowID>::deser(ctx, input, idx)?;
-        let (idx, p) = ForBitpackingDeser::<PageID>::deser(ctx, input, idx)?;
+        let (idx, s) = LwcPrimitiveDeser::<RowID>::deser(ctx, input, start_idx)?;
+        let (idx, d) = LwcPrimitiveDeser::<RowID>::deser(ctx, input, idx)?;
+        let (idx, p) = LwcPrimitiveDeser::<PageID>::deser(ctx, input, idx)?;
         Ok((
             idx,
             SuperPageBlockIndexDeser {
