@@ -803,33 +803,47 @@ impl Deser for () {
     }
 }
 
+/// Serialization of FOR+Bitpacking.
+///
+/// The format is as below:
+///
+/// |----------|----------------|
+/// | field    | length(B)      |
+/// |----------|----------------|
+/// | n_bits   | 1              |
+/// | len      | 8              |
+/// | min      | sizeof(T)      |
+/// | packed   | (n_bits*len)/8 |
+/// |----------|----------------|
+///
+/// Special case handling:
+/// 1. input is empty, n_bits will be set to 0 and no more output.
+/// 2. input should not be packed, as no space can be saved,
+///    no serializer willbe returned. User should use other method.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForBitpackingSer<'a, T> {
     data: &'a [T],
-    info: Option<(usize, T)>,
+    info: (usize, T),
 }
 
 impl<'a, T: BitPackable + Ord> ForBitpackingSer<'a, T> {
     #[inline]
-    pub fn new(data: &'a [T]) -> Self {
-        let info = prepare_for_bitpacking(data);
-        ForBitpackingSer { data, info }
+    pub fn new(data: &'a [T]) -> Option<Self> {
+        prepare_for_bitpacking(data).map(|info| ForBitpackingSer { data, info })
     }
 }
 
 impl<'a, T: BitPackable + Ord + Ser<'a>> Ser<'a> for ForBitpackingSer<'a, T> {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
         mem::size_of::<u8>() // number of bits: 0 means empty; 0xFF means no packing.
         + if self.data.is_empty() {
                         0
-                    } else if let Some((n_bits, _)) = self.info {
+                    } else {
+                        let (n_bits, _) = self.info;
                         mem::size_of::<u64>() // total number of elements
                             + mem::size_of::<T>() // minimum value of all elements
                             + (n_bits * self.data.len()).div_ceil(8) // packed bytes
-                    } else {
-                        // follow serialization rule of &[u64].
-                        self.data.ser_len(ctx)
                     }
     }
 
@@ -838,7 +852,8 @@ impl<'a, T: BitPackable + Ord + Ser<'a>> Ser<'a> for ForBitpackingSer<'a, T> {
         let idx = start_idx;
         if self.data.is_empty() {
             ctx.ser_u8(out, idx, 0)
-        } else if let Some((n_bits, min)) = self.info {
+        } else {
+            let (n_bits, min) = self.info;
             let idx = ctx.ser_u8(out, idx, n_bits as u8);
             let idx = ctx.ser_u64(out, idx, self.data.len() as u64);
             let idx = min.ser(ctx, out, idx);
@@ -853,27 +868,17 @@ impl<'a, T: BitPackable + Ord + Ser<'a>> Ser<'a> for ForBitpackingSer<'a, T> {
                 _ => unreachable!("unexpected number bits of FOR bitpacking"),
             }
             idx + packed_len
-        } else {
-            let idx = ctx.ser_u8(out, idx, 0xFF);
-            self.data.ser(ctx, out, idx)
         }
     }
 }
 
-/// FOR+bitpacking decompression on u64s.
+/// FOR+bitpacking decompression.
 pub struct ForBitpackingDeser<T>(pub Vec<T>);
 
 impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let (idx, n_bits) = ctx.deser_u8(input, start_idx)?;
-        if n_bits == 0 {
-            return Ok((idx, ForBitpackingDeser(vec![])));
-        }
-        if n_bits == 0xFF {
-            let (idx, data) = <Vec<T>>::deser(ctx, input, idx)?;
-            return Ok((idx, ForBitpackingDeser(data)));
-        }
         let (idx, n_elems) = ctx.deser_u64(input, idx)?;
         let (idx, min) = T::deser(ctx, input, idx)?;
         let n_bytes = (n_elems as usize * n_bits as usize).div_ceil(8);
@@ -1058,8 +1063,8 @@ mod tests {
 
     #[test]
     fn test_for_bitpacking_serde() {
+        let mut ctx = SerdeCtx::default();
         for input in vec![
-            vec![],
             vec![1u64],
             vec![1, 1 << 1],
             vec![1, 1 << 1, 1 << 2],
@@ -1067,10 +1072,8 @@ mod tests {
             vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8],
             vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16],
             vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32],
-            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32, 1 << 50],
         ] {
-            let mut ctx = SerdeCtx::default();
-            let bp = ForBitpackingSer::new(&input);
+            let bp = ForBitpackingSer::new(&input).unwrap();
             let mut res = vec![0u8; bp.ser_len(&ctx)];
             let ser_idx = bp.ser(&ctx, &mut res, 0);
             assert_eq!(ser_idx, res.len());
@@ -1079,5 +1082,17 @@ mod tests {
             assert_eq!(de_idx, res.len());
             assert_eq!(decompressed.0, input);
         }
+        let input = vec![
+            1u64,
+            1 << 1,
+            1 << 2,
+            1 << 4,
+            1 << 8,
+            1 << 16,
+            1 << 32,
+            1 << 50,
+        ];
+        let bp = ForBitpackingSer::new(&input);
+        assert!(bp.is_none());
     }
 }
