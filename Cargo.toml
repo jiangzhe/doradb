@@ -1,15 +1,8 @@
 [workspace]
 members = [
     "doradb-datatype",
-    "doradb-catalog", 
-    "doradb-sql",
-    "doradb-expr",
-    "doradb-compute", 
-    "doradb-plan",
-    "doradb-protocol",
+    "doradb-catalog",
     "doradb-storage",
-    "doradb-server",
-    "doradb-tpch-tests"
 ]
 resolver = "2"
 exclude = ["doradb-bench"]

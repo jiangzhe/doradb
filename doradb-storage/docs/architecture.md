@@ -17,10 +17,13 @@ LWC(LightWeight Columnar) pages on disk store warm data for persistence.
 This kind of pages apply lightweight columnar compression, such as bitpacking and dict, to support both fast scan and random access. 
 Updates are converted to delete mask + insert. So there are also delete bitmaps stored accordingly.
 
-3. Column pages on disk.
+3. Column pages on disk(optional).
 
 Column pages on disk store cold data with columnar encoding.
 They are transformed by background task to speed up analytical queries.
+If the engine is used as a local storage, columnar encoding is preferred.
+If the engine is used as an ingestion and query node, integration with object store is preferred.
+So let's see what it can be in future.
 
 ![doradb-storage-architecture](./images/doradb-storage-architecture.png)
 
@@ -50,11 +53,21 @@ The principal of data modification in **Table File** is to do it in copy-on-writ
 
 ### Redo Log File
 
-**Redo Log File** contains all committed data of recent transactions.
+**Redo Log File** contains all committed data of recent transactions. It's different from the concept of "WAL log" in tranditional database perspective, because it only persists committed data. It does not contains "undo", therefore it does not support ARIES-style fuzzy checkpoint. The design of transactional system with logging and recovery will be introduced in a separate document.
 
 ### Secondary Index
 
 **Secondary Index** is a B+Tree index. It stores mapping between key and row id.
+The secondary index is composite of two trees: **MemTree** and **DiskTree**.
+**MemTree** is similar to a MemTable in LSM architecture, it holds new data inserted and hot data which are frequently updated. A background task will transfer **MemTree** to **DiskTree** as part of the checkpoint process.
+
+**DiskTree** is a CoW B+Tree which supports fast lookup, scan and batch inserts. Small transactions will be combined as large batch and modify the **DiskTree** in a CoW way. New root will be created and updated in metadata. In such way, no logging is required for recovery.
+
+Query on index will execute on both tree and aggregate their results.
+
+## Transactional System
+
+See [Transaction System](./transaction-system.md).
 
 ## Process Flow
 

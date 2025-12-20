@@ -9,14 +9,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    services:
-      mysql:
-        image: mysql:8.0.30-debian
-        ports:
-          - 13306:3306
-        env:
-          MYSQL_ROOT_PASSWORD: password
-        options: --health-cmd="mysqladmin ping" --health-interval=5s --health-timeout=2s --health-retries=3
     steps:
     - name: Install libaio
       run: sudo apt-get install -y libaio1 libaio-dev
