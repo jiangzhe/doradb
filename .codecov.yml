@@ -1,0 +1,12 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 80%
+    patch:
+      default:
+        target: auto
+        threshold: 80%
+  ignore:
+    - "legacy/"
