@@ -1,7 +1,9 @@
 // mod index;
+pub mod spec;
 pub mod storage;
 pub mod table;
 
+pub use spec::*;
 pub use storage::*;
 pub use table::*;
 
@@ -13,11 +15,16 @@ use crate::latch::RwLock;
 use crate::lifetime::StaticLifetime;
 use crate::table::Table;
 use crate::trx::sys::TransactionSystem;
-use doradb_catalog::{ColumnSpec, IndexKey, IndexSpec, SchemaID, TableID};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ROW_ID_COL_NAME: &str = "__row_id";
+
+pub type ObjID = u64;
+pub type TableID = ObjID;
+pub type SchemaID = ObjID;
+pub type ColumnID = ObjID;
+pub type IndexID = ObjID;
 
 /// Catalog contains metadata of user tables.
 pub struct Catalog {
@@ -247,9 +254,9 @@ impl<'a> TableCache<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::engine::Engine;
-    use doradb_catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
-    use doradb_datatype::{Collation, PreciseType};
+    use crate::value::ValKind;
     use semistr::SemiStr;
 
     #[inline]
@@ -273,7 +280,7 @@ pub mod tests {
                     table_name: SemiStr::new("table1"),
                     columns: vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                 },
@@ -304,12 +311,12 @@ pub mod tests {
                     columns: vec![
                         ColumnSpec {
                             column_name: SemiStr::new("id"),
-                            column_type: PreciseType::Int(4, false),
+                            column_type: ValKind::I32,
                             column_attributes: ColumnAttributes::empty(),
                         },
                         ColumnSpec {
                             column_name: SemiStr::new("name"),
-                            column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                            column_type: ValKind::VarByte,
                             column_attributes: ColumnAttributes::empty(),
                         },
                     ],
@@ -341,7 +348,7 @@ pub mod tests {
                     table_name: SemiStr::new("table3"),
                     columns: vec![ColumnSpec {
                         column_name: SemiStr::new("name"),
-                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                 },
@@ -375,12 +382,12 @@ pub mod tests {
                     columns: vec![
                         ColumnSpec {
                             column_name: SemiStr::new("id"),
-                            column_type: PreciseType::Int(4, false),
+                            column_type: ValKind::I32,
                             column_attributes: ColumnAttributes::empty(),
                         },
                         ColumnSpec {
                             column_name: SemiStr::new("val"),
-                            column_type: PreciseType::Int(4, false),
+                            column_type: ValKind::I32,
                             column_attributes: ColumnAttributes::empty(),
                         },
                     ],

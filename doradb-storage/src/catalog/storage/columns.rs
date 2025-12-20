@@ -2,15 +2,15 @@ use crate::buffer::BufferPool;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::TableMetadata;
+use crate::catalog::{
+    ColumnAttributes, ColumnID, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID,
+};
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
 use crate::table::{Table, TableAccess};
 use crate::value::Val;
-use doradb_catalog::{
-    ColumnAttributes, ColumnID, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID,
-};
-use doradb_datatype::{Collation, PreciseType};
+use crate::value::ValKind;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
@@ -42,37 +42,37 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
                     // column_id bigint primary key not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_ID),
-                        column_type: PreciseType::Int(8, false),
+                        column_type: ValKind::I64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // table_id bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_TABLE_ID),
-                        column_type: PreciseType::Int(8, false),
+                        column_type: ValKind::I64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // column_name string not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_NAME),
-                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     // column_no integer not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_NO),
-                        column_type: PreciseType::Int(2, false),
+                        column_type: ValKind::I16,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     // column_type integer not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_TYPE),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     // column_attributes integer not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_ATTRIBUTES),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::U32,
                         column_attributes: ColumnAttributes::empty(),
                     },
                 ],
@@ -108,7 +108,7 @@ fn row_to_column_object(row: Row<'_>) -> ColumnObject {
         table_id: *table_id,
         column_name: SemiStr::new(column_name),
         column_no: *column_no,
-        column_type: PreciseType::from(*column_type),
+        column_type: ValKind::from(*column_type as u8),
         column_attributes: ColumnAttributes::from_bits_truncate(*column_attributes),
     }
 }
@@ -126,7 +126,7 @@ impl<P: BufferPool> Columns<'_, P> {
             Val::from(obj.table_id),
             Val::from(obj.column_name.as_str()),
             Val::from(obj.column_no),
-            Val::from(u32::from(obj.column_type)),
+            Val::from(obj.column_type as u32),
             Val::from(obj.column_attributes.bits()),
         ];
         self.table

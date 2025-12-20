@@ -1,6 +1,6 @@
+use crate::catalog::{IndexAttributes, IndexKey, IndexOrder, IndexSpec};
 use crate::compression::bitpacking::*;
 use crate::error::{Error, Result};
-use doradb_catalog::{IndexAttributes, IndexKey, IndexOrder, IndexSpec};
 use semistr::SemiStr;
 use std::collections::BTreeMap;
 use std::fmt;

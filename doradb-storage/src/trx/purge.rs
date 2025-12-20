@@ -1,6 +1,6 @@
 use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
-use crate::catalog::{Catalog, TableCache};
+use crate::catalog::{Catalog, TableCache, TableID};
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
 use crate::table::TableAccess;
@@ -10,7 +10,6 @@ use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, TrxID};
 use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
-use doradb_catalog::TableID;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::HashSet;

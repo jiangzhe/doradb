@@ -15,13 +15,13 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, TableID};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
 use crate::serde::LenPrefixPod;
-use crate::table::{Table, TableAccess, TableID, TableRecover};
+use crate::table::{Table, TableAccess, TableRecover};
 use crate::trx::TrxID;
 use crate::trx::log::{LogMerger, LogPartition, LogPartitionInitializer, LogPartitionStream};
 use crate::trx::purge::GC;
@@ -381,6 +381,9 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
 #[cfg(test)]
 mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+    };
     use crate::engine::EngineConfig;
     use crate::row::RowRead;
     use crate::row::ops::{SelectKey, UpdateCol};
@@ -388,10 +391,7 @@ mod tests {
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
     use crate::value::Val;
-    use doradb_catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
-    };
-    use doradb_datatype::{Collation, PreciseType};
+    use crate::value::ValKind;
 
     #[test]
     fn test_log_recover_empty() {
@@ -448,8 +448,8 @@ mod tests {
             let table_spec = TableSpec::new(
                 "t1",
                 vec![
-                    ColumnSpec::new("c0", PreciseType::u32(), ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", PreciseType::u64(), ColumnAttributes::empty()),
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
                 ],
             );
 
@@ -527,12 +527,8 @@ mod tests {
             let table_spec = TableSpec::new(
                 "t1",
                 vec![
-                    ColumnSpec::new("c0", PreciseType::u32(), ColumnAttributes::empty()),
-                    ColumnSpec::new(
-                        "c1",
-                        PreciseType::varchar(200, Collation::Ascii),
-                        ColumnAttributes::empty(),
-                    ),
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::VarByte, ColumnAttributes::empty()),
                 ],
             );
 

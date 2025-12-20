@@ -5,6 +5,7 @@ mod schemas;
 mod tables;
 
 use crate::buffer::FixedBufferPool;
+use crate::catalog::TableID;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 pub use crate::catalog::storage::object::*;
@@ -16,7 +17,6 @@ use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::table::Table;
 use crate::trx::MIN_SNAPSHOT_TS;
-use doradb_catalog::TableID;
 
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,

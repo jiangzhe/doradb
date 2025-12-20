@@ -1,8 +1,8 @@
-use crate::value::{Val, ValKind, ValType};
-use doradb_datatype::memcmp::{
+use crate::memcmp::{
     BytesExtendable, MemCmpFormat, MemCmpKey, NormalBytes, Null, Nullable, NullableMemCmpFormat,
     SegmentedBytes,
 };
+use crate::value::{Val, ValKind, ValType};
 use std::borrow::Borrow;
 
 pub type BTreeKey = MemCmpKey;
@@ -482,7 +482,7 @@ fn encode_key_prefix<V: Borrow<Val>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use doradb_datatype::memcmp::NULL_FLAG;
+    use crate::memcmp::NULL_FLAG;
 
     #[test]
     fn test_single_key_encoder_basic() {

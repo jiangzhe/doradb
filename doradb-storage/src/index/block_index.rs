@@ -3,7 +3,7 @@ use crate::buffer::guard::{
 };
 use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
 use crate::buffer::{BufferPool, FixedBufferPool};
-use crate::catalog::TableMetadata;
+use crate::catalog::{TableID, TableMetadata};
 use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
@@ -14,7 +14,6 @@ use crate::latch::HybridLatch;
 use crate::latch::LatchFallbackMode;
 use crate::row::{INVALID_ROW_ID, RowID, RowPage};
 use crate::trx::sys::TransactionSystem;
-use doradb_catalog::TableID;
 use either::Either::{self, Left, Right};
 use parking_lot::Mutex;
 use std::cell::UnsafeCell;
@@ -1185,12 +1184,12 @@ impl BlockIndexMemCursor<'_> {
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::engine::EngineConfig;
     use crate::lifetime::StaticLifetime;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
-    use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use doradb_datatype::PreciseType;
+    use crate::value::ValKind;
     use semistr::SemiStr;
 
     #[test]
@@ -1216,7 +1215,7 @@ mod tests {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
@@ -1270,7 +1269,7 @@ mod tests {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
@@ -1326,7 +1325,7 @@ mod tests {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
@@ -1413,7 +1412,7 @@ mod tests {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
@@ -1497,7 +1496,7 @@ mod tests {
                 let metadata = TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],

@@ -1,13 +1,13 @@
 use crate::buffer::page::PageID;
 
+use crate::catalog::{SchemaID, TableID, TableSpec};
 use crate::row::RowID;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-use crate::table::{Table, TableAccess, TableID};
+use crate::table::{Table, TableAccess};
 use crate::trx::ActiveTrx;
 use crate::trx::redo::RedoLogs;
 use crate::trx::undo::{IndexUndo, IndexUndoKind, IndexUndoLogs, RowUndoKind, RowUndoLogs};
 use crate::value::Val;
-use doradb_catalog::{SchemaID, TableSpec};
 use semistr::SemiStr;
 use std::mem;
 

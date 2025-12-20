@@ -1,7 +1,7 @@
 use crate::buffer::page::PageID;
+use crate::catalog::TableID;
 use crate::row::{INVALID_ROW_ID, RowID};
 use crate::trx::sys::TransactionSystem;
-use doradb_catalog::TableID;
 
 /// Value that can be masked as deleted.
 pub trait Maskable: Copy + PartialEq + Eq {

@@ -566,10 +566,10 @@ fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
-    use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use doradb_datatype::PreciseType;
+    use crate::value::ValKind;
 
     #[test]
     fn test_table_file() {
@@ -577,8 +577,8 @@ mod tests {
             let fs = TableFileSystemConfig::default().build().unwrap();
             let metadata = TableMetadata::new(
                 vec![
-                    ColumnSpec::new("c0", PreciseType::Int(4, true), ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", PreciseType::Int(8, true), ColumnAttributes::NULLABLE),
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
                 ],
                 vec![IndexSpec::new(
                     "idx1",
@@ -628,8 +628,8 @@ mod tests {
             let fs = TableFileSystemConfig::default().build().unwrap();
             let metadata = TableMetadata::new(
                 vec![
-                    ColumnSpec::new("c0", PreciseType::Int(4, true), ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", PreciseType::Int(8, true), ColumnAttributes::NULLABLE),
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
                 ],
                 vec![IndexSpec::new(
                     "idx1",

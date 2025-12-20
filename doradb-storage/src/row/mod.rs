@@ -1414,10 +1414,10 @@ pub fn var_len_for_insert(schema: &TableMetadata, cols: &[Val]) -> usize {
 mod tests {
     use core::str;
 
-    use doradb_catalog::{
+    use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
     };
-    use doradb_datatype::{Collation, PreciseType};
+    use crate::value::ValKind;
     use mem::MaybeUninit;
     use semistr::SemiStr;
 
@@ -1441,7 +1441,7 @@ mod tests {
         let metadata = TableMetadata::new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("id"),
-                column_type: PreciseType::Int(4, false),
+                column_type: ValKind::I32,
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![IndexSpec {
@@ -1472,7 +1472,7 @@ mod tests {
         let metadata = TableMetadata::new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("id"),
-                column_type: PreciseType::Int(4, false),
+                column_type: ValKind::I32,
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![IndexSpec {
@@ -1499,12 +1499,12 @@ mod tests {
             vec![
                 ColumnSpec {
                     column_name: SemiStr::new("id"),
-                    column_type: PreciseType::Int(4, false),
+                    column_type: ValKind::I32,
                     column_attributes: ColumnAttributes::empty(),
                 },
                 ColumnSpec {
                     column_name: SemiStr::new("name"),
-                    column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                    column_type: ValKind::VarByte,
                     column_attributes: ColumnAttributes::empty(),
                 },
             ],
@@ -1558,27 +1558,27 @@ mod tests {
             vec![
                 ColumnSpec {
                     column_name: SemiStr::new("col1"),
-                    column_type: PreciseType::Int(1, true),
+                    column_type: ValKind::U8,
                     column_attributes: ColumnAttributes::empty(),
                 },
                 ColumnSpec {
                     column_name: SemiStr::new("col2"),
-                    column_type: PreciseType::Int(2, true),
+                    column_type: ValKind::U16,
                     column_attributes: ColumnAttributes::empty(),
                 },
                 ColumnSpec {
                     column_name: SemiStr::new("col3"),
-                    column_type: PreciseType::Int(4, true),
+                    column_type: ValKind::U32,
                     column_attributes: ColumnAttributes::empty(),
                 },
                 ColumnSpec {
                     column_name: SemiStr::new("col4"),
-                    column_type: PreciseType::Int(8, true),
+                    column_type: ValKind::U64,
                     column_attributes: ColumnAttributes::empty(),
                 },
                 ColumnSpec {
                     column_name: SemiStr::new("col5"),
-                    column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                    column_type: ValKind::VarByte,
                     column_attributes: ColumnAttributes::empty(),
                 },
             ],

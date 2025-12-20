@@ -1,11 +1,10 @@
 use crate::error::Result;
-use crate::serde::{Deser, Ser, SerdeCtx};
-use doradb_datatype::PreciseType;
-use doradb_datatype::konst::{ValidF32, ValidF64};
-use doradb_datatype::memcmp::{
+use crate::float::{ValidF32, ValidF64};
+use crate::memcmp::{
     BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
     SegmentedBytes,
 };
+use crate::serde::{Deser, Ser, SerdeCtx};
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
 use std::alloc::{Layout as AllocLayout, alloc, dealloc};
@@ -147,34 +146,6 @@ impl From<u8> for ValKind {
     #[inline]
     fn from(value: u8) -> Self {
         unsafe { mem::transmute(value) }
-    }
-}
-
-impl From<PreciseType> for ValKind {
-    #[inline]
-    fn from(value: PreciseType) -> Self {
-        match value {
-            PreciseType::Int(1, false) => ValKind::U8,
-            PreciseType::Int(1, true) => ValKind::I8,
-            PreciseType::Int(2, false) => ValKind::U16,
-            PreciseType::Int(2, true) => ValKind::I16,
-            PreciseType::Int(4, false) => ValKind::U32,
-            PreciseType::Int(4, true) => ValKind::I32,
-            PreciseType::Int(8, false) => ValKind::U64,
-            PreciseType::Int(8, true) => ValKind::I64,
-            PreciseType::Int(_, _) => unreachable!(),
-            PreciseType::Float(4) => ValKind::F32,
-            PreciseType::Float(8) => ValKind::F64,
-            PreciseType::Bool => ValKind::U8,
-            PreciseType::Decimal(_, _)
-            | PreciseType::Date
-            | PreciseType::Time(..)
-            | PreciseType::Datetime(..)
-            | PreciseType::Interval => todo!(),
-            PreciseType::Char(_, _) | PreciseType::Varchar(_, _) => ValKind::VarByte,
-            PreciseType::Compound => todo!(),
-            _ => todo!(),
-        }
     }
 }
 

@@ -10,6 +10,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
+use crate::catalog::{IndexSpec, TableID};
 use crate::file::table_file::TableFile;
 use crate::index::util::Maskable;
 use crate::index::{
@@ -28,12 +29,9 @@ use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo};
 use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoKind, UndoStatus};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
-use doradb_catalog::IndexSpec;
 use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
-
-pub use doradb_catalog::TableID;
 
 /// Table is a logical data set of rows.
 /// It combines components such as row page, undo map, block index, secondary
