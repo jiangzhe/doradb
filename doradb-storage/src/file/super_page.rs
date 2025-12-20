@@ -416,16 +416,16 @@ impl Deser for SuperPageBlockIndexDeser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::file::table_file::ActiveRoot;
-    use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use doradb_datatype::PreciseType;
+    use crate::value::ValKind;
 
     #[test]
     fn test_active_root_serde() {
         let metadata = TableMetadata::new(
             vec![
-                ColumnSpec::new("c0", PreciseType::Int(4, true), ColumnAttributes::empty()),
-                ColumnSpec::new("c1", PreciseType::Int(8, true), ColumnAttributes::NULLABLE),
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
             ],
             vec![IndexSpec::new(
                 "idx1",

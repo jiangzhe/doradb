@@ -4,16 +4,16 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
-use doradb_catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableSpec,
-};
-use doradb_datatype::{Collation, PreciseType};
 use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig};
+use doradb_storage::catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableID,
+    TableSpec,
+};
 use doradb_storage::engine::{Engine, EngineConfig, EngineRef};
-use doradb_storage::table::TableID;
 use doradb_storage::trx::log::LogSync;
 use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::Val;
+use doradb_storage::value::ValKind;
 use easy_parallel::Parallel;
 use semistr::SemiStr;
 use std::str::FromStr;
@@ -270,22 +270,22 @@ pub async fn sbtest(engine: &Engine) -> TableID {
                 columns: vec![
                     ColumnSpec {
                         column_name: SemiStr::new("id"),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     ColumnSpec {
                         column_name: SemiStr::new("k"),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     ColumnSpec {
                         column_name: SemiStr::new("c"),
-                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     ColumnSpec {
                         column_name: SemiStr::new("pad"),
-                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::empty(),
                     },
                 ],

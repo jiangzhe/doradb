@@ -1,11 +1,10 @@
 use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::catalog::TableMetadata;
+use crate::catalog::{TableID, TableMetadata};
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
 use crate::stmt::Statement;
-use crate::table::TableID;
 use crate::trx::recover::RecoverMap;
 use crate::trx::undo::{
     IndexBranch, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRef,

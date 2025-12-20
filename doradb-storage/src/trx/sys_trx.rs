@@ -1,9 +1,9 @@
 use crate::buffer::page::PageID;
+use crate::catalog::TableID;
 use crate::row::RowID;
 use crate::serde::{LenPrefixPod, SerdeCtx};
 use crate::trx::PreparedTrx;
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
-use doradb_catalog::TableID;
 use std::mem;
 
 /// SysTrx is a special kind of transaction only used for system

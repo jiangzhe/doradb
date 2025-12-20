@@ -1,4 +1,6 @@
 use crate::buffer::FixedBufferPool;
+use crate::catalog::IndexSpec;
+use crate::float::{ValidF32, ValidF64};
 use crate::index::btree::BTree;
 use crate::index::btree_key::{BTreeKey, BTreeKeyEncoder};
 use crate::index::non_unique_index::NonUniqueBTreeIndex;
@@ -6,8 +8,6 @@ use crate::index::unique_index::UniqueBTreeIndex;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use crate::value::{Val, ValKind, ValType};
-use doradb_catalog::IndexSpec;
-use doradb_datatype::konst::{ValidF32, ValidF64};
 use either::Either;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;

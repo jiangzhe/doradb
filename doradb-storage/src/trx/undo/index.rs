@@ -1,11 +1,10 @@
 use crate::buffer::BufferPool;
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, TableID};
 use crate::index::util::Maskable;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage, RowRead};
-use crate::table::TableID;
 use crate::trx::TrxID;
 
 #[derive(Default)]

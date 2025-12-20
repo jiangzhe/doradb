@@ -2,16 +2,16 @@ use crate::buffer::BufferPool;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::{IndexColumnObject, IndexObject};
 use crate::catalog::table::TableMetadata;
+use crate::catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKey, IndexOrder, IndexSpec,
+    TableID,
+};
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
 use crate::table::{Table, TableAccess};
 use crate::value::Val;
-use doradb_catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKey, IndexOrder, IndexSpec,
-    TableID,
-};
-use doradb_datatype::{Collation, PreciseType};
+use crate::value::ValKind;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
@@ -41,25 +41,25 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
                     // index_id bigint primary key not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_ID),
-                        column_type: PreciseType::Int(8, false),
+                        column_type: ValKind::I64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // table_id bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEXES_TABLE_ID),
-                        column_type: PreciseType::Int(8, false),
+                        column_type: ValKind::I64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // index_name string unique not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_NAME),
-                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     // index_attributes integer not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_ATTRIBUTES),
-                        column_type: PreciseType::Int(4, false),
+                        column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     },
                 ],
@@ -170,31 +170,31 @@ pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
                     // column_id bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_COLUMN_ID),
-                        column_type: PreciseType::Int(8, false),
+                        column_type: ValKind::I64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // index_id bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_ID),
-                        column_type: PreciseType::Int(8, false),
+                        column_type: ValKind::I64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // column_no smallint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_COLUMN_NO),
-                        column_type: PreciseType::Int(2, false),
+                        column_type: ValKind::I16,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     // index_column_no smallint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO),
-                        column_type: PreciseType::Int(2, false),
+                        column_type: ValKind::I16,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     // descending boolean not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_ORDER),
-                        column_type: PreciseType::Bool,
+                        column_type: ValKind::U8,
                         column_attributes: ColumnAttributes::empty(),
                     },
                 ],

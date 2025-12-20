@@ -1,11 +1,8 @@
 [workspace]
 members = [
-    "doradb-datatype",
-    "doradb-catalog",
     "doradb-storage",
 ]
 resolver = "2"
-exclude = ["doradb-bench"]
 
 [profile.release]
 debug = true

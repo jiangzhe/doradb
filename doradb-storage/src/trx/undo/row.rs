@@ -1,10 +1,10 @@
 use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
+use crate::catalog::TableID;
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
-use crate::table::TableID;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};

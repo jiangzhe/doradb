@@ -1,3 +1,4 @@
+use crate::catalog::TableID;
 use crate::catalog::table::TableMetadata;
 use crate::error::Result;
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
@@ -5,7 +6,6 @@ use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE, TableFile}
 use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
 use crate::io::{AIOClient, AIOContext};
 use crate::lifetime::StaticLifetime;
-use doradb_catalog::TableID;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::thread::JoinHandle;

@@ -1,6 +1,7 @@
-use doradb_catalog::{ColumnAttributes, IndexAttributes, IndexOrder};
-use doradb_catalog::{ColumnID, IndexID, SchemaID, TableID};
-use doradb_datatype::PreciseType;
+use crate::catalog::{
+    ColumnAttributes, ColumnID, IndexAttributes, IndexID, IndexOrder, SchemaID, TableID,
+};
+use crate::value::ValKind;
 use semistr::SemiStr;
 
 #[derive(Debug)]
@@ -22,7 +23,7 @@ pub struct ColumnObject {
     pub table_id: TableID,
     pub column_name: SemiStr,
     pub column_no: u16,
-    pub column_type: PreciseType,
+    pub column_type: ValKind,
     pub column_attributes: ColumnAttributes,
 }
 

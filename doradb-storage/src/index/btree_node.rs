@@ -9,9 +9,9 @@ use crate::index::btree_value::{
     BTREE_VALUE_PACK_MAX_LEN, BTreeU64, BTreeValue, BTreeValuePackable,
 };
 use crate::index::util::Maskable;
+use crate::memcmp::BytesExtendable;
 use crate::row::RowID;
 use crate::trx::TrxID;
-use doradb_datatype::memcmp::BytesExtendable;
 use std::alloc::{Layout, alloc_zeroed};
 use std::cmp;
 use std::cmp::Ordering;

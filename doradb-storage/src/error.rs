@@ -1,5 +1,4 @@
 use crate::io::AIOError;
-use doradb_datatype::error::Error as DataTypeError;
 use std::array::TryFromSliceError;
 use std::ops::ControlFlow;
 use thiserror::Error;
@@ -78,16 +77,6 @@ impl From<TryFromSliceError> for Error {
     #[inline]
     fn from(_src: TryFromSliceError) -> Error {
         Error::InvalidFormat
-    }
-}
-
-impl From<DataTypeError> for Error {
-    #[inline]
-    fn from(src: DataTypeError) -> Self {
-        match src {
-            DataTypeError::InvalidFormat => Error::InvalidFormat,
-            DataTypeError::IOError => Error::IOError,
-        }
     }
 }
 

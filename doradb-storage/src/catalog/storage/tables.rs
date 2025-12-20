@@ -2,15 +2,15 @@ use crate::buffer::BufferPool;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::TableMetadata;
+use crate::catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableID,
+};
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
 use crate::table::{Table, TableAccess};
 use crate::value::Val;
-use doradb_catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableID,
-};
-use doradb_datatype::{Collation, PreciseType};
+use crate::value::ValKind;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
@@ -36,19 +36,19 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                     // table_id bigint primary key not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_TABLES_TABLE_ID),
-                        column_type: PreciseType::Int(8, false),
+                        column_type: ValKind::I64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // schema_id bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_TABLES_SCHEMA_ID),
-                        column_type: PreciseType::Int(8, false),
+                        column_type: ValKind::I64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // table_name string not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_TABLES_TABLE_NAME),
-                        column_type: PreciseType::Varchar(255, Collation::Utf8mb4),
+                        column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                 ],

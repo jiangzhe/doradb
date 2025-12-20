@@ -1,9 +1,9 @@
+use crate::catalog::spec::{ColumnAttributes, ColumnSpec, IndexSpec};
 use crate::error::Result;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::value::{Layout, Val, ValKind, ValType};
-use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexSpec};
 use semistr::SemiStr;
 use std::collections::HashSet;
 
@@ -256,15 +256,14 @@ fn layout_match(val: &Val, layout: Layout) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use doradb_catalog::{ColumnSpec, IndexAttributes, IndexKey};
-    use doradb_datatype::PreciseType;
+    use crate::catalog::{ColumnSpec, IndexAttributes, IndexKey};
 
     #[test]
     fn test_table_metadata_serde() {
         let metadata = TableMetadata::new(
             vec![
-                ColumnSpec::new("c0", PreciseType::Int(4, true), ColumnAttributes::empty()),
-                ColumnSpec::new("c1", PreciseType::Int(8, true), ColumnAttributes::NULLABLE),
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
             ],
             vec![IndexSpec::new(
                 "idx1",

@@ -2,15 +2,14 @@ use crate::buffer::page::PageID;
 use crate::catalog::{
     ColumnObject, IndexColumnObject, IndexObject, SchemaObject, TableMetadata, TableObject,
 };
+use crate::catalog::{IndexSpec, SchemaID, TableID, TableSpec};
 use crate::engine::EngineRef;
 use crate::error::{Error, Result};
 use crate::index::BlockIndex;
 use crate::row::RowID;
 use crate::table::Table;
-use crate::table::TableID;
 use crate::trx::redo::DDLRedo;
 use crate::trx::{ActiveTrx, TrxID};
-use doradb_catalog::{IndexSpec, SchemaID, TableSpec};
 use parking_lot::Mutex;
 use semistr::SemiStr;
 use std::collections::HashMap;

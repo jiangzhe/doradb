@@ -10,8 +10,6 @@ categories = ["database-implementations"]
 repository = "https://github.com/jiangzhe/doradb/doradb-storage/"
 
 [dependencies]
-doradb-datatype = { version = "0.1.0", path = "../doradb-datatype" }
-doradb-catalog = { version = "0.1.0", path = "../doradb-catalog" }
 smallvec = {version = "1.8", features = ["union"]}
 thiserror = "1.0"
 bitflags = "1.3"

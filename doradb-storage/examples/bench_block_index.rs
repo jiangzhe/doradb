@@ -1,11 +1,12 @@
 use clap::Parser;
-use doradb_catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-use doradb_datatype::PreciseType;
 use doradb_storage::buffer::EvictableBufferPoolConfig;
-use doradb_storage::catalog::TableMetadata;
+use doradb_storage::catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+};
 use doradb_storage::engine::EngineConfig;
 use doradb_storage::index::{BlockIndex, RowLocation};
 use doradb_storage::trx::sys_conf::TrxSysConfig;
+use doradb_storage::value::ValKind;
 use parking_lot::RwLock;
 use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
 use perfcnt::{AbstractPerfCounter, PerfCounter};
@@ -37,7 +38,7 @@ fn main() {
             let metadata = TableMetadata::new(
                 vec![ColumnSpec {
                     column_name: SemiStr::new("id"),
-                    column_type: PreciseType::Int(4, false),
+                    column_type: ValKind::I32,
                     column_attributes: ColumnAttributes::INDEX,
                 }],
                 vec![IndexSpec::new(
