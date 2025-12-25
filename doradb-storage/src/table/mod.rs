@@ -637,14 +637,7 @@ impl Table {
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
         for v in &cols {
-            match v {
-                Val::Null => new_row.add_null(),
-                Val::Byte1(v1) => new_row.add_val(*v1),
-                Val::Byte2(v2) => new_row.add_val(*v2),
-                Val::Byte4(v4) => new_row.add_val(*v4),
-                Val::Byte8(v8) => new_row.add_val(*v8),
-                Val::VarByte(var) => new_row.add_var(var.as_bytes()),
-            }
+            new_row.add_col(v);
         }
         let new_row_id = new_row.finish();
         debug_assert!(new_row_id == row_id);

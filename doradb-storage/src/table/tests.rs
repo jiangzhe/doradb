@@ -652,7 +652,7 @@ fn test_row_page_scan_rows_uncommitted() {
         {
             let mut res_len = 0usize;
             sys.table
-                .table_scan_uncommitted(sys.engine.data_pool, |_row| {
+                .table_scan_uncommitted(sys.engine.data_pool, 0, |_row| {
                     res_len += 1;
                     true
                 })

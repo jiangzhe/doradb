@@ -1,10 +1,10 @@
-use crate::error::Result;
-use crate::float::{ValidF32, ValidF64};
+use crate::error::{Error, Result};
 use crate::memcmp::{
     BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
     SegmentedBytes,
 };
 use crate::serde::{Deser, Ser, SerdeCtx};
+use ordered_float::OrderedFloat;
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
 use std::alloc::{Layout as AllocLayout, alloc, dealloc};
@@ -12,7 +12,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::*;
 
 pub const PAGE_VAR_HEADER: usize = 8;
 pub const PAGE_VAR_LEN_INLINE: usize = 6;
@@ -84,11 +84,12 @@ impl Deser for ValType {
     fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let idx = start_idx;
         let (idx, kind) = ctx.deser_u8(data, idx)?;
+        let kind = ValKind::try_from(kind)?;
         let (idx, nullable) = ctx.deser_u8(data, idx)?;
         Ok((
             idx,
             ValType {
-                kind: ValKind::from(kind),
+                kind,
                 nullable: nullable != 0,
             },
         ))
@@ -103,33 +104,30 @@ pub enum ValKind {
     U16 = 4,
     I32 = 5,
     U32 = 6,
-    I64 = 7,
-    U64 = 8,
-    F32 = 9,
+    F32 = 7,
+    I64 = 8,
+    U64 = 9,
     F64 = 10,
     VarByte = 11,
 }
 
 impl ValKind {
     #[inline]
-    pub fn layout(self) -> Layout {
+    pub const fn inline_len(self) -> usize {
         match self {
-            ValKind::I8 | ValKind::U8 => Layout::Byte1,
-            ValKind::I16 | ValKind::U16 => Layout::Byte2,
-            ValKind::I32 | ValKind::U32 | ValKind::F32 => Layout::Byte4,
-            ValKind::I64 | ValKind::U64 | ValKind::F64 => Layout::Byte8,
-            ValKind::VarByte => Layout::VarByte,
+            ValKind::I8 | ValKind::U8 => 1,
+            ValKind::I16 | ValKind::U16 => 2,
+            ValKind::I32 | ValKind::U32 | ValKind::F32 => 4,
+            ValKind::I64 | ValKind::U64 | ValKind::F64 => 8,
+            // 2-byte len, 2-byte offset, 4-byte prefix
+            // or inline version, 2-byte len, at most 6 inline bytes
+            ValKind::VarByte => 8,
         }
     }
 
     #[inline]
-    pub fn inline_len(self) -> usize {
-        self.layout().inline_len()
-    }
-
-    #[inline]
     pub fn is_fixed(self) -> bool {
-        self.layout().is_fixed()
+        !matches!(self, ValKind::VarByte)
     }
 
     /// Create a value type with nullable setting.
@@ -142,62 +140,25 @@ impl ValKind {
     }
 }
 
-impl From<u8> for ValKind {
+impl TryFrom<u8> for ValKind {
+    type Error = Error;
     #[inline]
-    fn from(value: u8) -> Self {
-        unsafe { mem::transmute(value) }
-    }
-}
-
-/// Layout defines the memory layout of columns
-/// stored in row page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Layout {
-    Byte1, // i8, u8, bool, char(1) with ascii/latin charset
-    Byte2, // i16, u16, decimal(1-2)
-    Byte4, // i32, u32, f32, decimal(3-8)
-    Byte8, // i64, u64, f64, decimal(9-18)
-    // Byte16,  // decimal(19-38)
-    VarByte, // bytes, string, no more than 60k.
-}
-
-impl Layout {
-    #[inline]
-    pub const fn inline_len(&self) -> usize {
-        match self {
-            Layout::Byte1 => 1,
-            Layout::Byte2 => 2,
-            Layout::Byte4 => 4,
-            Layout::Byte8 => 8,
-            // Layout::Byte16 => 16,
-            // 2-byte len, 2-byte offset, 4-byte prefix
-            // or inline version, 2-byte len, at most 6 inline bytes
-            Layout::VarByte => 8,
-        }
-    }
-
-    #[inline]
-    pub fn is_fixed(&self) -> bool {
-        !matches!(self, Layout::VarByte)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ValCode {
-    Null = 0,
-    Byte1 = 1,
-    Byte2 = 2,
-    Byte4 = 3,
-    Byte8 = 4,
-    VarByte = 5,
-}
-
-impl From<u8> for ValCode {
-    #[inline]
-    fn from(value: u8) -> Self {
-        unsafe { mem::transmute(value) }
+    fn try_from(value: u8) -> Result<Self> {
+        let res = match value {
+            1 => ValKind::I8,
+            2 => ValKind::U8,
+            3 => ValKind::I16,
+            4 => ValKind::U16,
+            5 => ValKind::I32,
+            6 => ValKind::U32,
+            7 => ValKind::F32,
+            8 => ValKind::I64,
+            9 => ValKind::U64,
+            10 => ValKind::F64,
+            11 => ValKind::VarByte,
+            _ => return Err(Error::InvalidFormat),
+        };
+        Ok(res)
     }
 }
 
@@ -208,10 +169,16 @@ impl From<u8> for ValCode {
 pub enum Val {
     #[default]
     Null,
-    Byte1(Byte1Val),
-    Byte2(Byte2Val),
-    Byte4(Byte4Val),
-    Byte8(Byte8Val),
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    F32(OrderedFloat<f32>),
+    I64(i64),
+    U64(u64),
+    F64(OrderedFloat<f64>),
     VarByte(MemVar),
 }
 
@@ -223,10 +190,16 @@ impl PartialEq for Val {
     fn eq(&self, rhs: &Self) -> bool {
         match (self, rhs) {
             (Val::Null, Val::Null) => true,
-            (Val::Byte1(l), Val::Byte1(r)) => l == r,
-            (Val::Byte2(l), Val::Byte2(r)) => l == r,
-            (Val::Byte4(l), Val::Byte4(r)) => l == r,
-            (Val::Byte8(l), Val::Byte8(r)) => l == r,
+            (Val::I8(l), Val::I8(r)) => l == r,
+            (Val::U8(l), Val::U8(r)) => l == r,
+            (Val::I16(l), Val::I16(r)) => l == r,
+            (Val::U16(l), Val::U16(r)) => l == r,
+            (Val::I32(l), Val::I32(r)) => l == r,
+            (Val::U32(l), Val::U32(r)) => l == r,
+            (Val::F32(l), Val::F32(r)) => l == r,
+            (Val::I64(l), Val::I64(r)) => l == r,
+            (Val::U64(l), Val::U64(r)) => l == r,
+            (Val::F64(l), Val::F64(r)) => l == r,
             (Val::VarByte(l), Val::VarByte(r)) => l.as_bytes() == r.as_bytes(),
             _ => false,
         }
@@ -238,10 +211,16 @@ impl Hash for Val {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             Val::Null => state.write_u64(0),
-            Val::Byte1(v) => state.write_u64(*v as u64),
-            Val::Byte2(v) => state.write_u64(*v as u64),
-            Val::Byte4(v) => state.write_u64(*v as u64),
-            Val::Byte8(v) => state.write_u64(*v),
+            Val::I8(v) => state.write_i8(*v),
+            Val::U8(v) => state.write_u8(*v),
+            Val::I16(v) => state.write_i16(*v),
+            Val::U16(v) => state.write_u16(*v),
+            Val::I32(v) => state.write_i32(*v),
+            Val::U32(v) => state.write_u32(*v),
+            Val::F32(v) => state.write_u32(v.to_bits()),
+            Val::I64(v) => state.write_i64(*v),
+            Val::U64(v) => state.write_u64(*v),
+            Val::F64(v) => state.write_u64(v.to_bits()),
             Val::VarByte(var) => state.write(var.as_bytes()),
         }
     }
@@ -256,7 +235,7 @@ impl Val {
     #[inline]
     pub fn as_u8(&self) -> Option<u8> {
         match self {
-            Val::Byte1(v) => Some(*v),
+            Val::U8(v) => Some(*v),
             _ => None,
         }
     }
@@ -264,7 +243,7 @@ impl Val {
     #[inline]
     pub fn as_i8(&self) -> Option<i8> {
         match self {
-            Val::Byte1(v) => Some(*v as i8),
+            Val::I8(v) => Some(*v),
             _ => None,
         }
     }
@@ -272,7 +251,7 @@ impl Val {
     #[inline]
     pub fn as_u16(&self) -> Option<u16> {
         match self {
-            Val::Byte2(v) => Some(*v),
+            Val::U16(v) => Some(*v),
             _ => None,
         }
     }
@@ -280,7 +259,7 @@ impl Val {
     #[inline]
     pub fn as_i16(&self) -> Option<i16> {
         match self {
-            Val::Byte2(v) => Some(*v as i16),
+            Val::I16(v) => Some(*v),
             _ => None,
         }
     }
@@ -288,7 +267,7 @@ impl Val {
     #[inline]
     pub fn as_i32(&self) -> Option<i32> {
         match self {
-            Val::Byte4(v) => Some(*v as i32),
+            Val::I32(v) => Some(*v),
             _ => None,
         }
     }
@@ -296,7 +275,7 @@ impl Val {
     #[inline]
     pub fn as_u32(&self) -> Option<u32> {
         match self {
-            Val::Byte4(v) => Some(*v),
+            Val::U32(v) => Some(*v),
             _ => None,
         }
     }
@@ -304,7 +283,7 @@ impl Val {
     #[inline]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
-            Val::Byte8(v) => Some(*v as i64),
+            Val::I64(v) => Some(*v),
             _ => None,
         }
     }
@@ -312,39 +291,23 @@ impl Val {
     #[inline]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
-            Val::Byte8(v) => Some(*v),
+            Val::U64(v) => Some(*v),
             _ => None,
         }
     }
 
     #[inline]
-    pub fn as_valid_f32(&self) -> Option<ValidF32> {
+    pub fn as_f32(&self) -> Option<OrderedFloat<f32>> {
         match self {
-            Val::Byte4(v) => ValidF32::new(f32::from_bits(*v)),
+            Val::F32(v) => Some(*v),
             _ => None,
         }
     }
 
     #[inline]
-    pub fn as_f32(&self) -> Option<f32> {
+    pub fn as_f64(&self) -> Option<OrderedFloat<f64>> {
         match self {
-            Val::Byte4(v) => Some(f32::from_bits(*v)),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn as_valid_f64(&self) -> Option<ValidF64> {
-        match self {
-            Val::Byte8(v) => ValidF64::new(f64::from_bits(*v)),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Val::Byte8(v) => Some(f64::from_bits(*v)),
+            Val::F64(v) => Some(*v),
             _ => None,
         }
     }
@@ -372,6 +335,31 @@ impl Val {
         } else {
             self.encode_mcf(ty.kind, buf);
         }
+    }
+
+    #[inline]
+    pub fn kind(&self) -> Option<ValKind> {
+        let kind = match self {
+            Val::Null => return None,
+            Val::I8(_) => ValKind::I8,
+            Val::U8(_) => ValKind::U8,
+            Val::I16(_) => ValKind::I16,
+            Val::U16(_) => ValKind::U16,
+            Val::I32(_) => ValKind::I32,
+            Val::U32(_) => ValKind::U32,
+            Val::F32(_) => ValKind::F32,
+            Val::I64(_) => ValKind::I64,
+            Val::U64(_) => ValKind::U64,
+            Val::F64(_) => ValKind::F64,
+            Val::VarByte(_) => ValKind::VarByte,
+        };
+        Some(kind)
+    }
+
+    #[inline]
+    pub fn matches_kind(&self, kind: ValKind) -> bool {
+        // null matches all types.
+        self.kind().map(|k| k == kind).unwrap_or(true)
     }
 
     #[inline]
@@ -423,70 +411,70 @@ impl fmt::Debug for Val {
 impl From<u8> for Val {
     #[inline]
     fn from(value: u8) -> Self {
-        Val::Byte1(value)
+        Val::U8(value)
     }
 }
 
 impl From<i8> for Val {
     #[inline]
     fn from(value: i8) -> Self {
-        Val::Byte1(value as u8)
+        Val::I8(value)
     }
 }
 
 impl From<u16> for Val {
     #[inline]
     fn from(value: u16) -> Self {
-        Val::Byte2(value)
+        Val::U16(value)
     }
 }
 
 impl From<i16> for Val {
     #[inline]
     fn from(value: i16) -> Self {
-        Val::Byte2(value as u16)
+        Val::I16(value)
     }
 }
 
 impl From<u32> for Val {
     #[inline]
     fn from(value: u32) -> Self {
-        Val::Byte4(value)
+        Val::U32(value)
     }
 }
 
 impl From<i32> for Val {
     #[inline]
     fn from(value: i32) -> Self {
-        Val::Byte4(value as u32)
-    }
-}
-
-impl From<u64> for Val {
-    #[inline]
-    fn from(value: u64) -> Self {
-        Val::Byte8(value)
-    }
-}
-
-impl From<i64> for Val {
-    #[inline]
-    fn from(value: i64) -> Self {
-        Val::Byte8(value as u64)
+        Val::I32(value)
     }
 }
 
 impl From<f32> for Val {
     #[inline]
     fn from(value: f32) -> Self {
-        Val::Byte4(value.to_bits())
+        Val::F32(OrderedFloat(value))
+    }
+}
+
+impl From<u64> for Val {
+    #[inline]
+    fn from(value: u64) -> Self {
+        Val::U64(value)
+    }
+}
+
+impl From<i64> for Val {
+    #[inline]
+    fn from(value: i64) -> Self {
+        Val::I64(value)
     }
 }
 
 impl From<f64> for Val {
     #[inline]
     fn from(value: f64) -> Self {
-        Val::Byte8(value.to_bits())
+        Val::F64(OrderedFloat(value))
     }
 }
 
@@ -521,13 +509,13 @@ impl From<Vec<u8>> for Val {
 impl Ser<'_> for Val {
     #[inline]
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
-        mem::size_of::<ValCode>()
+        mem::size_of::<u8>()
             + match self {
                 Val::Null => 0, // null is encoded with code only.
-                Val::Byte1(_) => 1,
-                Val::Byte2(_) => 2,
-                Val::Byte4(_) => 4,
-                Val::Byte8(_) => 8,
+                Val::I8(_) | Val::U8(_) => 1,
+                Val::I16(_) | Val::U16(_) => 2,
+                Val::I32(_) | Val::U32(_) | Val::F32(_) => 4,
+                Val::I64(_) | Val::U64(_) | Val::F64(_) => 8,
                 Val::VarByte(v) => mem::size_of::<u16>() + v.len(),
             }
     }
@@ -535,68 +523,80 @@ impl Ser<'_> for Val {
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
         debug_assert!(start_idx + self.ser_len(ctx) <= out.len());
-        let mut idx = start_idx;
+        let code = self.kind().map(|k| k as u8).unwrap_or(0);
+        let idx = ctx.ser_u8(out, start_idx, code);
         match self {
-            Val::Null => {
-                out[idx] = ValCode::Null as u8;
-                idx += 1;
-            }
-            Val::Byte1(v) => {
-                out[idx] = ValCode::Byte1 as u8;
-                out[idx + 1] = *v;
-                idx += 2;
-            }
-            Val::Byte2(v) => {
-                out[idx] = ValCode::Byte2 as u8;
-                out[idx + 1..idx + 3].copy_from_slice(&v.to_le_bytes());
-                idx += 3;
-            }
-            Val::Byte4(v) => {
-                out[idx] = ValCode::Byte4 as u8;
-                out[idx + 1..idx + 5].copy_from_slice(&v.to_le_bytes());
-                idx += 5;
-            }
-            Val::Byte8(v) => {
-                out[idx] = ValCode::Byte8 as u8;
-                out[idx + 1..idx + 9].copy_from_slice(&v.to_le_bytes());
-                idx += 9;
-            }
+            Val::Null => idx,
+            Val::I8(v) => ctx.ser_i8(out, idx, *v),
+            Val::U8(v) => ctx.ser_u8(out, idx, *v),
+            Val::I16(v) => ctx.ser_i16(out, idx, *v),
+            Val::U16(v) => ctx.ser_u16(out, idx, *v),
+            Val::I32(v) => ctx.ser_i32(out, idx, *v),
+            Val::U32(v) => ctx.ser_u32(out, idx, *v),
+            Val::F32(v) => ctx.ser_f32(out, idx, v.0),
+            Val::I64(v) => ctx.ser_i64(out, idx, *v),
+            Val::U64(v) => ctx.ser_u64(out, idx, *v),
+            Val::F64(v) => ctx.ser_f64(out, idx, v.0),
             Val::VarByte(v) => {
-                out[idx] = ValCode::VarByte as u8;
-                out[idx + 1..idx + 3].copy_from_slice(&(v.len() as u16).to_le_bytes());
-                out[idx + 3..idx + 3 + v.len()].copy_from_slice(v.as_bytes());
-                idx += 3 + v.len();
+                let idx = ctx.ser_u16(out, idx, v.len() as u16);
+                out[idx..idx + v.len()].copy_from_slice(v.as_bytes());
+                idx + v.len()
             }
         }
-        idx
     }
 }
 
 impl Deser for Val {
     #[inline]
-    fn deser(_ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let mut idx = start_idx;
-        let code = ValCode::from(input[idx]);
-        idx += 1;
-        match code {
-            ValCode::Null => Ok((idx, Val::Null)),
-            ValCode::Byte1 => {
-                let v = Byte1Val::from(input[idx]);
-                Ok((idx + 1, Val::Byte1(v)))
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        let c = input[start_idx];
+        let idx = start_idx + 1;
+        if c == 0 {
+            return Ok((idx, Val::Null));
+        }
+        let kind = ValKind::try_from(c)?;
+        match kind {
+            ValKind::I8 => {
+                let (idx, v) = ctx.deser_i8(input, idx)?;
+                Ok((idx, Val::I8(v)))
             }
-            ValCode::Byte2 => {
-                let v = Byte2Val::from_le_bytes(input[idx..idx + 2].try_into()?);
-                Ok((idx + 2, Val::Byte2(v)))
+            ValKind::U8 => {
+                let (idx, v) = ctx.deser_u8(input, idx)?;
+                Ok((idx, Val::U8(v)))
             }
-            ValCode::Byte4 => {
-                let v = Byte4Val::from_le_bytes(input[idx..idx + 4].try_into()?);
-                Ok((idx + 4, Val::Byte4(v)))
+            ValKind::I16 => {
+                let (idx, v) = ctx.deser_i16(input, idx)?;
+                Ok((idx, Val::I16(v)))
             }
-            ValCode::Byte8 => {
-                let v = Byte8Val::from_le_bytes(input[idx..idx + 8].try_into()?);
-                Ok((idx + 8, Val::Byte8(v)))
+            ValKind::U16 => {
+                let (idx, v) = ctx.deser_u16(input, idx)?;
+                Ok((idx, Val::U16(v)))
             }
-            ValCode::VarByte => {
+            ValKind::I32 => {
+                let (idx, v) = ctx.deser_i32(input, idx)?;
+                Ok((idx, Val::I32(v)))
+            }
+            ValKind::U32 => {
+                let (idx, v) = ctx.deser_u32(input, idx)?;
+                Ok((idx, Val::U32(v)))
+            }
+            ValKind::F32 => {
+                let (idx, v) = ctx.deser_f32(input, idx)?;
+                Ok((idx, Val::F32(OrderedFloat(v))))
+            }
+            ValKind::I64 => {
+                let (idx, v) = ctx.deser_i64(input, idx)?;
+                Ok((idx, Val::I64(v)))
+            }
+            ValKind::U64 => {
+                let (idx, v) = ctx.deser_u64(input, idx)?;
+                Ok((idx, Val::U64(v)))
+            }
+            ValKind::F64 => {
+                let (idx, v) = ctx.deser_f64(input, idx)?;
+                Ok((idx, Val::F64(OrderedFloat(v))))
+            }
+            ValKind::VarByte => {
                 let len = u16::from_le_bytes(input[idx..idx + 2].try_into()?);
                 let v = MemVar::from(&input[idx + 2..idx + 2 + len as usize]);
                 Ok((idx + 2 + len as usize, Val::VarByte(v)))
@@ -608,8 +608,6 @@ impl Deser for Val {
 /// Value is a marker trait to represent
 /// fixed-length column value in row page.
 pub(crate) trait Value: Sized {
-    const LAYOUT: Layout;
-
     /// Store self value into target position in atomic way.
     ///
     /// # Safety: This method is only used for atomic update on page.
@@ -621,181 +619,70 @@ pub(crate) trait Value: Sized {
     unsafe fn store(&self, ptr: *mut u8);
 }
 
-pub type Byte1Val = u8;
-pub trait Byte1ValSlice {
-    fn as_i8s(&self) -> &[i8];
+macro_rules! impl_value_fixed_size {
+    ($t:ty, $at:ident, $size:expr) => {
+        impl Value for $t {
+            #[inline]
+            unsafe fn atomic_store(&self, ptr: *const u8) {
+                debug_assert!((ptr as usize).is_multiple_of($size));
+                unsafe {
+                    let atom = $at::from_ptr(ptr as *mut u8 as *mut $t);
+                    atom.store(*self, Ordering::Release);
+                }
+            }
 
-    fn as_i8s_mut(&mut self) -> &mut [i8];
+            #[inline]
+            unsafe fn store(&self, ptr: *mut u8) {
+                unsafe {
+                    *(ptr as *mut $t) = *self;
+                }
+            }
+        }
+    };
 }
 
-impl Value for Byte1Val {
-    const LAYOUT: Layout = Layout::Byte1;
+impl_value_fixed_size!(i8, AtomicI8, 1);
+impl_value_fixed_size!(u8, AtomicU8, 1);
+impl_value_fixed_size!(i16, AtomicI16, 2);
+impl_value_fixed_size!(u16, AtomicU16, 2);
+impl_value_fixed_size!(i32, AtomicI32, 4);
+impl_value_fixed_size!(u32, AtomicU32, 4);
+impl_value_fixed_size!(i64, AtomicI64, 8);
+impl_value_fixed_size!(u64, AtomicU64, 8);
+
+impl Value for f32 {
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
+        debug_assert!((ptr as usize).is_multiple_of(4));
         unsafe {
-            let atom = AtomicU8::from_ptr(ptr as *mut _);
-            atom.store(*self, Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
-    unsafe fn store(&self, ptr: *mut u8) {
-        unsafe {
-            *ptr = *self;
-        }
-    }
-}
-
-impl Byte1ValSlice for [Byte1Val] {
-    #[inline]
-    fn as_i8s(&self) -> &[i8] {
-        unsafe { mem::transmute(self) }
-    }
-
-    #[inline]
-    fn as_i8s_mut(&mut self) -> &mut [i8] {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-pub type Byte2Val = u16;
-pub trait Byte2ValSlice {
-    fn as_i16s(&self) -> &[i16];
-
-    fn as_i16s_mut(&mut self) -> &mut [i16];
-}
-impl Value for Byte2Val {
-    const LAYOUT: Layout = Layout::Byte2;
-    #[inline]
-    unsafe fn atomic_store(&self, ptr: *const u8) {
-        unsafe {
-            debug_assert!((ptr as usize).is_multiple_of(2));
-            let atom = AtomicU16::from_ptr(ptr as *mut u8 as *mut u16);
-            atom.store(*self, Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
-    unsafe fn store(&self, ptr: *mut u8) {
-        unsafe {
-            *(ptr as *mut u16) = *self;
-        }
-    }
-}
-
-impl Byte2ValSlice for [Byte2Val] {
-    #[inline]
-    fn as_i16s(&self) -> &[i16] {
-        unsafe { mem::transmute(self) }
-    }
-
-    #[inline]
-    fn as_i16s_mut(&mut self) -> &mut [i16] {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-pub type Byte4Val = u32;
-pub trait Byte4ValSlice {
-    fn as_i32s(&self) -> &[i32];
-
-    fn as_i32s_mut(&mut self) -> &mut [i32];
-
-    fn as_f32s(&self) -> &[f32];
-
-    fn as_f32s_mut(&mut self) -> &mut [f32];
-}
-
-impl Value for Byte4Val {
-    const LAYOUT: Layout = Layout::Byte4;
-    #[inline]
-    unsafe fn atomic_store(&self, ptr: *const u8) {
-        unsafe {
-            debug_assert!((ptr as usize).is_multiple_of(4));
             let atom = AtomicU32::from_ptr(ptr as *mut u8 as *mut u32);
-            atom.store(*self, Ordering::Relaxed);
+            atom.store(self.to_bits(), Ordering::Release);
         }
     }
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
         unsafe {
-            *(ptr as *mut u32) = *self;
+            *(ptr as *mut u32) = self.to_bits();
         }
     }
 }
 
-impl Byte4ValSlice for [Byte4Val] {
-    #[inline]
-    fn as_i32s(&self) -> &[i32] {
-        unsafe { mem::transmute(self) }
-    }
-
-    #[inline]
-    fn as_i32s_mut(&mut self) -> &mut [i32] {
-        unsafe { mem::transmute(self) }
-    }
-
-    #[inline]
-    fn as_f32s(&self) -> &[f32] {
-        unsafe { mem::transmute(self) }
-    }
-
-    #[inline]
-    fn as_f32s_mut(&mut self) -> &mut [f32] {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-pub type Byte8Val = u64;
-pub trait Byte8ValSlice {
-    fn as_i64s(&self) -> &[i64];
-
-    fn as_i64s_mut(&mut self) -> &mut [i64];
-
-    fn as_f64s(&self) -> &[f64];
-
-    fn as_f64s_mut(&mut self) -> &mut [f64];
-}
-
-impl Value for Byte8Val {
-    const LAYOUT: Layout = Layout::Byte8;
+impl Value for f64 {
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
+        debug_assert!((ptr as usize).is_multiple_of(8));
         unsafe {
-            debug_assert!((ptr as usize).is_multiple_of(8));
             let atom = AtomicU64::from_ptr(ptr as *mut u8 as *mut u64);
-            atom.store(*self, Ordering::Relaxed);
+            atom.store(self.to_bits(), Ordering::Release);
         }
     }
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
         unsafe {
-            *(ptr as *mut u64) = *self;
+            *(ptr as *mut u64) = self.to_bits();
         }
-    }
-}
-
-impl Byte8ValSlice for [Byte8Val] {
-    #[inline]
-    fn as_i64s(&self) -> &[i64] {
-        unsafe { mem::transmute(self) }
-    }
-
-    #[inline]
-    fn as_i64s_mut(&mut self) -> &mut [i64] {
-        unsafe { mem::transmute(self) }
-    }
-
-    #[inline]
-    fn as_f64s(&self) -> &[f64] {
-        unsafe { mem::transmute(self) }
-    }
-
-    #[inline]
-    fn as_f64s_mut(&mut self) -> &mut [f64] {
-        unsafe { mem::transmute(self) }
     }
 }
 
@@ -1333,51 +1220,125 @@ mod tests {
         let val = Val::from(42u8);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
-        assert!(buf == b"\x01\x2a");
+        assert!(buf == b"\x02\x2a");
 
         let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(42u8));
+
+        // serialize and deserialize i8
+        let ctx = &mut SerdeCtx::default();
+        let val = Val::from(-42i8);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        // i8 code is 1, value -42 is 0xd6 in two's complement
+        assert!(buf == b"\x01\xd6");
+
+        let ctx = &mut SerdeCtx::default();
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(-42i8));
 
         // serialize and deserialize u16
         let ctx = &mut SerdeCtx::default();
         let val = Val::from(1200u16);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
-        assert!(buf == b"\x02\xb0\x04");
+        assert!(buf == b"\x04\xb0\x04");
 
         let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(1200u16));
+
+        // serialize and deserialize i16
+        let ctx = &mut SerdeCtx::default();
+        let val = Val::from(-1200i16);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        // i16 code is 3, value -1200 is 0xfb50 in two's complement (little-endian)
+        assert!(buf == b"\x03\x50\xfb");
+
+        let ctx = &mut SerdeCtx::default();
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(-1200i16));
 
         // serialize and deserialize u32
         let ctx = &mut SerdeCtx::default();
         let val = Val::from(0xdefcab12u32);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
-        assert!(buf == b"\x03\x12\xab\xfc\xde");
+        assert!(buf == b"\x06\x12\xab\xfc\xde");
 
         let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(0xdefcab12u32));
+
+        // serialize and deserialize i32
+        let ctx = &mut SerdeCtx::default();
+        let val = Val::from(-0x12345678i32);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        // i32 code is 5, value -0x12345678 is 0xedcba988 in two's complement (little-endian)
+        // -0x12345678 = 0xedcba988
+        assert!(buf == b"\x05\x88\xa9\xcb\xed");
+
+        let ctx = &mut SerdeCtx::default();
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(-0x12345678i32));
 
         // serialize and deserialize u64
         let ctx = &mut SerdeCtx::default();
         let val = Val::from(0x1234567890abcdefu64);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
-        assert!(buf == b"\x04\xef\xcd\xab\x90\x78\x56\x34\x12");
+        assert!(buf == b"\x09\xef\xcd\xab\x90\x78\x56\x34\x12");
 
         let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
         assert!(val == Val::from(0x1234567890abcdefu64));
+
+        // serialize and deserialize i64
+        let ctx = &mut SerdeCtx::default();
+        let val = Val::from(-0x1234567890abcdefi64);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        // i64 code is 8, value -0x1234567890abcdef is 0xedcba9876f543211 in two's complement (little-endian)
+        // -0x1234567890abcdef = 0xedcba9876f543211
+        assert!(buf == b"\x08\x11\x32\x54\x6f\x87\xa9\xcb\xed");
+
+        let ctx = &mut SerdeCtx::default();
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(-0x1234567890abcdefi64));
+
+        // serialize and deserialize f32
+        let ctx = &mut SerdeCtx::default();
+        let val = Val::from(3.14f32);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        // f32 code is 7, value 3.14f32 bits: 0x4048f5c3
+        assert!(buf == b"\x07\xc3\xf5\x48\x40");
+
+        let ctx = &mut SerdeCtx::default();
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(3.14f32));
+
+        // serialize and deserialize f64
+        let ctx = &mut SerdeCtx::default();
+        let val = Val::from(3.141592653589793f64);
+        let mut buf = vec![0; val.ser_len(ctx)];
+        val.ser(ctx, &mut buf, 0);
+        // f64 code is 10, value 3.141592653589793 bits: 0x400921fb54442d18
+        assert!(buf == b"\x0a\x18\x2d\x44\x54\xfb\x21\x09\x40");
+
+        let ctx = &mut SerdeCtx::default();
+        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        assert!(val == Val::from(3.141592653589793f64));
 
         // serialize and deserialize bytes
         let ctx = &mut SerdeCtx::default();
         let val = Val::from(&b"hello"[..]);
         let mut buf = vec![0; val.ser_len(ctx)];
         val.ser(ctx, &mut buf, 0);
-        assert!(buf == b"\x05\x05\x00\x68\x65\x6c\x6c\x6f");
+        assert!(buf == b"\x0b\x05\x00\x68\x65\x6c\x6c\x6f");
 
         let ctx = &mut SerdeCtx::default();
         let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
@@ -1475,30 +1436,30 @@ mod tests {
     fn test_val_hash() {
         use std::hash::DefaultHasher;
         let hash1 = {
-            let v1 = Val::Byte1(1);
+            let v1 = Val::U8(1);
             let mut h = DefaultHasher::new();
             v1.hash(&mut h);
             h.finish()
         };
         let hash2 = {
-            let v1 = Val::Byte2(1);
+            let v1 = Val::U16(1);
             let mut h = DefaultHasher::new();
             v1.hash(&mut h);
             h.finish()
         };
         let hash3 = {
-            let v1 = Val::Byte4(1);
+            let v1 = Val::U32(1);
             let mut h = DefaultHasher::new();
             v1.hash(&mut h);
             h.finish()
         };
         let hash4 = {
-            let v1 = Val::Byte8(1);
+            let v1 = Val::U64(1);
             let mut h = DefaultHasher::new();
             v1.hash(&mut h);
             h.finish()
         };
-        assert!(hash1 == hash2 && hash1 == hash3 && hash1 == hash4);
+        assert!(hash1 != hash2 && hash1 != hash3 && hash1 != hash4);
 
         let hash5 = {
             let v1 = Val::VarByte(MemVar::inline(b"hello"));

@@ -33,6 +33,7 @@ async-lock = "3"
 futures = "0.3"
 scopeguard = "1.2"
 blake3 = "1.8"
+ordered-float = {version = "5.1", features = ["serde"] }
 
 [features]
 default = []

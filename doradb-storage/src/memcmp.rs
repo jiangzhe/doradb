@@ -1368,7 +1368,7 @@ mod tests {
 
         // empty key
         let k3 = MemCmpKey::empty();
-        assert_eq!(k3.as_bytes(), &[]);
+        assert_eq!(k3.as_bytes(), b"");
 
         // zeroed key
         let k4 = MemCmpKey::zeroed(10);

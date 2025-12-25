@@ -33,16 +33,16 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
             table_id: TABLE_ID_TABLES,
             metadata: TableMetadata::new(
                 vec![
-                    // table_id bigint primary key not null
+                    // table_id unsigned bigint primary key not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_TABLES_TABLE_ID),
-                        column_type: ValKind::I64,
+                        column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
-                    // schema_id bigint not null
+                    // schema_id unsigned bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_TABLES_SCHEMA_ID),
-                        column_type: ValKind::I64,
+                        column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // table_name string not null

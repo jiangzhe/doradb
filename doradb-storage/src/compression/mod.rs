@@ -183,15 +183,15 @@ impl LwcPrimitive<'_> {
     #[inline]
     pub fn value(&self, col_idx: usize) -> Option<Val> {
         match self {
-            LwcPrimitive::FlatI8(f) => f.value(col_idx).map(|v| Val::Byte1(v as u8)),
-            LwcPrimitive::FlatU8(f) => f.value(col_idx).map(|v| Val::Byte1(v)),
-            LwcPrimitive::FlatU64(f) => f.value(col_idx).map(Val::Byte8),
-            LwcPrimitive::ForBp1U64(f) => f.value(col_idx).map(Val::Byte8),
-            LwcPrimitive::ForBp2U64(f) => f.value(col_idx).map(Val::Byte8),
-            LwcPrimitive::ForBp4U64(f) => f.value(col_idx).map(Val::Byte8),
-            LwcPrimitive::ForBp8U64(f) => f.value(col_idx).map(Val::Byte8),
-            LwcPrimitive::ForBp16U64(f) => f.value(col_idx).map(Val::Byte8),
-            LwcPrimitive::ForBp32U64(f) => f.value(col_idx).map(Val::Byte8),
+            LwcPrimitive::FlatI8(f) => f.value(col_idx).map(Val::I8),
+            LwcPrimitive::FlatU8(f) => f.value(col_idx).map(Val::U8),
+            LwcPrimitive::FlatU64(f) => f.value(col_idx).map(Val::U64),
+            LwcPrimitive::ForBp1U64(f) => f.value(col_idx).map(Val::U64),
+            LwcPrimitive::ForBp2U64(f) => f.value(col_idx).map(Val::U64),
+            LwcPrimitive::ForBp4U64(f) => f.value(col_idx).map(Val::U64),
+            LwcPrimitive::ForBp8U64(f) => f.value(col_idx).map(Val::U64),
+            LwcPrimitive::ForBp16U64(f) => f.value(col_idx).map(Val::U64),
+            LwcPrimitive::ForBp32U64(f) => f.value(col_idx).map(Val::U64),
         }
     }
 }
@@ -466,7 +466,7 @@ fn read_le_u64(input: &[u8]) -> Result<(u64, &[u8])> {
 
 #[inline]
 fn read_u8(input: &[u8]) -> Result<(u8, &[u8])> {
-    if input.len() < 1 {
+    if input.is_empty() {
         return Err(Error::InvalidCompressedData);
     }
     let v = input[0];

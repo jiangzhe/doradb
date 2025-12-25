@@ -614,7 +614,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut rows = 0usize;
             table
-                .table_scan_uncommitted(engine.data_pool, |row| {
+                .table_scan_uncommitted(engine.data_pool, 0, |row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
                     rows += if row.is_deleted() { 0 } else { 1 };
                     true

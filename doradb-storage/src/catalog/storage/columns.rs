@@ -39,16 +39,16 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
             table_id: TABLE_ID_COLUMNS,
             metadata: TableMetadata::new(
                 vec![
-                    // column_id bigint primary key not null
+                    // column_id unsigned bigint primary key not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_ID),
-                        column_type: ValKind::I64,
+                        column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
-                    // table_id bigint not null
+                    // table_id unsigned bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_TABLE_ID),
-                        column_type: ValKind::I64,
+                        column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // column_name string not null
@@ -57,19 +57,19 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
                         column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::empty(),
                     },
-                    // column_no integer not null
+                    // column_no unsigned smallint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_NO),
-                        column_type: ValKind::I16,
+                        column_type: ValKind::U16,
                         column_attributes: ColumnAttributes::empty(),
                     },
-                    // column_type integer not null
+                    // column_type unsgined int not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_TYPE),
-                        column_type: ValKind::I32,
+                        column_type: ValKind::U32,
                         column_attributes: ColumnAttributes::empty(),
                     },
-                    // column_attributes integer not null
+                    // column_attributes unsgined int not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_ATTRIBUTES),
                         column_type: ValKind::U32,
@@ -108,7 +108,7 @@ fn row_to_column_object(row: Row<'_>) -> ColumnObject {
         table_id: *table_id,
         column_name: SemiStr::new(column_name),
         column_no: *column_no,
-        column_type: ValKind::from(*column_type as u8),
+        column_type: ValKind::try_from(*column_type as u8).unwrap(),
         column_attributes: ColumnAttributes::from_bits_truncate(*column_attributes),
     }
 }
@@ -138,7 +138,7 @@ impl<P: BufferPool> Columns<'_, P> {
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<ColumnObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, |row| {
+            .table_scan_uncommitted(self.buf_pool, 0, |row| {
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = *row.val::<TableID>(COL_NO_COLUMNS_TABLE_ID);
                 if table_id_in_row == table_id {
