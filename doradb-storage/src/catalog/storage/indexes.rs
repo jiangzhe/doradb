@@ -38,16 +38,16 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
             table_id: TABLE_ID_INDEXES,
             metadata: TableMetadata::new(
                 vec![
-                    // index_id bigint primary key not null
+                    // index_id unsgined bigint primary key not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_ID),
-                        column_type: ValKind::I64,
+                        column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
-                    // table_id bigint not null
+                    // table_id unsgined bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEXES_TABLE_ID),
-                        column_type: ValKind::I64,
+                        column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
                     // index_name string unique not null
@@ -56,10 +56,10 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
                         column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::empty(),
                     },
-                    // index_attributes integer not null
+                    // index_attributes unsigned int not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_ATTRIBUTES),
-                        column_type: ValKind::I32,
+                        column_type: ValKind::U32,
                         column_attributes: ColumnAttributes::empty(),
                     },
                 ],
@@ -129,7 +129,7 @@ impl<P: BufferPool> Indexes<'_, P> {
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<IndexObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, |row| {
+            .table_scan_uncommitted(self.buf_pool, 0, |row| {
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = *row.val::<TableID>(COL_NO_INDEXES_TABLE_ID);
                 if table_id_in_row == table_id {
@@ -167,28 +167,28 @@ pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
             table_id: TABLE_ID_INDEX_COLUMNS,
             metadata: TableMetadata::new(
                 vec![
-                    // column_id bigint not null
+                    // column_id unsigned bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_COLUMN_ID),
-                        column_type: ValKind::I64,
+                        column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
-                    // index_id bigint not null
+                    // index_id unsigned bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_ID),
-                        column_type: ValKind::I64,
+                        column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
-                    // column_no smallint not null
+                    // column_no unsigned smallint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_COLUMN_NO),
-                        column_type: ValKind::I16,
+                        column_type: ValKind::U16,
                         column_attributes: ColumnAttributes::empty(),
                     },
-                    // index_column_no smallint not null
+                    // index_column_no unsigned smallint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO),
-                        column_type: ValKind::I16,
+                        column_type: ValKind::U16,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     // descending boolean not null
@@ -254,7 +254,7 @@ impl<P: BufferPool> IndexColumns<'_, P> {
     pub async fn list_uncommitted_by_index_id(&self, index_id: IndexID) -> Vec<IndexColumnObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, |row| {
+            .table_scan_uncommitted(self.buf_pool, 0, |row| {
                 let index_id_in_row = *row.val::<TableID>(COL_NO_INDEX_COLUMNS_INDEX_ID);
                 if index_id_in_row == index_id {
                     let obj = row_to_index_column_object(row);

@@ -291,9 +291,9 @@ impl ActiveTrx {
                 page_id: 0,
                 row_id: 0,
                 kind: RowRedoKind::Insert(vec![
-                    Val::Byte8(123),
-                    Val::Byte4(1),
-                    Val::Byte4(2),
+                    Val::U64(123),
+                    Val::U32(1),
+                    Val::U32(2),
                     Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
                     Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
                 ]),

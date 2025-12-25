@@ -4,6 +4,7 @@ use crate::buffer::page::{BufferPage, PAGE_SIZE};
 use crate::catalog::TableMetadata;
 use crate::row::ops::{Delete, InsertRow, Recover, Select, SelectKey, Update, UpdateCol};
 use crate::value::*;
+use ordered_float::OrderedFloat;
 use std::fmt;
 use std::mem;
 use std::slice;
@@ -96,7 +97,7 @@ impl RowPage {
         let mut col_offset = self.header.fix_field_offset;
         for (i, ty) in schema.col_types().iter().enumerate() {
             *self.col_offset_mut(i) = col_offset;
-            col_offset += col_inline_len(&ty.kind.layout(), row_count as usize) as u16;
+            col_offset += col_inline_len(ty.kind, row_count as usize) as u16;
         }
         self.header.fix_field_end = col_offset;
     }
@@ -232,14 +233,7 @@ impl RowPage {
             };
         let mut new_row = self.new_row(row_idx, var_offset);
         for v in user_cols {
-            match v {
-                Val::Null => new_row.add_null(),
-                Val::Byte1(v1) => new_row.add_val(*v1),
-                Val::Byte2(v2) => new_row.add_val(*v2),
-                Val::Byte4(v4) => new_row.add_val(*v4),
-                Val::Byte8(v8) => new_row.add_val(*v8),
-                Val::VarByte(var) => new_row.add_var(var.as_bytes()),
-            }
+            new_row.add_col(v);
         }
         InsertRow::Ok(new_row.finish())
     }
@@ -480,20 +474,44 @@ impl RowPage {
             Val::Null => {
                 self.set_null(row_idx, col_idx, true);
             }
-            Val::Byte1(v1) => {
-                self.update_val(row_idx, col_idx, *v1);
+            Val::I8(v) => {
+                self.update_val(row_idx, col_idx, *v);
                 self.set_null(row_idx, col_idx, false);
             }
-            Val::Byte2(v2) => {
-                self.update_val(row_idx, col_idx, *v2);
+            Val::U8(v) => {
+                self.update_val(row_idx, col_idx, *v);
                 self.set_null(row_idx, col_idx, false);
             }
-            Val::Byte4(v4) => {
-                self.update_val(row_idx, col_idx, *v4);
+            Val::I16(v) => {
+                self.update_val(row_idx, col_idx, *v);
                 self.set_null(row_idx, col_idx, false);
             }
-            Val::Byte8(v8) => {
-                self.update_val(row_idx, col_idx, *v8);
+            Val::U16(v) => {
+                self.update_val(row_idx, col_idx, *v);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::I32(v) => {
+                self.update_val(row_idx, col_idx, *v);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::U32(v) => {
+                self.update_val(row_idx, col_idx, *v);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::F32(v) => {
+                self.update_val(row_idx, col_idx, v.0);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::I64(v) => {
+                self.update_val(row_idx, col_idx, *v);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::U64(v) => {
+                self.update_val(row_idx, col_idx, *v);
+                self.set_null(row_idx, col_idx, false);
+            }
+            Val::F64(v) => {
+                self.update_val(row_idx, col_idx, v.0);
                 self.set_null(row_idx, col_idx, false);
             }
             Val::VarByte(var) => {
@@ -521,20 +539,44 @@ impl RowPage {
             Val::Null => {
                 self.set_null_exclusive(row_idx, col_idx, true);
             }
-            Val::Byte1(v1) => {
-                self.update_val_exclusive(row_idx, col_idx, *v1);
+            Val::I8(v) => {
+                self.update_val_exclusive(row_idx, col_idx, *v);
                 self.set_null_exclusive(row_idx, col_idx, false);
             }
-            Val::Byte2(v2) => {
-                self.update_val_exclusive(row_idx, col_idx, *v2);
+            Val::U8(v) => {
+                self.update_val_exclusive(row_idx, col_idx, *v);
                 self.set_null_exclusive(row_idx, col_idx, false);
             }
-            Val::Byte4(v4) => {
-                self.update_val_exclusive(row_idx, col_idx, *v4);
+            Val::I16(v) => {
+                self.update_val_exclusive(row_idx, col_idx, *v);
                 self.set_null_exclusive(row_idx, col_idx, false);
             }
-            Val::Byte8(v8) => {
-                self.update_val_exclusive(row_idx, col_idx, *v8);
+            Val::U16(v) => {
+                self.update_val_exclusive(row_idx, col_idx, *v);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::I32(v) => {
+                self.update_val_exclusive(row_idx, col_idx, *v);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::U32(v) => {
+                self.update_val_exclusive(row_idx, col_idx, *v);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::F32(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v.0);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::I64(v) => {
+                self.update_val_exclusive(row_idx, col_idx, *v);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::U64(v) => {
+                self.update_val_exclusive(row_idx, col_idx, *v);
+                self.set_null_exclusive(row_idx, col_idx, false);
+            }
+            Val::F64(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v.0);
                 self.set_null_exclusive(row_idx, col_idx, false);
             }
             Val::VarByte(var) => {
@@ -962,6 +1004,24 @@ impl NewRow<'_> {
         self.col_idx += 1;
     }
 
+    #[inline]
+    pub fn add_col(&mut self, val: &Val) {
+        match val {
+            Val::Null => self.add_null(),
+            Val::I8(v) => self.add_val(*v),
+            Val::U8(v) => self.add_val(*v),
+            Val::I16(v) => self.add_val(*v),
+            Val::U16(v) => self.add_val(*v),
+            Val::I32(v) => self.add_val(*v),
+            Val::U32(v) => self.add_val(*v),
+            Val::F32(v) => self.add_val(v.0),
+            Val::I64(v) => self.add_val(*v),
+            Val::U64(v) => self.add_val(*v),
+            Val::F64(v) => self.add_val(v.0),
+            Val::VarByte(var) => self.add_var(var.as_bytes()),
+        }
+    }
+
     /// Add string value to current row, same as add_var().
     #[inline]
     pub fn add_str_atomic(&mut self, input: &str) {
@@ -1061,24 +1121,48 @@ pub(crate) trait RowRead {
         if self.is_null(col_idx) {
             return Val::Null;
         }
-        match metadata.col_layout(col_idx) {
-            Layout::Byte1 => {
-                let v = self.val::<Byte1Val>(col_idx);
+        match metadata.col_type(col_idx).kind {
+            ValKind::I8 => {
+                let v = self.val::<i8>(col_idx);
                 Val::from(*v)
             }
-            Layout::Byte2 => {
-                let v = self.val::<Byte2Val>(col_idx);
+            ValKind::U8 => {
+                let v = self.val::<u8>(col_idx);
                 Val::from(*v)
             }
-            Layout::Byte4 => {
-                let v = self.val::<Byte4Val>(col_idx);
+            ValKind::I16 => {
+                let v = self.val::<i16>(col_idx);
                 Val::from(*v)
             }
-            Layout::Byte8 => {
-                let v = self.val::<Byte8Val>(col_idx);
+            ValKind::U16 => {
+                let v = self.val::<u16>(col_idx);
                 Val::from(*v)
             }
-            Layout::VarByte => {
+            ValKind::I32 => {
+                let v = self.val::<i32>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::U32 => {
+                let v = self.val::<u32>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::F32 => {
+                let v = self.val::<f32>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::I64 => {
+                let v = self.val::<i64>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::U64 => {
+                let v = self.val::<u64>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::F64 => {
+                let v = self.val::<f64>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::VarByte => {
                 let v = self.var(col_idx);
                 Val::VarByte(MemVar::from(v))
             }
@@ -1094,30 +1178,55 @@ pub(crate) trait RowRead {
         if self.is_null(col_idx) {
             return (Val::Null, None);
         }
-        match metadata.col_layout(col_idx) {
-            Layout::Byte1 => {
-                let v = self.val::<Byte1Val>(col_idx);
-                (Val::from(*v), None)
+        let v = match metadata.col_type(col_idx).kind {
+            ValKind::I8 => {
+                let v = self.val::<i8>(col_idx);
+                Val::from(*v)
             }
-            Layout::Byte2 => {
-                let v = self.val::<Byte2Val>(col_idx);
-                (Val::from(*v), None)
+            ValKind::U8 => {
+                let v = self.val::<u8>(col_idx);
+                Val::from(*v)
             }
-            Layout::Byte4 => {
-                let v = self.val::<Byte4Val>(col_idx);
-                (Val::from(*v), None)
+            ValKind::I16 => {
+                let v = self.val::<i16>(col_idx);
+                Val::from(*v)
             }
-            Layout::Byte8 => {
-                let v = self.val::<Byte8Val>(col_idx);
-                (Val::from(*v), None)
+            ValKind::U16 => {
+                let v = self.val::<u16>(col_idx);
+                Val::from(*v)
             }
-            Layout::VarByte => unsafe {
+            ValKind::I32 => {
+                let v = self.val::<i32>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::U32 => {
+                let v = self.val::<u32>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::F32 => {
+                let v = self.val::<f32>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::I64 => {
+                let v = self.val::<i64>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::U64 => {
+                let v = self.val::<u64>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::F64 => {
+                let v = self.val::<f64>(col_idx);
+                Val::from(*v)
+            }
+            ValKind::VarByte => unsafe {
                 let pv = self.page().var_unchecked(self.row_idx(), col_idx);
                 let v = pv.as_bytes(self.page().data_ptr());
                 let offset = pv.offset().map(|os| os as u16);
-                (Val::VarByte(MemVar::from(v)), offset)
+                return (Val::VarByte(MemVar::from(v)), offset);
             },
-        }
+        };
+        (v, None)
     }
 
     /// Clone all values.
@@ -1159,32 +1268,66 @@ pub(crate) trait RowRead {
     /// Returns whether the value of current row at given column index is different from given value.
     #[inline]
     fn is_different(&self, metadata: &TableMetadata, col_idx: usize, value: &Val) -> bool {
-        match (value, self.is_null(col_idx), metadata.col_layout(col_idx)) {
+        match (
+            value,
+            self.is_null(col_idx),
+            metadata.col_type(col_idx).kind,
+        ) {
             (Val::Null, true, _) => false,
             (Val::Null, false, _) => true,
             (_, true, _) => true,
-            (Val::Byte1(new), false, lo) => {
-                debug_assert!(lo == Layout::Byte1);
-                let old = self.val::<Byte1Val>(col_idx);
+            (Val::I8(new), false, lo) => {
+                debug_assert!(lo == ValKind::I8);
+                let old = self.val::<i8>(col_idx);
                 old != new
             }
-            (Val::Byte2(new), false, lo) => {
-                debug_assert!(lo == Layout::Byte2);
-                let old = self.val::<Byte2Val>(col_idx);
+            (Val::U8(new), false, lo) => {
+                debug_assert!(lo == ValKind::U8);
+                let old = self.val::<u8>(col_idx);
                 old != new
             }
-            (Val::Byte4(new), false, lo) => {
-                debug_assert!(lo == Layout::Byte4);
-                let old = self.val::<Byte4Val>(col_idx);
+            (Val::I16(new), false, lo) => {
+                debug_assert!(lo == ValKind::I16);
+                let old = self.val::<i16>(col_idx);
                 old != new
             }
-            (Val::Byte8(new), false, lo) => {
-                debug_assert!(lo == Layout::Byte8);
-                let old = self.val::<Byte8Val>(col_idx);
+            (Val::U16(new), false, lo) => {
+                debug_assert!(lo == ValKind::U16);
+                let old = self.val::<u16>(col_idx);
                 old != new
+            }
+            (Val::I32(new), false, lo) => {
+                debug_assert!(lo == ValKind::I32);
+                let old = self.val::<i32>(col_idx);
+                old != new
+            }
+            (Val::U32(new), false, lo) => {
+                debug_assert!(lo == ValKind::U32);
+                let old = self.val::<u32>(col_idx);
+                old != new
+            }
+            (Val::F32(new), false, lo) => {
+                debug_assert!(lo == ValKind::F32);
+                let old = self.val::<f32>(col_idx);
+                OrderedFloat(*old) != *new
+            }
+            (Val::I64(new), false, lo) => {
+                debug_assert!(lo == ValKind::I64);
+                let old = self.val::<i64>(col_idx);
+                old != new
+            }
+            (Val::U64(new), false, lo) => {
+                debug_assert!(lo == ValKind::U64);
+                let old = self.val::<u64>(col_idx);
+                old != new
+            }
+            (Val::F64(new), false, lo) => {
+                debug_assert!(lo == ValKind::F64);
+                let old = self.val::<f64>(col_idx);
+                OrderedFloat(*old) != *new
             }
             (Val::VarByte(new), false, lo) => {
-                debug_assert!(lo == Layout::VarByte);
+                debug_assert!(lo == ValKind::VarByte);
                 let old = self.var(col_idx);
                 old != new.as_bytes()
             }
@@ -1373,8 +1516,8 @@ const fn col_offset_list_len(col_count: usize) -> usize {
 
 // column inline length, align to 8 bytes.
 #[inline]
-const fn col_inline_len(col: &Layout, row_count: usize) -> usize {
-    align8(col.inline_len() * row_count)
+const fn col_inline_len(kind: ValKind, row_count: usize) -> usize {
+    align8(kind.inline_len() * row_count)
 }
 
 /// Returns estimation of maximum row count of a new page with average row length
@@ -1485,10 +1628,10 @@ mod tests {
         page.init(100, 200, &metadata);
         assert!(page.header.row_count() == 0);
         assert!(page.header.col_count == 1);
-        let insert = vec![Val::Byte8(1u64)];
+        let insert = vec![Val::U64(1u64)];
         assert!(page.insert(&metadata, &insert).is_ok());
         assert!(page.header.row_count() == 1);
-        let insert = vec![Val::Byte8(2u64)];
+        let insert = vec![Val::U64(2u64)];
         assert!(page.insert(&metadata, &insert).is_ok());
         assert!(page.header.row_count() == 2);
     }
@@ -1522,7 +1665,7 @@ mod tests {
 
         let row1 = page.row(0);
         assert!(row1.row_id() == 100);
-        assert!(*row1.val::<Byte4Val>(0) as i32 == 1_000_000i32);
+        assert!(*row1.val::<i32>(0) == 1_000_000i32);
         assert!(row1.var(1) == b"hello");
 
         let insert = vec![
@@ -1533,7 +1676,7 @@ mod tests {
 
         let row2 = page.row(1);
         assert!(row2.row_id() == 101);
-        assert!(*row2.val::<Byte4Val>(0) as i32 == 2_000_000i32);
+        assert!(*row2.val::<i32>(0) == 2_000_000i32);
         let s = row2.var(1);
         println!("len={:?}, s={:?}", s.len(), str::from_utf8(&s[..24]));
         assert!(row2.var(1) == b"this value is not inline");
@@ -1594,10 +1737,10 @@ mod tests {
         let long = b"very loooooooooooooooooong";
 
         let insert = vec![
-            Val::Byte1(1),
-            Val::Byte2(1000),
-            Val::Byte4(1_000_000),
-            Val::Byte8(1 << 35),
+            Val::U8(1),
+            Val::U16(1000),
+            Val::U32(1_000_000),
+            Val::U64(1 << 35),
             Val::from(&short[..]),
         ];
         let res = page.insert(&schema, &insert);
@@ -1608,19 +1751,19 @@ mod tests {
         let update = vec![
             UpdateCol {
                 idx: 0,
-                val: Val::Byte1(2),
+                val: Val::U8(2),
             },
             UpdateCol {
                 idx: 1,
-                val: Val::Byte2(2000),
+                val: Val::U16(2000),
             },
             UpdateCol {
                 idx: 2,
-                val: Val::Byte4(2_000_000),
+                val: Val::U32(2_000_000),
             },
             UpdateCol {
                 idx: 3,
-                val: Val::Byte8(2 << 35),
+                val: Val::U64(2 << 35),
             },
             UpdateCol {
                 idx: 4,

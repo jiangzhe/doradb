@@ -3,7 +3,7 @@ use crate::error::Result;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, SerdeCtx};
-use crate::value::{Layout, Val, ValKind, ValType};
+use crate::value::{Val, ValKind, ValType};
 use semistr::SemiStr;
 use std::collections::HashSet;
 
@@ -41,9 +41,11 @@ impl TableMetadata {
         let col_types: Vec<_> = column_specs
             .iter()
             .map(|c| {
-                let kind = ValKind::from(c.column_type);
                 let nullable = c.column_attributes.contains(ColumnAttributes::NULLABLE);
-                ValType { kind, nullable }
+                ValType {
+                    kind: c.column_type,
+                    nullable,
+                }
             })
             .collect();
         TableMetadata::create(col_names, col_types, index_specs)
@@ -58,8 +60,8 @@ impl TableMetadata {
         let mut fix_len = 0;
         let mut var_cols = vec![];
         for (idx, ty) in col_types.iter().enumerate() {
-            fix_len += ty.kind.layout().inline_len();
-            if !ty.kind.layout().is_fixed() {
+            fix_len += ty.kind.inline_len();
+            if !ty.kind.is_fixed() {
                 var_cols.push(idx);
             }
         }
@@ -100,12 +102,12 @@ impl TableMetadata {
     /// Returns whether the type is matched at given column index.
     #[inline]
     pub fn col_type_match(&self, col_idx: usize, val: &Val) -> bool {
-        layout_match(val, self.col_layout(col_idx))
+        val.matches_kind(self.col_type(col_idx).kind)
     }
 
     /// Returns whether input values matches given index.
     #[inline]
-    pub fn index_layout_match(&self, index_no: usize, vals: &[Val]) -> bool {
+    pub fn index_type_match(&self, index_no: usize, vals: &[Val]) -> bool {
         let index = &self.index_specs[index_no];
         if index.index_cols.len() != vals.len() {
             return false;
@@ -113,15 +115,9 @@ impl TableMetadata {
         index
             .index_cols
             .iter()
-            .map(|k| self.col_layout(k.col_no as usize))
+            .map(|k| self.col_type(k.col_no as usize).kind)
             .zip(vals)
-            .all(|(layout, val)| layout_match(val, layout))
-    }
-
-    /// Returns layout of column.
-    #[inline]
-    pub fn col_layout(&self, col_idx: usize) -> Layout {
-        self.col_types[col_idx].kind.layout()
+            .all(|(kind, val)| val.matches_kind(kind))
     }
 
     /// Returns index keys of a new row.
@@ -238,19 +234,6 @@ impl Deser for TableBriefMetadata {
             },
         ))
     }
-}
-
-#[inline]
-fn layout_match(val: &Val, layout: Layout) -> bool {
-    matches!(
-        (val, layout),
-        (Val::Null, _)
-            | (Val::Byte1(_), Layout::Byte1)
-            | (Val::Byte2(_), Layout::Byte2)
-            | (Val::Byte4(_), Layout::Byte4)
-            | (Val::Byte8(_), Layout::Byte8)
-            | (Val::VarByte(_), Layout::VarByte)
-    )
 }
 
 #[cfg(test)]

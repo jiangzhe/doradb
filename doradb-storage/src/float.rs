@@ -5,7 +5,7 @@ use std::ops::Deref;
 pub const F64_ZERO: ValidF64 = ValidF64(0.0);
 pub const F64_ONE: ValidF64 = ValidF64(1.0);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct ValidF64(f64);
 
@@ -66,7 +66,7 @@ impl Deref for ValidF64 {
 pub const F32_ZERO: ValidF32 = ValidF32(0.0);
 pub const F32_ONE: ValidF32 = ValidF32(1.0);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct ValidF32(f32);
 

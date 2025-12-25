@@ -39,12 +39,28 @@ impl SerdeCtx {
         idx + mem::size_of::<i64>()
     }
 
+    /// Serialize a f64 value to a byte slice.
+    #[inline]
+    pub fn ser_f64(&self, out: &mut [u8], idx: usize, val: f64) -> usize {
+        debug_assert!(idx + mem::size_of::<f64>() <= out.len());
+        out[idx..idx + mem::size_of::<f64>()].copy_from_slice(&val.to_le_bytes());
+        idx + mem::size_of::<f64>()
+    }
+
     /// Serialize a u32 value to a byte slice.
     #[inline]
     pub fn ser_u32(&self, out: &mut [u8], idx: usize, val: u32) -> usize {
         debug_assert!(idx + mem::size_of::<u32>() <= out.len());
         out[idx..idx + mem::size_of::<u32>()].copy_from_slice(&val.to_le_bytes());
         idx + mem::size_of::<u32>()
+    }
+
+    /// Serialize a f32 value to a byte slice.
+    #[inline]
+    pub fn ser_f32(&self, out: &mut [u8], idx: usize, val: f32) -> usize {
+        debug_assert!(idx + mem::size_of::<f32>() <= out.len());
+        out[idx..idx + mem::size_of::<f32>()].copy_from_slice(&val.to_le_bytes());
+        idx + mem::size_of::<f32>()
     }
 
     /// Serialize a i32 value to a byte slice.
@@ -121,6 +137,14 @@ impl SerdeCtx {
         Ok((idx + mem::size_of::<i64>(), val))
     }
 
+    /// Deserialize a f64 value from a byte slice.
+    #[inline]
+    pub fn deser_f64(&self, input: &[u8], idx: usize) -> Result<(usize, f64)> {
+        debug_assert!(idx + mem::size_of::<f64>() <= input.len());
+        let val = f64::from_le_bytes(input[idx..idx + mem::size_of::<f64>()].try_into()?);
+        Ok((idx + mem::size_of::<f64>(), val))
+    }
+
     /// Deserialize a u32 value from a byte slice.
     #[inline]
     pub fn deser_u32(&self, input: &[u8], idx: usize) -> Result<(usize, u32)> {
@@ -135,6 +159,14 @@ impl SerdeCtx {
         debug_assert!(idx + mem::size_of::<i32>() <= input.len());
         let val = i32::from_le_bytes(input[idx..idx + mem::size_of::<i32>()].try_into()?);
         Ok((idx + mem::size_of::<i32>(), val))
+    }
+
+    /// Deserialize a f32 value from a byte slice.
+    #[inline]
+    pub fn deser_f32(&self, input: &[u8], idx: usize) -> Result<(usize, f32)> {
+        debug_assert!(idx + mem::size_of::<f32>() <= input.len());
+        let val = f32::from_le_bytes(input[idx..idx + mem::size_of::<f32>()].try_into()?);
+        Ok((idx + mem::size_of::<f32>(), val))
     }
 
     /// Deserialize a u16 value from a byte slice.

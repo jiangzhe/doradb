@@ -834,30 +834,16 @@ impl<'a> RowWriteAccess<'a> {
                 self.page.set_deleted(self.row_idx, false);
             }
             RowUndoKind::Update(undo_cols) => {
+                // Here we try to rollback changes on this page
+                // and prefer to reuse the space occupied by old value.
                 for uc in undo_cols {
-                    match &uc.val {
-                        Val::Null => {
-                            self.page.set_null(self.row_idx, uc.idx, true);
-                        }
-                        Val::VarByte(var) => {
-                            let (pv, _) = self
-                                .page
-                                .add_var(var.as_bytes(), uc.var_offset.unwrap_or(0) as usize);
-                            self.page.update_var(self.row_idx, uc.idx, pv);
-                        }
-                        Val::Byte1(v) => {
-                            self.page.update_val(self.row_idx, uc.idx, *v);
-                        }
-                        Val::Byte2(v) => {
-                            self.page.update_val(self.row_idx, uc.idx, *v);
-                        }
-                        Val::Byte4(v) => {
-                            self.page.update_val(self.row_idx, uc.idx, *v);
-                        }
-                        Val::Byte8(v) => {
-                            self.page.update_val(self.row_idx, uc.idx, *v);
-                        }
-                    }
+                    self.page.update_col(
+                        self.row_idx,
+                        uc.idx,
+                        &uc.val,
+                        uc.var_offset.unwrap_or(0) as usize,
+                        true,
+                    );
                 }
             }
             RowUndoKind::Move(deleted) => {

@@ -659,7 +659,7 @@ pub fn for_b16_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
 
 #[inline]
 pub fn for_b16_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T, res: &mut E) {
-    debug_assert!(input.len() % 2 == 0);
+    debug_assert!(input.len().is_multiple_of(2));
     let input = bytemuck::cast_slice::<u8, [u8; 2]>(input);
     res.extend(input.iter().map(|src| {
         let delta = u16::from_le_bytes(*src);
@@ -707,7 +707,7 @@ pub fn for_b32_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
 
 #[inline]
 pub fn for_b32_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T, res: &mut E) {
-    debug_assert!(input.len() % 4 == 0);
+    debug_assert!(input.len().is_multiple_of(4));
     let input = bytemuck::cast_slice::<u8, [u8; 4]>(input);
     res.extend(input.iter().map(|src| {
         let delta = u32::from_le_bytes(*src);
@@ -899,7 +899,7 @@ impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking16<'a, T> {
     #[inline]
     fn value(&self, idx: usize) -> Option<T> {
         if idx < self.data.len() {
-            let u: [u8; 2] = self.data[idx].try_into().unwrap();
+            let u = self.data[idx];
             let v = self.min.add_from_u16(u16::from_le_bytes(u));
             Some(v)
         } else {
@@ -975,7 +975,7 @@ impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking32<'a, T> {
     #[inline]
     fn value(&self, idx: usize) -> Option<T> {
         if idx < self.data.len() {
-            let u: [u8; 4] = self.data[idx].try_into().unwrap();
+            let u = self.data[idx];
             let v = self.min.add_from_u32(u32::from_le_bytes(u));
             Some(v)
         } else {

@@ -19,10 +19,22 @@ pub trait TableAccess {
     fn table_scan_uncommitted<P: BufferPool, F>(
         &self,
         data_pool: &'static P,
+        start_row_id: RowID,
         row_action: F,
     ) -> impl Future<Output = ()>
     where
         F: for<'a> FnMut(Row<'a>) -> bool;
+
+    // /// Table scan with MVCC.
+    // fn table_scan_mvcc<P: BufferPool, F>(
+    //     &self,
+    //     data_pool: &'static P,
+    //     stmt: &Statement,
+    //     start_row_id: RowID,
+    //     row_action: F,
+    // ) -> impl Future<Output = ()>
+    // where
+    //     F: for<'a> FnMut(Row<'a>) -> bool;
 
     /// Index lookup unique row with MVCC.
     /// Result should be no more than one row.
@@ -133,6 +145,7 @@ impl TableAccess for Table {
     async fn table_scan_uncommitted<P: BufferPool, F>(
         &self,
         data_pool: &'static P,
+        start_row_id: RowID,
         mut row_action: F,
     ) where
         F: for<'a> FnMut(Row<'a>) -> bool,
@@ -140,7 +153,7 @@ impl TableAccess for Table {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
         let mut cursor = self.blk_idx.cursor();
-        cursor.seek(0).await;
+        cursor.seek(start_row_id).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.shared_async().await;
             debug_assert!(g.page().is_leaf());
@@ -162,6 +175,19 @@ impl TableAccess for Table {
         }
     }
 
+    // async fn table_vector_scan_mvcc<P: BufferPool, B, F>(
+    //     &self,
+    //     data_pool: &'static P,
+    //     stmt: &Statement,
+    //     start_row_id: RowID,
+    //     column_action: F,
+    // ) -> ()
+    // where
+    //     B: Bitmap,
+    //     F: for<'a> FnMut(&B, usize, ) -> bool,
+    // {
+    // }
+
     async fn index_lookup_unique_mvcc<P: BufferPool>(
         &self,
         data_pool: &'static P,
@@ -171,7 +197,7 @@ impl TableAccess for Table {
     ) -> SelectMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
-        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         debug_assert!({
             !user_read_set.is_empty()
                 && user_read_set
@@ -204,7 +230,7 @@ impl TableAccess for Table {
     {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
-        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let (page_guard, row_id) = match self.sec_idx[key.index_no]
             .unique()
             .unwrap()
@@ -252,7 +278,7 @@ impl TableAccess for Table {
         // Index scan should be applied to non-unique index.
         // todo: support partial key scan on unique index.
         debug_assert!(!self.metadata().index_specs[key.index_no].unique());
-        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         debug_assert!({
             !user_read_set.is_empty()
                 && user_read_set
@@ -288,7 +314,8 @@ impl TableAccess for Table {
         stmt: &mut Statement,
         cols: Vec<Val>,
     ) -> InsertMvcc {
-        debug_assert!(cols.len() == self.metadata().col_count());
+        let metadata = self.metadata();
+        debug_assert!(cols.len() == metadata.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
@@ -376,7 +403,7 @@ impl TableAccess for Table {
     ) -> UpdateMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
-        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
             None => return UpdateMvcc::NotFound,
@@ -473,7 +500,7 @@ impl TableAccess for Table {
     ) -> DeleteMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
-        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
             None => return DeleteMvcc::NotFound,
@@ -508,7 +535,7 @@ impl TableAccess for Table {
     async fn delete_unique_no_trx<P: BufferPool>(&self, data_pool: &'static P, key: &SelectKey) {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
-        debug_assert!(self.metadata().index_layout_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
         let (mut page_guard, row_id) = match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await {
             None => unreachable!(),

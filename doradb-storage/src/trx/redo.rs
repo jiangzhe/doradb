@@ -563,7 +563,7 @@ mod tests {
         let insert_entry = RowRedo {
             page_id: 1,
             row_id: 100,
-            kind: RowRedoKind::Insert(vec![Val::Byte8(42)]),
+            kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
         redo_logs.insert_dml(1, insert_entry);
         assert_eq!(redo_logs.dml.len(), 1);
@@ -576,13 +576,13 @@ mod tests {
             row_id: 100,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
-                val: Val::Byte8(43),
+                val: Val::U64(43),
             }]),
         };
         redo_logs.insert_dml(1, update_entry);
         let table = redo_logs.dml.get(&1).unwrap();
         if let RowRedoKind::Insert(vals) = &table.rows.get(&100).unwrap().kind {
-            assert_eq!(vals[0], Val::Byte8(43));
+            assert_eq!(vals[0], Val::U64(43));
         } else {
             panic!("Expected Insert kind");
         }
@@ -601,7 +601,7 @@ mod tests {
         let insert_entry = RowRedo {
             page_id: 1,
             row_id: 200,
-            kind: RowRedoKind::Insert(vec![Val::Byte8(1), Val::Byte8(2)]),
+            kind: RowRedoKind::Insert(vec![Val::U64(1), Val::U64(2)]),
         };
         redo_logs.insert_dml(1, insert_entry);
 
@@ -610,7 +610,7 @@ mod tests {
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
-                val: Val::Byte8(3),
+                val: Val::U64(3),
             }]),
         };
         redo_logs.insert_dml(1, update1);
@@ -620,15 +620,15 @@ mod tests {
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 1,
-                val: Val::Byte8(4),
+                val: Val::U64(4),
             }]),
         };
         redo_logs.insert_dml(1, update2);
 
         let table = redo_logs.dml.get(&1).unwrap();
         if let RowRedoKind::Insert(vals) = &table.rows.get(&200).unwrap().kind {
-            assert_eq!(vals[0], Val::Byte8(3));
-            assert_eq!(vals[1], Val::Byte8(4));
+            assert_eq!(vals[0], Val::U64(3));
+            assert_eq!(vals[1], Val::U64(4));
         } else {
             panic!("Expected Insert kind");
         }
@@ -637,7 +637,7 @@ mod tests {
         let another_insert = RowRedo {
             page_id: 2,
             row_id: 300,
-            kind: RowRedoKind::Insert(vec![Val::Byte8(50)]),
+            kind: RowRedoKind::Insert(vec![Val::U64(50)]),
         };
         redo_logs.insert_dml(2, another_insert);
         assert_eq!(redo_logs.dml.len(), 2);
@@ -655,14 +655,14 @@ mod tests {
         let insert1 = RowRedo {
             page_id: 1,
             row_id: 100,
-            kind: RowRedoKind::Insert(vec![Val::Byte8(42)]),
+            kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
         redo_logs1.insert_dml(1, insert1);
 
         let insert2 = RowRedo {
             page_id: 2,
             row_id: 200,
-            kind: RowRedoKind::Insert(vec![Val::Byte8(43)]),
+            kind: RowRedoKind::Insert(vec![Val::U64(43)]),
         };
         redo_logs2.insert_dml(2, insert2);
 
@@ -676,7 +676,7 @@ mod tests {
         let insert3 = RowRedo {
             page_id: 1,
             row_id: 101,
-            kind: RowRedoKind::Insert(vec![Val::Byte8(44)]),
+            kind: RowRedoKind::Insert(vec![Val::U64(44)]),
         };
         redo_logs2.insert_dml(1, insert3);
 
@@ -684,10 +684,10 @@ mod tests {
         let table1 = redo_logs1.dml.get(&1).unwrap();
         assert_eq!(table1.rows.len(), 2);
         if let RowRedoKind::Insert(vals) = &table1.rows.get(&100).unwrap().kind {
-            assert_eq!(vals[0], Val::Byte8(42));
+            assert_eq!(vals[0], Val::U64(42));
         }
         if let RowRedoKind::Insert(vals) = &table1.rows.get(&101).unwrap().kind {
-            assert_eq!(vals[0], Val::Byte8(44));
+            assert_eq!(vals[0], Val::U64(44));
         }
 
         // 测试用例3：合并相同表相同行的操作
@@ -697,7 +697,7 @@ mod tests {
             row_id: 100,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
-                val: Val::Byte8(45),
+                val: Val::U64(45),
             }]),
         };
         redo_logs2.insert_dml(1, update1);
@@ -705,7 +705,7 @@ mod tests {
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&1).unwrap();
         if let RowRedoKind::Insert(vals) = &table1.rows.get(&100).unwrap().kind {
-            assert_eq!(vals[0], Val::Byte8(45));
+            assert_eq!(vals[0], Val::U64(45));
         }
 
         // 测试用例4：合并空日志
@@ -739,7 +739,7 @@ mod tests {
         let insert_entry = RowRedo {
             page_id: 1,
             row_id: 100,
-            kind: RowRedoKind::Insert(vec![Val::Byte8(42)]),
+            kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
         table_dml.insert(insert_entry);
 
@@ -749,7 +749,7 @@ mod tests {
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
-                val: Val::Byte8(43),
+                val: Val::U64(43),
             }]),
         };
         table_dml.insert(update_entry);
@@ -779,7 +779,7 @@ mod tests {
         match &insert_redo.kind {
             RowRedoKind::Insert(vals) => {
                 assert_eq!(vals.len(), 1);
-                assert_eq!(vals[0], Val::Byte8(42));
+                assert_eq!(vals[0], Val::U64(42));
             }
             _ => panic!("Expected Insert kind"),
         }
@@ -792,7 +792,7 @@ mod tests {
             RowRedoKind::Update(cols) => {
                 assert_eq!(cols.len(), 1);
                 assert_eq!(cols[0].idx, 0);
-                assert_eq!(cols[0].val, Val::Byte8(43));
+                assert_eq!(cols[0].val, Val::U64(43));
             }
             _ => panic!("Expected Update kind"),
         }

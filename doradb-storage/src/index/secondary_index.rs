@@ -1,6 +1,5 @@
 use crate::buffer::FixedBufferPool;
 use crate::catalog::IndexSpec;
-use crate::float::{ValidF32, ValidF64};
 use crate::index::btree::BTree;
 use crate::index::btree_key::{BTreeKey, BTreeKeyEncoder};
 use crate::index::non_unique_index::NonUniqueBTreeIndex;
@@ -136,10 +135,20 @@ impl_self_encode_number!(i32, as_i32);
 impl_self_encode_number!(u32, as_u32);
 impl_self_encode_number!(i64, as_i64);
 impl_self_encode_number!(u64, as_u64);
-impl_self_encode_number!(f32, as_f32);
-impl_self_encode_number!(f64, as_f64);
-impl_self_encode_number!(ValidF32, as_valid_f32);
-impl_self_encode_number!(ValidF64, as_valid_f64);
+
+impl EncodeKeySelf for f32 {
+    #[inline]
+    fn encode(key: &[Val]) -> Self {
+        key[0].as_f32().unwrap().0
+    }
+}
+
+impl EncodeKeySelf for f64 {
+    #[inline]
+    fn encode(key: &[Val]) -> Self {
+        key[0].as_f64().unwrap().0
+    }
+}
 
 impl EncodeKeySelf for BTreeKey {
     #[inline]
