@@ -4,13 +4,14 @@ use crate::catalog::TableMetadata;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, InsertMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateIndex,
-    UpdateMvcc,
+    DeleteMvcc, InsertIndex, InsertMvcc, ReadRow, ScanMvcc, SelectKey, SelectMvcc, UpdateCol,
+    UpdateIndex, UpdateMvcc,
 };
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::stmt::Statement;
 use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
+use crate::trx::row::{ReadAllRows, RowReadAccess};
 use crate::trx::undo::RowUndoKind;
 use crate::value::Val;
 use std::future::Future;
@@ -26,16 +27,17 @@ pub trait TableAccess {
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool;
 
-    // /// Table scan with MVCC.
-    // fn table_scan_mvcc<P: BufferPool, F>(
-    //     &self,
-    //     data_pool: &'static P,
-    //     stmt: &Statement,
-    //     start_row_id: RowID,
-    //     row_action: F,
-    // ) -> impl Future<Output = ()>
-    // where
-    //     F: for<'a> FnMut(Row<'a>) -> bool;
+    /// Table scan with MVCC.
+    fn table_scan_mvcc<P: BufferPool, F>(
+        &self,
+        data_pool: &'static P,
+        stmt: &Statement,
+        start_row_id: RowID,
+        read_set: &[usize],
+        row_action: F,
+    ) -> impl Future<Output = ()>
+    where
+        F: FnMut(Vec<Val>) -> bool;
 
     /// Index lookup unique row with MVCC.
     /// Result should be no more than one row.
@@ -151,45 +153,47 @@ impl TableAccess for Table {
     ) where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
     {
-        // With cursor, we lock two pages in block index and one row page
-        // when scanning rows.
-        let mut cursor = self.blk_idx.cursor();
-        cursor.seek(start_row_id).await;
-        while let Some(leaf) = cursor.next().await {
-            let g = leaf.shared_async().await;
-            debug_assert!(g.page().is_leaf());
-            let blocks = g.page().leaf_blocks();
-            for block in blocks {
-                for page_entry in block.row_page_entries() {
-                    let row_page: PageSharedGuard<RowPage> = data_pool
-                        .get_page(page_entry.page_id, LatchFallbackMode::Shared)
-                        .await
-                        .shared_async()
-                        .await;
-                    let (ctx, _) = row_page.ctx_and_page();
-                    let metadata = &*ctx.undo().unwrap().metadata;
-                    for row_access in row_page.read_all_rows() {
-                        if !row_action(metadata, row_access.row()) {
-                            return;
+        self.table_scan(data_pool, start_row_id, |page_guard| {
+            let (ctx, page) = page_guard.ctx_and_page();
+            let metadata = &*ctx.undo().unwrap().metadata;
+            for row_access in ReadAllRows::new(page, ctx) {
+                if !row_action(metadata, row_access.row()) {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+    }
+
+    async fn table_scan_mvcc<P: BufferPool, F>(
+        &self,
+        data_pool: &'static P,
+        stmt: &Statement,
+        start_row_id: RowID,
+        read_set: &[usize],
+        mut row_action: F,
+    ) where
+        F: FnMut(Vec<Val>) -> bool,
+    {
+        self.table_scan(data_pool, start_row_id, |page_guard| {
+            let (ctx, page) = page_guard.ctx_and_page();
+            let metadata = &*ctx.undo().unwrap().metadata;
+            for row_access in ReadAllRows::new(page, ctx) {
+                match row_access.read_row_mvcc(&stmt.trx, metadata, read_set, None) {
+                    ReadRow::InvalidIndex => unreachable!(),
+                    ReadRow::NotFound => (),
+                    ReadRow::Ok(vals) => {
+                        if !row_action(vals) {
+                            return false;
                         }
                     }
                 }
             }
-        }
+            true
+        })
+        .await;
     }
-
-    // async fn table_vector_scan_mvcc<P: BufferPool, B, F>(
-    //     &self,
-    //     data_pool: &'static P,
-    //     stmt: &Statement,
-    //     start_row_id: RowID,
-    //     column_action: F,
-    // ) -> ()
-    // where
-    //     B: Bitmap,
-    //     F: for<'a> FnMut(&B, usize, ) -> bool,
-    // {
-    // }
 
     async fn index_lookup_unique_mvcc<P: BufferPool>(
         &self,
@@ -259,7 +263,7 @@ impl TableAccess for Table {
             return None;
         }
         let metadata = &*ctx.undo().unwrap().metadata;
-        let access = page_guard.read_row_by_id(row_id);
+        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         let row = access.row();
         // latest version in row page.
         if row.is_deleted() {

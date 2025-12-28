@@ -6,6 +6,7 @@ use crate::row::{RowID, RowPage};
 use crate::table::TableAccess;
 use crate::thread;
 use crate::trx::log::LogPartition;
+use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, TrxID};
 use async_executor::LocalExecutor;
@@ -134,8 +135,10 @@ impl TransactionSystem {
                     .shared_async()
                     .await
             };
+            let (ctx, page) = page_guard.ctx_and_page();
             for row_id in row_ids {
-                let mut access = page_guard.write_row_by_id(row_id);
+                let row_idx = page.row_idx(row_id);
+                let mut access = RowWriteAccess::new(page, ctx, row_idx);
                 access.purge_undo_chain(min_active_sts);
             }
         }
@@ -532,6 +535,7 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
     use crate::row::ops::SelectKey;
+    use crate::trx::row::RowReadAccess;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::tests::remove_files;
     use crate::value::Val;
@@ -748,7 +752,8 @@ mod tests {
                     .await
                     .shared_async()
                     .await;
-                let access = page_guard.read_row_by_id(row_id);
+                let (ctx, page) = page_guard.ctx_and_page();
+                let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
                 let ts = access.ts();
                 println!("row ts={:?}", ts);
             }

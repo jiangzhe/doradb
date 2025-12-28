@@ -25,7 +25,7 @@ use crate::row::ops::{
 use crate::row::{RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
-use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo};
+use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
 use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoKind, UndoStatus};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
@@ -129,11 +129,42 @@ impl Table {
                 if !page.row_id_in_valid_range(row_id) {
                     return SelectMvcc::NotFound;
                 }
-                // MVCC read does not require row lock.
-                let access = page_guard.read_row_by_id(row_id);
-                match access.read_row_mvcc(&stmt.trx, self.metadata(), user_read_set, key) {
+                let (ctx, page) = page_guard.ctx_and_page();
+                let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
+                match access.read_row_mvcc(&stmt.trx, self.metadata(), user_read_set, Some(key)) {
                     ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
                     ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
+                }
+            }
+        }
+    }
+
+    async fn table_scan<P: BufferPool, F>(
+        &self,
+        data_pool: &'static P,
+        start_row_id: RowID,
+        mut page_action: F,
+    ) where
+        F: FnMut(&PageSharedGuard<RowPage>) -> bool,
+    {
+        // With cursor, we lock two pages in block index and one row page
+        // when scanning rows.
+        let mut cursor = self.blk_idx.cursor();
+        cursor.seek(start_row_id).await;
+        while let Some(leaf) = cursor.next().await {
+            let g = leaf.shared_async().await;
+            debug_assert!(g.page().is_leaf());
+            let blocks = g.page().leaf_blocks();
+            for block in blocks {
+                for page_entry in block.row_page_entries() {
+                    let page_guard: PageSharedGuard<RowPage> = data_pool
+                        .get_page(page_entry.page_id, LatchFallbackMode::Shared)
+                        .await
+                        .shared_async()
+                        .await;
+                    if !page_action(&page_guard) {
+                        return;
+                    }
                 }
             }
         }
@@ -394,7 +425,8 @@ impl Table {
                 }
             }
         };
-        let access = page_guard.read_row_by_id(row_id);
+        let (ctx, page) = page_guard.ctx_and_page();
+        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
         // data or version chain.
@@ -450,7 +482,8 @@ impl Table {
                 }
             }
         };
-        let access = page_guard.read_row_by_id(row_id);
+        let (ctx, page) = page_guard.ctx_and_page();
+        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
         // data or version chain.
@@ -556,15 +589,17 @@ impl Table {
         };
         // The link process is to find one version of the old row that matches
         // given key and then link new row to it.
-        let old_access = old_guard.read_row_by_id(old_id);
         let metadata = self.metadata();
+        let (ctx, page) = old_guard.ctx_and_page();
+        let old_access = RowReadAccess::new(page, ctx, page.row_idx(old_id));
         match old_access.find_old_version_for_unique_key(metadata, key, &stmt.trx) {
             FindOldVersion::None => LinkForUniqueIndex::None,
             FindOldVersion::DuplicateKey => LinkForUniqueIndex::DuplicateKey,
             FindOldVersion::WriteConflict => LinkForUniqueIndex::WriteConflict,
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
-                let mut new_access = new_guard.write_row_by_id(new_id);
+                let (ctx, page) = new_guard.ctx_and_page();
+                let mut new_access = RowWriteAccess::new(page, ctx, page.row_idx(new_id));
                 let undo_vals = new_access.row().calc_delta(metadata, &old_row);
                 new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
                 LinkForUniqueIndex::Ok
@@ -620,7 +655,7 @@ impl Table {
         });
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
-        let page = page_guard.page();
+        let (ctx, page) = page_guard.ctx_and_page();
         debug_assert!(metadata.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
 
@@ -633,7 +668,7 @@ impl Table {
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = page_guard.write_row(row_idx);
+        let mut access = RowWriteAccess::new(page, ctx, row_idx);
         access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
@@ -651,7 +686,8 @@ impl Table {
         if let Some((old_id, old_guard)) = move_entry {
             // Here we actually lock both new row and old row,
             // not very sure if this will cause dead-lock.
-            let old_access = old_guard.write_row_by_id(old_id);
+            let (ctx, page) = old_guard.ctx_and_page();
+            let old_access = RowWriteAccess::new(page, ctx, page.row_idx(old_id));
             debug_assert!({ old_access.undo_head().is_some() });
             debug_assert!(
                 stmt.trx
@@ -897,8 +933,9 @@ impl Table {
         row_id: RowID,
         key: Option<&SelectKey>,
     ) -> LockRowForWrite<'a> {
+        let (ctx, page) = page_guard.ctx_and_page();
         loop {
-            let mut access = page_guard.write_row_by_id(row_id);
+            let mut access = RowWriteAccess::new(page, ctx, page.row_idx(row_id));
             let lock_undo = access.lock_undo(
                 stmt,
                 self.metadata(),
@@ -1187,8 +1224,9 @@ impl Table {
                     .shared_async()
                     .await;
                 debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));
-                let row_idx = page_guard.page().row_idx(row_id);
-                let access = page_guard.read_row(row_idx);
+                let (ctx, page) = page_guard.ctx_and_page();
+                let row_idx = page.row_idx(row_id);
+                let access = RowReadAccess::new(page, ctx, row_idx);
                 access.ts()
             }
         }
@@ -1984,7 +2022,8 @@ fn read_latest_index_key(
     let index_spec = &metadata.index_specs[index_no];
     let mut new_key = SelectKey::null(index_no, index_spec.index_cols.len());
     for (pos, key) in index_spec.index_cols.iter().enumerate() {
-        let access = page_guard.read_row_by_id(row_id);
+        let (ctx, page) = page_guard.ctx_and_page();
+        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         let val = access.row().val(metadata, key.col_no as usize);
         new_key.vals[pos] = val;
     }

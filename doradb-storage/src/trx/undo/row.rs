@@ -6,6 +6,7 @@ use crate::catalog::TableMetadata;
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
+use crate::trx::row::RowWriteAccess;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -243,7 +244,7 @@ impl RowUndoLogs {
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.undo().unwrap().metadata;
             let row_idx = page.row_idx(entry.row_id);
-            let mut access = page_guard.write_row(row_idx);
+            let mut access = RowWriteAccess::new(page, ctx, row_idx);
             access.rollback_first_undo(metadata, entry);
         }
     }
@@ -388,8 +389,8 @@ impl NextRowUndo {
 
     /// Returns next index branch.
     #[inline]
-    pub fn index_branch(&self, key: &SelectKey) -> Option<&IndexBranch> {
-        self.indexes.iter().find(|&ib| &ib.key == key)
+    pub fn index_branch(&self, key: Option<&SelectKey>) -> Option<&IndexBranch> {
+        key.and_then(|k| self.indexes.iter().find(|&ib| &ib.key == k))
     }
 }
 

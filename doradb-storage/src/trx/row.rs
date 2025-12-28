@@ -1,5 +1,4 @@
 use crate::buffer::frame::FrameContext;
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::catalog::{TableID, TableMetadata};
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
@@ -22,13 +21,14 @@ use std::sync::atomic::Ordering;
 pub struct RowReadAccess<'a> {
     page: &'a RowPage,
     row_idx: usize,
-    // undo: RwLockReadGuard<'a, Option<Box<RowUndoHead>>>,
     state: RowReadState<'a>,
 }
 
 impl<'a> RowReadAccess<'a> {
+    /// Acquire read latch for single row with offset.
     #[inline]
-    pub fn new(page: &'a RowPage, row_idx: usize, state: RowReadState<'a>) -> Self {
+    pub fn new(page: &'a RowPage, ctx: &'a FrameContext, row_idx: usize) -> Self {
+        let state = RowReadState::from_ctx(ctx, row_idx);
         RowReadAccess {
             page,
             row_idx,
@@ -61,7 +61,7 @@ impl<'a> RowReadAccess<'a> {
     pub fn read_row_latest(
         &self,
         metadata: &TableMetadata,
-        user_read_set: &[usize],
+        read_set: &[usize],
         key: Option<&SelectKey>,
     ) -> ReadRow {
         let row = self.row();
@@ -74,7 +74,7 @@ impl<'a> RowReadAccess<'a> {
         {
             return ReadRow::InvalidIndex;
         }
-        let vals = row.vals_for_read_set(metadata, user_read_set);
+        let vals = row.vals_for_read_set(metadata, read_set);
         ReadRow::Ok(vals)
     }
 
@@ -83,12 +83,12 @@ impl<'a> RowReadAccess<'a> {
         &self,
         trx: &ActiveTrx,
         metadata: &TableMetadata,
-        user_read_set: &[usize],
-        key: &SelectKey,
+        read_set: &[usize],
+        key: Option<&SelectKey>,
     ) -> ReadRow {
         match &self.state {
             RowReadState::Undo(undo) => match &**undo {
-                None => self.read_row_latest(metadata, user_read_set, Some(key)),
+                None => self.read_row_latest(metadata, read_set, key),
                 Some(undo_head) => {
                     // At this point, we already wait for preparation of commit is done.
                     // So we only have two cases: uncommitted, and committed.
@@ -96,43 +96,50 @@ impl<'a> RowReadAccess<'a> {
                     if trx_is_committed(ts) {
                         if trx.sts > ts {
                             // This version is visible
-                            return self.read_row_latest(metadata, user_read_set, Some(key));
+                            return self.read_row_latest(metadata, read_set, key);
                         } // Otherwise, go to next version
                     } else {
                         let trx_id = trx.trx_id();
                         if trx_id == ts {
                             // Self update, see the latest version
-                            return self.read_row_latest(metadata, user_read_set, Some(key));
+                            return self.read_row_latest(metadata, read_set, key);
                         } // Otherwise, go to next version
                     }
                     // Page data is invisible, we have to backtrace version chain
                     // Prepare visitor of version chain.
                     let mut next = &undo_head.next;
-                    let read_set: BTreeSet<usize> = user_read_set.iter().cloned().collect();
-                    let index_spec = &metadata.index_specs[key.index_no];
-                    let user_key_idx_map: HashMap<usize, usize> = index_spec
-                        .index_cols
-                        .iter()
-                        .enumerate()
-                        .map(|(key_pos, key)| (key.col_no as usize, key_pos))
-                        .collect();
-                    let read_set_contains_key = user_key_idx_map
-                        .keys()
-                        .all(|user_key_idx| read_set.contains(user_key_idx));
-                    let undo_key = if read_set_contains_key {
-                        None
-                    } else {
-                        let vals = self.row().clone_index_vals(metadata, key.index_no);
-                        Some(SelectKey {
-                            index_no: key.index_no,
-                            vals,
+                    let read_set: BTreeSet<usize> = read_set.iter().cloned().collect();
+                    let key_tracker = if let Some(key) = key {
+                        let index_spec = &metadata.index_specs[key.index_no];
+                        let user_key_idx_map: HashMap<usize, usize> = index_spec
+                            .index_cols
+                            .iter()
+                            .enumerate()
+                            .map(|(key_pos, key)| (key.col_no as usize, key_pos))
+                            .collect();
+                        let read_set_contains_key = user_key_idx_map
+                            .keys()
+                            .all(|user_key_idx| read_set.contains(user_key_idx));
+                        let undo_key = if read_set_contains_key {
+                            None
+                        } else {
+                            let vals = self.row().clone_index_vals(metadata, key.index_no);
+                            Some(SelectKey {
+                                index_no: key.index_no,
+                                vals,
+                            })
+                        };
+                        Some(IndexKeyTracker {
+                            user_key_idx_map,
+                            undo_key,
                         })
+                    } else {
+                        None
                     };
                     let mut ver = RowVersion {
                         deleted: self.row().is_deleted(),
                         read_set,
-                        user_key_idx_map,
-                        undo_key,
+                        key_tracker,
                         undo_vals: BTreeMap::new(),
                     };
                     loop {
@@ -439,6 +446,17 @@ pub struct ReadAllRows<'a> {
 
 impl<'a> ReadAllRows<'a> {
     #[inline]
+    pub fn new(page: &'a RowPage, ctx: &'a FrameContext) -> Self {
+        let end_idx = page.header.row_count();
+        ReadAllRows {
+            ctx,
+            page,
+            start_idx: 0,
+            end_idx,
+        }
+    }
+
+    #[inline]
     pub fn metadata(&self) -> Option<&TableMetadata> {
         self.ctx.undo().map(|m| &*m.metadata)
     }
@@ -453,11 +471,7 @@ impl<'a> Iterator for ReadAllRows<'a> {
             return None;
         }
         self.start_idx += 1;
-        Some(RowReadAccess::new(
-            self.page,
-            row_idx,
-            RowReadState::from_ctx(self.ctx, row_idx),
-        ))
+        Some(RowReadAccess::new(self.page, self.ctx, row_idx))
     }
 }
 
@@ -465,9 +479,7 @@ impl<'a> Iterator for ReadAllRows<'a> {
 struct RowVersion {
     deleted: bool,
     read_set: BTreeSet<usize>,
-    user_key_idx_map: HashMap<usize, usize>,
-    // if undo key is none, key is stored in undo_vals.
-    undo_key: Option<SelectKey>,
+    key_tracker: Option<IndexKeyTracker>,
     undo_vals: BTreeMap<usize, Val>,
 }
 
@@ -479,8 +491,9 @@ impl RowVersion {
             if self.read_set.contains(&u.idx()) {
                 self.undo_vals.insert(u.idx(), u.val().clone());
             }
-            if let Some(undo_key) = self.undo_key.as_mut()
-                && let Some(pos) = self.user_key_idx_map.get(&u.idx())
+            if let Some(tracker) = self.key_tracker.as_mut()
+                && let Some(undo_key) = tracker.undo_key.as_mut()
+                && let Some(pos) = tracker.user_key_idx_map.get(&u.idx())
             {
                 undo_key.vals[*pos] = u.val().clone();
             }
@@ -492,31 +505,37 @@ impl RowVersion {
         mut self,
         metadata: &TableMetadata,
         row: Row<'_>,
-        search_key: &SelectKey,
+        search_key: Option<&SelectKey>,
     ) -> ReadRow {
-        if let Some(undo_key) = self.undo_key {
-            // compare key directly
-            if search_key
-                .vals
-                .iter()
-                .zip(&undo_key.vals)
-                .any(|(v1, v2)| v1 != v2)
+        if let Some(search_key) = search_key {
+            // If search key is provided, we need to validate key before
+            // returning visible values.
+            if let Some(tracker) = self.key_tracker.as_ref()
+                && let Some(undo_key) = tracker.undo_key.as_ref()
             {
-                return ReadRow::InvalidIndex;
-            }
-        } else {
-            // compare key using read set and latest row page
-            let index_spec = &metadata.index_specs[search_key.index_no];
-            let key_different = search_key.vals.iter().enumerate().any(|(pos, search_val)| {
-                let user_col_idx = index_spec.index_cols[pos].col_no as usize;
-                if let Some(undo_val) = self.undo_vals.get(&user_col_idx) {
-                    search_val != undo_val
-                } else {
-                    row.is_different(metadata, user_col_idx, search_val)
+                // compare key directly
+                if search_key
+                    .vals
+                    .iter()
+                    .zip(&undo_key.vals)
+                    .any(|(v1, v2)| v1 != v2)
+                {
+                    return ReadRow::InvalidIndex;
                 }
-            });
-            if key_different {
-                return ReadRow::InvalidIndex;
+            } else {
+                // compare key using read set and latest row page
+                let index_spec = &metadata.index_specs[search_key.index_no];
+                let key_different = search_key.vals.iter().enumerate().any(|(pos, search_val)| {
+                    let user_col_idx = index_spec.index_cols[pos].col_no as usize;
+                    if let Some(undo_val) = self.undo_vals.get(&user_col_idx) {
+                        search_val != undo_val
+                    } else {
+                        row.is_different(metadata, user_col_idx, search_val)
+                    }
+                });
+                if key_different {
+                    return ReadRow::InvalidIndex;
+                }
             }
         }
         let mut vals = Vec::with_capacity(self.read_set.len());
@@ -529,6 +548,11 @@ impl RowVersion {
         }
         ReadRow::Ok(vals)
     }
+}
+
+struct IndexKeyTracker {
+    user_key_idx_map: HashMap<usize, usize>,
+    undo_key: Option<SelectKey>,
 }
 
 struct KeyVersion {
@@ -558,12 +582,11 @@ pub struct RowWriteAccess<'a> {
 
 impl<'a> RowWriteAccess<'a> {
     #[inline]
-    pub fn new(
-        page: &'a RowPage,
-        undo_map: &'a UndoMap,
-        row_idx: usize,
-        undo: RwLockWriteGuard<'a, Option<Box<RowUndoHead>>>,
-    ) -> Self {
+    pub fn new(page: &'a RowPage, ctx: &'a FrameContext, row_idx: usize) -> Self {
+        let undo_map = ctx
+            .undo()
+            .expect("write_row not supported without undo map");
+        let undo = undo_map.write(row_idx);
         undo_map.version.fetch_add(1, Ordering::Release);
         RowWriteAccess {
             page,
@@ -886,54 +909,6 @@ impl Drop for RowWriteAccess<'_> {
     #[inline]
     fn drop(&mut self) {
         self.undo_map.version.fetch_add(1, Ordering::Release);
-    }
-}
-
-impl PageSharedGuard<RowPage> {
-    /// Acquire read latch for single row with offset.
-    #[inline]
-    pub fn read_row(&self, row_idx: usize) -> RowReadAccess<'_> {
-        let (ctx, page) = self.ctx_and_page();
-        RowReadAccess::new(page, row_idx, RowReadState::from_ctx(ctx, row_idx))
-    }
-
-    #[inline]
-    pub fn read_all_rows(&self) -> ReadAllRows<'_> {
-        let (ctx, page) = self.ctx_and_page();
-        let end_idx = page.header.row_count();
-        ReadAllRows {
-            ctx,
-            page,
-            start_idx: 0,
-            end_idx,
-        }
-    }
-
-    /// Acquire read latch for single row with row id.
-    #[inline]
-    pub fn read_row_by_id(&self, row_id: RowID) -> RowReadAccess<'_> {
-        let row_idx = self.page().row_idx(row_id);
-        self.read_row(row_idx)
-    }
-
-    /// Acquire write latch for single row with offset.
-    /// In recovery mode, this method is not invoked, because we
-    /// hold exclusive page guard and directly change values on each row.
-    #[inline]
-    pub fn write_row(&self, row_idx: usize) -> RowWriteAccess<'_> {
-        let (ctx, page) = self.ctx_and_page();
-        let undo_map = ctx
-            .undo()
-            .expect("write_row not supported without undo map");
-        let undo = undo_map.write(row_idx);
-        RowWriteAccess::new(page, undo_map, row_idx, undo)
-    }
-
-    /// Acquire write latch for single row with row id.
-    #[inline]
-    pub fn write_row_by_id(&self, row_id: RowID) -> RowWriteAccess<'_> {
-        let row_idx = self.page().row_idx(row_id);
-        self.write_row(row_idx)
     }
 }
 

@@ -633,7 +633,7 @@ fn test_evict_pool_insert_full() {
 }
 
 #[test]
-fn test_row_page_scan_rows_uncommitted() {
+fn test_table_scan_uncommitted() {
     smol::block_on(async {
         const SIZE: i32 = 10000;
 
@@ -662,6 +662,89 @@ fn test_row_page_scan_rows_uncommitted() {
         }
 
         drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_table_scan_mvcc() {
+    smol::block_on(async {
+        const SIZE: i32 = 100;
+
+        let sys = TestSys::new_evictable().await;
+
+        // insert 100 rows and commit
+        let mut session1 = sys.new_session();
+        {
+            let mut trx = session1.begin_trx().unwrap();
+            for i in 0..SIZE {
+                let s = format!("{}", i);
+                let insert = vec![Val::from(i), Val::from(&s[..])];
+                trx = sys.trx_insert(trx, insert).await;
+            }
+            _ = trx.commit().await.unwrap();
+        }
+        // we should see 100 committed rows.
+        let mut session2 = sys.new_session();
+        {
+            let trx = session2.begin_trx().unwrap();
+            let stmt = trx.start_stmt();
+            let mut res_len = 0usize;
+            sys.table
+                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |row| {
+                    res_len += 1;
+                    true
+                })
+                .await;
+            println!("res.len()={}", res_len);
+            assert!(res_len == SIZE as usize);
+            stmt.succeed().commit().await.unwrap();
+        }
+        // insert 100 rows but not commit.
+        let pending_trx = {
+            let mut trx = session1.begin_trx().unwrap();
+            for i in SIZE..SIZE * 2 {
+                let s = format!("{}", i);
+                let insert = vec![Val::from(i), Val::from(&s[..])];
+                trx = sys.trx_insert(trx, insert).await;
+            }
+            trx
+        };
+        // we should see only 100 rows
+        {
+            let trx = session2.begin_trx().unwrap();
+            let stmt = trx.start_stmt();
+            let mut res_len = 0usize;
+            sys.table
+                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |row| {
+                    res_len += 1;
+                    true
+                })
+                .await;
+            println!("res.len()={}", res_len);
+            assert!(res_len == SIZE as usize);
+            stmt.succeed().commit().await.unwrap();
+        }
+        // commit the pending transaction.
+        pending_trx.commit().await.unwrap();
+        // now we should see 200 rows.
+        {
+            let trx = session2.begin_trx().unwrap();
+            let stmt = trx.start_stmt();
+            let mut res_len = 0usize;
+            sys.table
+                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |row| {
+                    res_len += 1;
+                    true
+                })
+                .await;
+            println!("res.len()={}", res_len);
+            assert!(res_len == (SIZE * 2) as usize);
+            stmt.succeed().commit().await.unwrap();
+        }
+
+        drop(session1);
+        drop(session2);
         sys.clean_all();
     });
 }
