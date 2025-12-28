@@ -9,6 +9,7 @@ use crate::table::{
 };
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::TrxID;
+use crate::trx::row::ReadAllRows;
 use crate::value::Val;
 use std::collections::HashMap;
 use std::future::Future;
@@ -213,13 +214,14 @@ impl TableRecover for Table {
             .shared_async()
             .await;
         let metadata = self.metadata();
+        let (ctx, page) = page_guard.ctx_and_page();
         for (index_spec, sec_idx) in metadata.index_specs.iter().zip(&*self.sec_idx) {
             let read_set: Vec<_> = index_spec
                 .index_cols
                 .iter()
                 .map(|c| c.col_no as usize)
                 .collect();
-            for row_access in page_guard.read_all_rows() {
+            for row_access in ReadAllRows::new(page, ctx) {
                 let row_id = row_access.row().row_id();
                 match row_access.read_row_latest(metadata, &read_set, None) {
                     ReadRow::Ok(vals) => {

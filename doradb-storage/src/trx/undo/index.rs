@@ -6,6 +6,7 @@ use crate::latch::LatchFallbackMode;
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage, RowRead};
 use crate::trx::TrxID;
+use crate::trx::row::RowReadAccess;
 
 #[derive(Default)]
 pub struct IndexUndoLogs(Vec<IndexUndo>);
@@ -112,7 +113,8 @@ impl IndexUndoLogs {
                                 .shared_async()
                                 .await;
                             // acquire row latch to avoid race condition.
-                            let access = page_guard.read_row_by_id(old_row_id);
+                            let (ctx, page) = page_guard.ctx_and_page();
+                            let access = RowReadAccess::new(page, ctx, page.row_idx(old_row_id));
                             if access.row().is_deleted() && !access.any_old_version_exists() {
                                 // old row is invisible to all transactions.
                                 let new_row_id = entry.row_id;
