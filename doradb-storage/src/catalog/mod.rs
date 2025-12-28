@@ -173,7 +173,7 @@ impl Catalog {
                 let active_root = table_file.active_root();
                 // todo: refine recovery of corrupted file.
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
-                let metadata_in_file = &active_root.metadata;
+                let metadata_in_file = &*active_root.metadata;
                 debug_assert_eq!(&metadata_in_catalog, metadata_in_file);
                 let row_id_bound = active_root.row_id_bound;
 

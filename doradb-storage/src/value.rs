@@ -4,6 +4,7 @@ use crate::memcmp::{
     SegmentedBytes,
 };
 use crate::serde::{Deser, Ser, SerdeCtx};
+use bytemuck::{AnyBitPattern, Zeroable};
 use ordered_float::OrderedFloat;
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
@@ -297,17 +298,17 @@ impl Val {
     }
 
     #[inline]
-    pub fn as_f32(&self) -> Option<OrderedFloat<f32>> {
+    pub fn as_f32(&self) -> Option<f32> {
         match self {
-            Val::F32(v) => Some(*v),
+            Val::F32(v) => Some(v.0),
             _ => None,
         }
     }
 
     #[inline]
-    pub fn as_f64(&self) -> Option<OrderedFloat<f64>> {
+    pub fn as_f64(&self) -> Option<f64> {
         match self {
-            Val::F64(v) => Some(*v),
+            Val::F64(v) => Some(v.0),
             _ => None,
         }
     }
@@ -686,6 +687,69 @@ impl Value for f64 {
     }
 }
 
+/// ValBuffer represents a temporary b uffer to hold
+/// continuous values.
+/// Null bitmap is separated from this buffer.
+pub enum ValBuffer {
+    I8(Vec<i8>),
+    U8(Vec<u8>),
+    I16(Vec<i16>),
+    U16(Vec<u16>),
+    I32(Vec<i32>),
+    U32(Vec<u32>),
+    F32(Vec<f32>),
+    I64(Vec<i64>),
+    U64(Vec<u64>),
+    F64(Vec<f64>),
+    VarByte {
+        offsets: Vec<(usize, usize)>,
+        data: Vec<u8>,
+    },
+}
+
+impl ValBuffer {
+    /// Create a new value buffer.
+    #[inline]
+    pub fn new(kind: ValKind) -> Self {
+        match kind {
+            ValKind::I8 => ValBuffer::I8(vec![]),
+            ValKind::U8 => ValBuffer::U8(vec![]),
+            ValKind::I16 => ValBuffer::I16(vec![]),
+            ValKind::U16 => ValBuffer::U16(vec![]),
+            ValKind::I32 => ValBuffer::I32(vec![]),
+            ValKind::U32 => ValBuffer::U32(vec![]),
+            ValKind::F32 => ValBuffer::F32(vec![]),
+            ValKind::I64 => ValBuffer::I64(vec![]),
+            ValKind::U64 => ValBuffer::U64(vec![]),
+            ValKind::F64 => ValBuffer::F64(vec![]),
+            ValKind::VarByte => ValBuffer::VarByte {
+                offsets: vec![],
+                data: vec![],
+            },
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        match self {
+            ValBuffer::I8(vec) => vec.clear(),
+            ValBuffer::U8(vec) => vec.clear(),
+            ValBuffer::I16(vec) => vec.clear(),
+            ValBuffer::U16(vec) => vec.clear(),
+            ValBuffer::I32(vec) => vec.clear(),
+            ValBuffer::U32(vec) => vec.clear(),
+            ValBuffer::F32(vec) => vec.clear(),
+            ValBuffer::I64(vec) => vec.clear(),
+            ValBuffer::U64(vec) => vec.clear(),
+            ValBuffer::F64(vec) => vec.clear(),
+            ValBuffer::VarByte { offsets, data } => {
+                offsets.clear();
+                data.clear();
+            }
+        }
+    }
+}
+
 /// PageVar represents var-len value in page.
 /// It has two kinds: inline and outline.
 /// Inline means the bytes are inlined in the fixed field.
@@ -693,7 +757,7 @@ impl Value for f64 {
 /// offset and prfix. Entire value is located at
 /// tail of page.
 #[derive(Clone, Copy)]
-#[repr(align(8))]
+#[repr(C, align(8))]
 pub union PageVar {
     i: PageVarInline,
     o: PageVarOutline,
@@ -766,7 +830,7 @@ impl PageVar {
     ///
     /// Caller should make sure ptr is valid.
     #[inline]
-    pub unsafe fn as_bytes(&self, ptr: *const u8) -> &[u8] {
+    pub unsafe fn as_bytes_unchecked(&self, ptr: *const u8) -> &[u8] {
         unsafe {
             let len = self.len();
             if len <= PAGE_VAR_LEN_INLINE {
@@ -778,59 +842,15 @@ impl PageVar {
         }
     }
 
-    /// Returns mutable bytes.
-    ///
-    /// # Safety
-    ///
-    /// Caller should make sure ptr is valid.
+    /// Returns bytes on given page.
     #[inline]
-    pub unsafe fn as_bytes_mut(&mut self, ptr: *mut u8) -> &mut [u8] {
-        unsafe {
-            let len = self.len();
-            if len <= PAGE_VAR_LEN_INLINE {
-                &mut self.i.data[..len]
-            } else {
-                let data = ptr.add(self.o.offset as usize);
-                std::slice::from_raw_parts_mut(data, len)
-            }
-        }
-    }
-
-    /// Returns string.
-    ///
-    /// # Safety
-    ///
-    /// Caller should make sure ptr is valid.
-    #[inline]
-    pub unsafe fn as_str(&self, ptr: *const u8) -> &str {
-        unsafe {
-            let len = self.len();
-            if len <= PAGE_VAR_LEN_INLINE {
-                std::str::from_utf8_unchecked(&self.i.data[..len])
-            } else {
-                let data = ptr.add(self.o.offset as usize);
-                let bytes = std::slice::from_raw_parts(data, len);
-                std::str::from_utf8_unchecked(bytes)
-            }
-        }
-    }
-
-    /// Returns mutable string.
-    ///
-    /// # Safety
-    ///
-    /// Caller should make sure ptr is valid.
-    #[inline]
-    pub unsafe fn as_str_mut(&mut self, ptr: *mut u8) -> &mut str {
-        unsafe {
-            let len = self.len();
-            if len <= PAGE_VAR_LEN_INLINE {
-                std::str::from_utf8_unchecked_mut(&mut self.i.data[..len])
-            } else {
-                let data = ptr.add(self.o.offset as usize);
-                let bytes = std::slice::from_raw_parts_mut(data, len);
-                std::str::from_utf8_unchecked_mut(bytes)
-            }
+    pub fn as_bytes<'a>(&'a self, page_data: &'a [u8]) -> &'a [u8] {
+        let len = self.len();
+        if len <= PAGE_VAR_LEN_INLINE {
+            unsafe { &self.i.data[..len] }
+        } else {
+            let offset = unsafe { self.o.offset as usize };
+            &page_data[offset..offset + len]
         }
     }
 
@@ -862,14 +882,17 @@ impl PageVar {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+unsafe impl Zeroable for PageVar {}
+unsafe impl AnyBitPattern for PageVar {}
+
+#[derive(Debug, Clone, Copy, AnyBitPattern)]
 #[repr(C, align(8))]
 struct PageVarInline {
     len: u16,
     data: [u8; PAGE_VAR_LEN_INLINE],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, AnyBitPattern)]
 #[repr(C, align(8))]
 struct PageVarOutline {
     len: u16,
@@ -1182,7 +1205,7 @@ mod tests {
         let var1 = PageVar::inline(b"hello");
         assert!(var1.is_inlined());
         assert!(var1.len() == 5);
-        assert!(unsafe { var1.as_bytes(std::ptr::null()) } == b"hello");
+        assert!(unsafe { var1.as_bytes_unchecked(std::ptr::null()) } == b"hello");
     }
 
     #[test]
@@ -1482,7 +1505,7 @@ mod tests {
         let var = PageVar::inline(data);
         assert!(var.is_inlined());
         assert_eq!(var.len(), data.len());
-        assert_eq!(unsafe { var.as_bytes(std::ptr::null()) }, data);
+        assert_eq!(unsafe { var.as_bytes_unchecked(std::ptr::null()) }, data);
         assert_eq!(var.offset(), None);
     }
 
@@ -1500,7 +1523,7 @@ mod tests {
         assert!(!var.is_inlined());
         assert_eq!(var.len(), data.len());
         assert_eq!(var.offset(), Some(offset));
-        assert_eq!(unsafe { var.as_bytes(page_data.as_ptr()) }, data);
+        assert_eq!(unsafe { var.as_bytes_unchecked(page_data.as_ptr()) }, data);
     }
 
     #[test]
@@ -1542,30 +1565,6 @@ mod tests {
     }
 
     #[test]
-    fn test_page_var_as_str() {
-        let inline_str = "hello";
-        let outline_str = "a longer string that requires outline storage";
-        let mut page_data = vec![0u8; 100];
-        let offset = 20;
-
-        // Store outline data
-        page_data[offset..offset + outline_str.len()].copy_from_slice(outline_str.as_bytes());
-
-        let inline_var = PageVar::inline(inline_str.as_bytes());
-        let outline_var = PageVar::outline(
-            outline_str.len() as u16,
-            offset as u16,
-            &outline_str.as_bytes()[..PAGE_VAR_LEN_PREFIX],
-        );
-
-        assert_eq!(unsafe { inline_var.as_str(std::ptr::null()) }, inline_str);
-        assert_eq!(
-            unsafe { outline_var.as_str(page_data.as_ptr()) },
-            outline_str
-        );
-    }
-
-    #[test]
     fn test_page_var_update_in_place() {
         let mut page_data = vec![0u8; 100];
         let offset = 30;
@@ -1586,12 +1585,18 @@ mod tests {
         unsafe { var.update_in_place(page_data.as_mut_ptr(), updated_data) };
         assert!(!var.is_inlined());
         assert_eq!(var.len(), updated_data.len());
-        assert_eq!(unsafe { var.as_bytes(page_data.as_ptr()) }, updated_data);
+        assert_eq!(
+            unsafe { var.as_bytes_unchecked(page_data.as_ptr()) },
+            updated_data
+        );
         // Update with shorter data (should not switch to inline)
         unsafe { var.update_in_place(page_data.as_mut_ptr(), short_data) };
         assert!(var.is_inlined());
         assert_eq!(var.len(), short_data.len());
-        assert_eq!(unsafe { var.as_bytes(std::ptr::null()) }, short_data);
+        assert_eq!(
+            unsafe { var.as_bytes_unchecked(std::ptr::null()) },
+            short_data
+        );
     }
 
     #[test]

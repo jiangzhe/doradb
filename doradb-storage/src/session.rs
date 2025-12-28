@@ -171,7 +171,10 @@ impl Session {
         //    Use <table-id>.tbl as table name
         let table_id = engine.catalog().next_obj_id();
 
-        let metadata = TableMetadata::new(table_spec.columns.clone(), index_specs.clone());
+        let metadata = Arc::new(TableMetadata::new(
+            table_spec.columns.clone(),
+            index_specs.clone(),
+        ));
         let uninit_table_file = engine
             .table_fs
             .create_table_file(table_id, metadata, false)?;

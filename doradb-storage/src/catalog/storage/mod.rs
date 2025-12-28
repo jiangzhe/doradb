@@ -17,6 +17,7 @@ use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::table::Table;
 use crate::trx::MIN_SNAPSHOT_TS;
+use std::sync::Arc;
 
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
@@ -41,10 +42,11 @@ impl CatalogStorage {
             // make sure table id matches.
             assert_eq!(cat.len(), *table_id as usize);
             // catalog table with manually allocated page id.
-            let table_file = table_fs.create_table_file(*table_id, metadata.clone(), true)?;
+            let table_file =
+                table_fs.create_table_file(*table_id, Arc::new(metadata.clone()), true)?;
             let (table_file, old_root) = table_file.commit(MIN_SNAPSHOT_TS, false).await?;
             debug_assert!(old_root.is_none());
-            debug_assert!(metadata == &table_file.active_root().metadata);
+            debug_assert!(metadata == &*table_file.active_root().metadata);
             let blk_idx = BlockIndex::new(
                 meta_pool,
                 *table_id,

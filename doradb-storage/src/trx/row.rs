@@ -74,7 +74,7 @@ impl<'a> RowReadAccess<'a> {
         {
             return ReadRow::InvalidIndex;
         }
-        let vals = row.clone_vals_for_read_set(metadata, user_read_set);
+        let vals = row.vals_for_read_set(metadata, user_read_set);
         ReadRow::Ok(vals)
     }
 
@@ -437,6 +437,13 @@ pub struct ReadAllRows<'a> {
     end_idx: usize,
 }
 
+impl<'a> ReadAllRows<'a> {
+    #[inline]
+    pub fn metadata(&self) -> Option<&TableMetadata> {
+        self.ctx.undo().map(|m| &*m.metadata)
+    }
+}
+
 impl<'a> Iterator for ReadAllRows<'a> {
     type Item = RowReadAccess<'a>;
     #[inline]
@@ -517,7 +524,7 @@ impl RowVersion {
             if let Some(v) = self.undo_vals.remove(user_col_idx) {
                 vals.push(v);
             } else {
-                vals.push(row.clone_val(metadata, *user_col_idx))
+                vals.push(row.val(metadata, *user_col_idx))
             }
         }
         ReadRow::Ok(vals)
@@ -598,7 +605,7 @@ impl<'a> RowWriteAccess<'a> {
         }
         match self.page.request_free_space(var_len) {
             None => {
-                let old_row = self.row().clone_vals_with_var_offsets(metadata);
+                let old_row = self.row().vals_with_var_offsets(metadata);
                 UpdateRow::NoFreeSpace(old_row)
             }
             Some(offset) => {
@@ -817,7 +824,7 @@ impl<'a> RowWriteAccess<'a> {
 
     /// Rollback first undo log in the chain.
     #[inline]
-    pub fn rollback_first_undo(&mut self, mut owned_entry: OwnedRowUndo) {
+    pub fn rollback_first_undo(&mut self, metadata: &TableMetadata, mut owned_entry: OwnedRowUndo) {
         let head = self.undo.as_mut().expect("undo head");
         let entry = &mut head.next.main.entry;
         debug_assert!({
@@ -838,6 +845,7 @@ impl<'a> RowWriteAccess<'a> {
                 // and prefer to reuse the space occupied by old value.
                 for uc in undo_cols {
                     self.page.update_col(
+                        metadata,
                         self.row_idx,
                         uc.idx,
                         &uc.val,

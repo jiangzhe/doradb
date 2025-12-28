@@ -96,20 +96,32 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
 }
 
 #[inline]
-fn row_to_column_object(row: Row<'_>) -> ColumnObject {
-    let column_id = row.val::<u64>(COL_NO_COLUMNS_COLUMN_ID);
-    let table_id = row.val::<u64>(COL_NO_COLUMNS_TABLE_ID);
-    let column_name = row.str(COL_NO_COLUMNS_COLUMN_NAME);
-    let column_no = row.val::<u16>(COL_NO_COLUMNS_COLUMN_NO);
-    let column_type = row.val::<u32>(COL_NO_COLUMNS_COLUMN_TYPE);
-    let column_attributes = row.val::<u32>(COL_NO_COLUMNS_COLUMN_ATTRIBUTES);
+fn row_to_column_object(metadata: &TableMetadata, row: Row<'_>) -> ColumnObject {
+    let column_id = row
+        .val(metadata, COL_NO_COLUMNS_COLUMN_ID)
+        .as_u64()
+        .unwrap();
+    let table_id = row.val(metadata, COL_NO_COLUMNS_TABLE_ID).as_u64().unwrap();
+    let column_name = row.str(COL_NO_COLUMNS_COLUMN_NAME).unwrap();
+    let column_no = row
+        .val(metadata, COL_NO_COLUMNS_COLUMN_NO)
+        .as_u16()
+        .unwrap();
+    let column_type = row
+        .val(metadata, COL_NO_COLUMNS_COLUMN_TYPE)
+        .as_u32()
+        .unwrap();
+    let column_attributes = row
+        .val(metadata, COL_NO_COLUMNS_COLUMN_ATTRIBUTES)
+        .as_u32()
+        .unwrap();
     ColumnObject {
-        column_id: *column_id,
-        table_id: *table_id,
+        column_id,
+        table_id,
         column_name: SemiStr::new(column_name),
-        column_no: *column_no,
-        column_type: ValKind::try_from(*column_type as u8).unwrap(),
-        column_attributes: ColumnAttributes::from_bits_truncate(*column_attributes),
+        column_no,
+        column_type: ValKind::try_from(column_type as u8).unwrap(),
+        column_attributes: ColumnAttributes::from_bits_truncate(column_attributes),
     }
 }
 
@@ -138,11 +150,11 @@ impl<P: BufferPool> Columns<'_, P> {
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<ColumnObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, 0, |row| {
+            .table_scan_uncommitted(self.buf_pool, 0, |metadata, row| {
                 // filter by table id before deserializing the whole object.
-                let table_id_in_row = *row.val::<TableID>(COL_NO_COLUMNS_TABLE_ID);
+                let table_id_in_row = row.val(metadata, COL_NO_COLUMNS_TABLE_ID).as_u64().unwrap();
                 if table_id_in_row == table_id {
-                    let obj = row_to_column_object(row);
+                    let obj = row_to_column_object(metadata, row);
                     res.push(obj);
                 }
                 true

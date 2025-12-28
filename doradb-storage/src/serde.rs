@@ -839,6 +839,7 @@ impl Deser for () {
 ///
 /// The format is as below:
 ///
+/// ```text
 /// |----------|----------------|
 /// | field    | length(B)      |
 /// |----------|----------------|
@@ -847,6 +848,7 @@ impl Deser for () {
 /// | min      | sizeof(T)      |
 /// | packed   | (n_bits*len)/8 |
 /// |----------|----------------|
+/// ```
 ///
 /// Special case handling:
 /// 1. input is empty, n_bits will be set to 0 and no more output.

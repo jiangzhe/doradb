@@ -419,10 +419,11 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::file::table_file::ActiveRoot;
     use crate::value::ValKind;
+    use std::sync::Arc;
 
     #[test]
     fn test_active_root_serde() {
-        let metadata = TableMetadata::new(
+        let metadata = Arc::new(TableMetadata::new(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
@@ -432,8 +433,8 @@ mod tests {
                 vec![IndexKey::new(0)],
                 IndexAttributes::PK,
             )],
-        );
-        let active_root = ActiveRoot::new(1, 1024, metadata);
+        ));
+        let active_root = ActiveRoot::new(1, 1024, Arc::clone(&metadata));
         let mut ctx = SerdeCtx::default();
         let ser_view = active_root.ser_view();
         let ser_len = ser_view.ser_len(&ctx);
@@ -458,7 +459,7 @@ mod tests {
         }
 
         if let SuperPageMeta::Inline(metadata) = &body.meta {
-            assert_eq!(metadata, &active_root.metadata);
+            assert_eq!(metadata, &*active_root.metadata);
         } else {
             panic!("invalid super page");
         }

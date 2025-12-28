@@ -72,13 +72,13 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
 }
 
 #[inline]
-fn row_to_table_object(row: Row<'_>) -> TableObject {
-    let table_id = row.val::<u64>(COL_NO_TABLES_TABLE_ID);
-    let schema_id = row.val::<u64>(COL_NO_TABLES_SCHEMA_ID);
-    let table_name = row.str(COL_NO_TABLES_TABLE_NAME);
+fn row_to_table_object(metadata: &TableMetadata, row: Row<'_>) -> TableObject {
+    let table_id = row.val(metadata, COL_NO_TABLES_TABLE_ID).as_u64().unwrap();
+    let schema_id = row.val(metadata, COL_NO_TABLES_SCHEMA_ID).as_u64().unwrap();
+    let table_name = row.str(COL_NO_TABLES_TABLE_NAME).unwrap();
     TableObject {
-        table_id: *table_id,
-        schema_id: *schema_id,
+        table_id,
+        schema_id,
         table_name: SemiStr::new(table_name),
     }
 }

@@ -1,5 +1,6 @@
 use crate::buffer::BufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
+use crate::catalog::TableMetadata;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
@@ -23,7 +24,7 @@ pub trait TableAccess {
         row_action: F,
     ) -> impl Future<Output = ()>
     where
-        F: for<'a> FnMut(Row<'a>) -> bool;
+        F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool;
 
     // /// Table scan with MVCC.
     // fn table_scan_mvcc<P: BufferPool, F>(
@@ -54,7 +55,7 @@ pub trait TableAccess {
         row_action: F,
     ) -> impl Future<Output = Option<R>>
     where
-        for<'a> F: FnOnce(Row<'a>) -> R;
+        for<'m, 'p> F: FnOnce(&'m TableMetadata, Row<'p>) -> R;
 
     /// Index scan with MVCC of given key.
     fn index_scan_mvcc<P: BufferPool>(
@@ -148,7 +149,7 @@ impl TableAccess for Table {
         start_row_id: RowID,
         mut row_action: F,
     ) where
-        F: for<'a> FnMut(Row<'a>) -> bool,
+        F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
@@ -165,8 +166,10 @@ impl TableAccess for Table {
                         .await
                         .shared_async()
                         .await;
+                    let (ctx, _) = row_page.ctx_and_page();
+                    let metadata = &*ctx.undo().unwrap().metadata;
                     for row_access in row_page.read_all_rows() {
-                        if !row_action(row_access.row()) {
+                        if !row_action(metadata, row_access.row()) {
                             return;
                         }
                     }
@@ -226,7 +229,7 @@ impl TableAccess for Table {
         row_action: F,
     ) -> Option<R>
     where
-        for<'a> F: FnOnce(Row<'a>) -> R,
+        for<'m, 'p> F: FnOnce(&'m TableMetadata, Row<'p>) -> R,
     {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
@@ -251,10 +254,11 @@ impl TableAccess for Table {
                 }
             },
         };
-        let page = page_guard.page();
+        let (ctx, page) = page_guard.ctx_and_page();
         if !page.row_id_in_valid_range(row_id) {
             return None;
         }
+        let metadata = &*ctx.undo().unwrap().metadata;
         let access = page_guard.read_row_by_id(row_id);
         let row = access.row();
         // latest version in row page.
@@ -264,7 +268,7 @@ impl TableAccess for Table {
         if row.is_key_different(self.metadata(), key) {
             return None;
         }
-        Some(row_action(row))
+        Some(row_action(metadata, row))
     }
 
     async fn index_scan_mvcc<P: BufferPool>(
@@ -380,7 +384,7 @@ impl TableAccess for Table {
             let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
             debug_assert!(row.is_deleted());
             for (col_idx, user_col) in cols.iter().enumerate() {
-                row.update_col(col_idx, user_col, false);
+                row.update_col(metadata, col_idx, user_col, false);
             }
             // update index
             for key in keys {

@@ -7,7 +7,6 @@ pub mod catalog;
 pub mod compression;
 pub mod engine;
 pub mod file;
-pub mod float;
 pub mod free_list;
 pub mod index;
 pub mod latch;

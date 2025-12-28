@@ -28,6 +28,7 @@ const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcP
 ///
 /// Header:
 ///
+/// ```text
 /// |-------------------------|-----------|
 /// | field                   | length(B) |
 /// |-------------------------|-----------|
@@ -38,9 +39,11 @@ const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcP
 /// | first_col_offset        | 2         |
 /// | _padding                | 2         |
 /// |-------------------------|-----------|
+/// ```
 ///
 /// Body:
 ///
+/// ```text
 /// |------------------|------------------------------------------------|
 /// | field            | length(B)                                      |
 /// |------------------|------------------------------------------------|
@@ -51,14 +54,17 @@ const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcP
 /// | c_n              | col_offsets[n] - col_offsets[n-1]              |
 /// | padding          | rest of the page except checksum               |
 /// |------------------|------------------------------------------------|
+/// ```
 ///
 /// Footer:
 ///
+/// ```text
 /// |-------------------------|-----------|
 /// | field                   | length(B) |
 /// |-------------------------|-----------|
 /// | b3sum                   | 32        |
 /// |-------------------------|-----------|
+/// ```
 pub struct LwcPage {
     // The conversion from disk page to mem page is not safe.
     // We should use Ser and Deser for endianess safety.

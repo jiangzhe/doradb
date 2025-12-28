@@ -83,16 +83,19 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
 }
 
 #[inline]
-fn row_to_index_object(row: Row<'_>) -> IndexObject {
-    let index_id = row.val::<u64>(COL_NO_INDEXES_INDEX_ID);
-    let table_id = row.val::<u64>(COL_NO_INDEXES_TABLE_ID);
-    let index_name = row.str(COL_NO_INDEXES_INDEX_NAME);
-    let index_attributes = row.val::<u32>(COL_NO_INDEXES_INDEX_ATTRIBUTES);
+fn row_to_index_object(metadata: &TableMetadata, row: Row<'_>) -> IndexObject {
+    let index_id = row.val(metadata, COL_NO_INDEXES_INDEX_ID).as_u64().unwrap();
+    let table_id = row.val(metadata, COL_NO_INDEXES_TABLE_ID).as_u64().unwrap();
+    let index_name = row.str(COL_NO_INDEXES_INDEX_NAME).unwrap();
+    let index_attributes = row
+        .val(metadata, COL_NO_INDEXES_INDEX_ATTRIBUTES)
+        .as_u32()
+        .unwrap();
     IndexObject {
-        index_id: *index_id,
-        table_id: *table_id,
+        index_id,
+        table_id,
         index_name: SemiStr::new(index_name),
-        index_attributes: IndexAttributes::from_bits_truncate(*index_attributes),
+        index_attributes: IndexAttributes::from_bits_truncate(index_attributes),
     }
 }
 
@@ -129,11 +132,11 @@ impl<P: BufferPool> Indexes<'_, P> {
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<IndexObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, 0, |row| {
+            .table_scan_uncommitted(self.buf_pool, 0, |metadata, row| {
                 // filter by table id before deserializing the whole object.
-                let table_id_in_row = *row.val::<TableID>(COL_NO_INDEXES_TABLE_ID);
+                let table_id_in_row = row.val(metadata, COL_NO_INDEXES_TABLE_ID).as_u64().unwrap();
                 if table_id_in_row == table_id {
-                    let obj = row_to_index_object(row);
+                    let obj = row_to_index_object(metadata, row);
                     res.push(obj);
                 }
                 true
@@ -212,18 +215,33 @@ pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
 }
 
 #[inline]
-fn row_to_index_column_object(row: Row<'_>) -> IndexColumnObject {
-    let column_id = row.val::<u64>(COL_NO_INDEX_COLUMNS_COLUMN_ID);
-    let index_id = row.val::<u64>(COL_NO_INDEX_COLUMNS_INDEX_ID);
-    let column_no = row.val::<u16>(COL_NO_INDEX_COLUMNS_COLUMN_NO);
-    let index_column_no = row.val::<u16>(COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO);
-    let index_order = row.val::<u8>(COL_NO_INDEX_COLUMNS_INDEX_ORDER);
+fn row_to_index_column_object(metadata: &TableMetadata, row: Row<'_>) -> IndexColumnObject {
+    let column_id = row
+        .val(metadata, COL_NO_INDEX_COLUMNS_COLUMN_ID)
+        .as_u64()
+        .unwrap();
+    let index_id = row
+        .val(metadata, COL_NO_INDEX_COLUMNS_INDEX_ID)
+        .as_u64()
+        .unwrap();
+    let column_no = row
+        .val(metadata, COL_NO_INDEX_COLUMNS_COLUMN_NO)
+        .as_u16()
+        .unwrap();
+    let index_column_no = row
+        .val(metadata, COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO)
+        .as_u16()
+        .unwrap();
+    let index_order = row
+        .val(metadata, COL_NO_INDEX_COLUMNS_INDEX_ORDER)
+        .as_u8()
+        .unwrap();
     IndexColumnObject {
-        column_id: *column_id,
-        index_id: *index_id,
-        column_no: *column_no,
-        index_column_no: *index_column_no,
-        index_order: IndexOrder::from(*index_order),
+        column_id,
+        index_id,
+        column_no,
+        index_column_no,
+        index_order: IndexOrder::from(index_order),
     }
 }
 
@@ -254,10 +272,13 @@ impl<P: BufferPool> IndexColumns<'_, P> {
     pub async fn list_uncommitted_by_index_id(&self, index_id: IndexID) -> Vec<IndexColumnObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, 0, |row| {
-                let index_id_in_row = *row.val::<TableID>(COL_NO_INDEX_COLUMNS_INDEX_ID);
+            .table_scan_uncommitted(self.buf_pool, 0, |metadata, row| {
+                let index_id_in_row = row
+                    .val(metadata, COL_NO_INDEX_COLUMNS_INDEX_ID)
+                    .as_u64()
+                    .unwrap();
                 if index_id_in_row == index_id {
-                    let obj = row_to_index_column_object(row);
+                    let obj = row_to_index_column_object(metadata, row);
                     res.push(obj);
                 }
                 true

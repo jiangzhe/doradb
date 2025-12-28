@@ -64,11 +64,14 @@ pub fn catalog_definition_of_schemas() -> &'static CatalogDefinition {
 }
 
 #[inline]
-fn row_to_schema_object(row: Row<'_>) -> SchemaObject {
-    let schema_id = row.val::<u64>(COL_NO_SCHEMAS_SCHEMA_ID);
-    let schema_name = row.str(COL_NO_SCHEMAS_SCHEMA_NAME);
+fn row_to_schema_object(metadata: &TableMetadata, row: Row<'_>) -> SchemaObject {
+    let schema_id = row
+        .val(metadata, COL_NO_SCHEMAS_SCHEMA_ID)
+        .as_u64()
+        .unwrap();
+    let schema_name = row.str(COL_NO_SCHEMAS_SCHEMA_NAME).unwrap();
     SchemaObject {
-        schema_id: *schema_id,
+        schema_id,
         schema_name: SemiStr::new(schema_name),
     }
 }

@@ -45,8 +45,8 @@ impl SingleKeyEncoder {
             (ValKind::U32, false) => BTreeKey::from(key.as_u32().unwrap()),
             (ValKind::I64, false) => BTreeKey::from(key.as_i64().unwrap()),
             (ValKind::U64, false) => BTreeKey::from(key.as_u64().unwrap()),
-            (ValKind::F32, false) => BTreeKey::from(key.as_f32().unwrap().0),
-            (ValKind::F64, false) => BTreeKey::from(key.as_f64().unwrap().0),
+            (ValKind::F32, false) => BTreeKey::from(key.as_f32().unwrap()),
+            (ValKind::F64, false) => BTreeKey::from(key.as_f64().unwrap()),
             (ValKind::VarByte, false) => BTreeKey::from(key.as_bytes().unwrap()),
             (ValKind::I8, true) => BTreeKey::from(Nullable(key.as_i8().unwrap())),
             (ValKind::U8, true) => BTreeKey::from(Nullable(key.as_u8().unwrap())),
@@ -56,8 +56,8 @@ impl SingleKeyEncoder {
             (ValKind::U32, true) => BTreeKey::from(Nullable(key.as_u32().unwrap())),
             (ValKind::I64, true) => BTreeKey::from(Nullable(key.as_i64().unwrap())),
             (ValKind::U64, true) => BTreeKey::from(Nullable(key.as_u64().unwrap())),
-            (ValKind::F32, true) => BTreeKey::from(Nullable(key.as_f32().unwrap().0)),
-            (ValKind::F64, true) => BTreeKey::from(Nullable(key.as_f64().unwrap().0)),
+            (ValKind::F32, true) => BTreeKey::from(Nullable(key.as_f32().unwrap())),
+            (ValKind::F64, true) => BTreeKey::from(Nullable(key.as_f64().unwrap())),
             (ValKind::VarByte, true) => BTreeKey::from(Nullable(key.as_bytes().unwrap())),
         }
     }

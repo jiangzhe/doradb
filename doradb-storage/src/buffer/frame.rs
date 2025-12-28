@@ -1,7 +1,9 @@
 use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID};
+use crate::catalog::TableMetadata;
 use crate::latch::HybridLatch;
 use crate::trx::recover::RecoverMap;
 use crate::trx::undo::UndoMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 const _: () = assert!(
@@ -67,8 +69,10 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn init_undo_map(&mut self, max_size: usize) {
-        self.ctx = Some(Box::new(FrameContext::UndoMap(UndoMap::new(max_size))));
+    pub fn init_undo_map(&mut self, metadata: Arc<TableMetadata>, max_size: usize) {
+        self.ctx = Some(Box::new(FrameContext::UndoMap(UndoMap::new(
+            metadata, max_size,
+        ))));
     }
 
     #[inline]

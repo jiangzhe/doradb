@@ -15,7 +15,7 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
-use crate::catalog::{Catalog, TableID};
+use crate::catalog::{Catalog, TableID, TableMetadata};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
@@ -29,6 +29,7 @@ use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RowRedo, RowRedoKind, Tabl
 use crossbeam_utils::CachePadded;
 use flume::Receiver;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 pub struct RecoverMap(Vec<Option<TrxID>>);
 
@@ -170,17 +171,18 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
         // Update and Delete require a robust consideration.
         for (table_id, pages) in &self.recovered_tables {
             if let Some(table) = self.catalog.get_table(*table_id).await {
+                let metadata = &table.file.active_root().metadata;
                 for page_id in pages {
                     table
                         .populate_index_via_row_page(self.data_pool, *page_id)
                         .await;
-                    self.refresh_page(*page_id).await;
+                    self.refresh_page(Arc::clone(metadata), *page_id).await;
                 }
             }
         }
     }
 
-    async fn refresh_page(&self, page_id: PageID) {
+    async fn refresh_page(&self, metadata: Arc<TableMetadata>, page_id: PageID) {
         let mut page_guard = self
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
@@ -189,7 +191,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             .await;
 
         let max_row_count = page_guard.page().header.max_row_count as usize;
-        page_guard.bf_mut().init_undo_map(max_row_count);
+        page_guard.bf_mut().init_undo_map(metadata, max_row_count);
     }
 
     async fn replay_ddl(
@@ -614,7 +616,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut rows = 0usize;
             table
-                .table_scan_uncommitted(engine.data_pool, 0, |row| {
+                .table_scan_uncommitted(engine.data_pool, 0, |_metadata, row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
                     rows += if row.is_deleted() { 0 } else { 1 };
                     true
