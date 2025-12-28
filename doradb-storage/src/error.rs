@@ -71,6 +71,10 @@ pub enum Error {
     NotSupported(&'static str),
     #[error("invalid compressed data")]
     InvalidCompressedData,
+    #[error("column cannot be null")]
+    ColumnNeverNull,
+    #[error("invalid column scan")]
+    InvalidColumnScan,
 }
 
 impl From<TryFromSliceError> for Error {

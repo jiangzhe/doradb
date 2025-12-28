@@ -1,4 +1,3 @@
-use crate::float::{F32_ZERO, F64_ZERO, ValidF32, ValidF64};
 use std::alloc::{Layout, alloc, alloc_zeroed};
 use std::cmp::Ordering;
 use std::fmt;
@@ -282,51 +281,6 @@ impl_mcf_for_f!(f64, 0.0f64, 0x8000_0000_0000_0000);
 impl_nmcf_for!(f32);
 impl_nmcf_for!(f64);
 
-macro_rules! impl_mcf_for_vf {
-    ($t1:ty, $zero:ident, $mask:expr) => {
-        impl MemCmpFormat for $t1 {
-            #[inline]
-            fn est_mcf_len() -> Option<usize> {
-                Some(size_of::<$t1>())
-            }
-
-            #[inline]
-            fn enc_mcf_len(&self) -> usize {
-                size_of::<$t1>()
-            }
-
-            #[inline]
-            fn extend_mcf_to<T: BytesExtendable>(&self, buf: &mut T) {
-                let u = if *self >= $zero {
-                    // flip msb
-                    self.to_bits() ^ $mask
-                } else {
-                    // flip all bits
-                    !(self.to_bits())
-                };
-                buf.extend_from_byte_slice(&u.to_be_bytes());
-            }
-
-            #[inline]
-            fn copy_mcf_to(&self, buf: &mut [u8], start_idx: usize) -> usize {
-                let u = if *self >= $zero {
-                    self.to_bits() ^ $mask
-                } else {
-                    !(self.to_bits())
-                };
-                let end_idx = start_idx + self.enc_mcf_len();
-                buf[start_idx..end_idx].copy_from_slice(&u.to_be_bytes());
-                end_idx
-            }
-        }
-    };
-}
-
-impl_mcf_for_vf!(ValidF32, F32_ZERO, 0x8000_0000);
-impl_mcf_for_vf!(ValidF64, F64_ZERO, 0x8000_0000_0000_0000);
-impl_nmcf_for!(ValidF32);
-impl_nmcf_for!(ValidF64);
-
 #[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SegmentedBytes<'a>(pub &'a [u8]);
@@ -588,8 +542,6 @@ impl_mem_cmp_key_from_non_nullable!(u32);
 impl_mem_cmp_key_from_non_nullable!(u64);
 impl_mem_cmp_key_from_non_nullable!(f32);
 impl_mem_cmp_key_from_non_nullable!(f64);
-impl_mem_cmp_key_from_non_nullable!(ValidF32);
-impl_mem_cmp_key_from_non_nullable!(ValidF64);
 
 #[repr(transparent)]
 pub struct Nullable<T>(pub T);
@@ -617,8 +569,6 @@ impl_mem_cmp_key_from_nullable!(u32);
 impl_mem_cmp_key_from_nullable!(u64);
 impl_mem_cmp_key_from_nullable!(f32);
 impl_mem_cmp_key_from_nullable!(f64);
-impl_mem_cmp_key_from_nullable!(ValidF32);
-impl_mem_cmp_key_from_nullable!(ValidF64);
 
 impl Deref for MemCmpKey {
     type Target = [u8];
@@ -1051,20 +1001,11 @@ mod tests {
         run_test_mcf::<i32>();
         run_test_mcf::<i64>();
 
-        // float
-        run_test_mcf::<ValidF64>();
-
         // int + int
         run_test_mcf2::<i32, i32>();
         run_test_mcf2::<u32, u32>();
         run_test_mcf2::<i64, i64>();
         run_test_mcf2::<u64, u64>();
-
-        // int + float
-        run_test_mcf2::<i32, ValidF64>();
-        run_test_mcf2::<ValidF64, u32>();
-        run_test_mcf2::<u64, ValidF64>();
-        run_test_mcf2::<ValidF64, i64>();
     }
 
     #[test]
@@ -1074,18 +1015,29 @@ mod tests {
 
     #[test]
     fn test_mcf_float() {
-        let f0 = ValidF64::new(-1.0).unwrap();
+        let f0 = -1.0f64;
         let mut buf0 = vec![];
         f0.extend_mcf_to(&mut buf0);
         assert_eq!(buf0.len(), 8);
         assert!(buf0[0] & 0x80 == 0);
 
-        let f1 = ValidF64::new(-1.0).unwrap();
+        let f1 = -1.0f64;
         let mut buf1 = vec![];
         NullableMemCmpFormat::extend_nmcf_to(&f1, &mut buf1);
         assert_eq!(buf1.len(), 9);
         assert_eq!(buf1[0], NON_NULL_FLAG);
         assert!(buf1[1] & 0x80 == 0);
+
+        let mut r = rand::rng();
+        let input1 = gen_input::<f32>(&mut r);
+        check_mcf_length(&input1[0]);
+        let input2 = gen_input::<f32>(&mut r);
+        check_nmcf_length(&input2[0]);
+
+        let input1 = gen_input::<f64>(&mut r);
+        check_mcf_length(&input1[0]);
+        let input2 = gen_input::<f64>(&mut r);
+        check_nmcf_length(&input2[0]);
     }
 
     fn run_test_mcf<T>()
@@ -1192,7 +1144,7 @@ mod tests {
 
     fn check_mcf_length<T>(value: &T)
     where
-        T: MemCmpFormat + Ord + ?Sized,
+        T: MemCmpFormat + ?Sized,
     {
         if let Some(el) = T::est_mcf_len() {
             assert_eq!(el, T::enc_mcf_len(value));
@@ -1204,7 +1156,7 @@ mod tests {
 
     fn check_nmcf_length<T>(value: &T)
     where
-        T: NullableMemCmpFormat + Ord,
+        T: NullableMemCmpFormat,
     {
         if let Some(el) = <SegmentedBytes as NullableMemCmpFormat>::est_nmcf_len() {
             assert_eq!(el, value.enc_nmcf_len());
@@ -1346,12 +1298,6 @@ mod tests {
             s.push(r.sample(StandardUniform));
         }
         s
-    }
-
-    impl Distribution<ValidF64> for StandardUniform {
-        fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> ValidF64 {
-            ValidF64::new(rng.sample(StandardUniform)).unwrap()
-        }
     }
 
     #[test]

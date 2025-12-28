@@ -6,6 +6,7 @@ use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::value::{Val, ValKind, ValType};
 use semistr::SemiStr;
 use std::collections::HashSet;
+use std::mem;
 
 /// Table metadata including column names, column types,
 /// index specifications.
@@ -19,6 +20,11 @@ pub struct TableMetadata {
     pub fix_len: usize,
     // index of var-length columns.
     pub var_cols: Vec<usize>,
+    // number of nullable columns.
+    pub nullable_cols: usize,
+    // scan sums of null bitmap, it can locate null bitmap
+    // in row page.
+    null_scan_sums: Vec<usize>,
     // index column id.
     pub index_specs: Vec<IndexSpec>,
     // columns that are included in any index.
@@ -71,11 +77,20 @@ impl TableMetadata {
                 index_cols.insert(key.col_no as usize);
             }
         }
+        // calculate column null bitmap offsets.
+        let mut nullable_cols = 0usize;
+        let mut null_scan_sums = vec![];
+        for ty in &col_types {
+            null_scan_sums.push(nullable_cols);
+            nullable_cols += if ty.nullable { 1 } else { 0 };
+        }
         TableMetadata {
             col_names,
             col_types,
             fix_len,
             var_cols,
+            nullable_cols,
+            null_scan_sums,
             index_specs,
             index_cols,
         }
@@ -99,10 +114,29 @@ impl TableMetadata {
         self.col_types[col_idx]
     }
 
+    /// Returns value kind of given column.
+    #[inline]
+    pub fn val_kind(&self, col_idx: usize) -> ValKind {
+        self.col_type(col_idx).kind
+    }
+
+    /// Returns whether the given column is nullable.
+    #[inline]
+    pub fn nullable(&self, col_idx: usize) -> bool {
+        self.col_type(col_idx).nullable
+    }
+
     /// Returns whether the type is matched at given column index.
     #[inline]
     pub fn col_type_match(&self, col_idx: usize, val: &Val) -> bool {
         val.matches_kind(self.col_type(col_idx).kind)
+    }
+
+    /// Returns current column offset, compared to all
+    /// nullable columns.
+    #[inline]
+    pub fn null_offset(&self, col_idx: usize) -> usize {
+        self.null_scan_sums[col_idx]
     }
 
     /// Returns whether input values matches given index.
@@ -147,7 +181,7 @@ impl TableMetadata {
                 let vals: Vec<Val> = is
                     .index_cols
                     .iter()
-                    .map(|k| row.clone_val(self, k.col_no as usize))
+                    .map(|k| row.val(self, k.col_no as usize))
                     .collect();
                 SelectKey { index_no, vals }
             })

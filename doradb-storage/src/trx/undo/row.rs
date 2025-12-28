@@ -2,6 +2,7 @@ use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::catalog::TableID;
+use crate::catalog::TableMetadata;
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 pub struct UndoMap {
     entries: Box<[RwLock<Option<Box<RowUndoHead>>>]>,
+    pub metadata: Arc<TableMetadata>,
     // Monotonically increasing version number.
     // indicates whether the undo map is changed.
     pub version: AtomicU64,
@@ -27,10 +29,11 @@ pub struct UndoMap {
 
 impl UndoMap {
     #[inline]
-    pub fn new(len: usize) -> Self {
+    pub fn new(metadata: Arc<TableMetadata>, len: usize) -> Self {
         let vec: Vec<_> = (0..len).map(|_| RwLock::new(None)).collect();
         UndoMap {
             entries: vec.into_boxed_slice(),
+            metadata,
             version: AtomicU64::new(0),
             maybe_invisible: AtomicUsize::new(0),
         }
@@ -237,9 +240,11 @@ impl RowUndoLogs {
                 .await
                 .shared_async()
                 .await;
-            let row_idx = page_guard.page().row_idx(entry.row_id);
+            let (ctx, page) = page_guard.ctx_and_page();
+            let metadata = &*ctx.undo().unwrap().metadata;
+            let row_idx = page.row_idx(entry.row_id);
             let mut access = page_guard.write_row(row_idx);
-            access.rollback_first_undo(entry);
+            access.rollback_first_undo(metadata, entry);
         }
     }
 }

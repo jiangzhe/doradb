@@ -43,7 +43,7 @@ impl TableFileSystem {
     pub fn create_table_file(
         &self,
         table_id: TableID,
-        metadata: TableMetadata,
+        metadata: Arc<TableMetadata>,
         trunc: bool,
     ) -> Result<MutableTableFile> {
         let file_path = format!("{}/{}.tbl", self.base_dir, table_id);

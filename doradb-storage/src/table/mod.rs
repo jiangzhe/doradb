@@ -201,8 +201,9 @@ impl Table {
         let row_idx = page.row_idx(row_id);
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert!(row.is_deleted()); // before recovery, this row should be initialized as deleted.
+        let metadata = self.metadata();
         for (user_col_idx, user_col) in cols.iter().enumerate() {
-            row.update_col(user_col_idx, user_col, false);
+            row.update_col(metadata, user_col_idx, user_col, false);
         }
         row.finish_insert()
     }
@@ -279,15 +280,15 @@ impl Table {
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert_eq!(row_id, row.row_id());
 
+        let metadata = self.metadata();
         let disable_index = index_change_cols.is_none();
         if disable_index {
             for uc in cols {
-                row.update_col(uc.idx, &uc.val, true);
+                row.update_col(metadata, uc.idx, &uc.val, true);
             }
             row.finish_update()
         } else {
             // collect index change columns.
-            let metadata = self.metadata();
             let index_change_cols = index_change_cols.unwrap();
             for uc in cols {
                 if let Some((old_val, _)) = row.different(metadata, uc.idx, &uc.val) {
@@ -297,7 +298,7 @@ impl Table {
                         index_change_cols.insert(uc.idx, old_val);
                     }
                     // actual update
-                    row.update_col(uc.idx, &uc.val, true);
+                    row.update_col(metadata, uc.idx, &uc.val, true);
                 }
             }
             row.finish_update()
@@ -327,7 +328,7 @@ impl Table {
             // save index columns for index update.
             let row = page.row(row_idx);
             for idx_col_no in &metadata.index_cols {
-                let val = row.clone_val(metadata, *idx_col_no);
+                let val = row.val(metadata, *idx_col_no);
                 index_cols.insert(*idx_col_no, val);
             }
         }
@@ -637,7 +638,7 @@ impl Table {
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
         for v in &cols {
-            new_row.add_col(v);
+            new_row.add_col(metadata, v);
         }
         let new_row_id = new_row.finish();
         debug_assert!(new_row_id == row_id);
@@ -780,7 +781,7 @@ impl Table {
                                     index_change_cols.insert(uc.idx, old_val.clone());
                                 }
                                 // actual update
-                                row.update_col(uc.idx, &new_val);
+                                row.update_col(metadata, uc.idx, &new_val);
                                 // record undo and redo
                                 undo_cols.push(UndoCol {
                                     idx: uc.idx,
@@ -1984,7 +1985,7 @@ fn read_latest_index_key(
     let mut new_key = SelectKey::null(index_no, index_spec.index_cols.len());
     for (pos, key) in index_spec.index_cols.iter().enumerate() {
         let access = page_guard.read_row_by_id(row_id);
-        let val = access.row().clone_val(metadata, key.col_no as usize);
+        let val = access.row().val(metadata, key.col_no as usize);
         new_key.vals[pos] = val;
     }
     new_key

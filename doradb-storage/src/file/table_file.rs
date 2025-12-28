@@ -201,7 +201,7 @@ impl TableFile {
             row_id_bound: super_page.header.row_id_bound,
             alloc_map,
             free_list,
-            metadata,
+            metadata: Arc::new(metadata),
             block_index,
         })
     }
@@ -398,7 +398,7 @@ pub struct ActiveRoot {
     /// when all transactions before T finished.
     pub free_list: Vec<PageID>,
     /// Metadata of this table.
-    pub metadata: TableMetadata,
+    pub metadata: Arc<TableMetadata>,
     /// Block index array.
     pub block_index: BlockIndexArray,
     // page index (todo): this is two-layer index, persistent block index
@@ -411,7 +411,7 @@ impl ActiveRoot {
     /// Create a new active root.
     /// Page number is set to zero(the first page of this file)
     #[inline]
-    pub fn new(trx_id: TrxID, max_pages: usize, metadata: TableMetadata) -> Self {
+    pub fn new(trx_id: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
         const DEFALT_ROOT_PAGE_NO: PageID = 0;
 
         let alloc_map = AllocMap::new(max_pages);
@@ -575,7 +575,7 @@ mod tests {
     fn test_table_file() {
         smol::block_on(async {
             let fs = TableFileSystemConfig::default().build().unwrap();
-            let metadata = TableMetadata::new(
+            let metadata = Arc::new(TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                     ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
@@ -585,7 +585,7 @@ mod tests {
                     vec![IndexKey::new(0)],
                     IndexAttributes::PK,
                 )],
-            );
+            ));
             let table_file = fs.create_table_file(41, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
@@ -626,7 +626,7 @@ mod tests {
     fn test_table_file_system() {
         smol::block_on(async {
             let fs = TableFileSystemConfig::default().build().unwrap();
-            let metadata = TableMetadata::new(
+            let metadata = Arc::new(TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                     ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
@@ -636,7 +636,7 @@ mod tests {
                     vec![IndexKey::new(0)],
                     IndexAttributes::PK,
                 )],
-            );
+            ));
             let table_file = fs.create_table_file(42, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());

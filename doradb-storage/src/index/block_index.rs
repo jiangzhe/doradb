@@ -18,6 +18,7 @@ use either::Either::{self, Left, Right};
 use parking_lot::Mutex;
 use std::cell::UnsafeCell;
 use std::mem;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub const BLOCK_PAGE_SIZE: usize = PAGE_SIZE;
@@ -505,16 +506,16 @@ impl BlockIndex {
     #[inline]
     async fn insert_page_guard(&self, count: usize, new_page: &mut PageExclusiveGuard<RowPage>) {
         let new_page_id = new_page.page_id();
-        let metadata = self.root.metadata().unwrap();
+        let metadata = self.root.clone_metadata().unwrap();
         loop {
             match self.insert_row_page(count as u64, new_page_id).await {
                 Invalid => (),
                 Valid((start_row_id, end_row_id)) => {
                     // initialize row page.
                     debug_assert!(end_row_id == start_row_id + count as u64);
-                    new_page.page_mut().init(start_row_id, count, metadata);
+                    new_page.page_mut().init(start_row_id, count, &metadata);
                     // create and attach a new empty undo map.
-                    new_page.bf_mut().init_undo_map(count);
+                    new_page.bf_mut().init_undo_map(metadata, count);
 
                     // persist log to commit this page.
                     if let Some(page_committer) = {
@@ -1044,6 +1045,16 @@ impl BlockIndexRoot {
             unsafe { Some(&(*ptr).metadata) }
         }
     }
+
+    #[inline]
+    pub fn clone_metadata(&self) -> Option<Arc<TableMetadata>> {
+        let ptr = self.file.load(Ordering::Relaxed);
+        if ptr.is_null() {
+            None
+        } else {
+            unsafe { Some(Arc::clone(&(*ptr).metadata)) }
+        }
+    }
 }
 
 pub enum RowLocation {
@@ -1212,14 +1223,14 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let metadata = TableMetadata::new(
+                let metadata = Arc::new(TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
                         column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
-                );
+                ));
                 let table_id = 101;
                 let uninit_table_file = engine
                     .table_fs
@@ -1266,14 +1277,14 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let metadata = TableMetadata::new(
+                let metadata = Arc::new(TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
                         column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
-                );
+                ));
                 let table_id = 101;
                 let uninit_table_file = engine
                     .table_fs
@@ -1322,14 +1333,14 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let metadata = TableMetadata::new(
+                let metadata = Arc::new(TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
                         column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
-                );
+                ));
                 let table_id = 101;
                 let uninit_table_file = engine
                     .table_fs
@@ -1409,14 +1420,14 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let metadata = TableMetadata::new(
+                let metadata = Arc::new(TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
                         column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
-                );
+                ));
                 let table_id = 101;
                 let uninit_table_file = engine
                     .table_fs
@@ -1493,14 +1504,14 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let metadata = TableMetadata::new(
+                let metadata = Arc::new(TableMetadata::new(
                     vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
                         column_type: ValKind::I32,
                         column_attributes: ColumnAttributes::empty(),
                     }],
                     vec![first_i32_unique_index()],
-                );
+                ));
                 let table_id = 101;
                 let uninit_table_file = engine
                     .table_fs

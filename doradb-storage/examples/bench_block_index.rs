@@ -35,7 +35,7 @@ fn main() {
             .await
             .unwrap();
         {
-            let metadata = TableMetadata::new(
+            let metadata = Arc::new(TableMetadata::new(
                 vec![ColumnSpec {
                     column_name: SemiStr::new("id"),
                     column_type: ValKind::I32,
@@ -46,7 +46,7 @@ fn main() {
                     vec![IndexKey::new(0)],
                     IndexAttributes::PK,
                 )],
-            );
+            ));
             let table_id = 101;
             let uninit_table_file = engine
                 .table_fs

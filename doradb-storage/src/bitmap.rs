@@ -72,6 +72,13 @@ pub trait Bitmap {
         }
     }
 
+    #[inline]
+    fn bitmap_count(&self, len: usize, flag: bool) -> usize {
+        self.bitmap_range_iter(len)
+            .map(|(f, n)| if f == flag { n } else { 0 })
+            .sum()
+    }
+
     /// Create index iterator with all true bits, stop at len.
     #[inline]
     fn bitmap_true_index_iter(&self, len: usize) -> BitmapTrueIndexIter<'_> {
@@ -82,6 +89,17 @@ pub trait Bitmap {
             end: 0,
         }
     }
+
+    /// Create a bitmap range filter, which only returns ranges with given flag.
+    #[inline]
+    fn bitmap_range_filter(&self, len: usize, flag: bool) -> BitmapRangeFilter<'_> {
+        let range_iter = self.bitmap_range_iter(len);
+        BitmapRangeFilter {
+            range_iter,
+            flag,
+            offset: 0,
+        }
+    }
 }
 
 impl Bitmap for [u64] {
@@ -90,7 +108,7 @@ impl Bitmap for [u64] {
         let unit_idx = idx / 64;
         let bit_idx = idx % 64;
         let v = self[unit_idx];
-        v & (1 << bit_idx) == (1 << bit_idx)
+        v & (1 << bit_idx) != 0
     }
 
     #[inline]
@@ -131,12 +149,57 @@ impl Bitmap for [u64] {
     }
 }
 
+pub trait ExtendBitmap {
+    /// Extend existing bitmap with new bitmap.
+    fn bitmap_extend<B: Bitmap + ?Sized>(&mut self, offset: usize, bm: &B, len: usize);
+}
+
+impl ExtendBitmap for Vec<u64> {
+    #[inline]
+    fn bitmap_extend<B: Bitmap + ?Sized>(&mut self, offset: usize, bm: &B, len: usize) {
+        debug_assert!(offset <= self.len() * 64);
+        debug_assert!(len <= bm.bitmap_units().len() * 64);
+        if offset.is_multiple_of(64) {
+            // fast path: extend directly.
+            let bm_units = len.div_ceil(64);
+            self.extend_from_slice(&bm.bitmap_units()[..bm_units]);
+            return;
+        }
+        // slow path: shift and extend.
+        let new_len = offset + len;
+        let new_units = new_len.div_ceil(64);
+        if self.len() < new_units {
+            // make sure new bitmap has enough space.
+            self.resize(new_units, 0);
+        }
+        let shift_l = offset % 64;
+        let shift_r = 64 - shift_l;
+        let target = &mut self[offset / 64..new_units];
+        // we shift tail of original bitmap, so that it can be paired
+        // with head of new bitmap and simplify the concat logic.
+        let head = target[0] << shift_r;
+        let source = &bm.bitmap_units()[..len.div_ceil(64)];
+        let pairs = source.iter().zip(std::iter::once(&head).chain(source));
+        for (tgt, (l, r)) in target.iter_mut().zip(pairs) {
+            *tgt = (l << shift_l) | (r >> shift_r);
+        }
+        if target.len() > source.len() {
+            target[target.len() - 1] = source[source.len() - 1] >> shift_r;
+        }
+    }
+}
+
 /// Create a new bitmap with all zeros.
-#[allow(clippy::manual_div_ceil)]
 #[inline]
 pub fn new_bitmap(nbr_of_bits: usize) -> Box<[u64]> {
-    let len = (nbr_of_bits + 63) / 64;
-    vec![0u64; len].into_boxed_slice()
+    let units = bitmap_required_units(nbr_of_bits);
+    vec![0u64; units].into_boxed_slice()
+}
+
+/// Returns required units of bitmap for given number of values.
+#[inline]
+pub const fn bitmap_required_units(count: usize) -> usize {
+    count.div_ceil(64)
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +367,35 @@ impl Iterator for BitmapRangeIter<'_> {
             self.break_trues_in_word();
         }
         Some(ret)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BitmapRangeFilter<'a> {
+    range_iter: BitmapRangeIter<'a>,
+    flag: bool,
+    offset: usize,
+}
+
+impl Iterator for BitmapRangeFilter<'_> {
+    type Item = (usize, usize);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.range_iter.next() {
+                Some((f, n)) => {
+                    if f == self.flag {
+                        let start = self.offset;
+                        let end = start + n;
+                        self.offset = end;
+                        return Some((start, end));
+                    } else {
+                        self.offset += n;
+                    }
+                }
+                None => return None,
+            }
+        }
     }
 }
 
@@ -807,6 +899,23 @@ mod tests {
     }
 
     #[test]
+    fn test_bitmap_range_filter() {
+        let bm = new_bitmap(32);
+        let mut filter_true = bm.bitmap_range_filter(32, true);
+        assert_eq!(filter_true.next(), None);
+        let mut filter_false = bm.bitmap_range_filter(32, false);
+        assert_eq!(filter_false.next(), Some((0, 32)));
+        assert_eq!(filter_false.next(), None);
+
+        let mut bm = new_bitmap(64);
+        bm[0] |= 1 << 10;
+        let mut filter_false = bm.bitmap_range_filter(64, false);
+        assert_eq!(filter_false.next(), Some((0, 10)));
+        assert_eq!(filter_false.next(), Some((11, 64)));
+        assert_eq!(filter_false.next(), None);
+    }
+
+    #[test]
     fn test_alloc_map_concurrent() {
         let bitmap = Arc::new(AllocMap::new(128));
         let mut handles = vec![];
@@ -867,5 +976,43 @@ mod tests {
         let g1 = alloc_map.inner.lock();
         let g2 = alloc_map2.inner.lock();
         assert!(&*g1 == &*g2);
+    }
+
+    #[test]
+    fn test_bitmap_extend() {
+        let mut bm1 = vec![1u64];
+        let bm2 = vec![1u64];
+        bm1.bitmap_extend(1, &bm2[..], 1);
+        assert_eq!(bm1, vec![3u64]);
+
+        let mut bm1 = vec![1u64];
+        let bm2 = vec![1u64];
+        bm1.bitmap_extend(64, &bm2[..], 1);
+        assert_eq!(bm1, vec![1u64, 1u64]);
+
+        let mut bm1 = vec![1u64];
+        let bm2 = vec![1u64];
+        bm1.bitmap_extend(60, &bm2[..], 4);
+        assert_eq!(bm1, vec![1u64 | (1u64 << 60)]);
+
+        let mut bm1 = vec![1u64];
+        let bm2 = vec![1u64];
+        bm1.bitmap_extend(60, &bm2[..], 5);
+        assert_eq!(bm1, vec![1u64 | (1u64 << 60), 0u64]);
+
+        let mut bm1 = vec![1u64];
+        let bm2 = vec![1u64 | 16];
+        bm1.bitmap_extend(60, &bm2[..], 5);
+        assert_eq!(bm1, vec![1u64 | (1u64 << 60), 1u64]);
+
+        let mut bm1 = vec![1u64];
+        let bm2 = vec![1u64, 1u64];
+        bm1.bitmap_extend(64, &bm2[..], 65);
+        assert_eq!(bm1, vec![1u64, 1, 1]);
+
+        let mut bm1 = vec![1u64, 0];
+        let bm2 = vec![1u64, 1u64];
+        bm1.bitmap_extend(65, &bm2[..], 65);
+        assert_eq!(bm1, vec![1u64, 2, 2]);
     }
 }
