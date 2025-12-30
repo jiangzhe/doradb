@@ -7,17 +7,17 @@ use crate::stmt::Statement;
 use crate::trx::recover::RecoverMap;
 use crate::trx::undo::{
     IndexBranch, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRef,
-    UndoMap, UndoStatus,
+    UndoStatus,
 };
+use crate::trx::ver_map::{RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{ActiveTrx, SharedTrxStatus, TrxID, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
-use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
+/// Read row with latest or visible version.
 pub struct RowReadAccess<'a> {
     page: &'a RowPage,
     row_idx: usize,
@@ -44,7 +44,7 @@ impl<'a> RowReadAccess<'a> {
     #[inline]
     pub fn any_old_version_exists(&self) -> bool {
         match &self.state {
-            RowReadState::Undo(g) => g.is_some(),
+            RowReadState::RowVer(g) => g.is_some(),
             RowReadState::Recover(_) => false,
         }
     }
@@ -52,7 +52,7 @@ impl<'a> RowReadAccess<'a> {
     #[inline]
     pub fn ts(&self) -> Option<TrxID> {
         match &self.state {
-            RowReadState::Undo(head) => head.as_ref().map(|h| h.ts()),
+            RowReadState::RowVer(head) => head.as_ref().map(|h| h.ts()),
             RowReadState::Recover(rec) => rec.at(self.row_idx),
         }
     }
@@ -87,7 +87,7 @@ impl<'a> RowReadAccess<'a> {
         key: Option<&SelectKey>,
     ) -> ReadRow {
         match &self.state {
-            RowReadState::Undo(undo) => match &**undo {
+            RowReadState::RowVer(undo) => match &**undo {
                 None => self.read_row_latest(metadata, read_set, key),
                 Some(undo_head) => {
                     // At this point, we already wait for preparation of commit is done.
@@ -246,7 +246,7 @@ impl<'a> RowReadAccess<'a> {
     ) -> FindOldVersion {
         let undo = match &self.state {
             RowReadState::Recover(_) => unreachable!(),
-            RowReadState::Undo(undo) => undo,
+            RowReadState::RowVer(undo) => undo,
         };
 
         match &**undo {
@@ -361,7 +361,7 @@ impl<'a> RowReadAccess<'a> {
         // Page data does not match, check version chain.
         match &self.state {
             RowReadState::Recover(_) => false,
-            RowReadState::Undo(undo) => match &**undo {
+            RowReadState::RowVer(undo) => match &**undo {
                 None => false,
                 Some(undo_head) => {
                     // Page data is already checked, we can traverse version
@@ -423,7 +423,7 @@ impl<'a> RowReadAccess<'a> {
 }
 
 pub enum RowReadState<'a> {
-    Undo(RwLockReadGuard<'a, Option<Box<RowUndoHead>>>),
+    RowVer(RowVersionReadGuard<'a>),
     Recover(&'a RecoverMap),
 }
 
@@ -431,7 +431,7 @@ impl<'a> RowReadState<'a> {
     #[inline]
     fn from_ctx(ctx: &'a FrameContext, row_idx: usize) -> Self {
         match ctx {
-            FrameContext::UndoMap(undo) => RowReadState::Undo(undo.read(row_idx)),
+            FrameContext::RowVerMap(ver) => RowReadState::RowVer(ver.read_latch(row_idx)),
             FrameContext::RecoverMap(rec) => RowReadState::Recover(rec),
         }
     }
@@ -458,7 +458,7 @@ impl<'a> ReadAllRows<'a> {
 
     #[inline]
     pub fn metadata(&self) -> Option<&TableMetadata> {
-        self.ctx.undo().map(|m| &*m.metadata)
+        self.ctx.row_ver().map(|m| &*m.metadata)
     }
 }
 
@@ -575,24 +575,26 @@ impl KeyVersion {
 
 pub struct RowWriteAccess<'a> {
     page: &'a RowPage,
-    undo_map: &'a UndoMap,
     row_idx: usize,
-    undo: RwLockWriteGuard<'a, Option<Box<RowUndoHead>>>,
+    guard: RowVersionWriteGuard<'a>,
 }
 
 impl<'a> RowWriteAccess<'a> {
     #[inline]
-    pub fn new(page: &'a RowPage, ctx: &'a FrameContext, row_idx: usize) -> Self {
-        let undo_map = ctx
-            .undo()
+    pub fn new(
+        page: &'a RowPage,
+        ctx: &'a FrameContext,
+        row_idx: usize,
+        sts: Option<TrxID>,
+    ) -> Self {
+        let ver_map = ctx
+            .row_ver()
             .expect("write_row not supported without undo map");
-        let undo = undo_map.write(row_idx);
-        undo_map.version.fetch_add(1, Ordering::Release);
+        let guard = ver_map.write_latch(row_idx, sts);
         RowWriteAccess {
             page,
-            undo_map,
             row_idx,
-            undo,
+            guard,
         }
     }
 
@@ -614,7 +616,7 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub fn row_and_undo_mut(&mut self) -> (Row<'_>, &mut Option<Box<RowUndoHead>>) {
         let row = self.page.row(self.row_idx);
-        (row, &mut *self.undo)
+        (row, &mut *self.guard)
     }
 
     #[inline]
@@ -640,31 +642,25 @@ impl<'a> RowWriteAccess<'a> {
 
     #[inline]
     pub fn undo_head(&self) -> &Option<Box<RowUndoHead>> {
-        &self.undo
+        &self.guard
     }
 
     /// Returns first undo entry on main branch of the chain.
     #[inline]
     pub fn first_undo_entry(&self) -> Option<RowUndoRef> {
-        self.undo.as_ref().map(|head| head.next.main.entry.clone())
+        self.guard.as_ref().map(|head| head.next.main.entry.clone())
     }
 
     #[inline]
     fn add_undo_head(&mut self, status: Arc<SharedTrxStatus>, entry: RowUndoRef) {
-        debug_assert!(self.undo.is_none());
-        self.undo_map
-            .maybe_invisible
-            .fetch_add(1, Ordering::Release);
+        debug_assert!(self.guard.is_none());
         let head = RowUndoHead::new(status, entry);
-        self.undo.replace(Box::new(head));
+        self.guard.replace(Box::new(head));
     }
 
     #[inline]
     fn remove_undo_head(&mut self) {
-        self.undo_map
-            .maybe_invisible
-            .fetch_sub(1, Ordering::Release);
-        self.undo.take();
+        self.guard.take();
     }
 
     /// Add a Lock undo entry as a transaction-level logical row lock.
@@ -679,7 +675,7 @@ impl<'a> RowWriteAccess<'a> {
         key: Option<&SelectKey>,
     ) -> LockUndo {
         let row = self.page.row(self.row_idx);
-        match &mut *self.undo {
+        match &mut *self.guard {
             None => {
                 let entry = OwnedRowUndo::new(table_id, page_id, row_id, RowUndoKind::Lock);
                 self.add_undo_head(stmt.trx.status(), entry.leak());
@@ -778,7 +774,7 @@ impl<'a> RowWriteAccess<'a> {
         entry: RowUndoRef,
         undo_vals: Vec<UpdateCol>,
     ) {
-        let undo_head = self.undo.as_mut().expect("undo head");
+        let undo_head = self.guard.as_mut().expect("undo head");
         undo_head.next.indexes.push(IndexBranch {
             key,
             cts,
@@ -792,7 +788,7 @@ impl<'a> RowWriteAccess<'a> {
     /// The real deletion of undo log is performed later.
     #[inline]
     pub fn purge_undo_chain(&mut self, min_active_sts: TrxID) {
-        match &mut *self.undo {
+        match &mut *self.guard {
             None => (),
             Some(undo_head) => {
                 if undo_head.purge_ts >= min_active_sts {
@@ -806,11 +802,7 @@ impl<'a> RowWriteAccess<'a> {
                 if trx_is_committed(ts) && ts < min_active_sts {
                     // First entry is too old. That means page data is globally visible.
                     // So we can remove the entire undo head.
-                    self.undo.take();
-                    // Update maybe_invisible because we remove the entire version chain.
-                    self.undo_map
-                        .maybe_invisible
-                        .fetch_sub(1, Ordering::Relaxed);
+                    self.guard.take();
                     return;
                 }
                 let mut entry = undo_head.next.main.entry.as_mut();
@@ -848,7 +840,7 @@ impl<'a> RowWriteAccess<'a> {
     /// Rollback first undo log in the chain.
     #[inline]
     pub fn rollback_first_undo(&mut self, metadata: &TableMetadata, mut owned_entry: OwnedRowUndo) {
-        let head = self.undo.as_mut().expect("undo head");
+        let head = self.guard.as_mut().expect("undo head");
         let entry = &mut head.next.main.entry;
         debug_assert!({
             let input_ref = &*owned_entry;
@@ -902,13 +894,6 @@ impl<'a> RowWriteAccess<'a> {
                 head.next = next;
             }
         }
-    }
-}
-
-impl Drop for RowWriteAccess<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        self.undo_map.version.fetch_add(1, Ordering::Release);
     }
 }
 

@@ -155,7 +155,7 @@ impl TableAccess for Table {
     {
         self.table_scan(data_pool, start_row_id, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
-            let metadata = &*ctx.undo().unwrap().metadata;
+            let metadata = &*ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, ctx) {
                 if !row_action(metadata, row_access.row()) {
                     return false;
@@ -178,7 +178,7 @@ impl TableAccess for Table {
     {
         self.table_scan(data_pool, start_row_id, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
-            let metadata = &*ctx.undo().unwrap().metadata;
+            let metadata = &*ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, ctx) {
                 match row_access.read_row_mvcc(&stmt.trx, metadata, read_set, None) {
                     ReadRow::InvalidIndex => unreachable!(),
@@ -262,7 +262,7 @@ impl TableAccess for Table {
         if !page.row_id_in_valid_range(row_id) {
             return None;
         }
-        let metadata = &*ctx.undo().unwrap().metadata;
+        let metadata = &*ctx.row_ver().unwrap().metadata;
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         let row = access.row();
         // latest version in row page.

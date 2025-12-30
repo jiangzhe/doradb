@@ -1,68 +1,16 @@
 use crate::buffer::BufferPool;
-use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::catalog::TableID;
-use crate::catalog::TableMetadata;
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
 use crate::trx::row::RowWriteAccess;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
-
-pub struct UndoMap {
-    entries: Box<[RwLock<Option<Box<RowUndoHead>>>]>,
-    pub metadata: Arc<TableMetadata>,
-    // Monotonically increasing version number.
-    // indicates whether the undo map is changed.
-    pub version: AtomicU64,
-    // How many entries may be invisible.
-    // This is optimization for analytical query which may skip
-    // entire version chain and directly query page data.
-    pub maybe_invisible: AtomicUsize,
-}
-
-impl UndoMap {
-    #[inline]
-    pub fn new(metadata: Arc<TableMetadata>, len: usize) -> Self {
-        let vec: Vec<_> = (0..len).map(|_| RwLock::new(None)).collect();
-        UndoMap {
-            entries: vec.into_boxed_slice(),
-            metadata,
-            version: AtomicU64::new(0),
-            maybe_invisible: AtomicUsize::new(0),
-        }
-    }
-
-    #[inline]
-    pub fn occupied(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|entry| if entry.read().is_some() { 1 } else { 0 })
-            .sum()
-    }
-
-    #[inline]
-    pub fn read(&self, row_idx: usize) -> RwLockReadGuard<'_, Option<Box<RowUndoHead>>> {
-        self.entries[row_idx].read()
-    }
-
-    #[inline]
-    pub fn write(&self, row_idx: usize) -> RwLockWriteGuard<'_, Option<Box<RowUndoHead>>> {
-        self.entries[row_idx].write()
-    }
-
-    #[inline]
-    pub fn write_exclusive(&mut self, row_idx: usize) -> &mut Option<Box<RowUndoHead>> {
-        self.entries[row_idx].get_mut()
-    }
-}
 
 /// RowUndoKind represents the kind of original operation.
 /// So the actual undo action should be opposite of the kind.
@@ -234,7 +182,7 @@ impl RowUndoLogs {
     }
 
     #[inline]
-    pub async fn rollback<P: BufferPool>(&mut self, buf_pool: &'static P) {
+    pub async fn rollback<P: BufferPool>(&mut self, buf_pool: &'static P, sts: Option<TrxID>) {
         while let Some(entry) = self.0.pop() {
             let page_guard = buf_pool
                 .get_page::<RowPage>(entry.page_id, LatchFallbackMode::Shared)
@@ -242,9 +190,9 @@ impl RowUndoLogs {
                 .shared_async()
                 .await;
             let (ctx, page) = page_guard.ctx_and_page();
-            let metadata = &*ctx.undo().unwrap().metadata;
+            let metadata = &*ctx.row_ver().unwrap().metadata;
             let row_idx = page.row_idx(entry.row_id);
-            let mut access = RowWriteAccess::new(page, ctx, row_idx);
+            let mut access = RowWriteAccess::new(page, ctx, row_idx, sts);
             access.rollback_first_undo(metadata, entry);
         }
     }
@@ -454,6 +402,7 @@ impl UndoStatus {
 ///
 /// Below is a sample data flow of the undo branch maintainance.
 ///
+/// ```text
 ///  ┌──────────────────────────────────────────────────────────┐                     
 ///  │t1: insert {rowid=100,k=1,v=1}                            │                     
 ///  └──────────────────────────────────────────────────────────┘                     
@@ -509,6 +458,7 @@ impl UndoStatus {
 ///   │k=3────►200├───┐      ┌─────────────────┐   ┌─▼─────┐               │          
 ///   └───────────┘   └─────►│rowid=200,k=3,v=4├──►│k=1,v=2├───────────────┘          
 ///                          └─────────────────┘   └───────┘                          
+/// ```
 pub struct IndexBranch {
     pub key: SelectKey,
     pub cts: TrxID,
@@ -563,16 +513,3 @@ impl RowUndoHead {
 }
 
 unsafe impl Send for RowUndoHead {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_undo_head_size() {
-        println!(
-            "size of RwLock<Option<UndoHead>> is {}",
-            std::mem::size_of::<RwLock<Option<RowUndoHead>>>()
-        );
-    }
-}

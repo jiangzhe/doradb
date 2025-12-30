@@ -25,6 +25,7 @@ pub mod sys;
 pub mod sys_conf;
 pub mod sys_trx;
 pub mod undo;
+pub mod ver_map;
 
 use crate::engine::EngineRef;
 use crate::error::Result;
@@ -216,6 +217,7 @@ impl ActiveTrx {
             debug_assert!(Arc::strong_count(&self.status) == 1);
             debug_assert!(self.index_undo.is_empty());
             return PreparedTrx {
+                sts: Some(self.sts),
                 redo_bin: None,
                 payload: Some(PreparedTrxPayload {
                     status: Arc::clone(&self.status),
@@ -251,6 +253,7 @@ impl ActiveTrx {
         let row_undo = mem::take(&mut self.row_undo);
         let index_undo = mem::take(&mut self.index_undo);
         PreparedTrx {
+            sts: Some(self.sts),
             redo_bin,
             payload: Some(PreparedTrxPayload {
                 status: self.status.clone(),
@@ -326,6 +329,7 @@ pub struct PreparedTrxPayload {
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
 pub struct PreparedTrx {
+    sts: Option<TrxID>,
     redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
     payload: Option<PreparedTrxPayload>,
     session: Option<Arc<SessionState>>,
