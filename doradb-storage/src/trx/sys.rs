@@ -206,7 +206,7 @@ impl TransactionSystem {
         trx.index_undo
             .rollback(buf_pool, &self.catalog, trx.sts)
             .await;
-        trx.row_undo.rollback(buf_pool).await;
+        trx.row_undo.rollback(buf_pool, Some(trx.sts)).await;
         trx.redo.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         if let Some(s) = trx.session.take() {
@@ -223,7 +223,7 @@ impl TransactionSystem {
         debug_assert!(trx.redo_bin.is_none());
         // Note: rollback can only happens to user transaction, so payload is always non-empty.
         let mut payload = trx.payload.take().unwrap();
-        payload.row_undo.rollback(buf_pool).await;
+        payload.row_undo.rollback(buf_pool, trx.sts).await;
         payload
             .index_undo
             .rollback(buf_pool, &self.catalog, payload.sts)

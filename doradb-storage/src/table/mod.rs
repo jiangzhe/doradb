@@ -599,7 +599,8 @@ impl Table {
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
                 let (ctx, page) = new_guard.ctx_and_page();
-                let mut new_access = RowWriteAccess::new(page, ctx, page.row_idx(new_id));
+                let mut new_access =
+                    RowWriteAccess::new(page, ctx, page.row_idx(new_id), Some(stmt.trx.sts));
                 let undo_vals = new_access.row().calc_delta(metadata, &old_row);
                 new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
                 LinkForUniqueIndex::Ok
@@ -668,7 +669,7 @@ impl Table {
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new(page, ctx, row_idx);
+        let mut access = RowWriteAccess::new(page, ctx, row_idx, Some(stmt.trx.sts));
         access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
@@ -687,7 +688,8 @@ impl Table {
             // Here we actually lock both new row and old row,
             // not very sure if this will cause dead-lock.
             let (ctx, page) = old_guard.ctx_and_page();
-            let old_access = RowWriteAccess::new(page, ctx, page.row_idx(old_id));
+            let old_access =
+                RowWriteAccess::new(page, ctx, page.row_idx(old_id), Some(stmt.trx.sts));
             debug_assert!({ old_access.undo_head().is_some() });
             debug_assert!(
                 stmt.trx
@@ -935,7 +937,8 @@ impl Table {
     ) -> LockRowForWrite<'a> {
         let (ctx, page) = page_guard.ctx_and_page();
         loop {
-            let mut access = RowWriteAccess::new(page, ctx, page.row_idx(row_id));
+            let mut access =
+                RowWriteAccess::new(page, ctx, page.row_idx(row_id), Some(stmt.trx.sts));
             let lock_undo = access.lock_undo(
                 stmt,
                 self.metadata(),

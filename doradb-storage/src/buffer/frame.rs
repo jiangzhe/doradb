@@ -2,7 +2,7 @@ use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID};
 use crate::catalog::TableMetadata;
 use crate::latch::HybridLatch;
 use crate::trx::recover::RecoverMap;
-use crate::trx::undo::UndoMap;
+use crate::trx::ver_map::RowVersionMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -70,7 +70,7 @@ impl BufferFrame {
 
     #[inline]
     pub fn init_undo_map(&mut self, metadata: Arc<TableMetadata>, max_size: usize) {
-        self.ctx = Some(Box::new(FrameContext::UndoMap(UndoMap::new(
+        self.ctx = Some(Box::new(FrameContext::RowVerMap(RowVersionMap::new(
             metadata, max_size,
         ))));
     }
@@ -134,15 +134,15 @@ impl From<u8> for FrameKind {
 }
 
 pub enum FrameContext {
-    UndoMap(UndoMap),
+    RowVerMap(RowVersionMap),
     RecoverMap(RecoverMap),
 }
 
 impl FrameContext {
     #[inline]
-    pub fn undo(&self) -> Option<&UndoMap> {
+    pub fn row_ver(&self) -> Option<&RowVersionMap> {
         match self {
-            FrameContext::UndoMap(undo) => Some(undo),
+            FrameContext::RowVerMap(ver) => Some(ver),
             FrameContext::RecoverMap(_) => None,
         }
     }
@@ -151,7 +151,7 @@ impl FrameContext {
     pub fn recover(&self) -> Option<&RecoverMap> {
         match self {
             FrameContext::RecoverMap(rec) => Some(rec),
-            FrameContext::UndoMap(_) => None,
+            FrameContext::RowVerMap(_) => None,
         }
     }
 
@@ -159,7 +159,7 @@ impl FrameContext {
     pub fn recover_mut(&mut self) -> Option<&mut RecoverMap> {
         match self {
             FrameContext::RecoverMap(rec) => Some(rec),
-            FrameContext::UndoMap(_) => None,
+            FrameContext::RowVerMap(_) => None,
         }
     }
 }
