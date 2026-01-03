@@ -413,14 +413,14 @@ impl BlockIndex {
     pub async fn new(
         pool: &'static FixedBufferPool,
         table_id: TableID,
-        boundary: RowID,
+        pivot: RowID,
         file_root: AtomicPtr<ActiveRoot>,
     ) -> Self {
         let mut g = pool.allocate_page::<BlockNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init_empty(0, 0);
-        let root = BlockIndexRoot::new(page_id, boundary, file_root);
+        let root = BlockIndexRoot::new(page_id, pivot, file_root);
         BlockIndex {
             table_id,
             root,
@@ -568,7 +568,7 @@ impl BlockIndex {
 
     /// Returns the cursor for range scan.
     #[inline]
-    pub fn cursor(&self) -> BlockIndexMemCursor<'_> {
+    pub fn mem_cursor(&self) -> BlockIndexMemCursor<'_> {
         BlockIndexMemCursor {
             blk_idx: self,
             parent: None,
@@ -969,7 +969,7 @@ pub struct BlockIndexRoot {
     /// minimum row id of row pages.
     /// If row id is less than this value, it
     /// goes to column store.
-    bound: UnsafeCell<RowID>,
+    pivot: UnsafeCell<RowID>,
     /// Root of in-file rows.
     /// This can be changed if compaction (conversion
     /// from row to col) happens.
@@ -977,26 +977,27 @@ pub struct BlockIndexRoot {
 }
 
 impl BlockIndexRoot {
+    /// Create a block index root.
     #[inline]
-    pub fn new(mem: PageID, boundary: RowID, file: AtomicPtr<ActiveRoot>) -> Self {
+    pub fn new(mem: PageID, pivot: RowID, file: AtomicPtr<ActiveRoot>) -> Self {
         BlockIndexRoot {
             mem,
             latch: HybridLatch::new(),
-            bound: UnsafeCell::new(boundary),
+            pivot: UnsafeCell::new(pivot),
             file,
         }
     }
 
     /// Guide the search path of given row id.
     /// The search path can be determined by comparison
-    /// to row id boundary.
+    /// to pivot row id.
     #[inline]
     pub fn guide(&self, row_id: RowID) -> Either<&ActiveRoot, PageID> {
         loop {
             unsafe {
                 let g = self.latch.optimistic_spin();
-                let boundary = *self.bound.get();
-                if row_id < boundary {
+                let pivot = *self.pivot.get();
+                if row_id < pivot {
                     // go to file
                     let file_root = self.file.load(Ordering::Acquire);
                     if g.validate() {
@@ -1020,8 +1021,8 @@ impl BlockIndexRoot {
         loop {
             unsafe {
                 let g = self.latch.optimistic_spin();
-                let bound = *self.bound.get();
-                if row_id < bound {
+                let pivot = *self.pivot.get();
+                if row_id < pivot {
                     // go to file
                     let file_root = self.file.load(Ordering::Acquire);
                     if g.validate() {
@@ -1354,7 +1355,7 @@ mod tests {
                     let _ = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 }
                 let mut count = 0usize;
-                let mut cursor = blk_idx.cursor();
+                let mut cursor = blk_idx.mem_cursor();
                 cursor.seek(0).await;
                 while let Some(res) = cursor.next().await {
                     count += 1;

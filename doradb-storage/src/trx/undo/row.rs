@@ -192,7 +192,7 @@ impl RowUndoLogs {
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             let row_idx = page.row_idx(entry.row_id);
-            let mut access = RowWriteAccess::new(page, ctx, row_idx, sts);
+            let mut access = RowWriteAccess::new(page, ctx, row_idx, sts, false);
             access.rollback_first_undo(metadata, entry);
         }
     }

@@ -57,6 +57,24 @@ impl<'a> RowReadAccess<'a> {
         }
     }
 
+    #[allow(clippy::borrowed_box)]
+    #[inline]
+    pub fn undo_head(&self) -> Option<&Box<RowUndoHead>> {
+        match &self.state {
+            RowReadState::RowVer(guard) => guard.as_ref(),
+            RowReadState::Recover(_) => None,
+        }
+    }
+
+    /// Returns first undo entry on main branch of the chain.
+    #[inline]
+    pub fn first_undo_entry(&self) -> Option<RowUndoRef> {
+        match &self.state {
+            RowReadState::RowVer(guard) => guard.as_ref().map(|head| head.next.main.entry.clone()),
+            RowReadState::Recover(_) => None,
+        }
+    }
+
     #[inline]
     pub fn read_row_latest(
         &self,
@@ -586,11 +604,12 @@ impl<'a> RowWriteAccess<'a> {
         ctx: &'a FrameContext,
         row_idx: usize,
         sts: Option<TrxID>,
+        ins_or_update: bool,
     ) -> Self {
         let ver_map = ctx
             .row_ver()
             .expect("write_row not supported without undo map");
-        let guard = ver_map.write_latch(row_idx, sts);
+        let guard = ver_map.write_latch(row_idx, sts, ins_or_update);
         RowWriteAccess {
             page,
             row_idx,
@@ -610,7 +629,9 @@ impl<'a> RowWriteAccess<'a> {
 
     #[inline]
     pub fn delete_row(&mut self) {
-        self.page.set_deleted(self.row_idx, true);
+        let res = self.page.set_deleted(self.row_idx, true);
+        debug_assert!(res);
+        self.page.inc_approx_deleted();
     }
 
     #[inline]
@@ -620,7 +641,16 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn update_row(&self, metadata: &TableMetadata, cols: &[UpdateCol]) -> UpdateRow<'_> {
+    pub fn update_row(
+        &self,
+        metadata: &TableMetadata,
+        cols: &[UpdateCol],
+        frozen: bool,
+    ) -> UpdateRow<'_> {
+        if frozen {
+            let old_row = self.row().vals_with_var_offsets(metadata);
+            return UpdateRow::NoFreeSpaceOrFrozen(old_row);
+        }
         let var_len = self.row().var_len_for_update(cols);
         if var_len == 0 {
             // fast path, no change on var-length column.
@@ -631,24 +661,13 @@ impl<'a> RowWriteAccess<'a> {
         match self.page.request_free_space(var_len) {
             None => {
                 let old_row = self.row().vals_with_var_offsets(metadata);
-                UpdateRow::NoFreeSpace(old_row)
+                UpdateRow::NoFreeSpaceOrFrozen(old_row)
             }
             Some(offset) => {
                 let row = self.row_mut(offset, offset + var_len);
                 UpdateRow::Ok(row)
             }
         }
-    }
-
-    #[inline]
-    pub fn undo_head(&self) -> &Option<Box<RowUndoHead>> {
-        &self.guard
-    }
-
-    /// Returns first undo entry on main branch of the chain.
-    #[inline]
-    pub fn first_undo_entry(&self) -> Option<RowUndoRef> {
-        self.guard.as_ref().map(|head| head.next.main.entry.clone())
     }
 
     #[inline]
@@ -850,10 +869,14 @@ impl<'a> RowWriteAccess<'a> {
         match &owned_entry.kind {
             RowUndoKind::Lock => (), // do nothing.
             RowUndoKind::Insert => {
-                self.page.set_deleted(self.row_idx, true);
+                let res = self.page.set_deleted(self.row_idx, true);
+                debug_assert!(res);
+                self.page.inc_approx_deleted();
             }
             RowUndoKind::Delete => {
-                self.page.set_deleted(self.row_idx, false);
+                let res = self.page.set_deleted(self.row_idx, false);
+                debug_assert!(res);
+                self.page.dec_approx_deleted();
             }
             RowUndoKind::Update(undo_cols) => {
                 // Here we try to rollback changes on this page
@@ -870,7 +893,13 @@ impl<'a> RowWriteAccess<'a> {
                 }
             }
             RowUndoKind::Move(deleted) => {
-                self.page.set_deleted(self.row_idx, *deleted);
+                let res = self.page.set_deleted(self.row_idx, *deleted);
+                debug_assert!(res);
+                if *deleted {
+                    self.page.inc_approx_deleted();
+                } else {
+                    self.page.dec_approx_deleted();
+                }
             }
         }
         // rollback undo
@@ -887,13 +916,22 @@ impl<'a> RowWriteAccess<'a> {
                     debug_assert!(matches!(owned_entry.kind, RowUndoKind::Update(_)));
                     // Out-of-place update inserts new row just like a insert operation
                     // so we should mark it as deleted.
-                    self.page.set_deleted(self.row_idx, true);
+                    // todo: simplify move+update logic, replace it with delete+insert.
+                    //       so that we do not need to handle this special case.
+                    let res = self.page.set_deleted(self.row_idx, true);
+                    debug_assert!(res);
+                    self.page.inc_approx_deleted();
                     self.remove_undo_head();
                     return;
                 }
                 head.next = next;
             }
         }
+    }
+
+    #[inline]
+    pub fn enable_ins_or_update(&mut self) {
+        self.guard.enable_ins_or_update();
     }
 }
 
@@ -910,6 +948,13 @@ pub enum LockUndo {
     InvalidIndex,
     // row is locked by a preparing transaction.
     Preparing(Option<EventListener>),
+}
+
+impl LockUndo {
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        matches!(self, LockUndo::Ok)
+    }
 }
 
 pub enum LockRowForWrite<'a> {

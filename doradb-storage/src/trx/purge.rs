@@ -138,7 +138,7 @@ impl TransactionSystem {
             let (ctx, page) = page_guard.ctx_and_page();
             for row_id in row_ids {
                 let row_idx = page.row_idx(row_id);
-                let mut access = RowWriteAccess::new(page, ctx, row_idx, None);
+                let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
                 access.purge_undo_chain(min_active_sts);
             }
         }

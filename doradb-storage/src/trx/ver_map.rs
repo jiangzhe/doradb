@@ -4,7 +4,7 @@ use crate::trx::undo::RowUndoHead;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// RowVersionMap is a page-level hash map to store
 /// old versions of rows in row page.
@@ -37,6 +37,17 @@ pub struct RowVersionMap {
     // by mistake, e.g. a transaction modifies one row, then
     // rollback.
     max_sts: AtomicU64,
+    // Maximum STS of transactions that has insertion or update
+    // on current page. This can speed up version check on
+    // frozen pages, if `global_min_active_sts > max_ins_sts`,
+    // we can make sure the content of row page can be safely
+    // transformed to LWC block.
+    max_ins_sts: AtomicU64,
+    // Frozen flag indicates the row page is frozen and no
+    // more insert or update can be applied to it.
+    // No lock is used because frozen is just a transitional
+    // period to restrict incoming transactions.
+    frozen: AtomicBool,
 }
 
 impl RowVersionMap {
@@ -49,7 +60,21 @@ impl RowVersionMap {
             metadata,
             mod_counter: AtomicU64::new(0),
             max_sts: AtomicU64::new(0),
+            max_ins_sts: AtomicU64::new(0),
+            frozen: AtomicBool::new(false),
         }
+    }
+
+    /// Returns whether this page is frozen.
+    #[inline]
+    pub fn frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    /// Freeze current row page.
+    #[inline]
+    pub fn set_frozen(&self) {
+        self.frozen.store(true, Ordering::Release);
     }
 
     /// Acquire a read latch on given row.
@@ -61,7 +86,12 @@ impl RowVersionMap {
 
     /// Acquire a write latch on given row.
     #[inline]
-    pub fn write_latch(&self, row_idx: usize, sts: Option<TrxID>) -> RowVersionWriteGuard<'_> {
+    pub fn write_latch(
+        &self,
+        row_idx: usize,
+        sts: Option<TrxID>,
+        ins_or_update: bool,
+    ) -> RowVersionWriteGuard<'_> {
         let g = self.entries[row_idx].write();
         // If STS is not provided, there should be no modification
         // on current page, so we don't need to bump the counter.
@@ -69,7 +99,12 @@ impl RowVersionMap {
         if sts.is_some() {
             self.mod_counter.fetch_add(1, Ordering::AcqRel);
         }
-        RowVersionWriteGuard { m: self, g, sts }
+        RowVersionWriteGuard {
+            m: self,
+            g,
+            sts,
+            ins_or_update,
+        }
     }
 
     /// Acquire exclusive latch as self is exclusive.
@@ -96,6 +131,14 @@ pub struct RowVersionWriteGuard<'a> {
     m: &'a RowVersionMap,
     g: RwLockWriteGuard<'a, Option<Box<RowUndoHead>>>,
     sts: Option<TrxID>,
+    ins_or_update: bool,
+}
+
+impl RowVersionWriteGuard<'_> {
+    #[inline]
+    pub fn enable_ins_or_update(&mut self) {
+        self.ins_or_update = true;
+    }
 }
 
 impl<'a> Drop for RowVersionWriteGuard<'a> {
@@ -104,9 +147,12 @@ impl<'a> Drop for RowVersionWriteGuard<'a> {
         // Only update sts and counter for user transaction.
         if let Some(sts) = self.sts {
             // First we update max sts of this map.
-            self.m.max_sts.fetch_max(sts, Ordering::AcqRel);
+            self.m.max_sts.fetch_max(sts, Ordering::Relaxed);
             // Then we bump the modification counter.
             self.m.mod_counter.fetch_add(1, Ordering::AcqRel);
+            if self.ins_or_update {
+                self.m.max_ins_sts.fetch_max(sts, Ordering::Relaxed);
+            }
         }
     }
 }
