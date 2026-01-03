@@ -318,7 +318,7 @@ impl UndoVal for UndoCol {
 
 pub enum UpdateRow<'a> {
     Ok(RowMut<'a>),
-    NoFreeSpace(Vec<(Val, Option<u16>)>),
+    NoFreeSpaceOrFrozen(Vec<(Val, Option<u16>)>),
 }
 
 pub enum Delete {

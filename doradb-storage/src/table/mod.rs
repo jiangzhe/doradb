@@ -102,9 +102,27 @@ impl Table {
         }
     }
 
+    /// Returns table id.
     #[inline]
     pub fn table_id(&self) -> TableID {
         self.blk_idx.table_id
+    }
+
+    /// Returns total number of row pages.
+    #[inline]
+    pub async fn total_row_pages(&self) -> usize {
+        let mut res = 0usize;
+        let mut cursor = self.blk_idx.mem_cursor();
+        cursor.seek(0).await;
+        while let Some(leaf) = cursor.next().await {
+            let g = leaf.shared_async().await;
+            debug_assert!(g.page().is_leaf());
+            let blocks = g.page().leaf_blocks();
+            for block in blocks {
+                res += block.row_page_entries().iter().count();
+            }
+        }
+        res
     }
 
     #[inline]
@@ -139,17 +157,17 @@ impl Table {
         }
     }
 
-    async fn table_scan<P: BufferPool, F>(
+    async fn mem_scan<P: BufferPool, F>(
         &self,
         data_pool: &'static P,
         start_row_id: RowID,
         mut page_action: F,
     ) where
-        F: FnMut(&PageSharedGuard<RowPage>) -> bool,
+        F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let mut cursor = self.blk_idx.cursor();
+        let mut cursor = self.blk_idx.mem_cursor();
         cursor.seek(start_row_id).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.shared_async().await;
@@ -162,7 +180,7 @@ impl Table {
                         .await
                         .shared_async()
                         .await;
-                    if !page_action(&page_guard) {
+                    if !page_action(page_guard) {
                         return;
                     }
                 }
@@ -600,7 +618,7 @@ impl Table {
                 // row latch is enough, because row lock is already acquired.
                 let (ctx, page) = new_guard.ctx_and_page();
                 let mut new_access =
-                    RowWriteAccess::new(page, ctx, page.row_idx(new_id), Some(stmt.trx.sts));
+                    RowWriteAccess::new(page, ctx, page.row_idx(new_id), Some(stmt.trx.sts), false);
                 let undo_vals = new_access.row().calc_delta(metadata, &old_row);
                 new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
                 LinkForUniqueIndex::Ok
@@ -629,7 +647,7 @@ impl Table {
                     return (row_id, page_guard);
                 }
                 // this page cannot be inserted any more, just leave it and retry another page.
-                InsertRowIntoPage::NoSpaceOrRowID(ins, uk, me) => {
+                InsertRowIntoPage::NoSpaceOrFrozen(ins, uk, me) => {
                     insert = ins;
                     undo_kind = uk;
                     move_entry = me;
@@ -641,6 +659,7 @@ impl Table {
     /// Insert row into given page.
     /// There might be move+update call this method, in such case, undo_kind will be
     /// set to UndoKind::Update.
+    /// If row page is frozen, the insert will fail.
     #[inline]
     fn insert_row_to_page(
         &self,
@@ -657,6 +676,9 @@ impl Table {
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page();
+        if ctx.row_ver().unwrap().frozen() {
+            return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, move_entry);
+        }
         debug_assert!(metadata.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
 
@@ -665,12 +687,13 @@ impl Table {
             if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
             } else {
-                return InsertRowIntoPage::NoSpaceOrRowID(cols, undo_kind, move_entry);
+                return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, move_entry);
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new(page, ctx, row_idx, Some(stmt.trx.sts));
-        access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
+        let mut access = RowWriteAccess::new(page, ctx, row_idx, Some(stmt.trx.sts), true);
+        let res = access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
+        debug_assert!(res.is_ok());
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
         for v in &cols {
@@ -678,7 +701,7 @@ impl Table {
         }
         let new_row_id = new_row.finish();
         debug_assert!(new_row_id == row_id);
-        stmt.update_last_undo(undo_kind);
+        stmt.update_last_row_undo(undo_kind);
         // Here we do not release row latch because we may need to link MOVE entry.
 
         // The MOVE undo entry is for MOVE+UPDATE.
@@ -688,8 +711,7 @@ impl Table {
             // Here we actually lock both new row and old row,
             // not very sure if this will cause dead-lock.
             let (ctx, page) = old_guard.ctx_and_page();
-            let old_access =
-                RowWriteAccess::new(page, ctx, page.row_idx(old_id), Some(stmt.trx.sts));
+            let old_access = RowReadAccess::new(page, ctx, page.row_idx(old_id));
             debug_assert!({ old_access.undo_head().is_some() });
             debug_assert!(
                 stmt.trx
@@ -709,6 +731,7 @@ impl Table {
             old_guard.set_dirty(); // mark as dirty page.
         }
         drop(access);
+
         // Here we do not unlock the page because we need to verify validity of unique index update
         // according to this insert.
         // There might be scenario that a deleted row or old version of updated row shares the same
@@ -740,7 +763,7 @@ impl Table {
         mut update: Vec<UpdateCol>,
     ) -> UpdateRowInplace {
         let page_id = page_guard.page_id();
-        let page = page_guard.page();
+        let (ctx, page) = page_guard.ctx_and_page();
         // column indexes must be in range
         debug_assert!(
             {
@@ -766,6 +789,7 @@ impl Table {
         {
             return UpdateRowInplace::RowNotFound;
         }
+        let frozen = ctx.row_ver().unwrap().frozen();
         let mut lock_row = self
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
@@ -778,17 +802,17 @@ impl Table {
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }
-                match access.update_row(metadata, &update) {
-                    UpdateRow::NoFreeSpace(old_row) => {
-                        // Page does not have enough space for update, we need to switch
-                        // to out-of-place update mode, which will add a MOVE undo entry
-                        // to end original row and perform a INSERT into new page, and
-                        // link the two versions.
+                match access.update_row(metadata, &update, frozen) {
+                    UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
+                        // Page does not have enough space or has been frozen for update,
+                        // we need to switch to out-of-place update mode, which will add
+                        // a MOVE undo entry to end original row and perform a INSERT into
+                        // new page, and link the two versions.
                         //
                         // Mark page data as deleted.
                         access.delete_row();
                         // Update LOCK entry to MOVE entry.
-                        stmt.update_last_undo(RowUndoKind::Move(false));
+                        stmt.update_last_row_undo(RowUndoKind::Move(false));
                         drop(access); // unlock row
                         drop(lock_row);
                         // Here we do not unlock page because we need to perform MOVE+UPDATE
@@ -834,7 +858,9 @@ impl Table {
                             }
                         }
                         // Update LOCK entry to UPDATE entry.
-                        stmt.update_last_undo(RowUndoKind::Update(undo_cols));
+                        stmt.update_last_row_undo(RowUndoKind::Update(undo_cols));
+                        // Mark this access as update, so page-level max_ins_sts will be updated.
+                        access.enable_ins_or_update();
                         drop(access); // unlock the row.
                         drop(lock_row);
                         // we may still need this page if we'd like to update index.
@@ -882,7 +908,7 @@ impl Table {
                 }
                 access.delete_row();
                 // update LOCK entry to DELETE entry.
-                stmt.update_last_undo(RowUndoKind::Delete);
+                stmt.update_last_row_undo(RowUndoKind::Delete);
                 drop(access); // unlock row.
                 drop(lock_row);
                 // hold page lock in order to update index later.
@@ -938,7 +964,7 @@ impl Table {
         let (ctx, page) = page_guard.ctx_and_page();
         loop {
             let mut access =
-                RowWriteAccess::new(page, ctx, page.row_idx(row_id), Some(stmt.trx.sts));
+                RowWriteAccess::new(page, ctx, page.row_idx(row_id), Some(stmt.trx.sts), false);
             let lock_undo = access.lock_undo(
                 stmt,
                 self.metadata(),
@@ -1958,7 +1984,7 @@ fn row_len(metadata: &TableMetadata, cols: &[Val]) -> usize {
 
 enum InsertRowIntoPage {
     Ok(RowID, PageSharedGuard<RowPage>),
-    NoSpaceOrRowID(
+    NoSpaceOrFrozen(
         Vec<Val>,
         RowUndoKind,
         Option<(RowID, PageSharedGuard<RowPage>)>,

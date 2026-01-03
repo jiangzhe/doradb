@@ -44,7 +44,64 @@ Checkpointing is executed by background threads. While the Heap and Index checkp
 ### 4.1 State Ingestion (Common Step)
 Before any component starts a checkpoint, it drains the table's `commit_queue` and inserts all items into the `unflushed_map`. This ensures the map contains the latest commit history.
 
-### 4.2 Index Checkpoint (Per Index)
+### 4.3 Data Checkpoint (Heap / Tuple Mover)
+
+The Data Checkpoint is driven by the **Tuple Mover**, a background task responsible for transforming in-memory **RowPages** into on-disk **LWC (LightWeight Columnar) Blocks**.
+
+This process follows a strict **Three-Stage Lifecycle** to ensure non-blocking writes and data consistency.
+
+#### 4.3.1 RowPage Lifecycle States
+
+Each RowPage maintains an atomic `state` word (`[RefCount: 62bit | State: 2bit]`):
+
+1.  **ACTIVE**:
+    *   **Allowed**: Insert, In-place Update, Delete.
+    *   **Behavior**: Transaction threads perform standard MVCC operations. The page tracks `Max_Ins_STS` (the STS of the latest transaction to perform an Insert or Update).
+2.  **FROZEN** (Draining):
+    *   **Allowed**: Delete **only**.
+    *   **Redirect**: Insert/Update attempts are rejected and redirected to the "Cold Update" path (Delete + Re-Insert into a new Active page).
+    *   **Purpose**: Allows existing uncommitted transactions to settle without blocking new writers.
+3.  **INVALID** (Converting):
+    *   **Allowed**: None.
+    *   **Behavior**: All access attempts block or retry until the LWC Block is visible in the Block Index.
+
+#### 4.3.2. The Tuple Mover Workflow
+
+The Tuple Mover processes a batch of RowPages through these stages:
+
+**Step 1: Freeze (Active -> Frozen)**
+
+The goal is to stop new mutations (Inserts/Updates) instantly without waiting.
+1.  **Atomic Switch**: The Tuple Mover performs a `CAS(state, ACTIVE, FROZEN)` on the target RowPages.
+2.  **Effect**: Subsequent Insert/Update requests immediately fail the state check and divert to the "Cold Update" path (logical deletion + insertion into a fresh Active page). Delete operations continue to be allowed to minimize aborts.
+
+**Step 2: Stabilize (Wait for Visibility)**
+
+The Tuple Mover must ensure that all data in the Frozen pages is fully committed (or aborted) before conversion.
+1.  **Check Condition**: Instead of scanning Undo Chains, the Tuple Mover compares timestamps:
+    $$ \text{Global\_Min\_Active\_STS} > \text{Page.Max\_Insert\_STS} $$
+    *   `Global_Min_Active_STS`: The start timestamp of the oldest active transaction in the system.
+    *   `Page.Max_Insert_STS`: Updated by every writer during the Active phase.
+2.  **Wait**: If the condition is not met, the Tuple Mover yields/sleeps and retries later. This ensures no uncommitted Inserts/Updates exist on the page.
+
+**Step 3: Convert (Frozen -> Invalid)**
+
+Once stabilized, the page is ready for conversion.
+1.  **Atomic Invalid**: Perform `CAS(state, FROZEN, INVALID)`.
+2.  **Drain Reference Count**: Spin-wait until `RefCount == 0`. This ensures any concurrent Delete operations (which were allowed in Frozen state) have finished.
+3.  **Read & Transform**:
+    *   Read the now-immutable RowPage data.
+    *   Apply any committed Deletes from the delete bitmap.
+    *   Encode data into an **LWC Block**.
+    *   If uncommitted Deletes exist (rare, but possible), they are carried over to the LWC Block's separate "Delta Bitmap" or Delta Store.
+4.  **Persist**:
+    *   Write the LWC Block and its Block Index entry to disk. This step is fast because both blocks and its index are append-only.
+5.  **Switch Metadata**:
+    *   Update the in-memory Block Index to point to the new LWC Block.
+    *   Update `Table.watermarks.heap_rec_cts` based on the maximum CTS found in the converted data.
+    *   Release the memory of the RowPages.
+
+### 4.3 Index Checkpoint (Per Index)
 
 The Index Checkpoint thread persists dirty data from the in-memory **MemTree** to the on-disk **DiskTree**.
 
@@ -63,16 +120,6 @@ The Index Checkpoint thread persists dirty data from the in-memory **MemTree** t
     *   Perform `CAS(&Entry.sts, STS, 0)` on the processed MemTree entries to mark them as **Clean**.
 5.  **Watermark Update**:
     *   Update `Table.watermarks.index_rec_cts[IndexID]` in memory.
-
-### 4.3 Data Checkpoint (Heap / Tuple Mover)
-
-The Tuple Mover converts immutable RowPages to Column Blocks.
-
-1.  **Selection**: Select a range of frozen RowPages.
-2.  **CTS Determination**: Identify the maximum CTS contained within these pages (read directly from row headers/undo chains). Let this be `Batch_Max_CTS`.
-3.  **Persistence**: Write the LWC Block and Block Index to disk.
-4.  **Watermark Update**:
-    *   Update `Table.watermarks.heap_rec_cts = Batch_Max_CTS` in memory and in the Table File Header.
 
 ---
 

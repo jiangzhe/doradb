@@ -749,6 +749,75 @@ fn test_table_scan_mvcc() {
     });
 }
 
+#[test]
+fn test_table_freeze() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+
+        let mut session1 = sys.new_session();
+        {
+            let trx = session1.begin_trx().unwrap();
+            let insert = vec![Val::from(1), Val::from("1")];
+            sys.trx_insert(trx, insert).await.commit().await.unwrap();
+        }
+        let row_pages = sys.table.total_row_pages().await;
+        assert!(row_pages == 1);
+        sys.table.freeze(sys.engine.data_pool, 10).await;
+        // after freezing, new row should be inserted into second page.
+        {
+            let trx = session1.begin_trx().unwrap();
+            let insert = vec![Val::from(2), Val::from("2")];
+            sys.trx_insert(trx, insert).await.commit().await.unwrap();
+        }
+        let row_pages = sys.table.total_row_pages().await;
+        assert!(row_pages == 2);
+        sys.table.freeze(sys.engine.data_pool, 10).await;
+
+        // update row 1 will cause new insert into new page.
+        {
+            let mut stmt = session1.begin_trx().unwrap().start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(1)]);
+            let res = stmt
+                .update_row(
+                    &sys.table,
+                    &key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("3"),
+                    }],
+                )
+                .await;
+            assert!(res.is_ok());
+            stmt.succeed().commit().await.unwrap();
+        }
+        let row_pages = sys.table.total_row_pages().await;
+        assert!(row_pages == 3);
+
+        // update row 1 will just be in-place.
+        {
+            let mut stmt = session1.begin_trx().unwrap().start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(1)]);
+            let res = stmt
+                .update_row(
+                    &sys.table,
+                    &key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("4"),
+                    }],
+                )
+                .await;
+            assert!(res.is_ok());
+            stmt.succeed().commit().await.unwrap();
+        }
+        let row_pages = sys.table.total_row_pages().await;
+        assert!(row_pages == 3);
+
+        drop(session1);
+        sys.clean_all();
+    });
+}
+
 struct TestSys {
     engine: Engine,
     table: Table,

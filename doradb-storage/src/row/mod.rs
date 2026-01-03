@@ -12,7 +12,7 @@ use ordered_float::OrderedFloat;
 use std::fmt;
 use std::mem;
 use std::slice;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 pub type RowID = u64;
 pub const INVALID_ROW_ID: RowID = !0;
@@ -257,7 +257,9 @@ impl RowPage {
         if self.is_deleted(row_idx) {
             return Delete::AlreadyDeleted;
         }
-        self.set_deleted(row_idx, true);
+        let res = self.set_deleted(row_idx, true);
+        debug_assert!(res);
+        self.inc_approx_deleted();
         Delete::Ok
     }
 
@@ -801,8 +803,9 @@ impl RowPage {
     }
 
     /// Mark given row as deleted.
+    /// Returns true if this operation succeeds.
     #[inline]
-    pub(crate) fn set_deleted(&self, row_idx: usize, deleted: bool) {
+    pub(crate) fn set_deleted(&self, row_idx: usize, deleted: bool) -> bool {
         let offset = self.header.del_bit_offset(row_idx);
         // SAFETY
         //
@@ -816,28 +819,38 @@ impl RowPage {
             let current = atom.load(Ordering::Acquire);
             if deleted {
                 if current & bit_mask != 0 {
-                    return; // already deleted.
+                    return false; // already deleted.
                 }
                 let new = current | bit_mask;
                 if atom
                     .compare_exchange_weak(current, new, Ordering::SeqCst, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return;
+                    return true;
                 }
             } else {
                 if current & bit_mask == 0 {
-                    return; //already not deleted.
+                    return false; //already not deleted.
                 }
                 let new = current & !bit_mask;
                 if atom
                     .compare_exchange_weak(current, new, Ordering::SeqCst, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return;
+                    return true;
                 }
             }
         }
+    }
+
+    #[inline]
+    pub(crate) fn inc_approx_deleted(&self) {
+        self.header.approx_deleted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn dec_approx_deleted(&self) {
+        self.header.approx_deleted.fetch_sub(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -991,7 +1004,9 @@ pub struct RowPageHeader {
     pub col_offset_list_offset: u16,
     pub fix_field_offset: u16,
     pub fix_field_end: u16,
-
+    // approximate deleted count, used by checkpoint thread
+    // to estimate row count to migrate.
+    pub approx_deleted: AtomicU16,
     padding: [u8; 6],
 }
 
@@ -1091,6 +1106,14 @@ impl RowPageHeader {
     pub fn del_bit_offset(&self, row_idx: usize) -> usize {
         self.del_bitmap_offset as usize + row_idx / 8
     }
+
+    /// Returns approximate non-deleted row count.
+    #[inline]
+    pub fn approx_non_deleted(&self) -> usize {
+        let approx_deleted = self.approx_deleted.load(Ordering::Relaxed);
+        let row_count = self.row_count();
+        row_count.wrapping_sub(approx_deleted as usize)
+    }
 }
 
 impl fmt::Debug for RowPageHeader {
@@ -1182,7 +1205,9 @@ impl NewRow<'_> {
     #[inline]
     pub fn finish(self) -> RowID {
         debug_assert!(self.col_idx == self.page.header.col_count as usize);
-        self.page.set_deleted(self.row_idx, false);
+        let res = self.page.set_deleted(self.row_idx, false);
+        debug_assert!(res);
+        // new row does not count to approx_deleted_count.
         self.row_id
     }
 }
@@ -1424,12 +1449,6 @@ impl RowMut<'_> {
         self.page.set_null(metadata, self.row_idx, col_idx, null);
     }
 
-    /// Set delete flag by given row.
-    #[inline]
-    pub fn set_deleted(&mut self, deleted: bool) {
-        self.page.set_deleted(self.row_idx, deleted);
-    }
-
     #[inline]
     pub fn finish(self) {
         debug_assert!(self.var_offset == self.var_end);
@@ -1480,7 +1499,9 @@ impl RowMutExclusive<'_> {
     #[inline]
     pub fn finish_insert(self) -> Recover {
         debug_assert!(self.var_offset == self.var_end);
-        self.page.set_deleted(self.row_idx, false);
+        let res = self.page.set_deleted(self.row_idx, false);
+        debug_assert!(res);
+        // new row does not count to approx_deleted.
         Recover::Ok
     }
 

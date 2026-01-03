@@ -1,5 +1,4 @@
 use crate::buffer::BufferPool;
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::TableMetadata;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
@@ -142,6 +141,14 @@ pub trait TableAccess {
         row_id: RowID,
         unique: bool,
     ) -> impl Future<Output = bool>;
+
+    /// Freeze row pages.
+    /// Returns number of pages that are frozen.
+    fn freeze<P: BufferPool>(
+        &self,
+        data_pool: &'static P,
+        max_rows: usize,
+    ) -> impl Future<Output = usize>;
 }
 
 impl TableAccess for Table {
@@ -153,7 +160,7 @@ impl TableAccess for Table {
     ) where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
     {
-        self.table_scan(data_pool, start_row_id, |page_guard| {
+        self.mem_scan(data_pool, start_row_id, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, ctx) {
@@ -176,7 +183,7 @@ impl TableAccess for Table {
     ) where
         F: FnMut(Vec<Val>) -> bool,
     {
-        self.table_scan(data_pool, start_row_id, |page_guard| {
+        self.mem_scan(data_pool, start_row_id, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, ctx) {
@@ -592,5 +599,22 @@ impl TableAccess for Table {
             self.delete_non_unique_index(data_pool, index, key, row_id)
                 .await
         }
+    }
+
+    async fn freeze<P: BufferPool>(&self, data_pool: &'static P, max_rows: usize) -> usize {
+        let mut rows = 0usize;
+        self.mem_scan(data_pool, 0, |page_guard| {
+            let (ctx, page) = page_guard.ctx_and_page();
+            let vmap = ctx.row_ver().unwrap();
+            rows += page.header.approx_non_deleted();
+            if vmap.frozen() {
+                return rows < max_rows;
+            }
+            // set frozen to true.
+            vmap.set_frozen();
+            rows < max_rows
+        })
+        .await;
+        rows
     }
 }

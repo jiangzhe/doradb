@@ -40,7 +40,7 @@ impl Statement {
     }
 
     #[inline]
-    pub fn update_last_undo(&mut self, kind: RowUndoKind) {
+    pub fn update_last_row_undo(&mut self, kind: RowUndoKind) {
         let last_undo = self.row_undo.last_mut().unwrap();
         // Currently the update can only be applied on LOCK entry.
         debug_assert!(matches!(last_undo.kind, RowUndoKind::Lock));
