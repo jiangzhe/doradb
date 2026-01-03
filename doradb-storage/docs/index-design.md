@@ -54,22 +54,11 @@ The Block Index serves as global navigation structure for both column store on d
 
 ---
 
-## 4. Active Transaction Table
-
-The transaction table is backed by a concurrent hash table.
-
-When any transaction begins, it will insert its **TrxID/STS** into global active transaction table.
-And when it ends(commit or rollback), remove it from transaction table.
-
-It's used to identify transaction status of dirty index entries by checkpoint thread.
-
----
-
-## 5. Secondary Index Architecture
+## 4. Secondary Index Architecture
 
 The secondary index maps arbitrary keys to RowIDs (`Key -> RowID`). It employs a **LSM-like tiered architecture** but uses a B+Tree for the disk component to optimize read performance.
 
-### 5.1 Layer 1: In-Memory MemTree
+### 4.1 Layer 1: In-Memory MemTree
 *   **Role**: Write Cache, and "Hot" Data Store.
 *   **Data Structure**: In-memory B+Tree.
 *   **Entry Format**:
@@ -86,7 +75,7 @@ The secondary index maps arbitrary keys to RowIDs (`Key -> RowID`). It employs a
     };
     ```
 
-#### 5.1.1 MemTree GC
+#### 4.1.1 MemTree GC
 
 *   **Write Reuse**: 
     *   In write path, if key exists, overwrite `Entry.sts` and reset `Entry.dirty = true`.
@@ -100,35 +89,35 @@ The secondary index maps arbitrary keys to RowIDs (`Key -> RowID`). It employs a
 
 ---
 
-### 5.2 Layer 2: On-Disk CoW B+Tree
+### 4.2 Layer 2: On-Disk CoW B+Tree
 *   **Role**: Durable, read-optimized storage for "Cold" and "Checkpointed" index data.
 *   **Data Structure**: Copy-on-Write B+Tree (LMDB-style).
 *   **Characteristics**:
     *   **Strict No-Steal**: Contains **only** committed data. Never contains dirty data from active transactions.
     *   **Double Buffering**: Uses a Double-Root mechanism in the Meta Page to ensure atomic updates.
 
-#### 5.2.1 Checkpoint Process
+#### 4.2.1 Checkpoint Process
 The DiskTree is updated asynchronously by a background Checkpoint thread.
 
 1.  **MemTree Scan**: A dispatcher scans dirty entries in MemTree.
 2.  **Batch Merge**:
     *   The dispatcher create a **New Root**(`Current_Epoch = OldRoot.Epoch + 1`) and dispatch merge tasks to workers.
-    *   The worker reads a batch of dirty entries `{Key, RowID, STS}`.
+    *   The worker reads a batch of dirty entries `{Key, RowID, STS}`, and identify their commit status using **Per-Table Commit Queue**.
     *   It performs a CoW update on the B+Tree: nodes on the path from leaf to root are copied (at the first time) and modified.
 3.  **Persistence**:
     *   Flush the new pages to disk.
     *   Atomically switch the Meta Page to point to the New Root.
 4.  **State Transition**:
     *   Update dirty Entries with `Entry.dirty = false`, use CAS to make sure `Entry.STS == old_sts`, otherwise skip the update.    
-    *   Leaf node of MemTree which contains dirty entries (and no CAS failed) will be updated with `Node.dirty_epoch = Current_Epoch`.
+    *   Leaf node of MemTree which contains dirty entries (and no CAS failed) will be updated with `Node.flush_epoch = Current_Epoch`.
 
-#### 5.2.2 DiskTree GC (Merge-on-Write)
+#### 4.2.2 DiskTree GC (Merge-on-Write)
 *   Garbage collection of old B+Tree nodes happens naturally during the CoW process.
 *   When a new root is successfully committed, the pages belonging to the old version (that are not shared) are added to a **Free List** for reuse in future checkpoints.
 
 ---
 
-### 5.3 Write Path (Execution Phase)
+### 4.3 Write Path (Execution Phase)
 1.  **Insert**:
     *   Insert row into row page and generate RowID.
     *   Insert `{Key, RowID}` into MemTree.
@@ -149,7 +138,7 @@ The DiskTree is updated asynchronously by a background Checkpoint thread.
 
 ---
 
-### 5.4 Read Path
+### 4.4 Read Path
 1.  **Index Lookup**
     *   Search MemTree for `Key`, to get RowID.
     *   **If Found**: no matter what value `Entry.deleted` is, proceed to visibility check in Heap.
@@ -164,7 +153,7 @@ The DiskTree is updated asynchronously by a background Checkpoint thread.
 
 ---
 
-## 6. Logging
+## 5. Logging
 
 *   There is no separate logging for index change. It is combined with transaction logging.
 *   If a table has index, the transaction logging will always contain index keys.
@@ -175,7 +164,7 @@ The DiskTree is updated asynchronously by a background Checkpoint thread.
 
 ---
 
-## 7. Recovery
+## 6. Recovery
 
 *   **Goal**: Rebuild the MemTree to reflect the state at the moment of the crash.
 *   **Process**:
@@ -188,6 +177,6 @@ The DiskTree is updated asynchronously by a background Checkpoint thread.
 
 ---
 
-## 8. Summary
+## 7. Summary
 
 This design ensures that index lookups are fast (memory-first), writes are non-blocking (memory-only + sequential WAL), and persistence is robust and consistent (CoW + Log Replay).

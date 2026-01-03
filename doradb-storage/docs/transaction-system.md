@@ -15,7 +15,7 @@ The system employs a unique persistence and recovery model that fundamentally di
 |----|----|----|
 | **Dirty Page Policy** | **Strict No-Steal**: Disk data structures (DiskTree/ColumnStore) are immutable or CoW, containing only committed data. No dirty pages are flushed. | **Steal**: Dirty pages from uncommitted transactions can be flushed to disk, requiring Undo Logs for rollback. |
 | **Persistence** | **No-Force**: Only commit log is forced to disk at commit. Data pages remain in memory until checkpoint. | **No-Force**: Only WAL is forced. |
-| **Checkpoint** | **Log-Driven**: Background threads replay the Commit Log to update disk structures via Copy-on-Write (CoW). | **Fuzzy Checkpoint**: Flushes dirty pages from the buffer pool, dealing with complex LSN ordering. |
+| **Checkpoint** | **Commit-Only**: Background threads scan committed data/index to update disk structures via Copy-on-Write (CoW). | **Fuzzy Checkpoint**: Flushes dirty pages from the buffer pool, dealing with complex LSN ordering. |
 | **Recovery** | **Redo-Only**: Crash recovery involves replaying the Commit Log to rebuild memory state. **No Undo phase** is required for disk structures. | **Redo + Undo**: Requires replaying history and then undoing uncommitted changes using Undo Logs. |
 
 **Design Advantages**:
@@ -63,7 +63,7 @@ The index stores only the Key -> RowID mapping. It reflects latest(uncommitted) 
 
 ### In-Memory MemTree
 
-- **Role**: Write Cache and Lock Manager.
+- **Role**: Write Cache.
 - **Entry Structure**:
 
 ```rust
@@ -71,12 +71,12 @@ struct MemTreeEntry {
     key: Key,
     val: RowID,
     sts: AtomicU64,
+    deleted: bool,
+    dirty: bool,
 }
 ```
 
-- **Semantics**:
-  - `sts > 0`: Dirty entry (Active or Committed but not Checkpointed). Used for write conflict detection.
-  - `sts == 0`: Clean entry (Persisted in DiskTree).
+Checkpoint task merges committed and dirty entries to DiskTree and reset them to *clean*.
 
 ### On-Disk CoW B+Tree (DiskTree)
 
@@ -130,14 +130,12 @@ struct MemTreeEntry {
 
 ####  Index Checkpoint
 
-The system uses a **Log Replay** mechanism to decouple foreground latency from background persistence.
+The system uses a **MemTree Scan** mechanism to decouple foreground latency from background persistence.
 
-1. **Dispatch**: A background Log Dispatcher reads the global commit log and routes index-related logs to per-index queues.
-2. **Apply**: Worker threads consume these queues and apply batches of updates to the DiskTree using the CoW mechanism.
-3. **Callback**:
-   - After the DiskTree is updated and flushed, the worker calls back to the MemTree.
-   - It performs a **CAS (Compare-And-Swap)** operation on the sts field of the corresponding keys: `CAS(&Entry.sts, Log.STS, 0)`.
-   - This marks entries as **Clean (0)** only if they haven't been modified by a newer active transaction.
+1. **Dispatch**: A background dispatcher scans dirty entries in MemTree and dispatch them to worker threads.
+2. **Apply**: Worker threads apply batches of updates to the DiskTree using the CoW mechanism.
+3. **State Transition**:
+   - After the DiskTree is updated and flushed, the worker update page-level `flush_epoch = Current_Epoch`(used for index scan to skip MemTree) and entry-level `dirty = false`.
 
 ### Heap Persistence
 

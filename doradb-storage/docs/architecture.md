@@ -53,7 +53,11 @@ The principal of data modification in **Table File** is to do it in copy-on-writ
 
 ### Redo Log File
 
-**Redo Log File** contains all committed data of recent transactions. It's different from the concept of "WAL log" in tranditional database perspective, because it only persists committed data. It does not contains "undo", therefore it does not support ARIES-style fuzzy checkpoint. The design of transactional system with logging and recovery will be introduced in a separate document.
+**Redo Log File** contains all committed data of recent transactions.
+
+It's different from the concept of "WAL log" in tranditional database perspective, because it only persists committed data.
+
+It does not contains "undo", therefore it does not support ARIES-style fuzzy checkpoint. The design of transactional system with logging and recovery will be introduced in a separate document.
 
 ### Secondary Index
 
@@ -66,6 +70,8 @@ The secondary index is composite of two trees: **MemTree** and **DiskTree**.
 Query on index will execute on both tree and aggregate their results.
 
 ## Transactional System
+
+The system employs a unique persistence and recovery model (No-Steal / No-Force) that fundamentally differs from traditional ARIES algorithms (Steal / No-Force).
 
 See [Transaction System](./transaction-system.md).
 

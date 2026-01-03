@@ -21,6 +21,10 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 - [Storage Architecture](./doradb-storage/docs/architecture.md)
 - [Transaction System](./doradb-storage/docs/transaction-system.md)
 - [Index Design](./doradb-storage/docs/index-design.md)
+- [Checkpoint and Recovery](./doradb-storage/docs/checkpoint-and-recovery.md)
+
+Some ideas are different from tranditional database system.
+I'm glad to have discussions if someone is interested in details.
 
 ## Code Structure
 
