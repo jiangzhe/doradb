@@ -22,8 +22,27 @@ Each Table object maintains the following structures to coordinate checkpoints:
 
 ### 2.2 Watermark Definitions
 
-*   **`Heap.Rec_CTS`**: All data rows with `CTS <= Rec_CTS` have been converted to LWC/Column blocks and persisted to disk.
-*   **`Index.Rec_CTS`**: All key changes with `CTS <= Rec_CTS` have been merged into the on-disk B+Tree.
+Each table maintains three types of watermarks, corresponding to its three persistence components. The minimum of these defines the table's retention requirement.
+
+1. Heap Watermark: `Heap_Redo_Start_CTS`
+    *   **Definition**: The creation timestamp (CTS) of the **oldest active RowPage** currently resident in the in-memory RowStore.
+    *   **Purpose**: To rebuild the volatile RowStore, the system must replay all heap operations (Insert/Update) that occurred since the creation of the oldest surviving page.
+    *   **Maintenance**:
+        *   When a new RowPage is allocated, its `Creation_CTS` is set to the current system clock.
+        *   When the **Tuple Mover** successfully converts a batch of frozen RowPages into LWC blocks and persists them:
+            1.  It identifies the *next* oldest active RowPage remaining in memory.
+            2.  It updates `Heap_Redo_Start_CTS` in the Table Metadata to that page's `Creation_CTS`.
+        *   *Edge Case*: If the RowStore becomes empty (all data flushed to LWC), `Heap_Redo_Start_CTS` is advanced to the current system CTS.
+
+2. Delta Watermark: `Delta_Rec_CTS`
+    *   **Definition**: The maximum CTS such that all deletions with `CTS <= Delta_Rec_CTS` targeting cold data (`RowID < Pivot`) have been persisted into on-disk Delete Bitmaps.
+    *   **Purpose**: To rebuild the in-memory **ColumnDeltaBuffer**, the system must replay delete operations that occurred after this point.
+    *   **Maintenance**: Updated atomically in the Table Metadata after a successful **Delta Checkpoint**.
+
+3. Index Watermark: `Index_Rec_CTS` (Per Index)
+    *   **Definition**: The maximum CTS such that all key changes with `CTS <= Index_Rec_CTS` have been merged into the on-disk DiskTree.
+    *   **Purpose**: To rebuild the in-memory **MemTree**, the system must replay index operations that occurred after this point.
+    *   **Maintenance**: Updated atomically in the Index Meta Page after a successful **Index Checkpoint**.
 
 ---
 
@@ -101,7 +120,28 @@ Once stabilized, the page is ready for conversion.
     *   Update `Table.watermarks.heap_rec_cts` based on the maximum CTS found in the converted data.
     *   Release the memory of the RowPages.
 
-### 4.3 Index Checkpoint (Per Index)
+## 4.3 Delta Checkpoint (Delete Bitmap)
+
+While the Tuple Mover handles the append-only growth of data (Heap), deletions on existing persistent data (`RowID < Pivot`) are handled via the Delta Checkpoint.
+
+### Triggering
+Delta Checkpoint can be triggered in two ways:
+1.  **Piggyback**: Runs automatically alongside the Tuple Mover tasks to amortize metadata I/O overhead.
+2.  **Threshold**: Runs independently if the in-memory **ColumnDeltaBuffer** exceeds a size threshold (e.g., 64MB) or time interval (e.g., 5 mins).
+
+### Process
+1.  **Select**: Identify all committed deletions in the `ColumnDeltaBuffer`. Let the max CTS in this batch be `Batch_Delta_CTS`.
+2.  **Apply**:
+    *   Load relevant Delete Bitmap pages (if not cached).
+    *   Apply deletions using Copy-on-Write (CoW).
+    *   Generate new Bitmap Pages.
+3.  **Persist**:
+    *   Write new Bitmap Pages to the Table File.
+    *   Update Block Index to point to new Bitmaps.
+    *   Update `Table.watermarks.delta_rec_cts = Batch_Delta_CTS`.
+4.  **Cleanup**: Remove processed deletions from the memory buffer.
+
+### 4.4 Index Checkpoint (Per Index)
 
 The Index Checkpoint thread persists dirty data from the in-memory **MemTree** to the on-disk **DiskTree**.
 
@@ -140,22 +180,44 @@ To prevent the `unflushed_map` from growing indefinitely, a cleanup task runs pe
 
 The recovery process restores the in-memory state by replaying the WAL, filtering operations based on the persisted watermarks.
 
-### 6.1 Initialization
-1.  **Load Metadata**: Read `Heap.Rec_CTS` and all `Index.Rec_CTS` from the disk headers of every table.
-2.  **Determine Replay Start**:
-    $$ \text{Start\_CTS} = \min_{\forall \text{Tables}}(\text{Heap.Rec\_CTS}, \min(\text{Index.Rec\_CTS})) $$
+### 6.1 Log Truncation and Recovery Start Point
 
-### 6.2 Filtered Replay Logic
+To manage disk space and ensure data durability, the system calculates a global **Recovery Start Point**. This point determines the oldest transaction log record required to fully restore the database state. Any logs preceding this point are obsolete and can be safely truncated.
 
-1. The recovery thread reads logs sequentially. 
-2. For each log entry, it dispatches parsed logs to data recovery workers and index recovery workers based on table id.
-3. Data worker replays the log if `entry.CTS > table.Heap_Rec_CTS`.
-4. Index worker replays the log if `entry.CTS > table.Index_rec_CTS[i]` for each index. 
+$$ \text{Table\_Min\_CTS}(T) = \min \left( T.\text{Heap\_Redo\_Start\_CTS}, \ T.\text{Delta\_Rec\_CTS}, \ \min_{i \in T.\text{Indexes}}(i.\text{Rec\_CTS}) \right) $$
 
-### 6.3 Post-Replay State
-*   **RowStore**: Populated with data that hadn't been moved to LWC blocks.
-*   **MemTree**: Populated with "Dirty" entries that hadn't been merged to DiskTree.
-*   **First Checkpoint**: After recovery, the system behaves as if all recovered transactions are "newly committed". Checkpoint will be started once data and index recovery is done. All entries in MemTree are marked as dirty, and recovered transactions are appended to table's commit queue. This ensures the first checkpoint cycle can correctly process them.
+$$ \text{Global\_Truncation\_CTS} = \min_{\forall T \in \text{All Tables}} ( \text{Table\_Min\_CTS}(T) ) $$
+
+The Log Manager periodically computes this value and physically deletes log segments where `CTS < Global_Truncation_CTS`.
+
+### 6.2 Recovery Procedure
+
+Upon system restart, the recovery process uses these persistent watermarks to determine where to begin reading the log and how to filter operations.
+
+#### 6.2.1 Metadata Load & Start Point Determination
+1.  The system scans the headers of all Table Files and Index Files.
+2.  It constructs an in-memory view of all watermarks (`Heap_Redo_Start_CTS`, `Delta_Rec_CTS`, `Index.Rec_CTS`).
+3.  It calculates the global **Recovery Start Point**:
+    $$ \text{Replay\_Start\_CTS} = \min(\text{All Loaded Watermarks}) $$
+4.  The Log Reader seeks to the log file/offset corresponding to `Replay_Start_CTS`.
+
+#### 6.2.2 Log Replay
+The recovery thread reads logs sequentially from the start point. For each log entry, it checks against the specific object's watermark to decide whether to replay or skip.
+
+*   **Heap Operations (Insert/Update on `RowID >= Pivot`)**:
+    *   **Rule**: Replay if `Entry.CTS >= T.Heap_Redo_Start_CTS.Heap_Redo_Start_CTS`.
+    *   *Note*: Since `Pivot` separates persistent LWC from volatile RowStore, any log targeting `RowID >= Pivot` effectively implies it belongs to the RowStore region and needs recovery. The watermark check is a sanity check (and optimization for edge cases where RowID ranges might overlap in time due to updates).
+
+*   **Delta Operations (Delete on `RowID < Pivot`)**:
+    *   **Rule**: Replay if `Entry.CTS > T.Delta_rec_CTS`.
+    *   *Action*: Insert into `ColumnDeltaBuffer`.
+
+*   **Index Operations**:
+    *   **Rule**: Replay if `Entry.CTS > Index.Rec_CTS`.
+    *   *Action*: Insert into `MemTree` and mark as Dirty.
+
+#### 6.2.3 Completion
+Once the log end is reached, the in-memory state (RowStore, DeltaBuffer, MemTree) is consistent with the state at the moment of the crash. The system then opens for new transactions.
 
 ---
 
