@@ -1269,7 +1269,7 @@ mod tests {
         assert_eq!(bytes.len(), 1);
         assert!(bytes.value_at(0).is_none());
         assert!(bytes.value_at(1).is_none());
-        assert_eq!(bytes.iter().count(), 1);
+        assert_eq!(bytes.iter().count(), 0);
         assert!(bytes.iter().next().is_none());
     }
 
