@@ -2,7 +2,7 @@
 //!
 //! Current implementation only support bits=1, 2, 4, 8, 16, 32.
 
-use crate::compression::{LwcPrimitiveData, SortedPosition};
+use crate::lwc::{LwcPrimitiveData, SortedPosition};
 use std::mem;
 
 /// Data type that supports bitpacking.
@@ -718,9 +718,9 @@ pub fn for_b32_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T,
 macro_rules! impl_lwc_bitpackable_data {
     ($t:ident, $nbits:literal, $extendf:ident, $it:ident) => {
         pub struct $t<'a, T> {
-            pub(super) len: usize,
-            pub(super) min: T,
-            pub(super) data: &'a [u8],
+            pub(crate) len: usize,
+            pub(crate) min: T,
+            pub(crate) data: &'a [u8],
         }
         impl<'a, T: BitPackable> LwcPrimitiveData for $t<'a, T> {
             type Value = T;
@@ -796,8 +796,8 @@ impl_lwc_bitpackable_data!(ForBitpacking2, 2, for_b2_unpack_extend, ForBitpackin
 impl_lwc_bitpackable_data!(ForBitpacking4, 4, for_b4_unpack_extend, ForBitpacking4Iter);
 
 pub struct ForBitpacking8<'a, T> {
-    pub(super) min: T,
-    pub(super) data: &'a [u8],
+    pub(crate) min: T,
+    pub(crate) data: &'a [u8],
 }
 
 impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking8<'a, T> {
@@ -868,8 +868,8 @@ impl<T: BitPackable> Iterator for ForBitpacking8Iter<'_, T> {
 }
 
 pub struct ForBitpacking16<'a, T> {
-    pub(super) min: T,
-    pub(super) data: &'a [[u8; 2]],
+    pub(crate) min: T,
+    pub(crate) data: &'a [[u8; 2]],
 }
 
 impl<T: BitPackable + Ord> SortedPosition for ForBitpacking16<'_, T> {
@@ -944,8 +944,8 @@ impl<T: BitPackable> Iterator for ForBitpacking16Iter<'_, T> {
 }
 
 pub struct ForBitpacking32<'a, T> {
-    pub(super) min: T,
-    pub(super) data: &'a [[u8; 4]],
+    pub(crate) min: T,
+    pub(crate) data: &'a [[u8; 4]],
 }
 
 impl<T: BitPackable + Ord> SortedPosition for ForBitpacking32<'_, T> {
