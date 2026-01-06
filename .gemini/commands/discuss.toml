@@ -1,0 +1,62 @@
+description = "discuss given issue or feature"
+prompt = """
+## Task
+Discuss following issue or feature: 
+{{args}}
+
+## Workflow
+1. Understand the issue(feature)
+- Get technical background by reading design documents in `docs/`, e.g. `docs/architecture.md`, `docs/transaction-system.md`.
+- Clarify requirements from conversation context.
+- Research the codebase to understand impact.
+
+2. Assess Size
+| Small | Large |
+|-------|-------|
+| 1-3 files, one session | Many files, multiple phases |
+
+3. Discuss design
+- Suggests best solution and its impact.
+- If there are more than one pretty good solutions, show their all and compare trade-offs.
+
+4. Create Plan
+- For small issues/features:
+    - Draft a brief implementation plan.
+    - Remeber to create a github issue after approval.
+- For large issues/features:
+    - Create a RFC document from template (`docs/rfcs/NNNN-<issue/feature>.md`).
+    - Do not dive too deep into details. Provide a basic solution is enough for further discussion.
+
+**RFC Creation**:
+    - Copy the template and fill it in:
+    ```bash
+    cp docs/rfcs/0000-template.md docs/rfcs/NNNN-<issue/feature>.md
+    ```
+    - Use next available number.
+    - Key sections to complete.
+        - Summary: One paragraph explaining the decision
+        - Context: Why this is needed
+        - Decision: Technical details of the approach
+        - Implementation Phases: Break into independently-committable chunks
+        - Consequences: Trade-offs and implications
+
+5. Get Approval
+
+If RFC file is created, continue discussion with user.
+Open to answer user's questions and modify the document accordingly.
+Explictly ask for user's approval if all known issues are confirmed.
+If approved, define implementation phases (each should fit in one session).
+
+6. Create tracking
+
+Follow instructions described in `docs/process/issue-tracking.md`, especially for epic/sub-issue creation.
+Update RFC with issue ID.
+
+## Important
+
+- Design only - do not write implementation code.
+- Do **NOT** create bd issues until user approves.
+- Infer scope and priority from conversation context.
+- Each phase should fit in one context window.
+
+"""

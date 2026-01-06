@@ -18,10 +18,10 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 
 ## Design 
 
-- [Storage Architecture](./doradb-storage/docs/architecture.md)
-- [Transaction System](./doradb-storage/docs/transaction-system.md)
-- [Index Design](./doradb-storage/docs/index-design.md)
-- [Checkpoint and Recovery](./doradb-storage/docs/checkpoint-and-recovery.md)
+- [Storage Architecture](./docs/architecture.md)
+- [Transaction System](./docs/transaction-system.md)
+- [Index Design](./docs/index-design.md)
+- [Checkpoint and Recovery](./docs/checkpoint-and-recovery.md)
 
 Some ideas are different from tranditional database system.
 I'm glad to have discussions if someone is interested in details.
@@ -35,12 +35,12 @@ Code structure of storage engine:
 
 - [buffer](./doradb-storage/src/buffer): Buffer pool implementation with async direct IO.
 - [catalog](./doradb-storage/src/catalog): Catalog of storage engine.
-- [col](./doradb-storage/src/col): Deprecated columnar format. Will integrate Arrow in future as it's de facto standard of Rust's columnar format and computation.
 - [compression](./doradb-storage/src/compression): Compression algorithms for column store.
 - [file](./doradb-storage/src/file): Storage of table data, index and delete bitmap. The file is page based and organized as CoW B+Tree, to enable simple recovery and fast access.
 - [index](./doradb-storage/src/index): Block index and B+Tree index.
 - [io](./doradb-storage/src/io): Async direct IO system backed by libaio. May introduce io-uring in future.
 - [latch](./doradb-storage/src/latch): Async latch primitives including Mutex, RWLock and HybridLatch(enhanced RWLock with optimistic mode).
+- [lwc](./doradb-storage/src/lwc): LightWeight Columnar format for on-disk warm data.
 - [row](./doradb-storage/src/row): In-memory row store and operations.
 - [stmt](./doradb-storage/src/stmt): Statements.
 - [table](./doradb-storage/src/table): Table of data, composite of block index, secondary index, buffer pool and table file. Support operations like index lookup, index scan, table scan, insert, delete, update, etc.
