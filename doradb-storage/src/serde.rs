@@ -1192,4 +1192,25 @@ mod tests {
         assert_eq!(de_idx, res.len());
         assert_eq!(decompressed.0, input);
     }
+
+    #[test]
+    fn test_scalar_signed_ser_de() {
+        let mut ctx = SerdeCtx::default();
+
+        let values = vec![-1024i16, -1, 0, 1, 2048];
+        let mut out = vec![0u8; values.ser_len(&ctx)];
+        let idx = values.ser(&ctx, &mut out, 0);
+        assert_eq!(idx, out.len());
+        let (idx, desered) = Vec::<i16>::deser(&mut ctx, &out, 0).unwrap();
+        assert_eq!(idx, out.len());
+        assert_eq!(desered, values);
+
+        let values = vec![-1i32, 0, 1024];
+        let mut out = vec![0u8; values.ser_len(&ctx)];
+        let idx = values.ser(&ctx, &mut out, 0);
+        assert_eq!(idx, out.len());
+        let (idx, desered) = Vec::<i32>::deser(&mut ctx, &out, 0).unwrap();
+        assert_eq!(idx, out.len());
+        assert_eq!(desered, values);
+    }
 }

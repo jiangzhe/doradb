@@ -1257,4 +1257,33 @@ mod tests {
         let err = LwcData::from_bytes(ValKind::VarByte, &res[..res.len() - 1]);
         assert!(matches!(err, Err(Error::InvalidCompressedData)));
     }
+
+    #[test]
+    fn test_lwc_bytes_out_of_range() {
+        // offsets point past the end of the backing data to exercise the
+        // defensive bounds checks inside `LwcBytes::slice` and `value_at`.
+        let offsets: &[[u8; 4]] = &[[0, 0, 0, 0], [5, 0, 0, 0]];
+        let data: &[u8] = &[1, 2, 3];
+        let bytes = LwcBytes { offsets, data };
+
+        assert_eq!(bytes.len(), 1);
+        assert!(bytes.value_at(0).is_none());
+        assert!(bytes.value_at(1).is_none());
+        assert_eq!(bytes.iter().count(), 1);
+        assert!(bytes.iter().next().is_none());
+    }
+
+    #[test]
+    fn test_for_bitpacking_invalid_bits() {
+        // Build a payload with an unsupported bit width for u8 (n_bits = 3)
+        // so `LwcData::from_bytes` returns NotSupported.
+        let mut payload = vec![LwcCode::ForBitpacking as u8];
+        payload.push(3); // n_bits
+        payload.extend_from_slice(&1u64.to_le_bytes()); // len
+        payload.push(0); // min value for u8
+        payload.push(0); // data byte (div_ceil(1 * 3, 8) == 1)
+
+        let err = LwcData::from_bytes(ValKind::U8, &payload);
+        assert!(matches!(err, Err(Error::NotSupported(_))));
+    }
 }
