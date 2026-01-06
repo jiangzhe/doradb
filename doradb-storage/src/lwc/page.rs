@@ -1,9 +1,14 @@
+//! This module contains definition and functions of LWC(Lightweight Compression) Block.
+
 use crate::catalog::TableMetadata;
-use crate::compression::*;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::file::table_file::TABLE_FILE_PAGE_SIZE;
+use crate::lwc::{
+    FlatU64, ForBitpacking1, ForBitpacking2, ForBitpacking4, ForBitpacking8, ForBitpacking16,
+    ForBitpacking32, LwcData, LwcPrimitive, LwcPrimitiveData, SortedPosition,
+};
 use crate::row::RowID;
-use crate::serde::{Deser, Ser};
+use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::value::{Val, ValKind};
 use std::mem;
 
@@ -37,7 +42,7 @@ const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcP
 /// | row_count               | 2         |
 /// | col_count               | 2         |
 /// | first_col_offset        | 2         |
-/// | _padding                | 2         |
+/// | padding                 | 2         |
 /// |-------------------------|-----------|
 /// ```
 ///
@@ -47,7 +52,7 @@ const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcP
 /// |------------------|------------------------------------------------|
 /// | field            | length(B)                                      |
 /// |------------------|------------------------------------------------|
-/// | col_offsets      | 2 * (col_count+1)                              |
+/// | col_offsets      | 2 * col_count                                  |
 /// | row_id           | col_offsets[0] - first_col_offset              |
 /// | c_0              | col_offsets[1] - col_offsets[0]                |
 /// | ...              | ...                                            |
@@ -156,7 +161,8 @@ pub struct LwcPageHeader {
     /// Row ID is excluded.
     /// This is actually the end of Row ID column.
     first_col_offset: [u8; 2],
-    _padding: [u8; 2],
+    /// padding for alignment.
+    padding: [u8; 2],
 }
 
 impl LwcPageHeader {
@@ -174,7 +180,7 @@ impl LwcPageHeader {
             row_count: row_count.to_le_bytes(),
             col_count: col_count.to_le_bytes(),
             first_col_offset: first_col_offset.to_le_bytes(),
-            _padding: [0u8; 2],
+            padding: [0u8; 2],
         }
     }
 
@@ -201,6 +207,23 @@ impl LwcPageHeader {
     #[inline]
     pub fn first_col_offset(&self) -> u16 {
         u16::from_le_bytes(self.first_col_offset)
+    }
+}
+
+impl Ser<'_> for LwcPageHeader {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<LwcPageHeader>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let idx = ctx.ser_byte_array(out, start_idx, &self.first_row_id);
+        let idx = ctx.ser_byte_array(out, idx, &self.last_row_id);
+        let idx = ctx.ser_byte_array(out, idx, &self.row_count);
+        let idx = ctx.ser_byte_array(out, idx, &self.col_count);
+        let idx = ctx.ser_byte_array(out, idx, &self.first_col_offset);
+        ctx.ser_byte_array(out, idx, &self.padding)
     }
 }
 
@@ -279,7 +302,7 @@ impl<'a> RowIDSet<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compression::LwcPrimitiveSer;
+    use crate::lwc::LwcPrimitiveSer;
     use crate::serde::SerdeCtx;
 
     #[test]
@@ -356,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    pub fn test_lwc_page() {
+    fn test_lwc_page() {
         let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];
         let page = unsafe { std::mem::transmute::<&mut [u8; 65536], &mut LwcPage>(&mut bytes) };
         page.header = LwcPageHeader::new(100, 200, 50, 2, 312);
@@ -365,5 +388,10 @@ mod tests {
         assert!(page.header.row_count() == 50);
         assert!(page.header.col_count() == 2);
         assert!(page.header.first_col_offset() == 312);
+        let ctx = SerdeCtx::default();
+        let mut header_vec = vec![0u8; page.header.ser_len(&ctx)];
+        let ser_idx = page.header.ser(&ctx, &mut header_vec, 0);
+        assert!(ser_idx == header_vec.len());
+        assert_eq!(&header_vec, &bytes[..header_vec.len()]);
     }
 }

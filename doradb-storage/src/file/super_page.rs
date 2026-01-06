@@ -1,9 +1,9 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PageID;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
-use crate::compression::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::error::Result;
 use crate::file::table_file::{BlockIndexArray, TABLE_FILE_SUPER_PAGE_FOOTER_SIZE};
+use crate::lwc::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::trx::TrxID;

@@ -691,7 +691,7 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |row| {
+                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -716,7 +716,7 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |row| {
+                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -733,7 +733,7 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |row| {
+                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |_| {
                     res_len += 1;
                     true
                 })
