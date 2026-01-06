@@ -1,6 +1,6 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
-use crate::catalog::TableMetadata;
+use crate::buffer::page::BufferPage;
 use crate::error::{Error, Result};
 use crate::file::table_file::TABLE_FILE_PAGE_SIZE;
 use crate::lwc::{
@@ -8,8 +8,8 @@ use crate::lwc::{
     ForBitpacking32, LwcData, LwcPrimitive, LwcPrimitiveData, SortedPosition,
 };
 use crate::row::RowID;
-use crate::serde::{Deser, Ser, SerdeCtx};
-use crate::value::{Val, ValKind};
+use crate::serde::{Ser, SerdeCtx};
+use crate::value::ValKind;
 use std::mem;
 
 const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>() - 32;
@@ -78,6 +78,8 @@ pub struct LwcPage {
 }
 
 impl LwcPage {
+    pub const BODY_SIZE: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>();
+
     /// Read row from this page.
     #[inline]
     pub fn row_id_exists(&self, row_id: RowID) -> Result<bool> {
@@ -113,6 +115,8 @@ impl LwcPage {
         }
     }
 }
+
+impl BufferPage for LwcPage {}
 
 pub struct ColOffsets<'a> {
     first_col_offset: usize,

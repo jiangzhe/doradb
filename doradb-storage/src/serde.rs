@@ -254,6 +254,25 @@ impl Deser for u64 {
     }
 }
 
+impl Ser<'_> for i32 {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<i32>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        ctx.ser_i32(out, start_idx, *self)
+    }
+}
+
+impl Deser for i32 {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        ctx.deser_i32(input, start_idx)
+    }
+}
+
 impl Ser<'_> for i64 {
     #[inline]
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
@@ -273,25 +292,6 @@ impl Deser for i64 {
     }
 }
 
-impl Ser<'_> for u32 {
-    #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
-        mem::size_of::<u32>()
-    }
-
-    #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        ctx.ser_u32(out, start_idx, *self)
-    }
-}
-
-impl Deser for u32 {
-    #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        ctx.deser_u32(input, start_idx)
-    }
-}
-
 impl Ser<'_> for u16 {
     #[inline]
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
@@ -308,6 +308,44 @@ impl Deser for u16 {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         ctx.deser_u16(input, start_idx)
+    }
+}
+
+impl Ser<'_> for i16 {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<i16>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        ctx.ser_i16(out, start_idx, *self)
+    }
+}
+
+impl Deser for i16 {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        ctx.deser_i16(input, start_idx)
+    }
+}
+
+impl Ser<'_> for u32 {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u32>()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        ctx.ser_u32(out, start_idx, *self)
+    }
+}
+
+impl Deser for u32 {
+    #[inline]
+    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+        ctx.deser_u32(input, start_idx)
     }
 }
 
@@ -1128,5 +1166,51 @@ mod tests {
         ];
         let bp = ForBitpackingSer::new(&input);
         assert!(bp.is_none());
+    }
+
+    #[test]
+    fn test_for_bitpacking_serde_signed_ints() {
+        let mut ctx = SerdeCtx::default();
+
+        let input = vec![-10i16, -3, 0, 1, 5, 8];
+        let bp = ForBitpackingSer::new(&input).unwrap();
+        let mut res = vec![0u8; bp.ser_len(&ctx)];
+        let ser_idx = bp.ser(&ctx, &mut res, 0);
+        assert_eq!(ser_idx, res.len());
+        let (de_idx, decompressed) =
+            ForBitpackingDeser::<i16>::deser(&mut ctx, &res, 0).unwrap();
+        assert_eq!(de_idx, res.len());
+        assert_eq!(decompressed.0, input);
+
+        let input = vec![-2i32, -1, 0, 1, 2, 4, 8, 128, 1024];
+        let bp = ForBitpackingSer::new(&input).unwrap();
+        let mut res = vec![0u8; bp.ser_len(&ctx)];
+        let ser_idx = bp.ser(&ctx, &mut res, 0);
+        assert_eq!(ser_idx, res.len());
+        let (de_idx, decompressed) =
+            ForBitpackingDeser::<i32>::deser(&mut ctx, &res, 0).unwrap();
+        assert_eq!(de_idx, res.len());
+        assert_eq!(decompressed.0, input);
+    }
+
+    #[test]
+    fn test_scalar_signed_ser_de() {
+        let mut ctx = SerdeCtx::default();
+
+        let values = vec![-1024i16, -1, 0, 1, 2048];
+        let mut out = vec![0u8; values.ser_len(&ctx)];
+        let idx = values.ser(&ctx, &mut out, 0);
+        assert_eq!(idx, out.len());
+        let (idx, desered) = Vec::<i16>::deser(&mut ctx, &out, 0).unwrap();
+        assert_eq!(idx, out.len());
+        assert_eq!(desered, values);
+
+        let values = vec![-1i32, 0, 1024];
+        let mut out = vec![0u8; values.ser_len(&ctx)];
+        let idx = values.ser(&ctx, &mut out, 0);
+        assert_eq!(idx, out.len());
+        let (idx, desered) = Vec::<i32>::deser(&mut ctx, &out, 0).unwrap();
+        assert_eq!(idx, out.len());
+        assert_eq!(desered, values);
     }
 }
