@@ -6,7 +6,6 @@ use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::value::{Val, ValKind, ValType};
 use semistr::SemiStr;
 use std::collections::HashSet;
-use std::mem;
 
 /// Table metadata including column names, column types,
 /// index specifications.
