@@ -5,11 +5,12 @@ use crate::error::{Error, Result};
 use crate::file::table_file::TABLE_FILE_PAGE_SIZE;
 use crate::lwc::{
     FlatU64, ForBitpacking1, ForBitpacking2, ForBitpacking4, ForBitpacking8, ForBitpacking16,
-    ForBitpacking32, LwcData, LwcPrimitive, LwcPrimitiveData, SortedPosition,
+    ForBitpacking32, LwcData, LwcNullBitmap, LwcPrimitive, LwcPrimitiveData, SortedPosition,
 };
 use crate::row::RowID;
 use crate::serde::{Ser, SerdeCtx};
 use crate::value::ValKind;
+use crate::catalog::TableMetadata;
 use std::mem;
 
 const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>() - 32;
@@ -114,9 +115,75 @@ impl LwcPage {
             offsets,
         }
     }
+
+    /// Returns column data for given column index based on metadata.
+    #[inline]
+    pub fn column<'a>(
+        &'a self,
+        metadata: &'a TableMetadata,
+        col_idx: usize,
+    ) -> Result<LwcColumn<'a>> {
+        let (start_idx, end_idx) = self.col_offsets().get(col_idx).ok_or(Error::IndexOutOfBound)?;
+        if end_idx > self.body.len() || start_idx > end_idx {
+            return Err(Error::InvalidCompressedData);
+        }
+        let data = &self.body[start_idx..end_idx];
+        let row_count = self.header.row_count() as usize;
+        let kind = metadata.val_kind(col_idx);
+        if metadata.nullable(col_idx) {
+            let (bitmap, values) = LwcNullBitmap::from_bytes(data)?;
+            let required = row_count.div_ceil(8);
+            if bitmap.len() < required {
+                return Err(Error::InvalidCompressedData);
+            }
+            Ok(LwcColumn {
+                kind,
+                row_count,
+                null_bitmap: Some(bitmap),
+                values,
+            })
+        } else {
+            Ok(LwcColumn {
+                kind,
+                row_count,
+                null_bitmap: None,
+                values: data,
+            })
+        }
+    }
 }
 
 impl BufferPage for LwcPage {}
+
+pub struct LwcColumn<'a> {
+    kind: ValKind,
+    row_count: usize,
+    null_bitmap: Option<LwcNullBitmap<'a>>,
+    values: &'a [u8],
+}
+
+impl<'a> LwcColumn<'a> {
+    #[inline]
+    pub fn is_null(&self, row_idx: usize) -> bool {
+        if row_idx >= self.row_count {
+            return false;
+        }
+        self.null_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.is_null(row_idx))
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn data(&self) -> Result<LwcData<'a>> {
+        LwcData::from_bytes(self.kind, self.values)
+    }
+
+    #[inline]
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+}
 
 pub struct ColOffsets<'a> {
     first_col_offset: usize,
@@ -306,6 +373,7 @@ impl<'a> RowIDSet<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{ColumnAttributes, ColumnSpec};
     use crate::lwc::LwcPrimitiveSer;
     use crate::serde::SerdeCtx;
 
@@ -397,5 +465,51 @@ mod tests {
         let ser_idx = page.header.ser(&ctx, &mut header_vec, 0);
         assert!(ser_idx == header_vec.len());
         assert_eq!(&header_vec, &bytes[..header_vec.len()]);
+    }
+
+    #[test]
+    fn test_lwc_page_nullable_column() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U8,
+                ColumnAttributes::NULLABLE,
+            )],
+            vec![],
+        );
+        let ctx = SerdeCtx::default();
+        let values = [10u8, 20, 30, 40];
+        let lwc_ser = LwcPrimitiveSer::new_u8(&values);
+        let mut values_bytes = vec![0u8; lwc_ser.ser_len(&ctx)];
+        lwc_ser.ser(&ctx, &mut values_bytes, 0);
+
+        let null_bytes = [0b0000_1010u8];
+        let null_ser = crate::lwc::LwcNullBitmapSer::new(&null_bytes).unwrap();
+        let mut column_bytes = vec![0u8; null_ser.ser_len(&ctx) + values_bytes.len()];
+        let idx = null_ser.ser(&ctx, &mut column_bytes, 0);
+        column_bytes[idx..].copy_from_slice(&values_bytes);
+
+        let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];
+        let page = unsafe { std::mem::transmute::<&mut [u8; 65536], &mut LwcPage>(&mut bytes) };
+        let col_offsets_len = mem::size_of::<u16>();
+        let col_start = col_offsets_len;
+        let col_end = col_start + column_bytes.len();
+        page.header = LwcPageHeader::new(1, 4, values.len() as u16, 1, col_start as u16);
+        page.body[..col_offsets_len].copy_from_slice(&(col_end as u16).to_le_bytes());
+        page.body[col_start..col_end].copy_from_slice(&column_bytes);
+
+        let column = page.column(&metadata, 0).unwrap();
+        assert_eq!(column.row_count(), values.len());
+        assert!(!column.is_null(0));
+        assert!(column.is_null(1));
+        assert!(!column.is_null(2));
+        assert!(column.is_null(3));
+
+        let lwc_data = column.data().unwrap();
+        let mut output = vec![];
+        for i in 0..lwc_data.len() {
+            output.push(lwc_data.value(i).unwrap().as_u8().unwrap());
+        }
+        assert_eq!(output, values);
     }
 }
