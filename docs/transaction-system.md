@@ -11,7 +11,7 @@ The system is designed to decouple foreground transaction processing from backgr
 
 The system employs a unique persistence and recovery model that fundamentally differs from traditional ARIES algorithms (Steal / No-Force).
 
-| Feature | This System (No-Steal / No-Force) | Tranditional ARIES (Steal / No-Force) |
+| Feature | This System (No-Steal / No-Force) | Traditional ARIES (Steal / No-Force) |
 |----|----|----|
 | **Dirty Page Policy** | **Strict No-Steal**: Disk data structures (DiskTree/ColumnStore) are immutable or CoW, containing only committed data. No dirty pages are flushed. | **Steal**: Dirty pages from uncommitted transactions can be flushed to disk, requiring Undo Logs for rollback. |
 | **Persistence** | **No-Force**: Only commit log is forced to disk at commit. Data pages remain in memory until checkpoint. | **No-Force**: Only WAL is forced. |

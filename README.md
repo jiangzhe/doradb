@@ -23,7 +23,7 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 - [Index Design](./docs/index-design.md)
 - [Checkpoint and Recovery](./docs/checkpoint-and-recovery.md)
 
-Some ideas are different from tranditional database system.
+Some ideas are different from traditional database system.
 I'm glad to have discussions if someone is interested in details.
 
 ## Code Structure
@@ -44,7 +44,7 @@ Code structure of storage engine:
 - [row](./doradb-storage/src/row): In-memory row store and operations.
 - [stmt](./doradb-storage/src/stmt): Statements.
 - [table](./doradb-storage/src/table): Table of data, composite of block index, secondary index, buffer pool and table file. Support operations like index lookup, index scan, table scan, insert, delete, update, etc.
-- [trx](./doradb-storage/src/trx): Transaction system, including trasaction lifecycle, redo log, undo log, recovery, garbage collect, etc.
+- [trx](./doradb-storage/src/trx): Transaction system, including transaction lifecycle, redo log, undo log, recovery, garbage collect, etc.
 
 ## License
 
