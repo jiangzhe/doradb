@@ -123,6 +123,9 @@ impl LwcPage {
         metadata: &'a TableMetadata,
         col_idx: usize,
     ) -> Result<LwcColumn<'a>> {
+        if col_idx >= metadata.col_count() {
+            return Err(Error::IndexOutOfBound);
+        }
         let (start_idx, end_idx) = self.col_offsets().get(col_idx).ok_or(Error::IndexOutOfBound)?;
         if end_idx > self.body.len() || start_idx > end_idx {
             return Err(Error::InvalidCompressedData);
@@ -511,5 +514,23 @@ mod tests {
             output.push(lwc_data.value(i).unwrap().as_u8().unwrap());
         }
         assert_eq!(output, values);
+    }
+
+    #[test]
+    fn test_lwc_page_column_metadata_mismatch() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty())],
+            vec![],
+        );
+        let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];
+        let page = unsafe { std::mem::transmute::<&mut [u8; 65536], &mut LwcPage>(&mut bytes) };
+        let col_offsets_len = mem::size_of::<u16>() * 2;
+        let end_offset = col_offsets_len as u16;
+        page.header = LwcPageHeader::new(1, 1, 0, 2, end_offset);
+        page.body[..2].copy_from_slice(&end_offset.to_le_bytes());
+        page.body[2..4].copy_from_slice(&end_offset.to_le_bytes());
+
+        let err = page.column(&metadata, 1).unwrap_err();
+        assert!(matches!(err, Error::IndexOutOfBound));
     }
 }
