@@ -123,6 +123,8 @@ impl DirectBuf {
     }
 
     /// Truncate length to given number.
+    ///
+    /// If the provided length exceeds capacity, it will be clamped to capacity.
     #[inline]
     pub fn truncate(&mut self, len: usize) {
         if len <= self.capacity() {
@@ -212,6 +214,15 @@ mod tests {
         buf.reset();
         assert_eq!(buf.len(), 0);
         assert!(buf.data().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_direct_buf_truncate_clamps_to_capacity() {
+        let mut buf = DirectBuf::uninit(32);
+        let capacity = buf.capacity();
+
+        buf.truncate(capacity + 1);
+        assert_eq!(buf.len(), capacity);
     }
 
     #[test]
