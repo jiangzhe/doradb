@@ -4,7 +4,7 @@ mod libaio_abi;
 use crate::lifetime::StaticLifetime;
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
-use libc::{EINTR, c_long};
+use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
@@ -94,14 +94,20 @@ impl AIOContext {
             return 0;
         }
         let batch_size = limit.min(reqs.len());
-        let ret = unsafe { io_submit(self.ctx, batch_size as c_long, reqs.as_ptr() as *mut _) };
+        let ret = io_submit_impl(self.ctx, batch_size as c_long, reqs.as_ptr() as *mut _);
         // See https://man7.org/linux/man-pages/man2/io_submit.2.html
         // for the details of return value of io_submit().
         // if success, non-negative value indicates how many IO submitted.
         // if error, negative value of error code.
-        // if ret < 0 && -ret != EAGAIN {
         if ret < 0 {
-            panic!("io_submit returns error code {ret}: batch_size={batch_size}");
+            let errcode = -ret;
+            if errcode == EAGAIN {
+                return 0;
+            }
+            panic!(
+                "io_submit returns error code {errcode}: batch_size={batch_size} limit={limit} reqs_len={}",
+                reqs.len()
+            );
         }
         ret as usize
     }
@@ -173,6 +179,38 @@ impl AIOContext {
             shutdown: false,
         };
         (el, AIOClient(tx))
+    }
+}
+
+#[inline]
+fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
+    #[cfg(test)]
+    {
+        let hook = IO_SUBMIT_HOOK.load(Ordering::SeqCst);
+        if !hook.is_null() {
+            let hook: IoSubmitHook = unsafe { std::mem::transmute(hook) };
+            return hook(ctx, nr, ios);
+        }
+    }
+    unsafe { io_submit(ctx, nr, ios) }
+}
+
+#[cfg(test)]
+type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
+
+#[cfg(test)]
+static IO_SUBMIT_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(test)]
+fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
+    let ptr = hook
+        .map(|func| func as *mut ())
+        .unwrap_or(std::ptr::null_mut());
+    let previous = IO_SUBMIT_HOOK.swap(ptr, Ordering::SeqCst);
+    if previous.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute(previous) })
     }
 }
 
@@ -799,6 +837,20 @@ mod tests {
         handle.join().unwrap();
 
         let _ = std::fs::remove_file("aio_file3.txt");
+    }
+
+    #[test]
+    fn test_submit_limit_eagain_no_panic() {
+        let ctx = AIOContext::try_default().unwrap();
+        let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
+        let iocb = unsafe { iocb::alloc() } as *mut iocb;
+        let reqs = vec![iocb];
+        let submit_count = ctx.submit_limit(&reqs, 1);
+        unsafe {
+            drop(Box::from_raw(iocb));
+        }
+        set_io_submit_hook(previous);
+        assert_eq!(submit_count, 0);
     }
 
     struct Request {
