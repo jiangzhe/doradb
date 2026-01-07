@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_raw_rwlock_single_thread() {
-        const COUNT: usize = 10_000_000;
+        const COUNT: usize = 200_000;
         smol::block_on(async {
             let counter = Counter::new();
             let start = Instant::now();

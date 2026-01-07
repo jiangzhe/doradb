@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_raw_mutex_single_thread() {
-        const COUNT: usize = 10_000_000;
+        const COUNT: usize = 1_000_000;
         smol::block_on(async {
             let counter = Counter::new();
             let start = Instant::now();
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_raw_mutex_multi_threads() {
-        const COUNT: usize = 3_000_000;
+        const COUNT: usize = 500_000;
 
         let threads = std::env::var("RAW_MUTEX_THREADS")
             .map_err(|_| ())

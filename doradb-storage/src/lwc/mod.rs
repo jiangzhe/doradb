@@ -220,6 +220,7 @@ impl<'a> LwcData<'a> {
     }
 
     /// Returns the length of Lwc Data.
+    #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
         match self {
@@ -293,6 +294,7 @@ pub trait LwcPrimitiveData {
     type Iter: Iterator<Item = Self::Value>;
 
     /// Returns total number of values.
+    #[allow(clippy::len_without_is_empty)]
     fn len(&self) -> usize;
 
     /// Returns value at given position.
@@ -832,7 +834,7 @@ impl Ser<'_> for LwcBytesSer {
 
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        debug_assert!(self.offsets.len() >= 1);
+        debug_assert!(!self.offsets.is_empty());
         let mut idx = ctx.ser_u64(out, start_idx, (self.offsets.len() - 1) as u64);
         for off in self.offsets.iter().copied() {
             idx = ctx.ser_u32(out, idx, off);
@@ -869,6 +871,7 @@ impl<'a> LwcNullBitmap<'a> {
         self.bytes[byte_idx] & bit_mask != 0
     }
 
+    #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
         self.bytes.len()
