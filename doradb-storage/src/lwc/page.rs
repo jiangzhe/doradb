@@ -1,6 +1,7 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
 use crate::buffer::page::BufferPage;
+use crate::catalog::TableMetadata;
 use crate::error::{Error, Result};
 use crate::file::table_file::TABLE_FILE_PAGE_SIZE;
 use crate::lwc::{
@@ -10,7 +11,6 @@ use crate::lwc::{
 use crate::row::RowID;
 use crate::serde::{Ser, SerdeCtx};
 use crate::value::ValKind;
-use crate::catalog::TableMetadata;
 use std::mem;
 
 const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>() - 32;
@@ -126,7 +126,10 @@ impl LwcPage {
         if col_idx >= metadata.col_count() {
             return Err(Error::IndexOutOfBound);
         }
-        let (start_idx, end_idx) = self.col_offsets().get(col_idx).ok_or(Error::IndexOutOfBound)?;
+        let (start_idx, end_idx) = self
+            .col_offsets()
+            .get(col_idx)
+            .ok_or(Error::IndexOutOfBound)?;
         if end_idx > self.body.len() || start_idx > end_idx {
             return Err(Error::InvalidCompressedData);
         }
@@ -519,7 +522,11 @@ mod tests {
     #[test]
     fn test_lwc_page_column_metadata_mismatch() {
         let metadata = TableMetadata::new(
-            vec![ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty())],
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U8,
+                ColumnAttributes::empty(),
+            )],
             vec![],
         );
         let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];
@@ -530,7 +537,7 @@ mod tests {
         page.body[..2].copy_from_slice(&end_offset.to_le_bytes());
         page.body[2..4].copy_from_slice(&end_offset.to_le_bytes());
 
-        let err = page.column(&metadata, 1).unwrap_err();
-        assert!(matches!(err, Error::IndexOutOfBound));
+        let err = page.column(&metadata, 1);
+        assert!(matches!(err, Err(Error::IndexOutOfBound)));
     }
 }
