@@ -843,6 +843,72 @@ impl Ser<'_> for LwcBytesSer {
     }
 }
 
+pub struct LwcNullBitmap<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> LwcNullBitmap<'a> {
+    #[inline]
+    pub fn from_bytes(input: &'a [u8]) -> Result<(Self, &'a [u8])> {
+        let (len, input) = read_le_u16(input)?;
+        let len = len as usize;
+        if input.len() < len {
+            return Err(Error::InvalidCompressedData);
+        }
+        let (bytes, rest) = input.split_at(len);
+        Ok((LwcNullBitmap { bytes }, rest))
+    }
+
+    #[inline]
+    pub fn is_null(&self, row_idx: usize) -> bool {
+        let byte_idx = row_idx / 8;
+        if byte_idx >= self.bytes.len() {
+            return false;
+        }
+        let bit_mask = 1 << (row_idx % 8);
+        self.bytes[byte_idx] & bit_mask != 0
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+pub struct LwcNullBitmapSer<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> LwcNullBitmapSer<'a> {
+    #[inline]
+    pub fn new(bytes: &'a [u8]) -> Result<Self> {
+        if bytes.len() > u16::MAX as usize {
+            return Err(Error::InvalidCompressedData);
+        }
+        Ok(LwcNullBitmapSer { bytes })
+    }
+}
+
+impl Ser<'_> for LwcNullBitmapSer<'_> {
+    #[inline]
+    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+        mem::size_of::<u16>() + self.bytes.len()
+    }
+
+    #[inline]
+    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+        let idx = ctx.ser_u16(out, start_idx, self.bytes.len() as u16);
+        let end_idx = idx + self.bytes.len();
+        out[idx..end_idx].copy_from_slice(self.bytes);
+        end_idx
+    }
+}
+
 macro_rules! impl_lwc_flat {
     ($t:ident, $v:ty, $unit:ty, $it:ident) => {
         pub struct $t<'a>(&'a [$unit]);
@@ -1285,5 +1351,24 @@ mod tests {
 
         let err = LwcData::from_bytes(ValKind::U8, &payload);
         assert!(matches!(err, Err(Error::NotSupported(_))));
+    }
+
+    #[test]
+    fn test_lwc_null_bitmap_serde() {
+        let ctx = SerdeCtx::default();
+        let bytes = [0b0000_1010u8, 0b0000_0001];
+        let ser = LwcNullBitmapSer::new(&bytes).unwrap();
+        let mut out = vec![0u8; ser.ser_len(&ctx)];
+        let idx = ser.ser(&ctx, &mut out, 0);
+        assert_eq!(idx, out.len());
+
+        let (bitmap, rest) = LwcNullBitmap::from_bytes(&out).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(bitmap.as_bytes(), bytes);
+        assert!(bitmap.is_null(1));
+        assert!(bitmap.is_null(3));
+        assert!(bitmap.is_null(8));
+        assert!(!bitmap.is_null(0));
+        assert!(!bitmap.is_null(2));
     }
 }
