@@ -49,7 +49,9 @@ For data on disk, it stores block id with some statistics, which can be used for
 
 **Table File** contians all persistent data of single table, including LWC pages, column pages, index pages and bitmap pages.
 
-The principal of data modification in **Table File** is to do it in copy-on-write way. Despite of batch insert, background tasks will be executed periodically for row-to-column data transmission, delta merge of index and bitmap from transaction logs.
+The principal of data modification in **Table File** is to do it in Copy-on-Write way. Despite of batch insert, background tasks will be executed periodically for row-to-column data transmission, delta merge of index and bitmap.
+
+For more details, see [Table File](./table-file.md).
 
 ### Redo Log File
 
@@ -69,11 +71,20 @@ The secondary index is composite of two trees: **MemTree** and **DiskTree**.
 
 Query on index will execute on both tree and aggregate their results.
 
+For more details, see [Index Design](./index-design.md).
+
 ## Transactional System
 
-The system employs a unique persistence and recovery model (No-Steal / No-Force) that fundamentally differs from traditional ARIES algorithms (Steal / No-Force).
+This system employs a unique persistence and recovery model (No-Steal / No-Force) that fundamentally differs from traditional ARIES algorithms (Steal / No-Force).
 
 See [Transaction System](./transaction-system.md).
+
+## Logging, Checkpoint and Recovery
+
+This system adopts logging and recovery strategy of in-memory database system, which uses value logging and redo-only recovery.
+Table-level checkpoint is applied to overcome shortcoming of in-memory database: expensive checkponit and slow recovery time. Basically, a background task converts row pages to LWC blocks periodically with CoW update on table file. The LWC blocks and metadata can be treated as table-level checkpoint. Recovery process respects the watermark of each table and only replay logs behind the point.
+
+For more details, see [Checkpoint and Recovery](./checkpoint-and-recovery.md).
 
 ## Process Flow
 

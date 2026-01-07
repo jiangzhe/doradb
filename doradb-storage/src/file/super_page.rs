@@ -17,8 +17,8 @@ pub struct SuperPageHeader {
     pub page_no: PageID,
     /// transaction id of this super page.
     pub trx_id: TrxID,
-    /// upper bound of row id.
-    pub row_id_bound: RowID,
+    /// pivot row id.
+    pub pivot_row_id: RowID,
 }
 
 impl Ser<'_> for SuperPageHeader {
@@ -35,7 +35,7 @@ impl Ser<'_> for SuperPageHeader {
         let idx = ctx.ser_byte_array(out, start_idx, &self.magic_word);
         let idx = ctx.ser_u64(out, idx, self.page_no);
         let idx = ctx.ser_u64(out, idx, self.trx_id);
-        ctx.ser_u64(out, idx, self.row_id_bound)
+        ctx.ser_u64(out, idx, self.pivot_row_id)
     }
 }
 
@@ -45,12 +45,12 @@ impl Deser for SuperPageHeader {
         let (idx, magic_word) = ctx.deser_byte_array::<8>(input, start_idx)?;
         let (idx, page_no) = ctx.deser_u64(input, idx)?;
         let (idx, trx_id) = ctx.deser_u64(input, idx)?;
-        let (idx, row_id_bound) = ctx.deser_u64(input, idx)?;
+        let (idx, pivot_row_id) = ctx.deser_u64(input, idx)?;
         let res = SuperPageHeader {
             magic_word,
             page_no,
             trx_id,
-            row_id_bound,
+            pivot_row_id,
         };
         Ok((idx, res))
     }

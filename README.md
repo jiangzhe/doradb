@@ -22,6 +22,7 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 - [Transaction System](./docs/transaction-system.md)
 - [Index Design](./docs/index-design.md)
 - [Checkpoint and Recovery](./docs/checkpoint-and-recovery.md)
+- [Table File](./docs/table-file.md)
 
 Some ideas are different from traditional database system.
 I'm glad to have discussions if someone is interested in details.

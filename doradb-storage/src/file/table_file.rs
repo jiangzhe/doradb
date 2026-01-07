@@ -198,7 +198,7 @@ impl TableFile {
         Ok(ActiveRoot {
             page_no: super_page.header.page_no,
             trx_id: super_page.header.trx_id,
-            row_id_bound: super_page.header.row_id_bound,
+            row_id_bound: super_page.header.pivot_row_id,
             alloc_map,
             free_list,
             metadata: Arc::new(metadata),
@@ -436,7 +436,7 @@ impl ActiveRoot {
                 magic_word: TABLE_FILE_MAGIC_WORD,
                 page_no: self.page_no,
                 trx_id: self.trx_id,
-                row_id_bound: self.row_id_bound,
+                pivot_row_id: self.row_id_bound,
             },
             body: SuperPageBodySerView::new(
                 &self.alloc_map,
