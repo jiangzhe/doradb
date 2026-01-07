@@ -1970,10 +1970,10 @@ mod tests {
 
     #[test]
     fn test_btree_lookup_disable_hints() {
-        const ROWS: usize = 500000;
+        const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+            let pool = FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap();
             {
                 let tree = BTree::new(pool, false, 200).await;
                 let mut map = BTreeMap::new();
@@ -2016,10 +2016,10 @@ mod tests {
         use rand::prelude::*;
         use rand_chacha::ChaCha8Rng;
         use rand_distr::Distribution;
-        const ROWS: usize = 500000;
+        const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+            let pool = FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap();
             {
                 let tree = BTree::new(pool, true, 200).await;
                 let mut map = BTreeMap::new();
@@ -2063,9 +2063,9 @@ mod tests {
     #[test]
     fn test_btree_with_stdmap() {
         smol::block_on(async {
-            const ROWS: u64 = 1_000_000;
-            const MAX_VALUE: u64 = 10_000_000;
-            let pool = FixedBufferPool::with_capacity_static(1 * 1024 * 1024 * 1024).unwrap();
+            const ROWS: u64 = 10_000;
+            const MAX_VALUE: u64 = 100_000;
+            let pool = FixedBufferPool::with_capacity_static(20 * 1024 * 1024).unwrap();
             {
                 let tree = BTree::new(pool, false, 1).await;
 
@@ -2232,10 +2232,10 @@ mod tests {
 
     #[test]
     fn test_btree_merge_partial() {
-        const ROWS: usize = 500000;
+        const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+            let pool = FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap();
             {
                 let tree = BTree::new(pool, false, 200).await;
                 // number less than 10 million

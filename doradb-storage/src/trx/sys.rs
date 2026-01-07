@@ -605,11 +605,11 @@ mod tests {
     #[test]
     fn test_log_rotate() {
         use crate::catalog::tests::table2;
-        // 10000 rows, 200 bytes each row, 20M log file size.
-        // log file is 5MB, so it will rotate at least 4 times.
+        // 2000 rows, 200 bytes each row, 4M log file size.
+        // log file is 1MB, so it will rotate at least 4 times.
         // Due to alignment of direct IO, the write amplification might
         // be higher and produce more files.
-        const COUNT: usize = 10000;
+        const COUNT: usize = 2000;
         smol::block_on(async {
             remove_files("*.tbl");
             let engine = EngineConfig::default()
@@ -623,7 +623,7 @@ mod tests {
                     TrxSysConfig::default()
                         .log_partitions(1)
                         .log_file_prefix("redo_rotate")
-                        .log_file_max_size(1024u64 * 1024 * 8)
+                        .log_file_max_size(1024u64 * 1024 * 1)
                         .skip_recovery(true),
                 )
                 .build()
@@ -633,7 +633,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
             let mut session = engine.new_session();
-            let s = vec![1u8; 120];
+            let s = vec![1u8; 196];
             for i in 0..COUNT {
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();

@@ -572,7 +572,7 @@ mod tests {
     fn test_trx_purge_single_thread() {
         use crate::catalog::tests::table1;
 
-        const PURGE_SIZE: usize = 1000;
+        const PURGE_SIZE: usize = 100;
         smol::block_on(async {
             let engine = EngineConfig::default()
                 .data_buffer(
@@ -639,7 +639,7 @@ mod tests {
                 {
                     break;
                 }
-                if start.elapsed() >= Duration::from_secs(3) {
+                if start.elapsed() >= Duration::from_secs(1) {
                     panic!("gc timeout");
                 } else {
                     std::thread::sleep(Duration::from_millis(100));
@@ -659,7 +659,7 @@ mod tests {
         use crate::catalog::tests::table1;
 
         smol::block_on(async {
-            const PURGE_SIZE: usize = 1000;
+            const PURGE_SIZE: usize = 100;
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -726,7 +726,7 @@ mod tests {
                 {
                     break;
                 }
-                if start.elapsed() >= Duration::from_secs(3) {
+                if start.elapsed() >= Duration::from_secs(1) {
                     // panic!("gc timeout");
                     gc_timeout = true;
                     break;

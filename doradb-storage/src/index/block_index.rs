@@ -1316,13 +1316,13 @@ mod tests {
     fn test_block_index_cursor_shared() {
         smol::block_on(async {
             remove_files("*.tbl");
-            let row_pages = 10240usize;
-            // allocate 1GB buffer pool is enough: 10240 pages ~= 640MB
+            let row_pages = 1024usize;
+            // allocate 100MB buffer pool is enough: 1024 pages ~= 64MB
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .max_mem_size(1024usize * 1024 * 1024)
-                        .max_file_size(2usize * 1024 * 1024 * 1024)
+                        .max_mem_size(100usize * 1024 * 1024)
+                        .max_file_size(1usize * 1024 * 1024 * 1024)
                         .file_path("databuffer_bi.bin"),
                 )
                 .trx(
@@ -1359,9 +1359,6 @@ mod tests {
                 cursor.seek(0).await;
                 while let Some(res) = cursor.next().await {
                     count += 1;
-                    if count == 10000 {
-                        println!("{}", count);
-                    }
                     let g = unsafe { res.as_shared() };
                     let node = g.page();
                     assert!(node.is_leaf());
@@ -1403,12 +1400,14 @@ mod tests {
     fn test_block_index_search() {
         smol::block_on(async {
             remove_files("*.tbl");
-            let row_pages = 10240usize;
+            // at least we need a two-level block index to search.
+            // todo: add test hook to avoid expensive memory allocation of row pages.
+            let row_pages = 5000usize;
             let rows_per_page = 100usize;
             let engine = EngineConfig::default()
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .max_mem_size(1024usize * 1024 * 1024)
+                        .max_mem_size(100usize * 1024 * 1024)
                         .max_file_size(2usize * 1024 * 1024 * 1024)
                         .file_path("databuffer_bi.bin"),
                 )

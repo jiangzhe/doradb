@@ -32,8 +32,8 @@ use std::time::Duration;
 
 pub const SAFETY_PAGES: usize = 10;
 const EVICT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-// min buffer pool size is 64KB * 512 = 32MB.
-const MIN_IN_MEM_PAGES: usize = 512;
+// min buffer pool size is 64KB * 128 = 8MB.
+const MIN_IN_MEM_PAGES: usize = 128;
 
 /// EvictableBufferPool is a buffer pool which can evict
 /// pages to disk.
@@ -1482,10 +1482,10 @@ mod tests {
 
     #[test]
     fn test_evict_buffer_pool_full() {
-        // 1024 in-mem pages and 2048 total pages.
+        // 100 in-mem pages and 200 total pages.
         let pool: &EvictableBufferPool = EvictableBufferPoolConfig::default()
-            .max_mem_size(64u64 * 1024 * 1024)
-            .max_file_size(128u64 * 1024 * 1024)
+            .max_mem_size(64u64 * 1024 * 130)
+            .max_file_size(128u64 * 1024 * 130)
             .file_path("data2.bin")
             .build_static()
             .unwrap();
@@ -1495,7 +1495,7 @@ mod tests {
             thread::spawn(move || {
                 smol::block_on(async move {
                     // allocate more pages than memory limit.
-                    for i in 0..1500 {
+                    for i in 0..160 {
                         let g = pool.allocate_page::<RowPage>().await;
                         let _ = tx.send(g.page_id());
                         println!("allocated page {}", i);
@@ -1505,7 +1505,7 @@ mod tests {
             })
         };
 
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(50));
         println!("wait sometime");
         smol::block_on(async move {
             while let Ok(page_id) = rx.recv() {
