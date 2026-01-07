@@ -176,7 +176,16 @@ mod tests {
     fn test_direct_buf_zeroed() {
         let buf = DirectBuf::zeroed(512);
         assert_eq!(buf.len(), 512);
+        assert!(buf.capacity() >= 512);
+        assert_eq!(buf.capacity() % STORAGE_SECTOR_SIZE, 0);
+        assert_eq!(buf.remaining_capacity(), buf.capacity() - buf.len());
         assert!(buf.data().iter().all(|&b| b == 0));
+
+        let buf = DirectBuf::zeroed(STORAGE_SECTOR_SIZE + 1);
+        assert_eq!(buf.len(), STORAGE_SECTOR_SIZE + 1);
+        assert!(buf.capacity() >= STORAGE_SECTOR_SIZE + 1);
+        assert_eq!(buf.capacity() % STORAGE_SECTOR_SIZE, 0);
+        assert_eq!(buf.remaining_capacity(), buf.capacity() - buf.len());
     }
 
     #[test]
