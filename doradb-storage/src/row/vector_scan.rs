@@ -16,6 +16,29 @@ pub struct ScanBuffer {
     len: usize,
 }
 
+pub struct ScanColumn<'a> {
+    pub col_idx: usize,
+    pub null_bitmap: Option<&'a [u64]>,
+    pub values: ScanColumnValues<'a>,
+}
+
+pub enum ScanColumnValues<'a> {
+    I8(&'a [i8]),
+    U8(&'a [u8]),
+    I16(&'a [i16]),
+    U16(&'a [u16]),
+    I32(&'a [i32]),
+    U32(&'a [u32]),
+    F32(&'a [f32]),
+    I64(&'a [i64]),
+    U64(&'a [u64]),
+    F64(&'a [f64]),
+    VarByte {
+        offsets: &'a [(usize, usize)],
+        data: &'a [u8],
+    },
+}
+
 impl ScanBuffer {
     /// Create a new scan buffer.
     #[inline]
@@ -37,6 +60,40 @@ impl ScanBuffer {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Returns number of columns stored in this buffer.
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        self.cols.len()
+    }
+
+    /// Returns scan column data by position.
+    #[inline]
+    pub fn column(&self, idx: usize) -> Option<ScanColumn<'_>> {
+        self.cols.get(idx).map(|col| {
+            let values = match &col.vals {
+                ValBuffer::I8(vals) => ScanColumnValues::I8(vals),
+                ValBuffer::U8(vals) => ScanColumnValues::U8(vals),
+                ValBuffer::I16(vals) => ScanColumnValues::I16(vals),
+                ValBuffer::U16(vals) => ScanColumnValues::U16(vals),
+                ValBuffer::I32(vals) => ScanColumnValues::I32(vals),
+                ValBuffer::U32(vals) => ScanColumnValues::U32(vals),
+                ValBuffer::F32(vals) => ScanColumnValues::F32(vals),
+                ValBuffer::I64(vals) => ScanColumnValues::I64(vals),
+                ValBuffer::U64(vals) => ScanColumnValues::U64(vals),
+                ValBuffer::F64(vals) => ScanColumnValues::F64(vals),
+                ValBuffer::VarByte { offsets, data } => ScanColumnValues::VarByte {
+                    offsets,
+                    data,
+                },
+            };
+            ScanColumn {
+                col_idx: col.col_idx,
+                null_bitmap: col.null_bitmap.as_deref(),
+                values,
+            }
+        })
     }
 
     /// Scan given page and extend all rows into buffer.
@@ -146,6 +203,47 @@ impl ScanBuffer {
             col.clear();
         }
         self.len = 0;
+    }
+
+    /// Truncate the buffer to given length.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        for col in &mut self.cols {
+            if let Some(null_bitmap) = col.null_bitmap.as_mut() {
+                let units = len.div_ceil(64);
+                null_bitmap.truncate(units);
+                if let Some(last) = null_bitmap.last_mut() {
+                    let rem = len % 64;
+                    if rem != 0 {
+                        let mask = (1u64 << rem) - 1;
+                        *last &= mask;
+                    }
+                }
+            }
+            match &mut col.vals {
+                ValBuffer::I8(vals) => vals.truncate(len),
+                ValBuffer::U8(vals) => vals.truncate(len),
+                ValBuffer::I16(vals) => vals.truncate(len),
+                ValBuffer::U16(vals) => vals.truncate(len),
+                ValBuffer::I32(vals) => vals.truncate(len),
+                ValBuffer::U32(vals) => vals.truncate(len),
+                ValBuffer::F32(vals) => vals.truncate(len),
+                ValBuffer::I64(vals) => vals.truncate(len),
+                ValBuffer::U64(vals) => vals.truncate(len),
+                ValBuffer::F64(vals) => vals.truncate(len),
+                ValBuffer::VarByte { offsets, data } => {
+                    if len < offsets.len() {
+                        offsets.truncate(len);
+                        let end = offsets.last().map(|(_, end)| *end).unwrap_or(0);
+                        data.truncate(end);
+                    }
+                }
+            }
+        }
+        self.len = len;
     }
 }
 
