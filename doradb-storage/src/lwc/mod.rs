@@ -1599,7 +1599,8 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
     use crate::row::{Delete, InsertRow, RowPage};
-    use crate::value::Val;
+    use crate::value::{MemVar, Val};
+    use ordered_float::OrderedFloat;
     use std::mem::MaybeUninit;
 
     #[test]
@@ -1957,6 +1958,176 @@ mod tests {
                 assert_eq!(data1.value(idx).unwrap().as_i16().unwrap(), *value);
             } else {
                 assert!(column1.is_null(idx));
+            }
+        }
+    }
+
+    #[test]
+    fn test_lwc_builder_rollback() {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::empty()),
+            ],
+            vec![],
+        );
+        let mut page: RowPage = unsafe { MaybeUninit::zeroed().assume_init() };
+        page.init(1, 4, &metadata);
+
+        for offset in 0..2u64 {
+            let c0 = Val::U8((10 + offset) as u8);
+            let c1 = Val::I16((20 + offset) as i16);
+            assert!(matches!(page.insert(&metadata, &[c0, c1]), InsertRow::Ok(_)));
+        }
+
+        let mut builder = LwcBuilder::new(&metadata);
+        assert!(builder.append_row_page(&page).unwrap());
+
+        let snapshot = builder.snapshot_state();
+        let expected_row_count = builder.row_count();
+        let expected_row_ids_len = builder.row_ids.len();
+        let expected_stats: Vec<_> = builder
+            .stats
+            .iter()
+            .map(|stat| {
+                let snap = stat.snapshot();
+                (
+                    snap.initialized,
+                    snap.min_i64,
+                    snap.max_i64,
+                    snap.min_u64,
+                    snap.max_u64,
+                )
+            })
+            .collect();
+
+        for offset in 0..2u64 {
+            let c0 = Val::U8((30 + offset) as u8);
+            let c1 = Val::I16((40 + offset) as i16);
+            assert!(matches!(page.insert(&metadata, &[c0, c1]), InsertRow::Ok(_)));
+        }
+        assert!(builder.append_row_page(&page).unwrap());
+
+        builder.rollback(snapshot);
+
+        assert_eq!(builder.row_count(), expected_row_count);
+        assert_eq!(builder.row_ids.len(), expected_row_ids_len);
+        let restored_stats: Vec<_> = builder
+            .stats
+            .iter()
+            .map(|stat| {
+                let snap = stat.snapshot();
+                (
+                    snap.initialized,
+                    snap.min_i64,
+                    snap.max_i64,
+                    snap.min_u64,
+                    snap.max_u64,
+                )
+            })
+            .collect();
+        assert_eq!(restored_stats, expected_stats);
+    }
+
+    #[test]
+    fn test_lwc_builder_all_column_types() {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec::new("c_i8", ValKind::I8, ColumnAttributes::empty()),
+                ColumnSpec::new("c_u8", ValKind::U8, ColumnAttributes::empty()),
+                ColumnSpec::new("c_i16", ValKind::I16, ColumnAttributes::empty()),
+                ColumnSpec::new("c_u16", ValKind::U16, ColumnAttributes::empty()),
+                ColumnSpec::new("c_i32", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("c_u32", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c_i64", ValKind::I64, ColumnAttributes::empty()),
+                ColumnSpec::new("c_u64", ValKind::U64, ColumnAttributes::empty()),
+                ColumnSpec::new("c_f32", ValKind::F32, ColumnAttributes::empty()),
+                ColumnSpec::new("c_f64", ValKind::F64, ColumnAttributes::empty()),
+                ColumnSpec::new("c_bytes", ValKind::VarByte, ColumnAttributes::empty()),
+            ],
+            vec![],
+        );
+        let mut page: RowPage = unsafe { MaybeUninit::zeroed().assume_init() };
+        page.init(10, 6, &metadata);
+
+        let rows = vec![
+            vec![
+                Val::I8(-1),
+                Val::U8(1),
+                Val::I16(-10),
+                Val::U16(10),
+                Val::I32(-100),
+                Val::U32(100),
+                Val::I64(-1000),
+                Val::U64(1000),
+                Val::F32(OrderedFloat(1.25)),
+                Val::F64(OrderedFloat(2.5)),
+                Val::VarByte(MemVar::inline(b"alpha")),
+            ],
+            vec![
+                Val::I8(2),
+                Val::U8(3),
+                Val::I16(20),
+                Val::U16(30),
+                Val::I32(200),
+                Val::U32(300),
+                Val::I64(2000),
+                Val::U64(3000),
+                Val::F32(OrderedFloat(-4.5)),
+                Val::F64(OrderedFloat(6.75)),
+                Val::VarByte(MemVar::inline(b"beta")),
+            ],
+            vec![
+                Val::I8(4),
+                Val::U8(5),
+                Val::I16(40),
+                Val::U16(50),
+                Val::I32(400),
+                Val::U32(500),
+                Val::I64(4000),
+                Val::U64(5000),
+                Val::F32(OrderedFloat(7.75)),
+                Val::F64(OrderedFloat(-8.125)),
+                Val::VarByte(MemVar::inline(b"gamma")),
+            ],
+        ];
+
+        for row in &rows {
+            assert!(matches!(page.insert(&metadata, row), InsertRow::Ok(_)));
+        }
+
+        let mut builder = LwcBuilder::new(&metadata);
+        assert!(builder.append_row_page(&page).unwrap());
+        let buf = builder.build().unwrap();
+
+        let mut bytes = [0u8; 65536];
+        bytes.copy_from_slice(buf.data());
+        let lwc_page = unsafe { std::mem::transmute::<&[u8; 65536], &LwcPage>(&bytes) };
+        assert_eq!(lwc_page.header.row_count() as usize, rows.len());
+
+        for (col_idx, expected_kind) in [
+            ValKind::I8,
+            ValKind::U8,
+            ValKind::I16,
+            ValKind::U16,
+            ValKind::I32,
+            ValKind::U32,
+            ValKind::I64,
+            ValKind::U64,
+            ValKind::F32,
+            ValKind::F64,
+            ValKind::VarByte,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let column = lwc_page.column(&metadata, col_idx).unwrap();
+            let data = column.data().unwrap();
+            assert_eq!(data.len(), rows.len());
+            for (row_idx, expected_row) in rows.iter().enumerate() {
+                let value = data.value(row_idx).unwrap();
+                assert_eq!(value.kind(), *expected_kind);
+                assert_eq!(value, expected_row[col_idx]);
             }
         }
     }
