@@ -4,9 +4,9 @@ pub mod page;
 
 pub use page::*;
 
-use crate::compression::*;
-use crate::catalog::TableMetadata;
 use crate::bitmap::Bitmap;
+use crate::catalog::TableMetadata;
+use crate::compression::*;
 use crate::error::{Error, Result};
 use crate::io::DirectBuf;
 use crate::row::vector_scan::{ScanBuffer, ScanColumnValues};
@@ -849,7 +849,10 @@ impl<'a> LwcBuilder<'a> {
                     let ser = LwcPrimitiveSer::new_f64(vals);
                     serialize_primitive(&ser, &self.ctx)
                 }
-                ScanColumnValues::VarByte { offsets, data: bytes } => {
+                ScanColumnValues::VarByte {
+                    offsets,
+                    data: bytes,
+                } => {
                     let mut lwc_offsets = Vec::with_capacity(offsets.len() + 1);
                     lwc_offsets.push(0u32);
                     for (_, end) in offsets.iter().copied() {
@@ -878,6 +881,7 @@ impl<'a> LwcBuilder<'a> {
         );
 
         let mut buf = DirectBuf::zeroed(LWC_PAGE_SIZE);
+        buf.truncate(0);
         buf.extend_ser(&header, &self.ctx);
         for offset in col_offsets {
             buf.extend_ser(&offset, &self.ctx);
@@ -1028,13 +1032,10 @@ fn estimate_row_ids_size(row_ids: &[RowID]) -> usize {
     match ForBitpackingSer::new(row_ids) {
         Some(fbp) => {
             let packed = mem::size_of::<u8>() + fbp.ser_len(&SerdeCtx::default());
-            let flat =
-                mem::size_of::<u8>() + mem::size_of::<u64>() + row_ids.len() * mem::size_of::<u64>();
-            if packed < flat {
-                packed
-            } else {
-                flat
-            }
+            let flat = mem::size_of::<u8>()
+                + mem::size_of::<u64>()
+                + row_ids.len() * mem::size_of::<u64>();
+            if packed < flat { packed } else { flat }
         }
         None => {
             mem::size_of::<u8>() + mem::size_of::<u64>() + row_ids.len() * mem::size_of::<u64>()
@@ -1366,6 +1367,7 @@ impl Ser<'_> for LwcBytesSer {
     }
 }
 
+#[derive(Debug)]
 pub struct LwcNullBitmap<'a> {
     bytes: &'a [u8],
 }
@@ -1926,7 +1928,11 @@ mod tests {
             expected_rows.push((
                 row_id,
                 offset as u8,
-                if offset % 2 == 0 { None } else { Some(offset as i16) },
+                if offset % 2 == 0 {
+                    None
+                } else {
+                    Some(offset as i16)
+                },
             ));
         }
 
@@ -1940,11 +1946,17 @@ mod tests {
         let buf = builder.build().unwrap();
 
         let mut bytes = [0u8; 65536];
-        bytes.copy_from_slice(buf.data());
+        bytes[..buf.data().len()].copy_from_slice(buf.data());
         let lwc_page = unsafe { std::mem::transmute::<&[u8; 65536], &LwcPage>(&bytes) };
         assert_eq!(lwc_page.header.row_count() as usize, expected_rows.len());
-        assert_eq!(lwc_page.header.first_row_id(), expected_rows.first().unwrap().0);
-        assert_eq!(lwc_page.header.last_row_id(), expected_rows.last().unwrap().0);
+        assert_eq!(
+            lwc_page.header.first_row_id(),
+            expected_rows.first().unwrap().0
+        );
+        assert_eq!(
+            lwc_page.header.last_row_id(),
+            expected_rows.last().unwrap().0
+        );
 
         let column0 = lwc_page.column(&metadata, 0).unwrap();
         let column1 = lwc_page.column(&metadata, 1).unwrap();

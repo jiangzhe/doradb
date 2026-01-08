@@ -83,10 +83,7 @@ impl ScanBuffer {
                 ValBuffer::I64(vals) => ScanColumnValues::I64(vals),
                 ValBuffer::U64(vals) => ScanColumnValues::U64(vals),
                 ValBuffer::F64(vals) => ScanColumnValues::F64(vals),
-                ValBuffer::VarByte { offsets, data } => ScanColumnValues::VarByte {
-                    offsets,
-                    data,
-                },
+                ValBuffer::VarByte { offsets, data } => ScanColumnValues::VarByte { offsets, data },
             };
             ScanColumn {
                 col_idx: col.col_idx,
