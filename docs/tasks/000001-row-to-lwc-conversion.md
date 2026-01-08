@@ -1,11 +1,5 @@
 # Task: Convert Row Pages to LWC Pages
 
-## Status
-- **ID**: 000001
-- **Status**: Proposed
-- **Owner**: Unassigned
-- **IssueID**: #238
-
 ## Summary
 Implement the logic to convert an in-memory `RowPage` (hot data, PAX format) into an on-disk `LwcPage` (warm data, compressed columnar format). This is a critical step in the checkpoint/flush process where data is moved from memory to disk.
 

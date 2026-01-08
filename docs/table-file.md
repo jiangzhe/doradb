@@ -14,21 +14,19 @@ To ensure data consistency and recovery speed, the design strictly follows **Cop
 
 ## 2. Physical Layout
 
-The file is divided into fixed-size 64KB pages. Pages 0 and 1 are fixed anchors; all other pages are dynamically allocated.
+The file is divided into fixed-size 64KB pages. Page 0 is the fixed anchor; all other pages are dynamically allocated.
 
 ```text
 +-------------------------------------------------------+
-| Page 0: SuperPage A (Active or Backup Anchor)         | <--- Double Buffering
+| Page 0: SuperPage (Double-Buffered Anchors A/B)       |
 +-------------------------------------------------------+
-| Page 1: SuperPage B (Active or Backup Anchor)         | <--- Double Buffering
+| Page 1: MetaPage (Snapshot V100)                      | <--- Dynamic, CoW
 +-------------------------------------------------------+
-| Page 2: MetaPage (Snapshot V100)                      | <--- Dynamic, CoW
+| Page 2: SpaceMap Page (Allocated/Free Bitmaps)        |
 +-------------------------------------------------------+
-| Page 3: SpaceMap Page (Allocated/Free Bitmaps)        |
+| Page 3: LWC Data Block (RowID 0~N)                    |
 +-------------------------------------------------------+
-| Page 4: LWC Data Block (RowID 0~N)                    |
-+-------------------------------------------------------+
-| Page 5: DiskTree Node (Index Internal/Leaf)           |
+| Page 4: DiskTree Node (Index Internal/Leaf)           |
 +-------------------------------------------------------+
 | ...                                                   |
 +-------------------------------------------------------+
@@ -38,22 +36,22 @@ The file is divided into fixed-size 64KB pages. Pages 0 and 1 are fixed anchors;
 
 ## 3. SuperPage Design (The Anchor)
 
-The **SuperPage** acts as the static entry point to the file. It is lightweight and only contains a pointer to the latest valid **MetaPage**.
+The **SuperPage** (Page 0) acts as the static entry point to the file. It is lightweight and contains two slots for double-buffering. Each slot points to the latest valid **MetaPage**.
 
-### 3.1. Structure
+### 3.1. Structure of a Slot
 | Section | Field | Description |
 | :--- | :--- | :--- |
 | **Header** | `magic_number` | File signature. |
 | | `version` | File format version. |
-| | `trx_id` | **Transaction ID** of the coordinator that wrote this page. Used to identify the freshest anchor. |
+| | `trx_id` | **Transaction ID** of the coordinator that wrote this slot. Used to identify the freshest anchor. |
 | **Body** | **`meta_page_id`** | Pointer to the latest **MetaPage**. |
 | **Footer** | `checksum` | CRC32C checksum of Header + Body. |
 | | `trx_id_redundant` | Must match `Header.trx_id`. |
 
 ### 3.2. Atomic Update Protocol
 To update the file state (commit a checkpoint):
-1.  **Write**: Write Header (new `trx_id`), Body (new `meta_page_id`), and Footer to the inactive SuperPage slot (e.g., Page 0).
-2.  **Fsync**: Persist the page to disk.
+1.  **Write**: Write Header (new `trx_id`), Body (new `meta_page_id`), and Footer to the inactive slot (A or B) within Page 0.
+2.  **Fsync**: Persist Page 0 to disk.
 3.  **Completion**: Once fsync returns successfully, the new state is valid. There is **no need** to check for active transactions during this step.
 
 
