@@ -1941,6 +1941,8 @@ mod tests {
         expected_rows.retain(|(row_id, _, _)| *row_id != 102 && *row_id != 105);
 
         let mut builder = LwcBuilder::new(&metadata);
+        assert!(builder.is_empty());
+        assert!(builder.row_count() == 0);
         let appended = builder.append_row_page(&page).unwrap();
         assert!(appended);
         let buf = builder.build().unwrap();
