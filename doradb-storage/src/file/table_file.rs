@@ -461,7 +461,7 @@ impl ActiveRoot {
     }
 
     #[inline]
-    pub fn ser_view(&self) -> SuperPageSerView<'_> {
+    pub fn ser_view(&self) -> SuperPageSerView {
         SuperPageSerView {
             header: SuperPageHeader {
                 magic_word: TABLE_FILE_MAGIC_WORD,
