@@ -1991,7 +1991,10 @@ mod tests {
         for offset in 0..2u64 {
             let c0 = Val::U8((10 + offset) as u8);
             let c1 = Val::I16((20 + offset) as i16);
-            assert!(matches!(page.insert(&metadata, &[c0, c1]), InsertRow::Ok(_)));
+            assert!(matches!(
+                page.insert(&metadata, &[c0, c1]),
+                InsertRow::Ok(_)
+            ));
         }
 
         let mut builder = LwcBuilder::new(&metadata);
@@ -2018,7 +2021,10 @@ mod tests {
         for offset in 0..2u64 {
             let c0 = Val::U8((30 + offset) as u8);
             let c1 = Val::I16((40 + offset) as i16);
-            assert!(matches!(page.insert(&metadata, &[c0, c1]), InsertRow::Ok(_)));
+            assert!(matches!(
+                page.insert(&metadata, &[c0, c1]),
+                InsertRow::Ok(_)
+            ));
         }
         assert!(builder.append_row_page(&page).unwrap());
 
@@ -2115,7 +2121,7 @@ mod tests {
         let buf = builder.build().unwrap();
 
         let mut bytes = [0u8; 65536];
-        bytes.copy_from_slice(buf.data());
+        bytes[..buf.data().len()].copy_from_slice(buf.data());
         let lwc_page = unsafe { std::mem::transmute::<&[u8; 65536], &LwcPage>(&bytes) };
         assert_eq!(lwc_page.header.row_count() as usize, rows.len());
 
@@ -2140,7 +2146,7 @@ mod tests {
             assert_eq!(data.len(), rows.len());
             for (row_idx, expected_row) in rows.iter().enumerate() {
                 let value = data.value(row_idx).unwrap();
-                assert_eq!(value.kind(), *expected_kind);
+                assert_eq!(value.kind(), Some(*expected_kind));
                 assert_eq!(value, expected_row[col_idx]);
             }
         }
