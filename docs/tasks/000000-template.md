@@ -1,11 +1,5 @@
 # Task: Convert Row Pages to LWC Pages
 
-## Status
-- **ID**: 000000
-- **Status**: Proposed
-- **Owner**: Unassigned
-- **IssueID**: After creating github issue, fill this field with github issue id.
-
 ## Summary
 
 Summarize the issue/feature and solution.
