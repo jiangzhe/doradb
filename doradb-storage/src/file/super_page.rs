@@ -5,14 +5,14 @@ use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::trx::TrxID;
 use std::mem;
 
-pub const SUPER_PAGE_VERSION: u16 = 1;
+pub const SUPER_PAGE_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperPageHeader {
     /// Magic word of table file, by default 'DORA\0\0\0\0'
     pub magic_word: [u8; 8],
     /// Version of super page format.
-    pub version: u16,
+    pub version: u64,
     /// Page number of this super page.
     pub page_no: PageID,
     /// transaction id of this super page.
@@ -23,7 +23,7 @@ impl Ser<'_> for SuperPageHeader {
     #[inline]
     fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
         mem::size_of::<[u8; 8]>() // magic word
-            + mem::size_of::<u16>() // version
+            + mem::size_of::<u64>() // version
             + mem::size_of::<PageID>() // page no
             + mem::size_of::<TrxID>() // transaction id
     }
@@ -31,7 +31,7 @@ impl Ser<'_> for SuperPageHeader {
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
         let idx = ctx.ser_byte_array(out, start_idx, &self.magic_word);
-        let idx = ctx.ser_u16(out, idx, self.version);
+        let idx = ctx.ser_u64(out, idx, self.version);
         let idx = ctx.ser_u64(out, idx, self.page_no);
         ctx.ser_u64(out, idx, self.trx_id)
     }
@@ -41,7 +41,7 @@ impl Deser for SuperPageHeader {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let (idx, magic_word) = ctx.deser_byte_array::<8>(input, start_idx)?;
-        let (idx, version) = ctx.deser_u16(input, idx)?;
+        let (idx, version) = ctx.deser_u64(input, idx)?;
         let (idx, page_no) = ctx.deser_u64(input, idx)?;
         let (idx, trx_id) = ctx.deser_u64(input, idx)?;
         let res = SuperPageHeader {

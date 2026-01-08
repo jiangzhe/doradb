@@ -30,8 +30,11 @@ pub const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
 pub const TABLE_FILE_PAGE_SIZE: usize = PAGE_SIZE;
 /// Super page size of table file is 32KB.
 pub const TABLE_FILE_SUPER_PAGE_SIZE: usize = TABLE_FILE_PAGE_SIZE / 2;
-/// Super page blake3 checksum size is 32B.
-pub const TABLE_FILE_SUPER_PAGE_HEADER_SIZE: usize = mem::size_of::<SuperPageHeader>();
+/// Super page header size.
+pub const TABLE_FILE_SUPER_PAGE_HEADER_SIZE: usize = mem::size_of::<[u8; 8]>()
+    + mem::size_of::<u64>()
+    + mem::size_of::<PageID>()
+    + mem::size_of::<TrxID>();
 /// Super page footer: blake3 checksum + trx id.
 pub const TABLE_FILE_SUPER_PAGE_FOOTER_SIZE: usize = mem::size_of::<SuperPageFooter>();
 /// Super page data size.
