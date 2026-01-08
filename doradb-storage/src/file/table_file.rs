@@ -3,9 +3,10 @@ use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::catalog::table::TableMetadata;
 use crate::error::{Error, Result};
 use crate::file::FixedSizeBufferFreeList;
+use crate::file::meta_page::{MetaPage, MetaPageSerView};
 use crate::file::super_page::{
-    SuperPage, SuperPageAlloc, SuperPageBlockIndex, SuperPageBody, SuperPageBodySerView,
-    SuperPageFooter, SuperPageFree, SuperPageHeader, SuperPageMeta, SuperPageSerView,
+    SUPER_PAGE_VERSION, SuperPage, SuperPageBody, SuperPageFooter, SuperPageHeader,
+    SuperPageSerView,
 };
 use crate::file::{FileIO, FileIOResult, SparseFile};
 use crate::io::DirectBuf;
@@ -179,30 +180,19 @@ impl TableFile {
         let buf = self.read_page(0).await?;
         let super_page = self.pick_super_page(buf.as_bytes())?;
         self.buf_list.push(buf);
-        let alloc_map = match super_page.body.alloc {
-            SuperPageAlloc::Inline(alloc) => alloc,
-            SuperPageAlloc::PageNo(_) => todo!("standalone alloc map page"),
-        };
-        let free_list = match super_page.body.free {
-            SuperPageFree::Inline(free) => free,
-            SuperPageFree::PageNo(_) => todo!("standalone free list page"),
-        };
-        let metadata = match super_page.body.meta {
-            SuperPageMeta::Inline(meta) => meta,
-            SuperPageMeta::PageNo(_) => todo!("standalone metadata page"),
-        };
-        let block_index = match super_page.body.block_index {
-            SuperPageBlockIndex::Inline(block_index) => block_index,
-            SuperPageBlockIndex::PageNo(_) => todo!("standalone block index page"),
-        };
+        let meta_page_id = super_page.body.meta_page_id;
+        let meta_buf = self.read_page(meta_page_id).await?;
+        let meta_page = self.parse_meta_page(meta_buf.as_bytes())?;
+        self.buf_list.push(meta_buf);
         Ok(ActiveRoot {
             page_no: super_page.header.page_no,
             trx_id: super_page.header.trx_id,
-            row_id_bound: super_page.header.pivot_row_id,
-            alloc_map,
-            free_list,
-            metadata: Arc::new(metadata),
-            block_index,
+            row_id_bound: meta_page.pivot_row_id,
+            alloc_map: meta_page.space_map,
+            gc_page_list: meta_page.gc_page_list,
+            metadata: Arc::new(meta_page.schema),
+            block_index: meta_page.block_index,
+            meta_page_id,
         })
     }
 
@@ -231,6 +221,9 @@ impl TableFile {
         let mut ctx = SerdeCtx::default();
         let (idx, header) = SuperPageHeader::deser(&mut ctx, buf, 0)?;
         debug_assert!(idx == TABLE_FILE_SUPER_PAGE_HEADER_SIZE);
+        if header.version != SUPER_PAGE_VERSION {
+            return Err(Error::InvalidFormat);
+        }
         let (idx, footer) =
             SuperPageFooter::deser(&mut ctx, buf, TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET)?;
         debug_assert!(idx == TABLE_FILE_SUPER_PAGE_SIZE);
@@ -248,6 +241,13 @@ impl TableFile {
             body,
             footer,
         })
+    }
+
+    #[inline]
+    fn parse_meta_page(&self, buf: &[u8]) -> Result<MetaPage> {
+        let mut ctx = SerdeCtx::default();
+        let (_, meta_page) = MetaPage::deser(&mut ctx, buf, 0)?;
+        Ok(meta_page)
     }
 
     /// fsync to make all data written persisted to disk.
@@ -317,10 +317,40 @@ impl MutableTableFile {
         debug_assert!(active_root.trx_id == 0 || active_root.trx_id < trx_id);
         active_root.trx_id = trx_id;
 
+        if active_root.meta_page_id != 0 {
+            active_root.gc_page_list.push(active_root.meta_page_id);
+        }
+        let new_meta_page_id = active_root
+            .alloc_map
+            .try_allocate()
+            .ok_or(Error::InvalidState)? as PageID;
+        active_root.meta_page_id = new_meta_page_id;
+
+        // serialize meta page.
+        let meta_page = active_root.meta_page_ser_view();
+        let mut meta_buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let ctx = SerdeCtx::default();
+        let meta_len = meta_page.ser_len(&ctx);
+        if meta_len > TABLE_FILE_PAGE_SIZE {
+            return Err(Error::InvalidState);
+        }
+        let meta_idx = meta_page.ser(&ctx, meta_buf.as_bytes_mut(), 0);
+        debug_assert!(meta_idx == meta_len);
+
+        // write meta page down.
+        match table_file.write_page(new_meta_page_id, meta_buf).await {
+            Ok(_) => {}
+            Err(e) => {
+                if try_delete_if_fail && let Some(f) = Arc::into_inner(table_file) {
+                    f.delete();
+                }
+                return Err(e);
+            }
+        }
+
         // serialize header and body of super page.
         let super_page = active_root.ser_view();
         let mut buf = DirectBuf::zeroed(TABLE_FILE_SUPER_PAGE_SIZE);
-        let ctx = SerdeCtx::default();
         let ser_len = super_page.ser_len(&ctx);
         if ser_len > TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET {
             // single super page cannot hold all data
@@ -393,14 +423,14 @@ pub struct ActiveRoot {
     pub row_id_bound: RowID,
     /// Page allocation map.
     pub alloc_map: AllocMap,
-    /// Pages that are freed by this transaction(T).
-    /// These pages can be actually freed/reused only
-    /// when all transactions before T finished.
-    pub free_list: Vec<PageID>,
+    /// Pages that became obsolete in this version.
+    pub gc_page_list: Vec<PageID>,
     /// Metadata of this table.
     pub metadata: Arc<TableMetadata>,
     /// Block index array.
     pub block_index: BlockIndexArray,
+    /// Current meta page id.
+    pub meta_page_id: PageID,
     // page index (todo): this is two-layer index, persistent block index
     //                    + intra-block page index
     // secondary index (todo)
@@ -423,9 +453,10 @@ impl ActiveRoot {
             trx_id,
             row_id_bound: 0,
             alloc_map,
-            free_list: vec![],
+            gc_page_list: vec![],
             metadata,
             block_index: BlockIndexArray::builder().build(),
+            meta_page_id: 0,
         }
     }
 
@@ -434,17 +465,26 @@ impl ActiveRoot {
         SuperPageSerView {
             header: SuperPageHeader {
                 magic_word: TABLE_FILE_MAGIC_WORD,
+                version: SUPER_PAGE_VERSION,
                 page_no: self.page_no,
                 trx_id: self.trx_id,
-                pivot_row_id: self.row_id_bound,
             },
-            body: SuperPageBodySerView::new(
-                &self.alloc_map,
-                &self.free_list,
-                self.metadata.ser_view(),
-                &self.block_index,
-            ),
+            body: SuperPageBody {
+                meta_page_id: self.meta_page_id,
+            },
         }
+    }
+
+    #[inline]
+    pub fn meta_page_ser_view(&self) -> MetaPageSerView<'_> {
+        MetaPageSerView::new(
+            self.metadata.ser_view(),
+            &self.block_index,
+            &self.alloc_map,
+            &self.gc_page_list,
+            self.row_id_bound,
+            self.trx_id,
+        )
     }
 
     #[inline]

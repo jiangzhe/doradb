@@ -1,3 +1,4 @@
+pub mod meta_page;
 pub mod super_page;
 pub mod table_file;
 pub mod table_fs;

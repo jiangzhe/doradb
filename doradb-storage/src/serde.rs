@@ -1177,8 +1177,7 @@ mod tests {
         let mut res = vec![0u8; bp.ser_len(&ctx)];
         let ser_idx = bp.ser(&ctx, &mut res, 0);
         assert_eq!(ser_idx, res.len());
-        let (de_idx, decompressed) =
-            ForBitpackingDeser::<i16>::deser(&mut ctx, &res, 0).unwrap();
+        let (de_idx, decompressed) = ForBitpackingDeser::<i16>::deser(&mut ctx, &res, 0).unwrap();
         assert_eq!(de_idx, res.len());
         assert_eq!(decompressed.0, input);
 
@@ -1187,8 +1186,7 @@ mod tests {
         let mut res = vec![0u8; bp.ser_len(&ctx)];
         let ser_idx = bp.ser(&ctx, &mut res, 0);
         assert_eq!(ser_idx, res.len());
-        let (de_idx, decompressed) =
-            ForBitpackingDeser::<i32>::deser(&mut ctx, &res, 0).unwrap();
+        let (de_idx, decompressed) = ForBitpackingDeser::<i32>::deser(&mut ctx, &res, 0).unwrap();
         assert_eq!(de_idx, res.len());
         assert_eq!(decompressed.0, input);
     }
