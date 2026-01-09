@@ -109,6 +109,7 @@ pub struct iovec {
     pub iov_len: usize,
 }
 
+#[cfg(feature = "libaio")]
 #[link(name = "aio")]
 unsafe extern "C" {
     pub fn io_queue_init(maxevents: c_int, ctxp: *mut io_context_t) -> c_int;
@@ -132,6 +133,58 @@ unsafe extern "C" {
         events: *mut io_event,
         timeout: *mut timespec,
     ) -> c_int;
+}
+
+#[cfg(not(feature = "libaio"))]
+#[inline]
+fn libaio_stub_error() -> c_int {
+    -(libc::ENOSYS as c_int)
+}
+
+#[cfg(not(feature = "libaio"))]
+pub unsafe fn io_queue_init(_maxevents: c_int, _ctxp: *mut io_context_t) -> c_int {
+    libaio_stub_error()
+}
+
+#[cfg(not(feature = "libaio"))]
+pub unsafe fn io_queue_release(_ctx: io_context_t) -> c_int {
+    libaio_stub_error()
+}
+
+#[cfg(not(feature = "libaio"))]
+pub unsafe fn io_queue_run(_ctx: io_context_t) -> c_int {
+    libaio_stub_error()
+}
+
+#[cfg(not(feature = "libaio"))]
+pub unsafe fn io_setup(_maxevents: c_int, _ctxp: *mut io_context_t) -> c_int {
+    libaio_stub_error()
+}
+
+#[cfg(not(feature = "libaio"))]
+pub unsafe fn io_destroy(_ctx: io_context_t) -> c_int {
+    libaio_stub_error()
+}
+
+#[cfg(not(feature = "libaio"))]
+pub unsafe fn io_submit(_ctx: io_context_t, _nr: c_long, _ios: *mut *mut iocb) -> c_int {
+    libaio_stub_error()
+}
+
+#[cfg(not(feature = "libaio"))]
+pub unsafe fn io_cancel(_ctx: io_context_t, _iocb: *mut iocb, _evt: *mut io_event) -> c_int {
+    libaio_stub_error()
+}
+
+#[cfg(not(feature = "libaio"))]
+pub unsafe fn io_getevents(
+    _ctx_id: io_context_t,
+    _min_nr: c_long,
+    _nr: c_long,
+    _events: *mut io_event,
+    _timeout: *mut timespec,
+) -> c_int {
+    libaio_stub_error()
 }
 
 #[cfg(test)]
