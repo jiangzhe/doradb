@@ -4,8 +4,13 @@ pub mod page;
 
 pub use page::*;
 
+use crate::bitmap::Bitmap;
+use crate::catalog::TableMetadata;
 use crate::compression::*;
 use crate::error::{Error, Result};
+use crate::io::DirectBuf;
+use crate::row::vector_scan::{ScanBuffer, ScanColumnValues};
+use crate::row::{RowID, RowPage};
 use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, SerdeCtx};
 use crate::value::{MemVar, Val, ValKind};
 use std::mem;
@@ -642,6 +647,523 @@ impl<'a> Ser<'a> for LwcPrimitiveSer<'a> {
     }
 }
 
+const LWC_PAGE_SIZE: usize = 64 * 1024;
+const LWC_PAGE_HEADER_SIZE: usize = 24;
+const LWC_PAGE_FOOTER_SIZE: usize = 32;
+
+struct LwcColumnStats {
+    min_i64: i64,
+    max_i64: i64,
+    min_u64: u64,
+    max_u64: u64,
+    initialized: bool,
+}
+
+impl LwcColumnStats {
+    fn new() -> Self {
+        LwcColumnStats {
+            min_i64: 0,
+            max_i64: 0,
+            min_u64: 0,
+            max_u64: 0,
+            initialized: false,
+        }
+    }
+
+    fn update_i64(&mut self, value: i64) {
+        if !self.initialized {
+            self.min_i64 = value;
+            self.max_i64 = value;
+            self.initialized = true;
+        } else {
+            self.min_i64 = self.min_i64.min(value);
+            self.max_i64 = self.max_i64.max(value);
+        }
+    }
+
+    fn update_u64(&mut self, value: u64) {
+        if !self.initialized {
+            self.min_u64 = value;
+            self.max_u64 = value;
+            self.initialized = true;
+        } else {
+            self.min_u64 = self.min_u64.min(value);
+            self.max_u64 = self.max_u64.max(value);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LwcColumnSnapshot {
+    initialized: bool,
+    min_i64: i64,
+    max_i64: i64,
+    min_u64: u64,
+    max_u64: u64,
+}
+
+impl LwcColumnStats {
+    fn snapshot(&self) -> LwcColumnSnapshot {
+        LwcColumnSnapshot {
+            initialized: self.initialized,
+            min_i64: self.min_i64,
+            max_i64: self.max_i64,
+            min_u64: self.min_u64,
+            max_u64: self.max_u64,
+        }
+    }
+
+    fn restore(&mut self, snapshot: LwcColumnSnapshot) {
+        self.initialized = snapshot.initialized;
+        self.min_i64 = snapshot.min_i64;
+        self.max_i64 = snapshot.max_i64;
+        self.min_u64 = snapshot.min_u64;
+        self.max_u64 = snapshot.max_u64;
+    }
+}
+
+struct LwcSnapshot {
+    row_count: usize,
+    row_ids_len: usize,
+    stats: Vec<LwcColumnSnapshot>,
+}
+
+pub struct LwcBuilder<'a> {
+    metadata: &'a TableMetadata,
+    buffer: ScanBuffer,
+    row_ids: Vec<RowID>,
+    stats: Vec<LwcColumnStats>,
+    ctx: SerdeCtx,
+}
+
+impl<'a> LwcBuilder<'a> {
+    pub fn new(metadata: &'a TableMetadata) -> Self {
+        let scan_set: Vec<_> = (0..metadata.col_count()).collect();
+        let stats = (0..metadata.col_count())
+            .map(|_| LwcColumnStats::new())
+            .collect();
+        let buffer = ScanBuffer::new(metadata, &scan_set);
+        LwcBuilder {
+            metadata,
+            buffer,
+            row_ids: Vec::new(),
+            stats,
+            ctx: SerdeCtx::default(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    #[inline]
+    pub fn row_count(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
+        let snapshot = self.snapshot_state();
+        let view = page.vector_view(self.metadata);
+        let mut new_row_ids = Vec::with_capacity(view.rows_non_deleted());
+        for (start_idx, end_idx) in view.range_non_deleted() {
+            for idx in start_idx..end_idx {
+                new_row_ids.push(page.row_id(idx));
+            }
+        }
+        self.scan_page_stats(&view, &new_row_ids)?;
+        self.buffer.scan(view)?;
+        self.row_ids.extend(new_row_ids);
+        if self.estimate_size()? > LWC_PAGE_SIZE {
+            self.rollback(snapshot);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub fn build(&self) -> Result<DirectBuf> {
+        if self.buffer.is_empty() {
+            return Err(Error::InvalidState);
+        }
+        let row_count = self.buffer.len();
+        if row_count > u16::MAX as usize {
+            return Err(Error::InvalidArgument);
+        }
+        let row_id_ser = LwcPrimitiveSer::new_u64(&self.row_ids);
+        let row_id_len = row_id_ser.ser_len(&self.ctx);
+        let mut column_payloads = Vec::with_capacity(self.metadata.col_count());
+        let mut col_offsets = Vec::with_capacity(self.metadata.col_count());
+        let mut offset = mem::size_of::<u16>() * self.metadata.col_count() + row_id_len;
+
+        for col_idx in 0..self.metadata.col_count() {
+            let column = self
+                .buffer
+                .column(col_idx)
+                .ok_or(Error::InvalidColumnScan)?;
+            let mut data = Vec::new();
+            if let Some(bitmap) = column.null_bitmap {
+                let bytes = bitmap_to_bytes(bitmap, row_count);
+                let bitmap_ser = LwcNullBitmapSer::new(&bytes)?;
+                let mut tmp = vec![0u8; bitmap_ser.ser_len(&self.ctx)];
+                bitmap_ser.ser(&self.ctx, &mut tmp, 0);
+                data.extend_from_slice(&tmp);
+            }
+            let payload = match column.values {
+                ScanColumnValues::I8(vals) => {
+                    let ser = LwcPrimitiveSer::new_i8(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::U8(vals) => {
+                    let ser = LwcPrimitiveSer::new_u8(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::I16(vals) => {
+                    let ser = LwcPrimitiveSer::new_i16(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::U16(vals) => {
+                    let ser = LwcPrimitiveSer::new_u16(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::I32(vals) => {
+                    let ser = LwcPrimitiveSer::new_i32(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::U32(vals) => {
+                    let ser = LwcPrimitiveSer::new_u32(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::F32(vals) => {
+                    let ser = LwcPrimitiveSer::new_f32(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::I64(vals) => {
+                    let ser = LwcPrimitiveSer::new_i64(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::U64(vals) => {
+                    let ser = LwcPrimitiveSer::new_u64(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::F64(vals) => {
+                    let ser = LwcPrimitiveSer::new_f64(vals);
+                    serialize_primitive(&ser, &self.ctx)
+                }
+                ScanColumnValues::VarByte {
+                    offsets,
+                    data: bytes,
+                } => {
+                    let mut lwc_offsets = Vec::with_capacity(offsets.len() + 1);
+                    lwc_offsets.push(0u32);
+                    for (_, end) in offsets.iter().copied() {
+                        lwc_offsets.push(end as u32);
+                    }
+                    let ser = LwcPrimitiveSer::new_bytes_owned(lwc_offsets, bytes.to_vec())?;
+                    serialize_primitive(&ser, &self.ctx)
+                }
+            };
+            data.extend_from_slice(&payload);
+            offset += data.len();
+            col_offsets.push(offset as u16);
+            column_payloads.push(data);
+        }
+
+        let first_row_id = *self.row_ids.first().unwrap_or(&0);
+        let last_row_id = *self.row_ids.last().unwrap_or(&0);
+        let first_col_offset =
+            (mem::size_of::<u16>() * self.metadata.col_count() + row_id_len) as u16;
+        let header = LwcPageHeader::new(
+            first_row_id,
+            last_row_id,
+            row_count as u16,
+            self.metadata.col_count() as u16,
+            first_col_offset,
+        );
+
+        let mut buf = DirectBuf::zeroed(LWC_PAGE_SIZE);
+        buf.truncate(0);
+        buf.extend_ser(&header, &self.ctx);
+        for offset in col_offsets {
+            buf.extend_ser(&offset, &self.ctx);
+        }
+        buf.extend_ser(&row_id_ser, &self.ctx);
+        for payload in column_payloads {
+            buf.extend_from_slice(&payload);
+        }
+        Ok(buf)
+    }
+
+    fn snapshot_state(&self) -> LwcSnapshot {
+        LwcSnapshot {
+            row_count: self.buffer.len(),
+            row_ids_len: self.row_ids.len(),
+            stats: self.stats.iter().map(|s| s.snapshot()).collect(),
+        }
+    }
+
+    fn rollback(&mut self, snapshot: LwcSnapshot) {
+        self.buffer.truncate(snapshot.row_count);
+        self.row_ids.truncate(snapshot.row_ids_len);
+        for (stat, snap) in self.stats.iter_mut().zip(snapshot.stats.into_iter()) {
+            stat.restore(snap);
+        }
+    }
+
+    fn scan_page_stats(
+        &mut self,
+        view: &crate::row::vector_scan::PageVectorView<'_, '_>,
+        row_ids: &[RowID],
+    ) -> Result<()> {
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+        for col_idx in 0..self.metadata.col_count() {
+            let (null_bitmap, values) = view.col(col_idx);
+            match values {
+                crate::row::vector_scan::ValArrayRef::I8(vals) => {
+                    self.update_stats_i64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                }
+                crate::row::vector_scan::ValArrayRef::U8(vals) => {
+                    self.update_stats_u64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                }
+                crate::row::vector_scan::ValArrayRef::I16(vals) => {
+                    self.update_stats_i64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                }
+                crate::row::vector_scan::ValArrayRef::U16(vals) => {
+                    self.update_stats_u64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                }
+                crate::row::vector_scan::ValArrayRef::I32(vals) => {
+                    self.update_stats_i64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                }
+                crate::row::vector_scan::ValArrayRef::U32(vals) => {
+                    self.update_stats_u64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                }
+                crate::row::vector_scan::ValArrayRef::I64(vals) => {
+                    self.update_stats_i64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                }
+                crate::row::vector_scan::ValArrayRef::U64(vals) => {
+                    self.update_stats_u64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                }
+                crate::row::vector_scan::ValArrayRef::F32(_)
+                | crate::row::vector_scan::ValArrayRef::F64(_)
+                | crate::row::vector_scan::ValArrayRef::VarByte(_, _) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn update_stats_i64<T: Copy + Into<i64>, R: Iterator<Item = (usize, usize)>>(
+        &mut self,
+        col_idx: usize,
+        null_bitmap: Option<&[u64]>,
+        values: &[T],
+        ranges: R,
+    ) {
+        for (start_idx, end_idx) in ranges {
+            for idx in start_idx..end_idx {
+                if null_bitmap.map(|bm| bm.bitmap_get(idx)).unwrap_or(false) {
+                    continue;
+                }
+                if let Some(value) = values.get(idx) {
+                    self.stats[col_idx].update_i64((*value).into());
+                }
+            }
+        }
+    }
+
+    fn update_stats_u64<T: Copy + Into<u64>, R: Iterator<Item = (usize, usize)>>(
+        &mut self,
+        col_idx: usize,
+        null_bitmap: Option<&[u64]>,
+        values: &[T],
+        ranges: R,
+    ) {
+        for (start_idx, end_idx) in ranges {
+            for idx in start_idx..end_idx {
+                if null_bitmap.map(|bm| bm.bitmap_get(idx)).unwrap_or(false) {
+                    continue;
+                }
+                if let Some(value) = values.get(idx) {
+                    self.stats[col_idx].update_u64((*value).into());
+                }
+            }
+        }
+    }
+
+    fn estimate_size(&self) -> Result<usize> {
+        let row_count = self.buffer.len();
+        let mut total = LWC_PAGE_HEADER_SIZE;
+        total += mem::size_of::<u16>() * self.metadata.col_count();
+        total += estimate_row_ids_size(&self.row_ids);
+        total += estimate_columns_size(self.metadata, &self.buffer, &self.stats, row_count)?;
+        total += LWC_PAGE_FOOTER_SIZE;
+        Ok(total)
+    }
+}
+
+fn serialize_primitive<'a>(ser: &LwcPrimitiveSer<'a>, ctx: &SerdeCtx) -> Vec<u8> {
+    let mut bytes = vec![0u8; ser.ser_len(ctx)];
+    ser.ser(ctx, &mut bytes, 0);
+    bytes
+}
+
+fn bitmap_to_bytes(bitmap: &[u64], len: usize) -> Vec<u8> {
+    let units = len.div_ceil(64);
+    let mut bytes = vec![0u8; len.div_ceil(8)];
+    for (unit_idx, &unit) in bitmap.iter().take(units).enumerate() {
+        let start = unit_idx * 8;
+        let end = (start + 8).min(bytes.len());
+        bytes[start..end].copy_from_slice(&unit.to_le_bytes()[..end - start]);
+    }
+    if let Some(last) = bytes.last_mut() {
+        let rem = len % 8;
+        if rem != 0 {
+            let mask = (1u8 << rem) - 1;
+            *last &= mask;
+        }
+    }
+    bytes
+}
+
+fn estimate_row_ids_size(row_ids: &[RowID]) -> usize {
+    if row_ids.is_empty() {
+        return mem::size_of::<u8>();
+    }
+    match ForBitpackingSer::new(row_ids) {
+        Some(fbp) => {
+            let packed = mem::size_of::<u8>() + fbp.ser_len(&SerdeCtx::default());
+            let flat = mem::size_of::<u8>()
+                + mem::size_of::<u64>()
+                + row_ids.len() * mem::size_of::<u64>();
+            if packed < flat { packed } else { flat }
+        }
+        None => {
+            mem::size_of::<u8>() + mem::size_of::<u64>() + row_ids.len() * mem::size_of::<u64>()
+        }
+    }
+}
+
+fn estimate_columns_size(
+    metadata: &TableMetadata,
+    buffer: &ScanBuffer,
+    stats: &[LwcColumnStats],
+    row_count: usize,
+) -> Result<usize> {
+    let mut total = 0usize;
+    for col_idx in 0..metadata.col_count() {
+        let column = buffer.column(col_idx).ok_or(Error::InvalidColumnScan)?;
+        if column.null_bitmap.is_some() {
+            total += mem::size_of::<u16>() + row_count.div_ceil(8);
+        }
+        total += estimate_column_payload(
+            metadata.val_kind(col_idx),
+            &column.values,
+            &stats[col_idx],
+            row_count,
+        )?;
+    }
+    Ok(total)
+}
+
+fn estimate_column_payload(
+    kind: ValKind,
+    values: &ScanColumnValues<'_>,
+    stats: &LwcColumnStats,
+    row_count: usize,
+) -> Result<usize> {
+    let size = match (kind, values) {
+        (ValKind::I8, ScanColumnValues::I8(_)) => {
+            estimate_i64_payload(stats, row_count, mem::size_of::<i8>())
+        }
+        (ValKind::U8, ScanColumnValues::U8(_)) => {
+            estimate_u64_payload(stats, row_count, mem::size_of::<u8>())
+        }
+        (ValKind::I16, ScanColumnValues::I16(_)) => {
+            estimate_i64_payload(stats, row_count, mem::size_of::<i16>())
+        }
+        (ValKind::U16, ScanColumnValues::U16(_)) => {
+            estimate_u64_payload(stats, row_count, mem::size_of::<u16>())
+        }
+        (ValKind::I32, ScanColumnValues::I32(_)) => {
+            estimate_i64_payload(stats, row_count, mem::size_of::<i32>())
+        }
+        (ValKind::U32, ScanColumnValues::U32(_)) => {
+            estimate_u64_payload(stats, row_count, mem::size_of::<u32>())
+        }
+        (ValKind::I64, ScanColumnValues::I64(_)) => {
+            estimate_i64_payload(stats, row_count, mem::size_of::<i64>())
+        }
+        (ValKind::U64, ScanColumnValues::U64(_)) => {
+            estimate_u64_payload(stats, row_count, mem::size_of::<u64>())
+        }
+        (ValKind::F32, ScanColumnValues::F32(_)) => {
+            mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * mem::size_of::<f32>()
+        }
+        (ValKind::F64, ScanColumnValues::F64(_)) => {
+            mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * mem::size_of::<f64>()
+        }
+        (ValKind::VarByte, ScanColumnValues::VarByte { offsets, data }) => {
+            let count = offsets.len();
+            mem::size_of::<u8>()
+                + mem::size_of::<u64>()
+                + (count + 1) * mem::size_of::<u32>()
+                + data.len()
+        }
+        _ => return Err(Error::InvalidColumnScan),
+    };
+    Ok(size)
+}
+
+fn estimate_i64_payload(stats: &LwcColumnStats, row_count: usize, unit: usize) -> usize {
+    let flat = mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * unit;
+    if !stats.initialized {
+        return flat;
+    }
+    let range = stats.max_i64.wrapping_sub(stats.min_i64) as u64;
+    estimate_bitpacked_size(range, row_count, unit, flat).min(flat)
+}
+
+fn estimate_u64_payload(stats: &LwcColumnStats, row_count: usize, unit: usize) -> usize {
+    let flat = mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * unit;
+    if !stats.initialized {
+        return flat;
+    }
+    let range = stats.max_u64.wrapping_sub(stats.min_u64);
+    estimate_bitpacked_size(range, row_count, unit, flat).min(flat)
+}
+
+fn estimate_bitpacked_size(range: u64, row_count: usize, unit: usize, flat: usize) -> usize {
+    let bits = if range < (1 << 1) {
+        1
+    } else if range < (1 << 2) {
+        2
+    } else if range < (1 << 4) {
+        4
+    } else if range < (1 << 8) {
+        if unit <= 1 {
+            return flat;
+        }
+        8
+    } else if range < (1 << 16) {
+        if unit <= 2 {
+            return flat;
+        }
+        16
+    } else if range < (1 << 32) {
+        if unit <= 4 {
+            return flat;
+        }
+        32
+    } else {
+        return flat;
+    };
+    mem::size_of::<u8>()
+        + mem::size_of::<u8>()
+        + mem::size_of::<u64>()
+        + unit
+        + (row_count * bits).div_ceil(8)
+}
+
 pub struct LwcPrimitiveDeser<T>(pub Vec<T>);
 
 impl<T: Deser + BitPackable> Deser for LwcPrimitiveDeser<T> {
@@ -845,6 +1367,7 @@ impl Ser<'_> for LwcBytesSer {
     }
 }
 
+#[derive(Debug)]
 pub struct LwcNullBitmap<'a> {
     bytes: &'a [u8],
 }
@@ -1076,6 +1599,11 @@ fn read_i8(input: &[u8]) -> Result<(i8, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::row::{Delete, InsertRow, RowPage};
+    use crate::value::{MemVar, Val};
+    use ordered_float::OrderedFloat;
+    use std::mem::MaybeUninit;
 
     #[test]
     fn test_lwc_primitive_serde() {
@@ -1373,5 +1901,254 @@ mod tests {
         assert!(bitmap.is_null(8));
         assert!(!bitmap.is_null(0));
         assert!(!bitmap.is_null(2));
+    }
+
+    #[test]
+    fn test_lwc_builder_from_row_page() {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::NULLABLE),
+            ],
+            vec![],
+        );
+        let mut page: RowPage = unsafe { MaybeUninit::zeroed().assume_init() };
+        page.init(100, 20, &metadata);
+
+        let mut expected_rows = Vec::new();
+        for offset in 0..10u64 {
+            let row_id = 100 + offset;
+            let c0 = Val::U8(offset as u8);
+            let c1 = if offset % 2 == 0 {
+                Val::Null
+            } else {
+                Val::I16(offset as i16)
+            };
+            let res = page.insert(&metadata, &[c0, c1]);
+            assert!(matches!(res, InsertRow::Ok(_)));
+            expected_rows.push((
+                row_id,
+                offset as u8,
+                if offset % 2 == 0 {
+                    None
+                } else {
+                    Some(offset as i16)
+                },
+            ));
+        }
+
+        assert!(matches!(page.delete(102), Delete::Ok));
+        assert!(matches!(page.delete(105), Delete::Ok));
+        expected_rows.retain(|(row_id, _, _)| *row_id != 102 && *row_id != 105);
+
+        let mut builder = LwcBuilder::new(&metadata);
+        assert!(builder.is_empty());
+        assert!(builder.row_count() == 0);
+        let appended = builder.append_row_page(&page).unwrap();
+        assert!(appended);
+        let buf = builder.build().unwrap();
+
+        let mut bytes = [0u8; 65536];
+        bytes[..buf.data().len()].copy_from_slice(buf.data());
+        let lwc_page = unsafe { std::mem::transmute::<&[u8; 65536], &LwcPage>(&bytes) };
+        assert_eq!(lwc_page.header.row_count() as usize, expected_rows.len());
+        assert_eq!(
+            lwc_page.header.first_row_id(),
+            expected_rows.first().unwrap().0
+        );
+        assert_eq!(
+            lwc_page.header.last_row_id(),
+            expected_rows.last().unwrap().0
+        );
+
+        let column0 = lwc_page.column(&metadata, 0).unwrap();
+        let column1 = lwc_page.column(&metadata, 1).unwrap();
+        let data0 = column0.data().unwrap();
+        let data1 = column1.data().unwrap();
+        for (idx, (_row_id, c0, c1)) in expected_rows.iter().enumerate() {
+            assert_eq!(data0.value(idx).unwrap().as_u8().unwrap(), *c0);
+            if let Some(value) = c1 {
+                assert!(!column1.is_null(idx));
+                assert_eq!(data1.value(idx).unwrap().as_i16().unwrap(), *value);
+            } else {
+                assert!(column1.is_null(idx));
+            }
+        }
+    }
+
+    #[test]
+    fn test_lwc_builder_rollback() {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::empty()),
+            ],
+            vec![],
+        );
+        let mut page: RowPage = unsafe { MaybeUninit::zeroed().assume_init() };
+        page.init(1, 4, &metadata);
+
+        for offset in 0..2u64 {
+            let c0 = Val::U8((10 + offset) as u8);
+            let c1 = Val::I16((20 + offset) as i16);
+            assert!(matches!(
+                page.insert(&metadata, &[c0, c1]),
+                InsertRow::Ok(_)
+            ));
+        }
+
+        let mut builder = LwcBuilder::new(&metadata);
+        assert!(builder.append_row_page(&page).unwrap());
+
+        let snapshot = builder.snapshot_state();
+        let expected_row_count = builder.row_count();
+        let expected_row_ids_len = builder.row_ids.len();
+        let expected_stats: Vec<_> = builder
+            .stats
+            .iter()
+            .map(|stat| {
+                let snap = stat.snapshot();
+                (
+                    snap.initialized,
+                    snap.min_i64,
+                    snap.max_i64,
+                    snap.min_u64,
+                    snap.max_u64,
+                )
+            })
+            .collect();
+
+        for offset in 0..2u64 {
+            let c0 = Val::U8((30 + offset) as u8);
+            let c1 = Val::I16((40 + offset) as i16);
+            assert!(matches!(
+                page.insert(&metadata, &[c0, c1]),
+                InsertRow::Ok(_)
+            ));
+        }
+        assert!(builder.append_row_page(&page).unwrap());
+
+        builder.rollback(snapshot);
+
+        assert_eq!(builder.row_count(), expected_row_count);
+        assert_eq!(builder.row_ids.len(), expected_row_ids_len);
+        let restored_stats: Vec<_> = builder
+            .stats
+            .iter()
+            .map(|stat| {
+                let snap = stat.snapshot();
+                (
+                    snap.initialized,
+                    snap.min_i64,
+                    snap.max_i64,
+                    snap.min_u64,
+                    snap.max_u64,
+                )
+            })
+            .collect();
+        assert_eq!(restored_stats, expected_stats);
+    }
+
+    #[test]
+    fn test_lwc_builder_all_column_types() {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec::new("c_i8", ValKind::I8, ColumnAttributes::empty()),
+                ColumnSpec::new("c_u8", ValKind::U8, ColumnAttributes::empty()),
+                ColumnSpec::new("c_i16", ValKind::I16, ColumnAttributes::empty()),
+                ColumnSpec::new("c_u16", ValKind::U16, ColumnAttributes::empty()),
+                ColumnSpec::new("c_i32", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("c_u32", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c_i64", ValKind::I64, ColumnAttributes::empty()),
+                ColumnSpec::new("c_u64", ValKind::U64, ColumnAttributes::empty()),
+                ColumnSpec::new("c_f32", ValKind::F32, ColumnAttributes::empty()),
+                ColumnSpec::new("c_f64", ValKind::F64, ColumnAttributes::empty()),
+                ColumnSpec::new("c_bytes", ValKind::VarByte, ColumnAttributes::empty()),
+            ],
+            vec![],
+        );
+        let mut page: RowPage = unsafe { MaybeUninit::zeroed().assume_init() };
+        page.init(10, 6, &metadata);
+
+        let rows = vec![
+            vec![
+                Val::I8(-1),
+                Val::U8(1),
+                Val::I16(-10),
+                Val::U16(10),
+                Val::I32(-100),
+                Val::U32(100),
+                Val::I64(-1000),
+                Val::U64(1000),
+                Val::F32(OrderedFloat(1.25)),
+                Val::F64(OrderedFloat(2.5)),
+                Val::VarByte(MemVar::inline(b"alpha")),
+            ],
+            vec![
+                Val::I8(2),
+                Val::U8(3),
+                Val::I16(20),
+                Val::U16(30),
+                Val::I32(200),
+                Val::U32(300),
+                Val::I64(2000),
+                Val::U64(3000),
+                Val::F32(OrderedFloat(-4.5)),
+                Val::F64(OrderedFloat(6.75)),
+                Val::VarByte(MemVar::inline(b"beta")),
+            ],
+            vec![
+                Val::I8(4),
+                Val::U8(5),
+                Val::I16(40),
+                Val::U16(50),
+                Val::I32(400),
+                Val::U32(500),
+                Val::I64(4000),
+                Val::U64(5000),
+                Val::F32(OrderedFloat(7.75)),
+                Val::F64(OrderedFloat(-8.125)),
+                Val::VarByte(MemVar::inline(b"gamma")),
+            ],
+        ];
+
+        for row in &rows {
+            assert!(matches!(page.insert(&metadata, row), InsertRow::Ok(_)));
+        }
+
+        let mut builder = LwcBuilder::new(&metadata);
+        assert!(builder.append_row_page(&page).unwrap());
+        let buf = builder.build().unwrap();
+
+        let mut bytes = [0u8; 65536];
+        bytes[..buf.data().len()].copy_from_slice(buf.data());
+        let lwc_page = unsafe { std::mem::transmute::<&[u8; 65536], &LwcPage>(&bytes) };
+        assert_eq!(lwc_page.header.row_count() as usize, rows.len());
+
+        for (col_idx, expected_kind) in [
+            ValKind::I8,
+            ValKind::U8,
+            ValKind::I16,
+            ValKind::U16,
+            ValKind::I32,
+            ValKind::U32,
+            ValKind::I64,
+            ValKind::U64,
+            ValKind::F32,
+            ValKind::F64,
+            ValKind::VarByte,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let column = lwc_page.column(&metadata, col_idx).unwrap();
+            let data = column.data().unwrap();
+            assert_eq!(data.len(), rows.len());
+            for (row_idx, expected_row) in rows.iter().enumerate() {
+                let value = data.value(row_idx).unwrap();
+                assert_eq!(value.kind(), Some(*expected_kind));
+                assert_eq!(value, expected_row[col_idx]);
+            }
+        }
     }
 }

@@ -1097,7 +1097,8 @@ impl RowPageHeader {
             return None;
         }
         let bitmap_len = bitmap_len(self.max_row_count as usize);
-        let start_idx = self.null_bitmap_list_offset as usize + bitmap_len * col_idx;
+        let start_idx =
+            self.null_bitmap_list_offset as usize + bitmap_len * metadata.null_offset(col_idx);
         Some((start_idx, start_idx + bitmap_len))
     }
 

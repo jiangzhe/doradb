@@ -161,6 +161,7 @@ impl LwcPage {
 
 impl BufferPage for LwcPage {}
 
+#[derive(Debug)]
 pub struct LwcColumn<'a> {
     kind: ValKind,
     row_count: usize,
@@ -485,6 +486,10 @@ mod tests {
             vec![],
         );
         let ctx = SerdeCtx::default();
+        let row_ids = [1u64, 2, 3, 4];
+        let row_id_ser = LwcPrimitiveSer::new_u64(&row_ids);
+        let mut row_id_bytes = vec![0u8; row_id_ser.ser_len(&ctx)];
+        row_id_ser.ser(&ctx, &mut row_id_bytes, 0);
         let values = [10u8, 20, 30, 40];
         let lwc_ser = LwcPrimitiveSer::new_u8(&values);
         let mut values_bytes = vec![0u8; lwc_ser.ser_len(&ctx)];
@@ -499,10 +504,11 @@ mod tests {
         let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];
         let page = unsafe { std::mem::transmute::<&mut [u8; 65536], &mut LwcPage>(&mut bytes) };
         let col_offsets_len = mem::size_of::<u16>();
-        let col_start = col_offsets_len;
+        let col_start = col_offsets_len + row_id_bytes.len();
         let col_end = col_start + column_bytes.len();
         page.header = LwcPageHeader::new(1, 4, values.len() as u16, 1, col_start as u16);
         page.body[..col_offsets_len].copy_from_slice(&(col_end as u16).to_le_bytes());
+        page.body[col_offsets_len..col_start].copy_from_slice(&row_id_bytes);
         page.body[col_start..col_end].copy_from_slice(&column_bytes);
 
         let column = page.column(&metadata, 0).unwrap();
