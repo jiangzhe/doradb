@@ -8,14 +8,12 @@ use doradb_storage::index::{BlockIndex, RowLocation};
 use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::ValKind;
 use parking_lot::RwLock;
-use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
-use perfcnt::{AbstractPerfCounter, PerfCounter};
+
 use rand::RngCore;
 use semistr::SemiStr;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use std::time::Instant;
 
 fn main() {
@@ -68,8 +66,7 @@ fn main() {
                     .get_insert_page(engine.data_pool, args.rows_per_page)
                     .await;
             }
-            let mut perf_monitor = PerfMonitor::new();
-            perf_monitor.start();
+            let start = Instant::now();
 
             let stop = Arc::new(AtomicBool::new(false));
             let mut handles = vec![];
@@ -90,27 +87,16 @@ fn main() {
                 total_count += count;
                 total_sum_page_id += sum_page_id;
             }
-            let perf_stats = perf_monitor.stop();
+            let dur = start.elapsed();
 
-            let qps = total_count as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-            let op_nanos =
-                perf_stats.dur.as_nanos() as f64 * args.threads as f64 / total_count as f64;
+            let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / total_count as f64;
             println!(
-                "block_index: threads={}, dur={}ms, total_count={}, sum_page_id={}, qps={:.2}, op={:.2}ns",
+                "block_index: threads={}, dur={}ms, total_count={}, sum_page_id={}, op={:.2}ns",
                 args.threads,
-                perf_stats.dur.as_millis(),
+                dur.as_millis(),
                 total_count,
                 total_sum_page_id,
-                qps,
                 op_nanos
-            );
-            println!(
-                "block_index: cache_refs={:.2}, cache_misses={:.2}, cycles={:.2}, instructions={:.2}, branch_misses={:.2}",
-                perf_stats.cache_refs as f64,
-                perf_stats.cache_misses as f64,
-                perf_stats.cycles as f64,
-                perf_stats.instructions as f64,
-                perf_stats.branch_misses as f64
             );
         }
         drop(engine);
@@ -136,8 +122,7 @@ fn bench_btreemap(args: Args) {
 
     let btreemap = Box::leak(Box::new(btreemap));
     {
-        let mut perf_monitor = PerfMonitor::new();
-        perf_monitor.start();
+        let start = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
         let mut handles = vec![];
         for _ in 0..args.threads {
@@ -153,25 +138,15 @@ fn bench_btreemap(args: Args) {
             total_count += count;
             total_sum_page_id += sum_page_id;
         }
-        let perf_stats = perf_monitor.stop();
-        let qps = total_count as f64 * 1_000_000_000f64 / perf_stats.dur.as_nanos() as f64;
-        let op_nanos = perf_stats.dur.as_nanos() as f64 * args.threads as f64 / total_count as f64;
+        let dur = start.elapsed();
+        let op_nanos = dur.as_nanos() as f64 * args.threads as f64 / total_count as f64;
         println!(
-            "btreemap: threads={}, dur={}ms, total_count={}, sum_page_id={}, qps={:.2}, op={:.2}ns",
+            "btreemap: threads={}, dur={}ms, total_count={}, sum_page_id={}, op={:.2}ns",
             args.threads,
-            perf_stats.dur.as_millis(),
+            dur.as_millis(),
             total_count,
             total_sum_page_id,
-            qps,
             op_nanos
-        );
-        println!(
-            "btreemap: cache_refs={:.2}, cache_misses={:.2}, cycles={:.2}, instructions={:.2}, branch_misses={:.2}",
-            perf_stats.cache_refs as f64,
-            perf_stats.cache_misses as f64,
-            perf_stats.cycles as f64,
-            perf_stats.instructions as f64,
-            perf_stats.branch_misses as f64
         );
     }
     unsafe {
@@ -240,126 +215,7 @@ fn worker_btreemap(
     (count, sum_page_id)
 }
 
-struct PerfMonitor {
-    cache_refs: Option<PerfCounter>,
-    cache_misses: Option<PerfCounter>,
-    cycles: Option<PerfCounter>,
-    instructions: Option<PerfCounter>,
-    branch_misses: Option<PerfCounter>,
-    start: Option<Instant>,
-}
 
-impl PerfMonitor {
-    #[inline]
-    pub fn new() -> PerfMonitor {
-        let pid = std::process::id() as i32;
-        let cache_refs = Builder::from_hardware_event(Hardware::CacheReferences)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        let cache_misses = Builder::from_hardware_event(Hardware::CacheMisses)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        let cycles = Builder::from_hardware_event(Hardware::CPUCycles)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        let instructions = Builder::from_hardware_event(Hardware::Instructions)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        let branch_misses = Builder::from_hardware_event(Hardware::BranchMisses)
-            .for_pid(pid)
-            .finish()
-            .ok();
-        PerfMonitor {
-            cache_refs,
-            cache_misses,
-            cycles,
-            instructions,
-            branch_misses,
-            start: None,
-        }
-    }
-
-    #[inline]
-    pub fn start(&mut self) {
-        if let Some(cache_refs) = self.cache_refs.as_mut() {
-            cache_refs.start().unwrap();
-        }
-        if let Some(cache_misses) = self.cache_misses.as_mut() {
-            cache_misses.start().unwrap();
-        }
-        if let Some(cycles) = self.cycles.as_mut() {
-            cycles.start().unwrap();
-        }
-        if let Some(instructions) = self.instructions.as_mut() {
-            instructions.start().unwrap();
-        }
-        if let Some(branch_misses) = self.branch_misses.as_mut() {
-            branch_misses.start().unwrap();
-        }
-        self.start = Some(Instant::now());
-    }
-
-    #[inline]
-    pub fn stop(&mut self) -> PerfStats {
-        if let Some(cache_refs) = self.cache_refs.as_mut() {
-            cache_refs.stop().unwrap();
-        }
-        if let Some(cache_misses) = self.cache_misses.as_mut() {
-            cache_misses.stop().unwrap();
-        }
-        if let Some(cycles) = self.cycles.as_mut() {
-            cycles.stop().unwrap();
-        }
-        if let Some(instructions) = self.instructions.as_mut() {
-            instructions.stop().unwrap();
-        }
-        if let Some(branch_misses) = self.branch_misses.as_mut() {
-            branch_misses.stop().unwrap();
-        }
-        let dur = self.start.take().unwrap().elapsed();
-        PerfStats {
-            cache_refs: self
-                .cache_refs
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            cache_misses: self
-                .cache_misses
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            cycles: self
-                .cycles
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            instructions: self
-                .instructions
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            branch_misses: self
-                .branch_misses
-                .as_mut()
-                .and_then(|p| p.read().ok())
-                .unwrap_or_default(),
-            dur,
-        }
-    }
-}
-
-struct PerfStats {
-    cache_refs: u64,
-    cache_misses: u64,
-    cycles: u64,
-    instructions: u64,
-    branch_misses: u64,
-    dur: Duration,
-}
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
