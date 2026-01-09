@@ -36,7 +36,8 @@ blake3 = "1.8"
 ordered-float = {version = "5.1", features = ["serde"] }
 
 [features]
-default = []
+default = ["libaio"]
+libaio = []
 mlock = []
 
 [dev-dependencies]
