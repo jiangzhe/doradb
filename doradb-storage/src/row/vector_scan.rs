@@ -340,6 +340,7 @@ pub enum ValArrayRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitmap::Bitmap;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
     use crate::row::tests::create_row_page;
     use crate::row::{Delete, InsertRow};
@@ -453,5 +454,227 @@ mod tests {
         assert!(scanner.len() == 98);
         scanner.clear();
         assert!(scanner.is_empty());
+    }
+
+    #[test]
+    fn test_scan_buffer_truncate_all_types() {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec {
+                    column_name: SemiStr::new("c1"),
+                    column_type: ValKind::I8,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c2"),
+                    column_type: ValKind::U8,
+                    column_attributes: ColumnAttributes::NULLABLE,
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c3"),
+                    column_type: ValKind::I16,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c4"),
+                    column_type: ValKind::U16,
+                    column_attributes: ColumnAttributes::NULLABLE,
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c5"),
+                    column_type: ValKind::I32,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c6"),
+                    column_type: ValKind::U32,
+                    column_attributes: ColumnAttributes::NULLABLE,
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c7"),
+                    column_type: ValKind::F32,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c8"),
+                    column_type: ValKind::I64,
+                    column_attributes: ColumnAttributes::NULLABLE,
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c9"),
+                    column_type: ValKind::U64,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c10"),
+                    column_type: ValKind::F64,
+                    column_attributes: ColumnAttributes::NULLABLE,
+                },
+                ColumnSpec {
+                    column_name: SemiStr::new("c11"),
+                    column_type: ValKind::VarByte,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+            ],
+            vec![],
+        );
+        let mut page = create_row_page();
+        page.init(0, 5, &metadata);
+        for row_id in 0u64..5 {
+            let row_idx = row_id as usize;
+            let row_bytes = format!("row-{row_id}");
+            let insert = vec![
+                Val::I8(row_idx as i8),
+                if matches!(row_idx, 0 | 3) {
+                    Val::Null
+                } else {
+                    Val::U8(10 + row_idx as u8)
+                },
+                Val::I16(-10 - row_idx as i16),
+                if matches!(row_idx, 2 | 3) {
+                    Val::Null
+                } else {
+                    Val::U16(100 + row_idx as u16)
+                },
+                Val::I32(-1000 - row_idx as i32),
+                if matches!(row_idx, 1 | 4) {
+                    Val::Null
+                } else {
+                    Val::U32(1000 + row_idx as u32)
+                },
+                Val::from(1.5f32 + row_idx as f32),
+                if matches!(row_idx, 0 | 2 | 4) {
+                    Val::Null
+                } else {
+                    Val::I64(-5000 - row_idx as i64)
+                },
+                Val::U64(5000 + row_idx as u64),
+                if row_idx == 3 {
+                    Val::Null
+                } else {
+                    Val::from(10.5f64 + row_idx as f64)
+                },
+                Val::from(row_bytes.as_bytes()),
+            ];
+            let res = page.insert(&metadata, &insert);
+            if let InsertRow::Ok(rid) = res {
+                assert_eq!(rid, row_id);
+            } else {
+                panic!("insert failed");
+            }
+        }
+        let mut scanner = ScanBuffer::new(&metadata, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let view = page.vector_view(&metadata);
+        scanner.scan(view).unwrap();
+        assert_eq!(scanner.len(), 5);
+
+        scanner.truncate(3);
+        assert_eq!(scanner.len(), 3);
+
+        let col_i8 = scanner.column(0).unwrap();
+        match col_i8.values {
+            ScanColumnValues::I8(vals) => assert_eq!(vals, &[0, 1, 2]),
+            _ => panic!("unexpected i8 column type"),
+        }
+
+        let col_u8 = scanner.column(1).unwrap();
+        match col_u8.values {
+            ScanColumnValues::U8(vals) => assert_eq!(vals.len(), 3),
+            _ => panic!("unexpected u8 column type"),
+        }
+        let null_bitmap = col_u8.null_bitmap.expect("u8 null bitmap");
+        assert!(null_bitmap.bitmap_get(0));
+        assert!(!null_bitmap.bitmap_get(1));
+        assert!(!null_bitmap.bitmap_get(2));
+        assert!(!null_bitmap.bitmap_get(3));
+
+        let col_i16 = scanner.column(2).unwrap();
+        match col_i16.values {
+            ScanColumnValues::I16(vals) => assert_eq!(vals, &[-10, -11, -12]),
+            _ => panic!("unexpected i16 column type"),
+        }
+
+        let col_u16 = scanner.column(3).unwrap();
+        match col_u16.values {
+            ScanColumnValues::U16(vals) => assert_eq!(vals.len(), 3),
+            _ => panic!("unexpected u16 column type"),
+        }
+        let null_bitmap = col_u16.null_bitmap.expect("u16 null bitmap");
+        assert!(!null_bitmap.bitmap_get(0));
+        assert!(!null_bitmap.bitmap_get(1));
+        assert!(null_bitmap.bitmap_get(2));
+        assert!(!null_bitmap.bitmap_get(3));
+
+        let col_i32 = scanner.column(4).unwrap();
+        match col_i32.values {
+            ScanColumnValues::I32(vals) => assert_eq!(vals, &[-1000, -1001, -1002]),
+            _ => panic!("unexpected i32 column type"),
+        }
+
+        let col_u32 = scanner.column(5).unwrap();
+        match col_u32.values {
+            ScanColumnValues::U32(vals) => assert_eq!(vals.len(), 3),
+            _ => panic!("unexpected u32 column type"),
+        }
+        let null_bitmap = col_u32.null_bitmap.expect("u32 null bitmap");
+        assert!(!null_bitmap.bitmap_get(0));
+        assert!(null_bitmap.bitmap_get(1));
+        assert!(!null_bitmap.bitmap_get(2));
+        assert!(!null_bitmap.bitmap_get(3));
+
+        let col_f32 = scanner.column(6).unwrap();
+        match col_f32.values {
+            ScanColumnValues::F32(vals) => {
+                let expected = [1.5f32, 2.5f32, 3.5f32];
+                for (idx, val) in vals.iter().enumerate() {
+                    assert!((*val - expected[idx]).abs() <= f32::EPSILON);
+                }
+            }
+            _ => panic!("unexpected f32 column type"),
+        }
+
+        let col_i64 = scanner.column(7).unwrap();
+        match col_i64.values {
+            ScanColumnValues::I64(vals) => assert_eq!(vals.len(), 3),
+            _ => panic!("unexpected i64 column type"),
+        }
+        let null_bitmap = col_i64.null_bitmap.expect("i64 null bitmap");
+        assert!(null_bitmap.bitmap_get(0));
+        assert!(!null_bitmap.bitmap_get(1));
+        assert!(null_bitmap.bitmap_get(2));
+        assert!(!null_bitmap.bitmap_get(3));
+
+        let col_u64 = scanner.column(8).unwrap();
+        match col_u64.values {
+            ScanColumnValues::U64(vals) => assert_eq!(vals, &[5000, 5001, 5002]),
+            _ => panic!("unexpected u64 column type"),
+        }
+
+        let col_f64 = scanner.column(9).unwrap();
+        match col_f64.values {
+            ScanColumnValues::F64(vals) => assert_eq!(vals.len(), 3),
+            _ => panic!("unexpected f64 column type"),
+        }
+        let null_bitmap = col_f64.null_bitmap.expect("f64 null bitmap");
+        assert!(!null_bitmap.bitmap_get(0));
+        assert!(!null_bitmap.bitmap_get(1));
+        assert!(!null_bitmap.bitmap_get(2));
+        assert!(!null_bitmap.bitmap_get(3));
+
+        let col_varbyte = scanner.column(10).unwrap();
+        match col_varbyte.values {
+            ScanColumnValues::VarByte { offsets, data } => {
+                assert_eq!(offsets.len(), 3);
+                let values: Vec<Vec<u8>> = offsets
+                    .iter()
+                    .map(|(start, end)| data[*start..*end].to_vec())
+                    .collect();
+                assert_eq!(
+                    values,
+                    vec![b"row-0".to_vec(), b"row-1".to_vec(), b"row-2".to_vec()]
+                );
+            }
+            _ => panic!("unexpected varbyte column type"),
+        }
     }
 }
