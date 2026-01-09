@@ -1,0 +1,34 @@
+description = "Write a RFC document"
+prompt = """
+## Goal
+
+Write a RFC(Request For Change) document for the change:
+{{args}}
+
+This change may have one or more impact(s) as below:
+- Require modifying many existing codes.
+- Generate a new module with lots of codes.
+- Process logic changes or become complicated.
+
+So before diving into the solution, have a good understanding of overall design and current implementation.
+
+## Workflow
+
+1. Understand the technical background.
+Read general design documents in `docs/`:
+- `docs/architecture.md`
+- `docs/transaction-system.md`
+- `docs/index-design.md`
+- `docs/checkpoint-and-recovery.md`
+- `docs/table-file.md`
+
+2. Research the codebase to know current relevant implementation and analyze impacts.
+
+3. Read the RFC template file to get an understanding of RFC document structure.
+    - `docs/rfcs/0000-template.md`
+
+4. Write the RFC document.
+    - RFC name should be simple and concise.
+    - Follow closely to the structure of template file.
+    - Use next number in the directory.
+"""

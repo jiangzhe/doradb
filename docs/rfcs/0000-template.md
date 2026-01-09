@@ -3,19 +3,10 @@ id: 0000
 title: RFC Title
 status: proposal  # proposal | accepted | implemented | superseded
 tags: []
-feature-flag: feature-name
 created: YYYY-MM-DD
-accepted:
-implemented:
-spec-sections: []
-superseded-by:
 ---
 
 # RFC-0000: Title
-
-## Status
-
-Proposal
 
 ## Summary
 
@@ -23,16 +14,23 @@ One paragraph explaining the decision.
 
 ## Context
 
-Why is this decision needed? What problem does it solve?
+What problem does it solve?
+Why is this decision needed?
 
 ## Decision
 
-What we're going to do. Technical details, syntax, semantics, etc.
+What we're going to do. Technical details, process flow, data structure, etc.
 
 ## Implementation Phases
 
-- [ ] **Phase 1: Name** - issue-XXX
-- [ ] **Phase 2: Name** - issue-XXX
+- [ ] **Phase 1: Name**
+
+Description of this phase, should be equivalent to a simple task.
+Focus on the scope of this task: context, goals, non-goals.
+
+- [ ] **Phase 2: Name**
+
+...
 
 ## Consequences
 
@@ -44,7 +42,7 @@ What we're going to do. Technical details, syntax, semantics, etc.
 
 ## Open Questions
 
-- Question 1?
+List open questions which may not be solved easily.
 
 ## Future Work
 
