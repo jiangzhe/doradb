@@ -836,8 +836,7 @@ impl TestSys {
             .data_buffer(
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024)
-                    .file_path("databuffer_testsys.bin"),
+                    .max_file_size(128u64 * 1024 * 1024),
             )
             .trx(
                 TrxSysConfig::default()

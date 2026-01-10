@@ -325,7 +325,7 @@ mod tests {
             let engine = EngineConfig::default()
                 .main_dir(main_dir)
                 .data_buffer(
-                    EvictableBufferPoolConfig::default().file_path("databuffer_secidx1.bin"),
+                    EvictableBufferPoolConfig::default(),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -427,7 +427,7 @@ mod tests {
             let engine = EngineConfig::default()
                 .main_dir(main_dir)
                 .data_buffer(
-                    EvictableBufferPoolConfig::default().file_path("databuffer_secidx2.bin"),
+                    EvictableBufferPoolConfig::default(),
                 )
                 .trx(
                     TrxSysConfig::default()

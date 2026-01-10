@@ -406,8 +406,7 @@ mod tests {
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .file_path("databuffer_recover.bin"),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -432,8 +431,7 @@ mod tests {
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .file_path("databuffer_recover.bin"),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -477,8 +475,7 @@ mod tests {
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .file_path("databuffer_recover.bin"),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -510,8 +507,7 @@ mod tests {
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .file_path("databuffer_recover.bin"),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -601,8 +597,7 @@ mod tests {
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .file_path("databuffer_recover.bin"),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()

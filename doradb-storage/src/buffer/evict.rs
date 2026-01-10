@@ -1430,11 +1430,10 @@ mod tests {
     fn test_evict_buffer_pool_simple() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let file_path = temp_dir.path().join("data1.bin");
             let pool = EvictableBufferPoolConfig::default()
+                .with_main_dir(temp_dir.path())
                 .max_mem_size(1024u64 * 1024 * 128)
                 .max_file_size(1024u64 * 1024 * 256)
-                .file_path(file_path.to_string_lossy().to_string())
                 .build_static()
                 .unwrap();
             {
@@ -1495,11 +1494,10 @@ mod tests {
     fn test_evict_buffer_pool_full() {
         // 100 in-mem pages and 200 total pages.
         let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("data2.bin");
         let pool: &EvictableBufferPool = EvictableBufferPoolConfig::default()
+            .with_main_dir(temp_dir.path())
             .max_mem_size(64u64 * 1024 * 130)
             .max_file_size(128u64 * 1024 * 130)
-            .file_path(file_path.to_string_lossy().to_string())
             .build_static()
             .unwrap();
 
@@ -1543,11 +1541,10 @@ mod tests {
     fn test_evict_buffer_pool_alloc() {
         // max pages 16k, max in-mem 1k
         let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("data3.bin");
         let pool = EvictableBufferPoolConfig::default()
+            .with_main_dir(temp_dir.path())
             .max_mem_size(1024u64 * 1024 * 64)
             .max_file_size(1024u64 * 1024 * 128)
-            .file_path(file_path.to_string_lossy().to_string())
             .build_static()
             .unwrap();
 
@@ -1571,11 +1568,10 @@ mod tests {
         use rand::{Rng, prelude::IndexedRandom};
         // max pages 2k, max in-mem 1k
         let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("data4.bin");
         let pool = EvictableBufferPoolConfig::default()
+            .with_main_dir(temp_dir.path())
             .max_mem_size(64u64 * 1024 * 1024)
             .max_file_size(64u64 * 1024 * 2048)
-            .file_path(file_path.to_string_lossy().to_string())
             .build_static()
             .unwrap();
 
