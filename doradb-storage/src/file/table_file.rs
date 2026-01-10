@@ -614,6 +614,8 @@ mod tests {
     use crate::io::AIOBuf;
     use crate::value::ValKind;
 
+    // libaio is required to test table file.
+    #[cfg(feature = "libaio")]
     #[test]
     fn test_table_file() {
         smol::block_on(async {
@@ -665,6 +667,8 @@ mod tests {
         });
     }
 
+    // libaio is required to test table file.
+    #[cfg(feature = "libaio")]
     #[test]
     fn test_table_file_system() {
         smol::block_on(async {

@@ -1,0 +1,17 @@
+description = "File a github issue"
+prompt = """
+## Goal
+
+File a github issue base on the task or RFC document:
+{{args}}
+
+## Workflow
+
+1. Read `docs/process/issue-tracking.md` to get understanding of issue tracking system of this project.
+
+2. For task only: file a github issue with label "type:task".
+    Explicitly ask for user approval before submitting the issue.
+
+3. For RFC only: Follow the Epic/Sub-issue pattern to submitting series of issues.
+    Explicitly ask for user approval before submitting each issue.
+"""

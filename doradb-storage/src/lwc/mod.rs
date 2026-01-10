@@ -299,8 +299,13 @@ pub trait LwcPrimitiveData {
     type Iter: Iterator<Item = Self::Value>;
 
     /// Returns total number of values.
-    #[allow(clippy::len_without_is_empty)]
     fn len(&self) -> usize;
+
+    /// Returns whether this data is empty.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Returns value at given position.
     /// None if index is out of range.
@@ -1034,11 +1039,11 @@ fn estimate_row_ids_size(row_ids: &[RowID]) -> usize {
             let packed = mem::size_of::<u8>() + fbp.ser_len(&SerdeCtx::default());
             let flat = mem::size_of::<u8>()
                 + mem::size_of::<u64>()
-                + row_ids.len() * mem::size_of::<u64>();
+                + mem::size_of_val(row_ids);
             if packed < flat { packed } else { flat }
         }
         None => {
-            mem::size_of::<u8>() + mem::size_of::<u64>() + row_ids.len() * mem::size_of::<u64>()
+            mem::size_of::<u8>() + mem::size_of::<u64>() + mem::size_of_val(row_ids)
         }
     }
 }
@@ -1050,7 +1055,8 @@ fn estimate_columns_size(
     row_count: usize,
 ) -> Result<usize> {
     let mut total = 0usize;
-    for col_idx in 0..metadata.col_count() {
+    debug_assert!(stats.len() == metadata.col_count());
+    for (col_idx, st) in stats.iter().enumerate() {
         let column = buffer.column(col_idx).ok_or(Error::InvalidColumnScan)?;
         if column.null_bitmap.is_some() {
             total += mem::size_of::<u16>() + row_count.div_ceil(8);
@@ -1058,7 +1064,7 @@ fn estimate_columns_size(
         total += estimate_column_payload(
             metadata.val_kind(col_idx),
             &column.values,
-            &stats[col_idx],
+            st,
             row_count,
         )?;
     }

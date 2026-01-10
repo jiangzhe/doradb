@@ -36,7 +36,8 @@ blake3 = "1.8"
 ordered-float = {version = "5.1", features = ["serde"] }
 
 [features]
-default = []
+default = ["libaio"]
+libaio = []
 mlock = []
 
 [dev-dependencies]
@@ -47,8 +48,7 @@ clap = { version = "4.5", features = ["derive"] }
 easy-parallel = "3.3"
 humantime = "2.1"
 criterion = { version = "0.5", features = ["html_reports"] }
-criterion-perf-events = "0.4"
-perfcnt = "0.8"
+
 fastrand = "2"
 tikv-jemallocator = "0.6"
 bplustree = "0.1.0"

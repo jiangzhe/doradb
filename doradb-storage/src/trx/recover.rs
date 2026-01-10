@@ -380,7 +380,8 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
     }
 }
 
-#[cfg(test)]
+// libaio is required for recovery test.
+#[cfg(all(test, feature = "libaio"))]
 mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::{

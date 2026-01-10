@@ -1409,7 +1409,8 @@ pub enum PoolRequest {
     BatchWrite(Vec<PageExclusiveGuard<Page>>),
 }
 
-#[cfg(test)]
+// libaio is required for evict buffer pool testing.
+#[cfg(all(test, feature="libaio"))]
 mod tests {
     use super::*;
     use crate::row::RowPage;

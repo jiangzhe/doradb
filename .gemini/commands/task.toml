@@ -1,0 +1,30 @@
+description = "write a task document"
+prompt = """
+## Goal
+
+Write a task document of following issue or feature: 
+{{args}}
+
+This task should be not very complex.
+If in the workflow, you find it's too complicated to do in a task, you should stop and suggest user to start a RFC process for large change as it's more suitable.
+
+## Workflow
+
+1. Understand the technical background.
+You may want to read one or more document(s) related to this task in `docs/`:
+- `docs/architecture.md`
+- `docs/transaction-system.md`
+- `docs/index-design.md`
+- `docs/checkpoint-and-recovery.md`
+- `docs/table-file.md`
+
+2. Research the codebase to know current relevant implementation and analyze impacts.
+
+3. Read the task template file to get an understanding of task document structure.
+    - `docs/tasks/000000-template.md`
+
+4. Write the task document.
+    - Task name should be simple and concise.
+    - Follow closely to the structure of template file.
+    - Use next number in the directory.
+"""

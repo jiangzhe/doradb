@@ -525,7 +525,8 @@ impl PurgeExecutor {
     }
 }
 
-#[cfg(test)]
+// libaio is required for purge test
+#[cfg(all(test, feature = "libaio"))]
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;

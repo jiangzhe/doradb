@@ -751,7 +751,8 @@ pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T
     )
 }
 
-#[cfg(test)]
+// libaio is required for io test.
+#[cfg(all(test, feature = "libaio"))]
 mod tests {
     use super::*;
     use crate::file::{FixedSizeBufferFreeList, SparseFile};

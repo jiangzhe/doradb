@@ -1192,7 +1192,8 @@ impl BlockIndexMemCursor<'_> {
     }
 }
 
-#[cfg(test)]
+// libaio is required for block index test.
+#[cfg(all(test, feature = "libaio"))]
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
