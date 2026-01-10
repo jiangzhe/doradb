@@ -305,7 +305,8 @@ impl PartitionMultiKeyIndex {
     }
 }
 
-#[cfg(test)]
+// libaio is required for secondary index test.
+#[cfg(all(test, feature = "libaio"))]
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
