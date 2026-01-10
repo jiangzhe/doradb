@@ -392,15 +392,17 @@ mod tests {
     use crate::row::ops::{SelectKey, UpdateCol};
     use crate::table::TableAccess;
     use crate::trx::sys_conf::TrxSysConfig;
-    use crate::trx::tests::remove_files;
     use crate::value::Val;
     use crate::value::ValKind;
+    use tempfile::TempDir;
 
     #[test]
     fn test_log_recover_empty() {
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -417,19 +419,16 @@ mod tests {
                 .unwrap();
 
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_recover.bin");
-            remove_files("recover1*");
-            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_log_recover_ddl() {
         smol::block_on(async {
-            remove_files("*.tbl");
-            remove_files("recover2*");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -474,6 +473,7 @@ mod tests {
 
             // second recovery.
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -492,9 +492,6 @@ mod tests {
             assert!(engine.catalog().get_table(table_id).await.is_some());
 
             drop(engine);
-            let _ = std::fs::remove_file("databuffer_recover.bin");
-            remove_files("recover2*");
-            remove_files("*.tbl");
         })
     }
 
@@ -506,9 +503,10 @@ mod tests {
             const UPD_STEP: usize = 11;
             const DEL_STEP: usize = 13;
 
-            remove_files("*.tbl");
-            remove_files("recover3*");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -599,6 +597,7 @@ mod tests {
 
             // second recovery.
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -626,9 +625,6 @@ mod tests {
             assert_eq!(rows, DML_SIZE - (DML_SIZE / DEL_STEP + 1));
 
             drop(engine);
-            let _ = std::fs::remove_file("databuffer_recover.bin");
-            remove_files("recover3*");
-            remove_files("*.tbl");
         })
     }
 }

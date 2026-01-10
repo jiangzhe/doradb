@@ -1201,15 +1201,17 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::lifetime::StaticLifetime;
     use crate::trx::sys_conf::TrxSysConfig;
-    use crate::trx::tests::remove_files;
     use crate::value::ValKind;
     use semistr::SemiStr;
+    use tempfile::TempDir;
 
     #[test]
     fn test_block_index_free_list() {
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1252,18 +1254,16 @@ mod tests {
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_bi.bin");
-            remove_files("redo_bi*");
-            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_block_index_insert_row_page() {
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1306,20 +1306,18 @@ mod tests {
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_bi.bin");
-            remove_files("redo_bi*");
-            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_block_index_cursor_shared() {
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let row_pages = 1024usize;
             // allocate 100MB buffer pool is enough: 1024 pages ~= 64MB
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(100usize * 1024 * 1024)
@@ -1386,10 +1384,6 @@ mod tests {
                 assert!(count == (row_pages + row_pages_per_leaf - 1) / row_pages_per_leaf);
             }
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_bi.bin");
-            remove_files("redo_bi*");
-            remove_files("*.tbl");
         })
     }
 
@@ -1400,12 +1394,14 @@ mod tests {
     #[test]
     fn test_block_index_search() {
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             // at least we need a two-level block index to search.
             // todo: add test hook to avoid expensive memory allocation of row pages.
             let row_pages = 5000usize;
             let rows_per_page = 100usize;
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(100usize * 1024 * 1024)
@@ -1477,19 +1473,17 @@ mod tests {
                 }
             }
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_bi.bin");
-            remove_files("redo_bi*");
-            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_block_index_log() {
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let rows_per_page = 100;
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1529,17 +1523,12 @@ mod tests {
                 // todo: analyze log to see the log is persisted.
             }
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_bi.bin");
-            remove_files("redo_bi*");
-            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_block_index_split() {
         smol::block_on(async {
-            remove_files("*.tbl");
             let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
             {
                 let blk_idx =

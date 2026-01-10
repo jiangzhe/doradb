@@ -5,8 +5,8 @@ use crate::session::Session;
 use crate::table::{Table, TableAccess};
 use crate::trx::ActiveTrx;
 use crate::trx::sys_conf::TrxSysConfig;
-use crate::trx::tests::remove_files;
 use crate::value::Val;
+use tempfile::TempDir;
 
 #[test]
 fn test_mvcc_insert_normal() {
@@ -821,6 +821,7 @@ fn test_table_freeze() {
 struct TestSys {
     engine: Engine,
     table: Table,
+    _temp_dir: TempDir,
 }
 
 impl TestSys {
@@ -828,7 +829,10 @@ impl TestSys {
     async fn new_evictable() -> Self {
         use crate::catalog::tests::table2;
         // 64KB * 16
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_string_lossy().to_string();
         let engine = EngineConfig::default()
+            .main_dir(main_dir)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(64u64 * 1024 * 1024)
@@ -845,7 +849,11 @@ impl TestSys {
             .unwrap();
         let table_id = table2(&engine).await;
         let table = engine.catalog().get_table(table_id).await.unwrap();
-        TestSys { engine, table }
+        TestSys {
+            engine,
+            table,
+            _temp_dir: temp_dir,
+        }
     }
 }
 
@@ -853,10 +861,6 @@ impl TestSys {
     #[inline]
     fn clean_all(self) {
         drop(self);
-
-        let _ = std::fs::remove_file("databuffer_testsys.bin");
-        remove_files("redo_testsys*");
-        remove_files("*.tbl");
     }
 
     #[inline]
