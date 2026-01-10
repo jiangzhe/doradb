@@ -7,6 +7,7 @@ use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
 use crate::io::{AIOClient, AIOContext};
 use crate::lifetime::StaticLifetime;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -94,6 +95,13 @@ pub struct TableFileSystemConfig {
 }
 
 impl TableFileSystemConfig {
+    #[inline]
+    pub fn with_main_dir(mut self, main_dir: impl AsRef<Path>) -> Self {
+        let base_dir = main_dir.as_ref().join(&self.base_dir);
+        self.base_dir = base_dir.to_string_lossy().to_string();
+        self
+    }
+
     #[inline]
     pub fn io_depth(mut self, io_depth: usize) -> Self {
         self.io_depth = io_depth;

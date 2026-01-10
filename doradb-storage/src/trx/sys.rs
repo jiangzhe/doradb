@@ -380,24 +380,25 @@ mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::engine::EngineConfig;
-    use crate::trx::tests::remove_files;
     use crate::value::Val;
     use crossbeam_utils::CachePadded;
     use parking_lot::Mutex;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Instant;
+    use tempfile::TempDir;
 
     #[test]
     fn test_transaction_system() {
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024)
-                        .file_path("databuffer_sys.bin"),
+                        .max_file_size(256usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -425,10 +426,6 @@ mod tests {
 
             drop(session);
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_sys.bin");
-            remove_files("redo_trx*");
-            remove_files("*.tbl");
         })
     }
 
@@ -564,13 +561,14 @@ mod tests {
     fn test_single_thread_trx_begin_and_commit() {
         const COUNT: usize = 1000000;
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024)
-                        .file_path("databuffer_trx.bin"),
+                        .max_file_size(256usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -596,10 +594,6 @@ mod tests {
             );
             drop(session);
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_trx.bin");
-            remove_files("redo_trx*");
-            remove_files("*.tbl");
         });
     }
 
@@ -612,13 +606,14 @@ mod tests {
         // be higher and produce more files.
         const COUNT: usize = 2000;
         smol::block_on(async {
-            remove_files("*.tbl");
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024)
-                        .file_path("databuffer_rotate.bin"),
+                        .max_file_size(256usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -646,10 +641,6 @@ mod tests {
             }
             drop(session);
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_rotate.bin");
-            remove_files("redo_rotate*");
-            remove_files("*.tbl");
         });
     }
 }

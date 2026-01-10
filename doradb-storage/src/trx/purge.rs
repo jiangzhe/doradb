@@ -538,9 +538,9 @@ mod tests {
     use crate::row::ops::SelectKey;
     use crate::trx::row::RowReadAccess;
     use crate::trx::sys_conf::TrxSysConfig;
-    use crate::trx::tests::remove_files;
     use crate::value::Val;
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
 
     #[test]
     fn test_active_sts_list() {
@@ -575,12 +575,14 @@ mod tests {
 
         const PURGE_SIZE: usize = 100;
         smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .file_path("databuffer_purge.bin"),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -648,10 +650,6 @@ mod tests {
             }
             drop(session);
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_purge.bin");
-            remove_files("redo_purge*");
-            remove_files("*.tbl");
         });
     }
 
@@ -661,12 +659,14 @@ mod tests {
 
         smol::block_on(async {
             const PURGE_SIZE: usize = 100;
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .file_path("databuffer_purge.bin"),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -764,10 +764,6 @@ mod tests {
             );
             drop(session);
             drop(engine);
-
-            let _ = std::fs::remove_file("databuffer_purge.bin");
-            remove_files("redo_purge*");
-            remove_files("*.tbl");
         });
     }
 }

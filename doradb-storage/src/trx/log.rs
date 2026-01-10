@@ -1069,15 +1069,18 @@ mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table2;
     use crate::engine::EngineConfig;
-    use crate::trx::tests::remove_files;
     use crate::value::Val;
+    use tempfile::TempDir;
 
     #[test]
     fn test_mmap_log_reader() {
         smol::block_on(async {
             const SIZE: i32 = 100;
 
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .trx(
                     TrxSysConfig::default()
                         .log_file_prefix(String::from("mmap_log_reader_redo.log"))
@@ -1086,8 +1089,7 @@ mod tests {
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64u64 * 1024 * 1024)
-                        .max_file_size(128u64 * 1024 * 1024)
-                        .file_path("databuffer_mmap.bin"),
+                        .max_file_size(128u64 * 1024 * 1024),
                 )
                 .build()
                 .await
@@ -1136,11 +1138,6 @@ mod tests {
             println!("total log records {}", log_recs);
 
             drop(engine);
-
-            // remove log file
-            let _ = std::fs::remove_file("databuffer_mmap.bin");
-            remove_files("*mmap_log_reader_redo.log.*");
-            remove_files("*.tbl");
         });
     }
 
@@ -1149,18 +1146,22 @@ mod tests {
         smol::block_on(async {
             const SIZE: i32 = 1000;
 
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let log_prefix = temp_dir.path().join("redo_merger");
+            let log_prefix = log_prefix.to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_merger")
+                        .log_file_prefix(log_prefix.clone())
                         .log_partitions(2)
                         .skip_recovery(true),
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64u64 * 1024 * 1024)
-                        .max_file_size(128u64 * 1024 * 1024)
-                        .file_path("databuffer_mmap.bin"),
+                        .max_file_size(128u64 * 1024 * 1024),
                 )
                 .build()
                 .await
@@ -1208,7 +1209,7 @@ mod tests {
 
             // after the first engine is done, we reopen log files to test log merger.
             let trx_sys_config = TrxSysConfig::default()
-                .log_file_prefix("redo_merger")
+                .log_file_prefix(log_prefix)
                 .log_partitions(2)
                 .skip_recovery(true);
 
@@ -1222,10 +1223,6 @@ mod tests {
             while let Some(log) = log_merger.try_next().unwrap() {
                 println!("header={:?}, payload={:?}", log.header, log.payload);
             }
-            // remove log file
-            let _ = std::fs::remove_file("databuffer_mmap.bin");
-            remove_files("redo_merger*");
-            remove_files("*.tbl");
         });
     }
 }

@@ -315,14 +315,17 @@ mod tests {
     use crate::row::ops::{SelectKey, UpdateCol};
     use crate::table::TableAccess;
     use crate::trx::sys_conf::TrxSysConfig;
-    use crate::trx::tests::remove_files;
+    use tempfile::TempDir;
 
     #[test]
     fn test_secondary_index_common() {
         smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
-                    EvictableBufferPoolConfig::default().file_path("databuffer_secidx1.bin"),
+                    EvictableBufferPoolConfig::default(),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -413,18 +416,18 @@ mod tests {
                 assert!(res.len() == 1);
             }
             drop(engine);
-            let _ = std::fs::remove_file("databuffer_secidx1.bin");
-            remove_files("redo_secidx1*");
-            remove_files("*.tbl");
         })
     }
 
     #[test]
     fn test_secondary_index_rollback() {
         smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
+                .main_dir(main_dir)
                 .data_buffer(
-                    EvictableBufferPoolConfig::default().file_path("databuffer_secidx2.bin"),
+                    EvictableBufferPoolConfig::default(),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -555,9 +558,6 @@ mod tests {
                 assert!(vals[0] == Val::from(3i32) && vals[1] == Val::from(3i32));
             }
             drop(engine);
-            let _ = std::fs::remove_file("databuffer_secidx2.bin");
-            remove_files("redo_secidx2*");
-            remove_files("*.tbl");
         })
     }
 }

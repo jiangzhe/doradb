@@ -27,7 +27,7 @@ The storage engine uses a unique architecture designed for modern hardware and m
 
 ### Prerequisites
 *   **OS**: Linux (Due to `libaio` dependency).
-*   **System Libraries**: `libaio1`, `libaio-dev`.
+*   **System Libraries**: `libaio1`, `libaio-dev` (Required unless building with `--no-default-features`).
     *   Ubuntu/Debian: `sudo apt-get install libaio1 libaio-dev`
 *   **Rust**: Stable toolchain (Edition 2024).
 
@@ -39,11 +39,19 @@ Run these commands from the project root:
     ```bash
     cargo build -p doradb-storage
     ```
+    *To build without `libaio` (e.g., in environments where it cannot be installed):*
+    ```bash
+    cargo build -p doradb-storage --no-default-features
+    ```
 
 *   **Run Tests**:
     **Note**: Tests typically require running in a single thread due to concurrent file/resource access patterns in the test suite.
     ```bash
-    cargo test -p doradb-storage -- --test-threads=1
+    cargo test -p doradb-storage
+    ```
+    *To run tests without `libaio` support:*
+    ```bash
+    cargo test -p doradb-storage --no-default-features
     ```
 
 *   **Run Benchmarks/Examples**:

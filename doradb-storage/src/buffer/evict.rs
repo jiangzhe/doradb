@@ -25,6 +25,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::ops::{Range, RangeFrom, RangeTo};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -1116,6 +1117,13 @@ impl Default for EvictableBufferPoolConfig {
 
 impl EvictableBufferPoolConfig {
     #[inline]
+    pub fn with_main_dir(mut self, main_dir: impl AsRef<Path>) -> Self {
+        let path = main_dir.as_ref().join(&self.file_path);
+        self.file_path = path.to_string_lossy().to_string();
+        self
+    }
+
+    #[inline]
     pub fn file_path(mut self, file_path: impl Into<String>) -> Self {
         self.file_path = file_path.into();
         self
@@ -1416,14 +1424,16 @@ mod tests {
     use crate::row::RowPage;
     use std::thread;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     #[test]
     fn test_evict_buffer_pool_simple() {
         smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
             let pool = EvictableBufferPoolConfig::default()
+                .with_main_dir(temp_dir.path())
                 .max_mem_size(1024u64 * 1024 * 128)
                 .max_file_size(1024u64 * 1024 * 256)
-                .file_path("data1.bin")
                 .build_static()
                 .unwrap();
             {
@@ -1477,17 +1487,17 @@ mod tests {
             unsafe {
                 StaticLifetime::drop_static(pool);
             }
-            let _ = std::fs::remove_file("data1.bin");
         })
     }
 
     #[test]
     fn test_evict_buffer_pool_full() {
         // 100 in-mem pages and 200 total pages.
+        let temp_dir = TempDir::new().unwrap();
         let pool: &EvictableBufferPool = EvictableBufferPoolConfig::default()
+            .with_main_dir(temp_dir.path())
             .max_mem_size(64u64 * 1024 * 130)
             .max_file_size(128u64 * 1024 * 130)
-            .file_path("data2.bin")
             .build_static()
             .unwrap();
 
@@ -1525,16 +1535,16 @@ mod tests {
         unsafe {
             StaticLifetime::drop_static(pool);
         }
-        let _ = std::fs::remove_file("data2.bin");
     }
 
     #[test]
     fn test_evict_buffer_pool_alloc() {
         // max pages 16k, max in-mem 1k
+        let temp_dir = TempDir::new().unwrap();
         let pool = EvictableBufferPoolConfig::default()
+            .with_main_dir(temp_dir.path())
             .max_mem_size(1024u64 * 1024 * 64)
             .max_file_size(1024u64 * 1024 * 128)
-            .file_path("data3.bin")
             .build_static()
             .unwrap();
 
@@ -1551,17 +1561,17 @@ mod tests {
             }
             debug_assert!(pages.len() == 2048);
         });
-        let _ = std::fs::remove_file("data3.bin");
     }
 
     #[test]
     fn test_evict_buffer_pool_multi_threads() {
         use rand::{Rng, prelude::IndexedRandom};
         // max pages 2k, max in-mem 1k
+        let temp_dir = TempDir::new().unwrap();
         let pool = EvictableBufferPoolConfig::default()
+            .with_main_dir(temp_dir.path())
             .max_mem_size(64u64 * 1024 * 1024)
             .max_file_size(64u64 * 1024 * 2048)
-            .file_path("data4.bin")
             .build_static()
             .unwrap();
 
@@ -1625,6 +1635,5 @@ mod tests {
         unsafe {
             StaticLifetime::drop_static(pool);
         }
-        let _ = std::fs::remove_file("data4.bin");
     }
 }
