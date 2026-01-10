@@ -11,6 +11,7 @@ use crate::trx::sys::TransactionSystem;
 use byte_unit::Byte;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::path::Path;
 
 use super::log::list_log_files;
 
@@ -56,6 +57,13 @@ pub struct TrxSysConfig {
 }
 
 impl TrxSysConfig {
+    #[inline]
+    pub fn with_main_dir(mut self, main_dir: impl AsRef<Path>) -> Self {
+        let path = main_dir.as_ref().join(&self.log_file_prefix);
+        self.log_file_prefix = path.to_string_lossy().to_string();
+        self
+    }
+
     /// How many commits can be issued concurrently.
     #[inline]
     pub fn io_depth_per_log(mut self, io_depth_per_log: usize) -> Self {

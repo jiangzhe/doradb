@@ -104,6 +104,7 @@ const DEFAULT_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
+    main_dir: String,
     trx: TrxSysConfig,
     meta_buffer: Byte,
     index_buffer: Byte,
@@ -115,6 +116,7 @@ impl Default for EngineConfig {
     #[inline]
     fn default() -> Self {
         EngineConfig {
+            main_dir: String::from("."),
             trx: TrxSysConfig::default(),
             meta_buffer: Byte::from_u64(DEFAULT_META_BUFFER as u64),
             index_buffer: Byte::from_u64(DEFAULT_INDEX_BUFFER as u64),
@@ -125,6 +127,12 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    #[inline]
+    pub fn main_dir(mut self, main_dir: impl Into<String>) -> Self {
+        self.main_dir = main_dir.into();
+        self
+    }
+
     #[inline]
     pub fn trx(mut self, trx: TrxSysConfig) -> Self {
         self.trx = trx;
@@ -157,17 +165,21 @@ impl EngineConfig {
 
     #[inline]
     pub async fn build(self) -> Result<Engine> {
-        let table_fs = self.file.build()?;
+        std::fs::create_dir_all(&self.main_dir)?;
+        let file = self.file.with_main_dir(&self.main_dir);
+        std::fs::create_dir_all(&file.base_dir)?;
+        let table_fs = file.build()?;
         let table_fs = StaticLifetime::new_static(table_fs);
         // todo: avoid resource leak when errors occur.
         let meta_pool = FixedBufferPool::with_capacity_static(self.meta_buffer.as_u64() as usize)?;
         // todo: implement index pool
         let index_pool =
             FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
-        let data_pool = self.data_buffer.build()?;
+        let data_pool = self.data_buffer.with_main_dir(&self.main_dir).build()?;
         let data_pool = StaticLifetime::new_static(data_pool);
         let trx_sys = self
             .trx
+            .with_main_dir(&self.main_dir)
             .build_static(meta_pool, index_pool, data_pool, table_fs)
             .await?;
         Ok(Engine(Arc::new(EngineInner {
