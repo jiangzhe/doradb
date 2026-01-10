@@ -1089,8 +1089,7 @@ mod tests {
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64u64 * 1024 * 1024)
-                        .max_file_size(128u64 * 1024 * 1024)
-                        .file_path("databuffer_mmap.bin"),
+                        .max_file_size(128u64 * 1024 * 1024),
                 )
                 .build()
                 .await
@@ -1162,8 +1161,7 @@ mod tests {
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64u64 * 1024 * 1024)
-                        .max_file_size(128u64 * 1024 * 1024)
-                        .file_path("databuffer_mmap.bin"),
+                        .max_file_size(128u64 * 1024 * 1024),
                 )
                 .build()
                 .await
