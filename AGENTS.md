@@ -10,8 +10,11 @@
 
 ## Build, Test, and Development Commands
 - `cargo build -p doradb-storage` builds the storage engine crate.
-- `cargo test -p doradb-storage -- --test-threads=1` runs unit/integration tests in the active crate. Note: single test thread is required because some test cases can not be executed concurrently.
-- `cargo test --workspace -- --test-threads=1` runs tests across workspace members (currently just storage).
+  - Use `cargo build -p doradb-storage --no-default-features` to build without `libaio` dependency.
+- `cargo test -p doradb-storage` runs unit/integration tests in the active crate.
+  - Use `cargo test -p doradb-storage --no-default-features` to run tests without `libaio`. 
+    This is used for test environment (e.g. codex cloud sandbox) that cannot install libaio, you can use command `dpkg -l | grep libaio` to check whether current environment has libaio/libaio-dev installed.
+- `cargo test --workspace` runs tests across workspace members (currently just storage).
 - `cargo run -p doradb-storage --example bench_btree` runs a specific example/benchmark.
 
 ## Coding Style & Naming Conventions
