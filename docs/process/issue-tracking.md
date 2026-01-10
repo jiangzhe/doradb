@@ -1,7 +1,26 @@
-# Issue Tracking with gh (GitHub CLI)
-**IMPORTANT**: This project uses **GitHub Issues** via `gh` CLI for ALL issue tracking. Do NOT use markdown TODOs within files or local tracking files.
+# Issue Tracking and Planning
 
-## Quick Start
+**IMPORTANT**: This project uses a "Document-First" approach for all significant work.
+- **Planning**: All work must be documented in `docs/tasks/` or `docs/rfcs/` *before* implementation.
+- **Tracking**: Use **GitHub Issues** via `gh` CLI for assignment and state tracking.
+
+## Planning: Tasks & RFCs
+
+Before writing code, you must create a planning document in the repository.
+
+### 1. Tasks (Small/Simple)
+- **Scope**: Narrow, well-defined changes (e.g., bug fixes, small features, refactoring).
+- **Location**: `docs/tasks/<nnnnnn>-<description>.md`
+- **Template**: Use `docs/tasks/000000-template.md`.
+- **Workflow**: Create the task doc -> Link to a `gh` issue -> Implement.
+
+### 2. RFCs (Large/Complex)
+- **Scope**: Large architectural changes, new subsystems, or complex implementations.
+- **Location**: `docs/rfcs/<nnnn>-<description>.md`
+- **Template**: Use `docs/rfcs/0000-template.md`.
+- **Workflow**: Create RFC doc -> Review/Acceptance -> Break into Tasks -> Implement.
+
+## Quick Start (with `gh` CLI)
 
 ```bash
 # Find unassigned, open issues (Ready work)
@@ -98,24 +117,35 @@ gh issue edit 42 --body "High-level goal.
 
 ## Workflow for AI Agents
 
-1. **Check ready work**:
-   Run `gh issue list --state open -S "no:assignee" --json number,title,labels,body` to see backlog items that need attention.
+1.  **Plan**:
+    *   This step is often triggered by a user command.
+    *   Perform solid analysis on background, codebase, problem scope, and potential solutions.
+    *   **Output**: Create a Task or RFC document in `docs/tasks/` or `docs/rfcs/`.
 
-2. **Claim your task**:
-   Run `gh issue edit <number> --add-assignee "@me"` to signal you are working on it.
+2.  **File Issue**:
+    *   File a GitHub issue based on the created Task/RFC document.
+    *   Use `gh issue create` with appropriate labels.
 
-3. **Work on it**: Implement, test, document.
+3.  **Branch**:
+    *   Create a new branch for the task.
+    *   Ensure it is rebased to `main` first.
+    *   Push the branch to upstream.
 
-4. **Discover new work?**
-   If you find a bug or missing feature while working, create it immediately:
-   `gh issue create --title "Found bug" --body "Discovered while working on #<parent-id>" --label "type:bug"`
+4.  **Implement**:
+    *   Perform implementation and bug fixes.
+    *   Update the new branch with these changes.
 
-5. **Commit & Reference**:
-   When committing code, include the issue reference in your commit message to link them automatically:
-   `git commit -m "feat: implement login logic (Fixes #42)"`
+5.  **PR**:
+    *   Fire a Pull Request once code on the new branch is finalized.
+    *   Link to the related issue by commenting `#<issue id>` in the PR description.
+    *   Ensure CI succeeds and code review is passed.
 
-6. **Complete**:
-   Run `gh issue close <number>` (or let the commit message "Fixes #..." handle it automatically after push).
+6.  **Merge**:
+    *   Squash all commits.
+    *   Merge to the `main` branch.
+
+7.  **Close**:
+    *   Close the issue.
 
 ## CLI Rules & Data Format
 
@@ -135,5 +165,4 @@ Run `gh <command> --help` to see all available flags for any command.
 - ✅ Use **Labels** strictly to define Type and Priority.
 - ✅ Link related work by mentioning "Ref #<number>" in the issue body.
 - ❌ Do NOT create markdown TODO lists in source code.
-- ❌ Do NOT try to edit/manage a local tracking file (GitHub is the source of truth).
 - ❌ Do NOT commit issue state; only commit code. Issue state is handled via API.
