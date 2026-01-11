@@ -186,3 +186,27 @@ impl<'a> DerefMut for RowVersionWriteGuard<'a> {
         &mut self.g
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::TableMetadata;
+    use crate::catalog::spec::{ColumnAttributes, ColumnSpec, IndexSpec};
+    use crate::value::ValKind;
+
+    #[test]
+    fn test_row_version_map_create_cts() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "id",
+                ValKind::I64,
+                ColumnAttributes::empty(),
+            )],
+            Vec::<IndexSpec>::new(),
+        );
+        let map = RowVersionMap::new(Arc::new(metadata), 1);
+        assert_eq!(map.create_cts(), 0);
+        map.set_create_cts(42);
+        assert_eq!(map.create_cts(), 42);
+    }
+}

@@ -1091,7 +1091,10 @@ mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table2;
     use crate::engine::EngineConfig;
+    use crate::trx::sys_conf::TrxSysConfig;
+    use crate::trx::sys_trx::SysTrx;
     use crate::value::Val;
+    use std::sync::atomic::AtomicU64;
     use tempfile::TempDir;
 
     #[test]
@@ -1245,6 +1248,32 @@ mod tests {
             while let Some(log) = log_merger.try_next().unwrap() {
                 println!("header={:?}, payload={:?}", log.header, log.payload);
             }
+        });
+    }
+
+    #[test]
+    fn test_commit_no_wait_returns_cts() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let log_prefix = temp_dir
+                .path()
+                .join("redo_no_wait")
+                .to_string_lossy()
+                .to_string();
+            let config = TrxSysConfig::default()
+                .log_file_prefix(log_prefix)
+                .skip_recovery(true);
+            let initializer = config.log_partition_initializer(0).unwrap();
+            let (partition, _gc_rx) = initializer.finish().unwrap();
+
+            let mut sys_trx = SysTrx {
+                redo: RedoLogs::default(),
+            };
+            sys_trx.create_row_page(1, 1, 0, 1);
+            let prepared = sys_trx.prepare();
+            let global_ts = AtomicU64::new(MIN_SNAPSHOT_TS);
+            let cts = partition.commit(prepared, &global_ts, false).await.unwrap();
+            assert!(cts >= MIN_SNAPSHOT_TS);
         });
     }
 }

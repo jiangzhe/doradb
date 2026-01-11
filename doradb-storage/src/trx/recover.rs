@@ -88,6 +88,28 @@ impl RecoverMap {
     }
 }
 
+#[cfg(test)]
+mod basic_tests {
+    use super::RecoverMap;
+
+    #[test]
+    fn test_recover_map_tracks_create_cts_and_entries() {
+        let mut map = RecoverMap::new(7);
+        assert_eq!(map.create_cts(), 7);
+        assert!(map.is_vacant(0));
+
+        map.insert_at(2, 11);
+        assert!(map.is_vacant(0));
+        assert!(map.is_vacant(1));
+        assert!(!map.is_vacant(2));
+        assert_eq!(map.at(2), Some(11));
+        assert_eq!(map.at(3), None);
+
+        map.update_at(2, 13);
+        assert_eq!(map.at(2), Some(13));
+    }
+}
+
 pub(super) async fn log_recover<P: BufferPool>(
     index_pool: &'static FixedBufferPool,
     data_pool: &'static P,

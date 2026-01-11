@@ -129,3 +129,74 @@ impl CommitGroup {
         (iocb_ptr, sync_group)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notify::EventNotifyOnDrop;
+    use crate::serde::{LenPrefixPod, SerdeCtx};
+    use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind};
+
+    fn redo_bin(cts: TrxID) -> LenPrefixPod<RedoHeader, RedoLogs> {
+        LenPrefixPod::new(
+            RedoHeader {
+                cts,
+                trx_kind: RedoTrxKind::System,
+            },
+            RedoLogs::default(),
+            &SerdeCtx::default(),
+        )
+    }
+
+    fn precommit(cts: TrxID) -> PrecommitTrx {
+        PrecommitTrx {
+            cts,
+            redo_bin: Some(redo_bin(cts)),
+            payload: None,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn test_commit_group_join_without_sync_listener() {
+        let serde_ctx = SerdeCtx::default();
+        let mut log_buf = DirectBuf::zeroed(64);
+        log_buf.truncate(0);
+        log_buf.extend_ser(&redo_bin(1), &serde_ctx);
+        let sync_ev = EventNotifyOnDrop::new();
+        let mut group = CommitGroup {
+            trx_list: vec![precommit(1)],
+            max_cts: 1,
+            fd: 0,
+            offset: 0,
+            log_buf,
+            sync_ev,
+            serde_ctx,
+        };
+
+        let (session, listener) = group.join(precommit(2), false);
+        assert!(session.is_none());
+        assert!(listener.is_none());
+        assert_eq!(group.trx_list.len(), 2);
+        assert_eq!(group.max_cts, 2);
+    }
+
+    #[test]
+    fn test_commit_group_can_join_respects_capacity() {
+        let serde_ctx = SerdeCtx::default();
+        let mut log_buf = DirectBuf::zeroed(64);
+        log_buf.truncate(log_buf.capacity());
+        let sync_ev = EventNotifyOnDrop::new();
+        let group = CommitGroup {
+            trx_list: vec![precommit(1)],
+            max_cts: 1,
+            fd: 0,
+            offset: 0,
+            log_buf,
+            sync_ev,
+            serde_ctx,
+        };
+
+        assert!(!group.can_join(&precommit(2)));
+    }
+}
