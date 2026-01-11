@@ -154,12 +154,12 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 
 **Recovery** is simplified due to the **No-Steal** policy (no dirty data on disk) and Append-Only heap design.
 
-1. **Load Metadata**: Read `Pivot_RowID`, `Last_Index_Checkpoint_LSN`, and `Heap_Redo_Start_LSN` (derived from the oldest active RowPage).
+1. **Load Metadata**: Read `Pivot_RowID`, `Index_Rec_CTS`, and `Heap_Redo_Start_CTS` (derived from the oldest active RowPage).
 2. **Load ColumnStore**: Initialize access to persisted columnar data (`RowID < Pivot`).
 3. **Load DiskTree**: Open the B+Tree at the last valid root.
 4. **Replay Commit Log**:
-   - **Heap Redo**: Start scanning from `Heap_Redo_Start_LSN`. Reconstruct the in-memory RowStore pages by replaying insert/update logs.
-   - **Index Redo**: Start scanning from `Last_Index_Checkpoint_LSN`. Re-insert missing keys into the MemTree, restoring their `sts` to the value found in the log (marking them as Dirty/Clean relative to the DiskTree).
+   - **Heap Redo**: Start scanning from `Heap_Redo_Start_CTS`. Reconstruct the in-memory RowStore pages by replaying insert/update logs.
+   - **Index Redo**: Start scanning from `Index_Rec_CTS`. Re-insert missing keys into the MemTree, restoring their `sts` to the value found in the log (marking them as Dirty/Clean relative to the DiskTree).
    - **Delta Buffer Redo**: Rebuild the **ColumnDeltaBuffer** from logs to restore deletion states for columnar data.
 5. **Completion**: The system is open for service once memory structures are rebuilt. The background Checkpoint thread resumes to flush the restored MemTree data to DiskTree.
 

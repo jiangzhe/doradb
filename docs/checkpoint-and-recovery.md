@@ -9,8 +9,6 @@ The Doradb persistence layer operates on a **No-Steal / No-Force** policy. This 
 2.  **Table-Centric Management**: Persistence coordination is grouped by **Table**. Each table acts as an autonomous unit managing the commit status of its data heap and all associated indexes.
 3.  **Decoupled Components**: Within a table, the Heap (Tuple Mover) and each Secondary Index (Checkpoint Thread) persist independently but share a common commit history for coordination.
 
----
-
 ## 2. Architecture Components
 
 ### 2.1 Table Structure for Persistence
@@ -44,8 +42,6 @@ Each table maintains three types of watermarks, corresponding to its three persi
     *   **Purpose**: To rebuild the in-memory **MemTree**, the system must replay index operations that occurred after this point.
     *   **Maintenance**: Updated atomically in the Index Meta Page after a successful **Index Checkpoint**.
 
----
-
 ## 3. The Commit Flow
 
 When a transaction $T$ (`My_STS`, `My_CTS`) commits, it performs the following steps for each table it modified:
@@ -53,8 +49,6 @@ When a transaction $T$ (`My_STS`, `My_CTS`) commits, it performs the following s
 1.  **Commit Log**: Write the transaction record to the global transaction log.
 2.  **Memory Update**: Update the in-memory CTS in Undo Chains or Delta Buffers for visibility.
 3.  **Queue Push**: Push a `(sts, cts)` pair into the Table's `commit_queue`.
-
----
 
 ## 4. Checkpoint Processes
 
@@ -80,9 +74,9 @@ Each RowPage maintains an atomic `state` word (`[RefCount: 62bit | State: 2bit]`
     *   **Allowed**: Delete **only**.
     *   **Redirect**: Insert/Update attempts are rejected and redirected to the "Cold Update" path (Delete + Re-Insert into a new Active page).
     *   **Purpose**: Allows existing uncommitted transactions to settle without blocking new writers.
-3.  **INVALID** (Converting):
-    *   **Allowed**: None.
-    *   **Behavior**: All access attempts block or retry until the LWC Block is visible in the Block Index.
+3.  **TRANSITION** (Converting):
+    *   **Allowed**: Read (Snapshot Read).
+    *   **Behavior**: Data is immutable. Source for LWC generation. Writers backoff & retry.
 
 #### 4.3.2. The Tuple Mover Workflow
 
@@ -106,7 +100,7 @@ The Tuple Mover must ensure that all data in the Frozen pages is fully committed
 **Step 3: Convert (Frozen -> Invalid)**
 
 Once stabilized, the page is ready for conversion.
-1.  **Atomic Invalid**: Perform `CAS(state, FROZEN, INVALID)`.
+1.  **Atomic Transition**: Perform `CAS(state, FROZEN, TRANSITION)`.
 2.  **Drain Reference Count**: Spin-wait until `RefCount == 0`. This ensures any concurrent Delete operations (which were allowed in Frozen state) have finished.
 3.  **Read & Transform**:
     *   Read the now-immutable RowPage data.
@@ -116,9 +110,9 @@ Once stabilized, the page is ready for conversion.
 4.  **Persist**:
     *   Write the LWC Block and its Block Index entry to disk. This step is fast because both blocks and its index are append-only.
 5.  **Switch Metadata**:
-    *   Update the in-memory Block Index to point to the new LWC Block.
+    *   Update in-memory Block Index to point to the new LWC Block.
     *   Update `Table.watermarks.heap_rec_cts` based on the maximum CTS found in the converted data.
-    *   Release the memory of the RowPages.
+    *   Mark `TRANSITION` pages as **Retired** (hand over to Transaction-based GC).
 
 ## 4.3 Delta Checkpoint (Delete Bitmap)
 
@@ -161,8 +155,6 @@ The Index Checkpoint thread persists dirty data from the in-memory **MemTree** t
 5.  **Watermark Update**:
     *   Update `Table.watermarks.index_rec_cts[IndexID]` in memory.
 
----
-
 ## 5. Garbage Collection (Map Cleanup)
 
 To prevent the `unflushed_map` from growing indefinitely, a cleanup task runs periodically (e.g., after every checkpoint cycle).
@@ -173,8 +165,6 @@ To prevent the `unflushed_map` from growing indefinitely, a cleanup task runs pe
     *   Check if **all** relevant components have `Rec_CTS >= T.CTS`.
 2.  **Prune**:
     *   If the condition is met, $T$ is fully persisted everywhere. Remove $T$ from `unflushed_map`.
-
----
 
 ## 6. Recovery System
 
@@ -218,8 +208,6 @@ The recovery thread reads logs sequentially from the start point. For each log e
 
 #### 6.2.3 Completion
 Once the log end is reached, the in-memory state (RowStore, DeltaBuffer, MemTree) is consistent with the state at the moment of the crash. The system then opens for new transactions.
-
----
 
 ## 7. Summary
 
