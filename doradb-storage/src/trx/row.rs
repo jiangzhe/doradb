@@ -192,14 +192,7 @@ impl<'a> RowReadAccess<'a> {
                                 ver.undo_update(undo_vals);
                             }
                             RowUndoKind::Delete => {
-                                debug_assert!(ver.deleted);
-                                ver.deleted = true; // delete is not seen, mark as not deleted.
-                            }
-                            RowUndoKind::Move(del) => {
-                                // we cannot determine the delete flag here,
-                                // because if move+insert, flag is true.
-                                // if move+update, flag is false.
-                                ver.deleted = *del; // recover moved status
+                                ver.deleted = false; // delete is not seen, mark as not deleted.
                             }
                         }
                         match entry.next.as_ref() {
@@ -334,9 +327,6 @@ impl<'a> RowReadAccess<'a> {
                             debug_assert!(deleted);
                             deleted = false;
                         }
-                        RowUndoKind::Move(del) => {
-                            deleted = *del;
-                        }
                     }
                     // Here we check if current version matches input key
                     if !deleted && metadata.match_key(key, &vals) {
@@ -413,9 +403,6 @@ impl<'a> RowReadAccess<'a> {
                             RowUndoKind::Delete => {
                                 debug_assert!(ver.deleted);
                                 ver.deleted = false;
-                            }
-                            RowUndoKind::Move(del) => {
-                                ver.deleted = *del;
                             }
                         }
                         // Here we check if current version matches input key
@@ -892,15 +879,6 @@ impl<'a> RowWriteAccess<'a> {
                     );
                 }
             }
-            RowUndoKind::Move(deleted) => {
-                let res = self.page.set_deleted(self.row_idx, *deleted);
-                debug_assert!(res);
-                if *deleted {
-                    self.page.inc_approx_deleted();
-                } else {
-                    self.page.dec_approx_deleted();
-                }
-            }
         }
         // rollback undo
         match owned_entry.next.take() {
@@ -911,19 +889,6 @@ impl<'a> RowWriteAccess<'a> {
                 self.remove_undo_head();
             }
             Some(next) => {
-                if let RowUndoKind::Move(_) = &next.main.entry.as_ref().kind {
-                    // MOVE is undo entry of another row, can only follow UPDATE.
-                    debug_assert!(matches!(owned_entry.kind, RowUndoKind::Update(_)));
-                    // Out-of-place update inserts new row just like a insert operation
-                    // so we should mark it as deleted.
-                    // todo: simplify move+update logic, replace it with delete+insert.
-                    //       so that we do not need to handle this special case.
-                    let res = self.page.set_deleted(self.row_idx, true);
-                    debug_assert!(res);
-                    self.page.inc_approx_deleted();
-                    self.remove_undo_head();
-                    return;
-                }
                 head.next = next;
             }
         }

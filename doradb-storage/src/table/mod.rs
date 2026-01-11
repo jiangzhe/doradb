@@ -27,7 +27,7 @@ use crate::row::{RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_in
 use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
-use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoKind, UndoStatus};
+use crate::trx::undo::{IndexBranch, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use std::collections::HashMap;
@@ -526,41 +526,81 @@ impl Table {
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
     ) -> (RowID, HashMap<usize, Val>, PageSharedGuard<RowPage>) {
-        // calculate new row and undo entry.
-        let (new_row, undo_kind, index_change_cols) = {
+        // calculate new row and index changes.
+        let (new_row, old_vals, index_change_cols) = {
             let mut index_change_cols = HashMap::new();
             let mut row = Vec::with_capacity(old_row.len());
-            let mut var_offsets = Vec::with_capacity(old_row.len());
-            for (v, var_offset) in old_row {
+            let mut old_vals = Vec::with_capacity(old_row.len());
+            for (v, _) in old_row {
+                old_vals.push(v.clone());
                 row.push(v);
-                var_offsets.push(var_offset);
             }
             let metadata = self.metadata();
-            let mut undo_cols = vec![];
             for mut uc in update {
                 let old_val = &mut row[uc.idx];
                 if old_val != &uc.val {
                     if metadata.index_cols.contains(&uc.idx) {
                         index_change_cols.insert(uc.idx, old_val.clone());
                     }
-                    // swap old value and new value, then put into undo columns
+                    // swap old value and new value
                     mem::swap(&mut uc.val, old_val);
-                    undo_cols.push(UndoCol {
-                        idx: uc.idx,
-                        val: uc.val,
-                        var_offset: var_offsets[uc.idx],
-                    });
                 }
             }
-            (row, RowUndoKind::Update(undo_cols), index_change_cols)
+            (row, old_vals, index_change_cols)
         };
+        let metadata = self.metadata();
+        let undo_vals: Vec<UpdateCol> = new_row
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, val)| {
+                if val != &old_vals[idx] {
+                    Some(UpdateCol {
+                        idx,
+                        val: old_vals[idx].clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let index_branches = {
+            let (ctx, page) = old_guard.ctx_and_page();
+            let old_access = RowReadAccess::new(page, ctx, page.row_idx(old_id));
+            let undo_head = old_access.undo_head().expect("undo head");
+            debug_assert!(stmt.trx.is_same_trx(undo_head));
+            let old_entry = old_access.first_undo_entry().expect("old undo entry");
+            debug_assert!(matches!(
+                old_entry.as_ref().kind,
+                RowUndoKind::Delete
+            ));
+            metadata
+                .index_specs
+                .iter()
+                .enumerate()
+                .filter(|(_, index)| index.unique())
+                .map(|(index_no, index)| {
+                    let vals = index
+                        .index_cols
+                        .iter()
+                        .map(|key| new_row[key.col_no as usize].clone())
+                        .collect();
+                    IndexBranch {
+                        key: SelectKey::new(index_no, vals),
+                        cts: undo_head.ts(),
+                        entry: old_entry.clone(),
+                        undo_vals: undo_vals.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        old_guard.set_dirty(); // mark as dirty page.
         let (new_row_id, new_guard) = self
             .insert_row_internal(
                 data_pool,
                 stmt,
                 new_row,
-                undo_kind,
-                Some((old_id, old_guard)),
+                RowUndoKind::Insert,
+                index_branches,
             )
             .await;
         // do not unlock the page because we may need to update index
@@ -634,7 +674,7 @@ impl Table {
         stmt: &mut Statement,
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
-        mut move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
+        mut index_branches: Vec<IndexBranch>,
     ) -> (RowID, PageSharedGuard<RowPage>) {
         let metadata = self.metadata();
         let row_len = row_len(metadata, &insert);
@@ -642,16 +682,16 @@ impl Table {
         loop {
             let page_guard = self.get_insert_page(data_pool, stmt, row_count).await;
             let page_id = page_guard.page_id();
-            match self.insert_row_to_page(stmt, page_guard, insert, undo_kind, move_entry) {
+            match self.insert_row_to_page(stmt, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
                     stmt.save_active_insert_page(self.table_id(), page_id, row_id);
                     return (row_id, page_guard);
                 }
                 // this page cannot be inserted any more, just leave it and retry another page.
-                InsertRowIntoPage::NoSpaceOrFrozen(ins, uk, me) => {
+                InsertRowIntoPage::NoSpaceOrFrozen(ins, uk, ib) => {
                     insert = ins;
                     undo_kind = uk;
-                    move_entry = me;
+                    index_branches = ib;
                 }
             }
         }
@@ -668,17 +708,14 @@ impl Table {
         page_guard: PageSharedGuard<RowPage>,
         cols: Vec<Val>,
         undo_kind: RowUndoKind,
-        move_entry: Option<(RowID, PageSharedGuard<RowPage>)>,
+        index_branches: Vec<IndexBranch>,
     ) -> InsertRowIntoPage {
-        debug_assert!({
-            (matches!(undo_kind, RowUndoKind::Insert) && move_entry.is_none())
-                || (matches!(undo_kind, RowUndoKind::Update(_)) && move_entry.is_some())
-        });
+        debug_assert!(matches!(undo_kind, RowUndoKind::Insert));
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page();
         if ctx.row_ver().unwrap().frozen() {
-            return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, move_entry);
+            return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
         }
         debug_assert!(metadata.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
@@ -688,7 +725,7 @@ impl Table {
             if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
             } else {
-                return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, move_entry);
+                return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
@@ -703,33 +740,8 @@ impl Table {
         let new_row_id = new_row.finish();
         debug_assert!(new_row_id == row_id);
         stmt.update_last_row_undo(undo_kind);
-        // Here we do not release row latch because we may need to link MOVE entry.
-
-        // The MOVE undo entry is for MOVE+UPDATE.
-        // Once update in-place fails, we convert the update operation to insert.
-        // and link them together.
-        if let Some((old_id, old_guard)) = move_entry {
-            // Here we actually lock both new row and old row,
-            // not very sure if this will cause dead-lock.
-            let (ctx, page) = old_guard.ctx_and_page();
-            let old_access = RowReadAccess::new(page, ctx, page.row_idx(old_id));
-            debug_assert!({ old_access.undo_head().is_some() });
-            debug_assert!(
-                stmt.trx
-                    .is_same_trx(old_access.undo_head().as_ref().unwrap())
-            );
-            // re-lock moved row and link new entry to it.
-            let move_entry = old_access.first_undo_entry().unwrap();
-            let new_entry = stmt.row_undo.last_mut().unwrap();
-            debug_assert!(matches!(move_entry.as_ref().kind, RowUndoKind::Move(_)));
-            debug_assert!(matches!(new_entry.kind, RowUndoKind::Update(_)));
-            debug_assert!(new_entry.next.is_none());
-            new_entry.next.replace(NextRowUndo::new(MainBranch {
-                entry: move_entry,
-                status: UndoStatus::Ref(stmt.trx.status()),
-            }));
-            drop(old_access);
-            old_guard.set_dirty(); // mark as dirty page.
+        for branch in index_branches {
+            access.link_for_unique_index(branch.key, branch.cts, branch.entry, branch.undo_vals);
         }
         drop(access);
 
@@ -741,9 +753,6 @@ impl Table {
         // Hold the page guard in order to re-lock the undo head fast.
         //
         // create redo log.
-        // even if the operation is move+update, we still treat it as insert redo log.
-        // because redo is only useful when recovering and no version chain is required
-        // during recovery.
         let redo_entry = RowRedo {
             page_id,
             row_id,
@@ -807,17 +816,17 @@ impl Table {
                     UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
                         // Page does not have enough space or has been frozen for update,
                         // we need to switch to out-of-place update mode, which will add
-                        // a MOVE undo entry to end original row and perform a INSERT into
-                        // new page, and link the two versions.
+                        // a DELETE undo entry to end original row and perform an INSERT into
+                        // new page, and link the two versions with index branches.
                         //
                         // Mark page data as deleted.
                         access.delete_row();
-                        // Update LOCK entry to MOVE entry.
-                        stmt.update_last_row_undo(RowUndoKind::Move(false));
+                        // Update LOCK entry to DELETE entry.
+                        stmt.update_last_row_undo(RowUndoKind::Delete);
                         drop(access); // unlock row
                         drop(lock_row);
-                        // Here we do not unlock page because we need to perform MOVE+UPDATE
-                        // and link undo entries of two rows.
+                        // Here we do not unlock page because we need to perform out-of-place
+                        // update and link undo entries of two rows via index branches.
                         // The re-lock of current undo is required.
                         let redo_entry = RowRedo {
                             page_id,
@@ -1985,11 +1994,7 @@ fn row_len(metadata: &TableMetadata, cols: &[Val]) -> usize {
 
 enum InsertRowIntoPage {
     Ok(RowID, PageSharedGuard<RowPage>),
-    NoSpaceOrFrozen(
-        Vec<Val>,
-        RowUndoKind,
-        Option<(RowID, PageSharedGuard<RowPage>)>,
-    ),
+    NoSpaceOrFrozen(Vec<Val>, RowUndoKind, Vec<IndexBranch>),
 }
 
 enum UpdateRowInplace {

@@ -339,7 +339,7 @@ impl TableAccess for Table {
         let keys = self.metadata().keys_for_insert(&cols);
         // insert row into page with undo log linked.
         let (row_id, page_guard) = self
-            .insert_row_internal(data_pool, stmt, cols, RowUndoKind::Insert, None)
+            .insert_row_internal(data_pool, stmt, cols, RowUndoKind::Insert, Vec::new())
             .await;
         // insert index
         for key in keys {
