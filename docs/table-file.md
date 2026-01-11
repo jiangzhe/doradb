@@ -54,7 +54,6 @@ To update the file state (commit a checkpoint):
 2.  **Fsync**: Persist Page 0 to disk.
 3.  **Completion**: Once fsync returns successfully, the new state is valid. There is **no need** to check for active transactions during this step.
 
-
 ## 4. MetaPage Design (The Snapshot)
 
 The **MetaPage** holds the complete state of the table at a specific point in time. It is a dynamic page managed via CoW. Every checkpoint creates a completely new MetaPage.
@@ -67,7 +66,7 @@ The **MetaPage** holds the complete state of the table at a specific point in ti
 | `disktree_roots` | Map `<IndexID, PageID>` storing roots for all Secondary Indexes. |
 | `space_map_root` | PageID of the **SpaceMap**. |
 | `pivot_rowid` | The watermark separating Disk Store (<) and Memory Store (>=). |
-| `last_checkpoint_cts` | The logical watermark (Commit Timestamp) of this snapshot. |
+| **`last_checkpoint_sts`** | The logical watermark (Start Timestamp) of this snapshot. |
 | **`gc_page_list`** | A list of PageIDs that became obsolete in this version (including the *previous* MetaPage ID). |
 
 ### 4.2. Lifecycle
