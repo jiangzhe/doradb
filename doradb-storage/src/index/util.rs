@@ -2,6 +2,7 @@ use crate::buffer::page::PageID;
 use crate::catalog::TableID;
 use crate::row::{INVALID_ROW_ID, RowID};
 use crate::trx::sys::TransactionSystem;
+use crate::trx::TrxID;
 
 /// Value that can be masked as deleted.
 pub trait Maskable: Copy + PartialEq + Eq {
@@ -74,13 +75,19 @@ impl RedoLogPageCommitter {
         RedoLogPageCommitter { trx_sys, table_id }
     }
 
-    pub async fn commit_row_page(&self, page_id: PageID, start_row_id: RowID, end_row_id: RowID) {
+    pub async fn commit_row_page(
+        &self,
+        page_id: PageID,
+        start_row_id: RowID,
+        end_row_id: RowID,
+    ) -> TrxID {
         let mut trx = self.trx_sys.begin_sys_trx();
         let table_id = self.table_id;
         // Once a row page is added to block index, we start
         // a new internal transaction and log its information.
         trx.create_row_page(table_id, page_id, start_row_id, end_row_id);
-        let res = self.trx_sys.commit_sys(trx).await;
-        assert!(res.is_ok());
+        self.trx_sys
+            .commit_sys(trx)
+            .expect("commit system transaction for row page")
     }
 }

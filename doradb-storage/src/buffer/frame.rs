@@ -3,6 +3,7 @@ use crate::catalog::TableMetadata;
 use crate::latch::HybridLatch;
 use crate::trx::recover::RecoverMap;
 use crate::trx::ver_map::RowVersionMap;
+use crate::trx::TrxID;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -76,8 +77,10 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn init_recover_map(&mut self) {
-        self.ctx = Some(Box::new(FrameContext::RecoverMap(RecoverMap::empty())));
+    pub fn init_recover_map(&mut self, create_cts: TrxID) {
+        self.ctx = Some(Box::new(FrameContext::RecoverMap(RecoverMap::new(
+            create_cts,
+        ))));
     }
 }
 
