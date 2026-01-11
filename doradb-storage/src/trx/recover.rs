@@ -31,42 +31,60 @@ use flume::Receiver;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-pub struct RecoverMap(Vec<Option<TrxID>>);
+pub struct RecoverMap {
+    create_cts: TrxID,
+    entries: Vec<Option<TrxID>>,
+}
 
 impl RecoverMap {
     /// Returns an empty recover map.
     #[inline]
     pub fn empty() -> Self {
-        RecoverMap(vec![])
+        RecoverMap::new(0)
+    }
+
+    /// Returns a recover map with given create CTS.
+    #[inline]
+    pub fn new(create_cts: TrxID) -> Self {
+        RecoverMap {
+            create_cts,
+            entries: vec![],
+        }
+    }
+
+    /// Returns CTS when this page is created.
+    #[inline]
+    pub fn create_cts(&self) -> TrxID {
+        self.create_cts
     }
 
     /// Returns whether entry of given row position is vacant.
     #[inline]
     pub fn is_vacant(&self, row_idx: usize) -> bool {
-        row_idx >= self.0.len() || self.0[row_idx].is_none()
+        row_idx >= self.entries.len() || self.entries[row_idx].is_none()
     }
 
     /// Insert CTS at given row position.
     #[inline]
     pub fn insert_at(&mut self, row_idx: usize, cts: TrxID) {
-        while self.0.len() <= row_idx {
-            self.0.push(None);
+        while self.entries.len() <= row_idx {
+            self.entries.push(None);
         }
-        self.0[row_idx] = Some(cts);
+        self.entries[row_idx] = Some(cts);
     }
 
     /// Update CTS at given row position.
     #[inline]
     pub fn update_at(&mut self, row_idx: usize, cts: TrxID) {
-        debug_assert!(row_idx < self.0.len());
+        debug_assert!(row_idx < self.entries.len());
         debug_assert!(self.at(row_idx).unwrap() <= cts);
-        self.0[row_idx].replace(cts);
+        self.entries[row_idx].replace(cts);
     }
 
     /// Returns CTS at given row position.
     #[inline]
     pub fn at(&self, row_idx: usize) -> Option<TrxID> {
-        self.0.get(row_idx).and_then(|v| *v)
+        self.entries.get(row_idx).and_then(|v| *v)
     }
 }
 
@@ -155,7 +173,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             // Execute DDL after all previous DML is done.
             // We treat every DDL as pipeline breaker.
             self.wait_for_dml_done().await?;
-            self.replay_ddl(ddl, dml).await?;
+            self.replay_ddl(ddl, dml, log.header.cts).await?;
         } else {
             // replay DML-only transaction.
             // todo: dispatch DML execution to multiple threads.
@@ -190,14 +208,25 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             .exclusive_async()
             .await;
 
+        let create_cts = page_guard
+            .bf()
+            .ctx
+            .as_ref()
+            .and_then(|ctx| ctx.recover())
+            .map(|rec| rec.create_cts())
+            .unwrap_or(0);
         let max_row_count = page_guard.page().header.max_row_count as usize;
         page_guard.bf_mut().init_undo_map(metadata, max_row_count);
+        if let Some(row_ver) = page_guard.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver()) {
+            row_ver.set_create_cts(create_cts);
+        }
     }
 
     async fn replay_ddl(
         &mut self,
         ddl: Box<DDLRedo>,
         dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
     ) -> Result<()> {
         match &*ddl {
             DDLRedo::CreateSchema(schema_id) => {
@@ -233,7 +262,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                     .allocate_row_page_at(self.data_pool, count as usize, *page_id)
                     .await;
                 // Here we switch row page to recover mode.
-                page_guard.bf_mut().init_recover_map();
+                page_guard.bf_mut().init_recover_map(cts);
 
                 // Record recovered pages so we can recover indexes and refresh undo map at end.
                 // Note: we do not need to recover catalog tables because they are specially handled.
