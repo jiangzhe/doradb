@@ -157,6 +157,10 @@ mod tests {
         }
     }
 
+    fn clear_redo(trx: &mut PrecommitTrx) {
+        trx.redo_bin.take();
+    }
+
     #[test]
     fn test_commit_group_join_without_sync_listener() {
         let serde_ctx = SerdeCtx::default();
@@ -179,6 +183,9 @@ mod tests {
         assert!(listener.is_none());
         assert_eq!(group.trx_list.len(), 2);
         assert_eq!(group.max_cts, 2);
+        for trx in &mut group.trx_list {
+            clear_redo(trx);
+        }
     }
 
     #[test]
@@ -187,7 +194,7 @@ mod tests {
         let mut log_buf = DirectBuf::zeroed(64);
         log_buf.truncate(log_buf.capacity());
         let sync_ev = EventNotifyOnDrop::new();
-        let group = CommitGroup {
+        let mut group = CommitGroup {
             trx_list: vec![precommit(1)],
             max_cts: 1,
             fd: 0,
@@ -197,6 +204,11 @@ mod tests {
             serde_ctx,
         };
 
-        assert!(!group.can_join(&precommit(2)));
+        let mut candidate = precommit(2);
+        assert!(!group.can_join(&candidate));
+        clear_redo(&mut candidate);
+        for trx in &mut group.trx_list {
+            clear_redo(trx);
+        }
     }
 }
