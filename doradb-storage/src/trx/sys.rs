@@ -183,21 +183,21 @@ impl TransactionSystem {
             return Ok(0);
         }
         // start group commit
-        partition.commit(prepared_trx, &self.ts).await
+        partition.commit(prepared_trx, &self.ts, true).await
     }
 
     #[inline]
-    pub async fn commit_sys(&self, trx: SysTrx) -> Result<()> {
+    pub async fn commit_sys(&self, trx: SysTrx) -> Result<TrxID> {
         if trx.redo.is_empty() {
             // System transaction does not hold any active start timestamp
             // so we can just drop it if there is no change to replay.
-            return Ok(());
+            return Ok(0);
         }
         // system transactions are always submitted to first log partition.
         const LOG_NO: usize = 0;
         let partition = &*self.log_partitions[LOG_NO];
         let prepared_trx = trx.prepare();
-        partition.commit(prepared_trx, &self.ts).await.map(|_| ())
+        partition.commit(prepared_trx, &self.ts, false).await
     }
 
     /// Rollback active transaction.

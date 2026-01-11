@@ -522,9 +522,14 @@ impl BlockIndex {
                         let page_committer_guard = self.page_committer.lock();
                         page_committer_guard.as_ref().cloned()
                     } {
-                        page_committer
+                        let create_cts = page_committer
                             .commit_row_page(new_page_id, start_row_id, end_row_id)
                             .await;
+                        if let Some(row_ver) =
+                            new_page.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver())
+                        {
+                            row_ver.set_create_cts(create_cts);
+                        }
                     }
                     // finally, we downgrade the page lock for shared mode.
                     return;

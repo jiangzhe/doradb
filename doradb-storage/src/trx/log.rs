@@ -282,7 +282,12 @@ impl LogPartition {
     // disable clippy lint due to false positive.
     #[allow(clippy::await_holding_lock)]
     #[inline]
-    pub(super) async fn commit(&self, trx: PreparedTrx, global_ts: &AtomicU64) -> Result<TrxID> {
+    pub(super) async fn commit(
+        &self,
+        trx: PreparedTrx,
+        global_ts: &AtomicU64,
+        wait_sync: bool,
+    ) -> Result<TrxID> {
         let mut group_commit_g = self.group_commit.lock();
         let cts = global_ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
@@ -291,6 +296,10 @@ impl LogPartition {
             let (mut session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
             self.group_commit.notify_one(); // notify sync thread to work.
             drop(group_commit_g);
+            if !wait_sync {
+                debug_assert!(session.is_none());
+                return Ok(cts);
+            }
             listener.await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             if let Some(s) = session.as_mut() {
@@ -309,6 +318,10 @@ impl LogPartition {
         if last_group.can_join(&precommit_trx) {
             let (mut session, listener) = last_group.join(precommit_trx);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
+            if !wait_sync {
+                debug_assert!(session.is_none());
+                return Ok(cts);
+            }
             listener.await; // wait for fsync
             assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
             if let Some(s) = session.as_mut() {
@@ -319,6 +332,10 @@ impl LogPartition {
         let (mut session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
         self.group_commit.notify_one(); // notify sync thread to work.
         drop(group_commit_g);
+        if !wait_sync {
+            debug_assert!(session.is_none());
+            return Ok(cts);
+        }
         listener.await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
         if let Some(s) = session.as_mut() {

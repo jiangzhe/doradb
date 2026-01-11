@@ -23,6 +23,8 @@ pub struct RowVersionMap {
     // Monotonically increasing version number.
     // indicates whether the undo map is changed.
     mod_counter: AtomicU64,
+    // Commit timestamp when this row page is created.
+    create_cts: AtomicU64,
     // Maximum STS of transactions that have modified
     // current page.
     // This is used to bypass version chain traversal
@@ -59,6 +61,7 @@ impl RowVersionMap {
             entries: vec.into_boxed_slice(),
             metadata,
             mod_counter: AtomicU64::new(0),
+            create_cts: AtomicU64::new(0),
             max_sts: AtomicU64::new(0),
             max_ins_sts: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
@@ -75,6 +78,18 @@ impl RowVersionMap {
     #[inline]
     pub fn set_frozen(&self) {
         self.frozen.store(true, Ordering::Release);
+    }
+
+    /// Set commit timestamp of page creation.
+    #[inline]
+    pub fn set_create_cts(&self, cts: TrxID) {
+        self.create_cts.store(cts, Ordering::Release);
+    }
+
+    /// Returns commit timestamp of page creation.
+    #[inline]
+    pub fn create_cts(&self) -> TrxID {
+        self.create_cts.load(Ordering::Acquire)
     }
 
     /// Acquire a read latch on given row.
