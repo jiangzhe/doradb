@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 /// RowUndoKind represents the kind of original operation.
 /// So the actual undo action should be opposite of the kind.
-/// There is one special UndoKind *Move*, due to the design of DoraDB.
 pub enum RowUndoKind {
     /// Lock a row.
     /// Before insert/delete/update, we add a lock record to version chain
@@ -31,75 +30,6 @@ pub enum RowUndoKind {
     /// This is common scenario. The insert is first version of a row. And it
     /// does not have older(next) version.
     Insert,
-    /// Move is a special kind.
-    ///
-    /// It's not directly mapping to a user operation, e.g insert, update, delete.
-    /// But it's a internal action which is triggered by user operation.
-    ///
-    /// # Scenarios:
-    ///
-    /// 1. insert into a table with unique constraint(primary key or unique key).
-    ///
-    /// A row with original key is deleted and then new row with the same key is
-    /// inserted.
-    /// Our index design is to make all secondary indexes to point to newest version.
-    /// Therefore, we need to build a version chain from the insert log to delete log.
-    ///
-    /// For example, old(deleted) row has RowID 100, and new(inserted) row has
-    /// RowID 200. they have KeyColumn with same value(k=1).
-    /// In such case, for deleted row, we have a secondary index with an entry
-    /// (key=1 => RowID=100).
-    /// To insert the new row, we first perform the insertion directly on data
-    /// page, and get new row inserted(RowID=200). It's necessary because RowID should
-    /// be first generated before updating index.
-    /// Then we try to update secondary index, and find there is already an entry,
-    /// but the entry is deleted(otherwrise, we will fail with an error of duplicate
-    /// key and rollback the insert).
-    /// So we lock the deleted row and add undo entry *Move* at the head of its undo
-    /// chain, then link new row's undo log head to "Move" entry.
-    /// Finally, we update index to point k=1 to RowID=200.
-    /// This is safe because we already locked the deleted row. Any concurrent operation
-    /// will see original row locked, and wait or die according to concurrency control
-    /// protocol.
-    ///
-    /// If we perform index lookup, we always land at the newest version.
-    /// And then go through the version chain to locate visible version.
-    /// A key validation is also required because key column might be changed and
-    /// two key index entries pointing to the same new version. MVCC visible check must
-    /// ensure key column matches the visible version built from version chain.
-    ///
-    /// If we scan the table(skipping secondary index), we can find deleted row before
-    /// MOVE and new row after MOVE. In case of visiting MOVE entry on old page,
-    /// if current transaction is newer, we do not undo MOVE, and deleted flag on page
-    /// is true - as it's *moved*, so we don't see the data. In case of visiting MOVE
-    /// entry in version chain from new page. we have to stop the version traversal,
-    /// in order to avoid double read(see the old version twice).
-    ///  
-    /// 2. fail to in-place update.
-    ///
-    /// This can happen when data page's free space is not enough for the update.
-    /// The original row is moved to a new page, so should be marked as *MOVE*d.
-    ///
-    /// 3. update on rows in a freezed row page or column-store.
-    ///
-    /// As DoraDB supports integrated column-store and row-store. To convert row page
-    /// to column file, we need to freeze the pages.
-    /// The fronzed pages does not support insert, delete or update, but it supports
-    /// move rows to new pages.
-    ///
-    /// # Possible chains:
-    ///
-    /// 1. Move -> Insert.
-    ///
-    /// 2. Move -> Update.
-    ///
-    /// 3. Move -> Delete.
-    ///
-    /// 4. Move -> null.
-    ///
-    /// Note: Move always marks the row in data page as deleted. so we need to record
-    /// delete flag of previous version. And undo if necessary.
-    Move(bool),
     /// Delete an existing row.
     /// We optimize to not have row values in delete log entry, because we always can
     /// find the version in row page.
@@ -134,11 +64,6 @@ pub enum RowUndoKind {
     /// update(instead of insert) entry to it.
     /// In this way, we may not need to change secondary index.
     ///
-    /// 4. Update -> Move.
-    ///
-    /// Note: Update -> Delete is impossible. Even if we re-insert
-    /// a deleted row, we will first *move* the deleted row to
-    /// other place and then perform update.
     Update(Vec<UndoCol>),
 }
 
@@ -149,7 +74,6 @@ impl fmt::Debug for RowUndoKind {
             RowUndoKind::Delete => f.pad("Delete"),
             RowUndoKind::Insert => f.pad("Insert"),
             RowUndoKind::Lock => f.pad("Lock"),
-            RowUndoKind::Move(..) => f.pad("Move"),
             RowUndoKind::Update(_) => f.pad("Update"),
         }
     }
