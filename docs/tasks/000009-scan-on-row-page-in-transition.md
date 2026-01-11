@@ -8,7 +8,7 @@ Implement an MVCC-aware scan for `RowPage` that filters rows based on a specific
 
 The Data Checkpoint process converts "Frozen" `RowPage`s (which do not allow new inserts or updates, but allow deletes and locks) into immutable `LWC` (LightWeight Columnar) blocks. To ensure data consistency, the conversion must satisfy the **No-Steal** policy: only data committed before the checkpoint's start timestamp (`CP.STS`) should be included.
 
-Since `RowPage`s in the `FROZEN` or `TRANSITION` state may still receive `Delete` and `Lock` operations from concurrent transactions, a simple scan of the page's content (which reflects the latest state) is insufficient. We need to "travel back in time" to `CP.STS` by reversing any `Delete` operations that happened after `CP.STS`.
+Since `RowPage`s in `TRANSITION` state may still receive `Delete` and `Lock` operations from concurrent transactions, a simple scan of the page's content (which reflects the latest state) is insufficient. We need to "travel back in time" to `CP.STS` by reversing any `Delete` operations that happened after `CP.STS`.
 
 Existing `LwcBuilder` and `PageVectorView` support efficient vectorized scanning but lack MVCC support.
 
