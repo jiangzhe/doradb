@@ -88,7 +88,6 @@ impl RedoLogPageCommitter {
         trx.create_row_page(table_id, page_id, start_row_id, end_row_id);
         self.trx_sys
             .commit_sys(trx)
-            .await
             .expect("commit system transaction for row page")
     }
 }

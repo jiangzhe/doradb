@@ -99,7 +99,8 @@ impl CommitGroup {
     pub(super) fn join(
         &mut self,
         mut trx: PrecommitTrx,
-    ) -> (Option<Arc<SessionState>>, EventListener) {
+        wait_sync: bool,
+    ) -> (Option<Arc<SessionState>>, Option<EventListener>) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
             self.log_buf.extend_ser(&redo_bin, &self.serde_ctx);
@@ -107,7 +108,8 @@ impl CommitGroup {
         self.max_cts = trx.cts;
         let session = trx.take_session();
         self.trx_list.push(trx);
-        (session, self.sync_ev.listen())
+        let listener = wait_sync.then(|| self.sync_ev.listen());
+        (session, listener)
     }
 
     #[inline]
