@@ -6,9 +6,12 @@
 //! but that's not included in this module.
 
 use crate::bitmap::{Bitmap, BitmapRangeFilter};
+use crate::buffer::frame::FrameContext;
 use crate::catalog::TableMetadata;
 use crate::error::{Error, Result};
 use crate::row::RowPage;
+use crate::trx::undo::RowUndoKind;
+use crate::trx::{TrxID, trx_is_committed};
 use crate::value::{PageVar, ValBuffer, ValType};
 
 pub struct ScanBuffer {
@@ -286,6 +289,73 @@ pub struct PageVectorView<'p, 'm> {
     del_bitmap: Vec<u64>,
 }
 
+impl RowPage {
+    /// Create a vectorized view on row page in transition state.
+    /// This view reflects MVCC visibility at given snapshot timestamp.
+    #[inline]
+    pub fn vector_view_in_transition<'p, 'm>(
+        &'p self,
+        metadata: &'m TableMetadata,
+        ctx: &FrameContext,
+        read_ts: TrxID,
+        global_min_active_sts: TrxID,
+    ) -> PageVectorView<'p, 'm> {
+        let Some(map) = ctx.row_ver() else {
+            return self.vector_view(metadata);
+        };
+        let initial_mod_counter = map.mod_counter();
+        if map.max_sts() < global_min_active_sts {
+            let view = self.vector_view(metadata);
+            if map.mod_counter() == initial_mod_counter {
+                return view;
+            }
+        }
+        let row_count = self.header.row_count();
+        let mut del_bitmap = Vec::from(self.del_bitmap(row_count));
+        for row_idx in 0..row_count {
+            let undo_guard = map.read_latch(row_idx);
+            let Some(head) = undo_guard.as_ref() else {
+                continue;
+            };
+            let mut ts = head.ts();
+            let mut entry = head.next.main.entry.clone();
+            loop {
+                match &entry.as_ref().kind {
+                    RowUndoKind::Lock => {}
+                    RowUndoKind::Delete => {
+                        if !trx_is_committed(ts) || ts > read_ts {
+                            del_bitmap.bitmap_unset(row_idx);
+                        } else {
+                            del_bitmap.bitmap_set(row_idx);
+                        }
+                        break;
+                    }
+                    RowUndoKind::Insert | RowUndoKind::Update(_) => {
+                        if !trx_is_committed(ts) || ts > read_ts {
+                            panic!("Uncommitted/Future Insert/Update found in Checkpoint");
+                        }
+                        del_bitmap.bitmap_unset(row_idx);
+                        break;
+                    }
+                }
+                match entry.as_ref().next.as_ref() {
+                    None => break,
+                    Some(next) => {
+                        ts = next.main.status.ts();
+                        entry = next.main.entry.clone();
+                    }
+                }
+            }
+        }
+        PageVectorView {
+            page: self,
+            metadata,
+            row_count,
+            del_bitmap,
+        }
+    }
+}
+
 impl<'p, 'm> PageVectorView<'p, 'm> {
     /// Create a page vector view.
     #[inline]
@@ -341,11 +411,15 @@ pub enum ValArrayRef<'a> {
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::row::tests::create_row_page;
     use crate::row::{Delete, InsertRow};
+    use crate::trx::undo::{MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, UndoStatus};
+    use crate::trx::ver_map::RowVersionMap;
+    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS};
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
+    use std::sync::Arc;
 
     #[test]
     fn test_row_page_vector_scan() {
@@ -676,5 +750,141 @@ mod tests {
             }
             _ => panic!("unexpected varbyte column type"),
         }
+    }
+
+    #[test]
+    fn test_vector_view_in_transition_revive_deleted_row() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("c1"),
+                column_type: ValKind::I8,
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![],
+        );
+        let mut page = create_row_page();
+        page.init(0, 1, &metadata);
+        let insert = vec![Val::I8(1)];
+        let res = page.insert(&metadata, &insert);
+        assert!(matches!(res, InsertRow::Ok(0)));
+        assert!(matches!(page.delete(0), Delete::Ok));
+
+        let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
+        let undo = OwnedRowUndo::new(0, 0, page.row_id(0), RowUndoKind::Delete);
+        let undo_ref = undo.leak();
+        let head = RowUndoHead {
+            next: NextRowUndo {
+                main: MainBranch {
+                    entry: undo_ref,
+                    status: UndoStatus::CTS(200),
+                },
+                indexes: vec![],
+            },
+            purge_ts: MIN_SNAPSHOT_TS,
+        };
+        *map.write_exclusive(0) = Some(Box::new(head));
+        let ctx = FrameContext::RowVerMap(map);
+
+        let view = page.vector_view_in_transition(&metadata, &ctx, 100, 0);
+        assert_eq!(view.rows_non_deleted(), 1);
+        let _keep_undo = undo;
+    }
+
+    #[test]
+    fn test_vector_view_in_transition_fast_path() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("c1"),
+                column_type: ValKind::I8,
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![],
+        );
+        let mut page = create_row_page();
+        page.init(0, 2, &metadata);
+        let insert = vec![Val::I8(1)];
+        assert!(matches!(page.insert(&metadata, &insert), InsertRow::Ok(0)));
+        assert!(matches!(page.insert(&metadata, &insert), InsertRow::Ok(1)));
+        assert!(matches!(page.delete(1), Delete::Ok));
+
+        let map = RowVersionMap::new(Arc::new(metadata.clone()), 2);
+        let ctx = FrameContext::RowVerMap(map);
+
+        let expected = page.vector_view(&metadata);
+        let view = page.vector_view_in_transition(&metadata, &ctx, 100, 1);
+        assert_eq!(view.rows_non_deleted(), expected.rows_non_deleted());
+    }
+
+    #[test]
+    #[should_panic(expected = "Uncommitted/Future Insert/Update found in Checkpoint")]
+    fn test_vector_view_in_transition_uncommitted_insert_panics() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("c1"),
+                column_type: ValKind::I8,
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![],
+        );
+        let mut page = create_row_page();
+        page.init(0, 1, &metadata);
+        let insert = vec![Val::I8(1)];
+        assert!(matches!(page.insert(&metadata, &insert), InsertRow::Ok(0)));
+
+        let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
+        let uncommitted_ts = MIN_ACTIVE_TRX_ID + 1;
+        let undo = OwnedRowUndo::new(0, 0, page.row_id(0), RowUndoKind::Insert);
+        let undo_ref = undo.leak();
+        let head = RowUndoHead {
+            next: NextRowUndo {
+                main: MainBranch {
+                    entry: undo_ref,
+                    status: UndoStatus::CTS(uncommitted_ts),
+                },
+                indexes: vec![],
+            },
+            purge_ts: MIN_SNAPSHOT_TS,
+        };
+        *map.write_exclusive(0) = Some(Box::new(head));
+        let ctx = FrameContext::RowVerMap(map);
+
+        let _view = page.vector_view_in_transition(&metadata, &ctx, 100, 0);
+        let _keep_undo = undo;
+    }
+
+    #[test]
+    fn test_vector_view_in_transition_lock_undo() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("c1"),
+                column_type: ValKind::I8,
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![],
+        );
+        let mut page = create_row_page();
+        page.init(0, 1, &metadata);
+        let insert = vec![Val::I8(1)];
+        assert!(matches!(page.insert(&metadata, &insert), InsertRow::Ok(0)));
+
+        let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
+        let undo = OwnedRowUndo::new(0, 0, page.row_id(0), RowUndoKind::Lock);
+        let undo_ref = undo.leak();
+        let head = RowUndoHead {
+            next: NextRowUndo {
+                main: MainBranch {
+                    entry: undo_ref,
+                    status: UndoStatus::CTS(200),
+                },
+                indexes: vec![],
+            },
+            purge_ts: MIN_SNAPSHOT_TS,
+        };
+        *map.write_exclusive(0) = Some(Box::new(head));
+        let ctx = FrameContext::RowVerMap(map);
+
+        let view = page.vector_view_in_transition(&metadata, &ctx, 100, 0);
+        assert_eq!(view.rows_non_deleted(), 1);
+        let _keep_undo = undo;
     }
 }

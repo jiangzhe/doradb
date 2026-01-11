@@ -92,6 +92,18 @@ impl RowVersionMap {
         self.create_cts.load(Ordering::Acquire)
     }
 
+    /// Returns modification counter.
+    #[inline]
+    pub fn mod_counter(&self) -> u64 {
+        self.mod_counter.load(Ordering::Acquire)
+    }
+
+    /// Returns maximum STS recorded in this map.
+    #[inline]
+    pub fn max_sts(&self) -> TrxID {
+        self.max_sts.load(Ordering::Acquire)
+    }
+
     /// Acquire a read latch on given row.
     #[inline]
     pub fn read_latch(&self, row_idx: usize) -> RowVersionReadGuard<'_> {
