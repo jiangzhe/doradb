@@ -240,7 +240,8 @@ impl LogPartition {
         &self,
         mut trx: PrecommitTrx,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
-    ) -> (Option<Arc<SessionState>>, EventListener) {
+        wait_sync: bool,
+    ) -> (Option<Arc<SessionState>>, Option<EventListener>) {
         let cts = trx.cts;
         let serde_ctx = SerdeCtx::default();
         let redo_bin = trx.redo_bin.take().unwrap();
@@ -265,7 +266,7 @@ impl LogPartition {
         };
         let session = trx.take_session();
         let sync_ev = EventNotifyOnDrop::new();
-        let listener = sync_ev.listen();
+        let listener = wait_sync.then(|| sync_ev.listen());
         let new_group = CommitGroup {
             trx_list: vec![trx],
             max_cts: cts,
@@ -279,33 +280,23 @@ impl LogPartition {
         (session, listener)
     }
 
-    // disable clippy lint due to false positive.
-    #[allow(clippy::await_holding_lock)]
     #[inline]
-    pub(super) async fn commit(
+    fn enqueue_commit(
         &self,
         trx: PreparedTrx,
         global_ts: &AtomicU64,
         wait_sync: bool,
-    ) -> Result<TrxID> {
+    ) -> Result<(TrxID, Option<Arc<SessionState>>, Option<EventListener>)> {
         let mut group_commit_g = self.group_commit.lock();
         let cts = global_ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
-            let (mut session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
+            let (session, listener) =
+                self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
             self.group_commit.notify_one(); // notify sync thread to work.
             drop(group_commit_g);
-            if !wait_sync {
-                debug_assert!(session.is_none());
-                return Ok(cts);
-            }
-            listener.await; // wait for fsync
-            assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
-            if let Some(s) = session.as_mut() {
-                s.commit(cts);
-            }
-            return Ok(cts);
+            return Ok((cts, session, listener));
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
             Commit::Shutdown => return Err(Error::TransactionSystemShutdown),
@@ -316,26 +307,40 @@ impl LogPartition {
             }
         };
         if last_group.can_join(&precommit_trx) {
-            let (mut session, listener) = last_group.join(precommit_trx);
+            let (session, listener) = last_group.join(precommit_trx, wait_sync);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
-            if !wait_sync {
-                debug_assert!(session.is_none());
-                return Ok(cts);
-            }
-            listener.await; // wait for fsync
-            assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
-            if let Some(s) = session.as_mut() {
-                s.commit(cts);
-            }
-            return Ok(cts);
+            return Ok((cts, session, listener));
         }
-        let (mut session, listener) = self.create_new_group(precommit_trx, &mut group_commit_g);
+        let (session, listener) =
+            self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
         self.group_commit.notify_one(); // notify sync thread to work.
         drop(group_commit_g);
+        Ok((cts, session, listener))
+    }
+
+    #[inline]
+    pub(super) fn commit_no_wait(&self, trx: PreparedTrx, global_ts: &AtomicU64) -> Result<TrxID> {
+        let (cts, session, listener) = self.enqueue_commit(trx, global_ts, false)?;
+        debug_assert!(session.is_none());
+        debug_assert!(listener.is_none());
+        Ok(cts)
+    }
+
+    // disable clippy lint due to false positive.
+    #[allow(clippy::await_holding_lock)]
+    #[inline]
+    pub(super) async fn commit(
+        &self,
+        trx: PreparedTrx,
+        global_ts: &AtomicU64,
+        wait_sync: bool,
+    ) -> Result<TrxID> {
+        let (cts, mut session, listener) = self.enqueue_commit(trx, global_ts, wait_sync)?;
         if !wait_sync {
             debug_assert!(session.is_none());
             return Ok(cts);
         }
+        let listener = listener.expect("listener should exist when wait_sync");
         listener.await; // wait for fsync
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
         if let Some(s) = session.as_mut() {
