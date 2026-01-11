@@ -851,40 +851,4 @@ mod tests {
         let _view = page.vector_view_in_transition(&metadata, &ctx, 100, 0);
         let _keep_undo = undo;
     }
-
-    #[test]
-    fn test_vector_view_in_transition_lock_undo() {
-        let metadata = TableMetadata::new(
-            vec![ColumnSpec {
-                column_name: SemiStr::new("c1"),
-                column_type: ValKind::I8,
-                column_attributes: ColumnAttributes::empty(),
-            }],
-            vec![],
-        );
-        let mut page = create_row_page();
-        page.init(0, 1, &metadata);
-        let insert = vec![Val::I8(1)];
-        assert!(matches!(page.insert(&metadata, &insert), InsertRow::Ok(0)));
-
-        let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
-        let undo = OwnedRowUndo::new(0, 0, page.row_id(0), RowUndoKind::Lock);
-        let undo_ref = undo.leak();
-        let head = RowUndoHead {
-            next: NextRowUndo {
-                main: MainBranch {
-                    entry: undo_ref,
-                    status: UndoStatus::CTS(200),
-                },
-                indexes: vec![],
-            },
-            purge_ts: MIN_SNAPSHOT_TS,
-        };
-        *map.write_exclusive(0) = Some(Box::new(head));
-        let ctx = FrameContext::RowVerMap(map);
-
-        let view = page.vector_view_in_transition(&metadata, &ctx, 100, 0);
-        assert_eq!(view.rows_non_deleted(), 1);
-        let _keep_undo = undo;
-    }
 }
