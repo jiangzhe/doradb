@@ -9,7 +9,7 @@ use crate::catalog::TableMetadata;
 use crate::compression::*;
 use crate::error::{Error, Result};
 use crate::io::DirectBuf;
-use crate::row::vector_scan::{ScanBuffer, ScanColumnValues};
+use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
 use crate::row::{RowID, RowPage};
 use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, SerdeCtx};
 use crate::value::{MemVar, Val, ValKind};
@@ -768,8 +768,12 @@ impl<'a> LwcBuilder<'a> {
     }
 
     pub fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
-        let snapshot = self.snapshot_state();
         let view = page.vector_view(self.metadata);
+        self.append_view(page, view)
+    }
+
+    pub fn append_view(&mut self, page: &RowPage, view: PageVectorView<'_, '_>) -> Result<bool> {
+        let snapshot = self.snapshot_state();
         let mut new_row_ids = Vec::with_capacity(view.rows_non_deleted());
         for (start_idx, end_idx) in view.range_non_deleted() {
             for idx in start_idx..end_idx {
