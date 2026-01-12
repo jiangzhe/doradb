@@ -85,16 +85,12 @@ pub trait TableAccess {
     /// Update row in transaction.
     /// This method is for update based on unique index lookup.
     /// It also takes care of index change.
-    ///
-    /// If parameter disable_inplace is set to true, update will be
-    /// converted to delete+insert.
     fn update_unique_mvcc<P: BufferPool>(
         &self,
         data_pool: &'static P,
         stmt: &mut Statement,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-        disable_inplace: bool,
     ) -> impl Future<Output = UpdateMvcc>;
 
     /// Delete row in transaction.
@@ -414,92 +410,108 @@ impl TableAccess for Table {
         stmt: &mut Statement,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-        disable_inplace: bool,
     ) -> UpdateMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
-        let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
-            None => return UpdateMvcc::NotFound,
-            Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
-                RowLocation::NotFound => return UpdateMvcc::NotFound,
-                RowLocation::LwcPage(..) => todo!("lwc page"),
-                RowLocation::RowPage(page_id) => {
-                    let page_guard = data_pool
-                        .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                        .await
-                        .shared_async()
-                        .await;
-                    (page_guard, row_id)
-                }
-            },
-        };
-        if disable_inplace {
-            todo!()
-        }
-        let res = self
-            .update_row_inplace(stmt, page_guard, key, row_id, update)
-            .await;
-        match res {
-            UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
-                debug_assert!(row_id == new_row_id);
-                if !index_change_cols.is_empty() {
-                    // Index may change, we should check whether each index key change and update correspondingly.
-                    let res = self
-                        .update_indexes_only_key_change(
-                            data_pool,
-                            stmt,
-                            row_id,
-                            &page_guard,
-                            &index_change_cols,
-                        )
-                        .await;
-                    page_guard.set_dirty(); // mark as dirty page.
-                    return match res {
-                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
-                    };
-                } // otherwise, do nothing
-                page_guard.set_dirty(); // mark as dirty page.
-                UpdateMvcc::Ok(row_id)
-            }
-            UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => UpdateMvcc::NotFound,
-            UpdateRowInplace::WriteConflict => UpdateMvcc::WriteConflict,
-            UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
-                // in-place update failed, we transfer update into
-                // move+update.
-                let (new_row_id, index_change_cols, new_guard) = self
-                    .move_update_for_space(data_pool, stmt, old_row, update, old_row_id, old_guard)
-                    .await;
-                if !index_change_cols.is_empty() {
-                    let res = self
-                        .update_indexes_may_both_change(
-                            data_pool,
-                            stmt,
-                            old_row_id,
-                            new_row_id,
-                            &index_change_cols,
-                            &new_guard,
-                        )
-                        .await;
-                    // old guard is already marked inside.
-                    new_guard.set_dirty(); // mark as dirty page.
-                    match res {
-                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+        loop {
+            let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
+                None => return UpdateMvcc::NotFound,
+                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
+                    RowLocation::NotFound => return UpdateMvcc::NotFound,
+                    RowLocation::LwcPage(..) => todo!("lwc page"),
+                    RowLocation::RowPage(page_id) => {
+                        let page_guard = data_pool
+                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                            .await
+                            .shared_async()
+                            .await;
+                        (page_guard, row_id)
                     }
-                } else {
-                    let res = self
-                        .update_indexes_only_row_id_change(stmt, old_row_id, new_row_id, &new_guard)
+                },
+            };
+            let res = self
+                .update_row_inplace(stmt, page_guard, key, row_id, update.clone())
+                .await;
+            match res {
+                UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
+                    debug_assert!(row_id == new_row_id);
+                    if !index_change_cols.is_empty() {
+                        // Index may change, we should check whether each index key change and update correspondingly.
+                        let res = self
+                            .update_indexes_only_key_change(
+                                data_pool,
+                                stmt,
+                                row_id,
+                                &page_guard,
+                                &index_change_cols,
+                            )
+                            .await;
+                        page_guard.set_dirty(); // mark as dirty page.
+                        return match res {
+                            UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
+                            UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
+                            UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                        };
+                    } // otherwise, do nothing
+                    page_guard.set_dirty(); // mark as dirty page.
+                    return UpdateMvcc::Ok(row_id);
+                }
+                UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => {
+                    return UpdateMvcc::NotFound;
+                }
+                UpdateRowInplace::WriteConflict => return UpdateMvcc::WriteConflict,
+                UpdateRowInplace::RetryInTransition => {
+                    smol::Timer::after(std::time::Duration::from_millis(1)).await;
+                    continue;
+                }
+                UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
+                    // in-place update failed, we transfer update into
+                    // move+update.
+                    let (new_row_id, index_change_cols, new_guard) = self
+                        .move_update_for_space(
+                            data_pool,
+                            stmt,
+                            old_row,
+                            update,
+                            old_row_id,
+                            old_guard,
+                        )
                         .await;
-                    new_guard.set_dirty(); // mark as dirty page.
-                    match res {
-                        UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
-                        UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
-                        UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                    if !index_change_cols.is_empty() {
+                        let res = self
+                            .update_indexes_may_both_change(
+                                data_pool,
+                                stmt,
+                                old_row_id,
+                                new_row_id,
+                                &index_change_cols,
+                                &new_guard,
+                            )
+                            .await;
+                        // old guard is already marked inside.
+                        new_guard.set_dirty(); // mark as dirty page.
+                        return match res {
+                            UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
+                            UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
+                            UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                        };
+                    } else {
+                        let res = self
+                            .update_indexes_only_row_id_change(
+                                stmt,
+                                old_row_id,
+                                new_row_id,
+                                &new_guard,
+                            )
+                            .await;
+                        new_guard.set_dirty(); // mark as dirty page.
+                        return match res {
+                            UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
+                            UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
+                            UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                        };
                     }
                 }
             }
@@ -517,32 +529,38 @@ impl TableAccess for Table {
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx[key.index_no].unique().unwrap();
-        let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
-            None => return DeleteMvcc::NotFound,
-            Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
-                RowLocation::NotFound => return DeleteMvcc::NotFound,
-                RowLocation::LwcPage(..) => todo!("lwc page"),
-                RowLocation::RowPage(page_id) => {
-                    let page_guard = data_pool
-                        .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                        .await
-                        .shared_async()
-                        .await;
-                    (page_guard, row_id)
+        loop {
+            let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
+                None => return DeleteMvcc::NotFound,
+                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
+                    RowLocation::NotFound => return DeleteMvcc::NotFound,
+                    RowLocation::LwcPage(..) => todo!("lwc page"),
+                    RowLocation::RowPage(page_id) => {
+                        let page_guard = data_pool
+                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                            .await
+                            .shared_async()
+                            .await;
+                        (page_guard, row_id)
+                    }
+                },
+            };
+            match self
+                .delete_row_internal(stmt, page_guard, row_id, key, log_by_key)
+                .await
+            {
+                DeleteInternal::NotFound => return DeleteMvcc::NotFound,
+                DeleteInternal::WriteConflict => return DeleteMvcc::WriteConflict,
+                DeleteInternal::RetryInTransition => {
+                    smol::Timer::after(std::time::Duration::from_millis(1)).await;
+                    continue;
                 }
-            },
-        };
-        match self
-            .delete_row_internal(stmt, page_guard, row_id, key, log_by_key)
-            .await
-        {
-            DeleteInternal::NotFound => DeleteMvcc::NotFound,
-            DeleteInternal::WriteConflict => DeleteMvcc::WriteConflict,
-            DeleteInternal::Ok(page_guard) => {
-                // defer index deletion with index undo log.
-                self.defer_delete_indexes(stmt, row_id, &page_guard).await;
-                page_guard.set_dirty(); // mark as dirty.
-                DeleteMvcc::Ok
+                DeleteInternal::Ok(page_guard) => {
+                    // defer index deletion with index undo log.
+                    self.defer_delete_indexes(stmt, row_id, &page_guard).await;
+                    page_guard.set_dirty(); // mark as dirty.
+                    return DeleteMvcc::Ok;
+                }
             }
         }
     }
@@ -607,7 +625,7 @@ impl TableAccess for Table {
             let (ctx, page) = page_guard.ctx_and_page();
             let vmap = ctx.row_ver().unwrap();
             rows += page.header.approx_non_deleted();
-            if vmap.frozen() {
+            if vmap.is_frozen() {
                 return rows < max_rows;
             }
             // set frozen to true.

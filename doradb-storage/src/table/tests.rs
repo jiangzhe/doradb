@@ -1,11 +1,15 @@
-use crate::buffer::EvictableBufferPoolConfig;
+use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
+use crate::index::{UniqueIndex, RowLocation};
+use crate::latch::LatchFallbackMode;
 use crate::row::ops::{InsertMvcc, SelectKey, UpdateCol};
+use crate::row::RowPage;
 use crate::session::Session;
 use crate::table::{Table, TableAccess};
 use crate::trx::ActiveTrx;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::value::Val;
+use super::{DeleteInternal, UpdateRowInplace};
 use tempfile::TempDir;
 
 #[test]
@@ -195,6 +199,73 @@ fn test_mvcc_delete_normal() {
             trx = sys.trx_select_not_found(trx, &k1).await;
             let _ = trx.commit().await.unwrap();
         }
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_row_page_transition_retries_update_delete() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        {
+            let insert = vec![Val::from(1i32), Val::from("hello")];
+            let mut trx = session.begin_trx().unwrap();
+            trx = sys.trx_insert(trx, insert).await;
+            trx.commit().await.unwrap();
+        }
+        let key = single_key(1i32);
+        let mut trx = session.begin_trx().unwrap();
+        let mut stmt = trx.start_stmt();
+        let index = sys.table.sec_idx[key.index_no].unique().unwrap();
+        let (row_id, _) = index.lookup(&key.vals, stmt.trx.sts).await.unwrap();
+        let page_id = match sys.table.blk_idx.find_row(row_id).await {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::NotFound => panic!("row should exist"),
+            RowLocation::LwcPage(..) => unreachable!("lwc page"),
+        };
+        let page_guard = sys
+            .engine
+            .data_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .await
+            .shared_async()
+            .await;
+        let (ctx, _) = page_guard.ctx_and_page();
+        let row_ver = ctx.row_ver().unwrap();
+        row_ver.set_frozen();
+        row_ver.set_transition();
+
+        let update = vec![UpdateCol {
+            idx: 1,
+            val: Val::from("world"),
+        }];
+        let res = sys
+            .table
+            .update_row_inplace(&mut stmt, page_guard, &key, row_id, update)
+            .await;
+        assert!(matches!(res, UpdateRowInplace::RetryInTransition));
+        trx = stmt.fail().await;
+        trx.rollback().await;
+
+        let mut trx = session.begin_trx().unwrap();
+        let mut stmt = trx.start_stmt();
+        let page_guard = sys
+            .engine
+            .data_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .await
+            .shared_async()
+            .await;
+        let res = sys
+            .table
+            .delete_row_internal(&mut stmt, page_guard, row_id, &key, false)
+            .await;
+        assert!(matches!(res, DeleteInternal::RetryInTransition));
+        trx = stmt.fail().await;
+        trx.rollback().await;
+
+        drop(session);
         sys.clean_all();
     });
 }

@@ -27,4 +27,7 @@ You may want to read one or more document(s) related to this task in `docs/`:
     - Task name should be simple and concise.
     - Follow closely to the structure of template file.
     - Use next number in the directory.
+
+## Important
+- Do not modify any source code file.
 """
