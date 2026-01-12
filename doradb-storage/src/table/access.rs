@@ -226,7 +226,7 @@ impl TableAccess for Table {
                 RowLocation::NotFound => return None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.mem_pool
+                    let page_guard = self.data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .shared_async()
@@ -343,7 +343,7 @@ impl TableAccess for Table {
             // acquire insert page from block index.
             let mut page_guard = self
                 .blk_idx
-                .get_insert_page_exclusive(self.mem_pool, row_count)
+                .get_insert_page_exclusive(self.data_pool, row_count)
                 .await;
             let page = page_guard.page_mut();
             debug_assert!(metadata.col_count() == page.header.col_count as usize);
@@ -390,7 +390,7 @@ impl TableAccess for Table {
                     RowLocation::NotFound => return UpdateMvcc::NotFound,
                     RowLocation::LwcPage(..) => todo!("lwc page"),
                     RowLocation::RowPage(page_id) => {
-                        let page_guard = self.mem_pool
+                        let page_guard = self.data_pool
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
                             .shared_async()
@@ -500,7 +500,7 @@ impl TableAccess for Table {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
                     RowLocation::LwcPage(..) => todo!("lwc page"),
                     RowLocation::RowPage(page_id) => {
-                        let page_guard = self.mem_pool
+                        let page_guard = self.data_pool
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
                             .shared_async()
@@ -540,7 +540,7 @@ impl TableAccess for Table {
                 RowLocation::NotFound => unreachable!(),
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.mem_pool
+                    let page_guard = self.data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                         .await
                         .exclusive_async()

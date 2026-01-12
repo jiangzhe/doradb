@@ -183,7 +183,8 @@ impl Catalog {
                     table_file.active_root_ptr(),
                 )
                 .await;
-                let table = Table::new(self.storage.mem_pool, index_pool, blk_idx, table_file).await;
+                let table =
+                    Table::new(self.storage.data_pool, index_pool, blk_idx, table_file).await;
                 // Update table into cache
                 let mut table_cache_g = self.cache.tables.write().await;
                 let res = table_cache_g.insert(table_id, table);
