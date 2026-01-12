@@ -9,7 +9,7 @@ pub use recover::*;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::buffer::{EvictableBufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
 use crate::file::table_file::TableFile;

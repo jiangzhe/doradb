@@ -11,6 +11,7 @@ use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::row::{ReadAllRows, RowReadAccess};
 use crate::trx::undo::RowUndoKind;
+use crate::buffer::BufferPool;
 use crate::value::Val;
 use std::future::Future;
 
