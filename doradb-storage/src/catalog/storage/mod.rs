@@ -4,7 +4,7 @@ mod object;
 mod schemas;
 mod tables;
 
-use crate::buffer::FixedBufferPool;
+use crate::buffer::{EvictableBufferPool, FixedBufferPool};
 use crate::catalog::TableID;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
+    pub(super) mem_pool: &'static EvictableBufferPool,
     tables: Box<[Table]>,
 }
 
@@ -29,6 +30,7 @@ impl CatalogStorage {
     pub async fn new(
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
+        mem_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
     ) -> Result<Self> {
         let mut cat: Vec<Table> = vec![];
@@ -54,51 +56,47 @@ impl CatalogStorage {
                 table_file.active_root_ptr(),
             )
             .await;
-            let table = Table::new(index_pool, blk_idx, table_file).await;
+            let table = Table::new(mem_pool, index_pool, blk_idx, table_file).await;
             cat.push(table);
         }
         Ok(CatalogStorage {
             meta_pool,
+            mem_pool,
             tables: cat.into_boxed_slice(),
         })
     }
 
     #[inline]
-    pub fn schemas(&self) -> Schemas<'_, FixedBufferPool> {
+    pub fn schemas(&self) -> Schemas<'_> {
         Schemas {
-            buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_SCHEMAS as usize],
         }
     }
 
     #[inline]
-    pub fn tables(&self) -> Tables<'_, FixedBufferPool> {
+    pub fn tables(&self) -> Tables<'_> {
         Tables {
-            buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_TABLES as usize],
         }
     }
 
     #[inline]
-    pub fn columns(&self) -> Columns<'_, FixedBufferPool> {
+    pub fn columns(&self) -> Columns<'_> {
         Columns {
-            buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_COLUMNS as usize],
         }
     }
 
     #[inline]
-    pub fn indexes(&self) -> Indexes<'_, FixedBufferPool> {
+    pub fn indexes(&self) -> Indexes<'_> {
         Indexes {
-            buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_INDEXES as usize],
         }
     }
 
     #[inline]
-    pub fn index_columns(&self) -> IndexColumns<'_, FixedBufferPool> {
+    pub fn index_columns(&self) -> IndexColumns<'_> {
         IndexColumns {
-            buf_pool: self.meta_pool,
             table: &self.tables[TABLE_ID_INDEX_COLUMNS as usize],
         }
     }

@@ -214,7 +214,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 let metadata = &table.file.active_root().metadata;
                 for page_id in pages {
                     table
-                        .populate_index_via_row_page(self.data_pool, *page_id)
+                        .populate_index_via_row_page(*page_id)
                         .await;
                     self.refresh_page(Arc::clone(metadata), *page_id).await;
                 }
@@ -362,12 +362,10 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
-                    table.insert_no_trx(self.catalog.meta_pool(), vals).await;
+                    table.insert_no_trx(vals).await;
                 }
                 RowRedoKind::DeleteByUniqueKey(key) => {
-                    table
-                        .delete_unique_no_trx(self.catalog.meta_pool(), key)
-                        .await;
+                    table.delete_unique_no_trx(key).await;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     // updates of catalog are implemented as DeleteByUniqueKey and Insert.
@@ -389,7 +387,6 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 RowRedoKind::Insert(vals) => {
                     table
                         .recover_row_insert(
-                            self.data_pool,
                             row.page_id,
                             row.row_id,
                             vals,
@@ -401,7 +398,6 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 RowRedoKind::Update(vals) => {
                     table
                         .recover_row_update(
-                            self.data_pool,
                             row.page_id,
                             row.row_id,
                             vals,
@@ -413,7 +409,6 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 RowRedoKind::Delete => {
                     table
                         .recover_row_delete(
-                            self.data_pool,
                             row.page_id,
                             row.row_id,
                             cts,
@@ -662,7 +657,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut rows = 0usize;
             table
-                .table_scan_uncommitted(engine.data_pool, 0, |_metadata, row| {
+                .table_scan_uncommitted(0, |_metadata, row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
                     rows += if row.is_deleted() { 0 } else { 1 };
                     true

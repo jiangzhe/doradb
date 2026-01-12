@@ -95,16 +95,12 @@ impl Statement {
     /// Insert a row into a table.
     #[inline]
     pub async fn insert_row(&mut self, table: &Table, cols: Vec<Val>) -> InsertMvcc {
-        let engine = self.trx.engine().unwrap();
-        table.insert_mvcc(engine.data_pool, self, cols).await
+        table.insert_mvcc(self, cols).await
     }
 
     #[inline]
     pub async fn delete_row(&mut self, table: &Table, key: &SelectKey) -> DeleteMvcc {
-        let engine = self.trx.engine().unwrap();
-        table
-            .delete_unique_mvcc(engine.data_pool, self, key, false)
-            .await
+        table.delete_unique_mvcc(self, key, false).await
     }
 
     #[inline]
@@ -114,10 +110,7 @@ impl Statement {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> SelectMvcc {
-        let engine = self.trx.engine().unwrap();
-        table
-            .index_lookup_unique_mvcc(engine.data_pool, self, key, user_read_set)
-            .await
+        table.index_lookup_unique_mvcc(self, key, user_read_set).await
     }
 
     #[inline]
@@ -127,10 +120,7 @@ impl Statement {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
-        let engine = self.trx.engine().unwrap();
-        table
-            .update_unique_mvcc(engine.data_pool, self, key, update)
-            .await
+        table.update_unique_mvcc(self, key, update).await
     }
 
     #[inline]

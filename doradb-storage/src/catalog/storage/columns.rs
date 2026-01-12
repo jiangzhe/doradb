@@ -1,4 +1,3 @@
-use crate::buffer::BufferPool;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::TableMetadata;
@@ -125,12 +124,11 @@ fn row_to_column_object(metadata: &TableMetadata, row: Row<'_>) -> ColumnObject 
     }
 }
 
-pub struct Columns<'a, P: BufferPool> {
-    pub(super) buf_pool: &'static P,
+pub struct Columns<'a> {
     pub(super) table: &'a Table,
 }
 
-impl<P: BufferPool> Columns<'_, P> {
+impl Columns<'_> {
     /// Insert a column.
     pub async fn insert(&self, stmt: &mut Statement, obj: &ColumnObject) -> bool {
         let cols = vec![
@@ -141,16 +139,13 @@ impl<P: BufferPool> Columns<'_, P> {
             Val::from(obj.column_type as u32),
             Val::from(obj.column_attributes.bits()),
         ];
-        self.table
-            .insert_mvcc(self.buf_pool, stmt, cols)
-            .await
-            .is_ok()
+        self.table.insert_mvcc(stmt, cols).await.is_ok()
     }
 
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<ColumnObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, 0, |metadata, row| {
+            .table_scan_uncommitted(0, |metadata, row| {
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = row.val(metadata, COL_NO_COLUMNS_TABLE_ID).as_u64().unwrap();
                 if table_id_in_row == table_id {
@@ -167,7 +162,7 @@ impl<P: BufferPool> Columns<'_, P> {
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: ColumnID) -> bool {
         let key = SelectKey::new(INDEX_NO_COLUMNS_COLUMN_ID, vec![Val::from(id)]);
         self.table
-            .delete_unique_mvcc(self.buf_pool, stmt, &key, true)
+            .delete_unique_mvcc(stmt, &key, true)
             .await
             .is_ok()
     }
