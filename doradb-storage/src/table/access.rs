@@ -470,8 +470,8 @@ impl TableAccess for Table {
                     return UpdateMvcc::NotFound;
                 }
                 UpdateRowInplace::WriteConflict => return UpdateMvcc::WriteConflict,
-                UpdateRowInplace::Retry => {
-                    smol::future::yield_now().await;
+                UpdateRowInplace::RetryInTransition => {
+                    smol::Timer::after(std::time::Duration::from_millis(1)).await;
                     continue;
                 }
                 UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
@@ -559,8 +559,8 @@ impl TableAccess for Table {
             {
                 DeleteInternal::NotFound => return DeleteMvcc::NotFound,
                 DeleteInternal::WriteConflict => return DeleteMvcc::WriteConflict,
-                DeleteInternal::Retry => {
-                    smol::future::yield_now().await;
+                DeleteInternal::RetryInTransition => {
+                    smol::Timer::after(std::time::Duration::from_millis(1)).await;
                     continue;
                 }
                 DeleteInternal::Ok(page_guard) => {

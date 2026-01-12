@@ -244,7 +244,7 @@ fn test_row_page_transition_retries_update_delete() {
             .table
             .update_row_inplace(&mut stmt, page_guard, &key, row_id, update)
             .await;
-        assert!(matches!(res, UpdateRowInplace::Retry));
+        assert!(matches!(res, UpdateRowInplace::RetryInTransition));
         trx = stmt.fail().await;
         trx.rollback().await;
 
@@ -261,7 +261,7 @@ fn test_row_page_transition_retries_update_delete() {
             .table
             .delete_row_internal(&mut stmt, page_guard, row_id, &key, false)
             .await;
-        assert!(matches!(res, DeleteInternal::Retry));
+        assert!(matches!(res, DeleteInternal::RetryInTransition));
         trx = stmt.fail().await;
         trx.rollback().await;
 

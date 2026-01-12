@@ -802,7 +802,7 @@ impl Table {
         }
         let row_state = ctx.row_ver().unwrap().state();
         if row_state == RowPageState::Transition {
-            return UpdateRowInplace::Retry;
+            return UpdateRowInplace::RetryInTransition;
         }
         let frozen = row_state == RowPageState::Frozen;
         let mut lock_row = self
@@ -817,7 +817,7 @@ impl Table {
                 if ctx.row_ver().unwrap().is_transition() {
                     drop(access);
                     drop(lock_row);
-                    return UpdateRowInplace::Retry;
+                    return UpdateRowInplace::RetryInTransition;
                 }
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
@@ -913,7 +913,7 @@ impl Table {
         let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page();
         if ctx.row_ver().unwrap().is_transition() {
-            return DeleteInternal::Retry;
+            return DeleteInternal::RetryInTransition;
         }
         if !page.row_id_in_valid_range(row_id) {
             return DeleteInternal::NotFound;
@@ -929,7 +929,7 @@ impl Table {
                 if ctx.row_ver().unwrap().is_transition() {
                     drop(access);
                     drop(lock_row);
-                    return DeleteInternal::Retry;
+                    return DeleteInternal::RetryInTransition;
                 }
                 if access.row().is_deleted() {
                     return DeleteInternal::NotFound;
@@ -2025,7 +2025,7 @@ enum UpdateRowInplace {
     RowNotFound,
     RowDeleted,
     WriteConflict,
-    Retry,
+    RetryInTransition,
     NoFreeSpace(
         RowID,
         Vec<(Val, Option<u16>)>,
@@ -2038,7 +2038,7 @@ enum DeleteInternal {
     Ok(PageSharedGuard<RowPage>),
     NotFound,
     WriteConflict,
-    Retry,
+    RetryInTransition,
 }
 
 #[inline]
