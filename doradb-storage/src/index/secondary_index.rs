@@ -383,7 +383,7 @@ mod tests {
                     val: Val::from(0i32),
                 }];
                 let res = table
-                    .update_unique_mvcc(engine.data_pool, &mut stmt, &key, update, false)
+                    .update_unique_mvcc(engine.data_pool, &mut stmt, &key, update)
                     .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
@@ -488,7 +488,7 @@ mod tests {
                     val: Val::from(0i32),
                 }];
                 let res = table
-                    .update_unique_mvcc(engine.data_pool, &mut stmt, &key, update, false)
+                    .update_unique_mvcc(engine.data_pool, &mut stmt, &key, update)
                     .await;
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;

@@ -85,16 +85,12 @@ pub trait TableAccess {
     /// Update row in transaction.
     /// This method is for update based on unique index lookup.
     /// It also takes care of index change.
-    ///
-    /// If parameter disable_inplace is set to true, update will be
-    /// converted to delete+insert.
     fn update_unique_mvcc<P: BufferPool>(
         &self,
         data_pool: &'static P,
         stmt: &mut Statement,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-        disable_inplace: bool,
     ) -> impl Future<Output = UpdateMvcc>;
 
     /// Delete row in transaction.
@@ -414,7 +410,6 @@ impl TableAccess for Table {
         stmt: &mut Statement,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-        disable_inplace: bool,
     ) -> UpdateMvcc {
         debug_assert!(key.index_no < self.sec_idx.len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
@@ -436,9 +431,6 @@ impl TableAccess for Table {
                     }
                 },
             };
-            if disable_inplace {
-                todo!()
-            }
             let res = self
                 .update_row_inplace(stmt, page_guard, key, row_id, update.clone())
                 .await;

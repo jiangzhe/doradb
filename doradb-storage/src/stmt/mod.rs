@@ -129,7 +129,7 @@ impl Statement {
     ) -> UpdateMvcc {
         let engine = self.trx.engine().unwrap();
         table
-            .update_unique_mvcc(engine.data_pool, self, key, update, false)
+            .update_unique_mvcc(engine.data_pool, self, key, update)
             .await
     }
 
