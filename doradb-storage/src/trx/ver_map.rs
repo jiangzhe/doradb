@@ -4,7 +4,7 @@ use crate::trx::undo::RowUndoHead;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// RowVersionMap is a page-level hash map to store
 /// old versions of rows in row page.
@@ -45,11 +45,30 @@ pub struct RowVersionMap {
     // we can make sure the content of row page can be safely
     // transformed to LWC block.
     max_ins_sts: AtomicU64,
-    // Frozen flag indicates the row page is frozen and no
-    // more insert or update can be applied to it.
-    // No lock is used because frozen is just a transitional
+    // Row page state indicates the write status of the page.
+    // No lock is used because state is just a transitional
     // period to restrict incoming transactions.
-    frozen: AtomicBool,
+    state: AtomicU8,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowPageState {
+    Active = 0,
+    Frozen = 1,
+    Transition = 2,
+}
+
+impl RowPageState {
+    #[inline]
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => RowPageState::Active,
+            1 => RowPageState::Frozen,
+            2 => RowPageState::Transition,
+            _ => unreachable!("invalid row page state"),
+        }
+    }
 }
 
 impl RowVersionMap {
@@ -64,20 +83,48 @@ impl RowVersionMap {
             create_cts: AtomicU64::new(0),
             max_sts: AtomicU64::new(0),
             max_ins_sts: AtomicU64::new(0),
-            frozen: AtomicBool::new(false),
+            state: AtomicU8::new(RowPageState::Active as u8),
         }
+    }
+
+    /// Returns current row page state.
+    #[inline]
+    pub fn state(&self) -> RowPageState {
+        RowPageState::from_u8(self.state.load(Ordering::Acquire))
     }
 
     /// Returns whether this page is frozen.
     #[inline]
-    pub fn frozen(&self) -> bool {
-        self.frozen.load(Ordering::Acquire)
+    pub fn is_frozen(&self) -> bool {
+        matches!(self.state(), RowPageState::Frozen | RowPageState::Transition)
+    }
+
+    /// Returns whether this page is in transition.
+    #[inline]
+    pub fn is_transition(&self) -> bool {
+        self.state.load(Ordering::Acquire) == RowPageState::Transition as u8
     }
 
     /// Freeze current row page.
     #[inline]
     pub fn set_frozen(&self) {
-        self.frozen.store(true, Ordering::Release);
+        let _ = self.state.compare_exchange(
+            RowPageState::Active as u8,
+            RowPageState::Frozen as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Set current row page to transition.
+    #[inline]
+    pub fn set_transition(&self) {
+        let _ = self.state.compare_exchange(
+            RowPageState::Frozen as u8,
+            RowPageState::Transition as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// Set commit timestamp of page creation.
@@ -220,5 +267,31 @@ mod tests {
         assert_eq!(map.create_cts(), 0);
         map.set_create_cts(42);
         assert_eq!(map.create_cts(), 42);
+    }
+
+    #[test]
+    fn test_row_version_map_state_transitions() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "id",
+                ValKind::I64,
+                ColumnAttributes::empty(),
+            )],
+            Vec::<IndexSpec>::new(),
+        );
+        let map = RowVersionMap::new(Arc::new(metadata), 1);
+        assert_eq!(map.state(), RowPageState::Active);
+        assert!(!map.is_frozen());
+        assert!(!map.is_transition());
+
+        map.set_frozen();
+        assert_eq!(map.state(), RowPageState::Frozen);
+        assert!(map.is_frozen());
+        assert!(!map.is_transition());
+
+        map.set_transition();
+        assert_eq!(map.state(), RowPageState::Transition);
+        assert!(map.is_frozen());
+        assert!(map.is_transition());
     }
 }
