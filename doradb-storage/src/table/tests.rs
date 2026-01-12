@@ -1,6 +1,6 @@
-use crate::buffer::EvictableBufferPoolConfig;
+use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
-use crate::index::RowLocation;
+use crate::index::{UniqueIndex, RowLocation};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{InsertMvcc, SelectKey, UpdateCol};
 use crate::row::RowPage;
