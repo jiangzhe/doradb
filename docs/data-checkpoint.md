@@ -91,40 +91,46 @@ Once stabilized, the page state is set to `TRANSITION`. The conversion pipeline 
 
 ## 4. Recovery & Log Replay Logic
 
-During crash recovery, the system determines which Redo Log entries to replay and which to skip, based on the metadata in the SuperPage/MetaPage.
+During crash recovery, the system uses the persisted metadata to determine which Redo Log entries to replay. This involves a two-level filtering process.
 
 **Inputs from MetaPage:**
-1.  `Pivot_RowID`: The boundary between Disk Store and Memory Store.
-2.  `Heap_Redo_Start_CTS`: The physical starting point for log reading.
-3.  `Last_Checkpoint_STS`: The logical snapshot time of the persistent ColumnStore.
+1.  `Pivot_RowID`: The boundary separating the on-disk ColumnStore from the in-memory RowStore.
+2.  `Heap_Redo_Start_CTS`: The **physical starting point** for scanning the log. This is a coarse-grained filter that allows the Log Manager to skip old log files entirely.
+3.  `Last_Checkpoint_STS`: The **logical snapshot time** of the persistent ColumnStore. This is a fine-grained filter used to determine if a specific change within the log is already reflected in the on-disk data.
 
 **Replay Algorithm:**
 
-The recovery thread reads logs sequentially starting from `Heap_Redo_Start_CTS`. For each log entry $L$ (with timestamp $L.CTS$ and target $L.RowID$):
+The recovery process begins by seeking to the `Heap_Redo_Start_CTS` in the commit log. It then reads logs sequentially from that point. For each log entry $L$ (with timestamp $L.CTS$ and target $L.RowID$), the following logic is applied:
 
 ```rust
+// First-level check: Is the log entry for hot or cold data?
 if L.RowID >= MetaPage.Pivot_RowID {
-    # Case 1: Hot Data
-    # The row belongs to an Active RowPage that was NOT checkpointed.
-    # Must replay to rebuild the in-memory RowStore.
-    replay(L)
+    // Case 1: Hot Data (In-Memory RowStore)
+    // The row belongs to an Active RowPage that was not checkpointed.
+    // The Heap_Redo_Start_CTS check was already implicitly handled by the
+    // initial log seek. We must replay all subsequent records to rebuild
+    // the in-memory RowStore.
+    replay_into_row_store(L);
+
 } else {
-    # L.RowID < MetaPage.Pivot_RowID
-    # Case 2: Cold Data
-    # The row falls within the range of the persisted LWC blocks.
+    // Case 2: Cold Data (On-Disk LWC ColumnStore)
+    // The row falls within the range of persisted LWC blocks.
+    // We must apply a second, logical filter to see if this specific
+    // change is already included in those blocks.
     
     if L.CTS <= MetaPage.Last_Checkpoint_STS {
-        # Case 2a: Already Persisted
-        # The change happened BEFORE the checkpoint snapshot.
-        # It is guaranteed to be physically present in the LWC block.
-        skip(L)
+        // Case 2a: Change is Already Persisted
+        // The change's commit timestamp is older than the logical snapshot
+        // time of the on-disk data. This means the change is guaranteed
+        // to be physically present in the LWC block.
+        skip(L);
     } else {
-        # Case 2b: Late Arrival / Cold Modification
-        # The change happened AFTER the checkpoint snapshot (e.g., during the 
-        # transition phase or a subsequent cold update).
-        # It is NOT in the LWC block Paylaod.
-        # Replay into ColumnDeltaBuffer.
-        replay_to_selta(L)
+        // Case 2b: Late-Arriving Change (Cold Modification)
+        // The change happened AFTER the checkpoint's logical snapshot was taken
+        // (e.g., a delete on cold data that happened during the checkpoint process).
+        // This change is NOT in the LWC block's primary data.
+        // It must be replayed into the in-memory delta structure.
+        replay_into_delta_buffer(L);
     }
 }
 ```
