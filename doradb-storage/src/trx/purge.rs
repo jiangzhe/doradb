@@ -119,22 +119,12 @@ impl TransactionSystem {
                 }
             }
         }
-        for ((table_id, page_id), row_ids) in target {
-            // User table and catalog table uses different buffer pool.
-            let page_guard = if self.catalog.is_user_table(table_id) {
-                buf_pool
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                    .await
-                    .shared_async()
-                    .await
-            } else {
-                catalog
-                    .meta_pool()
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                    .await
-                    .shared_async()
-                    .await
-            };
+        for ((_table_id, page_id), row_ids) in target {
+            let page_guard = buf_pool
+                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                .await
+                .shared_async()
+                .await;
             let (ctx, page) = page_guard.ctx_and_page();
             for row_id in row_ids {
                 let row_idx = page.row_idx(row_id);
@@ -149,10 +139,7 @@ impl TransactionSystem {
                 for ip in index_gc {
                     if let Some(table) = table_cache.get_table(ip.table_id).await {
                         // todo: index should stored in index pool, instead of data pool.
-                        if table
-                            .delete_index(buf_pool, &ip.key, ip.row_id, ip.unique)
-                            .await
-                        {
+                        if table.delete_index(&ip.key, ip.row_id, ip.unique).await {
                             purge_index_count += 1;
                         }
                     }

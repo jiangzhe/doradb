@@ -68,8 +68,7 @@ impl Catalog {
     }
 
     /// Enable page committer for tables, excluding catalog tables.
-    /// The catalog tables uses different buffer pool than data(user) tables.
-    /// So no page creation should be persisted in redo log.
+    /// No page creation should be persisted in redo log for catalog tables.
     #[inline]
     pub async fn enable_page_committer_for_tables(&self, trx_sys: &'static TransactionSystem) {
         let tables_g = self.cache.tables.read().await;
@@ -184,7 +183,8 @@ impl Catalog {
                     table_file.active_root_ptr(),
                 )
                 .await;
-                let table = Table::new(index_pool, blk_idx, table_file).await;
+                let table =
+                    Table::new(self.storage.data_pool, index_pool, blk_idx, table_file).await;
                 // Update table into cache
                 let mut table_cache_g = self.cache.tables.write().await;
                 let res = table_cache_g.insert(table_id, table);

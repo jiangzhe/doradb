@@ -1,4 +1,3 @@
-use crate::buffer::BufferPool;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::TableMetadata;
@@ -83,18 +82,17 @@ fn row_to_table_object(metadata: &TableMetadata, row: Row<'_>) -> TableObject {
     }
 }
 
-pub struct Tables<'a, P: BufferPool> {
-    pub(super) buf_pool: &'static P,
+pub struct Tables<'a> {
     pub(super) table: &'a Table,
 }
 
-impl<P: BufferPool> Tables<'_, P> {
+impl Tables<'_> {
     /// Find a table by id.
     #[inline]
     pub async fn find_uncommitted_by_id(&self, table_id: TableID) -> Option<TableObject> {
         let key = SelectKey::new(INDEX_NO_TABLES_TABLE_ID, vec![Val::from(table_id)]);
         self.table
-            .index_lookup_unique_uncommitted(self.buf_pool, &key, row_to_table_object)
+            .index_lookup_unique_uncommitted(&key, row_to_table_object)
             .await
     }
 
@@ -110,7 +108,7 @@ impl<P: BufferPool> Tables<'_, P> {
             vec![Val::from(schema_id), Val::from(name)],
         );
         self.table
-            .index_lookup_unique_uncommitted(self.buf_pool, &key, row_to_table_object)
+            .index_lookup_unique_uncommitted(&key, row_to_table_object)
             .await
     }
 
@@ -121,17 +119,14 @@ impl<P: BufferPool> Tables<'_, P> {
             Val::from(obj.schema_id),
             Val::from(obj.table_name.as_str()),
         ];
-        self.table
-            .insert_mvcc(self.buf_pool, stmt, cols)
-            .await
-            .is_ok()
+        self.table.insert_mvcc(stmt, cols).await.is_ok()
     }
 
     /// Delete a table by id.
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: TableID) -> bool {
         let key = SelectKey::new(INDEX_NO_TABLES_TABLE_ID, vec![Val::from(id)]);
         self.table
-            .delete_unique_mvcc(self.buf_pool, stmt, &key, true)
+            .delete_unique_mvcc(stmt, &key, true)
             .await
             .is_ok()
     }

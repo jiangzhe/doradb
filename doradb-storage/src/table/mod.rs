@@ -9,7 +9,7 @@ pub use recover::*;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
 use crate::file::table_file::TableFile;
@@ -70,6 +70,7 @@ use std::sync::Arc;
 /// index does not contain version information, and out-of-date index entry
 /// should ignored if visible data version does not match index key.
 pub struct Table {
+    pub data_pool: &'static EvictableBufferPool,
     pub file: Arc<TableFile>,
     pub blk_idx: Arc<BlockIndex>,
     pub sec_idx: Arc<[SecondaryIndex]>,
@@ -79,6 +80,7 @@ impl Table {
     /// Create a new table.
     #[inline]
     pub async fn new(
+        data_pool: &'static EvictableBufferPool,
         index_pool: &'static FixedBufferPool,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
@@ -98,6 +100,7 @@ impl Table {
             sec_idx.push(si);
         }
         Table {
+            data_pool,
             file,
             blk_idx: Arc::new(blk_idx),
             sec_idx: Arc::from(sec_idx.into_boxed_slice()),
@@ -128,9 +131,8 @@ impl Table {
     }
 
     #[inline]
-    async fn index_lookup_unique_row_mvcc<P: BufferPool>(
+    async fn index_lookup_unique_row_mvcc(
         &self,
-        data_pool: &'static P,
         stmt: &Statement,
         key: &SelectKey,
         user_read_set: &[usize],
@@ -140,7 +142,7 @@ impl Table {
             RowLocation::NotFound => SelectMvcc::NotFound,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
-                let page_guard = data_pool
+                let page_guard = self.data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -159,9 +161,8 @@ impl Table {
         }
     }
 
-    async fn mem_scan<P: BufferPool, F>(
+    async fn mem_scan<F>(
         &self,
-        data_pool: &'static P,
         start_row_id: RowID,
         mut page_action: F,
     ) where
@@ -177,7 +178,7 @@ impl Table {
             let blocks = g.page().leaf_blocks();
             for block in blocks {
                 for page_entry in block.row_page_entries() {
-                    let page_guard: PageSharedGuard<RowPage> = data_pool
+                    let page_guard: PageSharedGuard<RowPage> = self.data_pool
                         .get_page(page_entry.page_id, LatchFallbackMode::Shared)
                         .await
                         .shared_async()
@@ -209,16 +210,15 @@ impl Table {
     }
 
     #[inline]
-    async fn insert_index<P: BufferPool>(
+    async fn insert_index(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> InsertIndex {
         if self.metadata().index_specs[key.index_no].unique() {
-            self.insert_unique_index(data_pool, stmt, key, row_id, page_guard)
+            self.insert_unique_index(stmt, key, row_id, page_guard)
                 .await
         } else {
             self.insert_non_unique_index(stmt, key, row_id).await
@@ -260,15 +260,14 @@ impl Table {
     }
 
     #[inline]
-    async fn recover_index_insert<P: BufferPool>(
+    async fn recover_index_insert(
         &self,
-        data_pool: &'static P,
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
     ) -> RecoverIndex {
         if self.metadata().index_specs[key.index_no].unique() {
-            self.recover_unique_index_insert(data_pool, key, row_id, cts)
+            self.recover_unique_index_insert(key, row_id, cts)
                 .await
         } else {
             self.recover_non_unique_index_insert(key, row_id).await
@@ -405,9 +404,8 @@ impl Table {
     }
 
     #[inline]
-    async fn delete_unique_index<P: BufferPool>(
+    async fn delete_unique_index(
         &self,
-        data_pool: &'static P,
         index: &UniqueBTreeIndex,
         key: &SelectKey,
         row_id: RowID,
@@ -432,7 +430,7 @@ impl Table {
                         }
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let page_guard = data_pool
+                            let page_guard = self.data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .shared_async()
@@ -459,9 +457,8 @@ impl Table {
     }
 
     #[inline]
-    async fn delete_non_unique_index<P: BufferPool>(
+    async fn delete_non_unique_index(
         &self,
-        data_pool: &'static P,
         index: &NonUniqueBTreeIndex,
         key: &SelectKey,
         row_id: RowID,
@@ -489,7 +486,7 @@ impl Table {
                         }
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let page_guard = data_pool
+                            let page_guard = self.data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .shared_async()
@@ -518,9 +515,8 @@ impl Table {
     /// Move update is similar to a delete+insert.
     /// It's caused by no more space on current row page.
     #[inline]
-    async fn move_update_for_space<P: BufferPool>(
+    async fn move_update_for_space(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         old_row: Vec<(Val, Option<u16>)>,
         update: Vec<UpdateCol>,
@@ -597,7 +593,6 @@ impl Table {
         old_guard.set_dirty(); // mark as dirty page.
         let (new_row_id, new_guard) = self
             .insert_row_internal(
-                data_pool,
                 stmt,
                 new_row,
                 RowUndoKind::Insert,
@@ -621,9 +616,8 @@ impl Table {
     ///    a) we find it, then link it.
     ///    b) no version found, we skip this row.
     #[inline]
-    async fn link_for_unique_index<P: BufferPool>(
+    async fn link_for_unique_index(
         &self,
-        data_pool: &'static P,
         stmt: &Statement,
         old_id: RowID,
         key: &SelectKey,
@@ -636,7 +630,7 @@ impl Table {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let old_guard = data_pool
+                    let old_guard = self.data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .shared_async()
@@ -669,9 +663,8 @@ impl Table {
     }
 
     #[inline]
-    async fn insert_row_internal<P: BufferPool>(
+    async fn insert_row_internal(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
@@ -681,7 +674,7 @@ impl Table {
         let row_len = row_len(metadata, &insert);
         let row_count = estimate_max_row_count(row_len, metadata.col_count());
         loop {
-            let page_guard = self.get_insert_page(data_pool, stmt, row_count).await;
+            let page_guard = self.get_insert_page(stmt, row_count).await;
             let page_id = page_guard.page_id();
             match self.insert_row_to_page(stmt, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
@@ -957,14 +950,13 @@ impl Table {
     }
 
     #[inline]
-    async fn get_insert_page<P: BufferPool>(
+    async fn get_insert_page(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         row_count: usize,
     ) -> PageSharedGuard<RowPage> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
-            let page_guard = data_pool
+            let page_guard = self.data_pool
                 .get_page(page_id, LatchFallbackMode::Shared)
                 .await
                 .shared_async()
@@ -977,7 +969,7 @@ impl Table {
                 return page_guard;
             }
         }
-        self.blk_idx.get_insert_page(data_pool, row_count).await
+        self.blk_idx.get_insert_page(self.data_pool, row_count).await
     }
 
     // lock row will check write conflict on given row and lock it.
@@ -1033,9 +1025,8 @@ impl Table {
     }
 
     #[inline]
-    async fn insert_unique_index<P: BufferPool>(
+    async fn insert_unique_index(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         key: SelectKey,
         row_id: RowID,
@@ -1062,9 +1053,7 @@ impl Table {
                         return InsertIndex::DuplicateKey;
                     }
                     match self
-                        .link_for_unique_index(
-                            data_pool, stmt, old_row_id, &key, row_id, page_guard,
-                        )
+                        .link_for_unique_index(stmt, old_row_id, &key, row_id, page_guard)
                         .await
                     {
                         LinkForUniqueIndex::DuplicateKey => return InsertIndex::DuplicateKey,
@@ -1170,9 +1159,8 @@ impl Table {
     }
 
     #[inline]
-    async fn recover_unique_index_insert<P: BufferPool>(
+    async fn recover_unique_index_insert(
         &self,
-        data_pool: &'static P,
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
@@ -1191,7 +1179,7 @@ impl Table {
                     debug_assert!(old_row_id != row_id);
                     // Find CTS of old row.
                     match self
-                        .find_recover_cts_for_row_id(data_pool, old_row_id)
+                        .find_recover_cts_for_row_id(old_row_id)
                         .await
                     {
                         Some(old_cts) => {
@@ -1266,16 +1254,15 @@ impl Table {
     }
 
     #[inline]
-    async fn find_recover_cts_for_row_id<P: BufferPool>(
+    async fn find_recover_cts_for_row_id(
         &self,
-        data_pool: &'static P,
         row_id: RowID,
     ) -> Option<TrxID> {
         match self.blk_idx.find_row(row_id).await {
             RowLocation::NotFound => None,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
-                let page_guard = data_pool
+                let page_guard = self.data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -1290,9 +1277,8 @@ impl Table {
     }
 
     #[inline]
-    async fn update_indexes_only_key_change<P: BufferPool>(
+    async fn update_indexes_only_key_change(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
@@ -1310,7 +1296,6 @@ impl Table {
                 if index_schema.unique() {
                     match self
                         .update_unique_index_only_key_change(
-                            data_pool,
                             stmt,
                             index.unique().unwrap(),
                             old_key,
@@ -1382,9 +1367,8 @@ impl Table {
     }
 
     #[inline]
-    async fn update_indexes_may_both_change<P: BufferPool>(
+    async fn update_indexes_may_both_change(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         old_row_id: RowID,
         new_row_id: RowID,
@@ -1402,7 +1386,6 @@ impl Table {
                 if index_schema.unique() {
                     match self
                         .update_unique_index_key_and_row_id_change(
-                            data_pool,
                             stmt,
                             index.unique().unwrap(),
                             old_key,
@@ -1516,9 +1499,8 @@ impl Table {
 
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    async fn update_unique_index_key_and_row_id_change<P: BufferPool>(
+    async fn update_unique_index_key_and_row_id_change(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         index: &UniqueBTreeIndex,
         old_key: SelectKey,
@@ -1608,14 +1590,7 @@ impl Table {
                     // We have to check the status of the old row.
                     // See comments of method link_for_unique_index().
                     match self
-                        .link_for_unique_index(
-                            data_pool,
-                            stmt,
-                            index_row_id,
-                            &new_key,
-                            new_row_id,
-                            new_guard,
-                        )
+                        .link_for_unique_index(stmt, index_row_id, &new_key, new_row_id, new_guard)
                         .await
                     {
                         LinkForUniqueIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
@@ -1789,9 +1764,8 @@ impl Table {
     /// into index. Keep old index entry as is.
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    async fn update_unique_index_only_key_change<P: BufferPool>(
+    async fn update_unique_index_only_key_change(
         &self,
-        data_pool: &'static P,
         stmt: &mut Statement,
         index: &UniqueBTreeIndex,
         old_key: SelectKey,
@@ -1837,14 +1811,7 @@ impl Table {
                     // is set to true.
                     debug_assert!(index_row_id != row_id);
                     match self
-                        .link_for_unique_index(
-                            data_pool,
-                            stmt,
-                            index_row_id,
-                            &new_key,
-                            row_id,
-                            page_guard,
-                        )
+                        .link_for_unique_index(stmt, index_row_id, &new_key, row_id, page_guard)
                         .await
                     {
                         LinkForUniqueIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
@@ -1968,6 +1935,7 @@ impl Clone for Table {
     #[inline]
     fn clone(&self) -> Self {
         Table {
+            data_pool: self.data_pool,
             file: Arc::clone(&self.file),
             blk_idx: Arc::clone(&self.blk_idx),
             sec_idx: Arc::clone(&self.sec_idx),

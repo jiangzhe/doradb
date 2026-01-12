@@ -1,4 +1,3 @@
-use crate::buffer::BufferPool;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::{IndexColumnObject, IndexObject};
 use crate::catalog::table::TableMetadata;
@@ -99,12 +98,11 @@ fn row_to_index_object(metadata: &TableMetadata, row: Row<'_>) -> IndexObject {
     }
 }
 
-pub struct Indexes<'a, P: BufferPool> {
-    pub(super) buf_pool: &'static P,
+pub struct Indexes<'a> {
     pub(super) table: &'a Table,
 }
 
-impl<P: BufferPool> Indexes<'_, P> {
+impl Indexes<'_> {
     /// Insert an index.
     pub async fn insert(&self, stmt: &mut Statement, obj: &IndexObject) -> bool {
         let cols = vec![
@@ -113,17 +111,14 @@ impl<P: BufferPool> Indexes<'_, P> {
             Val::from(obj.index_name.as_str()),
             Val::from(obj.index_attributes.bits()),
         ];
-        self.table
-            .insert_mvcc(self.buf_pool, stmt, cols)
-            .await
-            .is_ok()
+        self.table.insert_mvcc(stmt, cols).await.is_ok()
     }
 
     /// Delete an index by id.
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: IndexID) -> bool {
         let key = SelectKey::new(INDEX_NO_INDEXES_INDEX_ID, vec![Val::from(id)]);
         self.table
-            .delete_unique_mvcc(self.buf_pool, stmt, &key, true)
+            .delete_unique_mvcc(stmt, &key, true)
             .await
             .is_ok()
     }
@@ -132,7 +127,7 @@ impl<P: BufferPool> Indexes<'_, P> {
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<IndexObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, 0, |metadata, row| {
+            .table_scan_uncommitted(0, |metadata, row| {
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = row.val(metadata, COL_NO_INDEXES_TABLE_ID).as_u64().unwrap();
                 if table_id_in_row == table_id {
@@ -245,12 +240,11 @@ fn row_to_index_column_object(metadata: &TableMetadata, row: Row<'_>) -> IndexCo
     }
 }
 
-pub struct IndexColumns<'a, P: BufferPool> {
-    pub(super) buf_pool: &'static P,
+pub struct IndexColumns<'a> {
     pub(super) table: &'a Table,
 }
 
-impl<P: BufferPool> IndexColumns<'_, P> {
+impl IndexColumns<'_> {
     pub async fn insert(&self, stmt: &mut Statement, obj: &IndexColumnObject) -> bool {
         let cols = vec![
             Val::from(obj.column_id),
@@ -259,10 +253,7 @@ impl<P: BufferPool> IndexColumns<'_, P> {
             Val::from(obj.index_column_no),
             Val::from(obj.index_order as u8),
         ];
-        self.table
-            .insert_mvcc(self.buf_pool, stmt, cols)
-            .await
-            .is_ok()
+        self.table.insert_mvcc(stmt, cols).await.is_ok()
     }
 
     pub async fn delete_by_index(&self, _stmt: &mut Statement, _index_id: IndexID) -> bool {
@@ -272,7 +263,7 @@ impl<P: BufferPool> IndexColumns<'_, P> {
     pub async fn list_uncommitted_by_index_id(&self, index_id: IndexID) -> Vec<IndexColumnObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(self.buf_pool, 0, |metadata, row| {
+            .table_scan_uncommitted(0, |metadata, row| {
                 let index_id_in_row = row
                     .val(metadata, COL_NO_INDEX_COLUMNS_INDEX_ID)
                     .as_u64()
