@@ -28,6 +28,7 @@ use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
 use crate::trx::undo::{IndexBranch, RowUndoKind};
+use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use std::collections::HashMap;
@@ -714,7 +715,7 @@ impl Table {
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page();
-        if ctx.row_ver().unwrap().frozen() {
+        if ctx.row_ver().unwrap().is_frozen() {
             return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
         }
         debug_assert!(metadata.col_count() == page.header.col_count as usize);
@@ -799,7 +800,11 @@ impl Table {
         {
             return UpdateRowInplace::RowNotFound;
         }
-        let frozen = ctx.row_ver().unwrap().frozen();
+        let row_state = ctx.row_ver().unwrap().state();
+        if row_state == RowPageState::Transition {
+            return UpdateRowInplace::Retry;
+        }
+        let frozen = row_state == RowPageState::Frozen;
         let mut lock_row = self
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
@@ -809,6 +814,11 @@ impl Table {
             LockRowForWrite::WriteConflict => UpdateRowInplace::WriteConflict,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
+                if ctx.row_ver().unwrap().is_transition() {
+                    drop(access);
+                    drop(lock_row);
+                    return UpdateRowInplace::Retry;
+                }
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }
@@ -901,7 +911,10 @@ impl Table {
         log_by_key: bool,
     ) -> DeleteInternal {
         let page_id = page_guard.page_id();
-        let page = page_guard.page();
+        let (ctx, page) = page_guard.ctx_and_page();
+        if ctx.row_ver().unwrap().is_transition() {
+            return DeleteInternal::Retry;
+        }
         if !page.row_id_in_valid_range(row_id) {
             return DeleteInternal::NotFound;
         }
@@ -913,6 +926,11 @@ impl Table {
             LockRowForWrite::WriteConflict => DeleteInternal::WriteConflict,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
+                if ctx.row_ver().unwrap().is_transition() {
+                    drop(access);
+                    drop(lock_row);
+                    return DeleteInternal::Retry;
+                }
                 if access.row().is_deleted() {
                     return DeleteInternal::NotFound;
                 }
@@ -2007,6 +2025,7 @@ enum UpdateRowInplace {
     RowNotFound,
     RowDeleted,
     WriteConflict,
+    Retry,
     NoFreeSpace(
         RowID,
         Vec<(Val, Option<u16>)>,
@@ -2019,6 +2038,7 @@ enum DeleteInternal {
     Ok(PageSharedGuard<RowPage>),
     NotFound,
     WriteConflict,
+    Retry,
 }
 
 #[inline]
