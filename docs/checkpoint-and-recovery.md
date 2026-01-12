@@ -119,21 +119,32 @@ Once stabilized, the page is ready for conversion.
 While the Tuple Mover handles the append-only growth of data (Heap), deletions on existing persistent data (`RowID < Pivot`) are handled via the Delta Checkpoint.
 
 ### Triggering
-Delta Checkpoint can be triggered in two ways:
+Delta Checkpoint can be triggered in three ways:
 1.  **Piggyback**: Runs automatically alongside the Tuple Mover tasks to amortize metadata I/O overhead.
-2.  **Threshold**: Runs independently if the in-memory **ColumnDeltaBuffer** exceeds a size threshold (e.g., 64MB) or time interval (e.g., 5 mins).
+2.  **Threshold**: Runs independently if the in-memory **ColumnDeltaBuffer** exceeds a size threshold (e.g., 64MB).
+3.  **Heartbeat**: Runs on a periodic timer (e.g., every minute) if no data-driven checkpoint has occurred for a table, or is triggered by the Log Manager when log usage is high. This is critical for log truncation.
 
 ### Process
-1.  **Select**: Identify all committed deletions in the `ColumnDeltaBuffer`. Let the max CTS in this batch be `Batch_Delta_CTS`.
-2.  **Apply**:
-    *   Load relevant Delete Bitmap pages (if not cached).
-    *   Apply deletions using Copy-on-Write (CoW).
-    *   Generate new Bitmap Pages.
-3.  **Persist**:
-    *   Write new Bitmap Pages to the Table File.
-    *   Update Block Index to point to new Bitmaps.
-    *   Update `Table.watermarks.delta_rec_cts = Batch_Delta_CTS`.
-4.  **Cleanup**: Remove processed deletions from the memory buffer.
+The process is coordinated by a system transaction that defines the persistence boundary.
+
+1.  **Snapshot & Barrier**: The Checkpoint Coordinator acquires a global system timestamp: **`Checkpoint_STS`**. This timestamp acts as a **Read View**, guaranteeing that all deletions committed at or before this time will be persisted.
+2.  **Select**: The coordinator scans the `ColumnDeltaBuffer` and collects `RowID`s where the entry is committed and its `CTS <= Checkpoint_STS`.
+3.  **Merge & Encode (Data Path)**: If deletions were selected:
+    *   For each affected LWC Block, load the old on-disk bitmap.
+    *   Merge the new deletions: `New_Bitmap = Old_Bitmap | New_Deletes`.
+    *   Persist the new bitmap using Copy-on-Write (CoW), updating the Block Index and/or a dedicated Bitmap B+Tree.
+4.  **Commit & Watermark Advancement**:
+    *   A new `MetaPage` is created.
+    *   **Crucially**, the watermark is advanced to the system timestamp acquired in Step 1: `Table.watermarks.delta_rec_cts = Checkpoint_STS`. This happens even if no data was written (the "Heartbeat" path), ensuring the recovery watermark always moves forward.
+    *   The SuperPage is atomically updated to point to the new `MetaPage`.
+
+### Memory Garbage Collection (Cleanup)
+Persistence of a delete is decoupled from its cleanup in memory. Entries are retained after a checkpoint to provide MVCC visibility (Undo) for long-running transactions.
+
+*   **Trigger**: A separate, periodic background task.
+*   **Condition**: An entry can be removed from the `ColumnDeltaBuffer` **only if** its commit timestamp is older than the start timestamp of the oldest active transaction in the system:
+    $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
+*   **Logic**: Once this condition is met, no active transaction can possibly need to see the "pre-delete" version of the row, so the Undo information in memory is obsolete and can be safely reclaimed.
 
 ### 4.4 Index Checkpoint (Per Index)
 
@@ -192,19 +203,25 @@ Upon system restart, the recovery process uses these persistent watermarks to de
 4.  The Log Reader seeks to the log file/offset corresponding to `Replay_Start_CTS`.
 
 #### 6.2.2 Log Replay
-The recovery thread reads logs sequentially from the start point. For each log entry, it checks against the specific object's watermark to decide whether to replay or skip.
+The recovery thread reads logs sequentially from the `Replay_Start_CTS`. This timestamp acts as a coarse-grained filter to skip log records that are guaranteed to be persisted across all tables and all components.
 
-*   **Heap Operations (Insert/Update on `RowID >= Pivot`)**:
-    *   **Rule**: Replay if `Entry.CTS >= T.Heap_Redo_Start_CTS.Heap_Redo_Start_CTS`.
-    *   *Note*: Since `Pivot` separates persistent LWC from volatile RowStore, any log targeting `RowID >= Pivot` effectively implies it belongs to the RowStore region and needs recovery. The watermark check is a sanity check (and optimization for edge cases where RowID ranges might overlap in time due to updates).
+For each log entry read from the log, a second, finer-grained check is performed against the specific component's watermark to decide whether to replay the operation. This ensures that each part of the system (Heap, Delta, Index) is restored to its correct state without re-applying changes that are already persisted.
 
-*   **Delta Operations (Delete on `RowID < Pivot`)**:
+*   **Heap Operations (Affecting the In-Memory RowStore)**:
+    *   **Filter**: An operation on a table `T` is a candidate if its `RowID >= T.Pivot_RowID`.
+    *   **Rule**: Replay if `Entry.CTS >= T.Heap_Redo_Start_CTS`.
+    *   **Action**: Re-apply the Insert or Update to reconstruct the in-memory RowPage.
+    *   **Clarification**: The `Heap_Redo_Start_CTS` specifically marks the point from which the *volatile* part of the heap needs to be reconstructed. There is an additional filter for *cold* data (see `data-checkpoint.md` for `Last_Checkpoint_STS` logic).
+
+*   **Delta Operations (Affecting the On-Disk ColumnStore)**:
+    *   **Filter**: An operation on a table `T` is a candidate if its `RowID < T.Pivot_RowID`.
     *   **Rule**: Replay if `Entry.CTS > T.Delta_rec_CTS`.
-    *   *Action*: Insert into `ColumnDeltaBuffer`.
+    *   **Action**: Insert the deletion record into the in-memory `ColumnDeltaBuffer`.
 
 *   **Index Operations**:
-    *   **Rule**: Replay if `Entry.CTS > Index.Rec_CTS`.
-    *   *Action*: Insert into `MemTree` and mark as Dirty.
+    *   **Filter**: All operations that modify an index.
+    *   **Rule**: Replay if `Entry.CTS > Index.Rec_CTS` for the specific index being modified.
+    *   **Action**: Insert the key change into the corresponding in-memory `MemTree` and mark it as dirty.
 
 #### 6.2.3 Completion
 Once the log end is reached, the in-memory state (RowStore, DeltaBuffer, MemTree) is consistent with the state at the moment of the crash. The system then opens for new transactions.
