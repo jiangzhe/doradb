@@ -2,7 +2,7 @@
 
 ## Summary
 
-This task proposes refactoring the `Table` API within the `doradb-storage` crate. The primary goal is to simplify the `Table` struct and its associated methods by removing the generic `data_pool: &'static P` parameter and instead embedding a dedicated `mem_pool: &'static EvictableBufferPool` directly into the `Table` struct. This change aims to improve code clarity and reduce boilerplate by centralizing buffer pool management for row pages.
+This task proposes refactoring the `Table` API within the `doradb-storage` crate. The primary goal is to simplify the `Table` struct and its associated methods by removing the generic `data_pool: &'static P` parameter and instead embedding a dedicated `data_pool: &'static EvictableBufferPool` directly into the `Table` struct. This change aims to improve code clarity and reduce boilerplate by centralizing buffer pool management for row pages.
 
 ## Context
 
@@ -10,12 +10,12 @@ Currently, many methods of the `Table` struct accept a generic `data_pool: &'sta
 
 ## Goals
 
-*   Modify the `Table` struct definition in `doradb-storage/src/table/mod.rs` to include a new field: `pub mem_pool: &'static EvictableBufferPool`.
-*   Update the `Table::new` constructor to accept an instance of `&'static EvictableBufferPool` and use it to initialize the new `mem_pool` field.
+*   Modify the `Table` struct definition in `doradb-storage/src/table/mod.rs` to include a new field: `pub data_pool: &'static EvictableBufferPool`.
+*   Update the `Table::new` constructor to accept an instance of `&'static EvictableBufferPool` and use it to initialize the new `data_pool` field.
 *   Remove the `data_pool: &'static P` parameter from all `Table` methods that currently utilize it.
-*   Update the `TableAccess` trait and its implementation for `Table` to remove the `data_pool` parameter and use `self.mem_pool`.
-*   Update the `TableRecover` trait and its implementation for `Table` to remove the `data_pool` parameter and use `self.mem_pool`.
-*   Replace all calls to `data_pool.` with `self.mem_pool.` within the implementation of these modified methods.
+*   Update the `TableAccess` trait and its implementation for `Table` to remove the `data_pool` parameter and use `self.data_pool`.
+*   Update the `TableRecover` trait and its implementation for `Table` to remove the `data_pool` parameter and use `self.data_pool`.
+*   Replace all calls to `data_pool.` with `self.data_pool.` within the implementation of these modified methods.
 *   Adjust relevant `use` statements in `doradb-storage/src/table/mod.rs`, `doradb-storage/src/table/access.rs`, and `doradb-storage/src/table/recover.rs` to reflect the direct use of `EvictableBufferPool` instead of the generic `BufferPool` trait and `FixedBufferPool` where it was previously used for row pages.
 
 ## Non-Goals
@@ -28,24 +28,24 @@ Currently, many methods of the `Table` struct accept a generic `data_pool: &'sta
 ## Plan
 
 1.  **Locate `struct Table`**: Identify the definition of the `Table` struct in `doradb-storage/src/table/mod.rs`.
-2.  **Add `mem_pool` field**: Insert `pub mem_pool: &'static EvictableBufferPool,` into the `Table` struct.
+2.  **Add `data_pool` field**: Insert `pub data_pool: &'static EvictableBufferPool,` into the `Table` struct.
 3.  **Update `Table::new`**: 
-    *   Modify the signature of `Table::new` to accept `mem_pool: &'static EvictableBufferPool` as an argument.
-    *   Initialize the `self.mem_pool` field with the provided `mem_pool` argument.
+    *   Modify the signature of `Table::new` to accept `data_pool: &'static EvictableBufferPool` as an argument.
+    *   Initialize the `self.data_pool` field with the provided `data_pool` argument.
 4.  **Refactor methods using `data_pool` in `doradb-storage/src/table/mod.rs`**: 
     *   Identify all `async fn` methods within `impl Table` that currently take `data_pool: &'static P`.
     *   Remove the `data_pool: &'static P` parameter from the function signatures.
-    *   Within the body of each affected method, replace every occurrence of `data_pool.some_method()` with `self.mem_pool.some_method()`.
+    *   Within the body of each affected method, replace every occurrence of `data_pool.some_method()` with `self.data_pool.some_method()`.
 5.  **Refactor `TableAccess` trait and `impl Table for TableAccess` in `doradb-storage/src/table/access.rs`**: 
     *   Remove `P: BufferPool` generic parameter from the trait methods.
     *   Remove `data_pool: &'static P` parameter from trait method signatures.
     *   Remove `P: BufferPool` generic parameter from `impl Table for TableAccess` block.
-    *   Replace `data_pool.some_method()` with `self.mem_pool.some_method()` in the implementation.
+    *   Replace `data_pool.some_method()` with `self.data_pool.some_method()` in the implementation.
 6.  **Refactor `TableRecover` trait and `impl Table for TableRecover` in `doradb-storage/src/table/recover.rs`**: 
     *   Remove `P: BufferPool` generic parameter from the trait methods.
     *   Remove `data_pool: &'static P` parameter from trait method signatures.
     *   Remove `P: BufferPool` generic parameter from `impl Table for TableRecover` block.
-    *   Replace `data_pool.some_method()` with `self.mem_pool.some_method()` in the implementation.
+    *   Replace `data_pool.some_method()` with `self.data_pool.some_method()` in the implementation.
 7.  **Adjust `use` statements**: Review and update `use` declarations at the top of `doradb-storage/src/table/mod.rs`, `doradb-storage/src/table/access.rs`, and `doradb-storage/src/table/recover.rs` to ensure `EvictableBufferPool` is correctly imported and unnecessary generic `BufferPool` imports or `FixedBufferPool` imports related to row pages are removed.
 
 ## Impacts
@@ -60,7 +60,7 @@ Currently, many methods of the `Table` struct accept a generic `data_pool: &'sta
     *   `Table::new`: Signature change.
     *   All methods within the `TableAccess` trait and its `impl Table` block.
     *   All methods within the `TableRecover` trait and its `impl Table` block.
-    *   Methods like `index_lookup_unique_row_mvcc`, `mem_scan`, `insert_index`, `recover_unique_index_insert`, `delete_unique_index`, `delete_non_unique_index`, `move_update_for_space`, `link_for_unique_index`, `insert_row_internal`, `get_insert_page`, `find_recover_cts_for_row_id`, `update_indexes_only_key_change`, `update_unique_index_key_and_row_id_change`, `update_unique_index_only_key_change` (and potentially others) will have their signatures modified and internal logic updated to use `self.mem_pool`.
+    *   Methods like `index_lookup_unique_row_mvcc`, `mem_scan`, `insert_index`, `recover_unique_index_insert`, `delete_unique_index`, `delete_non_unique_index`, `move_update_for_space`, `link_for_unique_index`, `insert_row_internal`, `get_insert_page`, `find_recover_cts_for_row_id`, `update_indexes_only_key_change`, `update_unique_index_key_and_row_id_change`, `update_unique_index_only_key_change` (and potentially others) will have their signatures modified and internal logic updated to use `self.data_pool`.
 *   **Dependencies:** Any external code or test cases that instantiate `Table` or call the affected methods will need to be updated to reflect the new API.
 ## Open Questions
 
