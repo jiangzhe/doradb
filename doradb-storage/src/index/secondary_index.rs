@@ -324,9 +324,7 @@ mod tests {
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
                 .main_dir(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default(),
-                )
+                .data_buffer(EvictableBufferPoolConfig::default())
                 .trx(
                     TrxSysConfig::default()
                         .log_file_prefix("redo_secidx1")
@@ -347,11 +345,7 @@ mod tests {
                 let mut stmt = trx.start_stmt();
                 for i in 0i32..5i32 {
                     let res = table
-                        .insert_mvcc(
-                            engine.data_pool,
-                            &mut stmt,
-                            vec![Val::from(i), Val::from(i)],
-                        )
+                        .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
                         .await;
                     assert!(res.is_ok());
                 }
@@ -361,7 +355,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let res = table
-                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
@@ -369,9 +363,7 @@ mod tests {
                 let trx = session.begin_trx().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(1i32)]);
-                let res = table
-                    .index_scan_mvcc(engine.data_pool, &stmt, &key, user_read_set)
-                    .await;
+                let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.len() == 1);
                 // update val = 0 where id = 1
@@ -382,36 +374,28 @@ mod tests {
                     idx: 1,
                     val: Val::from(0i32),
                 }];
-                let res = table
-                    .update_unique_mvcc(engine.data_pool, &mut stmt, &key, update)
-                    .await;
+                let res = table.update_unique_mvcc(&mut stmt, &key, update).await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
                 // select ... where val = 0
                 let trx = session.begin_trx().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
-                let res = table
-                    .index_scan_mvcc(engine.data_pool, &stmt, &key, user_read_set)
-                    .await;
+                let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.len() == 2);
                 // delete where id = 0
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
-                let res = table
-                    .delete_unique_mvcc(engine.data_pool, &mut stmt, &key, false)
-                    .await;
+                let res = table.delete_unique_mvcc(&mut stmt, &key, false).await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
                 // select ... where val = 0
                 let trx = session.begin_trx().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
-                let res = table
-                    .index_scan_mvcc(engine.data_pool, &stmt, &key, user_read_set)
-                    .await;
+                let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
                 _ = stmt.succeed().commit().await.unwrap();
                 assert!(res.len() == 1);
             }
@@ -426,9 +410,7 @@ mod tests {
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
                 .main_dir(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default(),
-                )
+                .data_buffer(EvictableBufferPoolConfig::default())
                 .trx(
                     TrxSysConfig::default()
                         .log_file_prefix("redo_secidx2")
@@ -449,11 +431,7 @@ mod tests {
                 let mut stmt = trx.start_stmt();
                 for i in 0i32..5i32 {
                     let res = table
-                        .insert_mvcc(
-                            engine.data_pool,
-                            &mut stmt,
-                            vec![Val::from(i), Val::from(i)],
-                        )
+                        .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
                         .await;
                     assert!(res.is_ok());
                 }
@@ -462,11 +440,7 @@ mod tests {
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let res = table
-                    .insert_mvcc(
-                        engine.data_pool,
-                        &mut stmt,
-                        vec![Val::from(5i32), Val::from(5i32)],
-                    )
+                    .insert_mvcc(&mut stmt, vec![Val::from(5i32), Val::from(5i32)])
                     .await;
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;
@@ -475,7 +449,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(5i32)]);
                 let res = table
-                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.not_found());
@@ -487,9 +461,7 @@ mod tests {
                     idx: 1,
                     val: Val::from(0i32),
                 }];
-                let res = table
-                    .update_unique_mvcc(engine.data_pool, &mut stmt, &key, update)
-                    .await;
+                let res = table.update_unique_mvcc(&mut stmt, &key, update).await;
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;
                 // select ... where id = 1
@@ -497,7 +469,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let res = table
-                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
@@ -507,9 +479,7 @@ mod tests {
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
-                let res = table
-                    .delete_unique_mvcc(engine.data_pool, &mut stmt, &key, false)
-                    .await;
+                let res = table.delete_unique_mvcc(&mut stmt, &key, false).await;
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;
                 // select ... where val = 0
@@ -517,7 +487,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
                 let res = table
-                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
@@ -528,18 +498,12 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(3i32)]);
                 let mut stmt = trx.start_stmt();
-                let res = table
-                    .delete_unique_mvcc(engine.data_pool, &mut stmt, &key, false)
-                    .await;
+                let res = table.delete_unique_mvcc(&mut stmt, &key, false).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
                 stmt = trx.start_stmt();
                 let res = table
-                    .insert_mvcc(
-                        engine.data_pool,
-                        &mut stmt,
-                        vec![Val::from(3), Val::from(3)],
-                    )
+                    .insert_mvcc(&mut stmt, vec![Val::from(3), Val::from(3)])
                     .await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
@@ -550,7 +514,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(3i32)]);
                 let res = table
-                    .index_lookup_unique_mvcc(engine.data_pool, &stmt, &key, user_read_set)
+                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 _ = stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());

@@ -298,7 +298,7 @@ impl Session {
             table_file.active_root_ptr(),
         )
         .await;
-        let table = Table::new(engine.index_pool, blk_idx, table_file).await;
+        let table = Table::new(engine.data_pool, engine.index_pool, blk_idx, table_file).await;
         // Enable page committer so all row pages can be recovered.
         table.blk_idx.enable_page_committer(engine.trx_sys);
 

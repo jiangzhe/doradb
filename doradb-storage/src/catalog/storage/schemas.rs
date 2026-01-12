@@ -1,4 +1,3 @@
-use crate::buffer::BufferPool;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::SchemaObject;
 use crate::catalog::table::TableMetadata;
@@ -76,19 +75,18 @@ fn row_to_schema_object(metadata: &TableMetadata, row: Row<'_>) -> SchemaObject 
     }
 }
 
-pub struct Schemas<'a, P: BufferPool> {
-    pub(super) buf_pool: &'static P,
+pub struct Schemas<'a> {
     pub(super) table: &'a Table,
 }
 
-impl<P: BufferPool> Schemas<'_, P> {
+impl Schemas<'_> {
     /// Find a schema by name.
     #[inline]
     pub async fn find_uncommitted_by_name(&self, name: &str) -> Option<SchemaObject> {
         let name = Val::from(name);
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_NAME, vec![name]);
         self.table
-            .index_lookup_unique_uncommitted(self.buf_pool, &key, row_to_schema_object)
+            .index_lookup_unique_uncommitted(&key, row_to_schema_object)
             .await
     }
 
@@ -96,7 +94,7 @@ impl<P: BufferPool> Schemas<'_, P> {
     pub async fn find_uncommitted_by_id(&self, id: SchemaID) -> Option<SchemaObject> {
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![Val::from(id)]);
         self.table
-            .index_lookup_unique_uncommitted(self.buf_pool, &key, row_to_schema_object)
+            .index_lookup_unique_uncommitted(&key, row_to_schema_object)
             .await
     }
 
@@ -107,10 +105,7 @@ impl<P: BufferPool> Schemas<'_, P> {
             Val::from(obj.schema_id),
             Val::from(obj.schema_name.as_str()),
         ];
-        self.table
-            .insert_mvcc(self.buf_pool, stmt, cols)
-            .await
-            .is_ok()
+        self.table.insert_mvcc(stmt, cols).await.is_ok()
     }
 
     /// Delete a schema by id.
@@ -118,7 +113,7 @@ impl<P: BufferPool> Schemas<'_, P> {
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: SchemaID) -> bool {
         let key = SelectKey::new(INDEX_NO_SCHEMAS_SCHEMA_ID, vec![Val::from(id)]);
         self.table
-            .delete_unique_mvcc(self.buf_pool, stmt, &key, true)
+            .delete_unique_mvcc(stmt, &key, true)
             .await
             .is_ok()
     }

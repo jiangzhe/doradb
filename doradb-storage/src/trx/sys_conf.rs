@@ -1,4 +1,4 @@
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::{EvictableBufferPool, FixedBufferPool};
 use crate::catalog::Catalog;
 use crate::catalog::storage::CatalogStorage;
 use crate::error::Result;
@@ -157,11 +157,11 @@ impl TrxSysConfig {
         })
     }
 
-    pub async fn build_static<P: BufferPool>(
+    pub async fn build_static(
         self,
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
-        data_pool: &'static P,
+        data_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
     ) -> Result<&'static TransactionSystem> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
@@ -170,7 +170,7 @@ impl TrxSysConfig {
             log_partition_initializers.push(initializer);
         }
 
-        let catalog_storage = CatalogStorage::new(meta_pool, index_pool, table_fs).await?;
+        let catalog_storage = CatalogStorage::new(meta_pool, index_pool, data_pool, table_fs).await?;
         let mut catalog = Catalog::new(catalog_storage);
 
         // Now we have an empty catalog, all log partitions and buffer pool.

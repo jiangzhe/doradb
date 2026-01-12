@@ -723,7 +723,7 @@ fn test_table_scan_uncommitted() {
         {
             let mut res_len = 0usize;
             sys.table
-                .table_scan_uncommitted(sys.engine.data_pool, 0, |_metadata, _row| {
+                .table_scan_uncommitted(0, |_metadata, _row| {
                     res_len += 1;
                     true
                 })
@@ -762,7 +762,7 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |_| {
+                .table_scan_mvcc(&stmt, 0, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -787,7 +787,7 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |_| {
+                .table_scan_mvcc(&stmt, 0, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -804,7 +804,7 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(sys.engine.data_pool, &stmt, 0, &[0], |_| {
+                .table_scan_mvcc(&stmt, 0, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -833,7 +833,7 @@ fn test_table_freeze() {
         }
         let row_pages = sys.table.total_row_pages().await;
         assert!(row_pages == 1);
-        sys.table.freeze(sys.engine.data_pool, 10).await;
+        sys.table.freeze(10).await;
         // after freezing, new row should be inserted into second page.
         {
             let trx = session1.begin_trx().unwrap();
@@ -842,7 +842,7 @@ fn test_table_freeze() {
         }
         let row_pages = sys.table.total_row_pages().await;
         assert!(row_pages == 2);
-        sys.table.freeze(sys.engine.data_pool, 10).await;
+        sys.table.freeze(10).await;
 
         // update row 1 will cause new insert into new page.
         {
