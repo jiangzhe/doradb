@@ -67,7 +67,7 @@ impl TableRecover for Table {
         });
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
-        let mut page_guard = self.mem_pool
+        let mut page_guard = self.data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -96,7 +96,7 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) {
-        let mut page_guard = self.mem_pool
+        let mut page_guard = self.data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -120,7 +120,7 @@ impl TableRecover for Table {
 
             if !index_change_cols.is_empty() {
                 // There is index change, we need to update index.
-                let page_guard = self.mem_pool
+                let page_guard = self.data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -156,7 +156,7 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) {
-        let mut page_guard = self.mem_pool
+        let mut page_guard = self.data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -196,7 +196,7 @@ impl TableRecover for Table {
         &self,
         page_id: PageID,
     ) {
-        let page_guard = self.mem_pool
+        let page_guard = self.data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
             .shared_async()
