@@ -174,7 +174,7 @@ impl Catalog {
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
                 let metadata_in_file = &*active_root.metadata;
                 debug_assert_eq!(&metadata_in_catalog, metadata_in_file);
-                let row_id_bound = active_root.row_id_bound;
+                let row_id_bound = active_root.pivot_row_id;
 
                 let blk_idx = BlockIndex::new(
                     self.storage.meta_pool,

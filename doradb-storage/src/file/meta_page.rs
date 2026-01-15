@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(meta_page.block_index, active_root.block_index);
         assert_eq!(meta_page.space_map, active_root.alloc_map);
         assert_eq!(meta_page.gc_page_list, active_root.gc_page_list);
-        assert_eq!(meta_page.pivot_row_id, active_root.row_id_bound);
+        assert_eq!(meta_page.pivot_row_id, active_root.pivot_row_id);
         assert_eq!(
             meta_page.last_checkpoint_cts,
             active_root.heap_redo_start_cts
