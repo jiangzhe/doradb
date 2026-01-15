@@ -14,6 +14,7 @@ use crate::io::{AIOBuf, AIOClient, AIOKind};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::trx::TrxID;
+use futures::future::try_join_all;
 use std::fs;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
@@ -191,6 +192,7 @@ impl TableFile {
             page_no: super_page.header.page_no,
             trx_id: super_page.header.trx_id,
             row_id_bound: meta_page.pivot_row_id,
+            heap_redo_start_cts: meta_page.last_checkpoint_cts,
             alloc_map: meta_page.space_map,
             gc_page_list: meta_page.gc_page_list,
             metadata: Arc::new(meta_page.schema),
@@ -283,6 +285,12 @@ impl Drop for TableFile {
 pub struct MutableTableFile {
     table_file: Arc<TableFile>,
     active_root: ActiveRoot,
+}
+
+pub struct LwcPagePersist {
+    pub start_row_id: RowID,
+    pub end_row_id: RowID,
+    pub buf: DirectBuf,
 }
 
 impl MutableTableFile {
@@ -396,6 +404,73 @@ impl MutableTableFile {
         Ok((table_file, old_root))
     }
 
+    pub async fn persist_lwc_pages(
+        self,
+        lwc_pages: Vec<LwcPagePersist>,
+        heap_redo_start_cts: TrxID,
+        ts: TrxID,
+    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+        let MutableTableFile {
+            table_file,
+            mut active_root,
+        } = self;
+
+        let mut max_row_id = active_root.row_id_bound;
+        let mut writes = Vec::with_capacity(lwc_pages.len());
+        let mut new_entries = Vec::with_capacity(lwc_pages.len());
+
+        for page in lwc_pages {
+            if page.start_row_id >= page.end_row_id {
+                return Err(Error::InvalidArgument);
+            }
+            let page_id = active_root
+                .alloc_map
+                .try_allocate()
+                .ok_or(Error::InvalidState)? as PageID;
+            max_row_id = max_row_id.max(page.end_row_id);
+            new_entries.push((page.start_row_id, page.end_row_id, page_id));
+            writes.push(table_file.write_page(page_id, page.buf));
+        }
+
+        try_join_all(writes).await?;
+
+        let mut builder = BlockIndexArrayBuilder::default();
+        for idx in 0..active_root.block_index.starts.len() {
+            let start = active_root.block_index.starts[idx];
+            let delta = active_root.block_index.deltas[idx];
+            let page = active_root.block_index.pages[idx];
+            builder.push(start, start + delta, page);
+        }
+
+        let mut last_end = active_root
+            .block_index
+            .starts
+            .last()
+            .zip(active_root.block_index.deltas.last())
+            .map(|(start, delta)| start + delta);
+
+        for (start_row_id, end_row_id, page_id) in new_entries {
+            if let Some(prev_end) = last_end {
+                if start_row_id < prev_end {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+            builder.push(start_row_id, end_row_id, page_id);
+            last_end = Some(end_row_id);
+        }
+
+        active_root.block_index = builder.build();
+        active_root.row_id_bound = max_row_id;
+        active_root.heap_redo_start_cts = heap_redo_start_cts;
+
+        MutableTableFile {
+            table_file,
+            active_root,
+        }
+        .commit(ts, false)
+        .await
+    }
+
     #[inline]
     pub fn try_delete(self) -> bool {
         if let Some(table_file) = Arc::into_inner(self.table_file) {
@@ -424,6 +499,8 @@ pub struct ActiveRoot {
     /// maximum row id might be small. The upper bound is large
     /// according the first row page which is not transfered.
     pub row_id_bound: RowID,
+    /// Redo log start point for in-memory heap.
+    pub heap_redo_start_cts: TrxID,
     /// Page allocation map.
     pub alloc_map: AllocMap,
     /// Pages that became obsolete in this version.
@@ -455,6 +532,7 @@ impl ActiveRoot {
             page_no: DEFALT_ROOT_PAGE_NO,
             trx_id,
             row_id_bound: 0,
+            heap_redo_start_cts: trx_id,
             alloc_map,
             gc_page_list: vec![],
             metadata,
@@ -486,7 +564,7 @@ impl ActiveRoot {
             &self.alloc_map,
             &self.gc_page_list,
             self.row_id_bound,
-            self.trx_id,
+            self.heap_redo_start_cts,
         )
     }
 
