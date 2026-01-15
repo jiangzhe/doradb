@@ -191,7 +191,7 @@ impl TableFile {
         Ok(ActiveRoot {
             page_no: super_page.header.page_no,
             trx_id: super_page.header.trx_id,
-            row_id_bound: meta_page.pivot_row_id,
+            pivot_row_id: meta_page.pivot_row_id,
             heap_redo_start_cts: meta_page.last_checkpoint_cts,
             alloc_map: meta_page.space_map,
             gc_page_list: meta_page.gc_page_list,
@@ -415,7 +415,7 @@ impl MutableTableFile {
             mut active_root,
         } = self;
 
-        let mut max_row_id = active_root.row_id_bound;
+        let mut max_row_id = active_root.pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_pages.len());
         let mut new_entries = Vec::with_capacity(lwc_pages.len());
 
@@ -460,7 +460,7 @@ impl MutableTableFile {
         }
 
         active_root.block_index = builder.build();
-        active_root.row_id_bound = max_row_id;
+        active_root.pivot_row_id = max_row_id;
         active_root.heap_redo_start_cts = heap_redo_start_cts;
 
         MutableTableFile {
@@ -498,7 +498,7 @@ pub struct ActiveRoot {
     /// to be transfered to LWC(LightWeight Columnar) pages, and
     /// maximum row id might be small. The upper bound is large
     /// according the first row page which is not transfered.
-    pub row_id_bound: RowID,
+    pub pivot_row_id: RowID,
     /// Redo log start point for in-memory heap.
     pub heap_redo_start_cts: TrxID,
     /// Page allocation map.
@@ -531,7 +531,7 @@ impl ActiveRoot {
         ActiveRoot {
             page_no: DEFALT_ROOT_PAGE_NO,
             trx_id,
-            row_id_bound: 0,
+            pivot_row_id: 0,
             heap_redo_start_cts: trx_id,
             alloc_map,
             gc_page_list: vec![],
@@ -563,7 +563,7 @@ impl ActiveRoot {
             &self.block_index,
             &self.alloc_map,
             &self.gc_page_list,
-            self.row_id_bound,
+            self.pivot_row_id,
             self.heap_redo_start_cts,
         )
     }
