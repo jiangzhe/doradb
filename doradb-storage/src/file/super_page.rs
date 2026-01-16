@@ -15,8 +15,8 @@ pub struct SuperPageHeader {
     pub version: u64,
     /// Page number of this super page.
     pub page_no: PageID,
-    /// transaction id of this super page.
-    pub trx_id: TrxID,
+    /// checkpoint timestamp of this super page.
+    pub checkpoint_cts: TrxID,
 }
 
 impl Ser<'_> for SuperPageHeader {
@@ -25,7 +25,7 @@ impl Ser<'_> for SuperPageHeader {
         mem::size_of::<[u8; 8]>() // magic word
             + mem::size_of::<u64>() // version
             + mem::size_of::<PageID>() // page no
-            + mem::size_of::<TrxID>() // transaction id
+            + mem::size_of::<TrxID>() // checkpoint timestamp
     }
 
     #[inline]
@@ -33,7 +33,7 @@ impl Ser<'_> for SuperPageHeader {
         let idx = ctx.ser_byte_array(out, start_idx, &self.magic_word);
         let idx = ctx.ser_u64(out, idx, self.version);
         let idx = ctx.ser_u64(out, idx, self.page_no);
-        ctx.ser_u64(out, idx, self.trx_id)
+        ctx.ser_u64(out, idx, self.checkpoint_cts)
     }
 }
 
@@ -43,12 +43,12 @@ impl Deser for SuperPageHeader {
         let (idx, magic_word) = ctx.deser_byte_array::<8>(input, start_idx)?;
         let (idx, version) = ctx.deser_u64(input, idx)?;
         let (idx, page_no) = ctx.deser_u64(input, idx)?;
-        let (idx, trx_id) = ctx.deser_u64(input, idx)?;
+        let (idx, checkpoint_cts) = ctx.deser_u64(input, idx)?;
         let res = SuperPageHeader {
             magic_word,
             version,
             page_no,
-            trx_id,
+            checkpoint_cts,
         };
         Ok((idx, res))
     }
@@ -82,15 +82,21 @@ impl Deser for SuperPageBody {
 #[derive(Default, PartialEq, Eq)]
 pub struct SuperPageFooter {
     pub b3sum: [u8; 32],
-    pub trx_id: TrxID,
+    pub checkpoint_cts: TrxID,
 }
 
 impl Deser for SuperPageFooter {
     #[inline]
     fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
         let (idx, b3sum) = ctx.deser_byte_array::<32>(input, start_idx)?;
-        let (idx, trx_id) = ctx.deser_u64(input, idx)?;
-        Ok((idx, SuperPageFooter { b3sum, trx_id }))
+        let (idx, checkpoint_cts) = ctx.deser_u64(input, idx)?;
+        Ok((
+            idx,
+            SuperPageFooter {
+                b3sum,
+                checkpoint_cts,
+            },
+        ))
     }
 }
 
@@ -103,7 +109,7 @@ impl Ser<'_> for SuperPageFooter {
     #[inline]
     fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
         let idx = ctx.ser_byte_array(out, start_idx, &self.b3sum);
-        ctx.ser_u64(out, idx, self.trx_id)
+        ctx.ser_u64(out, idx, self.checkpoint_cts)
     }
 }
 
@@ -143,7 +149,7 @@ mod tests {
             magic_word: TABLE_FILE_MAGIC_WORD,
             version: SUPER_PAGE_VERSION,
             page_no: 1,
-            trx_id: 12,
+            checkpoint_cts: 12,
         };
         let body = SuperPageBody { meta_page_id: 7 };
         let mut ctx = SerdeCtx::default();
