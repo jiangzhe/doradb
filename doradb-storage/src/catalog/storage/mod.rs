@@ -52,7 +52,7 @@ impl CatalogStorage {
             let blk_idx = BlockIndex::new(
                 meta_pool,
                 *table_id,
-                table_file.active_root().row_id_bound,
+                table_file.active_root().pivot_row_id,
                 table_file.active_root_ptr(),
             )
             .await;

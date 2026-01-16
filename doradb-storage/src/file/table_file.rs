@@ -14,6 +14,7 @@ use crate::io::{AIOBuf, AIOClient, AIOKind};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, SerdeCtx};
 use crate::trx::TrxID;
+use futures::future::try_join_all;
 use std::fs;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
@@ -189,8 +190,9 @@ impl TableFile {
         self.buf_list.push(meta_buf);
         Ok(ActiveRoot {
             page_no: super_page.header.page_no,
-            trx_id: super_page.header.trx_id,
-            row_id_bound: meta_page.pivot_row_id,
+            trx_id: super_page.header.checkpoint_cts,
+            pivot_row_id: meta_page.pivot_row_id,
+            heap_redo_start_cts: meta_page.heap_redo_start_cts,
             alloc_map: meta_page.space_map,
             gc_page_list: meta_page.gc_page_list,
             metadata: Arc::new(meta_page.schema),
@@ -209,7 +211,7 @@ impl TableFile {
             (Ok(root), Err(_)) | (Err(_), Ok(root)) => Ok(root),
             (Ok(r1), Ok(r2)) => {
                 // pick the one with larger transaction id.
-                if r1.header.trx_id < r2.header.trx_id {
+                if r1.header.checkpoint_cts < r2.header.checkpoint_cts {
                     Ok(r2)
                 } else {
                     Ok(r1)
@@ -230,7 +232,7 @@ impl TableFile {
         let (idx, footer) =
             SuperPageFooter::deser(&mut ctx, buf, TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET)?;
         debug_assert!(idx == TABLE_FILE_SUPER_PAGE_SIZE);
-        if header.trx_id != footer.trx_id {
+        if header.checkpoint_cts != footer.checkpoint_cts {
             // torn write happens
             return Err(Error::TornWrite);
         }
@@ -283,6 +285,12 @@ impl Drop for TableFile {
 pub struct MutableTableFile {
     table_file: Arc<TableFile>,
     active_root: ActiveRoot,
+}
+
+pub struct LwcPagePersist {
+    pub start_row_id: RowID,
+    pub end_row_id: RowID,
+    pub buf: DirectBuf,
 }
 
 impl MutableTableFile {
@@ -366,7 +374,7 @@ impl MutableTableFile {
         let b3sum = blake3::hash(&buf.as_bytes()[..TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET]);
         let footer = SuperPageFooter {
             b3sum: *b3sum.as_bytes(),
-            trx_id: super_page.header.trx_id,
+            checkpoint_cts: super_page.header.checkpoint_cts,
         };
         let ser_idx = footer.ser(
             &ctx,
@@ -396,6 +404,73 @@ impl MutableTableFile {
         Ok((table_file, old_root))
     }
 
+    pub async fn persist_lwc_pages(
+        self,
+        lwc_pages: Vec<LwcPagePersist>,
+        heap_redo_start_cts: TrxID,
+        ts: TrxID,
+    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+        let MutableTableFile {
+            table_file,
+            mut active_root,
+        } = self;
+
+        let mut max_row_id = active_root.pivot_row_id;
+        let mut writes = Vec::with_capacity(lwc_pages.len());
+        let mut new_entries = Vec::with_capacity(lwc_pages.len());
+
+        for page in lwc_pages {
+            if page.start_row_id >= page.end_row_id {
+                return Err(Error::InvalidArgument);
+            }
+            let page_id = active_root
+                .alloc_map
+                .try_allocate()
+                .ok_or(Error::InvalidState)? as PageID;
+            max_row_id = max_row_id.max(page.end_row_id);
+            new_entries.push((page.start_row_id, page.end_row_id, page_id));
+            writes.push(table_file.write_page(page_id, page.buf));
+        }
+
+        try_join_all(writes).await?;
+
+        let mut builder = BlockIndexArrayBuilder::default();
+        for idx in 0..active_root.block_index.starts.len() {
+            let start = active_root.block_index.starts[idx];
+            let delta = active_root.block_index.deltas[idx];
+            let page = active_root.block_index.pages[idx];
+            builder.push(start, start + delta, page);
+        }
+
+        let mut last_end = active_root
+            .block_index
+            .starts
+            .last()
+            .zip(active_root.block_index.deltas.last())
+            .map(|(start, delta)| start + delta);
+
+        for (start_row_id, end_row_id, page_id) in new_entries {
+            if let Some(prev_end) = last_end {
+                if start_row_id < prev_end {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+            builder.push(start_row_id, end_row_id, page_id);
+            last_end = Some(end_row_id);
+        }
+
+        active_root.block_index = builder.build();
+        active_root.pivot_row_id = max_row_id;
+        active_root.heap_redo_start_cts = heap_redo_start_cts;
+
+        MutableTableFile {
+            table_file,
+            active_root,
+        }
+        .commit(ts, false)
+        .await
+    }
+
     #[inline]
     pub fn try_delete(self) -> bool {
         if let Some(table_file) = Arc::into_inner(self.table_file) {
@@ -423,7 +498,9 @@ pub struct ActiveRoot {
     /// to be transfered to LWC(LightWeight Columnar) pages, and
     /// maximum row id might be small. The upper bound is large
     /// according the first row page which is not transfered.
-    pub row_id_bound: RowID,
+    pub pivot_row_id: RowID,
+    /// Redo log start point for in-memory heap.
+    pub heap_redo_start_cts: TrxID,
     /// Page allocation map.
     pub alloc_map: AllocMap,
     /// Pages that became obsolete in this version.
@@ -454,7 +531,8 @@ impl ActiveRoot {
         ActiveRoot {
             page_no: DEFALT_ROOT_PAGE_NO,
             trx_id,
-            row_id_bound: 0,
+            pivot_row_id: 0,
+            heap_redo_start_cts: trx_id,
             alloc_map,
             gc_page_list: vec![],
             metadata,
@@ -470,7 +548,7 @@ impl ActiveRoot {
                 magic_word: TABLE_FILE_MAGIC_WORD,
                 version: SUPER_PAGE_VERSION,
                 page_no: self.page_no,
-                trx_id: self.trx_id,
+                checkpoint_cts: self.trx_id,
             },
             body: SuperPageBody {
                 meta_page_id: self.meta_page_id,
@@ -485,8 +563,9 @@ impl ActiveRoot {
             &self.block_index,
             &self.alloc_map,
             &self.gc_page_list,
-            self.row_id_bound,
-            self.trx_id,
+            self.pivot_row_id,
+            self.heap_redo_start_cts,
+            0,
         )
     }
 
@@ -610,6 +689,7 @@ fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::error::Error;
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
     use crate::value::ValKind;
@@ -699,6 +779,121 @@ mod tests {
 
             drop(table_file);
             let _ = std::fs::remove_file("42.tbl");
+        });
+    }
+
+    #[cfg(feature = "libaio")]
+    fn build_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+            ],
+            vec![IndexSpec::new(
+                "idx1",
+                vec![IndexKey::new(0)],
+                IndexAttributes::PK,
+            )],
+        ))
+    }
+
+    #[cfg(feature = "libaio")]
+    fn page_buf(payload: &[u8]) -> DirectBuf {
+        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        buf.data_mut()[..payload.len()].copy_from_slice(payload);
+        buf
+    }
+
+    // libaio is required to test table file.
+    #[cfg(feature = "libaio")]
+    #[test]
+    fn test_persist_lwc_pages_appends_entries() {
+        smol::block_on(async {
+            let fs = TableFileSystemConfig::default().build().unwrap();
+            let metadata = build_test_metadata();
+            let table_file = fs.create_table_file(43, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let lwc_pages = vec![
+                LwcPagePersist {
+                    start_row_id: 0,
+                    end_row_id: 10,
+                    buf: page_buf(b"lwc-page-1"),
+                },
+                LwcPagePersist {
+                    start_row_id: 10,
+                    end_row_id: 20,
+                    buf: page_buf(b"lwc-page-2"),
+                },
+            ];
+
+            let (table_file, old_root) =
+                MutableTableFile::fork(&table_file)
+                    .persist_lwc_pages(lwc_pages, 7, 2)
+                    .await
+                    .unwrap();
+            drop(old_root);
+
+            let active_root = table_file.active_root();
+            assert_eq!(active_root.trx_id, 2);
+            assert_eq!(active_root.pivot_row_id, 20);
+            assert_eq!(active_root.heap_redo_start_cts, 7);
+            assert_eq!(active_root.block_index.starts.len(), 2);
+            assert_eq!(active_root.block_index.starts[0], 0);
+            assert_eq!(active_root.block_index.deltas[0], 10);
+            assert_eq!(active_root.block_index.starts[1], 10);
+            assert_eq!(active_root.block_index.deltas[1], 10);
+
+            let page_id_1 = active_root.block_index.pages[0];
+            let page_id_2 = active_root.block_index.pages[1];
+            let page1 = table_file.read_page(page_id_1).await.unwrap();
+            let page2 = table_file.read_page(page_id_2).await.unwrap();
+            assert_eq!(&page1.as_bytes()[..10], b"lwc-page-1");
+            assert_eq!(&page2.as_bytes()[..10], b"lwc-page-2");
+
+            drop(table_file);
+            drop(fs);
+            let _ = std::fs::remove_file("43.tbl");
+        });
+    }
+
+    // libaio is required to test table file.
+    #[cfg(feature = "libaio")]
+    #[test]
+    fn test_persist_lwc_pages_rejects_overlapping_ranges() {
+        smol::block_on(async {
+            let fs = TableFileSystemConfig::default().build().unwrap();
+            let metadata = build_test_metadata();
+            let table_file = fs.create_table_file(44, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let lwc_pages = vec![
+                LwcPagePersist {
+                    start_row_id: 0,
+                    end_row_id: 10,
+                    buf: page_buf(b"lwc-overlap-1"),
+                },
+                LwcPagePersist {
+                    start_row_id: 5,
+                    end_row_id: 15,
+                    buf: page_buf(b"lwc-overlap-2"),
+                },
+            ];
+
+            let result = MutableTableFile::fork(&table_file)
+                .persist_lwc_pages(lwc_pages, 7, 2)
+                .await;
+
+            assert!(matches!(result, Err(Error::InvalidArgument)));
+            let active_root = table_file.active_root();
+            assert_eq!(active_root.pivot_row_id, 0);
+            assert!(active_root.block_index.starts.is_empty());
+
+            drop(table_file);
+            drop(fs);
+            let _ = std::fs::remove_file("44.tbl");
         });
     }
 
