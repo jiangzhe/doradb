@@ -689,6 +689,7 @@ fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::error::Error;
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
     use crate::value::ValKind;
@@ -778,6 +779,121 @@ mod tests {
 
             drop(table_file);
             let _ = std::fs::remove_file("42.tbl");
+        });
+    }
+
+    #[cfg(feature = "libaio")]
+    fn build_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+            ],
+            vec![IndexSpec::new(
+                "idx1",
+                vec![IndexKey::new(0)],
+                IndexAttributes::PK,
+            )],
+        ))
+    }
+
+    #[cfg(feature = "libaio")]
+    fn page_buf(payload: &[u8]) -> DirectBuf {
+        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        buf.data_mut()[..payload.len()].copy_from_slice(payload);
+        buf
+    }
+
+    // libaio is required to test table file.
+    #[cfg(feature = "libaio")]
+    #[test]
+    fn test_persist_lwc_pages_appends_entries() {
+        smol::block_on(async {
+            let fs = TableFileSystemConfig::default().build().unwrap();
+            let metadata = build_test_metadata();
+            let table_file = fs.create_table_file(43, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let lwc_pages = vec![
+                LwcPagePersist {
+                    start_row_id: 0,
+                    end_row_id: 10,
+                    buf: page_buf(b"lwc-page-1"),
+                },
+                LwcPagePersist {
+                    start_row_id: 10,
+                    end_row_id: 20,
+                    buf: page_buf(b"lwc-page-2"),
+                },
+            ];
+
+            let (table_file, old_root) =
+                MutableTableFile::fork(&table_file)
+                    .persist_lwc_pages(lwc_pages, 7, 2)
+                    .await
+                    .unwrap();
+            drop(old_root);
+
+            let active_root = table_file.active_root();
+            assert_eq!(active_root.trx_id, 2);
+            assert_eq!(active_root.pivot_row_id, 20);
+            assert_eq!(active_root.heap_redo_start_cts, 7);
+            assert_eq!(active_root.block_index.starts.len(), 2);
+            assert_eq!(active_root.block_index.starts[0], 0);
+            assert_eq!(active_root.block_index.deltas[0], 10);
+            assert_eq!(active_root.block_index.starts[1], 10);
+            assert_eq!(active_root.block_index.deltas[1], 10);
+
+            let page_id_1 = active_root.block_index.pages[0];
+            let page_id_2 = active_root.block_index.pages[1];
+            let page1 = table_file.read_page(page_id_1).await.unwrap();
+            let page2 = table_file.read_page(page_id_2).await.unwrap();
+            assert_eq!(&page1.as_bytes()[..10], b"lwc-page-1");
+            assert_eq!(&page2.as_bytes()[..10], b"lwc-page-2");
+
+            drop(table_file);
+            drop(fs);
+            let _ = std::fs::remove_file("43.tbl");
+        });
+    }
+
+    // libaio is required to test table file.
+    #[cfg(feature = "libaio")]
+    #[test]
+    fn test_persist_lwc_pages_rejects_overlapping_ranges() {
+        smol::block_on(async {
+            let fs = TableFileSystemConfig::default().build().unwrap();
+            let metadata = build_test_metadata();
+            let table_file = fs.create_table_file(44, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let lwc_pages = vec![
+                LwcPagePersist {
+                    start_row_id: 0,
+                    end_row_id: 10,
+                    buf: page_buf(b"lwc-overlap-1"),
+                },
+                LwcPagePersist {
+                    start_row_id: 5,
+                    end_row_id: 15,
+                    buf: page_buf(b"lwc-overlap-2"),
+                },
+            ];
+
+            let result = MutableTableFile::fork(&table_file)
+                .persist_lwc_pages(lwc_pages, 7, 2)
+                .await;
+
+            assert!(matches!(result, Err(Error::InvalidArgument)));
+            let active_root = table_file.active_root();
+            assert_eq!(active_root.pivot_row_id, 0);
+            assert!(active_root.block_index.starts.is_empty());
+
+            drop(table_file);
+            drop(fs);
+            let _ = std::fs::remove_file("44.tbl");
         });
     }
 
