@@ -190,9 +190,9 @@ impl TableFile {
         self.buf_list.push(meta_buf);
         Ok(ActiveRoot {
             page_no: super_page.header.page_no,
-            trx_id: super_page.header.trx_id,
+            trx_id: super_page.header.checkpoint_cts,
             pivot_row_id: meta_page.pivot_row_id,
-            heap_redo_start_cts: meta_page.last_checkpoint_cts,
+            heap_redo_start_cts: meta_page.heap_redo_start_cts,
             alloc_map: meta_page.space_map,
             gc_page_list: meta_page.gc_page_list,
             metadata: Arc::new(meta_page.schema),
@@ -211,7 +211,7 @@ impl TableFile {
             (Ok(root), Err(_)) | (Err(_), Ok(root)) => Ok(root),
             (Ok(r1), Ok(r2)) => {
                 // pick the one with larger transaction id.
-                if r1.header.trx_id < r2.header.trx_id {
+                if r1.header.checkpoint_cts < r2.header.checkpoint_cts {
                     Ok(r2)
                 } else {
                     Ok(r1)
@@ -232,7 +232,7 @@ impl TableFile {
         let (idx, footer) =
             SuperPageFooter::deser(&mut ctx, buf, TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET)?;
         debug_assert!(idx == TABLE_FILE_SUPER_PAGE_SIZE);
-        if header.trx_id != footer.trx_id {
+        if header.checkpoint_cts != footer.checkpoint_cts {
             // torn write happens
             return Err(Error::TornWrite);
         }
@@ -374,7 +374,7 @@ impl MutableTableFile {
         let b3sum = blake3::hash(&buf.as_bytes()[..TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET]);
         let footer = SuperPageFooter {
             b3sum: *b3sum.as_bytes(),
-            trx_id: super_page.header.trx_id,
+            checkpoint_cts: super_page.header.checkpoint_cts,
         };
         let ser_idx = footer.ser(
             &ctx,
@@ -548,7 +548,7 @@ impl ActiveRoot {
                 magic_word: TABLE_FILE_MAGIC_WORD,
                 version: SUPER_PAGE_VERSION,
                 page_no: self.page_no,
-                trx_id: self.trx_id,
+                checkpoint_cts: self.trx_id,
             },
             body: SuperPageBody {
                 meta_page_id: self.meta_page_id,
@@ -565,6 +565,7 @@ impl ActiveRoot {
             &self.gc_page_list,
             self.pivot_row_id,
             self.heap_redo_start_cts,
+            0,
         )
     }
 
