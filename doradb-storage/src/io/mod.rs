@@ -5,6 +5,8 @@ use crate::lifetime::StaticLifetime;
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
 use libc::{EAGAIN, EINTR, c_long};
+#[cfg(not(feature = "libaio"))]
+use libc::{c_void, off_t};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
@@ -48,6 +50,10 @@ pub type AIOResult<T> = StdResult<T, AIOError>;
 pub struct AIOContext {
     ctx: io_context_t,
     max_events: usize,
+    #[cfg(not(feature = "libaio"))]
+    completion_tx: Sender<Completion>,
+    #[cfg(not(feature = "libaio"))]
+    completion_rx: Receiver<Completion>,
 }
 
 unsafe impl Sync for AIOContext {}
@@ -58,12 +64,24 @@ impl AIOContext {
     #[inline]
     pub fn new(max_events: usize) -> AIOResult<Self> {
         debug_assert!(max_events < isize::MAX as usize);
+        #[cfg(feature = "libaio")]
         let mut ctx = std::ptr::null_mut();
+        #[cfg(feature = "libaio")]
         unsafe {
             match io_setup(max_events as i32, &mut ctx) {
                 0 => Ok(AIOContext { ctx, max_events }),
                 _ => Err(AIOError::SetupError),
             }
+        }
+        #[cfg(not(feature = "libaio"))]
+        {
+            let (completion_tx, completion_rx) = flume::unbounded();
+            Ok(AIOContext {
+                ctx: std::ptr::null_mut(),
+                max_events,
+                completion_tx,
+                completion_rx,
+            })
         }
     }
 
@@ -89,6 +107,7 @@ impl AIOContext {
     /// Submit count will be returned, and caller need to take
     /// care of cleaning the input slice.
     #[inline]
+    #[cfg(feature = "libaio")]
     pub fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> usize {
         if reqs.is_empty() || limit == 0 {
             return 0;
@@ -112,9 +131,31 @@ impl AIOContext {
         ret as usize
     }
 
+    /// Submit IO requests with limit.
+    /// Submit count will be returned, and caller need to take
+    /// care of cleaning the input slice.
+    #[inline]
+    #[cfg(not(feature = "libaio"))]
+    pub fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> usize {
+        if reqs.is_empty() || limit == 0 {
+            return 0;
+        }
+        let batch_size = limit.min(reqs.len());
+        for iocb in reqs.iter().take(batch_size).copied() {
+            let completion_tx = self.completion_tx.clone();
+            smol::blocking::spawn(move || {
+                let completion = unsafe { blocking_iocb(iocb) };
+                let _ = completion_tx.send(completion);
+            })
+            .detach();
+        }
+        batch_size
+    }
+
     /// Wait until given number of IO finishes, and execute callback for each.
     /// Returns number of finished events.
     #[inline]
+    #[cfg(feature = "libaio")]
     pub fn wait_at_least<F>(
         &self,
         events: &mut [io_event],
@@ -167,6 +208,44 @@ impl AIOContext {
         (read_count, write_count)
     }
 
+    /// Wait until given number of IO finishes, and execute callback for each.
+    /// Returns number of finished events.
+    #[inline]
+    #[cfg(not(feature = "libaio"))]
+    pub fn wait_at_least<F>(
+        &self,
+        events: &mut [io_event],
+        min_nr: usize,
+        mut callback: F,
+    ) -> (usize, usize)
+    where
+        F: FnMut(AIOKey, StdResult<usize, std::io::Error>) -> AIOKind,
+    {
+        let max_nwait = events.len().max(1);
+        let mut read_count = 0;
+        let mut write_count = 0;
+        let mut handled = 0;
+        let mut handle_completion = |completion: Completion| {
+            match callback(completion.key, completion.res) {
+                AIOKind::Read => read_count += 1,
+                AIOKind::Write => write_count += 1,
+            }
+            handled += 1;
+        };
+        if min_nr > 0 {
+            let completion = self.completion_rx.recv().unwrap();
+            handle_completion(completion);
+        }
+        while handled < max_nwait {
+            match self.completion_rx.try_recv() {
+                Ok(completion) => handle_completion(completion),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        (read_count, write_count)
+    }
+
     /// Build a event loop.
     #[inline]
     pub fn event_loop<T>(self) -> (AIOEventLoop<T>, AIOClient<T>) {
@@ -183,6 +262,7 @@ impl AIOContext {
 }
 
 #[inline]
+#[cfg(feature = "libaio")]
 fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
     #[cfg(test)]
     {
@@ -219,6 +299,7 @@ unsafe impl StaticLifetime for AIOContext {}
 impl Drop for AIOContext {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(feature = "libaio")]
         unsafe {
             assert_eq!(io_destroy(self.ctx), 0);
         }
@@ -396,9 +477,11 @@ impl<T> IOQueue<T> {
     }
 
     #[inline]
-    pub fn drain_to(&mut self, n: usize) -> Vec<T> {
-        self.iocbs.drain(0..n);
-        self.reqs.drain(0..n).collect()
+    pub fn drain_to(&mut self, n: usize) -> Vec<(IocbRawPtr, T)> {
+        self.iocbs
+            .drain(0..n)
+            .zip(self.reqs.drain(0..n))
+            .collect()
     }
 
     /// Checks consistency of this queue.
@@ -595,6 +678,7 @@ impl<T> AIOEventLoop<T> {
     }
 
     #[inline]
+    #[cfg(feature = "libaio")]
     fn run<L: AIOEventListener<Request = T>>(mut self, mut listener: L) {
         // IO results.
         let mut results = self.ctx.events();
@@ -622,7 +706,7 @@ impl<T> AIOEventLoop<T> {
                 let limit = self.io_depth() - self.submitted;
                 let submit_count = self.ctx.submit_limit(queue.iocbs(), limit);
                 // Add requests to inflight tree.
-                for sub in queue.drain_to(submit_count) {
+                for (_iocb, sub) in queue.drain_to(submit_count) {
                     listener.on_submit(sub);
                 }
                 debug_assert!(queue.consistent());
@@ -672,6 +756,169 @@ impl<T> AIOEventLoop<T> {
             }
         }
         listener.end_loop(&self.ctx);
+    }
+
+    #[inline]
+    #[cfg(not(feature = "libaio"))]
+    fn run<L: AIOEventListener<Request = T>>(mut self, mut listener: L) {
+        // IO queue
+        let mut queue: IOQueue<L::Submission> = IOQueue::with_capacity(self.io_depth());
+        let (completion_tx, completion_rx) = flume::unbounded::<Completion>();
+        loop {
+            debug_assert!(
+                queue.consistent(),
+                "pending IO number equals to pending request number"
+            );
+            // We only accept request if shutdown flag is false.
+            if !self.shutdown {
+                if queue.len() + self.submitted == 0 {
+                    // there is no IO operation running.
+                    self.fetch_reqs(&mut listener, &mut queue, 1);
+                } else if queue.len() < self.io_depth() {
+                    self.fetch_reqs(&mut listener, &mut queue, 0);
+                } // otherwise, do not fetch
+            }
+            // Event if shutdown flag is set to true, we still process queued requests.
+            let (io_submit_count, io_submit_nanos) = if !queue.is_empty() {
+                let start = Instant::now();
+                // Try to submit as many IO requests as possible
+                debug_assert!(self.io_depth() >= self.submitted);
+                let limit = self.io_depth() - self.submitted;
+                let submit_count = limit.min(queue.len());
+                // Add requests to inflight tree.
+                for (iocb, sub) in queue.drain_to(submit_count) {
+                    listener.on_submit(sub);
+                    let completion_tx = completion_tx.clone();
+                    self.submitted += 1;
+                    smol::blocking::spawn(move || {
+                        let completion = unsafe { blocking_iocb(iocb) };
+                        let _ = completion_tx.send(completion);
+                    })
+                    .detach();
+                }
+                debug_assert!(queue.consistent());
+                debug_assert!(self.submitted <= self.io_depth());
+                (1, start.elapsed().as_nanos() as usize)
+            } else {
+                (0, 0)
+            };
+
+            // wait for any request to be done.
+            // Note: even if we received shutdown message, we should wait all submitted IO finish before quiting.
+            // This will prevent kernel from accessing a freed memory via async IO processing.
+            let (io_wait_count, io_wait_nanos, finished_reads, finished_writes) = if self.submitted
+                != 0
+            {
+                let start = Instant::now();
+                let mut read_count = 0;
+                let mut write_count = 0;
+                let mut handle_completion = |completion: Completion| {
+                    match listener.on_complete(completion.key, completion.res) {
+                        AIOKind::Read => read_count += 1,
+                        AIOKind::Write => write_count += 1,
+                    }
+                };
+                let completion = completion_rx.recv().unwrap();
+                handle_completion(completion);
+                while let Ok(completion) = completion_rx.try_recv() {
+                    handle_completion(completion);
+                }
+                listener.on_batch_complete(read_count, write_count);
+                self.submitted -= read_count + write_count;
+                (
+                    1,
+                    start.elapsed().as_nanos() as usize,
+                    read_count,
+                    write_count,
+                )
+            } else {
+                (0, 0, 0, 0)
+            };
+
+            listener.on_stats(&AIOStats {
+                queuing: queue.len(),
+                running: self.submitted,
+                finished_reads,
+                finished_writes,
+                io_submit_count,
+                io_submit_nanos,
+                io_wait_count,
+                io_wait_nanos,
+            });
+            // only quit when shutdown flag is set and no submitted tasks.
+            // all queued tasks are ignored. (is it safe???)
+            if self.shutdown && self.submitted == 0 {
+                break;
+            }
+        }
+        listener.end_loop(&self.ctx);
+    }
+}
+
+#[cfg(not(feature = "libaio"))]
+struct Completion {
+    key: AIOKey,
+    res: std::io::Result<usize>,
+}
+
+#[cfg(not(feature = "libaio"))]
+unsafe fn blocking_iocb(iocb: IocbRawPtr) -> Completion {
+    let iocb = unsafe { &*iocb };
+    let fd = iocb.aio_fildes as RawFd;
+    let offset = iocb.offset as off_t;
+    let len = iocb.count as usize;
+    let res = match iocb.aio_lio_opcode {
+        code if code == io_iocb_cmd::IO_CMD_PREAD as u16 => unsafe {
+            blocking_pread(fd, iocb.buf, len, offset)
+        },
+        code if code == io_iocb_cmd::IO_CMD_PWRITE as u16 => unsafe {
+            blocking_pwrite(fd, iocb.buf, len, offset)
+        },
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "unsupported iocb opcode",
+        )),
+    };
+    Completion { key: iocb.data, res }
+}
+
+#[cfg(not(feature = "libaio"))]
+unsafe fn blocking_pread(
+    fd: RawFd,
+    buf: *mut u8,
+    len: usize,
+    offset: off_t,
+) -> std::io::Result<usize> {
+    loop {
+        let ret = unsafe { libc::pread(fd, buf as *mut c_void, len, offset) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(ret as usize);
+    }
+}
+
+#[cfg(not(feature = "libaio"))]
+unsafe fn blocking_pwrite(
+    fd: RawFd,
+    buf: *mut u8,
+    len: usize,
+    offset: off_t,
+) -> std::io::Result<usize> {
+    loop {
+        let ret = unsafe { libc::pwrite(fd, buf as *mut c_void, len, offset) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(ret as usize);
     }
 }
 
