@@ -37,6 +37,8 @@ jobs:
           -s . -t lcov \
           --branch --ignore-not-existing \
           --ignore "target/" \
+          --ignore "legacy/**" \
+          --ignore "**/legacy/**" \
           --ignore "/home/runner/.cargo/registry/*" \
           --ignore "/home/runner/.cargo/git/*" \
           --ignore "*/.cargo/registry/*" \
@@ -59,6 +61,8 @@ jobs:
           -s . -t lcov \
           --branch --ignore-not-existing \
           --ignore "target/" \
+          --ignore "legacy/**" \
+          --ignore "**/legacy/**" \
           --ignore "/home/runner/.cargo/registry/*" \
           --ignore "/home/runner/.cargo/git/*" \
           --ignore "*/.cargo/registry/*" \
