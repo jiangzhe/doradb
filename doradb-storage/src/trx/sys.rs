@@ -374,8 +374,7 @@ pub struct TrxSysStartContext {
     pub gc_chans: Vec<Receiver<GC>>,
 }
 
-// libaio is required for trx sys test.
-#[cfg(all(test, feature = "libaio"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;

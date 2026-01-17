@@ -1084,8 +1084,7 @@ impl LogMerger {
     }
 }
 
-// libaio is required for log test.
-#[cfg(all(test, feature = "libaio"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;

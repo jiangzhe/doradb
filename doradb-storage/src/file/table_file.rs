@@ -694,8 +694,6 @@ mod tests {
     use crate::io::AIOBuf;
     use crate::value::ValKind;
 
-    // libaio is required to test table file.
-    #[cfg(feature = "libaio")]
     #[test]
     fn test_table_file() {
         smol::block_on(async {
@@ -747,8 +745,6 @@ mod tests {
         });
     }
 
-    // libaio is required to test table file.
-    #[cfg(feature = "libaio")]
     #[test]
     fn test_table_file_system() {
         smol::block_on(async {
@@ -782,7 +778,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "libaio")]
     fn build_test_metadata() -> Arc<TableMetadata> {
         Arc::new(TableMetadata::new(
             vec![
@@ -797,15 +792,12 @@ mod tests {
         ))
     }
 
-    #[cfg(feature = "libaio")]
     fn page_buf(payload: &[u8]) -> DirectBuf {
         let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
         buf.data_mut()[..payload.len()].copy_from_slice(payload);
         buf
     }
 
-    // libaio is required to test table file.
-    #[cfg(feature = "libaio")]
     #[test]
     fn test_persist_lwc_pages_appends_entries() {
         smol::block_on(async {
@@ -858,8 +850,6 @@ mod tests {
         });
     }
 
-    // libaio is required to test table file.
-    #[cfg(feature = "libaio")]
     #[test]
     fn test_persist_lwc_pages_rejects_overlapping_ranges() {
         smol::block_on(async {

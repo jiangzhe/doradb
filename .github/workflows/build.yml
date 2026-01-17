@@ -10,8 +10,8 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-    - name: Install libaio
-      run: sudo apt-get install -y libaio1 libaio-dev
+    - name: Install libaio & lcov
+      run: sudo apt-get install -y libaio1 libaio-dev lcov llvm
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Setup Rust
@@ -21,17 +21,37 @@ jobs:
         components: llvm-tools      
     - name: Install grcov
       run: cargo install grcov
-    - name: Build and Test
+    - name: Build and Test (default features)
       env:
         RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
-        LLVM_PROFILE_FILE: "coverage-%p-%m.profraw"
+        LLVM_PROFILE_FILE: "coverage/default/coverage-%p-%m.profraw"
+        CARGO_TARGET_DIR: "target/coverage-default"
       run: |
+        mkdir -p coverage/default
         cargo build --verbose --all
         cargo test --verbose --all
-    - name: Generate coverage report
+    - name: Build and Test (no default features)
+      env:
+        RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
+        LLVM_PROFILE_FILE: "coverage/no-default/coverage-%p-%m.profraw"
+        CARGO_TARGET_DIR: "target/coverage-no-default"
       run: |
-        grcov . --binary-path ./target/debug/ -s . -t lcov \
-          --branch --ignore-not-existing --ignore "target/" \
+        mkdir -p coverage/no-default
+        cargo build --verbose --all --no-default-features
+        cargo test --verbose --all --no-default-features
+    - name: Generate coverage report (merged)
+      run: |
+        grcov . \
+          --binary-path ./target \
+          -s . -t lcov \
+          --branch --ignore-not-existing \
+          --ignore "target/" \
+          --ignore "legacy/**" \
+          --ignore "**/legacy/**" \
+          --ignore "/home/runner/.cargo/registry/*" \
+          --ignore "/home/runner/.cargo/git/*" \
+          --ignore "*/.cargo/registry/*" \
+          --ignore "*/.cargo/git/*" \
           --ignore "doradb-tpch-tests" \
           -o lcov.info
     - name: Upload to codecov.io
