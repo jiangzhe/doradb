@@ -4,7 +4,9 @@ mod libaio_abi;
 use crate::lifetime::StaticLifetime;
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
-use libc::{EAGAIN, EINTR, c_long};
+use libc::EINTR;
+#[cfg(feature = "libaio")]
+use libc::{EAGAIN, c_long};
 #[cfg(not(feature = "libaio"))]
 use libc::{c_void, off_t};
 use std::collections::VecDeque;
@@ -143,8 +145,12 @@ impl AIOContext {
         let batch_size = limit.min(reqs.len());
         for iocb in reqs.iter().take(batch_size).copied() {
             let completion_tx = self.completion_tx.clone();
-            smol::blocking::spawn(move || {
-                let completion = unsafe { blocking_iocb(iocb) };
+            let iocb_addr = iocb as usize;
+            smol::spawn(async move {
+                let completion = smol::unblock(move || unsafe {
+                    blocking_iocb(iocb_addr as IocbRawPtr)
+                })
+                .await;
                 let _ = completion_tx.send(completion);
             })
             .detach();
@@ -222,23 +228,29 @@ impl AIOContext {
         F: FnMut(AIOKey, StdResult<usize, std::io::Error>) -> AIOKind,
     {
         let max_nwait = events.len().max(1);
+        let min_required = min_nr.min(max_nwait);
         let mut read_count = 0;
         let mut write_count = 0;
         let mut handled = 0;
-        let mut handle_completion = |completion: Completion| {
+        let mut handle_completion = |completion: Completion,
+                                     read_count: &mut usize,
+                                     write_count: &mut usize| {
             match callback(completion.key, completion.res) {
-                AIOKind::Read => read_count += 1,
-                AIOKind::Write => write_count += 1,
+                AIOKind::Read => *read_count += 1,
+                AIOKind::Write => *write_count += 1,
             }
-            handled += 1;
         };
-        if min_nr > 0 {
+        while handled < min_required {
             let completion = self.completion_rx.recv().unwrap();
-            handle_completion(completion);
+            handle_completion(completion, &mut read_count, &mut write_count);
+            handled += 1;
         }
         while handled < max_nwait {
             match self.completion_rx.try_recv() {
-                Ok(completion) => handle_completion(completion),
+                Ok(completion) => {
+                    handle_completion(completion, &mut read_count, &mut write_count);
+                    handled += 1;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
@@ -275,13 +287,13 @@ fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
     unsafe { io_submit(ctx, nr, ios) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "libaio"))]
 type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "libaio"))]
 static IO_SUBMIT_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "libaio"))]
 fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
     let ptr = hook
         .map(|func| func as *mut ())
@@ -790,8 +802,12 @@ impl<T> AIOEventLoop<T> {
                     listener.on_submit(sub);
                     let completion_tx = completion_tx.clone();
                     self.submitted += 1;
-                    smol::blocking::spawn(move || {
-                        let completion = unsafe { blocking_iocb(iocb) };
+                    let iocb_addr = iocb as usize;
+                    smol::spawn(async move {
+                        let completion = smol::unblock(move || unsafe {
+                            blocking_iocb(iocb_addr as IocbRawPtr)
+                        })
+                        .await;
                         let _ = completion_tx.send(completion);
                     })
                     .detach();
