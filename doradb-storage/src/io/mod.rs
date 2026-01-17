@@ -1014,8 +1014,7 @@ pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T
     )
 }
 
-// libaio is required for io test.
-#[cfg(all(test, feature = "libaio"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::file::{FixedSizeBufferFreeList, SparseFile};
@@ -1104,6 +1103,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "libaio")]
     fn test_submit_limit_eagain_no_panic() {
         let ctx = AIOContext::try_default().unwrap();
         let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));

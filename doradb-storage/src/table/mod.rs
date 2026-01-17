@@ -1,7 +1,6 @@
 mod access;
 mod recover;
-// libaio is required for table test
-#[cfg(all(test, feature = "libaio"))]
+#[cfg(test)]
 mod tests;
 
 pub use access::*;
