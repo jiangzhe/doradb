@@ -95,3 +95,4 @@ Run these commands from the project root:
 *   `doradb-storage/Cargo.toml`: Active dependency manifest.
 *   `docs/architecture.md`: The definitive guide to the storage engine's design.
 *   `AGENTS.md`: Guidelines for AI agents working in this repo.
+*   `docs/process/unit-test.md`: Guidelines for unit testing.

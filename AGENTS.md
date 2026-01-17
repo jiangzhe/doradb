@@ -35,6 +35,10 @@
 - The storage engine combines in-memory row store and on-disk column store with full transactions.
 - Start with `docs/architecture.md` for subsystem boundaries before deep changes.
 
+## Unit Test Guidelines
+
+Read `docs/process/unit-test.md` for details.
+
 ## Issue Tracking Guidelines
 
 Read `docs/process/issue-tracking.md` for details.
