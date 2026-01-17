@@ -10,8 +10,8 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-    - name: Install libaio
-      run: sudo apt-get install -y libaio1 libaio-dev
+    - name: Install libaio & lcov
+      run: sudo apt-get install -y libaio1 libaio-dev lcov
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Setup Rust
