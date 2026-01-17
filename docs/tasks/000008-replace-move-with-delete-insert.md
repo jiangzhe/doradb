@@ -38,8 +38,8 @@ By replacing `Move` with `Delete` + `Insert` and using `IndexBranch` for linking
     -   Change the operation on the old row from `RowUndoKind::Move(false)` to `RowUndoKind::Delete`.
     -   Identify all unique indexes for the table.
     -   For each unique index:
-        -   Calculate the `IndexBranch` parameters (Key, Undo Values/Delta).
-        -   The `undo_vals` for `IndexBranch` should reflect the delta between the new row and the old row.
+        -   Calculate the `IndexBranch` parameters (Key, Undo Values/Deletion).
+        -   The `undo_vals` for `IndexBranch` should reflect the deletion between the new row and the old row.
     -   Pass these `IndexBranch` definitions to `insert_row_internal` / `insert_row_to_page`.
 
 3.  **Update `Table::insert_row_to_page`**:
@@ -69,5 +69,5 @@ By replacing `Move` with `Delete` + `Insert` and using `IndexBranch` for linking
 
 ## Open Questions
 
--   **Delta Calculation for IndexBranch**: `IndexBranch` requires `undo_vals` (delta). In `move_update_for_space`, we calculate the delta for the update. We need to ensure this delta is correctly propagated to the `IndexBranch`. Since `IndexBranch` is per-index, does it need the full row delta or just columns relevant to that index?
+-   **Delta Calculation for IndexBranch**: `IndexBranch` requires `undo_vals` (deletion). In `move_update_for_space`, we calculate the deletion for the update. We need to ensure this deletion is correctly propagated to the `IndexBranch`. Since `IndexBranch` is per-index, does it need the full row deletion or just columns relevant to that index?
     -   *Answer*: `IndexBranch` typically carries the delta for the whole row (or at least the read set needed). Current `IndexBranch` stores `Vec<UpdateCol>`. `read_row_mvcc` applies these `undo_vals` to `ver.undo_vals`. So it should contain all modified columns to reconstruct the old version.

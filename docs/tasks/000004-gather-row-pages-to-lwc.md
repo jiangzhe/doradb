@@ -15,7 +15,7 @@ In DoraDB's HTAP architecture, hot data in `RowPage`s (PAX format, in-memory) mu
 ## Non-Goals
 - Designing or implementing the actual persistence to disk (file I/O).
 - Implementing the background thread/trigger logic that decides when to perform this gathering.
-- Advanced multi-column compression (e.g., cross-column delta) is out of scope.
+- Advanced multi-column compression (e.g., cross-column deletion) is out of scope.
 
 ## Plan
 

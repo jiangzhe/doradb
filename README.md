@@ -24,7 +24,7 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 - [Checkpoint and Recovery](./docs/checkpoint-and-recovery.md)
 - [Table File](./docs/table-file.md)
 - [Data Checkpoint](./docs/data-checkpoint.md)
-- [Delta Checkpoint](./docs/delta-checkpoint.md)
+- [Deletion Checkpoint](./docs/deletion-checkpoint.md)
 
 Some ideas are different from traditional database system.
 I'm glad to have discussions if someone is interested in details.

@@ -22,7 +22,7 @@ To enable non-blocking persistence, in-memory RowPages transition through three 
 | :--- | :--- | :--- | :--- |
 | **ACTIVE** | Normal operational state. | Insert, Update, Delete, Lock allowed. | Candidate for selection. |
 | **FROZEN** | Pending stabilization. | **Insert/Update**: Rejected. Redirect to "Cold Update" (Delete Old + Insert New to Tail).<br>**Delete/Lock**: Allowed (modify metadata only). | Analyzed for active transactions. |
-| **TRANSITION** | Being converted to LWC. | **Read**: Allowed (Snapshot Read).<br>**Write**: Backoff & Retry (Reroute to ColumnDeltaBuffer). | Data is immutable. Source for LWC generation. |
+| **TRANSITION** | Being converted to LWC. | **Read**: Allowed (Snapshot Read).<br>**Write**: Backoff & Retry (Reroute to ColumnDeletionBuffer). | Data is immutable. Source for LWC generation. |
 
 > **Note**: The state `INVALID` from previous designs has been renamed to **TRANSITION** to better reflect that the page is still valid for readers but is in the process of being retired.
 
@@ -59,7 +59,7 @@ Once stabilized, the page state is set to `TRANSITION`. The conversion pipeline 
 1.  **Selection Vector Construction**:
     *   Scan Row Header / Delete Bitmap.
     *   `Bitmask[i] = 1` if (Row `i` is Committed AND NOT Deleted).
-    *   *Optimization*: Since Uncommitted Inserts were aborted, we treat them as "Deleted/Free". Uncommitted Deletes are treated as "Alive" (data is written to LWC, deletion intent is in DeltaBuffer).
+    *   *Optimization*: Since Uncommitted Inserts were aborted, we treat them as "Deleted/Free". Uncommitted Deletes are treated as "Alive" (data is written to LWC, deletion intent is in DeletionBuffer).
 
 2.  **Explicit RowID Generation**:
     *   Since deleted rows are filtered out, the LWC block becomes **sparse**.
@@ -129,8 +129,8 @@ if L.RowID >= MetaPage.Pivot_RowID {
         // The change happened AFTER the checkpoint's logical snapshot was taken
         // (e.g., a delete on cold data that happened during the checkpoint process).
         // This change is NOT in the LWC block's primary data.
-        // It must be replayed into the in-memory delta structure.
-        replay_into_delta_buffer(L);
+        // It must be replayed into the in-memory deletion structure.
+        replay_into_deletion_buffer(L);
     }
 }
 ```
@@ -144,14 +144,14 @@ To support this logic, the **MetaPage** (referenced by SuperPage) must strictly 
 | `Pivot_RowID` | High watermark of ColumnStore. | Separates Hot vs. Cold data. |
 | `Block_Index_Root` | Root PageID of Block Index. | locating LWC blocks. |
 | `Heap_Redo_Start_CTS` | Min CTS of oldest active page. | Tells Log Manager where to truncate. |
-| **`Last_Checkpoint_STS`** | STS of the last CP transaction. | **Recovery Filter**: Distinguishes "Baked-in" data from "Delta" data. |
+| **`Last_Checkpoint_STS`** | STS of the last CP transaction. | **Recovery Filter**: Distinguishes "Baked-in" data from "Deletion" data. |
 
 ## 6. Concurrency Handling
 
 *   **Foreground Writer**:
     *   If encountering a `TRANSITION` page: Backoff (sleep) -> Retry.
     *   On Retry: Check Block Index.
-        *   If `RowID < Pivot`: Reroute to DeltaBuffer (Conversion finished).
+        *   If `RowID < Pivot`: Reroute to DeletionBuffer (Conversion finished).
         *   If `RowID >= Pivot`: Wait again (Conversion pending).
 *   **Foreground Reader**:
     *   Snapshot Reads access `TRANSITION` pages directly.
