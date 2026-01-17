@@ -37,6 +37,10 @@ jobs:
           -s . -t lcov \
           --branch --ignore-not-existing \
           --ignore "target/" \
+          --ignore "/home/runner/.cargo/registry/*" \
+          --ignore "/home/runner/.cargo/git/*" \
+          --ignore "*/.cargo/registry/*" \
+          --ignore "*/.cargo/git/*" \
           --ignore "doradb-tpch-tests" \
           -o lcov.default.info
     - name: Build and Test (no-default-features)
@@ -55,6 +59,10 @@ jobs:
           -s . -t lcov \
           --branch --ignore-not-existing \
           --ignore "target/" \
+          --ignore "/home/runner/.cargo/registry/*" \
+          --ignore "/home/runner/.cargo/git/*" \
+          --ignore "*/.cargo/registry/*" \
+          --ignore "*/.cargo/git/*" \
           --ignore "doradb-tpch-tests" \
           -o lcov.no-default.info
     - name: Merge coverage reports
