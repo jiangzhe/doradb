@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: Install libaio & lcov
-      run: sudo apt-get install -y libaio1 libaio-dev lcov
+      run: sudo apt-get install -y libaio1 libaio-dev lcov llvm
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Setup Rust
@@ -30,22 +30,7 @@ jobs:
         mkdir -p coverage/default
         cargo build --verbose --all
         cargo test --verbose --all
-    - name: Generate coverage report (default features)
-      run: |
-        grcov . \
-          --binary-path ./target/coverage-default/debug/ \
-          -s . -t lcov \
-          --branch --ignore-not-existing \
-          --ignore "target/" \
-          --ignore "legacy/**" \
-          --ignore "**/legacy/**" \
-          --ignore "/home/runner/.cargo/registry/*" \
-          --ignore "/home/runner/.cargo/git/*" \
-          --ignore "*/.cargo/registry/*" \
-          --ignore "*/.cargo/git/*" \
-          --ignore "doradb-tpch-tests" \
-          -o lcov.default.info
-    - name: Build and Test (no-default-features)
+    - name: Build and Test (no default features)
       env:
         RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
         LLVM_PROFILE_FILE: "coverage/no-default/coverage-%p-%m.profraw"
@@ -54,10 +39,10 @@ jobs:
         mkdir -p coverage/no-default
         cargo build --verbose --all --no-default-features
         cargo test --verbose --all --no-default-features
-    - name: Generate coverage report (no-default-features)
+    - name: Generate coverage report (merged)
       run: |
         grcov . \
-          --binary-path ./target/coverage-no-default/debug/ \
+          --binary-path ./target \
           -s . -t lcov \
           --branch --ignore-not-existing \
           --ignore "target/" \
@@ -68,10 +53,7 @@ jobs:
           --ignore "*/.cargo/registry/*" \
           --ignore "*/.cargo/git/*" \
           --ignore "doradb-tpch-tests" \
-          -o lcov.no-default.info
-    - name: Merge coverage reports
-      run: |
-        lcov -a lcov.default.info -a lcov.no-default.info -o lcov.info
+          -o lcov.info
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v3
       with:
