@@ -1,10 +1,10 @@
-# Delta Checkpoint
+# Deletion Checkpoint
 
 ## 1. Overview
 
-The **Delta Checkpoint** subsystem is responsible for persisting row deletions and updates from the in-memory buffer to the immutable storage on disk.
+The **Deletion Checkpoint** subsystem is responsible for persisting row deletions and updates from the in-memory buffer to the immutable storage on disk.
 
-In Doradb's HTAP architecture, data blocks (LWC Blocks) are immutable. Modifications are handled via a **Delete Bitmap** mechanism. The Delta Checkpoint bridges the gap between the mutable, high-concurrency in-memory **ColumnDeltaBuffer** and the persistent, compressed **Table File**.
+In Doradb's HTAP architecture, data blocks (LWC Blocks) are immutable. Modifications are handled via a **Delete Bitmap** mechanism. The Deletion Checkpoint bridges the gap between the mutable, high-concurrency in-memory **ColumnDeletionBuffer** and the persistent, compressed **Table File**.
 
 ### Core Design Principles
 
@@ -17,17 +17,17 @@ In Doradb's HTAP architecture, data blocks (LWC Blocks) are immutable. Modificat
 
 ## 2. Data Structures
 
-### 2.1 In-Memory: `ColumnDeltaBuffer`
+### 2.1 In-Memory: `ColumnDeletionBuffer`
 
 A concurrent, sharded hash map serving as both the write buffer and the MVCC Undo cache.
 
 ```rust
-struct ColumnDeltaBuffer {
+struct ColumnDeletionBuffer {
     // Sharded for high concurrency (e.g., 64 shards)
-    shards: Vec<RwLock<HashMap<RowID, DeltaEntry>>>,
+    shards: Vec<RwLock<HashMap<RowID, DeletionEntry>>>,
 }
 
-struct DeltaEntry {
+struct DeletionEntry {
     sts: u64, // Start Timestamp of the modifier (Lock owner)
     
     // Atomic Transaction State Hook
@@ -78,7 +78,7 @@ The visibility check logic determines whether a row is "alive" for a reader tran
     *   If `Bitmap.contains(RowID) == false`: **Row is Visible**. (Return data).
 2.  **Check Memory (Slow Path / Undo Path)**:
     *   *Condition*: Triggered only if `Bitmap.contains(RowID) == true`.
-    *   Query `ColumnDeltaBuffer`.
+    *   Query `ColumnDeletionBuffer`.
     *   **Case A: Entry Not Found**:
         *   The delete was committed long ago and GC'd.
         *   **Result**: **Row is Deleted**.
@@ -89,7 +89,7 @@ The visibility check logic determines whether a row is "alive" for a reader tran
         *   The delete happened *before* $T_{reader}$ started.
         *   **Result**: **Row is Deleted**.
 
-## 4. Delta Checkpoint Workflow
+## 4. Deletion Checkpoint Workflow
 
 The process moves committed deletions from memory to disk. Crucially, the **System Transaction Timestamp (`Checkpoint_STS`)** defines the persistence boundary, ensuring that the recovery watermark advances even if data is sparse.
 
@@ -97,7 +97,7 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
 *   **Action**: The Checkpoint Coordinator starts a system transaction and acquires the current global timestamp: **`Checkpoint_STS`**.
 *   **Semantic**: This timestamp acts as a **Read View**. The system guarantees that upon successful completion of this checkpoint, *all* deletions committed at or before `Checkpoint_STS` are persisted.
 *   **Scan & Filter**:
-    *   Iterate through `ColumnDeltaBuffer` shards.
+    *   Iterate through `ColumnDeletionBuffer` shards.
     *   Collect `RowID`s where:
         1.  `commit_state` is **Committed** (CTS > 0).
         2.  `CTS <= Checkpoint_STS`.
@@ -125,7 +125,7 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
 *   **Lock**: Acquire `SuperPage Lock`.
 *   **New MetaPage**: Create a new `MetaPage`.
     *   Update `BlockIndexRoot` and `BitmapTreeRoot` (if changed).
-    *   **Crucial Update**: Set `Table.watermarks.delta_rec_ts = Checkpoint_STS`.
+    *   **Crucial Update**: Set `Table.watermarks.deletion_rec_ts = Checkpoint_STS`.
     *   *Note*: This is set to the system timestamp acquired in Phase 1, regardless of the actual data timestamps.
 *   **Persist**: Write MetaPage to disk.
 *   **Switch**: Update `SuperPage` to point to the new MetaPage.
@@ -134,15 +134,15 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
 
 To prevent "cold" tables (tables with no recent deletions) from blocking the global truncation of the Redo Log, the system implements a Heartbeat mechanism.
 
-*   **Problem**: If we relied on data timestamps (`Batch_Max_CTS`) for the watermark, a table with no writes would keep its `delta_rec_ts` stuck in the past. The Log Manager cannot truncate logs older than `min(All_Tables.rec_cts)`, leading to disk exhaustion.
+*   **Problem**: If we relied on data timestamps (`Batch_Max_CTS`) for the watermark, a table with no writes would keep its `deletion_rec_ts` stuck in the past. The Log Manager cannot truncate logs older than `min(All_Tables.rec_cts)`, leading to disk exhaustion.
 *   **Trigger**:
-    *   Periodic timer (e.g., every minute) IF no regular Delta Checkpoint has occurred.
+    *   Periodic timer (e.g., every minute) IF no regular Deletion Checkpoint has occurred.
     *   Or triggered explicitly by the Log Manager when log usage is high.
 *   **Process**:
     1.  Acquire `Checkpoint_STS`.
-    2.  Verify `ColumnDeltaBuffer` has no pending commits with `CTS <= Checkpoint_STS`.
+    2.  Verify `ColumnDeletionBuffer` has no pending commits with `CTS <= Checkpoint_STS`.
     3.  **Fast Path**: Skip Phases 2 and 3 (No Data I/O).
-    4.  **Meta Update**: Directly generate a new MetaPage with `delta_rec_ts = Checkpoint_STS` and perform the SuperPage switch.
+    4.  **Meta Update**: Directly generate a new MetaPage with `deletion_rec_ts = Checkpoint_STS` and perform the SuperPage switch.
 *   **Result**: The watermark advances, allowing the Log Manager to safely discard old logs.
 
 ## 5. Garbage Collection (Memory Cleanup)
@@ -155,25 +155,25 @@ Memory entries are retained after the checkpoint to provide MVCC visibility (Und
     $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
 *   **Logic**:
     1.  Acquire `Global_Min_Active_STS` from the Transaction Manager.
-    2.  Scan `ColumnDeltaBuffer`.
+    2.  Scan `ColumnDeletionBuffer`.
     3.  Remove entries satisfying the condition.
     *   *Reasoning*: If the delete commit time is older than the oldest active transaction, then strictly **everyone** sees the row as deleted. The Disk Bitmap (which is a superset) is now the absolute truth, and the "Undo" info in memory is obsolete.
 
 
 ## 6. Crash Recovery
 
-Recovery relies on the `delta_rec_ts` as a strict **Persistence Barrier**.
+Recovery relies on the `deletion_rec_ts` as a strict **Persistence Barrier**.
 
 1.  **Load State**: Read the latest valid MetaPage from SuperPage.
 2.  **Determine Replay Start**:
-    *   Retrieve `Replay_Start_CTS = MetaPage.delta_rec_ts`.
+    *   Retrieve `Replay_Start_CTS = MetaPage.deletion_rec_ts`.
     *   This timestamp guarantees that **any** transaction with `CTS <= Replay_Start_CTS` has already been processed (either persisted to the Bitmap or confirmed non-existent).
 3.  **Log Replay**:
     *   The Log Reader scans entries starting from `Replay_Start_CTS`.
     *   **Filter**: Only replay delete operations where `Entry.CTS > Replay_Start_CTS`.
-    *   **Action**: Insert these replayed entries into the `ColumnDeltaBuffer`.
+    *   **Action**: Insert these replayed entries into the `ColumnDeletionBuffer`.
 4.  **Consistency**:
-    *   The system is now consistent. The on-disk Bitmap acts as the base state, and the `ColumnDeltaBuffer` contains the "tail" of deletions that occurred after the last checkpoint (Heartbeat or Data) but before the crash.
+    *   The system is now consistent. The on-disk Bitmap acts as the base state, and the `ColumnDeletionBuffer` contains the "tail" of deletions that occurred after the last checkpoint (Heartbeat or Data) but before the crash.
 
 
 ## 7. Process Flow Diagram
@@ -181,7 +181,7 @@ Recovery relies on the `delta_rec_ts` as a strict **Persistence Barrier**.
 ```mermaid
 sequenceDiagram
     participant FG as Foreground TRX
-    participant Mem as ColumnDeltaBuffer
+    participant Mem as ColumnDeletionBuffer
     participant CP as Checkpoint Thread
     participant IO as Disk (TableFile)
     participant IDX as BlockIndex

@@ -47,14 +47,14 @@ The Heap Table uses a **Tiered Architecture**, combining an in-memory RowStore (
   - MVCC metadata is not stored in Data Pages but in a separate **Undo Mapping Table** (`RowID -> UndoChain*`).
   - **Undo Log**: Stored in transaction-private memory, linking old versions and visibility timestamps.
 
-### On-Disk ColumnStore with Delta Buffer
+### On-Disk ColumnStore with Deletion Buffer
 
 - **Physical Structure**: Immutable PAX (Partition Attributes Across) format blocks.
 - **Index**: Sparse Block Index + Delete Bitmap.
 - **Handling Deletes/Updates**:
-  - Since ColumnStore blocks are immutable, modifications are handled via an in-memory **ColumnDeltaBuffer**.
-  - **ColumnDeltaBuffer**: A hash map or skip list storing {`RowID -> Delete_Flag & Version`}.
-  - **Read Path**: Queries first check the **ColumnDeltaBuffer**. If a delete marker is found, the row from disk is ignored.
+  - Since ColumnStore blocks are immutable, modifications are handled via an in-memory **ColumnDeletionBuffer**.
+  - **ColumnDeletionBuffer**: A hash map or skip list storing {`RowID -> Delete_Flag & Version`}.
+  - **Read Path**: Queries first check the **ColumnDeletionBuffer**. If a delete marker is found, the row from disk is ignored.
 - **Tuple Mover**: A background thread responsible for converting frozen RowStore pages into ColumnStore blocks and advancing the `Pivot_RowID`.
 
 ## Index Structure
@@ -106,7 +106,7 @@ Checkpoint task merges committed and dirty entries to DiskTree and reset them to
 1. **Read**: 
    - Search MemTree -> DiskTree to get `RowID`.
    - Route to RowStore or ColumnStore based on `RowID` vs `Pivot`.
-   - **Visibility Check**: Compare Reader.STS against the timestamp in the Undo Chain (for RowStore) or Delta Buffer (for ColumnStore).
+   - **Visibility Check**: Compare Reader.STS against the timestamp in the Undo Chain (for RowStore) or Deletion Buffer (for ColumnStore).
 
 2. **Insert**:
    - Append tuple to RowStore -> Get new `RowID`.
@@ -114,16 +114,16 @@ Checkpoint task merges committed and dirty entries to DiskTree and reset them to
 
 3. **Delete**:
    - **If RowStore**: Append a "Delete" record to the Undo Chain.
-   - **If ColumnStore**: Insert a "Delete Mark" into the **ColumnDeltaBuffer**.
+   - **If ColumnStore**: Insert a "Delete Mark" into the **ColumnDeletionBuffer**.
    - Update MemTree: Mark the key as deleted and set `sts = My_STS`.
 
 #### Commit Phase
 
-1. **Log**: Serialize all modifications (Heap appends, Index changes, DeltaBuffer updates) and append to the global Commit Log.
+1. **Log**: Serialize all modifications (Heap appends, Index changes, DeletionBuffer updates) and append to the global Commit Log.
 2. **State Update**
    - Instead of updating a global transaction table or traversing the MemTree, the transaction simply backfills the **Commit Timestamp (CTS)** into its Undo Log records.
-   - For the **ColumnDeltaBuffer**, the CTS is attached to the delete/update markers.
-   - The **CTS** of all undo and delta buffer in one transaction is backed by `Arc<AtomicU64>>`. This makes the commit operation extremely lightweight and fast. The visibility of the data is now naturally handled by the presence of a valid CTS in the Undo chain or Delta buffer.
+   - For the **ColumnDeletionBuffer**, the CTS is attached to the delete/update markers.
+   - The **CTS** of all undo and deletion buffer in one transaction is backed by `Arc<AtomicU64>>`. This makes the commit operation extremely lightweight and fast. The visibility of the data is now naturally handled by the presence of a valid CTS in the Undo chain or Deletion buffer.
 3. **Cleanup**: Discard local write buffers.
 
 ### Checkpoint and Persistence
@@ -160,7 +160,7 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 4. **Replay Commit Log**:
    - **Heap Redo**: Start scanning from `Heap_Redo_Start_CTS`. Reconstruct the in-memory RowStore pages by replaying insert/update logs.
    - **Index Redo**: Start scanning from `Index_Rec_CTS`. Re-insert missing keys into the MemTree, restoring their `sts` to the value found in the log (marking them as Dirty/Clean relative to the DiskTree).
-   - **Delta Buffer Redo**: Rebuild the **ColumnDeltaBuffer** from logs to restore deletion states for columnar data.
+   - **Deletion Buffer Redo**: Rebuild the **ColumnDeletionBuffer** from logs to restore deletion states for columnar data.
 5. **Completion**: The system is open for service once memory structures are rebuilt. The background Checkpoint thread resumes to flush the restored MemTree data to DiskTree.
 
 ### Garbage Collection (GC)
