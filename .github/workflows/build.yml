@@ -28,6 +28,7 @@ jobs:
       run: |
         cargo build --verbose --all
         cargo test --verbose --all
+        cargo test --verbose --no-default-features --all
     - name: Generate coverage report
       run: |
         grcov . --binary-path ./target/debug/ -s . -t lcov \
