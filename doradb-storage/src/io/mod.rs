@@ -5,10 +5,9 @@ use crate::lifetime::StaticLifetime;
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
 use libc::EINTR;
+use libc::c_void;
 #[cfg(feature = "libaio")]
 use libc::{EAGAIN, c_long};
-#[cfg(not(feature = "libaio"))]
-use libc::{c_void, off_t};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
@@ -19,6 +18,78 @@ use thiserror::Error;
 
 pub use buf::*;
 pub use libaio_abi::*;
+
+#[cfg(not(feature = "libaio"))]
+mod no_libaio {
+    use super::*;
+    use libc::off_t;
+
+    pub(super) struct Completion {
+        pub(super) key: AIOKey,
+        pub(super) res: std::io::Result<usize>,
+    }
+
+    pub(super) unsafe fn blocking_iocb(iocb: IocbRawPtr) -> Completion {
+        let iocb = unsafe { &*iocb };
+        let fd = iocb.aio_fildes as RawFd;
+        let offset = iocb.offset as off_t;
+        let len = iocb.count as usize;
+        let res = match iocb.aio_lio_opcode {
+            code if code == io_iocb_cmd::IO_CMD_PREAD as u16 => unsafe {
+                blocking_pread(fd, iocb.buf, len, offset)
+            },
+            code if code == io_iocb_cmd::IO_CMD_PWRITE as u16 => unsafe {
+                blocking_pwrite(fd, iocb.buf, len, offset)
+            },
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "unsupported iocb opcode",
+            )),
+        };
+        Completion { key: iocb.data, res }
+    }
+
+    pub(super) unsafe fn blocking_pread(
+        fd: RawFd,
+        buf: *mut u8,
+        len: usize,
+        offset: off_t,
+    ) -> std::io::Result<usize> {
+        loop {
+            let ret = unsafe { libc::pread(fd, buf as *mut c_void, len, offset) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(ret as usize);
+        }
+    }
+
+    pub(super) unsafe fn blocking_pwrite(
+        fd: RawFd,
+        buf: *mut u8,
+        len: usize,
+        offset: off_t,
+    ) -> std::io::Result<usize> {
+        loop {
+            let ret = unsafe { libc::pwrite(fd, buf as *mut c_void, len, offset) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(ret as usize);
+        }
+    }
+}
+
+#[cfg(not(feature = "libaio"))]
+use no_libaio::{blocking_iocb, Completion};
 
 pub const MIN_PAGE_SIZE: usize = 4096;
 pub const STORAGE_SECTOR_SIZE: usize = 4096;
@@ -868,73 +939,6 @@ impl<T> AIOEventLoop<T> {
             }
         }
         listener.end_loop(&self.ctx);
-    }
-}
-
-#[cfg(not(feature = "libaio"))]
-struct Completion {
-    key: AIOKey,
-    res: std::io::Result<usize>,
-}
-
-#[cfg(not(feature = "libaio"))]
-unsafe fn blocking_iocb(iocb: IocbRawPtr) -> Completion {
-    let iocb = unsafe { &*iocb };
-    let fd = iocb.aio_fildes as RawFd;
-    let offset = iocb.offset as off_t;
-    let len = iocb.count as usize;
-    let res = match iocb.aio_lio_opcode {
-        code if code == io_iocb_cmd::IO_CMD_PREAD as u16 => unsafe {
-            blocking_pread(fd, iocb.buf, len, offset)
-        },
-        code if code == io_iocb_cmd::IO_CMD_PWRITE as u16 => unsafe {
-            blocking_pwrite(fd, iocb.buf, len, offset)
-        },
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "unsupported iocb opcode",
-        )),
-    };
-    Completion { key: iocb.data, res }
-}
-
-#[cfg(not(feature = "libaio"))]
-unsafe fn blocking_pread(
-    fd: RawFd,
-    buf: *mut u8,
-    len: usize,
-    offset: off_t,
-) -> std::io::Result<usize> {
-    loop {
-        let ret = unsafe { libc::pread(fd, buf as *mut c_void, len, offset) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(EINTR) {
-                continue;
-            }
-            return Err(err);
-        }
-        return Ok(ret as usize);
-    }
-}
-
-#[cfg(not(feature = "libaio"))]
-unsafe fn blocking_pwrite(
-    fd: RawFd,
-    buf: *mut u8,
-    len: usize,
-    offset: off_t,
-) -> std::io::Result<usize> {
-    loop {
-        let ret = unsafe { libc::pwrite(fd, buf as *mut c_void, len, offset) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(EINTR) {
-                continue;
-            }
-            return Err(err);
-        }
-        return Ok(ret as usize);
     }
 }
 
