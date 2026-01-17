@@ -21,20 +21,45 @@ jobs:
         components: llvm-tools      
     - name: Install grcov
       run: cargo install grcov
-    - name: Build and Test
+    - name: Build and Test (default features)
       env:
         RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
-        LLVM_PROFILE_FILE: "coverage-%p-%m.profraw"
+        LLVM_PROFILE_FILE: "coverage/default/coverage-%p-%m.profraw"
+        CARGO_TARGET_DIR: "target/coverage-default"
       run: |
+        mkdir -p coverage/default
         cargo build --verbose --all
         cargo test --verbose --all
-        cargo test --verbose --no-default-features --all
-    - name: Generate coverage report
+    - name: Generate coverage report (default features)
       run: |
-        grcov . --binary-path ./target/debug/ -s . -t lcov \
-          --branch --ignore-not-existing --ignore "target/" \
+        grcov . \
+          --binary-path ./target/coverage-default/debug/ \
+          -s . -t lcov \
+          --branch --ignore-not-existing \
+          --ignore "target/" \
           --ignore "doradb-tpch-tests" \
-          -o lcov.info
+          -o lcov.default.info
+    - name: Build and Test (no-default-features)
+      env:
+        RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
+        LLVM_PROFILE_FILE: "coverage/no-default/coverage-%p-%m.profraw"
+        CARGO_TARGET_DIR: "target/coverage-no-default"
+      run: |
+        mkdir -p coverage/no-default
+        cargo build --verbose --all --no-default-features
+        cargo test --verbose --all --no-default-features
+    - name: Generate coverage report (no-default-features)
+      run: |
+        grcov . \
+          --binary-path ./target/coverage-no-default/debug/ \
+          -s . -t lcov \
+          --branch --ignore-not-existing \
+          --ignore "target/" \
+          --ignore "doradb-tpch-tests" \
+          -o lcov.no-default.info
+    - name: Merge coverage reports
+      run: |
+        lcov -a lcov.default.info -a lcov.no-default.info -o lcov.info
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v3
       with:
