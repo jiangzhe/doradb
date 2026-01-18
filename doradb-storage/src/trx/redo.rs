@@ -507,7 +507,7 @@ impl TableDML {
                         // Replace Update with Delete.
                         *old = RowRedo {
                             page_id: entry.page_id,
-                            row_id: entry.page_id,
+                            row_id: entry.row_id,
                             kind: RowRedoKind::Delete,
                         };
                     }

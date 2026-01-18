@@ -5,7 +5,7 @@ use crate::latch::LatchFallbackMode;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::table::{
-    RecoverIndex, Table, index_key_is_changed, index_key_replace, read_latest_index_key,
+    Recover, RecoverIndex, Table, index_key_is_changed, index_key_replace, read_latest_index_key,
 };
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::TrxID;
@@ -105,8 +105,17 @@ impl TableRecover for Table {
 
         if disable_index {
             let res = self.recover_row_update_to_page(&mut page_guard, row_id, update, cts, None);
-            assert!(res.is_ok());
-            page_guard.set_dirty(); // mark as dirty page.
+            match res {
+                Recover::Ok => {
+                    page_guard.set_dirty(); // mark as dirty page.
+                }
+                Recover::AlreadyDeleted | Recover::NotFound => {
+                    return;
+                }
+                Recover::NoSpace => {
+                    panic!("recover update should not run out of space");
+                }
+            }
         } else {
             let mut index_change_cols = HashMap::new();
             let res = self.recover_row_update_to_page(
@@ -116,8 +125,17 @@ impl TableRecover for Table {
                 cts,
                 Some(&mut index_change_cols),
             );
-            assert!(res.is_ok());
-            page_guard.set_dirty(); // mark as dirty page.
+            match res {
+                Recover::Ok => {
+                    page_guard.set_dirty(); // mark as dirty page.
+                }
+                Recover::AlreadyDeleted | Recover::NotFound => {
+                    return;
+                }
+                Recover::NoSpace => {
+                    panic!("recover update should not run out of space");
+                }
+            }
 
             if !index_change_cols.is_empty() {
                 // There is index change, we need to update index.
