@@ -30,27 +30,27 @@ All indices (primary and secondary) reference data via a unified **64-bit RowID*
 
 ## 3. Block Index
 
-The Block Index serves as global navigation structure for both column store on disk and row store in memory.
+The Block Index is a crucial component that maps a `RowID` to its physical storage location, whether in the in-memory RowStore or the on-disk ColumnStore. It is composed of two specialized, independent indexes: `RowPageIndex` and `ColumnBlockIndex`. A `pivot_row_id` determines which index to consult for a given `RowID`.
 
-### 3.1 Structure
-*   **Type**: Sparse Index.
-*   **Mapping**: `Start_RowID -> { ColumnBlockID&DeleteBitmapID / RowPageID }`.
-*   **Memory Residency**: The entire Block Index is typically small enough to reside in memory.
+-   Rows with `RowID >= pivot_row_id` are in the **RowStore**, and their locations are tracked by `RowPageIndex`.
+-   Rows with `RowID < pivot_row_id` are in the **ColumnStore**, and their locations are tracked by `ColumnBlockIndex`.
 
-### 3.2 Operation
-*   **Lookup (RowID)**:
-    *   Perform a binary search on the Block Index using `RowID` to find the target block interval `[Start_RowID, End_RowID)`.
-    *   Retrieve the physical block location.
-*   **Scan**:
-    *   Iterate sequentially through the Block Index entries to access ColumnStore blocks in order.
-    *   This facilitates efficient prefetching and vectorized processing.
+### 3.1 RowPageIndex
 
-### 3.3 Deletion Handling (Delete Bitmap)
-*   **Component**: A dedicated **Delete Bitmap** is associated with each ColumnStore block.
-*   **Function**: Tracks deleted rows within the immutable block.
-*   **Lifecycle**:
-    *   Updated via Copy-on-Write (CoW) when rows are deleted.
-    *   Reset/Cleared during background **Compaction** when the block is rewritten to remove dead rows.
+The `RowPageIndex` manages mappings for the hot, mutable data residing in in-memory row pages.
+
+-   **Structure**: Conceptually, it's a sorted array of `(start_row_id, page_id)` pairs, where `start_row_id` is the first `RowID` in a given row page. It is implemented as a B+Tree, but highly specialized for its unique access patterns.
+-   **Insertion**: New row pages are only ever added to the end of the logical sequence. This means inserts into the `RowPageIndex` B+Tree are always right-most appends. This design eliminates the need for complex logic to split full internal nodes, as new leaf nodes are simply added to the end of the tree.
+-   **Deletion**: Deletions are also specialized. During a "data checkpoint" process, the oldest row pages are converted to columnar format and moved to the `ColumnBlockIndex`. This corresponds to deleting the left-most entries from the `RowPageIndex`. A specialized `batch_delete` method efficiently removes all entries below a given `start_row_id`.
+
+### 3.2 ColumnBlockIndex
+
+The `ColumnBlockIndex` manages mappings for the cold, immutable data in the on-disk column store.
+
+-   **Structure**: It is a persistent, Copy-on-Write (CoW) B+Tree, ensuring simple recovery and transactional consistency.
+-   **Entry Format**: Each entry maps a `start_row_id` to a `column_page_id` and an optional inlined **delete bitmap**.
+-   **Deletion Handling**: The delete bitmap enables a "delete+insert" mechanism for updating data in the otherwise immutable column store. When rows within a columnar block are deleted, the bitmap is updated.
+-   **Data Checkpoint**: When row pages are converted into a columnar page during a checkpoint, a new entry is inserted into the `ColumnBlockIndex`. This entry includes the `column_page_id` and an initially empty delete bitmap.
 
 ---
 
