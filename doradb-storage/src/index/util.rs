@@ -1,8 +1,8 @@
 use crate::buffer::page::PageID;
 use crate::catalog::TableID;
 use crate::row::{INVALID_ROW_ID, RowID};
-use crate::trx::sys::TransactionSystem;
 use crate::trx::TrxID;
+use crate::trx::sys::TransactionSystem;
 
 /// Value that can be masked as deleted.
 pub trait Maskable: Copy + PartialEq + Eq {
@@ -75,7 +75,8 @@ impl RedoLogPageCommitter {
         RedoLogPageCommitter { trx_sys, table_id }
     }
 
-    pub async fn commit_row_page(
+    #[inline]
+    pub fn commit_row_page(
         &self,
         page_id: PageID,
         start_row_id: RowID,

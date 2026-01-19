@@ -1,7 +1,7 @@
 use crate::buffer::page::PageID;
 use crate::error::Result;
 use crate::file::table_file::TABLE_FILE_SUPER_PAGE_FOOTER_SIZE;
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use std::mem;
 
@@ -21,7 +21,7 @@ pub struct SuperPageHeader {
 
 impl Ser<'_> for SuperPageHeader {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<[u8; 8]>() // magic word
             + mem::size_of::<u64>() // version
             + mem::size_of::<PageID>() // page no
@@ -29,21 +29,21 @@ impl Ser<'_> for SuperPageHeader {
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_byte_array(out, start_idx, &self.magic_word);
-        let idx = ctx.ser_u64(out, idx, self.version);
-        let idx = ctx.ser_u64(out, idx, self.page_no);
-        ctx.ser_u64(out, idx, self.checkpoint_cts)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_byte_array(start_idx, &self.magic_word);
+        let idx = out.ser_u64(idx, self.version);
+        let idx = out.ser_u64(idx, self.page_no);
+        out.ser_u64(idx, self.checkpoint_cts)
     }
 }
 
 impl Deser for SuperPageHeader {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, magic_word) = ctx.deser_byte_array::<8>(input, start_idx)?;
-        let (idx, version) = ctx.deser_u64(input, idx)?;
-        let (idx, page_no) = ctx.deser_u64(input, idx)?;
-        let (idx, checkpoint_cts) = ctx.deser_u64(input, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, magic_word) = input.deser_byte_array::<8>(start_idx)?;
+        let (idx, version) = input.deser_u64(idx)?;
+        let (idx, page_no) = input.deser_u64(idx)?;
+        let (idx, checkpoint_cts) = input.deser_u64(idx)?;
         let res = SuperPageHeader {
             magic_word,
             version,
@@ -61,20 +61,20 @@ pub struct SuperPageBody {
 
 impl Ser<'_> for SuperPageBody {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<PageID>()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        ctx.ser_u64(out, start_idx, self.meta_page_id)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        out.ser_u64(start_idx, self.meta_page_id)
     }
 }
 
 impl Deser for SuperPageBody {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, meta_page_id) = ctx.deser_u64(input, start_idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, meta_page_id) = input.deser_u64(start_idx)?;
         Ok((idx, SuperPageBody { meta_page_id }))
     }
 }
@@ -87,9 +87,9 @@ pub struct SuperPageFooter {
 
 impl Deser for SuperPageFooter {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, b3sum) = ctx.deser_byte_array::<32>(input, start_idx)?;
-        let (idx, checkpoint_cts) = ctx.deser_u64(input, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;
+        let (idx, checkpoint_cts) = input.deser_u64(idx)?;
         Ok((
             idx,
             SuperPageFooter {
@@ -102,14 +102,14 @@ impl Deser for SuperPageFooter {
 
 impl Ser<'_> for SuperPageFooter {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         TABLE_FILE_SUPER_PAGE_FOOTER_SIZE
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_byte_array(out, start_idx, &self.b3sum);
-        ctx.ser_u64(out, idx, self.checkpoint_cts)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_byte_array(start_idx, &self.b3sum);
+        out.ser_u64(idx, self.checkpoint_cts)
     }
 }
 
@@ -127,14 +127,14 @@ pub struct SuperPageSerView {
 
 impl Ser<'_> for SuperPageSerView {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        self.header.ser_len(ctx) + self.body.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        self.header.ser_len() + self.body.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = self.header.ser(ctx, out, start_idx);
-        self.body.ser(ctx, out, idx)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = self.header.ser(out, start_idx);
+        self.body.ser(out, idx)
     }
 }
 
@@ -152,18 +152,17 @@ mod tests {
             checkpoint_cts: 12,
         };
         let body = SuperPageBody { meta_page_id: 7 };
-        let mut ctx = SerdeCtx::default();
         let ser_view = SuperPageSerView {
             header: header.clone(),
             body,
         };
-        let ser_len = ser_view.ser_len(&ctx);
+        let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
-        let res_idx = ser_view.ser(&ctx, &mut data, 0);
+        let res_idx = ser_view.ser(&mut data[..], 0);
         assert_eq!(res_idx, ser_len);
 
-        let (idx, deser_header) = SuperPageHeader::deser(&mut ctx, &data, 0).unwrap();
-        let (_, deser_body) = SuperPageBody::deser(&mut ctx, &data, idx).unwrap();
+        let (idx, deser_header) = SuperPageHeader::deser(&data[..], 0).unwrap();
+        let (_, deser_body) = SuperPageBody::deser(&data[..], idx).unwrap();
         assert_eq!(deser_header, header);
         assert_eq!(deser_body.meta_page_id, 7);
     }

@@ -141,7 +141,8 @@ impl Table {
             RowLocation::NotFound => SelectMvcc::NotFound,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
-                let page_guard = self.data_pool
+                let page_guard = self
+                    .data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -160,11 +161,8 @@ impl Table {
         }
     }
 
-    async fn mem_scan<F>(
-        &self,
-        start_row_id: RowID,
-        mut page_action: F,
-    ) where
+    async fn mem_scan<F>(&self, start_row_id: RowID, mut page_action: F)
+    where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         // With cursor, we lock two pages in block index and one row page
@@ -177,7 +175,8 @@ impl Table {
             let blocks = g.page().leaf_blocks();
             for block in blocks {
                 for page_entry in block.row_page_entries() {
-                    let page_guard: PageSharedGuard<RowPage> = self.data_pool
+                    let page_guard: PageSharedGuard<RowPage> = self
+                        .data_pool
                         .get_page(page_entry.page_id, LatchFallbackMode::Shared)
                         .await
                         .shared_async()
@@ -266,8 +265,7 @@ impl Table {
         cts: TrxID,
     ) -> RecoverIndex {
         if self.metadata().index_specs[key.index_no].unique() {
-            self.recover_unique_index_insert(key, row_id, cts)
-                .await
+            self.recover_unique_index_insert(key, row_id, cts).await
         } else {
             self.recover_non_unique_index_insert(key, row_id).await
         }
@@ -429,7 +427,8 @@ impl Table {
                         }
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let page_guard = self.data_pool
+                            let page_guard = self
+                                .data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .shared_async()
@@ -485,7 +484,8 @@ impl Table {
                         }
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let page_guard = self.data_pool
+                            let page_guard = self
+                                .data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .shared_async()
@@ -565,10 +565,7 @@ impl Table {
             let undo_head = old_access.undo_head().expect("undo head");
             debug_assert!(stmt.trx.is_same_trx(undo_head));
             let old_entry = old_access.first_undo_entry().expect("old undo entry");
-            debug_assert!(matches!(
-                old_entry.as_ref().kind,
-                RowUndoKind::Delete
-            ));
+            debug_assert!(matches!(old_entry.as_ref().kind, RowUndoKind::Delete));
             metadata
                 .index_specs
                 .iter()
@@ -591,12 +588,7 @@ impl Table {
         };
         old_guard.set_dirty(); // mark as dirty page.
         let (new_row_id, new_guard) = self
-            .insert_row_internal(
-                stmt,
-                new_row,
-                RowUndoKind::Insert,
-                index_branches,
-            )
+            .insert_row_internal(stmt, new_row, RowUndoKind::Insert, index_branches)
             .await;
         // do not unlock the page because we may need to update index
         (new_row_id, index_change_cols, new_guard)
@@ -629,7 +621,8 @@ impl Table {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let old_guard = self.data_pool
+                    let old_guard = self
+                        .data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .shared_async()
@@ -955,7 +948,8 @@ impl Table {
         row_count: usize,
     ) -> PageSharedGuard<RowPage> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
-            let page_guard = self.data_pool
+            let page_guard = self
+                .data_pool
                 .get_page(page_id, LatchFallbackMode::Shared)
                 .await
                 .shared_async()
@@ -968,7 +962,9 @@ impl Table {
                 return page_guard;
             }
         }
-        self.blk_idx.get_insert_page(self.data_pool, row_count).await
+        self.blk_idx
+            .get_insert_page(self.data_pool, row_count)
+            .await
     }
 
     // lock row will check write conflict on given row and lock it.
@@ -1177,10 +1173,7 @@ impl Table {
                 IndexInsert::DuplicateKey(old_row_id, deleted) => {
                     debug_assert!(old_row_id != row_id);
                     // Find CTS of old row.
-                    match self
-                        .find_recover_cts_for_row_id(old_row_id)
-                        .await
-                    {
+                    match self.find_recover_cts_for_row_id(old_row_id).await {
                         Some(old_cts) => {
                             if cts < old_cts {
                                 // Current row has smaller CTS, that means this insert
@@ -1253,15 +1246,13 @@ impl Table {
     }
 
     #[inline]
-    async fn find_recover_cts_for_row_id(
-        &self,
-        row_id: RowID,
-    ) -> Option<TrxID> {
+    async fn find_recover_cts_for_row_id(&self, row_id: RowID) -> Option<TrxID> {
         match self.blk_idx.find_row(row_id).await {
             RowLocation::NotFound => None,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
-                let page_guard = self.data_pool
+                let page_guard = self
+                    .data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()

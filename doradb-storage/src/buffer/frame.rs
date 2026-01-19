@@ -1,9 +1,9 @@
 use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID};
 use crate::catalog::TableMetadata;
 use crate::latch::HybridLatch;
+use crate::trx::TrxID;
 use crate::trx::recover::RecoverMap;
 use crate::trx::ver_map::RowVersionMap;
-use crate::trx::TrxID;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 

@@ -1,15 +1,15 @@
+use super::{DeleteInternal, UpdateRowInplace};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
-use crate::index::{UniqueIndex, RowLocation};
+use crate::index::{RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
-use crate::row::ops::{InsertMvcc, SelectKey, UpdateCol};
 use crate::row::RowPage;
+use crate::row::ops::{InsertMvcc, SelectKey, UpdateCol};
 use crate::session::Session;
 use crate::table::{Table, TableAccess};
 use crate::trx::ActiveTrx;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::value::Val;
-use super::{DeleteInternal, UpdateRowInplace};
 use tempfile::TempDir;
 
 #[test]

@@ -17,6 +17,7 @@
 //!    d) If less than current STS, return current version.
 pub mod group;
 pub mod log;
+pub mod log_replay;
 pub mod purge;
 pub mod recover;
 pub mod redo;
@@ -29,9 +30,9 @@ pub mod ver_map;
 
 use crate::engine::EngineRef;
 use crate::error::Result;
-use crate::serde::{LenPrefixPod, SerdeCtx};
 use crate::session::SessionState;
 use crate::stmt::Statement;
+use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
@@ -241,13 +242,12 @@ impl ActiveTrx {
         let redo_bin = if self.redo.is_empty() {
             None
         } else {
-            Some(LenPrefixPod::new(
+            Some(TrxLog::new(
                 RedoHeader {
                     cts: 0,
                     trx_kind: RedoTrxKind::User,
                 },
                 mem::take(&mut self.redo),
-                &SerdeCtx::default(),
             ))
         };
         let row_undo = mem::take(&mut self.row_undo);
@@ -330,7 +330,7 @@ pub struct PreparedTrxPayload {
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
 pub struct PreparedTrx {
     sts: Option<TrxID>,
-    redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
+    redo_bin: Option<TrxLog>,
     payload: Option<PreparedTrxPayload>,
     session: Option<Arc<SessionState>>,
 }
@@ -423,7 +423,7 @@ pub struct PrecommitTrxPayload {
 /// The other is system transaction which will be directly dropped and has no other info.
 pub struct PrecommitTrx {
     pub cts: TrxID,
-    pub redo_bin: Option<LenPrefixPod<RedoHeader, RedoLogs>>,
+    pub redo_bin: Option<TrxLog>,
     // Payload is only for user transaction
     pub payload: Option<PrecommitTrxPayload>,
     session: Option<Arc<SessionState>>,

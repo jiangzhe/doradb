@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::row::{Row, RowID, RowMut};
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser, Serde};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
 use std::mem;
@@ -28,22 +28,22 @@ impl SelectKey {
 
 impl Ser<'_> for SelectKey {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        mem::size_of::<u32>() + self.vals.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u32>() + self.vals.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_u32(out, start_idx, self.index_no as u32);
-        self.vals.ser(ctx, out, idx)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u32(start_idx, self.index_no as u32);
+        self.vals.ser(out, idx)
     }
 }
 
 impl Deser for SelectKey {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, index_no) = ctx.deser_u32(input, start_idx)?;
-        let (idx, vals) = <Vec<Val>>::deser(ctx, input, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, index_no) = input.deser_u32(start_idx)?;
+        let (idx, vals) = <Vec<Val>>::deser(input, idx)?;
         Ok((idx, SelectKey::new(index_no as usize, vals)))
     }
 }
@@ -255,24 +255,24 @@ pub struct UpdateCol {
 
 impl Ser<'_> for UpdateCol {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        mem::size_of::<u32>() + self.val.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u32>() + self.val.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = ctx.ser_u32(out, idx, self.idx as u32);
-        self.val.ser(ctx, out, idx)
+        idx = out.ser_u32(idx, self.idx as u32);
+        self.val.ser(out, idx)
     }
 }
 
 impl Deser for UpdateCol {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let idx = start_idx;
-        let (i, idx) = ctx.deser_u32(input, idx)?;
-        let (i, val) = Val::deser(ctx, input, i)?;
+        let (i, idx) = input.deser_u32(idx)?;
+        let (i, val) = Val::deser(input, i)?;
         Ok((
             i,
             UpdateCol {

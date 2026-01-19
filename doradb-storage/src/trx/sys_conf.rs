@@ -170,7 +170,8 @@ impl TrxSysConfig {
             log_partition_initializers.push(initializer);
         }
 
-        let catalog_storage = CatalogStorage::new(meta_pool, index_pool, data_pool, table_fs).await?;
+        let catalog_storage =
+            CatalogStorage::new(meta_pool, index_pool, data_pool, table_fs).await?;
         let mut catalog = Catalog::new(catalog_storage);
 
         // Now we have an empty catalog, all log partitions and buffer pool.

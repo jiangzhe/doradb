@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::io::DirectBuf;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
 use crate::row::{RowID, RowPage};
-use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, SerdeCtx};
+use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, Serde};
 use crate::value::{MemVar, Val, ValKind};
 use std::mem;
 
@@ -600,54 +600,54 @@ impl<'a> LwcPrimitiveSer<'a> {
 
 impl<'a> Ser<'a> for LwcPrimitiveSer<'a> {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<u8>()
             + match self {
-                LwcPrimitiveSer::FlatI8(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatU8(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatI16(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatU16(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatI32(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatU32(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatF32(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatI64(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatU64(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::FlatF64(f) => f.ser_len(ctx),
-                LwcPrimitiveSer::ForBpI8(b) => b.ser_len(ctx),
-                LwcPrimitiveSer::ForBpU8(b) => b.ser_len(ctx),
-                LwcPrimitiveSer::ForBpI16(b) => b.ser_len(ctx),
-                LwcPrimitiveSer::ForBpU16(b) => b.ser_len(ctx),
-                LwcPrimitiveSer::ForBpI32(b) => b.ser_len(ctx),
-                LwcPrimitiveSer::ForBpU32(b) => b.ser_len(ctx),
-                LwcPrimitiveSer::ForBpI64(b) => b.ser_len(ctx),
-                LwcPrimitiveSer::ForBpU64(b) => b.ser_len(ctx),
-                LwcPrimitiveSer::Bytes(b) => b.ser_len(ctx),
+                LwcPrimitiveSer::FlatI8(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatU8(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatI16(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatU16(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatI32(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatU32(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatF32(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatI64(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatU64(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatF64(f) => f.ser_len(),
+                LwcPrimitiveSer::ForBpI8(b) => b.ser_len(),
+                LwcPrimitiveSer::ForBpU8(b) => b.ser_len(),
+                LwcPrimitiveSer::ForBpI16(b) => b.ser_len(),
+                LwcPrimitiveSer::ForBpU16(b) => b.ser_len(),
+                LwcPrimitiveSer::ForBpI32(b) => b.ser_len(),
+                LwcPrimitiveSer::ForBpU32(b) => b.ser_len(),
+                LwcPrimitiveSer::ForBpI64(b) => b.ser_len(),
+                LwcPrimitiveSer::ForBpU64(b) => b.ser_len(),
+                LwcPrimitiveSer::Bytes(b) => b.ser_len(),
             }
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_u8(out, start_idx, self.code() as u8);
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u8(start_idx, self.code() as u8);
         match self {
-            LwcPrimitiveSer::FlatI8(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatU8(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatI16(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatU16(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatI32(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatU32(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatF32(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatI64(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatU64(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::FlatF64(f) => f.ser(ctx, out, idx),
-            LwcPrimitiveSer::ForBpI8(b) => b.ser(ctx, out, idx),
-            LwcPrimitiveSer::ForBpU8(b) => b.ser(ctx, out, idx),
-            LwcPrimitiveSer::ForBpI16(b) => b.ser(ctx, out, idx),
-            LwcPrimitiveSer::ForBpU16(b) => b.ser(ctx, out, idx),
-            LwcPrimitiveSer::ForBpI32(b) => b.ser(ctx, out, idx),
-            LwcPrimitiveSer::ForBpU32(b) => b.ser(ctx, out, idx),
-            LwcPrimitiveSer::ForBpI64(b) => b.ser(ctx, out, idx),
-            LwcPrimitiveSer::ForBpU64(b) => b.ser(ctx, out, idx),
-            LwcPrimitiveSer::Bytes(b) => b.ser(ctx, out, idx),
+            LwcPrimitiveSer::FlatI8(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatU8(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatI16(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatU16(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatI32(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatU32(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatF32(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatI64(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatU64(f) => f.ser(out, idx),
+            LwcPrimitiveSer::FlatF64(f) => f.ser(out, idx),
+            LwcPrimitiveSer::ForBpI8(b) => b.ser(out, idx),
+            LwcPrimitiveSer::ForBpU8(b) => b.ser(out, idx),
+            LwcPrimitiveSer::ForBpI16(b) => b.ser(out, idx),
+            LwcPrimitiveSer::ForBpU16(b) => b.ser(out, idx),
+            LwcPrimitiveSer::ForBpI32(b) => b.ser(out, idx),
+            LwcPrimitiveSer::ForBpU32(b) => b.ser(out, idx),
+            LwcPrimitiveSer::ForBpI64(b) => b.ser(out, idx),
+            LwcPrimitiveSer::ForBpU64(b) => b.ser(out, idx),
+            LwcPrimitiveSer::Bytes(b) => b.ser(out, idx),
         }
     }
 }
@@ -738,7 +738,6 @@ pub struct LwcBuilder<'a> {
     buffer: ScanBuffer,
     row_ids: Vec<RowID>,
     stats: Vec<LwcColumnStats>,
-    ctx: SerdeCtx,
 }
 
 impl<'a> LwcBuilder<'a> {
@@ -753,7 +752,6 @@ impl<'a> LwcBuilder<'a> {
             buffer,
             row_ids: Vec::new(),
             stats,
-            ctx: SerdeCtx::default(),
         }
     }
 
@@ -799,7 +797,7 @@ impl<'a> LwcBuilder<'a> {
             return Err(Error::InvalidArgument);
         }
         let row_id_ser = LwcPrimitiveSer::new_u64(&self.row_ids);
-        let row_id_len = row_id_ser.ser_len(&self.ctx);
+        let row_id_len = row_id_ser.ser_len();
         let mut column_payloads = Vec::with_capacity(self.metadata.col_count());
         let mut col_offsets = Vec::with_capacity(self.metadata.col_count());
         let mut offset = mem::size_of::<u16>() * self.metadata.col_count() + row_id_len;
@@ -813,50 +811,50 @@ impl<'a> LwcBuilder<'a> {
             if let Some(bitmap) = column.null_bitmap {
                 let bytes = bitmap_to_bytes(bitmap, row_count);
                 let bitmap_ser = LwcNullBitmapSer::new(&bytes)?;
-                let mut tmp = vec![0u8; bitmap_ser.ser_len(&self.ctx)];
-                bitmap_ser.ser(&self.ctx, &mut tmp, 0);
+                let mut tmp = vec![0u8; bitmap_ser.ser_len()];
+                bitmap_ser.ser(&mut tmp[..], 0);
                 data.extend_from_slice(&tmp);
             }
             let payload = match column.values {
                 ScanColumnValues::I8(vals) => {
                     let ser = LwcPrimitiveSer::new_i8(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::U8(vals) => {
                     let ser = LwcPrimitiveSer::new_u8(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::I16(vals) => {
                     let ser = LwcPrimitiveSer::new_i16(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::U16(vals) => {
                     let ser = LwcPrimitiveSer::new_u16(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::I32(vals) => {
                     let ser = LwcPrimitiveSer::new_i32(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::U32(vals) => {
                     let ser = LwcPrimitiveSer::new_u32(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::F32(vals) => {
                     let ser = LwcPrimitiveSer::new_f32(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::I64(vals) => {
                     let ser = LwcPrimitiveSer::new_i64(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::U64(vals) => {
                     let ser = LwcPrimitiveSer::new_u64(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::F64(vals) => {
                     let ser = LwcPrimitiveSer::new_f64(vals);
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
                 ScanColumnValues::VarByte {
                     offsets,
@@ -868,7 +866,7 @@ impl<'a> LwcBuilder<'a> {
                         lwc_offsets.push(end as u32);
                     }
                     let ser = LwcPrimitiveSer::new_bytes_owned(lwc_offsets, bytes.to_vec())?;
-                    serialize_primitive(&ser, &self.ctx)
+                    serialize_primitive(&ser)
                 }
             };
             data.extend_from_slice(&payload);
@@ -891,11 +889,11 @@ impl<'a> LwcBuilder<'a> {
 
         let mut buf = DirectBuf::zeroed(LWC_PAGE_SIZE);
         buf.truncate(0);
-        buf.extend_ser(&header, &self.ctx);
+        buf.extend_ser(&header);
         for offset in col_offsets {
-            buf.extend_ser(&offset, &self.ctx);
+            buf.extend_ser(&offset);
         }
-        buf.extend_ser(&row_id_ser, &self.ctx);
+        buf.extend_ser(&row_id_ser);
         for payload in column_payloads {
             buf.extend_from_slice(&payload);
         }
@@ -1010,9 +1008,10 @@ impl<'a> LwcBuilder<'a> {
     }
 }
 
-fn serialize_primitive<'a>(ser: &LwcPrimitiveSer<'a>, ctx: &SerdeCtx) -> Vec<u8> {
-    let mut bytes = vec![0u8; ser.ser_len(ctx)];
-    ser.ser(ctx, &mut bytes, 0);
+#[inline]
+fn serialize_primitive<'a>(ser: &LwcPrimitiveSer<'a>) -> Vec<u8> {
+    let mut bytes = vec![0u8; ser.ser_len()];
+    ser.ser(&mut bytes[..], 0);
     bytes
 }
 
@@ -1040,15 +1039,11 @@ fn estimate_row_ids_size(row_ids: &[RowID]) -> usize {
     }
     match ForBitpackingSer::new(row_ids) {
         Some(fbp) => {
-            let packed = mem::size_of::<u8>() + fbp.ser_len(&SerdeCtx::default());
-            let flat = mem::size_of::<u8>()
-                + mem::size_of::<u64>()
-                + mem::size_of_val(row_ids);
+            let packed = mem::size_of::<u8>() + fbp.ser_len();
+            let flat = mem::size_of::<u8>() + mem::size_of::<u64>() + mem::size_of_val(row_ids);
             if packed < flat { packed } else { flat }
         }
-        None => {
-            mem::size_of::<u8>() + mem::size_of::<u64>() + mem::size_of_val(row_ids)
-        }
+        None => mem::size_of::<u8>() + mem::size_of::<u64>() + mem::size_of_val(row_ids),
     }
 }
 
@@ -1065,12 +1060,8 @@ fn estimate_columns_size(
         if column.null_bitmap.is_some() {
             total += mem::size_of::<u16>() + row_count.div_ceil(8);
         }
-        total += estimate_column_payload(
-            metadata.val_kind(col_idx),
-            &column.values,
-            st,
-            row_count,
-        )?;
+        total +=
+            estimate_column_payload(metadata.val_kind(col_idx), &column.values, st, row_count)?;
     }
     Ok(total)
 }
@@ -1178,15 +1169,15 @@ pub struct LwcPrimitiveDeser<T>(pub Vec<T>);
 
 impl<T: Deser + BitPackable> Deser for LwcPrimitiveDeser<T> {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, code) = ctx.deser_u8(input, start_idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, code) = input.deser_u8(start_idx)?;
         match LwcCode::try_from(code)? {
             LwcCode::Flat => {
-                let (idx, data) = Vec::<T>::deser(ctx, input, idx)?;
+                let (idx, data) = Vec::<T>::deser(input, idx)?;
                 Ok((idx, LwcPrimitiveDeser(data)))
             }
             LwcCode::ForBitpacking => {
-                let (idx, data) = ForBitpackingDeser::<T>::deser(ctx, input, idx)?;
+                let (idx, data) = ForBitpackingDeser::<T>::deser(input, idx)?;
                 Ok((idx, LwcPrimitiveDeser(data.0)))
             }
         }
@@ -1360,20 +1351,18 @@ pub struct LwcBytesSer {
 
 impl Ser<'_> for LwcBytesSer {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<u64>() + self.offsets.len() * mem::size_of::<u32>() + self.data.len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         debug_assert!(!self.offsets.is_empty());
-        let mut idx = ctx.ser_u64(out, start_idx, (self.offsets.len() - 1) as u64);
+        let mut idx = out.ser_u64(start_idx, (self.offsets.len() - 1) as u64);
         for off in self.offsets.iter().copied() {
-            idx = ctx.ser_u32(out, idx, off);
+            idx = out.ser_u32(idx, off);
         }
-        let end_idx = idx + self.data.len();
-        out[idx..end_idx].copy_from_slice(self.data.as_slice());
-        end_idx
+        out.ser_byte_slice(idx, &self.data)
     }
 }
 
@@ -1432,16 +1421,14 @@ impl<'a> LwcNullBitmapSer<'a> {
 
 impl Ser<'_> for LwcNullBitmapSer<'_> {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<u16>() + self.bytes.len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_u16(out, start_idx, self.bytes.len() as u16);
-        let end_idx = idx + self.bytes.len();
-        out[idx..end_idx].copy_from_slice(self.bytes);
-        end_idx
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u16(start_idx, self.bytes.len() as u16);
+        out.ser_byte_slice(idx, self.bytes)
     }
 }
 
@@ -1617,8 +1604,6 @@ mod tests {
 
     #[test]
     fn test_lwc_primitive_serde() {
-        let ctx = SerdeCtx::default();
-
         // i8
         for input in [
             vec![1i8],
@@ -1631,8 +1616,8 @@ mod tests {
             vec![1i8, 2, 4, 16, -100, 100],
         ] {
             let lwc_ser = LwcPrimitiveSer::new_i8(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-            let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+            let mut res = vec![0u8; lwc_ser.ser_len()];
+            let ser_idx = lwc_ser.ser(&mut res[..], 0);
             assert_eq!(ser_idx, res.len());
             let lwc_data = LwcData::from_bytes(ValKind::I8, &res).unwrap();
             let mut output = vec![];
@@ -1653,8 +1638,8 @@ mod tests {
             vec![1u8, 2, 4, 16, 100, 200, 250],
         ] {
             let lwc_ser = LwcPrimitiveSer::new_u8(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-            let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+            let mut res = vec![0u8; lwc_ser.ser_len()];
+            let ser_idx = lwc_ser.ser(&mut res[..], 0);
             assert_eq!(ser_idx, res.len());
             let lwc_data = LwcData::from_bytes(ValKind::U8, &res).unwrap();
             let mut output = vec![];
@@ -1674,8 +1659,8 @@ mod tests {
             vec![-1i16, 2, 3, 4, -8, 1 << 14],
         ] {
             let lwc_ser = LwcPrimitiveSer::new_i16(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-            let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+            let mut res = vec![0u8; lwc_ser.ser_len()];
+            let ser_idx = lwc_ser.ser(&mut res[..], 0);
             assert_eq!(ser_idx, res.len());
             let lwc_data = LwcData::from_bytes(ValKind::I16, &res).unwrap();
             let mut output = vec![];
@@ -1695,8 +1680,8 @@ mod tests {
             vec![1u16, 2, 3, 4, 8, 16, 1 << 14],
         ] {
             let lwc_ser = LwcPrimitiveSer::new_u16(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-            let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+            let mut res = vec![0u8; lwc_ser.ser_len()];
+            let ser_idx = lwc_ser.ser(&mut res[..], 0);
             assert_eq!(ser_idx, res.len());
             let lwc_data = LwcData::from_bytes(ValKind::U16, &res).unwrap();
             let mut output = vec![];
@@ -1718,8 +1703,8 @@ mod tests {
             vec![-2i32, -1, 0, 1, 2, 4, 8, 128, 1 << 30],
         ] {
             let lwc_ser = LwcPrimitiveSer::new_i32(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-            let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+            let mut res = vec![0u8; lwc_ser.ser_len()];
+            let ser_idx = lwc_ser.ser(&mut res[..], 0);
             assert_eq!(ser_idx, res.len());
             let lwc_data = LwcData::from_bytes(ValKind::I32, &res).unwrap();
             let mut output = vec![];
@@ -1741,8 +1726,8 @@ mod tests {
             vec![1u32, 3, 7, 15, 31, 63, 1 << 30],
         ] {
             let lwc_ser = LwcPrimitiveSer::new_u32(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-            let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+            let mut res = vec![0u8; lwc_ser.ser_len()];
+            let ser_idx = lwc_ser.ser(&mut res[..], 0);
             assert_eq!(ser_idx, res.len());
             let lwc_data = LwcData::from_bytes(ValKind::U32, &res).unwrap();
             let mut output = vec![];
@@ -1755,8 +1740,8 @@ mod tests {
         // f32
         let input = vec![1.5f32, 2.25, -3.5, 0.0];
         let lwc_ser = LwcPrimitiveSer::new_f32(&input);
-        let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-        let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+        let mut res = vec![0u8; lwc_ser.ser_len()];
+        let ser_idx = lwc_ser.ser(&mut res[..], 0);
         assert_eq!(ser_idx, res.len());
         let lwc_data = LwcData::from_bytes(ValKind::F32, &res).unwrap();
         let mut output = vec![];
@@ -1778,8 +1763,8 @@ mod tests {
             vec![-2i64, -1, 0, 1, 2, 4, 8, 1024, 1 << 60],
         ] {
             let lwc_ser = LwcPrimitiveSer::new_i64(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-            let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+            let mut res = vec![0u8; lwc_ser.ser_len()];
+            let ser_idx = lwc_ser.ser(&mut res[..], 0);
             assert_eq!(ser_idx, res.len());
             let lwc_data = LwcData::from_bytes(ValKind::I64, &res).unwrap();
             let mut output = vec![];
@@ -1801,8 +1786,8 @@ mod tests {
             vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32],
         ] {
             let lwc_ser = LwcPrimitiveSer::new_u64(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-            let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+            let mut res = vec![0u8; lwc_ser.ser_len()];
+            let ser_idx = lwc_ser.ser(&mut res[..], 0);
             assert_eq!(ser_idx, res.len());
             let lwc_data = LwcData::from_bytes(ValKind::U64, &res).unwrap();
             let mut output = vec![];
@@ -1815,8 +1800,8 @@ mod tests {
         // f64
         let input = vec![1.5f64, 2.25, -3.5, 0.0, 128.5];
         let lwc_ser = LwcPrimitiveSer::new_f64(&input);
-        let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-        let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+        let mut res = vec![0u8; lwc_ser.ser_len()];
+        let ser_idx = lwc_ser.ser(&mut res[..], 0);
         assert_eq!(ser_idx, res.len());
         let lwc_data = LwcData::from_bytes(ValKind::F64, &res).unwrap();
         let mut output = vec![];
@@ -1834,8 +1819,8 @@ mod tests {
             .copied()
             .collect::<Vec<u8>>();
         let lwc_ser = LwcPrimitiveSer::new_bytes(&offsets, &bytes).unwrap();
-        let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-        let ser_idx = lwc_ser.ser(&ctx, &mut res, 0);
+        let mut res = vec![0u8; lwc_ser.ser_len()];
+        let ser_idx = lwc_ser.ser(&mut res[..], 0);
         assert_eq!(ser_idx, res.len());
         let lwc_data = LwcData::from_bytes(ValKind::VarByte, &res).unwrap();
         if let LwcData::Bytes(b) = lwc_data {
@@ -1848,8 +1833,6 @@ mod tests {
 
     #[test]
     fn test_lwc_bytes_invalid() {
-        let ctx = SerdeCtx::default();
-
         let err = LwcPrimitiveSer::new_bytes(&[], &[]);
         assert!(matches!(err, Err(Error::InvalidCompressedData)));
 
@@ -1859,8 +1842,8 @@ mod tests {
         let offsets = vec![0u32, 0];
         let bytes = vec![];
         let lwc_ser = LwcPrimitiveSer::new_bytes(&offsets, &bytes).unwrap();
-        let mut res = vec![0u8; lwc_ser.ser_len(&ctx)];
-        lwc_ser.ser(&ctx, &mut res, 0);
+        let mut res = vec![0u8; lwc_ser.ser_len()];
+        lwc_ser.ser(&mut res[..], 0);
         let err = LwcData::from_bytes(ValKind::VarByte, &res[..res.len() - 1]);
         assert!(matches!(err, Err(Error::InvalidCompressedData)));
     }
@@ -1896,11 +1879,10 @@ mod tests {
 
     #[test]
     fn test_lwc_null_bitmap_serde() {
-        let ctx = SerdeCtx::default();
         let bytes = [0b0000_1010u8, 0b0000_0001];
         let ser = LwcNullBitmapSer::new(&bytes).unwrap();
-        let mut out = vec![0u8; ser.ser_len(&ctx)];
-        let idx = ser.ser(&ctx, &mut out, 0);
+        let mut out = vec![0u8; ser.ser_len()];
+        let idx = ser.ser(&mut out[..], 0);
         assert_eq!(idx, out.len());
 
         let (bitmap, rest) = LwcNullBitmap::from_bytes(&out).unwrap();

@@ -46,7 +46,10 @@ mod no_libaio {
                 "unsupported iocb opcode",
             )),
         };
-        Completion { key: iocb.data, res }
+        Completion {
+            key: iocb.data,
+            res,
+        }
     }
 
     pub(super) unsafe fn blocking_pread(
@@ -89,7 +92,7 @@ mod no_libaio {
 }
 
 #[cfg(not(feature = "libaio"))]
-use no_libaio::{blocking_iocb, Completion};
+use no_libaio::{Completion, blocking_iocb};
 
 pub const MIN_PAGE_SIZE: usize = 4096;
 pub const STORAGE_SECTOR_SIZE: usize = 4096;
@@ -218,10 +221,8 @@ impl AIOContext {
             let completion_tx = self.completion_tx.clone();
             let iocb_addr = iocb as usize;
             smol::spawn(async move {
-                let completion = smol::unblock(move || unsafe {
-                    blocking_iocb(iocb_addr as IocbRawPtr)
-                })
-                .await;
+                let completion =
+                    smol::unblock(move || unsafe { blocking_iocb(iocb_addr as IocbRawPtr) }).await;
                 let _ = completion_tx.send(completion);
             })
             .detach();
@@ -561,10 +562,7 @@ impl<T> IOQueue<T> {
 
     #[inline]
     pub fn drain_to(&mut self, n: usize) -> Vec<(IocbRawPtr, T)> {
-        self.iocbs
-            .drain(0..n)
-            .zip(self.reqs.drain(0..n))
-            .collect()
+        self.iocbs.drain(0..n).zip(self.reqs.drain(0..n)).collect()
     }
 
     /// Checks consistency of this queue.
@@ -893,34 +891,33 @@ impl<T> AIOEventLoop<T> {
             // wait for any request to be done.
             // Note: even if we received shutdown message, we should wait all submitted IO finish before quiting.
             // This will prevent kernel from accessing a freed memory via async IO processing.
-            let (io_wait_count, io_wait_nanos, finished_reads, finished_writes) = if self.submitted
-                != 0
-            {
-                let start = Instant::now();
-                let mut read_count = 0;
-                let mut write_count = 0;
-                let mut handle_completion = |completion: Completion| {
-                    match listener.on_complete(completion.key, completion.res) {
+            let (io_wait_count, io_wait_nanos, finished_reads, finished_writes) =
+                if self.submitted != 0 {
+                    let start = Instant::now();
+                    let mut read_count = 0;
+                    let mut write_count = 0;
+                    let mut handle_completion = |completion: Completion| match listener
+                        .on_complete(completion.key, completion.res)
+                    {
                         AIOKind::Read => read_count += 1,
                         AIOKind::Write => write_count += 1,
-                    }
-                };
-                let completion = completion_rx.recv().unwrap();
-                handle_completion(completion);
-                while let Ok(completion) = completion_rx.try_recv() {
+                    };
+                    let completion = completion_rx.recv().unwrap();
                     handle_completion(completion);
-                }
-                listener.on_batch_complete(read_count, write_count);
-                self.submitted -= read_count + write_count;
-                (
-                    1,
-                    start.elapsed().as_nanos() as usize,
-                    read_count,
-                    write_count,
-                )
-            } else {
-                (0, 0, 0, 0)
-            };
+                    while let Ok(completion) = completion_rx.try_recv() {
+                        handle_completion(completion);
+                    }
+                    listener.on_batch_complete(read_count, write_count);
+                    self.submitted -= read_count + write_count;
+                    (
+                        1,
+                        start.elapsed().as_nanos() as usize,
+                        read_count,
+                        write_count,
+                    )
+                } else {
+                    (0, 0, 0, 0)
+                };
 
             listener.on_stats(&AIOStats {
                 queuing: queue.len(),

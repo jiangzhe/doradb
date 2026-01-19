@@ -3,7 +3,7 @@ use crate::memcmp::{
     BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
     SegmentedBytes,
 };
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser, Serde};
 use bytemuck::{AnyBitPattern, Zeroable};
 use ordered_float::OrderedFloat;
 use serde::de::Visitor;
@@ -68,25 +68,25 @@ impl ValType {
 
 impl Ser<'_> for ValType {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<u8>() + mem::size_of::<u8>()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = ctx.ser_u8(out, idx, self.kind as u8);
-        ctx.ser_u8(out, idx, self.nullable as u8)
+        idx = out.ser_u8(idx, self.kind as u8);
+        out.ser_u8(idx, self.nullable as u8)
     }
 }
 
 impl Deser for ValType {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let idx = start_idx;
-        let (idx, kind) = ctx.deser_u8(data, idx)?;
+        let (idx, kind) = input.deser_u8(idx)?;
         let kind = ValKind::try_from(kind)?;
-        let (idx, nullable) = ctx.deser_u8(data, idx)?;
+        let (idx, nullable) = input.deser_u8(idx)?;
         Ok((
             idx,
             ValType {
@@ -405,7 +405,69 @@ impl Val {
 impl fmt::Debug for Val {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Val").finish()
+        // f.debug_struct("Val").finish()
+        match self {
+            Val::Null => f.pad("Null"),
+            Val::I8(v) => {
+                f.pad("i8(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::U8(v) => {
+                f.pad("u8(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::I16(v) => {
+                f.pad("i16(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::U16(v) => {
+                f.pad("u16(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::I32(v) => {
+                f.pad("i32(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::U32(v) => {
+                f.pad("u32(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::F32(v) => {
+                f.pad("f32(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::I64(v) => {
+                f.pad("i64(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::U64(v) => {
+                f.pad("u64(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::F64(v) => {
+                f.pad("f64(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            Val::VarByte(v) => {
+                f.pad("bytes(")?;
+                if let Ok(s) = str::from_utf8(v.as_bytes()) {
+                    f.write_str(s)?;
+                } else {
+                    write!(f, "{:?}", v.as_bytes())?;
+                }
+                f.pad(")")
+            }
+        }
     }
 }
 
@@ -509,7 +571,7 @@ impl From<Vec<u8>> for Val {
 
 impl Ser<'_> for Val {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<u8>()
             + match self {
                 Val::Null => 0, // null is encoded with code only.
@@ -522,26 +584,25 @@ impl Ser<'_> for Val {
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        debug_assert!(start_idx + self.ser_len(ctx) <= out.len());
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        debug_assert!(start_idx + self.ser_len() <= out.size());
         let code = self.kind().map(|k| k as u8).unwrap_or(0);
-        let idx = ctx.ser_u8(out, start_idx, code);
+        let idx = out.ser_u8(start_idx, code);
         match self {
             Val::Null => idx,
-            Val::I8(v) => ctx.ser_i8(out, idx, *v),
-            Val::U8(v) => ctx.ser_u8(out, idx, *v),
-            Val::I16(v) => ctx.ser_i16(out, idx, *v),
-            Val::U16(v) => ctx.ser_u16(out, idx, *v),
-            Val::I32(v) => ctx.ser_i32(out, idx, *v),
-            Val::U32(v) => ctx.ser_u32(out, idx, *v),
-            Val::F32(v) => ctx.ser_f32(out, idx, v.0),
-            Val::I64(v) => ctx.ser_i64(out, idx, *v),
-            Val::U64(v) => ctx.ser_u64(out, idx, *v),
-            Val::F64(v) => ctx.ser_f64(out, idx, v.0),
+            Val::I8(v) => out.ser_i8(idx, *v),
+            Val::U8(v) => out.ser_u8(idx, *v),
+            Val::I16(v) => out.ser_i16(idx, *v),
+            Val::U16(v) => out.ser_u16(idx, *v),
+            Val::I32(v) => out.ser_i32(idx, *v),
+            Val::U32(v) => out.ser_u32(idx, *v),
+            Val::F32(v) => out.ser_f32(idx, v.0),
+            Val::I64(v) => out.ser_i64(idx, *v),
+            Val::U64(v) => out.ser_u64(idx, *v),
+            Val::F64(v) => out.ser_f64(idx, v.0),
             Val::VarByte(v) => {
-                let idx = ctx.ser_u16(out, idx, v.len() as u16);
-                out[idx..idx + v.len()].copy_from_slice(v.as_bytes());
-                idx + v.len()
+                let idx = out.ser_u16(idx, v.len() as u16);
+                out.ser_byte_slice(idx, v.as_bytes())
             }
         }
     }
@@ -549,58 +610,58 @@ impl Ser<'_> for Val {
 
 impl Deser for Val {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let c = input[start_idx];
-        let idx = start_idx + 1;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, c) = input.deser_u8(start_idx)?;
         if c == 0 {
             return Ok((idx, Val::Null));
         }
         let kind = ValKind::try_from(c)?;
         match kind {
             ValKind::I8 => {
-                let (idx, v) = ctx.deser_i8(input, idx)?;
+                let (idx, v) = input.deser_i8(idx)?;
                 Ok((idx, Val::I8(v)))
             }
             ValKind::U8 => {
-                let (idx, v) = ctx.deser_u8(input, idx)?;
+                let (idx, v) = input.deser_u8(idx)?;
                 Ok((idx, Val::U8(v)))
             }
             ValKind::I16 => {
-                let (idx, v) = ctx.deser_i16(input, idx)?;
+                let (idx, v) = input.deser_i16(idx)?;
                 Ok((idx, Val::I16(v)))
             }
             ValKind::U16 => {
-                let (idx, v) = ctx.deser_u16(input, idx)?;
+                let (idx, v) = input.deser_u16(idx)?;
                 Ok((idx, Val::U16(v)))
             }
             ValKind::I32 => {
-                let (idx, v) = ctx.deser_i32(input, idx)?;
+                let (idx, v) = input.deser_i32(idx)?;
                 Ok((idx, Val::I32(v)))
             }
             ValKind::U32 => {
-                let (idx, v) = ctx.deser_u32(input, idx)?;
+                let (idx, v) = input.deser_u32(idx)?;
                 Ok((idx, Val::U32(v)))
             }
             ValKind::F32 => {
-                let (idx, v) = ctx.deser_f32(input, idx)?;
+                let (idx, v) = input.deser_f32(idx)?;
                 Ok((idx, Val::F32(OrderedFloat(v))))
             }
             ValKind::I64 => {
-                let (idx, v) = ctx.deser_i64(input, idx)?;
+                let (idx, v) = input.deser_i64(idx)?;
                 Ok((idx, Val::I64(v)))
             }
             ValKind::U64 => {
-                let (idx, v) = ctx.deser_u64(input, idx)?;
+                let (idx, v) = input.deser_u64(idx)?;
                 Ok((idx, Val::U64(v)))
             }
             ValKind::F64 => {
-                let (idx, v) = ctx.deser_f64(input, idx)?;
+                let (idx, v) = input.deser_f64(idx)?;
                 Ok((idx, Val::F64(OrderedFloat(v))))
             }
             ValKind::VarByte => {
-                let len = u16::from_le_bytes(input[idx..idx + 2].try_into()?);
-                let v = MemVar::from(&input[idx + 2..idx + 2 + len as usize]);
-                Ok((idx + 2 + len as usize, Val::VarByte(v)))
+                let (idx, len) = input.deser_u16(idx)?;
+                let (idx, s) = input.deser(idx, len as usize)?;
+                let v = MemVar::from(s);
+                Ok((idx, Val::VarByte(v)))
             }
         }
     }
@@ -1228,157 +1289,131 @@ mod tests {
     #[test]
     fn test_val_serde() {
         // serialize and deserialize null
-        let ctx = &mut SerdeCtx::default();
         let val = Val::Null;
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         assert!(buf == b"\x00");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::Null);
 
         // serialize and deserialize u8
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(42u8);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         assert!(buf == b"\x02\x2a");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(42u8));
 
         // serialize and deserialize i8
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(-42i8);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         // i8 code is 1, value -42 is 0xd6 in two's complement
         assert!(buf == b"\x01\xd6");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(-42i8));
 
         // serialize and deserialize u16
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(1200u16);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         assert!(buf == b"\x04\xb0\x04");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(1200u16));
 
         // serialize and deserialize i16
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(-1200i16);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         // i16 code is 3, value -1200 is 0xfb50 in two's complement (little-endian)
         assert!(buf == b"\x03\x50\xfb");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(-1200i16));
 
         // serialize and deserialize u32
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(0xdefcab12u32);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         assert!(buf == b"\x06\x12\xab\xfc\xde");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(0xdefcab12u32));
 
         // serialize and deserialize i32
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(-0x12345678i32);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         // i32 code is 5, value -0x12345678 is 0xedcba988 in two's complement (little-endian)
         // -0x12345678 = 0xedcba988
         assert!(buf == b"\x05\x88\xa9\xcb\xed");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(-0x12345678i32));
 
         // serialize and deserialize u64
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(0x1234567890abcdefu64);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         assert!(buf == b"\x09\xef\xcd\xab\x90\x78\x56\x34\x12");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(0x1234567890abcdefu64));
 
         // serialize and deserialize i64
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(-0x1234567890abcdefi64);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         // i64 code is 8, value -0x1234567890abcdef is 0xedcba9876f543211 in two's complement (little-endian)
         // -0x1234567890abcdef = 0xedcba9876f543211
         assert!(buf == b"\x08\x11\x32\x54\x6f\x87\xa9\xcb\xed");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(-0x1234567890abcdefi64));
 
         // serialize and deserialize f32
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(3.14f32);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         // f32 code is 7, value 3.14f32 bits: 0x4048f5c3
         assert!(buf == b"\x07\xc3\xf5\x48\x40");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(3.14f32));
 
         // serialize and deserialize f64
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(3.141592653589793f64);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         // f64 code is 10, value 3.141592653589793 bits: 0x400921fb54442d18
         assert!(buf == b"\x0a\x18\x2d\x44\x54\xfb\x21\x09\x40");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(3.141592653589793f64));
 
         // serialize and deserialize bytes
-        let ctx = &mut SerdeCtx::default();
         let val = Val::from(&b"hello"[..]);
-        let mut buf = vec![0; val.ser_len(ctx)];
-        val.ser(ctx, &mut buf, 0);
+        let mut buf = vec![0; val.ser_len()];
+        val.ser(&mut buf[..], 0);
         assert!(buf == b"\x0b\x05\x00\x68\x65\x6c\x6c\x6f");
 
-        let ctx = &mut SerdeCtx::default();
-        let (_, val) = Val::deser(ctx, &buf, 0).unwrap();
+        let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(&b"hello"[..]));
     }
 
     #[test]
     fn test_valtype_serde() {
-        let mut ctx = SerdeCtx::default();
-
         // 测试用例1：非空的固定长度类型
         let val_type = ValType {
             kind: ValKind::I32,
             nullable: false,
         };
-        let mut buf = vec![0; val_type.ser_len(&ctx)];
-        val_type.ser(&ctx, &mut buf, 0);
+        let mut buf = vec![0; val_type.ser_len()];
+        val_type.ser(&mut buf[..], 0);
 
         // 验证序列化结果
         assert_eq!(buf.len(), 2);
@@ -1386,7 +1421,7 @@ mod tests {
         assert_eq!(buf[1], 0); // false
 
         // 验证反序列化结果
-        let (_, deserialized) = ValType::deser(&mut ctx, &buf, 0).unwrap();
+        let (_, deserialized) = ValType::deser(&buf[..], 0).unwrap();
         assert_eq!(deserialized.kind, ValKind::I32);
         assert_eq!(deserialized.nullable, false);
 
@@ -1395,8 +1430,8 @@ mod tests {
             kind: ValKind::VarByte,
             nullable: true,
         };
-        let mut buf = vec![0; val_type.ser_len(&ctx)];
-        val_type.ser(&ctx, &mut buf, 0);
+        let mut buf = vec![0; val_type.ser_len()];
+        val_type.ser(&mut buf[..], 0);
 
         // 验证序列化结果
         assert_eq!(buf.len(), 2);
@@ -1404,7 +1439,7 @@ mod tests {
         assert_eq!(buf[1], 1); // true
 
         // 验证反序列化结果
-        let (_, deserialized) = ValType::deser(&mut ctx, &buf, 0).unwrap();
+        let (_, deserialized) = ValType::deser(&buf[..], 0).unwrap();
         assert_eq!(deserialized.kind, ValKind::VarByte);
         assert_eq!(deserialized.nullable, true);
 
@@ -1428,10 +1463,10 @@ mod tests {
                 kind,
                 nullable: true,
             };
-            let mut buf = vec![0; val_type.ser_len(&ctx)];
-            val_type.ser(&ctx, &mut buf, 0);
+            let mut buf = vec![0; val_type.ser_len()];
+            val_type.ser(&mut buf[..], 0);
 
-            let (_, deserialized) = ValType::deser(&mut ctx, &buf, 0).unwrap();
+            let (_, deserialized) = ValType::deser(&buf[..], 0).unwrap();
             assert_eq!(deserialized.kind, kind);
             assert_eq!(deserialized.nullable, true);
         }
@@ -1441,15 +1476,15 @@ mod tests {
             kind: ValKind::I64,
             nullable: true,
         };
-        let mut buf = vec![0; 4 + val_type.ser_len(&ctx)]; // 添加4字节前缀
-        val_type.ser(&ctx, &mut buf, 4); // 从位置4开始序列化
+        let mut buf = vec![0; 4 + val_type.ser_len()]; // 添加4字节前缀
+        val_type.ser(&mut buf[..], 4); // 从位置4开始序列化
 
         // 验证序列化结果
         assert_eq!(buf[4], ValKind::I64 as u8);
         assert_eq!(buf[5], 1); // true
 
         // 验证反序列化结果
-        let (next_pos, deserialized) = ValType::deser(&mut ctx, &buf, 4).unwrap();
+        let (next_pos, deserialized) = ValType::deser(&buf[..], 4).unwrap();
         assert_eq!(next_pos, 6); // 应该前进2个字节
         assert_eq!(deserialized.kind, ValKind::I64);
         assert_eq!(deserialized.nullable, true);
@@ -1606,5 +1641,25 @@ mod tests {
         println!("v1={:?}", v1.as_bytes());
         println!("v2={:?}", v2.as_bytes());
         assert!(v1 == v2);
+    }
+
+    #[test]
+    fn test_val_debug_fmt() {
+        assert!(format!("{:?}", Val::Null) == "Null");
+        assert!(format!("{:?}", Val::I8(-8)) == "i8(-8)");
+        assert!(format!("{:?}", Val::U8(8)) == "u8(8)");
+        assert!(format!("{:?}", Val::I16(-16)) == "i16(-16)");
+        assert!(format!("{:?}", Val::U16(16)) == "u16(16)");
+        assert!(format!("{:?}", Val::I32(-32)) == "i32(-32)");
+        assert!(format!("{:?}", Val::U32(32)) == "u32(32)");
+        assert!(format!("{:?}", Val::F32(OrderedFloat(1.5))) == "f32(1.5)");
+        assert!(format!("{:?}", Val::I64(-64)) == "i64(-64)");
+        assert!(format!("{:?}", Val::U64(64)) == "u64(64)");
+        assert!(format!("{:?}", Val::F64(OrderedFloat(2.5))) == "f64(2.5)");
+
+        let utf8 = Val::VarByte(MemVar::from(&b"hi"[..]));
+        assert!(format!("{:?}", utf8) == "bytes(hi)");
+        let non_utf8 = Val::VarByte(MemVar::from(&[0xffu8][..]));
+        assert!(format!("{:?}", non_utf8) == "bytes([255])");
     }
 }

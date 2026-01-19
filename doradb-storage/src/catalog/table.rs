@@ -2,7 +2,7 @@ use crate::catalog::spec::{ColumnAttributes, ColumnSpec, IndexSpec};
 use crate::error::Result;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{Row, RowRead};
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser, Serde};
 use crate::value::{Val, ValKind, ValType};
 use semistr::SemiStr;
 use std::collections::HashSet;
@@ -232,15 +232,15 @@ pub struct TableBriefMetadataSerView<'a> {
 
 impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        self.col_names.ser_len(ctx) + self.col_types.ser_len(ctx) + self.index_specs.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        self.col_names.ser_len() + self.col_types.ser_len() + self.index_specs.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_slice(out, start_idx, self.col_names);
-        let idx = ctx.ser_slice(out, idx, self.col_types);
-        ctx.ser_slice(out, idx, self.index_specs)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = self.col_names.ser(out, start_idx);
+        let idx = self.col_types.ser(out, idx);
+        self.index_specs.ser(out, idx)
     }
 }
 
@@ -254,10 +254,10 @@ pub struct TableBriefMetadata {
 }
 
 impl Deser for TableBriefMetadata {
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, col_names) = <Vec<SemiStr>>::deser(ctx, input, start_idx)?;
-        let (idx, col_types) = <Vec<ValType>>::deser(ctx, input, idx)?;
-        let (idx, index_specs) = <Vec<IndexSpec>>::deser(ctx, input, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, col_names) = <Vec<SemiStr>>::deser(input, start_idx)?;
+        let (idx, col_types) = <Vec<ValType>>::deser(input, idx)?;
+        let (idx, index_specs) = <Vec<IndexSpec>>::deser(input, idx)?;
         Ok((
             idx,
             TableBriefMetadata {
@@ -287,15 +287,14 @@ mod tests {
                 IndexAttributes::PK,
             )],
         );
-        let mut ctx = SerdeCtx::default();
 
         let ser_view = metadata.ser_view();
 
-        let len = ser_view.ser_len(&ctx);
+        let len = ser_view.ser_len();
         let mut vec = vec![0u8; len];
-        let idx = ser_view.ser(&ctx, &mut vec[..], 0);
+        let idx = ser_view.ser(&mut vec[..], 0);
         assert_eq!(idx, vec.len());
-        let (idx, brief) = TableBriefMetadata::deser(&mut ctx, &vec, 0).unwrap();
+        let (idx, brief) = TableBriefMetadata::deser(&vec[..], 0).unwrap();
         assert_eq!(idx, vec.len());
         assert_eq!(metadata.col_names, brief.col_names);
         assert_eq!(metadata.col_types, brief.col_types);

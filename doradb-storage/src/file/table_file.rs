@@ -12,7 +12,7 @@ use crate::file::{FileIO, FileIOResult, SparseFile};
 use crate::io::DirectBuf;
 use crate::io::{AIOBuf, AIOClient, AIOKind};
 use crate::row::RowID;
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
 use futures::future::try_join_all;
 use std::fs;
@@ -223,14 +223,12 @@ impl TableFile {
     #[inline]
     fn parse_super_page(&self, buf: &[u8]) -> Result<SuperPage> {
         // first we extract and validate checksum and transaction id.
-        let mut ctx = SerdeCtx::default();
-        let (idx, header) = SuperPageHeader::deser(&mut ctx, buf, 0)?;
+        let (idx, header) = SuperPageHeader::deser(buf, 0)?;
         debug_assert!(idx == TABLE_FILE_SUPER_PAGE_HEADER_SIZE);
         if header.version != SUPER_PAGE_VERSION {
             return Err(Error::InvalidFormat);
         }
-        let (idx, footer) =
-            SuperPageFooter::deser(&mut ctx, buf, TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET)?;
+        let (idx, footer) = SuperPageFooter::deser(buf, TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET)?;
         debug_assert!(idx == TABLE_FILE_SUPER_PAGE_SIZE);
         if header.checkpoint_cts != footer.checkpoint_cts {
             // torn write happens
@@ -240,7 +238,7 @@ impl TableFile {
         if b3sum != footer.b3sum {
             return Err(Error::ChecksumMismatch);
         }
-        let (_, body) = SuperPageBody::deser(&mut ctx, buf, TABLE_FILE_SUPER_PAGE_HEADER_SIZE)?;
+        let (_, body) = SuperPageBody::deser(buf, TABLE_FILE_SUPER_PAGE_HEADER_SIZE)?;
         Ok(SuperPage {
             header,
             body,
@@ -250,8 +248,7 @@ impl TableFile {
 
     #[inline]
     fn parse_meta_page(&self, buf: &[u8]) -> Result<MetaPage> {
-        let mut ctx = SerdeCtx::default();
-        let (_, meta_page) = MetaPage::deser(&mut ctx, buf, 0)?;
+        let (_, meta_page) = MetaPage::deser(buf, 0)?;
         Ok(meta_page)
     }
 
@@ -340,12 +337,11 @@ impl MutableTableFile {
         // serialize meta page.
         let meta_page = active_root.meta_page_ser_view();
         let mut meta_buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
-        let ctx = SerdeCtx::default();
-        let meta_len = meta_page.ser_len(&ctx);
+        let meta_len = meta_page.ser_len();
         if meta_len > TABLE_FILE_PAGE_SIZE {
             return Err(Error::InvalidState);
         }
-        let meta_idx = meta_page.ser(&ctx, meta_buf.as_bytes_mut(), 0);
+        let meta_idx = meta_page.ser(meta_buf.as_bytes_mut(), 0);
         debug_assert!(meta_idx == meta_len);
 
         // write meta page down.
@@ -362,12 +358,12 @@ impl MutableTableFile {
         // serialize header and body of super page.
         let super_page = active_root.ser_view();
         let mut buf = DirectBuf::zeroed(TABLE_FILE_SUPER_PAGE_SIZE);
-        let ser_len = super_page.ser_len(&ctx);
+        let ser_len = super_page.ser_len();
         if ser_len > TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET {
             // single super page cannot hold all data
             unimplemented!("multiple pages are required to hold super data");
         }
-        let ser_idx = super_page.ser(&ctx, buf.as_bytes_mut(), 0);
+        let ser_idx = super_page.ser(buf.as_bytes_mut(), 0);
         debug_assert!(ser_idx == ser_len);
 
         // serialize footer of super page.
@@ -376,11 +372,7 @@ impl MutableTableFile {
             b3sum: *b3sum.as_bytes(),
             checkpoint_cts: super_page.header.checkpoint_cts,
         };
-        let ser_idx = footer.ser(
-            &ctx,
-            buf.as_bytes_mut(),
-            TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET,
-        );
+        let ser_idx = footer.ser(buf.as_bytes_mut(), TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET);
         debug_assert!(ser_idx == TABLE_FILE_SUPER_PAGE_SIZE);
 
         // write page down.
@@ -820,11 +812,10 @@ mod tests {
                 },
             ];
 
-            let (table_file, old_root) =
-                MutableTableFile::fork(&table_file)
-                    .persist_lwc_pages(lwc_pages, 7, 2)
-                    .await
-                    .unwrap();
+            let (table_file, old_root) = MutableTableFile::fork(&table_file)
+                .persist_lwc_pages(lwc_pages, 7, 2)
+                .await
+                .unwrap();
             drop(old_root);
 
             let active_root = table_file.active_root();
