@@ -178,9 +178,10 @@ impl LogPartition {
     #[inline]
     fn new_buf(&self, data: TrxLog) -> LogBuf {
         let ser_len = data.ser_len();
+        let buf_len = LogBuf::actual_len(ser_len);
         if ser_len > self.max_io_size {
             // data is longer than single page, we need to
-            let mut buf = LogBuf::new(ser_len);
+            let mut buf = LogBuf::new(buf_len);
             buf.ser(&data);
             return buf;
         }
@@ -188,7 +189,7 @@ impl LogPartition {
             buf.ser(&data);
             return buf;
         }
-        let mut buf = LogBuf::new(ser_len);
+        let mut buf = LogBuf::new(buf_len);
         buf.ser(&data);
         buf
     }
