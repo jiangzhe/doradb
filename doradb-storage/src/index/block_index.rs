@@ -23,16 +23,10 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub const BLOCK_PAGE_SIZE: usize = PAGE_SIZE;
 pub const BLOCK_HEADER_SIZE: usize = mem::size_of::<BlockNodeHeader>();
-pub const BLOCK_SIZE: usize = 1272;
-pub const NBR_BLOCKS_IN_LEAF: usize = 51;
 pub const NBR_ENTRIES_IN_BRANCH: usize = 4093;
 pub const ENTRY_SIZE: usize = mem::size_of::<PageEntry>();
-pub const NBR_PAGES_IN_ROW_BLOCK: usize = 78;
-pub const NBR_SEGMENTS_IN_COL_BLOCK: usize = 16;
-// header 32 bytes, padding 16 bytes.
-pub const BLOCK_BRANCH_ENTRY_START: usize = 48;
-// header 32 bytes, padding 640 bytes.
-pub const BLOCK_LEAF_ENTRY_START: usize = 672;
+pub const NBR_PAGE_ENTRIES_IN_LEAF: usize =
+    (BLOCK_PAGE_SIZE - BLOCK_HEADER_SIZE) / ENTRY_SIZE;
 
 const _: () = assert!(
     { mem::size_of::<BlockNode>() == BLOCK_PAGE_SIZE },
@@ -45,25 +39,14 @@ const _: () = assert!(
 );
 
 const _: () = assert!(
-    { BLOCK_HEADER_SIZE + NBR_BLOCKS_IN_LEAF * BLOCK_SIZE <= BLOCK_PAGE_SIZE },
+    { BLOCK_HEADER_SIZE + NBR_PAGE_ENTRIES_IN_LEAF * ENTRY_SIZE <= BLOCK_PAGE_SIZE },
     "Size of leaf node of BlockIndex can be at most 64KB"
 );
-
-/// BlockKind can be Row or Col.
-/// Row Block contains 78 row page ids.
-/// Col block represent a columnar file and
-/// stores segment information inside the block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum BlockKind {
-    Row = 1,
-    Col = 2,
-}
 
 /// BlockNode is B-Tree node of block index.
 /// It can be either branch or leaf.
 /// Branch contains at most 4093 child node pointers.
-/// Leaf contains at most 51 block headers.
+/// Leaf contains at most NBR_PAGE_ENTRIES_IN_LEAF page entries.
 #[repr(C)]
 #[derive(Clone)]
 pub struct BlockNode {
@@ -80,7 +63,7 @@ impl BlockNode {
         self.header.start_row_id = start_row_id;
         self.header.end_row_id = INVALID_ROW_ID;
         self.header.count = 0;
-        self.leaf_add_block(start_row_id, count, insert_page_id);
+        self.leaf_add_entry(start_row_id, count, insert_page_id);
     }
 
     #[inline]
@@ -180,7 +163,7 @@ impl BlockNode {
     #[inline]
     pub fn leaf_is_full(&self) -> bool {
         debug_assert!(self.is_leaf());
-        self.header.count as usize == NBR_BLOCKS_IN_LEAF
+        self.header.count as usize == NBR_PAGE_ENTRIES_IN_LEAF
     }
 
     /// Returns whether the leaf node is empty.
@@ -190,51 +173,51 @@ impl BlockNode {
         self.header.count == 0
     }
 
-    /// Returns block slice of leaf node.
+    /// Returns entry slice of leaf node.
     #[inline]
-    pub fn leaf_blocks(&self) -> &[Block] {
+    pub fn leaf_entries(&self) -> &[PageEntry] {
         debug_assert!(self.is_leaf());
         unsafe { std::slice::from_raw_parts(self.data_ptr(), self.header.count as usize) }
     }
 
-    /// Returns block in leaf node by given index.
+    /// Returns entry in leaf node by given index.
     #[inline]
-    pub fn leaf_block(&self, idx: usize) -> &Block {
+    pub fn leaf_entry(&self, idx: usize) -> &PageEntry {
         debug_assert!(self.is_leaf());
-        &self.leaf_blocks()[idx]
+        &self.leaf_entries()[idx]
     }
 
-    /// Returns last block in leaf node.
+    /// Returns last entry in leaf node.
     #[inline]
-    pub fn leaf_last_block(&self) -> &Block {
-        self.leaf_block(self.header.count as usize - 1)
+    pub fn leaf_last_entry(&self) -> &PageEntry {
+        self.leaf_entry(self.header.count as usize - 1)
     }
 
-    /// Returns mutable last block in leaf node.
+    /// Returns mutable last entry in leaf node.
     #[inline]
-    pub fn leaf_last_block_mut(&mut self) -> &mut Block {
+    pub fn leaf_last_entry_mut(&mut self) -> &mut PageEntry {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
-        &mut self.leaf_blocks_mut()[count - 1]
+        &mut self.leaf_entries_mut()[count - 1]
     }
 
-    /// Returns mutable block slice in leaf node.
+    /// Returns mutable entry slice in leaf node.
     #[inline]
-    pub fn leaf_blocks_mut(&mut self) -> &mut [Block] {
+    pub fn leaf_entries_mut(&mut self) -> &mut [PageEntry] {
         debug_assert!(self.is_leaf());
         unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), self.header.count as usize) }
     }
 
-    /// Add a new block in leaf node.
+    /// Add a new entry in leaf node.
     #[inline]
-    pub fn leaf_add_block(&mut self, start_row_id: RowID, count: u64, page_id: PageID) {
+    pub fn leaf_add_entry(&mut self, start_row_id: RowID, count: u64, page_id: PageID) {
         debug_assert!(self.is_leaf());
         debug_assert!(!self.leaf_is_full());
         self.header.count += 1;
-        self.leaf_last_block_mut()
-            .init_row(start_row_id, count, page_id);
-        // keep leaf header end row id as MAX_ROW_ID, and only when leaf is full, we will update
-        // end row id.
+        let entry = self.leaf_last_entry_mut();
+        entry.row_id = start_row_id;
+        entry.page_id = page_id;
+        self.header.end_row_id = start_row_id + count;
     }
 }
 
@@ -266,106 +249,6 @@ impl PageEntry {
     pub fn new(row_id: RowID, page_id: PageID) -> Self {
         PageEntry { row_id, page_id }
     }
-}
-
-#[repr(C)]
-pub struct BlockHeader {
-    pub kind: BlockKind,
-    pub count: u32,
-    pub start_row_id: RowID,
-    pub end_row_id: RowID,
-}
-
-/// Block is an abstraction on data distribution.
-/// Block has two kinds: row and column.
-/// Row block contains at most 78 row page ids with
-/// its associated min row id.
-/// Column block represents one on-disk columnar file
-/// with its row id range and statistics.
-#[repr(C)]
-pub struct Block {
-    pub header: BlockHeader,
-    padding: [u8; BLOCK_SIZE - mem::size_of::<BlockHeader>()],
-}
-
-impl Block {
-    /// Initialize block with single row page info.
-    #[inline]
-    pub fn init_row(&mut self, start_row_id: RowID, count: u64, page_id: PageID) {
-        self.header.kind = BlockKind::Row;
-        self.header.start_row_id = start_row_id;
-        self.header.end_row_id = start_row_id + count;
-        self.header.count = 1;
-        let entry = &mut self.row_page_entries_mut()[0];
-        entry.row_id = start_row_id;
-        entry.page_id = page_id;
-    }
-
-    /// Returns whether the block is row block.
-    #[inline]
-    pub fn is_row(&self) -> bool {
-        self.header.kind == BlockKind::Row
-    }
-
-    /// Returns whether the block is column block.
-    #[inline]
-    pub fn is_col(&self) -> bool {
-        !self.is_row()
-    }
-
-    #[inline]
-    fn data_ptr(&self) -> *const u8 {
-        self.padding.as_ptr()
-    }
-
-    #[inline]
-    fn data_ptr_mut(&mut self) -> *mut u8 {
-        self.padding.as_mut_ptr()
-    }
-
-    /* row block methods */
-
-    /// Returns page entry slice in row block.
-    #[inline]
-    pub fn row_page_entries(&self) -> &[PageEntry] {
-        let ptr = self.data_ptr() as *const PageEntry;
-        unsafe { std::slice::from_raw_parts(ptr, self.header.count as usize) }
-    }
-
-    /// Returns mutable page entry slice in row block.
-    #[inline]
-    pub fn row_page_entries_mut(&mut self) -> &mut [PageEntry] {
-        let ptr = self.data_ptr_mut() as *mut PageEntry;
-        unsafe { std::slice::from_raw_parts_mut(ptr, self.header.count as usize) }
-    }
-
-    /// Add a new page entry in row block.
-    #[inline]
-    pub fn row_add_page(&mut self, count: u64, page_id: PageID) {
-        debug_assert!((self.header.count as usize) < NBR_PAGES_IN_ROW_BLOCK);
-        let entry = PageEntry {
-            row_id: self.header.end_row_id,
-            page_id,
-        };
-        let idx = self.header.count as usize;
-        self.header.count += 1;
-        self.row_page_entries_mut()[idx] = entry;
-        self.header.end_row_id += count;
-    }
-
-    /// Returns whether the row block is full.
-    #[inline]
-    pub fn row_is_full(&self) -> bool {
-        self.header.count as usize == NBR_PAGES_IN_ROW_BLOCK
-    }
-
-    /* col block methods */
-}
-
-#[repr(C)]
-pub struct ColSegmentMeta {
-    pub row_id: RowID,
-    pub count: u64,
 }
 
 /// The base index of blocks.
@@ -755,7 +638,7 @@ impl BlockIndex {
         let c_page_id = if p_height == 1 {
             let mut leaf = self.pool.allocate_page::<BlockNode>().await;
             leaf.page_mut().init(0, row_id, count, insert_page_id);
-            debug_assert!(leaf.page_mut().header.end_row_id == INVALID_ROW_ID);
+            debug_assert!(leaf.page_mut().header.end_row_id == row_id + count);
             leaf.page_id()
         } else {
             self.create_sub_tree(p_height - 1, row_id, count, insert_page_id)
@@ -790,50 +673,26 @@ impl BlockIndex {
             let start_row_id = p_guard.page().header.start_row_id;
             p_guard
                 .page_mut()
-                .leaf_add_block(start_row_id, count, insert_page_id);
+                .leaf_add_entry(start_row_id, count, insert_page_id);
             return Valid((start_row_id, start_row_id + count));
         }
-        // end row id of leaf header is maximum value of ROW ID.
-        // the precise end row id is stored inside the header of last block.
-        let end_row_id = p_guard.page().leaf_last_block().header.end_row_id;
+        let end_row_id = p_guard.page().header.end_row_id;
         if p_guard.page().leaf_is_full() {
-            let block = p_guard.page_mut().leaf_last_block_mut();
-            if (block.is_row() && block.row_is_full()) || block.is_col() {
-                // leaf is full and block is full, we must add new leaf to block index
-                if stack.is_empty() {
-                    // root is full and already exclusive locked
-                    let res = self
-                        .insert_row_page_split_root(p_guard, end_row_id, count, insert_page_id)
-                        .await;
-                    return Valid(res);
-                }
-                return self
-                    .insert_row_page_to_new_leaf(
-                        &mut stack,
-                        p_guard,
-                        end_row_id,
-                        count,
-                        insert_page_id,
-                    )
+            // leaf is full, we must add new leaf to block index
+            if stack.is_empty() {
+                // root is full and already exclusive locked
+                let res = self
+                    .insert_row_page_split_root(p_guard, end_row_id, count, insert_page_id)
                     .await;
+                return Valid(res);
             }
-            // insert to current row block
-            block.row_add_page(count, insert_page_id);
-            return Valid((end_row_id, end_row_id + count));
-        }
-        if p_guard.page().leaf_last_block().is_col()
-            || p_guard.page().leaf_last_block().row_is_full()
-        {
-            let start_row_id = p_guard.page().leaf_last_block().header.end_row_id;
-            p_guard
-                .page_mut()
-                .leaf_add_block(start_row_id, count, insert_page_id);
-            return Valid((end_row_id, end_row_id + count));
+            return self
+                .insert_row_page_to_new_leaf(&mut stack, p_guard, end_row_id, count, insert_page_id)
+                .await;
         }
         p_guard
             .page_mut()
-            .leaf_last_block_mut()
-            .row_add_page(count, insert_page_id);
+            .leaf_add_entry(end_row_id, count, insert_page_id);
         Valid((end_row_id, end_row_id + count))
     }
 
@@ -897,25 +756,7 @@ impl BlockIndex {
                     verify!(g.validate());
                     return Valid(RowLocation::NotFound);
                 }
-                let blocks = pu.leaf_blocks();
-                let idx =
-                    match blocks.binary_search_by_key(&row_id, |block| block.header.start_row_id) {
-                        Ok(idx) => idx,
-                        Err(0) => {
-                            verify!(g.validate());
-                            return Valid(RowLocation::NotFound);
-                        }
-                        Err(idx) => idx - 1,
-                    };
-                let block = &blocks[idx];
-                if row_id >= block.header.end_row_id {
-                    verify!(g.validate());
-                    return Valid(RowLocation::NotFound);
-                }
-                if block.is_col() {
-                    todo!();
-                }
-                let entries = block.row_page_entries();
+                let entries = pu.leaf_entries();
                 let idx = match entries.binary_search_by_key(&row_id, |entry| entry.row_id) {
                     Ok(idx) => idx,
                     Err(0) => {
@@ -924,6 +765,14 @@ impl BlockIndex {
                     }
                     Err(idx) => idx - 1,
                 };
+                let entry_end_row_id = entries
+                    .get(idx + 1)
+                    .map(|entry| entry.row_id)
+                    .unwrap_or(pu.header.end_row_id);
+                if row_id >= entry_end_row_id {
+                    verify!(g.validate());
+                    return Valid(RowLocation::NotFound);
+                }
                 verify!(g.validate());
                 return Valid(RowLocation::RowPage(entries[idx].page_id));
             }
@@ -1361,26 +1210,16 @@ mod tests {
                     let g = unsafe { res.as_shared() };
                     let node = g.page();
                     assert!(node.is_leaf());
-                    let row_pages: usize = node
-                        .leaf_blocks()
-                        .iter()
-                        .map(|block| {
-                            if block.is_row() {
-                                block.row_page_entries().iter().count()
-                            } else {
-                                0usize
-                            }
-                        })
-                        .sum();
+                    let row_pages: usize = node.leaf_entries().len();
                     println!(
-                        "start_row_id={:?}, end_row_id={:?}, blocks={:?}, row_pages={:?}",
+                        "start_row_id={:?}, end_row_id={:?}, entries={:?}, row_pages={:?}",
                         node.header.start_row_id,
                         node.header.end_row_id,
                         node.header.count,
                         row_pages
                     );
                 }
-                let row_pages_per_leaf = NBR_BLOCKS_IN_LEAF * NBR_PAGES_IN_ROW_BLOCK;
+                let row_pages_per_leaf = NBR_PAGE_ENTRIES_IN_LEAF;
                 assert!(count == (row_pages + row_pages_per_leaf - 1) / row_pages_per_leaf);
             }
             drop(engine);
@@ -1546,9 +1385,7 @@ mod tests {
                 // assign right-most leaf node
                 let mut r_g = pool.allocate_page::<BlockNode>().await;
                 r_g.page_mut().init(0, 50000, 10000, 10001);
-                r_g.page_mut().header.count = NBR_BLOCKS_IN_LEAF as u32;
-                r_g.page_mut().leaf_last_block_mut().header.kind = BlockKind::Row;
-                r_g.page_mut().leaf_last_block_mut().header.count = NBR_PAGES_IN_ROW_BLOCK as u32;
+                r_g.page_mut().header.count = NBR_PAGE_ENTRIES_IN_LEAF as u32;
                 let r_page_id = r_g.page_id();
                 drop(r_g);
                 root.page_mut().branch_last_entry_mut().row_id = 50000;
