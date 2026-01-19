@@ -414,7 +414,9 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::row::tests::create_row_page;
     use crate::row::{Delete, InsertRow};
-    use crate::trx::undo::{MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, UndoStatus};
+    use crate::trx::undo::{
+        MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, UndoStatus,
+    };
     use crate::trx::ver_map::RowVersionMap;
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS};
     use crate::value::{Val, ValKind};

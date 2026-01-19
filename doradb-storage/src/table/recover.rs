@@ -1,5 +1,5 @@
-use crate::buffer::page::PageID;
 use crate::buffer::BufferPool;
+use crate::buffer::page::PageID;
 use crate::index::{IndexInsert, NonUniqueIndex, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
@@ -45,10 +45,7 @@ pub trait TableRecover {
     ) -> impl Future<Output = ()>;
 
     /// Populate index using data on row page.
-    fn populate_index_via_row_page(
-        &self,
-        page_id: PageID,
-    ) -> impl Future<Output = ()>;
+    fn populate_index_via_row_page(&self, page_id: PageID) -> impl Future<Output = ()>;
 }
 
 impl TableRecover for Table {
@@ -68,7 +65,8 @@ impl TableRecover for Table {
         });
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
-        let mut page_guard = self.data_pool
+        let mut page_guard = self
+            .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -97,7 +95,8 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) {
-        let mut page_guard = self.data_pool
+        let mut page_guard = self
+            .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -121,7 +120,8 @@ impl TableRecover for Table {
 
             if !index_change_cols.is_empty() {
                 // There is index change, we need to update index.
-                let page_guard = self.data_pool
+                let page_guard = self
+                    .data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .shared_async()
@@ -157,7 +157,8 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) {
-        let mut page_guard = self.data_pool
+        let mut page_guard = self
+            .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .exclusive_async()
@@ -193,11 +194,9 @@ impl TableRecover for Table {
         }
     }
 
-    async fn populate_index_via_row_page(
-        &self,
-        page_id: PageID,
-    ) {
-        let page_guard = self.data_pool
+    async fn populate_index_via_row_page(&self, page_id: PageID) {
+        let page_guard = self
+            .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
             .shared_async()

@@ -4,7 +4,7 @@ use crate::trx::undo::RowUndoHead;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// RowVersionMap is a page-level hash map to store
 /// old versions of rows in row page.
@@ -96,7 +96,10 @@ impl RowVersionMap {
     /// Returns whether this page is frozen.
     #[inline]
     pub fn is_frozen(&self) -> bool {
-        matches!(self.state(), RowPageState::Frozen | RowPageState::Transition)
+        matches!(
+            self.state(),
+            RowPageState::Frozen | RowPageState::Transition
+        )
     }
 
     /// Returns whether this page is in transition.

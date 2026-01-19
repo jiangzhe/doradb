@@ -110,7 +110,9 @@ impl Statement {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> SelectMvcc {
-        table.index_lookup_unique_mvcc(self, key, user_read_set).await
+        table
+            .index_lookup_unique_mvcc(self, key, user_read_set)
+            .await
     }
 
     #[inline]

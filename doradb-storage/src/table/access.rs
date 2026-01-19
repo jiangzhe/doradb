@@ -1,3 +1,4 @@
+use crate::buffer::BufferPool;
 use crate::catalog::TableMetadata;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
@@ -11,7 +12,6 @@ use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::row::{ReadAllRows, RowReadAccess};
 use crate::trx::undo::RowUndoKind;
-use crate::buffer::BufferPool;
 use crate::value::Val;
 use std::future::Future;
 
@@ -63,11 +63,8 @@ pub trait TableAccess {
     ) -> impl Future<Output = ScanMvcc>;
 
     /// Insert row in transaction.
-    fn insert_mvcc(
-        &self,
-        stmt: &mut Statement,
-        cols: Vec<Val>,
-    ) -> impl Future<Output = InsertMvcc>;
+    fn insert_mvcc(&self, stmt: &mut Statement, cols: Vec<Val>)
+    -> impl Future<Output = InsertMvcc>;
 
     /// Insert row in non-transactional way.
     fn insert_no_trx(&self, cols: &[Val]) -> impl Future<Output = ()>;
@@ -127,11 +124,8 @@ pub trait TableAccess {
 }
 
 impl TableAccess for Table {
-    async fn table_scan_uncommitted<F>(
-        &self,
-        start_row_id: RowID,
-        mut row_action: F,
-    ) where
+    async fn table_scan_uncommitted<F>(&self, start_row_id: RowID, mut row_action: F)
+    where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
     {
         self.mem_scan(start_row_id, |page_guard| {
@@ -227,7 +221,8 @@ impl TableAccess for Table {
                 RowLocation::NotFound => return None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.data_pool
+                    let page_guard = self
+                        .data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .shared_async()
@@ -293,11 +288,7 @@ impl TableAccess for Table {
         res
     }
 
-    async fn insert_mvcc(
-        &self,
-        stmt: &mut Statement,
-        cols: Vec<Val>,
-    ) -> InsertMvcc {
+    async fn insert_mvcc(&self, stmt: &mut Statement, cols: Vec<Val>) -> InsertMvcc {
         let metadata = self.metadata();
         debug_assert!(cols.len() == metadata.col_count());
         debug_assert!({
@@ -391,7 +382,8 @@ impl TableAccess for Table {
                     RowLocation::NotFound => return UpdateMvcc::NotFound,
                     RowLocation::LwcPage(..) => todo!("lwc page"),
                     RowLocation::RowPage(page_id) => {
-                        let page_guard = self.data_pool
+                        let page_guard = self
+                            .data_pool
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
                             .shared_async()
@@ -438,13 +430,7 @@ impl TableAccess for Table {
                     // in-place update failed, we transfer update into
                     // move+update.
                     let (new_row_id, index_change_cols, new_guard) = self
-                        .move_update_for_space(
-                            stmt,
-                            old_row,
-                            update,
-                            old_row_id,
-                            old_guard,
-                        )
+                        .move_update_for_space(stmt, old_row, update, old_row_id, old_guard)
                         .await;
                     if !index_change_cols.is_empty() {
                         let res = self
@@ -466,10 +452,7 @@ impl TableAccess for Table {
                     } else {
                         let res = self
                             .update_indexes_only_row_id_change(
-                                stmt,
-                                old_row_id,
-                                new_row_id,
-                                &new_guard,
+                                stmt, old_row_id, new_row_id, &new_guard,
                             )
                             .await;
                         new_guard.set_dirty(); // mark as dirty page.
@@ -501,7 +484,8 @@ impl TableAccess for Table {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
                     RowLocation::LwcPage(..) => todo!("lwc page"),
                     RowLocation::RowPage(page_id) => {
-                        let page_guard = self.data_pool
+                        let page_guard = self
+                            .data_pool
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
                             .shared_async()
@@ -541,7 +525,8 @@ impl TableAccess for Table {
                 RowLocation::NotFound => unreachable!(),
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.data_pool
+                    let page_guard = self
+                        .data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                         .await
                         .exclusive_async()
@@ -563,23 +548,16 @@ impl TableAccess for Table {
         page.set_deleted_exclusive(row_idx, true);
     }
 
-    async fn delete_index(
-        &self,
-        key: &SelectKey,
-        row_id: RowID,
-        unique: bool,
-    ) -> bool {
+    async fn delete_index(&self, key: &SelectKey, row_id: RowID, unique: bool) -> bool {
         // todo: consider index drop.
         let index_schema = &self.metadata().index_specs[key.index_no];
         debug_assert_eq!(unique, index_schema.unique());
         if unique {
             let index = self.sec_idx[key.index_no].unique().unwrap();
-            self.delete_unique_index(index, key, row_id)
-                .await
+            self.delete_unique_index(index, key, row_id).await
         } else {
             let index = self.sec_idx[key.index_no].non_unique().unwrap();
-            self.delete_non_unique_index(index, key, row_id)
-                .await
+            self.delete_non_unique_index(index, key, row_id).await
         }
     }
 
