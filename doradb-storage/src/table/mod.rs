@@ -121,10 +121,7 @@ impl Table {
         while let Some(leaf) = cursor.next().await {
             let g = leaf.shared_async().await;
             debug_assert!(g.page().is_leaf());
-            let blocks = g.page().leaf_blocks();
-            for block in blocks {
-                res += block.row_page_entries().iter().count();
-            }
+            res += g.page().leaf_entries().len();
         }
         res
     }
@@ -172,18 +169,16 @@ impl Table {
         while let Some(leaf) = cursor.next().await {
             let g = leaf.shared_async().await;
             debug_assert!(g.page().is_leaf());
-            let blocks = g.page().leaf_blocks();
-            for block in blocks {
-                for page_entry in block.row_page_entries() {
-                    let page_guard: PageSharedGuard<RowPage> = self
-                        .data_pool
-                        .get_page(page_entry.page_id, LatchFallbackMode::Shared)
-                        .await
-                        .shared_async()
-                        .await;
-                    if !page_action(page_guard) {
-                        return;
-                    }
+            let entries = g.page().leaf_entries();
+            for page_entry in entries {
+                let page_guard: PageSharedGuard<RowPage> = self
+                    .data_pool
+                    .get_page(page_entry.page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                if !page_action(page_guard) {
+                    return;
                 }
             }
         }
