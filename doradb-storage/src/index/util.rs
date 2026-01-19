@@ -75,7 +75,8 @@ impl RedoLogPageCommitter {
         RedoLogPageCommitter { trx_sys, table_id }
     }
 
-    pub async fn commit_row_page(
+    #[inline]
+    pub fn commit_row_page(
         &self,
         page_id: PageID,
         start_row_id: RowID,

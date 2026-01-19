@@ -1,8 +1,8 @@
 use crate::buffer::page::PageID;
 use crate::catalog::TableID;
 use crate::row::RowID;
-use crate::serde::{LenPrefixPod, SerdeCtx};
 use crate::trx::PreparedTrx;
+use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use std::mem;
 
@@ -39,13 +39,12 @@ impl SysTrx {
         let redo_bin = if self.redo.is_empty() {
             None
         } else {
-            Some(LenPrefixPod::new(
+            Some(TrxLog::new(
                 RedoHeader {
                     cts: 0,
                     trx_kind: RedoTrxKind::System,
                 },
                 mem::take(&mut self.redo),
-                &SerdeCtx::default(),
             ))
         };
         PreparedTrx {

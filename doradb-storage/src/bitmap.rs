@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser, Serde};
 use parking_lot::Mutex;
 use std::mem;
 use std::ops::Range;
@@ -568,7 +568,7 @@ impl Clone for AllocMap {
 
 impl Ser<'_> for AllocMap {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<u64>() // len
             + mem::size_of::<u64>() // allocated
             + mem::size_of::<u64>() // free_unit_idx
@@ -576,13 +576,13 @@ impl Ser<'_> for AllocMap {
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_u64(out, start_idx, self.len as u64);
-        let idx = ctx.ser_u64(out, idx, self.allocated.load(Ordering::Relaxed) as u64);
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u64(start_idx, self.len as u64);
+        let idx = out.ser_u64(idx, self.allocated.load(Ordering::Relaxed) as u64);
         let g = self.inner.lock();
-        let mut idx = ctx.ser_u64(out, idx, g.free_unit_idx as u64);
+        let mut idx = out.ser_u64(idx, g.free_unit_idx as u64);
         for u in &g.bitmap {
-            idx = ctx.ser_u64(out, idx, *u);
+            idx = out.ser_u64(idx, *u);
         }
         idx
     }
@@ -590,14 +590,14 @@ impl Ser<'_> for AllocMap {
 
 impl Deser for AllocMap {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, len) = ctx.deser_u64(input, start_idx)?;
-        let (idx, allocated) = ctx.deser_u64(input, idx)?;
-        let (mut idx, free_unit_idx) = ctx.deser_u64(input, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, len) = input.deser_u64(start_idx)?;
+        let (idx, allocated) = input.deser_u64(idx)?;
+        let (mut idx, free_unit_idx) = input.deser_u64(idx)?;
         let n = (len as usize).div_ceil(64);
         let mut vec: Vec<u64> = Vec::with_capacity(n);
         for _ in 0..n {
-            let (idx0, v) = ctx.deser_u64(input, idx)?;
+            let (idx0, v) = input.deser_u64(idx)?;
             idx = idx0;
             vec.push(v);
         }
@@ -960,13 +960,12 @@ mod tests {
             let idx = rng.next_u64() as usize % 1024;
             let _ = alloc_map.allocate_at(idx);
         }
-        let mut ctx = SerdeCtx::default();
-        let ser_len = alloc_map.ser_len(&ctx);
+        let ser_len = alloc_map.ser_len();
         let mut data = vec![0u8; ser_len];
-        let res_idx = alloc_map.ser(&ctx, &mut data, 0);
+        let res_idx = alloc_map.ser(&mut data[..], 0);
         assert!(res_idx == ser_len);
 
-        let (res_idx, alloc_map2) = AllocMap::deser(&mut ctx, &data, 0).unwrap();
+        let (res_idx, alloc_map2) = AllocMap::deser(&data[..], 0).unwrap();
         assert!(res_idx == ser_len);
         assert!(alloc_map2.len == alloc_map.len);
         assert!(

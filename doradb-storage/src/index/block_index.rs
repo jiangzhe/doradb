@@ -523,8 +523,7 @@ impl BlockIndex {
                         page_committer_guard.as_ref().cloned()
                     } {
                         let create_cts = page_committer
-                            .commit_row_page(new_page_id, start_row_id, end_row_id)
-                            .await;
+                            .commit_row_page(new_page_id, start_row_id, end_row_id);
                         if let Some(row_ver) =
                             new_page.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver())
                         {

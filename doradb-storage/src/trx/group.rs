@@ -1,9 +1,10 @@
 use crate::file::SparseFile;
-use crate::io::{DirectBuf, IocbRawPtr, pwrite};
+use crate::io::{IocbRawPtr, pwrite};
 use crate::notify::EventNotifyOnDrop;
-use crate::serde::{Ser, SerdeCtx};
+use crate::serde::Ser;
 use crate::session::SessionState;
 use crate::trx::log::SyncGroup;
+use crate::trx::log_replay::LogBuf;
 use crate::trx::{PrecommitTrx, TrxID};
 use event_listener::EventListener;
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
@@ -81,16 +82,15 @@ pub(super) struct CommitGroup {
     pub(super) max_cts: TrxID,
     pub(super) fd: RawFd,
     pub(super) offset: usize,
-    pub(super) log_buf: DirectBuf,
+    pub(super) log_buf: LogBuf,
     pub(super) sync_ev: EventNotifyOnDrop,
-    pub(super) serde_ctx: SerdeCtx,
 }
 
 impl CommitGroup {
     #[inline]
     pub(super) fn can_join(&self, trx: &PrecommitTrx) -> bool {
         if let Some(redo_bin) = trx.redo_bin.as_ref() {
-            return redo_bin.ser_len(&self.serde_ctx) <= self.log_buf.remaining_capacity();
+            return self.log_buf.capable_for(redo_bin.ser_len());
         }
         true
     }
@@ -103,7 +103,7 @@ impl CommitGroup {
     ) -> (Option<Arc<SessionState>>, Option<EventListener>) {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
-            self.log_buf.extend_ser(&redo_bin, &self.serde_ctx);
+            self.log_buf.ser(&redo_bin);
         }
         self.max_cts = trx.cts;
         let session = trx.take_session();
@@ -114,9 +114,11 @@ impl CommitGroup {
 
     #[inline]
     pub(super) fn split(self) -> (IocbRawPtr, SyncGroup) {
+        // confirm data length in buffer header.
+        let buf = self.log_buf.finish();
         // we always write a complete page instead of partial data.
-        let log_bytes = self.log_buf.capacity();
-        let aio = pwrite(self.max_cts, self.fd, self.offset, self.log_buf);
+        let log_bytes = buf.capacity();
+        let aio = pwrite(self.max_cts, self.fd, self.offset, buf);
         let iocb_ptr = aio.iocb().load(Ordering::Relaxed);
         let sync_group = SyncGroup {
             trx_list: self.trx_list,
@@ -134,17 +136,41 @@ impl CommitGroup {
 mod tests {
     use super::*;
     use crate::notify::EventNotifyOnDrop;
-    use crate::serde::{LenPrefixPod, SerdeCtx};
-    use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind};
+    use crate::trx::log_replay::TrxLog;
+    use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
+    use crate::value::Val;
+    use std::collections::BTreeMap;
 
-    fn redo_bin(cts: TrxID) -> LenPrefixPod<RedoHeader, RedoLogs> {
-        LenPrefixPod::new(
+    fn redo_bin(cts: TrxID) -> TrxLog {
+        TrxLog::new(
             RedoHeader {
                 cts,
                 trx_kind: RedoTrxKind::System,
             },
             RedoLogs::default(),
-            &SerdeCtx::default(),
+        )
+    }
+
+    fn redo_bin_large(cts: TrxID) -> TrxLog {
+        let mut rows = BTreeMap::new();
+        // 3000-bytes string.
+        let s: String = std::iter::repeat_n('a', 3000).collect();
+        rows.insert(
+            1u64,
+            RowRedo {
+                page_id: 5,
+                row_id: 100,
+                kind: RowRedoKind::Insert(vec![Val::from(1u32), Val::from(&s[..])]),
+            },
+        );
+        let mut dml = BTreeMap::new();
+        dml.insert(5u64, TableDML { rows });
+        TrxLog::new(
+            RedoHeader {
+                cts,
+                trx_kind: RedoTrxKind::User,
+            },
+            RedoLogs { ddl: None, dml },
         )
     }
 
@@ -157,16 +183,23 @@ mod tests {
         }
     }
 
+    fn precommit_large(cts: TrxID) -> PrecommitTrx {
+        PrecommitTrx {
+            cts,
+            redo_bin: Some(redo_bin_large(cts)),
+            payload: None,
+            session: None,
+        }
+    }
+
     fn clear_redo(trx: &mut PrecommitTrx) {
         trx.redo_bin.take();
     }
 
     #[test]
     fn test_commit_group_join_without_sync_listener() {
-        let serde_ctx = SerdeCtx::default();
-        let mut log_buf = DirectBuf::zeroed(64);
-        log_buf.truncate(0);
-        log_buf.extend_ser(&redo_bin(1), &serde_ctx);
+        let mut log_buf = LogBuf::new(64);
+        log_buf.ser(&redo_bin(1));
         let sync_ev = EventNotifyOnDrop::new();
         let mut group = CommitGroup {
             trx_list: vec![precommit(1)],
@@ -175,7 +208,6 @@ mod tests {
             offset: 0,
             log_buf,
             sync_ev,
-            serde_ctx,
         };
 
         let (session, listener) = group.join(precommit(2), false);
@@ -190,9 +222,8 @@ mod tests {
 
     #[test]
     fn test_commit_group_can_join_respects_capacity() {
-        let serde_ctx = SerdeCtx::default();
-        let mut log_buf = DirectBuf::zeroed(64);
-        log_buf.truncate(log_buf.capacity());
+        let mut log_buf = LogBuf::new(64);
+        log_buf.ser(&redo_bin(100));
         let sync_ev = EventNotifyOnDrop::new();
         let mut group = CommitGroup {
             trx_list: vec![precommit(1)],
@@ -201,12 +232,14 @@ mod tests {
             offset: 0,
             log_buf,
             sync_ev,
-            serde_ctx,
         };
 
-        let mut candidate = precommit(2);
-        assert!(!group.can_join(&candidate));
-        clear_redo(&mut candidate);
+        let candidate1 = precommit_large(2);
+        assert!(group.can_join(&candidate1));
+        let _ = group.join(candidate1, false);
+        let mut candidate2 = precommit_large(3);
+        assert!(!group.can_join(&candidate2));
+        clear_redo(&mut candidate2);
         for trx in &mut group.trx_list {
             clear_redo(trx);
         }

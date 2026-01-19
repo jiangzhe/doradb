@@ -3,7 +3,7 @@ use crate::catalog::{IndexID, SchemaID, TableID};
 use crate::error::Result;
 use crate::row::RowID;
 use crate::row::ops::{SelectKey, UpdateCol};
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use crate::value::Val;
 use std::collections::BTreeMap;
@@ -51,30 +51,30 @@ impl RowRedoKind {
 }
 impl Ser<'_> for RowRedoKind {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<u8>()
             + match self {
-                RowRedoKind::Insert(vals) => vals.ser_len(ctx),
+                RowRedoKind::Insert(vals) => vals.ser_len(),
                 RowRedoKind::Delete => 0,
-                RowRedoKind::Update(cols) => cols.ser_len(ctx),
-                RowRedoKind::DeleteByUniqueKey(key) => key.ser_len(ctx),
+                RowRedoKind::Update(cols) => cols.ser_len(),
+                RowRedoKind::DeleteByUniqueKey(key) => key.ser_len(),
             }
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = ctx.ser_u8(out, idx, self.code() as u8);
+        idx = out.ser_u8(idx, self.code() as u8);
         match self {
             RowRedoKind::Insert(vals) => {
-                idx = vals.ser(ctx, out, idx);
+                idx = vals.ser(out, idx);
             }
             RowRedoKind::Delete => (),
             RowRedoKind::Update(cols) => {
-                idx = cols.ser(ctx, out, idx);
+                idx = cols.ser(out, idx);
             }
             RowRedoKind::DeleteByUniqueKey(key) => {
-                idx = key.ser(ctx, out, idx);
+                idx = key.ser(out, idx);
             }
         }
         idx
@@ -83,20 +83,20 @@ impl Ser<'_> for RowRedoKind {
 
 impl Deser for RowRedoKind {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, code) = ctx.deser_u8(data, start_idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, code) = input.deser_u8(start_idx)?;
         match RowRedoCode::from(code) {
             RowRedoCode::Insert => {
-                let (idx, vals) = Vec::<Val>::deser(ctx, data, idx)?;
+                let (idx, vals) = Vec::<Val>::deser(input, idx)?;
                 Ok((idx, RowRedoKind::Insert(vals)))
             }
             RowRedoCode::Delete => Ok((idx, RowRedoKind::Delete)),
             RowRedoCode::Update => {
-                let (idx, cols) = Vec::<UpdateCol>::deser(ctx, data, idx)?;
+                let (idx, cols) = Vec::<UpdateCol>::deser(input, idx)?;
                 Ok((idx, RowRedoKind::Update(cols)))
             }
             RowRedoCode::DeleteByUniqueKey => {
-                let (idx, key) = SelectKey::deser(ctx, data, idx)?;
+                let (idx, key) = SelectKey::deser(input, idx)?;
                 Ok((idx, RowRedoKind::DeleteByUniqueKey(key)))
             }
         }
@@ -113,26 +113,25 @@ pub struct RowRedo {
 
 impl Ser<'_> for RowRedo {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        mem::size_of::<PageID>() + mem::size_of::<RowID>() + self.kind.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        mem::size_of::<PageID>() + mem::size_of::<RowID>() + self.kind.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = ctx.ser_u64(out, idx, self.page_id);
-        idx = ctx.ser_u64(out, idx, self.row_id);
-        idx = self.kind.ser(ctx, out, idx);
-        idx
+        idx = out.ser_u64(idx, self.page_id);
+        idx = out.ser_u64(idx, self.row_id);
+        self.kind.ser(out, idx)
     }
 }
 
 impl Deser for RowRedo {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, page_id) = ctx.deser_u64(data, start_idx)?;
-        let (idx, row_id) = ctx.deser_u64(data, idx)?;
-        let (idx, kind) = RowRedoKind::deser(ctx, data, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, page_id) = input.deser_u64(start_idx)?;
+        let (idx, row_id) = input.deser_u64(idx)?;
+        let (idx, kind) = RowRedoKind::deser(input, idx)?;
         Ok((
             idx,
             RowRedo {
@@ -200,7 +199,7 @@ impl DDLRedo {
 
 impl Ser<'_> for DDLRedo {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<u8>()
             + match self {
                 DDLRedo::CreateSchema(_) => mem::size_of::<SchemaID>(),
@@ -218,27 +217,27 @@ impl Ser<'_> for DDLRedo {
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = ctx.ser_u8(out, idx, self.code() as u8);
+        idx = out.ser_u8(idx, self.code() as u8);
         match self {
             DDLRedo::CreateSchema(schema_id) => {
-                idx = ctx.ser_u64(out, idx, *schema_id);
+                idx = out.ser_u64(idx, *schema_id);
             }
             DDLRedo::DropSchema(schema_id) => {
-                idx = ctx.ser_u64(out, idx, *schema_id);
+                idx = out.ser_u64(idx, *schema_id);
             }
             DDLRedo::CreateTable(table_id) => {
-                idx = ctx.ser_u64(out, idx, *table_id);
+                idx = out.ser_u64(idx, *table_id);
             }
             DDLRedo::DropTable(table_id) => {
-                idx = ctx.ser_u64(out, idx, *table_id);
+                idx = out.ser_u64(idx, *table_id);
             }
             DDLRedo::CreateIndex(index_id) => {
-                idx = ctx.ser_u64(out, idx, *index_id);
+                idx = out.ser_u64(idx, *index_id);
             }
             DDLRedo::DropIndex(index_id) => {
-                idx = ctx.ser_u64(out, idx, *index_id);
+                idx = out.ser_u64(idx, *index_id);
             }
             DDLRedo::CreateRowPage {
                 table_id,
@@ -246,10 +245,10 @@ impl Ser<'_> for DDLRedo {
                 start_row_id,
                 end_row_id,
             } => {
-                idx = ctx.ser_u64(out, idx, *table_id);
-                idx = ctx.ser_u64(out, idx, *page_id);
-                idx = ctx.ser_u64(out, idx, *start_row_id);
-                idx = ctx.ser_u64(out, idx, *end_row_id);
+                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u64(idx, *page_id);
+                idx = out.ser_u64(idx, *start_row_id);
+                idx = out.ser_u64(idx, *end_row_id);
             }
         }
         idx
@@ -258,38 +257,38 @@ impl Ser<'_> for DDLRedo {
 
 impl Deser for DDLRedo {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, code) = ctx.deser_u8(data, start_idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, code) = input.deser_u8(start_idx)?;
         match DDLRedoCode::from(code) {
             DDLRedoCode::CreateSchema => {
-                let (idx, schema_id) = ctx.deser_u64(data, idx)?;
+                let (idx, schema_id) = input.deser_u64(idx)?;
                 Ok((idx, DDLRedo::CreateSchema(schema_id)))
             }
             DDLRedoCode::DropSchema => {
-                let (idx, schema_id) = ctx.deser_u64(data, idx)?;
+                let (idx, schema_id) = input.deser_u64(idx)?;
                 Ok((idx, DDLRedo::DropSchema(schema_id)))
             }
             DDLRedoCode::CreateTable => {
-                let (idx, table_id) = ctx.deser_u64(data, idx)?;
+                let (idx, table_id) = input.deser_u64(idx)?;
                 Ok((idx, DDLRedo::CreateTable(table_id)))
             }
             DDLRedoCode::DropTable => {
-                let (idx, table_id) = ctx.deser_u64(data, idx)?;
+                let (idx, table_id) = input.deser_u64(idx)?;
                 Ok((idx, DDLRedo::DropTable(table_id)))
             }
             DDLRedoCode::CreateIndex => {
-                let (idx, index_id) = ctx.deser_u64(data, idx)?;
+                let (idx, index_id) = input.deser_u64(idx)?;
                 Ok((idx, DDLRedo::CreateIndex(index_id)))
             }
             DDLRedoCode::DropIndex => {
-                let (idx, index_id) = ctx.deser_u64(data, idx)?;
+                let (idx, index_id) = input.deser_u64(idx)?;
                 Ok((idx, DDLRedo::DropIndex(index_id)))
             }
             DDLRedoCode::CreateRowPage => {
-                let (idx, table_id) = ctx.deser_u64(data, idx)?;
-                let (idx, page_id) = ctx.deser_u64(data, idx)?;
-                let (idx, start_row_id) = ctx.deser_u64(data, idx)?;
-                let (idx, end_row_id) = ctx.deser_u64(data, idx)?;
+                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, page_id) = input.deser_u64(idx)?;
+                let (idx, start_row_id) = input.deser_u64(idx)?;
+                let (idx, end_row_id) = input.deser_u64(idx)?;
                 Ok((
                     idx,
                     DDLRedo::CreateRowPage {
@@ -368,24 +367,23 @@ impl RedoLogs {
 
 impl Ser<'_> for RedoLogs {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        self.ddl.ser_len(ctx) + self.dml.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        self.ddl.ser_len() + self.dml.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = self.ddl.ser(ctx, out, idx);
-        idx = self.dml.ser(ctx, out, idx);
-        idx
+        idx = self.ddl.ser(out, idx);
+        self.dml.ser(out, idx)
     }
 }
 
 impl Deser for RedoLogs {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, ddl) = Option::<Box<DDLRedo>>::deser(ctx, data, start_idx)?;
-        let (idx, dml) = BTreeMap::<TableID, TableDML>::deser(ctx, data, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, ddl) = Option::<Box<DDLRedo>>::deser(input, start_idx)?;
+        let (idx, dml) = BTreeMap::<TableID, TableDML>::deser(input, idx)?;
         Ok((idx, RedoLogs { ddl, dml }))
     }
 }
@@ -413,24 +411,23 @@ pub struct RedoHeader {
 
 impl Ser<'_> for RedoHeader {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<TrxID>() + mem::size_of::<u8>()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = self.cts.ser(ctx, out, idx);
-        idx = (self.trx_kind as u8).ser(ctx, out, idx);
-        idx
+        idx = self.cts.ser(out, idx);
+        (self.trx_kind as u8).ser(out, idx)
     }
 }
 
 impl Deser for RedoHeader {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, cts) = TrxID::deser(ctx, data, start_idx)?;
-        let (idx, code) = u8::deser(ctx, data, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, cts) = TrxID::deser(input, start_idx)?;
+        let (idx, code) = u8::deser(input, idx)?;
         Ok((
             idx,
             RedoHeader {
@@ -533,20 +530,20 @@ impl TableDML {
 
 impl Ser<'_> for TableDML {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        self.rows.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        self.rows.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        self.rows.ser(ctx, out, start_idx)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        self.rows.ser(out, start_idx)
     }
 }
 
 impl Deser for TableDML {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, data: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, rows) = BTreeMap::<RowID, RowRedo>::deser(ctx, data, start_idx)?;
+    fn deser<S: Serde + ?Sized>(data: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, rows) = BTreeMap::<RowID, RowRedo>::deser(data, start_idx)?;
         Ok((idx, TableDML { rows }))
     }
 }
@@ -730,8 +727,6 @@ mod tests {
 
     #[test]
     fn test_table_dml_serde() {
-        let mut ctx = SerdeCtx::default();
-
         // 创建测试数据
         let mut table_dml = TableDML::default();
 
@@ -763,11 +758,11 @@ mod tests {
         table_dml.insert(delete_entry);
 
         // 序列化
-        let mut buf = vec![0; table_dml.ser_len(&ctx)];
-        table_dml.ser(&ctx, &mut buf, 0);
+        let mut buf = vec![0; table_dml.ser_len()];
+        table_dml.ser(&mut buf[..], 0);
 
         // 反序列化
-        let (_, deserialized) = TableDML::deser(&mut ctx, &buf, 0).unwrap();
+        let (_, deserialized) = TableDML::deser(&buf[..], 0).unwrap();
 
         // 验证结果
         assert_eq!(deserialized.rows.len(), 3);
@@ -807,36 +802,34 @@ mod tests {
         }
 
         // 测试用例4：测试序列化位置偏移
-        let mut buf = vec![0; 4 + table_dml.ser_len(&ctx)]; // 添加4字节前缀
-        table_dml.ser(&ctx, &mut buf, 4); // 从位置4开始序列化
+        let mut buf = vec![0; 4 + table_dml.ser_len()]; // 添加4字节前缀
+        table_dml.ser(&mut buf[..], 4); // 从位置4开始序列化
 
         // 验证反序列化结果
-        let (_, deserialized) = TableDML::deser(&mut ctx, &buf, 4).unwrap();
+        let (_, deserialized) = TableDML::deser(&buf[..], 4).unwrap();
         assert_eq!(deserialized.rows.len(), 3);
 
         // 测试用例5：空TableDML的序列化和反序列化
         let empty_table_dml = TableDML::default();
-        let mut buf = vec![0; empty_table_dml.ser_len(&ctx)];
-        empty_table_dml.ser(&ctx, &mut buf, 0);
+        let mut buf = vec![0; empty_table_dml.ser_len()];
+        empty_table_dml.ser(&mut buf[..], 0);
 
-        let (_, deserialized) = TableDML::deser(&mut ctx, &buf, 0).unwrap();
+        let (_, deserialized) = TableDML::deser(&buf[..], 0).unwrap();
         assert_eq!(deserialized.rows.len(), 0);
     }
 
     #[test]
     fn test_ddl_redo_serde() {
-        let mut ctx = SerdeCtx::default();
-
         // 测试用例1：CreateTable
         let create_table = DDLRedo::CreateTable(1);
-        let mut buf = vec![0; create_table.ser_len(&ctx)];
-        create_table.ser(&ctx, &mut buf, 0);
+        let mut buf = vec![0; create_table.ser_len()];
+        create_table.ser(&mut buf[..], 0);
 
         // 验证序列化结果
         assert_eq!(buf[0], DDLRedoCode::CreateTable as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 0).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
             DDLRedo::CreateTable(table_id) => {
                 assert_eq!(table_id, 1);
@@ -846,14 +839,14 @@ mod tests {
 
         // 测试用例2：DropTable
         let drop_table = DDLRedo::DropTable(2);
-        let mut buf = vec![0; drop_table.ser_len(&ctx)];
-        drop_table.ser(&ctx, &mut buf, 0);
+        let mut buf = vec![0; drop_table.ser_len()];
+        drop_table.ser(&mut buf[..], 0);
 
         // 验证序列化结果
         assert_eq!(buf[0], DDLRedoCode::DropTable as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 0).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
             DDLRedo::DropTable(table_id) => {
                 assert_eq!(table_id, 2);
@@ -863,14 +856,14 @@ mod tests {
 
         // 测试用例3：CreateIndex
         let create_index = DDLRedo::CreateIndex(1);
-        let mut buf = vec![0; create_index.ser_len(&ctx)];
-        create_index.ser(&ctx, &mut buf, 0);
+        let mut buf = vec![0; create_index.ser_len()];
+        create_index.ser(&mut buf[..], 0);
 
         // 验证序列化结果
         assert_eq!(buf[0], DDLRedoCode::CreateIndex as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 0).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
             DDLRedo::CreateIndex(index_id) => {
                 assert_eq!(index_id, 1);
@@ -880,14 +873,14 @@ mod tests {
 
         // 测试用例4：DropIndex
         let drop_index = DDLRedo::DropIndex(2);
-        let mut buf = vec![0; drop_index.ser_len(&ctx)];
-        drop_index.ser(&ctx, &mut buf, 0);
+        let mut buf = vec![0; drop_index.ser_len()];
+        drop_index.ser(&mut buf[..], 0);
 
         // 验证序列化结果
         assert_eq!(buf[0], DDLRedoCode::DropIndex as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 0).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
             DDLRedo::DropIndex(index_id) => {
                 assert_eq!(index_id, 2);
@@ -897,14 +890,14 @@ mod tests {
 
         // 测试用例5：测试序列化位置偏移
         let drop_table = DDLRedo::DropTable(5);
-        let mut buf = vec![0; 4 + drop_table.ser_len(&ctx)]; // 添加4字节前缀
-        drop_table.ser(&ctx, &mut buf, 4); // 从位置4开始序列化
+        let mut buf = vec![0; 4 + drop_table.ser_len()]; // 添加4字节前缀
+        drop_table.ser(&mut buf[..], 4); // 从位置4开始序列化
 
         // 验证序列化结果
         assert_eq!(buf[4], DDLRedoCode::DropTable as u8);
 
         // 验证反序列化结果
-        let (_, deserialized) = DDLRedo::deser(&mut ctx, &buf, 4).unwrap();
+        let (_, deserialized) = DDLRedo::deser(&buf[..], 4).unwrap();
         match deserialized {
             DDLRedo::DropTable(table_id) => {
                 assert_eq!(table_id, 5);

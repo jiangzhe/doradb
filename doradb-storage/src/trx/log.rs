@@ -1,16 +1,14 @@
 use crate::error::{Error, Result};
 use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
-use crate::io::{
-    AIO, AIOContext, AIOError, AIOKind, DirectBuf, IocbRawPtr, align_to_sector_size, io_event,
-};
+use crate::io::{AIO, AIOContext, AIOError, AIOKind, DirectBuf, IocbRawPtr, io_event};
 use crate::notify::EventNotifyOnDrop;
-use crate::serde::{Deser, LenPrefixPod, Ser, SerdeCtx, len_prefix_pod_size};
+use crate::serde::Ser;
 use crate::session::SessionState;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{Commit, CommitGroup, GroupCommit, MutexGroupCommit};
+use crate::trx::log_replay::{LogBuf, LogPartitionStream, MmapLogReader, TrxLog};
 use crate::trx::purge::{GC, GCBucket};
-use crate::trx::redo::{RedoHeader, RedoLogs};
 use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx, TrxID};
@@ -18,13 +16,10 @@ use crossbeam_utils::CachePadded;
 use event_listener::EventListener;
 use flume::{Receiver, Sender};
 use glob::glob;
-use memmap2::Mmap;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
-use std::fs::File;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
-use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -181,25 +176,30 @@ impl LogPartition {
 
     /// Create a new log buffer to hold one transaction's redo log.
     #[inline]
-    fn new_buf(&self, serde_ctx: &SerdeCtx, data: LenPrefixPod<RedoHeader, RedoLogs>) -> DirectBuf {
-        let ser_len = data.ser_len(serde_ctx);
+    fn new_buf(&self, data: TrxLog) -> LogBuf {
+        let ser_len = data.ser_len();
         if ser_len > self.max_io_size {
             // data is longer than single page, we need to
-            let mut buf = DirectBuf::zeroed(ser_len);
-            buf.truncate(0);
-            buf.extend_ser(&data, serde_ctx);
+            let mut buf = LogBuf::new(ser_len);
+            buf.ser(&data);
             return buf;
         }
-        if let Some(mut buf) = self.buf_free_list.try_pop(true) {
-            // freed buffer should be always empty.
-            buf.truncate(0);
-            buf.extend_ser(&data, serde_ctx);
+        if let Some(mut buf) = self.try_buf_in_free_list(ser_len) {
+            buf.ser(&data);
             return buf;
         }
-        let mut buf = DirectBuf::zeroed(ser_len);
-        buf.truncate(0);
-        buf.extend_ser(&data, serde_ctx);
+        let mut buf = LogBuf::new(ser_len);
+        buf.ser(&data);
         buf
+    }
+
+    #[inline]
+    fn try_buf_in_free_list(&self, ser_len: usize) -> Option<LogBuf> {
+        if LogBuf::actual_len(ser_len) <= self.max_io_size {
+            // fit buffer size in free list.
+            return self.buf_free_list.try_pop(true).map(LogBuf::with_buffer);
+        }
+        None
     }
 
     #[inline]
@@ -243,10 +243,9 @@ impl LogPartition {
         wait_sync: bool,
     ) -> (Option<Arc<SessionState>>, Option<EventListener>) {
         let cts = trx.cts;
-        let serde_ctx = SerdeCtx::default();
         let redo_bin = trx.redo_bin.take().unwrap();
         // Serialize redo log to buffer.
-        let log_buf = self.new_buf(&serde_ctx, redo_bin);
+        let log_buf = self.new_buf(redo_bin);
         let log_file = group_commit_g.log_file.as_ref().unwrap();
         // Allocate space of log file.
         let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
@@ -274,7 +273,6 @@ impl LogPartition {
             offset,
             log_buf,
             sync_ev,
-            serde_ctx,
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
         (session, listener)
@@ -841,255 +839,14 @@ pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
     Ok(file_seq)
 }
 
-pub struct MmapLogReader {
-    m: Mmap,
-    page_size: usize,
-    max_file_size: usize,
-    offset: usize,
-}
-
-impl MmapLogReader {
-    #[inline]
-    pub fn new(
-        log_file_path: impl AsRef<Path>,
-        page_size: usize,
-        max_file_size: usize,
-        offset: usize,
-    ) -> Result<Self> {
-        let file = File::open(log_file_path.as_ref())?;
-        let m = unsafe { Mmap::map(&file)? };
-
-        Ok(MmapLogReader {
-            m,
-            page_size,
-            max_file_size,
-            offset,
-        })
-    }
-
-    #[inline]
-    pub fn read(&mut self) -> ReadLog<'_> {
-        if self.offset >= self.max_file_size {
-            return ReadLog::SizeLimit; // file is exhausted.
-        }
-        // Always read multiple pages.
-        debug_assert!(self.offset == align_to_sector_size(self.offset));
-        // Try single page first.
-        // This may fail as log is incomplete.
-        if let Some(mut buf) = self.m.get(self.offset..self.offset + self.page_size) {
-            let pod_len = len_prefix_pod_size(buf);
-            // Log file is truncated to certain size, and if no data is written, the header of page
-            // will always be zeroed. This is the default behavior on Linux.
-            // pod length equals to 8, means all bytes in current page are zeroed.
-            if pod_len == 8 {
-                return ReadLog::DataEnd; // empty data means end of file.
-            }
-            if pod_len > buf.len() {
-                // log occupies more than one page, so read more.
-                let new_len = align_to_sector_size(pod_len);
-                if let Some(new_buf) = self.m.get(self.offset..self.offset + new_len) {
-                    buf = new_buf;
-                } else {
-                    return ReadLog::DataCorrupted; // file is incomplete.
-                }
-                self.offset += new_len;
-            } else {
-                self.offset += self.page_size;
-            }
-            return ReadLog::Some(LogGroup {
-                data: &buf[..pod_len],
-                ctx: SerdeCtx::default(),
-            });
-        }
-        ReadLog::DataCorrupted
-    }
-}
-
-/// Result of log read.
-pub enum ReadLog<'a> {
-    /// Log is ended with empty page.
-    DataEnd,
-    /// File reach maximum size limit.
-    SizeLimit,
-    /// Data in file is corrupted.
-    DataCorrupted,
-    /// A group of log.
-    Some(LogGroup<'a>),
-}
-
-pub struct LogGroup<'a> {
-    data: &'a [u8],
-    ctx: SerdeCtx,
-}
-
-impl LogGroup<'_> {
-    #[inline]
-    pub fn data(&self) -> &[u8] {
-        self.data
-    }
-
-    #[inline]
-    pub fn try_next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
-        if self.data.is_empty() {
-            return Ok(None);
-        }
-        let (offset, res) =
-            LenPrefixPod::<RedoHeader, RedoLogs>::deser(&mut self.ctx, self.data, 0)?;
-        self.data = &self.data[offset..];
-        Ok(Some(res))
-    }
-}
-
-pub struct LogPartitionStream {
-    initializer: LogPartitionInitializer,
-    reader: Option<MmapLogReader>,
-    buffer: VecDeque<LenPrefixPod<RedoHeader, RedoLogs>>,
-}
-
-impl Deref for LogPartitionStream {
-    type Target = VecDeque<LenPrefixPod<RedoHeader, RedoLogs>>;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.buffer
-    }
-}
-
-impl LogPartitionStream {
-    #[inline]
-    pub fn fill_buffer(&mut self) -> Result<()> {
-        loop {
-            // fill buffer by reading current log file.
-            if let Some(reader) = self.reader.as_mut() {
-                match reader.read() {
-                    ReadLog::DataCorrupted => return Err(Error::LogFileCorrupted),
-                    ReadLog::Some(mut log_group) => {
-                        while let Some(res) = log_group.try_next()? {
-                            self.buffer.push_back(res);
-                        }
-                        return Ok(());
-                    }
-                    ReadLog::DataEnd | ReadLog::SizeLimit => {
-                        // current file exhausted.
-                        self.reader.take();
-                    }
-                }
-            }
-            debug_assert!(self.reader.is_none());
-            let reader = self.initializer.next_reader()?;
-            if reader.is_none() {
-                return Ok(());
-            }
-            self.reader = reader;
-        }
-    }
-
-    #[inline]
-    pub fn fill_if_empty(&mut self) -> Result<bool> {
-        if !self.is_empty() {
-            return Ok(true);
-        }
-        self.fill_buffer()?;
-        Ok(!self.is_empty())
-    }
-
-    #[inline]
-    pub fn pop(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
-        match self.buffer.pop_front() {
-            res @ Some(_) => Ok(res),
-            None => {
-                self.fill_buffer()?;
-                Ok(self.buffer.pop_front())
-            }
-        }
-    }
-
-    #[inline]
-    pub(super) fn into_initializer(self) -> LogPartitionInitializer {
-        debug_assert!(self.reader.is_none());
-        debug_assert!(self.buffer.is_empty());
-        self.initializer
-    }
-}
-
-impl PartialEq for LogPartitionStream {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        debug_assert!(!self.is_empty());
-        debug_assert!(!other.is_empty());
-        self.buffer[0].header.cts == other.buffer[0].header.cts
-    }
-}
-
-impl Eq for LogPartitionStream {}
-
-impl Ord for LogPartitionStream {
-    #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        debug_assert!(!self.is_empty());
-        debug_assert!(!other.is_empty());
-        // ordered by CTS in ascending order.
-        // so we need to reverse the comparison.
-        other.buffer[0].header.cts.cmp(&self.buffer[0].header.cts)
-    }
-}
-
-impl PartialOrd for LogPartitionStream {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Default)]
-pub struct LogMerger {
-    heap: BinaryHeap<LogPartitionStream>,
-    finished: Vec<LogPartitionStream>,
-}
-
-impl LogMerger {
-    #[inline]
-    pub fn add_stream(&mut self, mut stream: LogPartitionStream) -> Result<()> {
-        // before put the stream into priority queue, make sure there is
-        // at least one log entry.
-        if stream.fill_if_empty()? {
-            self.heap.push(stream);
-        } else {
-            // log stream is empty.
-            self.finished.push(stream);
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub fn try_next(&mut self) -> Result<Option<LenPrefixPod<RedoHeader, RedoLogs>>> {
-        match self.heap.pop() {
-            Some(mut stream) => {
-                let res = stream.pop()?;
-                if stream.fill_if_empty()? {
-                    // some logs remaining in the buffer, so put into heap again.
-                    self.heap.push(stream);
-                } else {
-                    // all logs are processed, put this stream into finish list.
-                    self.finished.push(stream);
-                }
-                Ok(res)
-            }
-            None => Ok(None),
-        }
-    }
-
-    #[inline]
-    pub fn finished_streams(self) -> Vec<LogPartitionStream> {
-        self.finished
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table2;
     use crate::engine::EngineConfig;
+    use crate::trx::log_replay::{LogMerger, ReadLog};
+    use crate::trx::redo::RedoLogs;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::sys_trx::SysTrx;
     use crate::value::Val;

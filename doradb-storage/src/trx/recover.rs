@@ -20,12 +20,12 @@ use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
-use crate::serde::LenPrefixPod;
 use crate::table::{Table, TableAccess, TableRecover};
 use crate::trx::TrxID;
-use crate::trx::log::{LogMerger, LogPartition, LogPartitionInitializer, LogPartitionStream};
+use crate::trx::log::{LogPartition, LogPartitionInitializer};
+use crate::trx::log_replay::{LogMerger, LogPartitionStream, TrxLog};
 use crate::trx::purge::GC;
-use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RowRedo, RowRedoKind, TableDML};
+use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crossbeam_utils::CachePadded;
 use flume::Receiver;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -187,19 +187,19 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
         Ok(self.log_merger.finished_streams())
     }
 
-    async fn replay_log(&mut self, log: LenPrefixPod<RedoHeader, RedoLogs>) -> Result<()> {
+    async fn replay_log(&mut self, log: TrxLog) -> Result<()> {
         // sequentially replay redo log.
-        let RedoLogs { ddl, dml } = log.payload;
+        let (header, RedoLogs { ddl, dml }) = log.into_inner();
 
         if let Some(ddl) = ddl {
             // Execute DDL after all previous DML is done.
             // We treat every DDL as pipeline breaker.
             self.wait_for_dml_done().await?;
-            self.replay_ddl(ddl, dml, log.header.cts).await?;
+            self.replay_ddl(ddl, dml, header.cts).await?;
         } else {
             // replay DML-only transaction.
             // todo: dispatch DML execution to multiple threads.
-            self.dispatch_dml(dml, log.header.cts).await?;
+            self.dispatch_dml(dml, header.cts).await?;
         }
         Ok(())
     }
@@ -213,9 +213,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             if let Some(table) = self.catalog.get_table(*table_id).await {
                 let metadata = &table.file.active_root().metadata;
                 for page_id in pages {
-                    table
-                        .populate_index_via_row_page(*page_id)
-                        .await;
+                    table.populate_index_via_row_page(*page_id).await;
                     self.refresh_page(Arc::clone(metadata), *page_id).await;
                 }
             }
@@ -271,6 +269,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 start_row_id,
                 end_row_id,
             } => {
+                debug_assert!(dml.is_empty());
                 // Row page creation is guaranteed to be ordered in the redo log,
                 // so its safe to recreate it and the row id range must be identical.
                 let table = self
@@ -386,34 +385,17 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
                     table
-                        .recover_row_insert(
-                            row.page_id,
-                            row.row_id,
-                            vals,
-                            cts,
-                            disable_index,
-                        )
+                        .recover_row_insert(row.page_id, row.row_id, vals, cts, disable_index)
                         .await;
                 }
                 RowRedoKind::Update(vals) => {
                     table
-                        .recover_row_update(
-                            row.page_id,
-                            row.row_id,
-                            vals,
-                            cts,
-                            disable_index,
-                        )
+                        .recover_row_update(row.page_id, row.row_id, vals, cts, disable_index)
                         .await;
                 }
                 RowRedoKind::Delete => {
                     table
-                        .recover_row_delete(
-                            row.page_id,
-                            row.row_id,
-                            cts,
-                            disable_index,
-                        )
+                        .recover_row_delete(row.page_id, row.row_id, cts, disable_index)
                         .await;
                 }
                 RowRedoKind::DeleteByUniqueKey(_) => {

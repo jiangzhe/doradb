@@ -9,7 +9,7 @@ use crate::lwc::{
     ForBitpacking32, LwcData, LwcNullBitmap, LwcPrimitive, LwcPrimitiveData, SortedPosition,
 };
 use crate::row::RowID;
-use crate::serde::{Ser, SerdeCtx};
+use crate::serde::{Ser, Serde};
 use crate::value::ValKind;
 use std::mem;
 
@@ -290,18 +290,18 @@ impl LwcPageHeader {
 
 impl Ser<'_> for LwcPageHeader {
     #[inline]
-    fn ser_len(&self, _ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<LwcPageHeader>()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_byte_array(out, start_idx, &self.first_row_id);
-        let idx = ctx.ser_byte_array(out, idx, &self.last_row_id);
-        let idx = ctx.ser_byte_array(out, idx, &self.row_count);
-        let idx = ctx.ser_byte_array(out, idx, &self.col_count);
-        let idx = ctx.ser_byte_array(out, idx, &self.first_col_offset);
-        ctx.ser_byte_array(out, idx, &self.padding)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_byte_array(start_idx, &self.first_row_id);
+        let idx = out.ser_byte_array(idx, &self.last_row_id);
+        let idx = out.ser_byte_array(idx, &self.row_count);
+        let idx = out.ser_byte_array(idx, &self.col_count);
+        let idx = out.ser_byte_array(idx, &self.first_col_offset);
+        out.ser_byte_array(idx, &self.padding)
     }
 }
 
@@ -383,7 +383,6 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
     use crate::lwc::LwcPrimitiveSer;
-    use crate::serde::SerdeCtx;
 
     #[test]
     fn test_row_id_set() {
@@ -449,11 +448,10 @@ mod tests {
 
     fn create_row_id_set<'a>(row_ids: &[RowID], buffer: &'a mut Vec<u8>) -> RowIDSet<'a> {
         buffer.clear();
-        let mut ctx = SerdeCtx::default();
         let lwc_ser = LwcPrimitiveSer::new_u64(row_ids);
-        let ser_len = lwc_ser.ser_len(&ctx);
+        let ser_len = lwc_ser.ser_len();
         buffer.resize(ser_len, 0);
-        let ser_idx = lwc_ser.ser(&mut ctx, buffer, 0);
+        let ser_idx = lwc_ser.ser(&mut buffer[..], 0);
         debug_assert!(ser_len == ser_idx);
         RowIDSet::from_bytes(buffer).unwrap()
     }
@@ -468,9 +466,8 @@ mod tests {
         assert!(page.header.row_count() == 50);
         assert!(page.header.col_count() == 2);
         assert!(page.header.first_col_offset() == 312);
-        let ctx = SerdeCtx::default();
-        let mut header_vec = vec![0u8; page.header.ser_len(&ctx)];
-        let ser_idx = page.header.ser(&ctx, &mut header_vec, 0);
+        let mut header_vec = vec![0u8; page.header.ser_len()];
+        let ser_idx = page.header.ser(&mut header_vec[..], 0);
         assert!(ser_idx == header_vec.len());
         assert_eq!(&header_vec, &bytes[..header_vec.len()]);
     }
@@ -485,20 +482,19 @@ mod tests {
             )],
             vec![],
         );
-        let ctx = SerdeCtx::default();
         let row_ids = [1u64, 2, 3, 4];
         let row_id_ser = LwcPrimitiveSer::new_u64(&row_ids);
-        let mut row_id_bytes = vec![0u8; row_id_ser.ser_len(&ctx)];
-        row_id_ser.ser(&ctx, &mut row_id_bytes, 0);
+        let mut row_id_bytes = vec![0u8; row_id_ser.ser_len()];
+        row_id_ser.ser(&mut row_id_bytes[..], 0);
         let values = [10u8, 20, 30, 40];
         let lwc_ser = LwcPrimitiveSer::new_u8(&values);
-        let mut values_bytes = vec![0u8; lwc_ser.ser_len(&ctx)];
-        lwc_ser.ser(&ctx, &mut values_bytes, 0);
+        let mut values_bytes = vec![0u8; lwc_ser.ser_len()];
+        lwc_ser.ser(&mut values_bytes[..], 0);
 
         let null_bytes = [0b0000_1010u8];
         let null_ser = crate::lwc::LwcNullBitmapSer::new(&null_bytes).unwrap();
-        let mut column_bytes = vec![0u8; null_ser.ser_len(&ctx) + values_bytes.len()];
-        let idx = null_ser.ser(&ctx, &mut column_bytes, 0);
+        let mut column_bytes = vec![0u8; null_ser.ser_len() + values_bytes.len()];
+        let idx = null_ser.ser(&mut column_bytes[..], 0);
         column_bytes[idx..].copy_from_slice(&values_bytes);
 
         let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];

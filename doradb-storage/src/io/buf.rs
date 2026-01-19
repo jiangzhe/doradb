@@ -1,5 +1,5 @@
 use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
-use crate::serde::{Ser, SerdeCtx};
+use crate::serde::Ser;
 use std::alloc::{Layout, alloc, alloc_zeroed};
 
 /// AIOBuf represents AIO buffer used for Linux direct IO(currently via libaio).
@@ -105,12 +105,12 @@ impl DirectBuf {
 
     /// Serialize data to end of data.
     #[inline]
-    pub fn extend_ser<'a, T: Ser<'a>>(&mut self, data: &T, ctx: &SerdeCtx) {
-        let ser_len = data.ser_len(ctx);
+    pub fn extend_ser<'a, T: Ser<'a>>(&mut self, data: &T) {
+        let ser_len = data.ser_len();
         let offset = self.len;
         debug_assert!(offset + ser_len <= self.capacity());
         let new_len = offset + ser_len;
-        let res_len = data.ser(ctx, &mut self.data[..new_len], offset);
+        let res_len = data.ser(&mut self.data[..new_len], offset);
         self.len = new_len;
         debug_assert!(res_len == new_len);
     }

@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::file::table_file::BlockIndexArray;
 use crate::lwc::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::row::RowID;
-use crate::serde::{Deser, Ser, SerdeCtx};
+use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use std::mem;
 
@@ -22,14 +22,14 @@ pub struct MetaPage {
 
 impl Deser for MetaPage {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, pivot_row_id) = ctx.deser_u64(input, start_idx)?;
-        let (idx, heap_redo_start_cts) = ctx.deser_u64(input, idx)?;
-        let (idx, delta_rec_ts) = ctx.deser_u64(input, idx)?;
-        let (idx, space_map) = AllocMap::deser(ctx, input, idx)?;
-        let (idx, gc_page_list) = LwcPrimitiveDeser::<PageID>::deser(ctx, input, idx)?;
-        let (idx, meta) = TableBriefMetadata::deser(ctx, input, idx)?;
-        let (idx, block_index) = MetaPageBlockIndexDeser::deser(ctx, input, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, pivot_row_id) = input.deser_u64(start_idx)?;
+        let (idx, heap_redo_start_cts) = input.deser_u64(idx)?;
+        let (idx, delta_rec_ts) = input.deser_u64(idx)?;
+        let (idx, space_map) = AllocMap::deser(input, idx)?;
+        let (idx, gc_page_list) = LwcPrimitiveDeser::<PageID>::deser(input, idx)?;
+        let (idx, meta) = TableBriefMetadata::deser(input, idx)?;
+        let (idx, block_index) = MetaPageBlockIndexDeser::deser(input, idx)?;
         Ok((
             idx,
             MetaPage {
@@ -80,25 +80,25 @@ impl<'a> MetaPageSerView<'a> {
 
 impl<'a> Ser<'a> for MetaPageSerView<'a> {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
+    fn ser_len(&self) -> usize {
         mem::size_of::<RowID>()
             + mem::size_of::<TrxID>()
             + mem::size_of::<TrxID>()
-            + self.space_map.ser_len(ctx)
-            + self.gc_page_list.ser_len(ctx)
-            + self.schema.ser_len(ctx)
-            + self.block_index.ser_len(ctx)
+            + self.space_map.ser_len()
+            + self.gc_page_list.ser_len()
+            + self.schema.ser_len()
+            + self.block_index.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = ctx.ser_u64(out, start_idx, self.pivot_row_id);
-        let idx = ctx.ser_u64(out, idx, self.heap_redo_start_cts);
-        let idx = ctx.ser_u64(out, idx, self.delta_rec_ts);
-        let idx = self.space_map.ser(ctx, out, idx);
-        let idx = self.gc_page_list.ser(ctx, out, idx);
-        let idx = self.schema.ser(ctx, out, idx);
-        self.block_index.ser(ctx, out, idx)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u64(start_idx, self.pivot_row_id);
+        let idx = out.ser_u64(idx, self.heap_redo_start_cts);
+        let idx = out.ser_u64(idx, self.delta_rec_ts);
+        let idx = self.space_map.ser(out, idx);
+        let idx = self.gc_page_list.ser(out, idx);
+        let idx = self.schema.ser(out, idx);
+        self.block_index.ser(out, idx)
     }
 }
 
@@ -113,13 +113,13 @@ impl<'a> MetaPageGcListSerView<'a> {
 
 impl<'a> Ser<'a> for MetaPageGcListSerView<'a> {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        self.0.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        self.0.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        self.0.ser(ctx, out, start_idx)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        self.0.ser(out, start_idx)
     }
 }
 
@@ -142,15 +142,15 @@ impl<'a> MetaPageBlockIndexSerView<'a> {
 
 impl<'a> Ser<'a> for MetaPageBlockIndexSerView<'a> {
     #[inline]
-    fn ser_len(&self, ctx: &SerdeCtx) -> usize {
-        self.s.ser_len(ctx) + self.d.ser_len(ctx) + self.p.ser_len(ctx)
+    fn ser_len(&self) -> usize {
+        self.s.ser_len() + self.d.ser_len() + self.p.ser_len()
     }
 
     #[inline]
-    fn ser(&self, ctx: &SerdeCtx, out: &mut [u8], start_idx: usize) -> usize {
-        let idx = self.s.ser(ctx, out, start_idx);
-        let idx = self.d.ser(ctx, out, idx);
-        self.p.ser(ctx, out, idx)
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = self.s.ser(out, start_idx);
+        let idx = self.d.ser(out, idx);
+        self.p.ser(out, idx)
     }
 }
 
@@ -173,10 +173,10 @@ impl From<MetaPageBlockIndexDeser> for BlockIndexArray {
 
 impl Deser for MetaPageBlockIndexDeser {
     #[inline]
-    fn deser(ctx: &mut SerdeCtx, input: &[u8], start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, s) = LwcPrimitiveDeser::<RowID>::deser(ctx, input, start_idx)?;
-        let (idx, d) = LwcPrimitiveDeser::<RowID>::deser(ctx, input, idx)?;
-        let (idx, p) = LwcPrimitiveDeser::<PageID>::deser(ctx, input, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, s) = LwcPrimitiveDeser::<RowID>::deser(input, start_idx)?;
+        let (idx, d) = LwcPrimitiveDeser::<RowID>::deser(input, idx)?;
+        let (idx, p) = LwcPrimitiveDeser::<PageID>::deser(input, idx)?;
         Ok((
             idx,
             MetaPageBlockIndexDeser {
@@ -210,14 +210,13 @@ mod tests {
             )],
         ));
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
-        let mut ctx = SerdeCtx::default();
         let ser_view = active_root.meta_page_ser_view();
-        let ser_len = ser_view.ser_len(&ctx);
+        let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
-        let res_idx = ser_view.ser(&ctx, &mut data, 0);
+        let res_idx = ser_view.ser(&mut data[..], 0);
         assert_eq!(res_idx, ser_len);
 
-        let (_, meta_page) = MetaPage::deser(&mut ctx, &data, 0).unwrap();
+        let (_, meta_page) = MetaPage::deser(&data[..], 0).unwrap();
         assert_eq!(meta_page.schema, *active_root.metadata);
         assert_eq!(meta_page.block_index, active_root.block_index);
         assert_eq!(meta_page.space_map, active_root.alloc_map);
