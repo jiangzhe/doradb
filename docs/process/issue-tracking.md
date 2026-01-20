@@ -40,6 +40,17 @@ gh issue list --assignee "@me" --state open --json number,title
 gh issue close <number> --comment "Completed"
 ```
 
+## Handle Body-Too-Long Problem
+
+If issue body is too long, use `gh issue create --title "..." --body "..."` may fail.
+To solve this problem, create a temporary file, e.g. `issue-description.txt`. Then use follow command to create issue.
+
+```bash
+gh issue create --title "Issue title" --body-file issue-description.txt --label "type:task"
+```
+
+Do NOT forget to remove the temporary file once issue is created successfully.
+
 ## Labels & Taxonomy
 
 Since GitHub does not have strict fields for type/priority, use **Labels**:
