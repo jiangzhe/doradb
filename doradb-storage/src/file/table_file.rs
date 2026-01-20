@@ -309,6 +309,22 @@ impl MutableTableFile {
         }
     }
 
+    /// Allocate a new page id for copy-on-write updates.
+    #[inline]
+    pub fn allocate_page_id(&mut self) -> Result<PageID> {
+        self.active_root
+            .alloc_map
+            .try_allocate()
+            .map(|page_id| page_id as PageID)
+            .ok_or(Error::InvalidState)
+    }
+
+    /// Record an obsolete page id to be reclaimed on commit.
+    #[inline]
+    pub fn record_gc_page(&mut self, page_id: PageID) {
+        self.active_root.gc_page_list.push(page_id);
+    }
+
     /// Commit the modification of table file.
     /// Returns the new table file and previous
     /// active root if exists.
