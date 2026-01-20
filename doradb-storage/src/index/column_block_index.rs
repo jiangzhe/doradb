@@ -1,6 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::error::{Error, Result};
-use crate::file::table_file::{MutableTableFile, TableFile, TABLE_FILE_PAGE_SIZE};
+use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE, TableFile};
 use crate::row::RowID;
 use std::mem;
 use std::slice;
@@ -35,7 +35,7 @@ pub struct ColumnBlockNodeHeader {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColumnPagePayload {
     pub block_id: u64,
     pub deletion_field: [u8; 120],
@@ -80,14 +80,19 @@ impl ColumnBlockNode {
     #[inline]
     pub fn leaf_start_row_ids(&self) -> &[RowID] {
         debug_assert!(self.is_leaf());
-        unsafe { slice::from_raw_parts(self.data_ptr() as *const RowID, self.header.count as usize) }
+        unsafe {
+            slice::from_raw_parts(self.data_ptr() as *const RowID, self.header.count as usize)
+        }
     }
 
     #[inline]
     pub fn leaf_start_row_ids_mut(&mut self) -> &mut [RowID] {
         debug_assert!(self.is_leaf());
         unsafe {
-            slice::from_raw_parts_mut(self.data_ptr_mut() as *mut RowID, self.header.count as usize)
+            slice::from_raw_parts_mut(
+                self.data_ptr_mut() as *mut RowID,
+                self.header.count as usize,
+            )
         }
     }
 
@@ -96,9 +101,7 @@ impl ColumnBlockNode {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
         let payload_ptr = unsafe {
-            self.data_ptr()
-                .add(count * mem::size_of::<RowID>())
-                as *const ColumnPagePayload
+            self.data_ptr().add(count * mem::size_of::<RowID>()) as *const ColumnPagePayload
         };
         unsafe { slice::from_raw_parts(payload_ptr, count) }
     }
@@ -108,9 +111,7 @@ impl ColumnBlockNode {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
         let payload_ptr = unsafe {
-            self.data_ptr_mut()
-                .add(count * mem::size_of::<RowID>())
-                as *mut ColumnPagePayload
+            self.data_ptr_mut().add(count * mem::size_of::<RowID>()) as *mut ColumnPagePayload
         };
         unsafe { slice::from_raw_parts_mut(payload_ptr, count) }
     }
