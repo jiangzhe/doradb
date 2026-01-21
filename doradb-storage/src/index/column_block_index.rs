@@ -133,6 +133,22 @@ impl ColumnBlockNode {
     }
 
     #[inline]
+    pub fn leaf_arrays_mut(&mut self) -> (&mut [RowID], &mut [ColumnPagePayload]) {
+        debug_assert!(self.is_leaf());
+        let count = self.header.count as usize;
+        let row_ptr = self.data_ptr_mut() as *mut RowID;
+        let payload_ptr = unsafe {
+            self.data_ptr_mut().add(count * mem::size_of::<RowID>()) as *mut ColumnPagePayload
+        };
+        unsafe {
+            (
+                slice::from_raw_parts_mut(row_ptr, count),
+                slice::from_raw_parts_mut(payload_ptr, count),
+            )
+        }
+    }
+
+    #[inline]
     pub fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
         debug_assert!(self.is_branch());
         unsafe {
@@ -254,13 +270,7 @@ impl ColumnBlockIndex {
         let root_node = self.read_node(self.root_page_id).await?;
         let root_height = root_node.header.height;
         let append_result = self
-            .append_to_node(
-                mutable_file,
-                self.root_page_id,
-                root_node,
-                entries,
-                create_ts,
-            )
+            .append_rightmost_path(mutable_file, entries, create_ts)
             .await?;
         if append_result.extra_entries.is_empty() {
             return Ok(append_result.new_page_id);
@@ -305,22 +315,23 @@ impl ColumnBlockIndex {
         Ok(())
     }
 
-    async fn read_node(&self, page_id: PageID) -> Result<ColumnBlockNode> {
+    async fn read_node(&self, page_id: PageID) -> Result<Box<ColumnBlockNode>> {
         let buf = self.table_file.read_page(page_id).await?;
         let node =
-            unsafe { std::ptr::read_unaligned(buf.as_bytes().as_ptr() as *const ColumnBlockNode) };
-        Ok(node)
+            unsafe { std::ptr::read_unaligned(buf.data().as_ptr() as *const ColumnBlockNode) };
+        Ok(Box::new(node))
     }
 
-    async fn write_node(&self, page_id: PageID, node: &ColumnBlockNode) -> Result<()> {
+    async fn write_node(&self, page_id: PageID, node: ColumnBlockNode) -> Result<()> {
         let mut buf = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
         unsafe {
             std::ptr::copy_nonoverlapping(
-                node as *const ColumnBlockNode as *const u8,
+                &node as *const ColumnBlockNode as *const u8,
                 buf.data_mut().as_mut_ptr(),
                 COLUMN_BLOCK_PAGE_SIZE,
             );
         }
+        drop(node);
         self.table_file.write_page(page_id, buf).await
     }
 
@@ -351,8 +362,7 @@ impl ColumnBlockIndex {
             let (page_id, mut node) = self.allocate_node(mutable_file, 0, chunk[0].0, create_ts)?;
             node.header.count = chunk.len() as u32;
             {
-                let row_ids = node.leaf_start_row_ids_mut();
-                let payloads = node.leaf_payloads_mut();
+                let (row_ids, payloads) = node.leaf_arrays_mut();
                 for (idx, entry) in chunk.iter().enumerate() {
                     row_ids[idx] = entry.0;
                     payloads[idx] = ColumnPagePayload {
@@ -361,7 +371,7 @@ impl ColumnBlockIndex {
                     };
                 }
             }
-            self.write_node(page_id, &node).await?;
+            self.write_node(page_id, node).await?;
             leaf_entries.push(ColumnBlockBranchEntry {
                 start_row_id: chunk[0].0,
                 page_id,
@@ -383,7 +393,7 @@ impl ColumnBlockIndex {
                     self.allocate_node(mutable_file, height, entries[0].start_row_id, create_ts)?;
                 node.header.count = entries.len() as u32;
                 node.branch_entries_mut().copy_from_slice(&entries);
-                self.write_node(page_id, &node).await?;
+                self.write_node(page_id, node).await?;
                 return Ok(page_id);
             }
             let mut next_entries = Vec::new();
@@ -392,7 +402,7 @@ impl ColumnBlockIndex {
                     self.allocate_node(mutable_file, height, chunk[0].start_row_id, create_ts)?;
                 node.header.count = chunk.len() as u32;
                 node.branch_entries_mut().copy_from_slice(chunk);
-                self.write_node(page_id, &node).await?;
+                self.write_node(page_id, node).await?;
                 next_entries.push(ColumnBlockBranchEntry {
                     start_row_id: chunk[0].start_row_id,
                     page_id,
@@ -403,28 +413,48 @@ impl ColumnBlockIndex {
         }
     }
 
-    async fn append_to_node(
+    async fn append_rightmost_path(
         &self,
         mutable_file: &mut MutableTableFile,
-        page_id: PageID,
-        node: ColumnBlockNode,
         entries: &[(RowID, u64)],
         create_ts: u64,
     ) -> Result<NodeAppendResult> {
-        if node.is_leaf() {
-            return self
-                .append_to_leaf(mutable_file, page_id, node, entries, create_ts)
-                .await;
+        let mut path = Vec::new();
+        let mut page_id = self.root_page_id;
+        loop {
+            let node = self.read_node(page_id).await?;
+            let next_page_id = if node.is_leaf() {
+                None
+            } else {
+                node.branch_entries().last().map(|entry| entry.page_id)
+            };
+            path.push((page_id, node));
+            if let Some(next_page_id) = next_page_id {
+                page_id = next_page_id;
+            } else {
+                break;
+            }
         }
-        self.append_to_branch(mutable_file, page_id, node, entries, create_ts)
-            .await
+
+        let (leaf_page_id, leaf_node) = path.pop().ok_or(Error::InvalidState)?;
+        let mut child_result = self
+            .append_to_leaf(mutable_file, leaf_page_id, leaf_node, entries, create_ts)
+            .await?;
+
+        for (page_id, node) in path.into_iter().rev() {
+            child_result = self
+                .append_to_branch_with_child(mutable_file, page_id, node, child_result, create_ts)
+                .await?;
+        }
+
+        Ok(child_result)
     }
 
     async fn append_to_leaf(
         &self,
         mutable_file: &mut MutableTableFile,
         page_id: PageID,
-        node: ColumnBlockNode,
+        node: Box<ColumnBlockNode>,
         entries: &[(RowID, u64)],
         create_ts: u64,
     ) -> Result<NodeAppendResult> {
@@ -446,8 +476,7 @@ impl ColumnBlockIndex {
             self.allocate_node(mutable_file, 0, start_row_id, create_ts)?;
         new_node.header.count = new_count as u32;
         {
-            let row_ids = new_node.leaf_start_row_ids_mut();
-            let payloads = new_node.leaf_payloads_mut();
+            let (row_ids, payloads) = new_node.leaf_arrays_mut();
             if old_count > 0 {
                 row_ids[..old_count].copy_from_slice(node.leaf_start_row_ids());
                 payloads[..old_count].copy_from_slice(node.leaf_payloads());
@@ -460,7 +489,7 @@ impl ColumnBlockIndex {
                 };
             }
         }
-        self.write_node(new_page_id, &new_node).await?;
+        self.write_node(new_page_id, new_node).await?;
         self.record_obsolete_node(mutable_file, page_id)?;
 
         remaining = &remaining[take..];
@@ -472,8 +501,7 @@ impl ColumnBlockIndex {
                 self.allocate_node(mutable_file, 0, chunk[0].0, create_ts)?;
             leaf_node.header.count = chunk_len as u32;
             {
-                let row_ids = leaf_node.leaf_start_row_ids_mut();
-                let payloads = leaf_node.leaf_payloads_mut();
+                let (row_ids, payloads) = leaf_node.leaf_arrays_mut();
                 for (idx, entry) in chunk.iter().enumerate() {
                     row_ids[idx] = entry.0;
                     payloads[idx] = ColumnPagePayload {
@@ -482,7 +510,7 @@ impl ColumnBlockIndex {
                     };
                 }
             }
-            self.write_node(page_id, &leaf_node).await?;
+            self.write_node(page_id, leaf_node).await?;
             extra_entries.push(ColumnBlockBranchEntry {
                 start_row_id: chunk[0].0,
                 page_id,
@@ -497,12 +525,12 @@ impl ColumnBlockIndex {
         })
     }
 
-    async fn append_to_branch(
+    async fn append_to_branch_with_child(
         &self,
         mutable_file: &mut MutableTableFile,
         page_id: PageID,
-        node: ColumnBlockNode,
-        entries: &[(RowID, u64)],
+        node: Box<ColumnBlockNode>,
+        child_result: NodeAppendResult,
         create_ts: u64,
     ) -> Result<NodeAppendResult> {
         let old_entries = node.branch_entries();
@@ -510,12 +538,6 @@ impl ColumnBlockIndex {
             return Err(Error::InvalidState);
         }
         let last_idx = old_entries.len() - 1;
-        let child_page_id = old_entries[last_idx].page_id;
-        let child_node = self.read_node(child_page_id).await?;
-        let child_result = self
-            .append_to_node(mutable_file, child_page_id, child_node, entries, create_ts)
-            .await?;
-
         let mut new_entries =
             Vec::with_capacity(old_entries.len() + child_result.extra_entries.len());
         new_entries.extend_from_slice(old_entries);
@@ -534,7 +556,7 @@ impl ColumnBlockIndex {
         new_node
             .branch_entries_mut()
             .copy_from_slice(&remaining[..first_len]);
-        self.write_node(new_page_id, &new_node).await?;
+        self.write_node(new_page_id, new_node).await?;
         self.record_obsolete_node(mutable_file, page_id)?;
 
         remaining = &remaining[first_len..];
@@ -550,7 +572,7 @@ impl ColumnBlockIndex {
             )?;
             branch_node.header.count = chunk_len as u32;
             branch_node.branch_entries_mut().copy_from_slice(chunk);
-            self.write_node(page_id, &branch_node).await?;
+            self.write_node(page_id, branch_node).await?;
             extra_entries.push(ColumnBlockBranchEntry {
                 start_row_id: chunk[0].start_row_id,
                 page_id,
@@ -596,9 +618,10 @@ fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Opt
 mod tests {
     use super::*;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata, ValKind,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::file::table_fs::TableFileSystemConfig;
+    use crate::value::ValKind;
 
     #[test]
     fn test_column_block_node_size() {
@@ -647,139 +670,160 @@ mod tests {
             .collect()
     }
 
+    fn run_with_large_stack<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
     #[test]
     fn test_batch_insert_into_empty_tree_and_find() {
-        smol::block_on(async {
-            let fs = TableFileSystemConfig::default().build().unwrap();
-            let metadata = build_test_metadata();
-            let table_file = fs.create_table_file(200, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let metadata = build_test_metadata();
+                let table_file = fs.create_table_file(200, metadata, false).unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
 
-            let index = ColumnBlockIndex::new(Arc::clone(&table_file), 0, 0);
-            let entries = vec![(10, 100), (20, 200), (30, 300)];
-            let mut mutable = MutableTableFile::fork(&table_file);
-            let new_root = index
-                .batch_insert(&mut mutable, &entries, 40, 2)
-                .await
-                .unwrap();
-            let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-            drop(old_root);
+                let index = ColumnBlockIndex::new(Arc::clone(&table_file), 0, 0);
+                let entries = vec![(10, 100), (20, 200), (30, 300)];
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let new_root = index
+                    .batch_insert(&mut mutable, &entries, 40, 2)
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+                drop(old_root);
 
-            let index = ColumnBlockIndex::new(Arc::clone(&table_file), new_root, 40);
-            assert_eq!(index.find(9).await.unwrap(), None);
-            assert_eq!(index.find(10).await.unwrap().unwrap().block_id, 100);
-            assert_eq!(index.find(19).await.unwrap().unwrap().block_id, 100);
-            assert_eq!(index.find(20).await.unwrap().unwrap().block_id, 200);
-            assert_eq!(index.find(39).await.unwrap().unwrap().block_id, 300);
-            assert_eq!(index.find(40).await.unwrap(), None);
+                let index = ColumnBlockIndex::new(Arc::clone(&table_file), new_root, 40);
+                assert_eq!(index.find(9).await.unwrap(), None);
+                assert_eq!(index.find(10).await.unwrap().unwrap().block_id, 100);
+                assert_eq!(index.find(19).await.unwrap().unwrap().block_id, 100);
+                assert_eq!(index.find(20).await.unwrap().unwrap().block_id, 200);
+                assert_eq!(index.find(39).await.unwrap().unwrap().block_id, 300);
+                assert_eq!(index.find(40).await.unwrap(), None);
 
-            drop(table_file);
-            drop(fs);
-            let _ = std::fs::remove_file("200.tbl");
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("200.tbl");
+            })
         });
     }
 
     #[test]
     fn test_batch_insert_appends_within_leaf() {
-        smol::block_on(async {
-            let fs = TableFileSystemConfig::default().build().unwrap();
-            let metadata = build_test_metadata();
-            let table_file = fs.create_table_file(201, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let metadata = build_test_metadata();
+                let table_file = fs.create_table_file(201, metadata, false).unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
 
-            let entries = build_entries(0, 8, 1000);
-            let index = ColumnBlockIndex::new(Arc::clone(&table_file), 0, 0);
-            let mut mutable = MutableTableFile::fork(&table_file);
-            let root_page = index
-                .batch_insert(&mut mutable, &entries, 8, 2)
-                .await
-                .unwrap();
-            let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-            drop(old_root);
+                let entries = build_entries(0, 8, 1000);
+                let index = ColumnBlockIndex::new(Arc::clone(&table_file), 0, 0);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_page = index
+                    .batch_insert(&mut mutable, &entries, 8, 2)
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+                drop(old_root);
 
-            let more_entries = build_entries(8, 4, 2000);
-            let index = ColumnBlockIndex::new(Arc::clone(&table_file), root_page, 8);
-            let mut mutable = MutableTableFile::fork(&table_file);
-            let new_root = index
-                .batch_insert(&mut mutable, &more_entries, 12, 3)
-                .await
-                .unwrap();
-            let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-            drop(old_root);
+                let more_entries = build_entries(8, 4, 2000);
+                let index = ColumnBlockIndex::new(Arc::clone(&table_file), root_page, 8);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let new_root = index
+                    .batch_insert(&mut mutable, &more_entries, 12, 3)
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
+                drop(old_root);
 
-            let index = ColumnBlockIndex::new(Arc::clone(&table_file), new_root, 12);
-            assert_eq!(index.find(0).await.unwrap().unwrap().block_id, 1000);
-            assert_eq!(index.find(7).await.unwrap().unwrap().block_id, 1007);
-            assert_eq!(index.find(8).await.unwrap().unwrap().block_id, 2000);
-            assert_eq!(index.find(11).await.unwrap().unwrap().block_id, 2003);
+                let index = ColumnBlockIndex::new(Arc::clone(&table_file), new_root, 12);
+                assert_eq!(index.find(0).await.unwrap().unwrap().block_id, 1000);
+                assert_eq!(index.find(7).await.unwrap().unwrap().block_id, 1007);
+                assert_eq!(index.find(8).await.unwrap().unwrap().block_id, 2000);
+                assert_eq!(index.find(11).await.unwrap().unwrap().block_id, 2003);
 
-            drop(table_file);
-            drop(fs);
-            let _ = std::fs::remove_file("201.tbl");
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("201.tbl");
+            })
         });
     }
 
     #[test]
     fn test_batch_insert_creates_new_leaf_nodes() {
-        smol::block_on(async {
-            let fs = TableFileSystemConfig::default().build().unwrap();
-            let metadata = build_test_metadata();
-            let table_file = fs.create_table_file(202, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let metadata = build_test_metadata();
+                let table_file = fs.create_table_file(202, metadata, false).unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
 
-            let initial_count = COLUMN_BLOCK_MAX_ENTRIES - 1;
-            let entries = build_entries(0, initial_count, 1);
-            let index = ColumnBlockIndex::new(Arc::clone(&table_file), 0, 0);
-            let mut mutable = MutableTableFile::fork(&table_file);
-            let root_page = index
-                .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
-                .await
-                .unwrap();
-            let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-            drop(old_root);
-
-            let append_entries = build_entries(initial_count as RowID, 2, 9000);
-            let index =
-                ColumnBlockIndex::new(Arc::clone(&table_file), root_page, initial_count as RowID);
-            let mut mutable = MutableTableFile::fork(&table_file);
-            let new_root = index
-                .batch_insert(&mut mutable, &append_entries, initial_count as RowID + 2, 3)
-                .await
-                .unwrap();
-            let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-            drop(old_root);
-
-            let index = ColumnBlockIndex::new(
-                Arc::clone(&table_file),
-                new_root,
-                initial_count as RowID + 2,
-            );
-            assert_eq!(index.find(0).await.unwrap().unwrap().block_id, 1);
-            assert_eq!(
-                index
-                    .find(initial_count as RowID)
+                let initial_count = COLUMN_BLOCK_MAX_ENTRIES - 1;
+                let entries = build_entries(0, initial_count, 1);
+                let index = ColumnBlockIndex::new(Arc::clone(&table_file), 0, 0);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_page = index
+                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
                     .await
-                    .unwrap()
-                    .unwrap()
-                    .block_id,
-                9000
-            );
-            assert_eq!(
-                index
-                    .find(initial_count as RowID + 1)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .block_id,
-                9001
-            );
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+                drop(old_root);
 
-            drop(table_file);
-            drop(fs);
-            let _ = std::fs::remove_file("202.tbl");
+                let append_entries = build_entries(initial_count as RowID, 2, 9000);
+                let index = ColumnBlockIndex::new(
+                    Arc::clone(&table_file),
+                    root_page,
+                    initial_count as RowID,
+                );
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let new_root = index
+                    .batch_insert(&mut mutable, &append_entries, initial_count as RowID + 2, 3)
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
+                drop(old_root);
+
+                let index = ColumnBlockIndex::new(
+                    Arc::clone(&table_file),
+                    new_root,
+                    initial_count as RowID + 2,
+                );
+                assert_eq!(index.find(0).await.unwrap().unwrap().block_id, 1);
+                assert_eq!(
+                    index
+                        .find(initial_count as RowID)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .block_id,
+                    9000
+                );
+                assert_eq!(
+                    index
+                        .find(initial_count as RowID + 1)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .block_id,
+                    9001
+                );
+
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("202.tbl");
+            })
         });
     }
 }
