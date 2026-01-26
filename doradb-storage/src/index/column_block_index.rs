@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE, TableFile};
 use crate::io::DirectBuf;
 use crate::row::RowID;
+use bytemuck::{cast_slice, cast_slice_mut};
 use std::mem;
 use std::slice;
 use std::sync::Arc;
@@ -43,6 +44,13 @@ pub struct ColumnBlockNodeHeader {
 pub struct ColumnPagePayload {
     pub block_id: u64,
     pub deletion_field: [u8; 120],
+}
+
+impl ColumnPagePayload {
+    #[inline]
+    pub fn deletion_list(&mut self) -> DeletionList<'_> {
+        DeletionList::new(&mut self.deletion_field)
+    }
 }
 
 #[repr(C)]
@@ -180,6 +188,211 @@ impl ColumnBlockNode {
             start_row_id,
             page_id,
         };
+    }
+}
+
+const DELETION_FIELD_SIZE: usize = 120;
+const DELETION_HEADER_SIZE: usize = 2;
+const DELETION_U16_OFFSET: usize = DELETION_HEADER_SIZE;
+const DELETION_U32_OFFSET: usize = 4;
+const DELETION_U16_CAPACITY: usize = (DELETION_FIELD_SIZE - DELETION_U16_OFFSET) / 2;
+const DELETION_U32_CAPACITY: usize = (DELETION_FIELD_SIZE - DELETION_U32_OFFSET) / 4;
+const DELETION_FLAG_U32: u8 = 0b1000_0000;
+const DELETION_FLAG_OFFLOADED: u8 = 0b0100_0000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeletionListError {
+    Full,
+}
+
+pub struct DeletionList<'a> {
+    data: &'a mut [u8; DELETION_FIELD_SIZE],
+}
+
+impl<'a> DeletionList<'a> {
+    #[inline]
+    pub fn new(data: &'a mut [u8; DELETION_FIELD_SIZE]) -> Self {
+        DeletionList { data }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data[1] as usize
+    }
+
+    #[inline]
+    pub fn is_offloaded(&self) -> bool {
+        (self.data[0] & DELETION_FLAG_OFFLOADED) != 0
+    }
+
+    #[inline]
+    pub fn set_offloaded(&mut self, offloaded: bool) {
+        if offloaded {
+            self.data[0] |= DELETION_FLAG_OFFLOADED;
+        } else {
+            self.data[0] &= !DELETION_FLAG_OFFLOADED;
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, delta: u32) -> bool {
+        if self.is_format_u32() {
+            self.deltas_u32()
+                .binary_search(&delta)
+                .is_ok()
+        } else if delta > u16::MAX as u32 {
+            false
+        } else {
+            let delta = delta as u16;
+            self.deltas_u16().binary_search(&delta).is_ok()
+        }
+    }
+
+    pub fn add(&mut self, delta: u32) -> std::result::Result<bool, DeletionListError> {
+        if !self.is_format_u32() && delta > u16::MAX as u32 {
+            self.promote_to_u32()?;
+        }
+
+        if self.is_format_u32() {
+            let count = self.len();
+            let deltas = self.deltas_u32_mut();
+            match deltas[..count].binary_search(&delta) {
+                Ok(_) => Ok(false),
+                Err(idx) => {
+                    if count >= DELETION_U32_CAPACITY {
+                        return Err(DeletionListError::Full);
+                    }
+                    if idx < count {
+                        deltas.copy_within(idx..count, idx + 1);
+                    }
+                    deltas[idx] = delta;
+                    self.set_count(count + 1);
+                    Ok(true)
+                }
+            }
+        } else {
+            let count = self.len();
+            let delta = delta as u16;
+            let deltas = self.deltas_u16_mut();
+            match deltas[..count].binary_search(&delta) {
+                Ok(_) => Ok(false),
+                Err(idx) => {
+                    if count >= DELETION_U16_CAPACITY {
+                        return Err(DeletionListError::Full);
+                    }
+                    if idx < count {
+                        deltas.copy_within(idx..count, idx + 1);
+                    }
+                    deltas[idx] = delta;
+                    self.set_count(count + 1);
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> DeletionListIter<'_> {
+        if self.is_format_u32() {
+            DeletionListIter::U32 {
+                data: self.deltas_u32(),
+                index: 0,
+            }
+        } else {
+            DeletionListIter::U16 {
+                data: self.deltas_u16(),
+                index: 0,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn iter_row_ids(&self, start_row_id: RowID) -> impl Iterator<Item = RowID> + '_ {
+        self.iter()
+            .map(move |delta| start_row_id + delta as RowID)
+    }
+
+    #[inline]
+    fn set_count(&mut self, count: usize) {
+        self.data[1] = count as u8;
+    }
+
+    #[inline]
+    fn is_format_u32(&self) -> bool {
+        (self.data[0] & DELETION_FLAG_U32) != 0
+    }
+
+    #[inline]
+    fn set_format_u32(&mut self, enabled: bool) {
+        if enabled {
+            self.data[0] |= DELETION_FLAG_U32;
+        } else {
+            self.data[0] &= !DELETION_FLAG_U32;
+        }
+    }
+
+    #[inline]
+    fn deltas_u16(&self) -> &[u16] {
+        let count = self.len();
+        debug_assert!(count <= DELETION_U16_CAPACITY);
+        let end = DELETION_U16_OFFSET + count * 2;
+        cast_slice(&self.data[DELETION_U16_OFFSET..end])
+    }
+
+    #[inline]
+    fn deltas_u16_mut(&mut self) -> &mut [u16] {
+        cast_slice_mut(&mut self.data[DELETION_U16_OFFSET..])
+    }
+
+    #[inline]
+    fn deltas_u32(&self) -> &[u32] {
+        let count = self.len();
+        debug_assert!(count <= DELETION_U32_CAPACITY);
+        let end = DELETION_U32_OFFSET + count * 4;
+        cast_slice(&self.data[DELETION_U32_OFFSET..end])
+    }
+
+    #[inline]
+    fn deltas_u32_mut(&mut self) -> &mut [u32] {
+        cast_slice_mut(&mut self.data[DELETION_U32_OFFSET..])
+    }
+
+    fn promote_to_u32(&mut self) -> std::result::Result<(), DeletionListError> {
+        let count = self.len();
+        if count > DELETION_U32_CAPACITY {
+            return Err(DeletionListError::Full);
+        }
+        let mut temp = [0u32; DELETION_U32_CAPACITY];
+        for (idx, delta) in self.deltas_u16().iter().enumerate() {
+            temp[idx] = *delta as u32;
+        }
+        self.deltas_u32_mut()[..count].copy_from_slice(&temp[..count]);
+        self.set_format_u32(true);
+        Ok(())
+    }
+}
+
+pub enum DeletionListIter<'a> {
+    U16 { data: &'a [u16], index: usize },
+    U32 { data: &'a [u32], index: usize },
+}
+
+impl<'a> Iterator for DeletionListIter<'a> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            DeletionListIter::U16 { data, index } => {
+                let value = data.get(*index).copied().map(u32::from);
+                *index += 1;
+                value
+            }
+            DeletionListIter::U32 { data, index } => {
+                let value = data.get(*index).copied();
+                *index += 1;
+                value
+            }
+        }
     }
 }
 
@@ -648,6 +861,83 @@ mod tests {
         assert_eq!(node.leaf_start_row_ids(), &[10, 20]);
         assert_eq!(node.leaf_payloads()[0].block_id, 1);
         assert_eq!(node.leaf_payloads()[1].block_id, 2);
+    }
+
+    fn build_deletion_payload() -> ColumnPagePayload {
+        ColumnPagePayload {
+            block_id: 0,
+            deletion_field: [0u8; 120],
+        }
+    }
+
+    #[test]
+    fn test_deletion_list_empty() {
+        let mut payload = build_deletion_payload();
+        let list = payload.deletion_list();
+        assert_eq!(list.len(), 0);
+        assert!(!list.contains(10));
+        assert_eq!(list.iter().collect::<Vec<_>>(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn test_deletion_list_add_u16_full() {
+        let mut payload = build_deletion_payload();
+        let mut list = payload.deletion_list();
+        for delta in 0..DELETION_U16_CAPACITY as u32 {
+            assert_eq!(list.add(delta).unwrap(), true);
+        }
+        assert_eq!(list.len(), DELETION_U16_CAPACITY);
+        assert_eq!(
+            list.add(DELETION_U16_CAPACITY as u32).unwrap_err(),
+            DeletionListError::Full
+        );
+    }
+
+    #[test]
+    fn test_deletion_list_promotion_to_u32() {
+        let mut payload = build_deletion_payload();
+        let mut list = payload.deletion_list();
+        assert_eq!(list.add(10).unwrap(), true);
+        assert_eq!(list.add(5).unwrap(), true);
+        assert_eq!(list.add(u16::MAX as u32 + 4).unwrap(), true);
+        assert!(list.contains(u16::MAX as u32 + 4));
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.iter().collect::<Vec<_>>(), vec![5, 10, u16::MAX as u32 + 4]);
+    }
+
+    #[test]
+    fn test_deletion_list_promotion_full() {
+        let mut payload = build_deletion_payload();
+        let mut list = payload.deletion_list();
+        for delta in 0..(DELETION_U32_CAPACITY as u32 + 1) {
+            assert_eq!(list.add(delta).unwrap(), true);
+        }
+        assert_eq!(
+            list.add(u16::MAX as u32 + 1).unwrap_err(),
+            DeletionListError::Full
+        );
+    }
+
+    #[test]
+    fn test_deletion_list_sorted_and_duplicates() {
+        let mut payload = build_deletion_payload();
+        let mut list = payload.deletion_list();
+        assert_eq!(list.add(10).unwrap(), true);
+        assert_eq!(list.add(3).unwrap(), true);
+        assert_eq!(list.add(8).unwrap(), true);
+        assert_eq!(list.add(8).unwrap(), false);
+        assert_eq!(list.iter().collect::<Vec<_>>(), vec![3, 8, 10]);
+    }
+
+    #[test]
+    fn test_deletion_list_offloaded_flag() {
+        let mut payload = build_deletion_payload();
+        let mut list = payload.deletion_list();
+        assert!(!list.is_offloaded());
+        list.set_offloaded(true);
+        assert!(list.is_offloaded());
+        list.set_offloaded(false);
+        assert!(!list.is_offloaded());
     }
 
     fn build_test_metadata() -> Arc<TableMetadata> {
