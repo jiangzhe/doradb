@@ -529,10 +529,7 @@ impl ColumnBlockIndex {
     }
 
     async fn read_node(&self, page_id: PageID) -> Result<Box<ColumnBlockNode>> {
-        let buf = self.table_file.read_page(page_id).await?;
-        let node =
-            unsafe { std::ptr::read_unaligned(buf.data().as_ptr() as *const ColumnBlockNode) };
-        Ok(Box::new(node))
+        read_node_from_file(&self.table_file, page_id).await
     }
 
     async fn write_node(&self, page_id: PageID, node: ColumnBlockNode) -> Result<()> {
@@ -798,6 +795,47 @@ impl ColumnBlockIndex {
             start_row_id: node.header.start_row_id,
             extra_entries,
         })
+    }
+}
+
+#[inline]
+async fn read_node_from_file(
+    table_file: &TableFile,
+    page_id: PageID,
+) -> Result<Box<ColumnBlockNode>> {
+    let buf = table_file.read_page(page_id).await?;
+    let node = unsafe { std::ptr::read_unaligned(buf.data().as_ptr() as *const ColumnBlockNode) };
+    table_file.buf_list().recycle(buf);
+    Ok(Box::new(node))
+}
+
+/// Find the payload for a row id using the column block index stored in file.
+#[inline]
+pub async fn find_in_file(
+    table_file: &TableFile,
+    root_page_id: PageID,
+    row_id: RowID,
+) -> Result<Option<ColumnPagePayload>> {
+    if root_page_id == 0 {
+        return Ok(None);
+    }
+    let mut page_id = root_page_id;
+    loop {
+        let node = read_node_from_file(table_file, page_id).await?;
+        if node.is_leaf() {
+            let start_row_ids = node.leaf_start_row_ids();
+            let idx = match search_start_row_id(start_row_ids, row_id) {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+            return Ok(Some(node.leaf_payloads()[idx]));
+        }
+        let entries = node.branch_entries();
+        let idx = match search_branch_entry(entries, row_id) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        page_id = entries[idx].page_id;
     }
 }
 
