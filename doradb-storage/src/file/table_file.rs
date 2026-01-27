@@ -196,7 +196,7 @@ impl TableFile {
             alloc_map: meta_page.space_map,
             gc_page_list: meta_page.gc_page_list,
             metadata: Arc::new(meta_page.schema),
-            block_index: meta_page.block_index,
+            column_block_index_root: meta_page.column_block_index_root,
             meta_page_id,
         })
     }
@@ -413,70 +413,49 @@ impl MutableTableFile {
     }
 
     pub async fn persist_lwc_pages(
-        self,
+        mut self,
         lwc_pages: Vec<LwcPagePersist>,
         heap_redo_start_cts: TrxID,
         ts: TrxID,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        let MutableTableFile {
-            table_file,
-            mut active_root,
-        } = self;
-
-        let mut max_row_id = active_root.pivot_row_id;
+        let mut max_row_id = self.active_root.pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_pages.len());
         let mut new_entries = Vec::with_capacity(lwc_pages.len());
+        let mut last_end = self.active_root.pivot_row_id;
 
         for page in lwc_pages {
             if page.start_row_id >= page.end_row_id {
                 return Err(Error::InvalidArgument);
             }
-            let page_id = active_root
+            let page_id = self
+                .active_root
                 .alloc_map
                 .try_allocate()
                 .ok_or(Error::InvalidState)? as PageID;
             max_row_id = max_row_id.max(page.end_row_id);
-            new_entries.push((page.start_row_id, page.end_row_id, page_id));
-            writes.push(table_file.write_page(page_id, page.buf));
+            if page.start_row_id < last_end {
+                return Err(Error::InvalidArgument);
+            }
+            last_end = page.end_row_id;
+            new_entries.push((page.start_row_id, page_id as u64));
+            writes.push(self.table_file.write_page(page_id, page.buf));
         }
 
         try_join_all(writes).await?;
 
-        let mut builder = BlockIndexArrayBuilder::default();
-        for idx in 0..active_root.block_index.starts.len() {
-            let start = active_root.block_index.starts[idx];
-            let delta = active_root.block_index.deltas[idx];
-            let page = active_root.block_index.pages[idx];
-            builder.push(start, start + delta, page);
-        }
+        let column_index = crate::index::column_block_index::ColumnBlockIndex::new(
+            Arc::clone(&self.table_file),
+            self.active_root.column_block_index_root,
+            self.active_root.pivot_row_id,
+        );
+        let new_root = column_index
+            .batch_insert(&mut self, &new_entries, max_row_id, ts)
+            .await?;
+        self.active_root.column_block_index_root = new_root;
+        self.active_root.pivot_row_id = max_row_id;
+        self.active_root.heap_redo_start_cts = heap_redo_start_cts;
 
-        let mut last_end = active_root
-            .block_index
-            .starts
-            .last()
-            .zip(active_root.block_index.deltas.last())
-            .map(|(start, delta)| start + delta);
-
-        for (start_row_id, end_row_id, page_id) in new_entries {
-            if let Some(prev_end) = last_end {
-                if start_row_id < prev_end {
-                    return Err(Error::InvalidArgument);
-                }
-            }
-            builder.push(start_row_id, end_row_id, page_id);
-            last_end = Some(end_row_id);
-        }
-
-        active_root.block_index = builder.build();
-        active_root.pivot_row_id = max_row_id;
-        active_root.heap_redo_start_cts = heap_redo_start_cts;
-
-        MutableTableFile {
-            table_file,
-            active_root,
-        }
-        .commit(ts, false)
-        .await
+        self.commit(ts, false).await
     }
 
     #[inline]
@@ -515,8 +494,8 @@ pub struct ActiveRoot {
     pub gc_page_list: Vec<PageID>,
     /// Metadata of this table.
     pub metadata: Arc<TableMetadata>,
-    /// Block index array.
-    pub block_index: BlockIndexArray,
+    /// Root page id of column block index.
+    pub column_block_index_root: PageID,
     /// Current meta page id.
     pub meta_page_id: PageID,
     // page index (todo): this is two-layer index, persistent block index
@@ -544,7 +523,7 @@ impl ActiveRoot {
             alloc_map,
             gc_page_list: vec![],
             metadata,
-            block_index: BlockIndexArray::builder().build(),
+            column_block_index_root: 0,
             meta_page_id: 0,
         }
     }
@@ -568,7 +547,7 @@ impl ActiveRoot {
     pub fn meta_page_ser_view(&self) -> MetaPageSerView<'_> {
         MetaPageSerView::new(
             self.metadata.ser_view(),
-            &self.block_index,
+            self.column_block_index_root,
             &self.alloc_map,
             &self.gc_page_list,
             self.pivot_row_id,
@@ -599,92 +578,6 @@ impl Drop for OldRoot {
 }
 
 unsafe impl Send for OldRoot {}
-
-/// BlockIndexArray
-///
-/// Flatten array for mapping between rowid range
-/// and pages.
-/// it uses struct of array instead of array of struct.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockIndexArray {
-    pub(super) starts: Box<[RowID]>,
-    pub(super) deltas: Box<[RowID]>,
-    pub(super) pages: Box<[PageID]>,
-}
-
-impl BlockIndexArray {
-    /// Binary search the given row id.
-    #[inline]
-    pub fn binary_search(&self, row_id: RowID) -> Option<usize> {
-        match self.starts.binary_search(&row_id) {
-            Ok(idx) => {
-                // equal to start row id.
-                Some(idx)
-            }
-            Err(0) => {
-                // less than start row id.
-                None
-            }
-            Err(idx) => {
-                // check if given row id less than last end row id.
-                let idx = idx - 1;
-                if row_id < self.starts[idx] + self.deltas[idx] {
-                    Some(idx)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    /// get row id range and page id at given position.
-    #[inline]
-    pub fn get(&self, idx: usize) -> Option<(RowID, RowID, PageID)> {
-        match (
-            self.starts.get(idx),
-            self.deltas.get(idx),
-            self.pages.get(idx),
-        ) {
-            (Some(&start), Some(&delta), Some(&page)) => Some((start, start + delta, page)),
-            _ => None,
-        }
-    }
-
-    /// create a builder to build new array.
-    #[inline]
-    pub fn builder() -> BlockIndexArrayBuilder {
-        BlockIndexArrayBuilder::default()
-    }
-}
-
-#[derive(Default)]
-pub struct BlockIndexArrayBuilder(Vec<(RowID, RowID, PageID)>);
-
-impl BlockIndexArrayBuilder {
-    #[inline]
-    pub fn push(&mut self, start: RowID, end: RowID, page: PageID) {
-        debug_assert!(start < end);
-        debug_assert!({ self.0.is_empty() || (self.0.last().unwrap().2 <= start) });
-        self.0.push((start, end - start, page));
-    }
-
-    #[inline]
-    pub fn build(self) -> BlockIndexArray {
-        let mut starts: Vec<RowID> = Vec::with_capacity(self.0.len());
-        let mut deltas: Vec<RowID> = Vec::with_capacity(self.0.len());
-        let mut pages: Vec<PageID> = Vec::with_capacity(self.0.len());
-        for (start, delta, page) in self.0 {
-            starts.push(start);
-            deltas.push(delta);
-            pages.push(page);
-        }
-        BlockIndexArray {
-            starts: starts.into_boxed_slice(),
-            deltas: deltas.into_boxed_slice(),
-            pages: pages.into_boxed_slice(),
-        }
-    }
-}
 
 #[inline]
 fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
@@ -838,16 +731,17 @@ mod tests {
             assert_eq!(active_root.trx_id, 2);
             assert_eq!(active_root.pivot_row_id, 20);
             assert_eq!(active_root.heap_redo_start_cts, 7);
-            assert_eq!(active_root.block_index.starts.len(), 2);
-            assert_eq!(active_root.block_index.starts[0], 0);
-            assert_eq!(active_root.block_index.deltas[0], 10);
-            assert_eq!(active_root.block_index.starts[1], 10);
-            assert_eq!(active_root.block_index.deltas[1], 10);
+            assert_ne!(active_root.column_block_index_root, 0);
 
-            let page_id_1 = active_root.block_index.pages[0];
-            let page_id_2 = active_root.block_index.pages[1];
-            let page1 = table_file.read_page(page_id_1).await.unwrap();
-            let page2 = table_file.read_page(page_id_2).await.unwrap();
+            let column_index = crate::index::column_block_index::ColumnBlockIndex::new(
+                Arc::clone(&table_file),
+                active_root.column_block_index_root,
+                active_root.pivot_row_id,
+            );
+            let payload1 = column_index.find(0).await.unwrap().unwrap();
+            let payload2 = column_index.find(15).await.unwrap().unwrap();
+            let page1 = table_file.read_page(payload1.block_id).await.unwrap();
+            let page2 = table_file.read_page(payload2.block_id).await.unwrap();
             assert_eq!(&page1.as_bytes()[..10], b"lwc-page-1");
             assert_eq!(&page2.as_bytes()[..10], b"lwc-page-2");
 
@@ -886,7 +780,7 @@ mod tests {
             assert!(matches!(result, Err(Error::InvalidArgument)));
             let active_root = table_file.active_root();
             assert_eq!(active_root.pivot_row_id, 0);
-            assert!(active_root.block_index.starts.is_empty());
+            assert_eq!(active_root.column_block_index_root, 0);
 
             drop(table_file);
             drop(fs);
@@ -894,116 +788,4 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_block_index_array_builder() {
-        // Test empty builder
-        let builder = BlockIndexArrayBuilder::default();
-        let array = builder.build();
-        assert!(array.starts.is_empty());
-        assert!(array.deltas.is_empty());
-        assert!(array.pages.is_empty());
-
-        // Test single entry
-        let mut builder = BlockIndexArrayBuilder::default();
-        builder.push(0, 100, 1);
-        let array = builder.build();
-        assert_eq!(array.starts.len(), 1);
-        assert_eq!(array.deltas.len(), 1);
-        assert_eq!(array.pages.len(), 1);
-        assert_eq!(array.starts[0], 0);
-        assert_eq!(array.deltas[0], 100);
-        assert_eq!(array.pages[0], 1);
-
-        // Test multiple entries
-        let mut builder = BlockIndexArrayBuilder::default();
-        builder.push(0, 100, 1);
-        builder.push(100, 200, 2);
-        builder.push(200, 300, 3);
-        let array = builder.build();
-        assert_eq!(array.starts.len(), 3);
-        assert_eq!(array.deltas.len(), 3);
-        assert_eq!(array.pages.len(), 3);
-        assert_eq!(array.starts[0], 0);
-        assert_eq!(array.deltas[0], 100);
-        assert_eq!(array.pages[0], 1);
-        assert_eq!(array.starts[1], 100);
-        assert_eq!(array.deltas[1], 100);
-        assert_eq!(array.pages[1], 2);
-        assert_eq!(array.starts[2], 200);
-        assert_eq!(array.deltas[2], 100);
-        assert_eq!(array.pages[2], 3);
-    }
-
-    #[test]
-    fn test_block_index_array() {
-        // Build a test array
-        let mut builder = BlockIndexArrayBuilder::default();
-        builder.push(0, 100, 1);
-        builder.push(100, 200, 2);
-        builder.push(200, 300, 3);
-        let array = builder.build();
-
-        // Test get method
-        assert_eq!(array.get(0), Some((0, 100, 1)));
-        assert_eq!(array.get(1), Some((100, 200, 2)));
-        assert_eq!(array.get(2), Some((200, 300, 3)));
-        assert_eq!(array.get(3), None);
-        assert_eq!(array.get(usize::MAX), None);
-
-        // Test binary_search method
-        // Exact match with start
-        assert_eq!(array.binary_search(0), Some(0));
-        assert_eq!(array.binary_search(100), Some(1));
-        assert_eq!(array.binary_search(200), Some(2));
-
-        // Within range
-        assert_eq!(array.binary_search(50), Some(0));
-        assert_eq!(array.binary_search(150), Some(1));
-        assert_eq!(array.binary_search(250), Some(2));
-
-        // Edge cases: end-1
-        assert_eq!(array.binary_search(99), Some(0));
-        assert_eq!(array.binary_search(199), Some(1));
-        assert_eq!(array.binary_search(299), Some(2));
-
-        // Edge cases: equal to end (not in range)
-        assert_eq!(array.binary_search(100), Some(1)); // 100 is start of second range
-        assert_eq!(array.binary_search(200), Some(2)); // 200 is start of third range
-        assert_eq!(array.binary_search(300), None); // 300 is end of third range, not in range
-
-        // Out of range
-        assert_eq!(array.binary_search(300), None); // equal to end
-        assert_eq!(array.binary_search(400), None); // greater than all
-        assert_eq!(array.binary_search(u64::MAX), None); // maximum value
-
-        // Test empty array
-        let empty_builder = BlockIndexArrayBuilder::default();
-        let empty_array = empty_builder.build();
-        assert_eq!(empty_array.binary_search(0), None);
-        assert_eq!(empty_array.binary_search(100), None);
-        assert_eq!(empty_array.binary_search(u64::MAX), None);
-
-        // Test with non-contiguous ranges
-        let mut builder2 = BlockIndexArrayBuilder::default();
-        builder2.push(0, 50, 1);
-        builder2.push(100, 150, 2); // gap between 50 and 100
-        builder2.push(200, 250, 3); // gap between 150 and 200
-        let array2 = builder2.build();
-
-        assert_eq!(array2.binary_search(0), Some(0));
-        assert_eq!(array2.binary_search(25), Some(0));
-        assert_eq!(array2.binary_search(49), Some(0));
-        assert_eq!(array2.binary_search(50), None); // equal to end, not in range
-        assert_eq!(array2.binary_search(75), None); // in gap
-        assert_eq!(array2.binary_search(100), Some(1));
-        assert_eq!(array2.binary_search(125), Some(1));
-        assert_eq!(array2.binary_search(149), Some(1));
-        assert_eq!(array2.binary_search(150), None); // equal to end
-        assert_eq!(array2.binary_search(175), None); // in gap
-        assert_eq!(array2.binary_search(200), Some(2));
-        assert_eq!(array2.binary_search(225), Some(2));
-        assert_eq!(array2.binary_search(249), Some(2));
-        assert_eq!(array2.binary_search(250), None); // equal to end
-        assert_eq!(array2.binary_search(300), None); // beyond all ranges
-    }
 }
