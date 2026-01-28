@@ -56,6 +56,7 @@ fn main() {
                 table_id,
                 table_file.active_root().pivot_row_id,
                 table_file.active_root_ptr(),
+                Arc::clone(&table_file),
             )
             .await;
             let blk_idx = Box::leak(Box::new(blk_idx));

@@ -9,7 +9,7 @@ use crate::error::{
     Validation::{Invalid, Valid},
 };
 use crate::file::table_file::{ActiveRoot, TableFile};
-use crate::index::column_block_index;
+use crate::index::find_in_file;
 use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
 use crate::latch::HybridLatch;
 use crate::latch::LatchFallbackMode;
@@ -439,11 +439,7 @@ impl BlockIndex {
                         Some(root) => root,
                         None => return RowLocation::NotFound,
                     };
-                    match column_block_index::find_in_file(
-                        &self.table_file,
-                        file_root,
-                        row_id,
-                    )
+                    match find_in_file(&self.table_file, file_root, row_id)
                     .await
                     {
                         Ok(Some(payload)) => {
@@ -753,10 +749,7 @@ impl BlockIndex {
     async fn try_find_row(&self, row_id: RowID) -> Validation<RowLocation> {
         let root = match self.root.guide(row_id) {
             Left(file_root) => {
-                let payload =
-                    match column_block_index::find_in_file(&self.table_file, file_root, row_id)
-                        .await
-                    {
+                let payload = match find_in_file(&self.table_file, file_root, row_id).await {
                         Ok(payload) => payload,
                         Err(_) => return Valid(RowLocation::NotFound),
                     };

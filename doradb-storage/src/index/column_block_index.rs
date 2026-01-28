@@ -508,9 +508,9 @@ impl ColumnBlockIndex {
         height: u32,
         start_row_id: RowID,
         create_ts: u64,
-    ) -> Result<(PageID, ColumnBlockNode)> {
+    ) -> Result<(PageID, Box<ColumnBlockNode>)> {
         let page_id = table_file.allocate_page_id()?;
-        let node = ColumnBlockNode::new(height, start_row_id, create_ts);
+        let node = Box::new(ColumnBlockNode::new(height, start_row_id, create_ts));
         Ok((page_id, node))
     }
 
@@ -532,16 +532,15 @@ impl ColumnBlockIndex {
         read_node_from_file(&self.table_file, page_id).await
     }
 
-    async fn write_node(&self, page_id: PageID, node: ColumnBlockNode) -> Result<()> {
+    async fn write_node(&self, page_id: PageID, node: &ColumnBlockNode) -> Result<()> {
         let mut buf = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
         unsafe {
             std::ptr::copy_nonoverlapping(
-                &node as *const ColumnBlockNode as *const u8,
+                node as *const ColumnBlockNode as *const u8,
                 buf.data_mut().as_mut_ptr(),
                 COLUMN_BLOCK_PAGE_SIZE,
             );
         }
-        drop(node);
         self.table_file.write_page(page_id, buf).await
     }
 
@@ -581,7 +580,7 @@ impl ColumnBlockIndex {
                     };
                 }
             }
-            self.write_node(page_id, node).await?;
+            self.write_node(page_id, &node).await?;
             leaf_entries.push(ColumnBlockBranchEntry {
                 start_row_id: chunk[0].0,
                 page_id,
@@ -603,7 +602,7 @@ impl ColumnBlockIndex {
                     self.allocate_node(mutable_file, height, entries[0].start_row_id, create_ts)?;
                 node.header.count = entries.len() as u32;
                 node.branch_entries_mut().copy_from_slice(&entries);
-                self.write_node(page_id, node).await?;
+                self.write_node(page_id, &node).await?;
                 return Ok(page_id);
             }
             let mut next_entries = Vec::new();
@@ -612,7 +611,7 @@ impl ColumnBlockIndex {
                     self.allocate_node(mutable_file, height, chunk[0].start_row_id, create_ts)?;
                 node.header.count = chunk.len() as u32;
                 node.branch_entries_mut().copy_from_slice(chunk);
-                self.write_node(page_id, node).await?;
+                self.write_node(page_id, &node).await?;
                 next_entries.push(ColumnBlockBranchEntry {
                     start_row_id: chunk[0].start_row_id,
                     page_id,
@@ -699,7 +698,7 @@ impl ColumnBlockIndex {
                 };
             }
         }
-        self.write_node(new_page_id, new_node).await?;
+        self.write_node(new_page_id, &new_node).await?;
         self.record_obsolete_node(mutable_file, page_id)?;
 
         remaining = &remaining[take..];
@@ -720,7 +719,7 @@ impl ColumnBlockIndex {
                     };
                 }
             }
-            self.write_node(page_id, leaf_node).await?;
+            self.write_node(page_id, &leaf_node).await?;
             extra_entries.push(ColumnBlockBranchEntry {
                 start_row_id: chunk[0].0,
                 page_id,
@@ -766,7 +765,7 @@ impl ColumnBlockIndex {
         new_node
             .branch_entries_mut()
             .copy_from_slice(&remaining[..first_len]);
-        self.write_node(new_page_id, new_node).await?;
+        self.write_node(new_page_id, &new_node).await?;
         self.record_obsolete_node(mutable_file, page_id)?;
 
         remaining = &remaining[first_len..];
@@ -782,7 +781,7 @@ impl ColumnBlockIndex {
             )?;
             branch_node.header.count = chunk_len as u32;
             branch_node.branch_entries_mut().copy_from_slice(chunk);
-            self.write_node(page_id, branch_node).await?;
+            self.write_node(page_id, &branch_node).await?;
             extra_entries.push(ColumnBlockBranchEntry {
                 start_row_id: chunk[0].start_row_id,
                 page_id,
@@ -804,9 +803,16 @@ async fn read_node_from_file(
     page_id: PageID,
 ) -> Result<Box<ColumnBlockNode>> {
     let buf = table_file.read_page(page_id).await?;
-    let node = unsafe { std::ptr::read_unaligned(buf.data().as_ptr() as *const ColumnBlockNode) };
+    let mut node = Box::<ColumnBlockNode>::new_uninit();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buf.data().as_ptr(),
+            node.as_mut_ptr() as *mut u8,
+            COLUMN_BLOCK_PAGE_SIZE,
+        );
+    }
     table_file.buf_list().recycle(buf);
-    Ok(Box::new(node))
+    Ok(unsafe { node.assume_init() })
 }
 
 /// Find the payload for a row id using the column block index stored in file.
