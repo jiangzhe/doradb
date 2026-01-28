@@ -443,7 +443,7 @@ impl MutableTableFile {
 
         try_join_all(writes).await?;
 
-        let column_index = crate::index::column_block_index::ColumnBlockIndex::new(
+        let column_index = crate::index::ColumnBlockIndex::new(
             Arc::clone(&self.table_file),
             self.active_root.column_block_index_root,
             self.active_root.pivot_row_id,
@@ -594,6 +594,7 @@ mod tests {
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
     use crate::value::ValKind;
+    use tempfile::TempDir;
 
     #[test]
     fn test_table_file() {
@@ -702,7 +703,11 @@ mod tests {
     #[test]
     fn test_persist_lwc_pages_appends_entries() {
         smol::block_on(async {
-            let fs = TableFileSystemConfig::default().build().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(43, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
@@ -733,7 +738,7 @@ mod tests {
             assert_eq!(active_root.heap_redo_start_cts, 7);
             assert_ne!(active_root.column_block_index_root, 0);
 
-            let column_index = crate::index::column_block_index::ColumnBlockIndex::new(
+            let column_index = crate::index::ColumnBlockIndex::new(
                 Arc::clone(&table_file),
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,
@@ -754,7 +759,11 @@ mod tests {
     #[test]
     fn test_persist_lwc_pages_rejects_overlapping_ranges() {
         smol::block_on(async {
-            let fs = TableFileSystemConfig::default().build().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(44, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
