@@ -16,6 +16,7 @@ use crate::lifetime::StaticLifetime;
 use crate::table::Table;
 use crate::trx::sys::TransactionSystem;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ROW_ID_COL_NAME: &str = "__row_id";
@@ -181,6 +182,7 @@ impl Catalog {
                     table.table_id,
                     row_id_bound,
                     table_file.active_root_ptr(),
+                    Arc::clone(&table_file),
                 )
                 .await;
                 let table =

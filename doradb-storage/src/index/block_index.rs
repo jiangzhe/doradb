@@ -8,7 +8,8 @@ use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
 };
-use crate::file::table_file::ActiveRoot;
+use crate::file::table_file::{ActiveRoot, TableFile};
+use crate::index::find_in_file;
 use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
 use crate::latch::HybridLatch;
 use crate::latch::LatchFallbackMode;
@@ -285,6 +286,7 @@ pub struct BlockIndex {
     insert_free_list: Mutex<Vec<PageID>>,
     // Fixed buffer pool to hold block nodes.
     pool: &'static FixedBufferPool,
+    table_file: Arc<TableFile>,
     // Reference to storage engine,
     // used for committing new page.
     page_committer: Mutex<Option<RedoLogPageCommitter>>,
@@ -298,6 +300,7 @@ impl BlockIndex {
         table_id: TableID,
         pivot: RowID,
         file_root: AtomicPtr<ActiveRoot>,
+        table_file: Arc<TableFile>,
     ) -> Self {
         let mut g = pool.allocate_page::<BlockNode>().await;
         let page_id = g.page_id();
@@ -310,6 +313,7 @@ impl BlockIndex {
             height: AtomicUsize::new(0),
             pool,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
+            table_file,
             page_committer: Mutex::new(None),
         }
     }
@@ -431,12 +435,17 @@ impl BlockIndex {
                 RowLocation::NotFound => {
                     // If not found in row store, re-check if transfered
                     // to column store.
-                    match self
-                        .root
-                        .try_file(row_id, |_| todo!("search row id in file"))
-                    {
-                        Some(page_id) => return RowLocation::LwcPage(page_id),
+                    let file_root = match self.root.try_file(row_id) {
+                        Some(root) => root,
                         None => return RowLocation::NotFound,
+                    };
+                    match find_in_file(&self.table_file, file_root, row_id)
+                    .await
+                    {
+                        Ok(Some(payload)) => {
+                            return RowLocation::LwcPage(payload.block_id as PageID)
+                        }
+                        Ok(None) | Err(_) => return RowLocation::NotFound,
                     }
                 }
                 found => return found,
@@ -739,7 +748,16 @@ impl BlockIndex {
     #[inline]
     async fn try_find_row(&self, row_id: RowID) -> Validation<RowLocation> {
         let root = match self.root.guide(row_id) {
-            Left(_) => todo!("search row id in file"),
+            Left(file_root) => {
+                let payload = match find_in_file(&self.table_file, file_root, row_id).await {
+                        Ok(payload) => payload,
+                        Err(_) => return Valid(RowLocation::NotFound),
+                    };
+                return Valid(match payload {
+                    Some(payload) => RowLocation::LwcPage(payload.block_id as PageID),
+                    None => RowLocation::NotFound,
+                });
+            }
             Right(mem) => mem,
         };
         let mut g = self
@@ -845,7 +863,7 @@ impl BlockIndexRoot {
     /// The search path can be determined by comparison
     /// to pivot row id.
     #[inline]
-    pub fn guide(&self, row_id: RowID) -> Either<&ActiveRoot, PageID> {
+    pub fn guide(&self, row_id: RowID) -> Either<PageID, PageID> {
         loop {
             unsafe {
                 let g = self.latch.optimistic_spin();
@@ -855,7 +873,7 @@ impl BlockIndexRoot {
                     let file_root = self.file.load(Ordering::Acquire);
                     if g.validate() {
                         // safe to dereference if version is unchanged.
-                        return Left(&*file_root);
+                        return Left((*file_root).column_block_index_root);
                     } else {
                         continue; // retry
                     }
@@ -870,7 +888,7 @@ impl BlockIndexRoot {
 
     /// Try to serach row id in file if row id within boundary.
     #[inline]
-    pub fn try_file<T, F: Fn(&ActiveRoot) -> Option<T>>(&self, row_id: RowID, f: F) -> Option<T> {
+    pub fn try_file(&self, row_id: RowID) -> Option<PageID> {
         loop {
             unsafe {
                 let g = self.latch.optimistic_spin();
@@ -880,7 +898,7 @@ impl BlockIndexRoot {
                     let file_root = self.file.load(Ordering::Acquire);
                     if g.validate() {
                         // safe to dereference if version is unchanged.
-                        return f(&*file_root);
+                        return Some((*file_root).column_block_index_root);
                     } else {
                         continue; // retry
                     }
@@ -1051,6 +1069,7 @@ mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::engine::EngineConfig;
+    use crate::file::table_fs::TableFileSystemConfig;
     use crate::lifetime::StaticLifetime;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::ValKind;
@@ -1092,9 +1111,14 @@ mod tests {
                     .create_table_file(table_id, metadata, true)
                     .unwrap();
                 let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
-                let blk_idx =
-                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
-                        .await;
+                let blk_idx = BlockIndex::new(
+                    engine.meta_pool,
+                    table_id,
+                    0,
+                    table_file.active_root_ptr(),
+                    Arc::clone(&table_file),
+                )
+                .await;
                 let p1 = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
@@ -1143,9 +1167,14 @@ mod tests {
                     .create_table_file(table_id, metadata, true)
                     .unwrap();
                 let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
-                let blk_idx =
-                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
-                        .await;
+                let blk_idx = BlockIndex::new(
+                    engine.meta_pool,
+                    table_id,
+                    0,
+                    table_file.active_root_ptr(),
+                    Arc::clone(&table_file),
+                )
+                .await;
                 let p1 = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
@@ -1196,9 +1225,14 @@ mod tests {
                     .create_table_file(table_id, metadata, true)
                     .unwrap();
                 let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
-                let blk_idx =
-                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
-                        .await;
+                let blk_idx = BlockIndex::new(
+                    engine.meta_pool,
+                    table_id,
+                    0,
+                    table_file.active_root_ptr(),
+                    Arc::clone(&table_file),
+                )
+                .await;
                 for _ in 0..row_pages {
                     let _ = blk_idx.get_insert_page(engine.data_pool, 100).await;
                 }
@@ -1269,9 +1303,14 @@ mod tests {
                     .create_table_file(table_id, metadata, true)
                     .unwrap();
                 let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
-                let blk_idx =
-                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
-                        .await;
+                let blk_idx = BlockIndex::new(
+                    engine.meta_pool,
+                    table_id,
+                    0,
+                    table_file.active_root_ptr(),
+                    Arc::clone(&table_file),
+                )
+                .await;
                 for _ in 0..row_pages {
                     let _ = blk_idx
                         .get_insert_page(engine.data_pool, rows_per_page)
@@ -1350,9 +1389,14 @@ mod tests {
                     .create_table_file(table_id, metadata, true)
                     .unwrap();
                 let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
-                let blk_idx =
-                    BlockIndex::new(engine.meta_pool, table_id, 0, table_file.active_root_ptr())
-                        .await;
+                let blk_idx = BlockIndex::new(
+                    engine.meta_pool,
+                    table_id,
+                    0,
+                    table_file.active_root_ptr(),
+                    Arc::clone(&table_file),
+                )
+                .await;
                 // create a new page for rowid=0..100
                 let _ = blk_idx
                     .get_insert_page(engine.data_pool, rows_per_page)
@@ -1367,9 +1411,30 @@ mod tests {
     fn test_block_index_split() {
         smol::block_on(async {
             let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let metadata = Arc::new(TableMetadata::new(
+                vec![ColumnSpec {
+                    column_name: SemiStr::new("id"),
+                    column_type: ValKind::I32,
+                    column_attributes: ColumnAttributes::empty(),
+                }],
+                vec![first_i32_unique_index()],
+            ));
+            let uninit_table_file = fs.create_table_file(1, metadata, true).unwrap();
+            let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
             {
-                let blk_idx =
-                    BlockIndex::new(pool, 1, 0, AtomicPtr::new(std::ptr::null_mut())).await;
+                let blk_idx = BlockIndex::new(
+                    pool,
+                    1,
+                    0,
+                    table_file.active_root_ptr(),
+                    Arc::clone(&table_file),
+                )
+                .await;
                 assert!(!blk_idx.is_page_committer_enabled());
                 assert!(blk_idx.height() == 0);
                 for row_page_id in 0..10000 {

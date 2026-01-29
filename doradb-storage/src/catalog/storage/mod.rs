@@ -54,6 +54,7 @@ impl CatalogStorage {
                 *table_id,
                 table_file.active_root().pivot_row_id,
                 table_file.active_root_ptr(),
+                Arc::clone(&table_file),
             )
             .await;
             let table = Table::new(data_pool, index_pool, blk_idx, table_file).await;

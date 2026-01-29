@@ -2,7 +2,6 @@ use crate::bitmap::AllocMap;
 use crate::buffer::page::PageID;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
 use crate::error::Result;
-use crate::file::table_file::BlockIndexArray;
 use crate::lwc::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, Serde};
@@ -15,7 +14,7 @@ pub struct MetaPage {
     pub heap_redo_start_cts: TrxID,
     pub delta_rec_ts: TrxID,
     pub schema: TableMetadata,
-    pub block_index: BlockIndexArray,
+    pub column_block_index_root: PageID,
     pub space_map: AllocMap,
     pub gc_page_list: Vec<PageID>,
 }
@@ -29,7 +28,7 @@ impl Deser for MetaPage {
         let (idx, space_map) = AllocMap::deser(input, idx)?;
         let (idx, gc_page_list) = LwcPrimitiveDeser::<PageID>::deser(input, idx)?;
         let (idx, meta) = TableBriefMetadata::deser(input, idx)?;
-        let (idx, block_index) = MetaPageBlockIndexDeser::deser(input, idx)?;
+        let (idx, column_block_index_root) = input.deser_u64(idx)?;
         Ok((
             idx,
             MetaPage {
@@ -37,7 +36,7 @@ impl Deser for MetaPage {
                 heap_redo_start_cts,
                 delta_rec_ts,
                 schema: TableMetadata::from(meta),
-                block_index: block_index.into(),
+                column_block_index_root,
                 space_map,
                 gc_page_list: gc_page_list.0,
             },
@@ -50,7 +49,7 @@ pub struct MetaPageSerView<'a> {
     pub heap_redo_start_cts: TrxID,
     pub delta_rec_ts: TrxID,
     pub schema: TableBriefMetadataSerView<'a>,
-    pub block_index: MetaPageBlockIndexSerView<'a>,
+    pub column_block_index_root: PageID,
     pub space_map: &'a AllocMap,
     pub gc_page_list: MetaPageGcListSerView<'a>,
 }
@@ -59,7 +58,7 @@ impl<'a> MetaPageSerView<'a> {
     #[inline]
     pub fn new(
         schema: TableBriefMetadataSerView<'a>,
-        block_index: &'a BlockIndexArray,
+        column_block_index_root: PageID,
         space_map: &'a AllocMap,
         gc_page_list: &'a [PageID],
         pivot_row_id: RowID,
@@ -71,7 +70,7 @@ impl<'a> MetaPageSerView<'a> {
             heap_redo_start_cts,
             delta_rec_ts,
             schema,
-            block_index: MetaPageBlockIndexSerView::new(block_index),
+            column_block_index_root,
             space_map,
             gc_page_list: MetaPageGcListSerView::new(gc_page_list),
         }
@@ -87,7 +86,7 @@ impl<'a> Ser<'a> for MetaPageSerView<'a> {
             + self.space_map.ser_len()
             + self.gc_page_list.ser_len()
             + self.schema.ser_len()
-            + self.block_index.ser_len()
+            + mem::size_of::<PageID>()
     }
 
     #[inline]
@@ -98,7 +97,7 @@ impl<'a> Ser<'a> for MetaPageSerView<'a> {
         let idx = self.space_map.ser(out, idx);
         let idx = self.gc_page_list.ser(out, idx);
         let idx = self.schema.ser(out, idx);
-        self.block_index.ser(out, idx)
+        out.ser_u64(idx, self.column_block_index_root)
     }
 }
 
@@ -120,71 +119,6 @@ impl<'a> Ser<'a> for MetaPageGcListSerView<'a> {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         self.0.ser(out, start_idx)
-    }
-}
-
-pub struct MetaPageBlockIndexSerView<'a> {
-    s: LwcPrimitiveSer<'a>,
-    d: LwcPrimitiveSer<'a>,
-    p: LwcPrimitiveSer<'a>,
-}
-
-impl<'a> MetaPageBlockIndexSerView<'a> {
-    #[inline]
-    pub fn new(block_index: &'a BlockIndexArray) -> Self {
-        MetaPageBlockIndexSerView {
-            s: LwcPrimitiveSer::new_u64(&block_index.starts),
-            d: LwcPrimitiveSer::new_u64(&block_index.deltas),
-            p: LwcPrimitiveSer::new_u64(&block_index.pages),
-        }
-    }
-}
-
-impl<'a> Ser<'a> for MetaPageBlockIndexSerView<'a> {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        self.s.ser_len() + self.d.ser_len() + self.p.ser_len()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = self.s.ser(out, start_idx);
-        let idx = self.d.ser(out, idx);
-        self.p.ser(out, idx)
-    }
-}
-
-pub struct MetaPageBlockIndexDeser {
-    s: Vec<RowID>,
-    d: Vec<RowID>,
-    p: Vec<PageID>,
-}
-
-impl From<MetaPageBlockIndexDeser> for BlockIndexArray {
-    #[inline]
-    fn from(value: MetaPageBlockIndexDeser) -> Self {
-        BlockIndexArray {
-            starts: value.s.into_boxed_slice(),
-            deltas: value.d.into_boxed_slice(),
-            pages: value.p.into_boxed_slice(),
-        }
-    }
-}
-
-impl Deser for MetaPageBlockIndexDeser {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, s) = LwcPrimitiveDeser::<RowID>::deser(input, start_idx)?;
-        let (idx, d) = LwcPrimitiveDeser::<RowID>::deser(input, idx)?;
-        let (idx, p) = LwcPrimitiveDeser::<PageID>::deser(input, idx)?;
-        Ok((
-            idx,
-            MetaPageBlockIndexDeser {
-                s: s.0,
-                d: d.0,
-                p: p.0,
-            },
-        ))
     }
 }
 
@@ -218,7 +152,10 @@ mod tests {
 
         let (_, meta_page) = MetaPage::deser(&data[..], 0).unwrap();
         assert_eq!(meta_page.schema, *active_root.metadata);
-        assert_eq!(meta_page.block_index, active_root.block_index);
+        assert_eq!(
+            meta_page.column_block_index_root,
+            active_root.column_block_index_root
+        );
         assert_eq!(meta_page.space_map, active_root.alloc_map);
         assert_eq!(meta_page.gc_page_list, active_root.gc_page_list);
         assert_eq!(meta_page.pivot_row_id, active_root.pivot_row_id);
