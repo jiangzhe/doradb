@@ -24,6 +24,10 @@ Describe implementation plan, including important changes on files, structs, tra
 
 Related modules, files, structs, traits and functions.
 
+## Test Cases
+
+Summarize test scenarios that should be covered to verify code correctness.
+
 ## Open Questions
 
 Issues that can not be solved in this task scope, and possible follow-ups.
