@@ -458,6 +458,20 @@ impl MutableTableFile {
         self.commit(ts, false).await
     }
 
+    pub async fn update_checkpoint(
+        mut self,
+        pivot_row_id: RowID,
+        heap_redo_start_cts: TrxID,
+        ts: TrxID,
+    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+        if pivot_row_id < self.active_root.pivot_row_id {
+            return Err(Error::InvalidArgument);
+        }
+        self.active_root.pivot_row_id = pivot_row_id;
+        self.active_root.heap_redo_start_cts = heap_redo_start_cts;
+        self.commit(ts, false).await
+    }
+
     #[inline]
     pub fn try_delete(self) -> bool {
         if let Some(table_file) = Arc::into_inner(self.table_file) {

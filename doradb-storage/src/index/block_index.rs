@@ -337,6 +337,17 @@ impl BlockIndex {
         self.page_committer.lock().is_some()
     }
 
+    #[inline]
+    pub async fn update_file_root(&self, active_root: &ActiveRoot) {
+        let _g = self.root.latch.exclusive_async().await;
+        unsafe {
+            *self.root.pivot.get() = active_root.pivot_row_id;
+        }
+        self.root
+            .file
+            .store(active_root as *const _ as *mut _, Ordering::Release);
+    }
+
     /// Get row page for insertion.
     /// Caller should cache insert page id to avoid invoking this method frequently.
     #[inline]

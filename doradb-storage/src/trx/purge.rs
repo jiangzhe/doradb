@@ -53,7 +53,7 @@ impl TransactionSystem {
     }
 
     #[inline]
-    pub(super) fn calc_min_active_sts_for_gc(&self) -> TrxID {
+    pub(crate) fn calc_min_active_sts_for_gc(&self) -> TrxID {
         // first, we load current STS as upperbound.
         // There might be case a transaction begins and commits
         // when we refresh min_active_sts, if we do not hold this
@@ -146,6 +146,21 @@ impl TransactionSystem {
                 }
             }
         }
+        let mut gc_row_pages = HashSet::new();
+        for trx in &trx_list {
+            if let Some(pages) = trx.gc_row_pages() {
+                gc_row_pages.extend(pages.iter().copied());
+            }
+        }
+        for page_id in gc_row_pages {
+            let page_guard = buf_pool
+                .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+                .await
+                .exclusive_async()
+                .await;
+            buf_pool.deallocate_page(page_guard);
+        }
+
         // Finally, delete all transactions
         drop(trx_list);
 
