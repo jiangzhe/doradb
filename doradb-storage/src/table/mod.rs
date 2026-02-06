@@ -11,13 +11,15 @@ use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
-use crate::file::table_file::TableFile;
+use crate::error::Result;
+use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::Maskable;
 use crate::index::{
     BlockIndex, IndexCompareExchange, IndexInsert, NonUniqueBTreeIndex, NonUniqueIndex,
     RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
+use crate::lwc::LwcBuilder;
 use crate::row::ops::{
     InsertIndex, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex, SelectKey, SelectMvcc,
     UndoCol, UpdateCol, UpdateIndex, UpdateRow,
@@ -28,11 +30,13 @@ use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
 use crate::trx::undo::{IndexBranch, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
+use crate::trx::sys::TransactionSystem;
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Table is a logical data set of rows.
 /// It combines components such as row page, undo map, block index, secondary
@@ -75,6 +79,12 @@ pub struct Table {
     pub sec_idx: Arc<[SecondaryIndex]>,
 }
 
+struct FrozenPage {
+    page_id: PageID,
+    start_row_id: RowID,
+    end_row_id: RowID,
+}
+
 impl Table {
     /// Create a new table.
     #[inline]
@@ -110,6 +120,139 @@ impl Table {
     #[inline]
     pub fn table_id(&self) -> TableID {
         self.blk_idx.table_id
+    }
+
+    async fn collect_frozen_pages(
+        &self,
+        pivot_row_id: RowID,
+    ) -> (Vec<FrozenPage>, Option<TrxID>) {
+        let mut frozen_pages = Vec::new();
+        let mut expected_row_id = pivot_row_id;
+        let mut heap_redo_start_cts = None;
+        self.mem_scan(pivot_row_id, |page_guard| {
+            let page = page_guard.page();
+            if page.header.start_row_id != expected_row_id {
+                return false;
+            }
+            let (ctx, _) = page_guard.ctx_and_page();
+            let row_ver = ctx.row_ver().unwrap();
+            if row_ver.state() != RowPageState::Frozen {
+                if row_ver.state() == RowPageState::Active {
+                    heap_redo_start_cts = Some(row_ver.create_cts());
+                }
+                return false;
+            }
+            let end_row_id = page.header.start_row_id + page.header.max_row_count as u64;
+            frozen_pages.push(FrozenPage {
+                page_id: page_guard.page_id(),
+                start_row_id: page.header.start_row_id,
+                end_row_id,
+            });
+            expected_row_id = end_row_id;
+            true
+        })
+        .await;
+        (frozen_pages, heap_redo_start_cts)
+    }
+
+    async fn wait_for_frozen_pages_stable(
+        &self,
+        trx_sys: &'static TransactionSystem,
+        frozen_pages: &[FrozenPage],
+    ) {
+        loop {
+            let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+            let mut stabilized = true;
+            for page_info in frozen_pages {
+                let page_guard = self
+                    .data_pool
+                    .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                let (ctx, _) = page_guard.ctx_and_page();
+                let row_ver = ctx.row_ver().unwrap();
+                if row_ver.max_ins_sts() >= min_active_sts {
+                    stabilized = false;
+                    break;
+                }
+            }
+            if stabilized {
+                break;
+            }
+            smol::Timer::after(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn set_frozen_pages_to_transition(&self, frozen_pages: &[FrozenPage]) {
+        for page_info in frozen_pages {
+            let page_guard = self
+                .data_pool
+                .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                .await
+                .shared_async()
+                .await;
+            let (ctx, _) = page_guard.ctx_and_page();
+            ctx.row_ver().unwrap().set_transition();
+        }
+    }
+
+    async fn build_lwc_pages(
+        &self,
+        trx_sys: &'static TransactionSystem,
+        sts: TrxID,
+        frozen_pages: &[FrozenPage],
+    ) -> Result<Vec<LwcPagePersist>> {
+        let mut lwc_pages = Vec::new();
+        if !frozen_pages.is_empty() {
+            let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+            let metadata = self.metadata();
+            let mut builder = LwcBuilder::new(metadata);
+            let mut current_start: RowID = 0;
+            let mut current_end: RowID = 0;
+            for page_info in frozen_pages {
+                let page_guard = self
+                    .data_pool
+                    .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                let (ctx, page) = page_guard.ctx_and_page();
+                let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
+                if view.rows_non_deleted() == 0 {
+                    continue;
+                }
+                if builder.is_empty() {
+                    current_start = page_info.start_row_id;
+                    current_end = page_info.end_row_id;
+                }
+                if !builder.append_view(page, view)? {
+                    let buf = builder.build()?;
+                    lwc_pages.push(LwcPagePersist {
+                        start_row_id: current_start,
+                        end_row_id: current_end,
+                        buf,
+                    });
+                    builder = LwcBuilder::new(metadata);
+                    current_start = page_info.start_row_id;
+                    current_end = page_info.end_row_id;
+                    if !builder.append_view(page, view)? {
+                        return Err(crate::error::Error::InvalidState);
+                    }
+                } else {
+                    current_end = page_info.end_row_id;
+                }
+            }
+            if !builder.is_empty() {
+                let buf = builder.build()?;
+                lwc_pages.push(LwcPagePersist {
+                    start_row_id: current_start,
+                    end_row_id: current_end,
+                    buf,
+                });
+            }
+        }
+        Ok(lwc_pages)
     }
 
     /// Returns total number of row pages.
