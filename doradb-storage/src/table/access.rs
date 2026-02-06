@@ -14,6 +14,7 @@ use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::row::{ReadAllRows, RowReadAccess};
 use crate::trx::undo::RowUndoKind;
+use crate::trx::TrxID;
 use crate::trx::ver_map::RowPageState;
 use crate::trx::sys::TransactionSystem;
 use crate::error::Result;
@@ -21,6 +22,12 @@ use crate::file::table_file::{LwcPagePersist, MutableTableFile};
 use crate::value::Val;
 use std::future::Future;
 use std::time::Duration;
+
+struct FrozenPage {
+    page_id: PageID,
+    start_row_id: RowID,
+    end_row_id: RowID,
+}
 
 pub trait TableAccess {
     /// Table scan including uncommitted versions.
@@ -134,6 +141,159 @@ pub trait TableAccess {
         &self,
         trx_sys: &'static TransactionSystem,
     ) -> impl Future<Output = Result<()>>;
+}
+
+impl Table {
+    async fn collect_frozen_pages(&self, pivot_row_id: RowID) -> Vec<FrozenPage> {
+        let mut frozen_pages = Vec::new();
+        let mut expected_row_id = pivot_row_id;
+        self.mem_scan(pivot_row_id, |page_guard| {
+            let page = page_guard.page();
+            if page.header.start_row_id != expected_row_id {
+                return false;
+            }
+            let (ctx, _) = page_guard.ctx_and_page();
+            let row_ver = ctx.row_ver().unwrap();
+            if row_ver.state() != RowPageState::Frozen {
+                return false;
+            }
+            let end_row_id = page.header.start_row_id + page.header.max_row_count as u64;
+            frozen_pages.push(FrozenPage {
+                page_id: page_guard.page_id(),
+                start_row_id: page.header.start_row_id,
+                end_row_id,
+            });
+            expected_row_id = end_row_id;
+            true
+        })
+        .await;
+        frozen_pages
+    }
+
+    async fn wait_for_frozen_pages_stable(
+        &self,
+        trx_sys: &'static TransactionSystem,
+        frozen_pages: &[FrozenPage],
+    ) {
+        loop {
+            let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+            let mut stabilized = true;
+            for page_info in frozen_pages {
+                let page_guard = self
+                    .data_pool
+                    .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                let (ctx, _) = page_guard.ctx_and_page();
+                let row_ver = ctx.row_ver().unwrap();
+                if row_ver.max_ins_sts() >= min_active_sts {
+                    stabilized = false;
+                    break;
+                }
+            }
+            if stabilized {
+                break;
+            }
+            smol::Timer::after(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn transition_frozen_pages(&self, frozen_pages: &[FrozenPage]) {
+        for page_info in frozen_pages {
+            let page_guard = self
+                .data_pool
+                .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                .await
+                .shared_async()
+                .await;
+            let (ctx, _) = page_guard.ctx_and_page();
+            ctx.row_ver().unwrap().set_transition();
+        }
+    }
+
+    async fn build_lwc_pages(
+        &self,
+        trx_sys: &'static TransactionSystem,
+        sts: TrxID,
+        frozen_pages: &[FrozenPage],
+        new_pivot_row_id: RowID,
+    ) -> Result<(Vec<LwcPagePersist>, TrxID)> {
+        let mut lwc_pages = Vec::new();
+        if !frozen_pages.is_empty() {
+            let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+            let metadata = self.metadata();
+            let mut builder = LwcBuilder::new(metadata);
+            let mut current_start: Option<RowID> = None;
+            let mut current_end: RowID = 0;
+            for page_info in frozen_pages {
+                let page_guard = self
+                    .data_pool
+                    .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                let (ctx, page) = page_guard.ctx_and_page();
+                let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
+                if view.rows_non_deleted() == 0 {
+                    continue;
+                }
+                if builder.is_empty() {
+                    current_start = Some(page_info.start_row_id);
+                    current_end = page_info.end_row_id;
+                }
+                if !builder.append_view(page, view)? {
+                    let buf = builder.build()?;
+                    lwc_pages.push(LwcPagePersist {
+                        start_row_id: current_start.unwrap(),
+                        end_row_id: current_end,
+                        buf,
+                    });
+                    builder = LwcBuilder::new(metadata);
+                    current_start = Some(page_info.start_row_id);
+                    current_end = page_info.end_row_id;
+                    if !builder.append_view(page, view)? {
+                        return Err(crate::error::Error::InvalidState);
+                    }
+                } else {
+                    current_end = page_info.end_row_id;
+                }
+            }
+            if !builder.is_empty() {
+                let buf = builder.build()?;
+                lwc_pages.push(LwcPagePersist {
+                    start_row_id: current_start.unwrap(),
+                    end_row_id: current_end,
+                    buf,
+                });
+            }
+        }
+
+        let heap_redo_start_cts = self.compute_heap_redo_start_cts(new_pivot_row_id, sts).await;
+        Ok((lwc_pages, heap_redo_start_cts))
+    }
+
+    async fn compute_heap_redo_start_cts(
+        &self,
+        start_row_id: RowID,
+        fallback: TrxID,
+    ) -> TrxID {
+        let mut heap_redo_start_cts = None;
+        self.mem_scan(start_row_id, |page_guard| {
+            let (ctx, _) = page_guard.ctx_and_page();
+            let row_ver = ctx.row_ver().unwrap();
+            if row_ver.state() == RowPageState::Active {
+                let cts = row_ver.create_cts();
+                heap_redo_start_cts = Some(match heap_redo_start_cts {
+                    Some(prev) => prev.min(cts),
+                    None => cts,
+                });
+            }
+            true
+        })
+        .await;
+        heap_redo_start_cts.unwrap_or(fallback)
+    }
 }
 
 impl TableAccess for Table {
@@ -592,174 +752,53 @@ impl TableAccess for Table {
     }
 
     async fn data_checkpoint(&self, trx_sys: &'static TransactionSystem) -> Result<()> {
-        struct FrozenPage {
-            page_id: PageID,
-            start_row_id: RowID,
-            end_row_id: RowID,
-        }
-
+        // Step 1: collect a contiguous range of frozen pages after the pivot row id.
         let pivot_row_id = self.file.active_root().pivot_row_id;
-        let mut frozen_pages = Vec::new();
-        let mut expected_row_id = pivot_row_id;
-        let mut found_frozen = true;
-        self.mem_scan(pivot_row_id, |page_guard| {
-            if !found_frozen {
-                return false;
-            }
-            let page = page_guard.page();
-            if page.header.start_row_id != expected_row_id {
-                found_frozen = false;
-                return false;
-            }
-            let (ctx, _) = page_guard.ctx_and_page();
-            let row_ver = ctx.row_ver().unwrap();
-            if row_ver.state() != RowPageState::Frozen {
-                found_frozen = false;
-                return false;
-            }
-            let end_row_id = page.header.start_row_id + page.header.max_row_count as u64;
-            frozen_pages.push(FrozenPage {
-                page_id: page_guard.page_id(),
-                start_row_id: page.header.start_row_id,
-                end_row_id,
-            });
-            expected_row_id = end_row_id;
-            true
-        })
-        .await;
+        let frozen_pages = self.collect_frozen_pages(pivot_row_id).await;
 
+        // Step 2: wait until frozen pages are stable, then move them to transition.
         if !frozen_pages.is_empty() {
-            loop {
-                let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
-                let mut stabilized = true;
-                for page_info in &frozen_pages {
-                    let page_guard = self
-                        .data_pool
-                        .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
-                        .await
-                        .shared_async()
-                        .await;
-                    let (ctx, _) = page_guard.ctx_and_page();
-                    let row_ver = ctx.row_ver().unwrap();
-                    if row_ver.max_ins_sts() >= min_active_sts {
-                        stabilized = false;
-                        break;
-                    }
-                }
-                if stabilized {
-                    break;
-                }
-                smol::Timer::after(Duration::from_secs(1)).await;
-            }
-
-            for page_info in &frozen_pages {
-                let page_guard = self
-                    .data_pool
-                    .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
-                    .await
-                    .shared_async()
-                    .await;
-                let (ctx, _) = page_guard.ctx_and_page();
-                ctx.row_ver().unwrap().set_transition();
-            }
+            self.wait_for_frozen_pages_stable(trx_sys, &frozen_pages)
+                .await;
+            self.transition_frozen_pages(&frozen_pages).await;
         }
 
+        // Step 3: begin a checkpoint transaction and compute the new pivot row id.
         let mut trx = trx_sys.begin_checkpoint_trx();
         let sts = trx.sts;
         let new_pivot_row_id = frozen_pages
             .last()
             .map(|page| page.end_row_id)
             .unwrap_or(pivot_row_id);
-        let build_result = async {
-            let mut lwc_pages = Vec::new();
-            if !frozen_pages.is_empty() {
-                let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
-                let metadata = self.metadata();
-                let mut builder = LwcBuilder::new(metadata);
-                let mut current_start: Option<RowID> = None;
-                let mut current_end: RowID = 0;
-                for page_info in &frozen_pages {
-                    let page_guard = self
-                        .data_pool
-                        .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
-                        .await
-                        .shared_async()
-                        .await;
-                    let (ctx, page) = page_guard.ctx_and_page();
-                    let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
-                    if view.rows_non_deleted() == 0 {
-                        continue;
-                    }
-                    if builder.is_empty() {
-                        current_start = Some(page_info.start_row_id);
-                        current_end = page_info.end_row_id;
-                    }
-                    if !builder.append_view(page, view)? {
-                        let buf = builder.build()?;
-                        lwc_pages.push(LwcPagePersist {
-                            start_row_id: current_start.unwrap(),
-                            end_row_id: current_end,
-                            buf,
-                        });
-                        builder = LwcBuilder::new(metadata);
-                        current_start = Some(page_info.start_row_id);
-                        current_end = page_info.end_row_id;
-                        if !builder.append_view(page, view)? {
-                            return Err(crate::error::Error::InvalidState);
-                        }
-                    } else {
-                        current_end = page_info.end_row_id;
-                    }
+        // Step 4: build LWC pages and compute heap redo start CTS; rollback on error.
+        let (lwc_pages, heap_redo_start_cts) =
+            match self
+                .build_lwc_pages(trx_sys, sts, &frozen_pages, new_pivot_row_id)
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    trx_sys.rollback(trx, self.data_pool).await;
+                    return Err(err);
                 }
-                if !builder.is_empty() {
-                    let buf = builder.build()?;
-                    lwc_pages.push(LwcPagePersist {
-                        start_row_id: current_start.unwrap(),
-                        end_row_id: current_end,
-                        buf,
-                    });
-                }
-            }
-
-            let mut heap_redo_start_cts = None;
-            self.mem_scan(new_pivot_row_id, |page_guard| {
-                let (ctx, _) = page_guard.ctx_and_page();
-                let row_ver = ctx.row_ver().unwrap();
-                if row_ver.state() == RowPageState::Active {
-                    let cts = row_ver.create_cts();
-                    heap_redo_start_cts = Some(match heap_redo_start_cts {
-                        Some(prev) => prev.min(cts),
-                        None => cts,
-                    });
-                }
-                true
-            })
-            .await;
-            let heap_redo_start_cts = heap_redo_start_cts.unwrap_or(sts);
-            Ok((lwc_pages, heap_redo_start_cts))
-        }
-        .await;
-        let (lwc_pages, heap_redo_start_cts) = match build_result {
-            Ok(payload) => payload,
-            Err(err) => {
-                trx_sys.rollback(trx, self.data_pool).await;
-                return Err(err);
-            }
-        };
+            };
         let mut lwc_pages = lwc_pages;
         if let Some(last) = lwc_pages.last_mut() {
             if last.end_row_id < new_pivot_row_id {
                 last.end_row_id = new_pivot_row_id;
             }
         }
+        // Step 5: attach retired row pages to the checkpoint transaction for GC.
         let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
         trx.extend_gc_row_pages(gc_pages);
 
+        // Step 6: commit the checkpoint transaction to get CTS.
         let cts = match trx_sys.commit(trx, self.data_pool).await {
             Ok(cts) => cts,
             Err(err) => return Err(err),
         };
 
+        // Step 7: persist LWC pages (or heartbeat checkpoint) and refresh file root.
         let table_file = MutableTableFile::fork(&self.file);
         let (table_file, old_root) = if !lwc_pages.is_empty() {
             table_file
