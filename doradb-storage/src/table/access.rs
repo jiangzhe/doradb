@@ -1,7 +1,9 @@
 use crate::buffer::BufferPool;
+use crate::buffer::page::PageID;
 use crate::catalog::TableMetadata;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
+use crate::lwc::LwcBuilder;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, ReadRow, ScanMvcc, SelectKey, SelectMvcc, UpdateCol,
     UpdateIndex, UpdateMvcc,
@@ -12,8 +14,13 @@ use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::row::{ReadAllRows, RowReadAccess};
 use crate::trx::undo::RowUndoKind;
+use crate::trx::ver_map::RowPageState;
+use crate::trx::sys::TransactionSystem;
+use crate::error::Result;
+use crate::file::table_file::{LwcPagePersist, MutableTableFile};
 use crate::value::Val;
 use std::future::Future;
+use std::time::Duration;
 
 pub trait TableAccess {
     /// Table scan including uncommitted versions.
@@ -121,6 +128,12 @@ pub trait TableAccess {
     /// Freeze row pages.
     /// Returns number of pages that are frozen.
     fn freeze(&self, max_rows: usize) -> impl Future<Output = usize>;
+
+    /// Convert frozen row pages to LWC pages and persist to table file.
+    fn data_checkpoint(
+        &self,
+        trx_sys: &'static TransactionSystem,
+    ) -> impl Future<Output = Result<()>>;
 }
 
 impl TableAccess for Table {
@@ -576,5 +589,189 @@ impl TableAccess for Table {
         })
         .await;
         rows
+    }
+
+    async fn data_checkpoint(&self, trx_sys: &'static TransactionSystem) -> Result<()> {
+        struct FrozenPage {
+            page_id: PageID,
+            start_row_id: RowID,
+            end_row_id: RowID,
+        }
+
+        let pivot_row_id = self.file.active_root().pivot_row_id;
+        let mut frozen_pages = Vec::new();
+        let mut expected_row_id = pivot_row_id;
+        let mut found_frozen = true;
+        self.mem_scan(pivot_row_id, |page_guard| {
+            if !found_frozen {
+                return false;
+            }
+            let page = page_guard.page();
+            if page.header.start_row_id != expected_row_id {
+                found_frozen = false;
+                return false;
+            }
+            let (ctx, _) = page_guard.ctx_and_page();
+            let row_ver = ctx.row_ver().unwrap();
+            if row_ver.state() != RowPageState::Frozen {
+                found_frozen = false;
+                return false;
+            }
+            let end_row_id = page.header.start_row_id + page.header.max_row_count as u64;
+            frozen_pages.push(FrozenPage {
+                page_id: page_guard.page_id(),
+                start_row_id: page.header.start_row_id,
+                end_row_id,
+            });
+            expected_row_id = end_row_id;
+            true
+        })
+        .await;
+
+        if !frozen_pages.is_empty() {
+            loop {
+                let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+                let mut stabilized = true;
+                for page_info in &frozen_pages {
+                    let page_guard = self
+                        .data_pool
+                        .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                        .await
+                        .shared_async()
+                        .await;
+                    let (ctx, _) = page_guard.ctx_and_page();
+                    let row_ver = ctx.row_ver().unwrap();
+                    if row_ver.max_ins_sts() >= min_active_sts {
+                        stabilized = false;
+                        break;
+                    }
+                }
+                if stabilized {
+                    break;
+                }
+                smol::Timer::after(Duration::from_secs(1)).await;
+            }
+
+            for page_info in &frozen_pages {
+                let page_guard = self
+                    .data_pool
+                    .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                let (ctx, _) = page_guard.ctx_and_page();
+                ctx.row_ver().unwrap().set_transition();
+            }
+        }
+
+        let mut trx = trx_sys.begin_checkpoint_trx();
+        let sts = trx.sts;
+        let new_pivot_row_id = frozen_pages
+            .last()
+            .map(|page| page.end_row_id)
+            .unwrap_or(pivot_row_id);
+        let build_result = async {
+            let mut lwc_pages = Vec::new();
+            if !frozen_pages.is_empty() {
+                let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+                let metadata = self.metadata();
+                let mut builder = LwcBuilder::new(metadata);
+                let mut current_start: Option<RowID> = None;
+                let mut current_end: RowID = 0;
+                for page_info in &frozen_pages {
+                    let page_guard = self
+                        .data_pool
+                        .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                        .await
+                        .shared_async()
+                        .await;
+                    let (ctx, page) = page_guard.ctx_and_page();
+                    let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
+                    if view.rows_non_deleted() == 0 {
+                        continue;
+                    }
+                    if builder.is_empty() {
+                        current_start = Some(page_info.start_row_id);
+                        current_end = page_info.end_row_id;
+                    }
+                    if !builder.append_view(page, view)? {
+                        let buf = builder.build()?;
+                        lwc_pages.push(LwcPagePersist {
+                            start_row_id: current_start.unwrap(),
+                            end_row_id: current_end,
+                            buf,
+                        });
+                        builder = LwcBuilder::new(metadata);
+                        current_start = Some(page_info.start_row_id);
+                        current_end = page_info.end_row_id;
+                        if !builder.append_view(page, view)? {
+                            return Err(crate::error::Error::InvalidState);
+                        }
+                    } else {
+                        current_end = page_info.end_row_id;
+                    }
+                }
+                if !builder.is_empty() {
+                    let buf = builder.build()?;
+                    lwc_pages.push(LwcPagePersist {
+                        start_row_id: current_start.unwrap(),
+                        end_row_id: current_end,
+                        buf,
+                    });
+                }
+            }
+
+            let mut heap_redo_start_cts = None;
+            self.mem_scan(new_pivot_row_id, |page_guard| {
+                let (ctx, _) = page_guard.ctx_and_page();
+                let row_ver = ctx.row_ver().unwrap();
+                if row_ver.state() == RowPageState::Active {
+                    let cts = row_ver.create_cts();
+                    heap_redo_start_cts = Some(match heap_redo_start_cts {
+                        Some(prev) => prev.min(cts),
+                        None => cts,
+                    });
+                }
+                true
+            })
+            .await;
+            let heap_redo_start_cts = heap_redo_start_cts.unwrap_or(sts);
+            Ok((lwc_pages, heap_redo_start_cts))
+        }
+        .await;
+        let (lwc_pages, heap_redo_start_cts) = match build_result {
+            Ok(payload) => payload,
+            Err(err) => {
+                trx_sys.rollback(trx, self.data_pool).await;
+                return Err(err);
+            }
+        };
+        let mut lwc_pages = lwc_pages;
+        if let Some(last) = lwc_pages.last_mut() {
+            if last.end_row_id < new_pivot_row_id {
+                last.end_row_id = new_pivot_row_id;
+            }
+        }
+        let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
+        trx.extend_gc_row_pages(gc_pages);
+
+        let cts = match trx_sys.commit(trx, self.data_pool).await {
+            Ok(cts) => cts,
+            Err(err) => return Err(err),
+        };
+
+        let table_file = MutableTableFile::fork(&self.file);
+        let (table_file, old_root) = if !lwc_pages.is_empty() {
+            table_file
+                .persist_lwc_pages(lwc_pages, heap_redo_start_cts, cts)
+                .await?
+        } else {
+            table_file
+                .update_checkpoint(new_pivot_row_id, heap_redo_start_cts, cts)
+                .await?
+        };
+        self.blk_idx.update_file_root(table_file.active_root()).await;
+        drop(old_root);
+        Ok(())
     }
 }
