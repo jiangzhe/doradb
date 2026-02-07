@@ -247,6 +247,8 @@ impl Table {
                     builder = LwcBuilder::new(metadata);
                     current_start = page_info.start_row_id;
                     current_end = page_info.end_row_id;
+                    let view =
+                        page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
                     if !builder.append_view(page, view)? {
                         return Err(crate::error::Error::InvalidState);
                     }
