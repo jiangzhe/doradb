@@ -9,7 +9,6 @@ use crate::session::Session;
 use crate::table::{Table, TableAccess};
 use crate::trx::ActiveTrx;
 use crate::trx::sys_conf::TrxSysConfig;
-use crate::trx::ver_map::RowPageState;
 use crate::value::Val;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -915,18 +914,6 @@ fn test_data_checkpoint_basic_flow() {
         assert!(new_root.pivot_row_id > old_root.pivot_row_id);
         assert!(new_root.column_block_index_root > 0);
 
-        for page_info in frozen_pages {
-            let page_guard = sys
-                .engine
-                .data_pool
-                .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
-                .await
-                .shared_async()
-                .await;
-            let (ctx, _) = page_guard.ctx_and_page();
-            assert_eq!(ctx.row_ver().unwrap().state(), RowPageState::Transition);
-        }
-
         drop(session);
         sys.clean_all();
     });
@@ -1064,13 +1051,11 @@ fn test_data_checkpoint_gc_verification() {
             .await
             .unwrap();
         let allocated_after = sys.engine.data_pool.allocated();
-        assert!(allocated_after >= allocated_before);
-
-        let mut reclaimed = false;
+        let mut reclaimed = allocated_after < allocated_before;
         for _ in 0..20 {
             smol::Timer::after(Duration::from_millis(200)).await;
             let allocated_now = sys.engine.data_pool.allocated();
-            if allocated_now < allocated_after {
+            if allocated_now < allocated_before {
                 reclaimed = true;
                 break;
             }

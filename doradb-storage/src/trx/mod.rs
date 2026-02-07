@@ -258,6 +258,7 @@ impl ActiveTrx {
                     gc_no: self.gc_no,
                     row_undo: RowUndoLogs::empty(),
                     index_undo: IndexUndoLogs::empty(),
+                    gc_row_pages: Vec::new(),
                 }),
                 session: self.session.take(),
             };
@@ -488,6 +489,7 @@ impl PrecommitTrx {
                 gc_no,
                 row_undo,
                 index_gc,
+                gc_row_pages,
             }) => {
                 // For user transaction, we need to notify readers that this transaction is committed,
                 // and readers can continue their work.
