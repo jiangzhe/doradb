@@ -36,7 +36,12 @@ use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+#[cfg(test)]
+static TEST_FORCE_LWC_BUILD_ERROR: AtomicBool = AtomicBool::new(false);
 
 /// Table is a logical data set of rows.
 /// It combines components such as row page, undo map, block index, secondary
@@ -203,6 +208,12 @@ impl Table {
         sts: TrxID,
         frozen_pages: &[FrozenPage],
     ) -> Result<Vec<LwcPagePersist>> {
+        #[cfg(test)]
+        {
+            if TEST_FORCE_LWC_BUILD_ERROR.load(Ordering::SeqCst) {
+                return Err(crate::error::Error::InvalidState);
+            }
+        }
         let mut lwc_pages = Vec::new();
         if !frozen_pages.is_empty() {
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
