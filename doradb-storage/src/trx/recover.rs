@@ -301,6 +301,9 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                             == *end_row_id
                 });
             }
+            DDLRedo::DataCheckpoint { .. } => {
+                debug_assert!(dml.is_empty());
+            }
             _ => todo!(),
         }
         Ok(())

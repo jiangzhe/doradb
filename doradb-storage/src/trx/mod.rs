@@ -152,8 +152,6 @@ pub struct ActiveTrx {
     pub(crate) redo: RedoLogs,
     // row pages to be GCed after commit.
     pub(crate) gc_row_pages: Vec<PageID>,
-    // Force redo log even if there is no logical change.
-    force_redo: bool,
 }
 
 impl ActiveTrx {
@@ -176,23 +174,6 @@ impl ActiveTrx {
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
             gc_row_pages: Vec::new(),
-            force_redo: false,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn new_checkpoint(trx_id: TrxID, sts: TrxID, log_no: usize, gc_no: usize) -> Self {
-        ActiveTrx {
-            session: None,
-            status: Arc::new(SharedTrxStatus::new(trx_id)),
-            sts,
-            log_no,
-            gc_no,
-            row_undo: RowUndoLogs::empty(),
-            index_undo: IndexUndoLogs::empty(),
-            redo: RedoLogs::default(),
-            gc_row_pages: Vec::new(),
-            force_redo: true,
         }
     }
 
@@ -229,10 +210,7 @@ impl ActiveTrx {
     /// Returns whether the transaction is readonly.
     #[inline]
     pub fn readonly(&self) -> bool {
-        !self.force_redo
-            && self.redo.is_empty()
-            && self.row_undo.is_empty()
-            && self.gc_row_pages.is_empty()
+        self.redo.is_empty() && self.row_undo.is_empty() && self.gc_row_pages.is_empty()
     }
 
     #[inline]
@@ -271,7 +249,7 @@ impl ActiveTrx {
             self.status.preparing.store(true, Ordering::SeqCst);
         }
         // use bincode to serialize redo log
-        let redo_bin = if self.redo.is_empty() && self.gc_row_pages.is_empty() && !self.force_redo {
+        let redo_bin = if self.redo.is_empty() && self.gc_row_pages.is_empty() {
             None
         } else {
             Some(TrxLog::new(

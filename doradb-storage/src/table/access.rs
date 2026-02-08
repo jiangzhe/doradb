@@ -1,7 +1,7 @@
 use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
 use crate::catalog::TableMetadata;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::file::table_file::MutableTableFile;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
@@ -10,11 +10,12 @@ use crate::row::ops::{
     UpdateIndex, UpdateMvcc,
 };
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
+use crate::session::Session;
 use crate::stmt::Statement;
 use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
+use crate::trx::redo::DDLRedo;
 use crate::trx::row::{ReadAllRows, RowReadAccess};
-use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::RowUndoKind;
 use crate::value::Val;
 use std::future::Future;
@@ -129,7 +130,7 @@ pub trait TableAccess {
     /// Convert frozen row pages to LWC pages and persist to table file.
     fn data_checkpoint(
         &self,
-        trx_sys: &'static TransactionSystem,
+        session: &mut Session,
     ) -> impl Future<Output = Result<()>>;
 }
 
@@ -588,7 +589,8 @@ impl TableAccess for Table {
         rows
     }
 
-    async fn data_checkpoint(&self, trx_sys: &'static TransactionSystem) -> Result<()> {
+    async fn data_checkpoint(&self, session: &mut Session) -> Result<()> {
+        let trx_sys = session.engine().trx_sys;
         // Step 1: collect a contiguous range of frozen pages after the pivot row id.
         let pivot_row_id = self.file.active_root().pivot_row_id;
         let (frozen_pages, heap_redo_start_ts) = self.collect_frozen_pages(pivot_row_id).await;
@@ -601,12 +603,19 @@ impl TableAccess for Table {
         }
 
         // Step 3: begin a checkpoint transaction and compute the new pivot row id.
-        let mut trx = trx_sys.begin_checkpoint_trx();
+        let mut trx = session
+            .begin_trx()
+            .ok_or(Error::NotSupported("checkpoint requires idle session"))?;
         let sts = trx.sts;
         let new_pivot_row_id = frozen_pages
             .last()
             .map(|page| page.end_row_id)
             .unwrap_or(pivot_row_id);
+        trx.redo.ddl = Some(Box::new(DDLRedo::DataCheckpoint {
+            table_id: self.table_id(),
+            pivor_row_id: new_pivot_row_id,
+            sts,
+        }));
 
         // Step 4: build LWC pages and compute heap redo start CTS; rollback on error.
         let (lwc_pages, heap_redo_start_ts) =

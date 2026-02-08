@@ -134,26 +134,6 @@ impl TransactionSystem {
         ActiveTrx::new(session_state, trx_id, sts, log_no, gc_no)
     }
 
-    #[inline]
-    pub fn begin_checkpoint_trx(&self) -> ActiveTrx {
-        let log_no = self.next_log_no();
-        let partition = &*self.log_partitions[log_no];
-        let gc_no = partition.next_gc_no();
-        let gc_bucket = &partition.gc_buckets[gc_no];
-        let mut g = gc_bucket.active_sts_list.lock();
-        let sts = self.ts.fetch_add(1, Ordering::SeqCst);
-        let trx_id = sts | (1 << 63);
-        debug_assert!(sts < MAX_SNAPSHOT_TS);
-        debug_assert!(trx_id >= MIN_ACTIVE_TRX_ID);
-        g.insert(sts);
-        if g.len() == 1 {
-            debug_assert!(gc_bucket.min_active_sts.load(Ordering::Relaxed) == MAX_SNAPSHOT_TS);
-            gc_bucket.min_active_sts.store(sts, Ordering::Relaxed);
-        }
-        drop(g);
-        ActiveTrx::new_checkpoint(trx_id, sts, log_no, gc_no)
-    }
-
     /// Returns next log(partition) number.
     #[inline]
     fn next_log_no(&self) -> usize {
