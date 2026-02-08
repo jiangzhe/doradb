@@ -637,27 +637,28 @@ impl TableAccess for Table {
         let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
         trx.extend_gc_row_pages(gc_pages);
 
-        // Step 6: commit the checkpoint transaction to get CTS.
-        let cts = match trx_sys.commit(trx, self.data_pool).await {
-            Ok(cts) => cts,
-            Err(err) => return Err(err),
-        };
-
-        // Step 7: persist LWC pages (or heartbeat checkpoint) and refresh file root.
+        // Step 6: persist LWC pages (or heartbeat checkpoint) and refresh file root.
+        let checkpoint_ts = sts;
         let table_file = MutableTableFile::fork(&self.file);
         let (table_file, old_root) = if !lwc_pages.is_empty() {
             table_file
-                .persist_lwc_pages(lwc_pages, heap_redo_start_ts, cts)
+                .persist_lwc_pages(lwc_pages, heap_redo_start_ts, checkpoint_ts)
                 .await?
         } else {
             table_file
-                .update_checkpoint(new_pivot_row_id, heap_redo_start_ts, cts)
+                .update_checkpoint(new_pivot_row_id, heap_redo_start_ts, checkpoint_ts)
                 .await?
         };
         self.blk_idx
             .update_file_root(table_file.active_root())
             .await;
         drop(old_root);
+
+        // Step 7: commit the checkpoint transaction to get CTS.
+        let _cts = match trx_sys.commit(trx, self.data_pool).await {
+            Ok(cts) => cts,
+            Err(err) => return Err(err),
+        };
         Ok(())
     }
 }
