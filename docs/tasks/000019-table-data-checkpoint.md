@@ -31,9 +31,9 @@ The process follows a strict state machine for `RowPage`s: `ACTIVE` -> `FROZEN` 
 ## Plan
 
 ### 1. Extend `TableAccess` and `Table`
-- Update `TableAccess` trait signature to include `TransactionSystem`:
+- Update `TableAccess` trait signature to accept a mutable `Session`:
   ```rust
-  fn data_checkpoint(&self, trx_sys: &'static TransactionSystem) -> impl Future<Output=Result<()>>
+fn data_checkpoint(&self, session: &mut Session) -> impl Future<Output=Result<()>>
   ```
 - Implement `data_checkpoint` in `Table`.
 - The method relies on the preceding `freeze` call. If no pages are frozen, it should still start a transaction and update `heap_redo_start_ts` in the table file (Heartbeat Checkpoint).
@@ -45,7 +45,7 @@ The process follows a strict state machine for `RowPage`s: `ACTIVE` -> `FROZEN` 
     - Once stabilized, atomically transition pages from `FROZEN` to `TRANSITION`.
 
 ### 3. Row-to-LWC Conversion
-- Start a **User Transaction** (`ActiveTrx`) internally using `trx_sys.begin_trx()`.
+- Start a **User Transaction** (`ActiveTrx`) internally using `session.begin_trx()`.
 - The transaction's Start Timestamp (`STS`) acts as the logical snapshot time.
 - For each `TRANSITION` page:
     - Use `LwcBuilder` to convert the page to one or more `LWC` blocks.
@@ -58,8 +58,8 @@ The process follows a strict state machine for `RowPage`s: `ACTIVE` -> `FROZEN` 
     - Use `MutableTableFile::persist_lwc_pages` to write blocks, update `ColumnBlockIndex`.
     - This generates a new `TableFile` root.
 - **Commit**:
-    - Commit the user transaction to get a Commit Timestamp (`CTS`).
-    - Update the `TableFile`'s active root with this `CTS` (persisting the change to disk).
+    - Persist the new `TableFile` root with the checkpoint `STS` as the snapshot timestamp.
+    - Commit the user transaction after the file root update.
 
 ### 5. Unified GC for RowPages
 - Extend `PreparedTrx` / `CommittedTrxPayload` in `doradb-storage/src/trx/mod.rs` to include `gc_row_pages: Vec<PageID>`.
@@ -72,11 +72,11 @@ The process follows a strict state machine for `RowPage`s: `ACTIVE` -> `FROZEN` 
 
 ## Impacts
 
-- `TableAccess` / `Table`: New method `data_checkpoint` with `trx_sys` dependency.
+- `TableAccess` / `Table`: New method `data_checkpoint` with `Session` dependency.
 - `RowVersionMap`: State transitions.
 - `LwcBuilder`: Used for conversion.
 - `TableFile` / `MutableTableFile`: Used for persistence.
-- `TransactionSystem`: GC logic extended to handle `RowPage` deallocation via user transactions.
+- `Session`: Used to start the checkpoint transaction.
 
 ## Test Cases
 
