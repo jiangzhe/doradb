@@ -271,8 +271,7 @@ impl ActiveTrx {
             self.status.preparing.store(true, Ordering::SeqCst);
         }
         // use bincode to serialize redo log
-        let redo_bin = if self.redo.is_empty() && self.gc_row_pages.is_empty() && !self.force_redo
-        {
+        let redo_bin = if self.redo.is_empty() && self.gc_row_pages.is_empty() && !self.force_redo {
             None
         } else {
             Some(TrxLog::new(
@@ -346,7 +345,10 @@ impl Drop for ActiveTrx {
         assert!(self.redo.is_empty(), "redo should be cleared");
         assert!(self.row_undo.is_empty(), "row undo should be cleared");
         assert!(self.index_undo.is_empty(), "index undo should be cleared");
-        assert!(self.gc_row_pages.is_empty(), "gc row pages should be cleared");
+        assert!(
+            self.gc_row_pages.is_empty(),
+            "gc row pages should be cleared"
+        );
         assert!(self.session.is_none(), "session should be cleared");
     }
 }

@@ -159,10 +159,7 @@ mod tests {
         assert_eq!(meta_page.space_map, active_root.alloc_map);
         assert_eq!(meta_page.gc_page_list, active_root.gc_page_list);
         assert_eq!(meta_page.pivot_row_id, active_root.pivot_row_id);
-        assert_eq!(
-            meta_page.heap_redo_start_ts,
-            active_root.heap_redo_start_ts
-        );
+        assert_eq!(meta_page.heap_redo_start_ts, active_root.heap_redo_start_ts);
         assert_eq!(meta_page.delta_rec_ts, 0);
     }
 }

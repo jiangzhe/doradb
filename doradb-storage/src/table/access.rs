@@ -1,6 +1,8 @@
 use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
 use crate::catalog::TableMetadata;
+use crate::error::Result;
+use crate::file::table_file::MutableTableFile;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
@@ -12,10 +14,8 @@ use crate::stmt::Statement;
 use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::row::{ReadAllRows, RowReadAccess};
-use crate::trx::undo::RowUndoKind;
 use crate::trx::sys::TransactionSystem;
-use crate::error::Result;
-use crate::file::table_file::MutableTableFile;
+use crate::trx::undo::RowUndoKind;
 use crate::value::Val;
 use std::future::Future;
 
@@ -591,8 +591,7 @@ impl TableAccess for Table {
     async fn data_checkpoint(&self, trx_sys: &'static TransactionSystem) -> Result<()> {
         // Step 1: collect a contiguous range of frozen pages after the pivot row id.
         let pivot_row_id = self.file.active_root().pivot_row_id;
-        let (frozen_pages, heap_redo_start_ts) =
-            self.collect_frozen_pages(pivot_row_id).await;
+        let (frozen_pages, heap_redo_start_ts) = self.collect_frozen_pages(pivot_row_id).await;
 
         // Step 2: wait until frozen pages are stable, then move them to transition.
         if !frozen_pages.is_empty() {
@@ -620,10 +619,11 @@ impl TableAccess for Table {
             };
         let mut lwc_pages = lwc_pages;
         if let Some(last) = lwc_pages.last_mut()
-            && last.end_row_id < new_pivot_row_id {
-                last.end_row_id = new_pivot_row_id;
+            && last.end_row_id < new_pivot_row_id
+        {
+            last.end_row_id = new_pivot_row_id;
         }
-        
+
         // Step 5: attach retired row pages to the checkpoint transaction for GC.
         let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
         trx.extend_gc_row_pages(gc_pages);
@@ -645,7 +645,9 @@ impl TableAccess for Table {
                 .update_checkpoint(new_pivot_row_id, heap_redo_start_ts, cts)
                 .await?
         };
-        self.blk_idx.update_file_root(table_file.active_root()).await;
+        self.blk_idx
+            .update_file_root(table_file.active_root())
+            .await;
         drop(old_root);
         Ok(())
     }

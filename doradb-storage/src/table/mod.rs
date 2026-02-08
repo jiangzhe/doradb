@@ -28,9 +28,9 @@ use crate::row::{RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_in
 use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
+use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{IndexBranch, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::sys::TransactionSystem;
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use std::collections::HashMap;
@@ -127,10 +127,7 @@ impl Table {
         self.blk_idx.table_id
     }
 
-    async fn collect_frozen_pages(
-        &self,
-        pivot_row_id: RowID,
-    ) -> (Vec<FrozenPage>, Option<TrxID>) {
+    async fn collect_frozen_pages(&self, pivot_row_id: RowID) -> (Vec<FrozenPage>, Option<TrxID>) {
         let mut frozen_pages = Vec::new();
         let mut expected_row_id = pivot_row_id;
         let mut heap_redo_start_ts = None;
@@ -143,7 +140,7 @@ impl Table {
             let row_ver = ctx.row_ver().unwrap();
             if row_ver.state() != RowPageState::Frozen {
                 if row_ver.state() == RowPageState::Active {
-                    // heap redo start ts is creation cts of first remaining active page. 
+                    // heap redo start ts is creation cts of first remaining active page.
                     heap_redo_start_ts = Some(row_ver.create_cts());
                 }
                 return false;
@@ -248,8 +245,7 @@ impl Table {
                     builder = LwcBuilder::new(metadata);
                     current_start = page_info.start_row_id;
                     current_end = page_info.end_row_id;
-                    let view =
-                        page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
+                    let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
                     if !builder.append_view(page, view)? {
                         return Err(crate::error::Error::InvalidState);
                     }

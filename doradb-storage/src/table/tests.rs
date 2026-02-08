@@ -905,10 +905,7 @@ fn test_data_checkpoint_basic_flow() {
         let (frozen_pages, _) = sys.table.collect_frozen_pages(pivot_row_id).await;
         assert!(!frozen_pages.is_empty());
 
-        sys.table
-            .data_checkpoint(sys.engine.trx_sys)
-            .await
-            .unwrap();
+        sys.table.data_checkpoint(sys.engine.trx_sys).await.unwrap();
 
         let new_root = sys.table.file.active_root();
         assert!(new_root.pivot_row_id > old_root.pivot_row_id);
@@ -948,10 +945,7 @@ fn test_data_checkpoint_snapshot_consistency() {
             write_trx = stmt.succeed();
         }
 
-        sys.table
-            .data_checkpoint(sys.engine.trx_sys)
-            .await
-            .unwrap();
+        sys.table.data_checkpoint(sys.engine.trx_sys).await.unwrap();
 
         {
             let key = SelectKey::new(0, vec![Val::from(10_000i32)]);
@@ -985,22 +979,18 @@ fn test_data_checkpoint_persistence_recovery() {
         insert_rows_direct(&table, &mut session, 0, 150, &name).await;
 
         table.freeze(usize::MAX).await;
-        table
-            .data_checkpoint(engine.trx_sys)
-            .await
-            .unwrap();
+        table.data_checkpoint(engine.trx_sys).await.unwrap();
 
         let root_before = table.file.active_root().clone();
         drop(table);
 
-        let table_file = engine
-            .table_fs
-            .open_table_file(table_id)
-            .await
-            .unwrap();
+        let table_file = engine.table_fs.open_table_file(table_id).await.unwrap();
         let root_after = table_file.active_root();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
-        assert_eq!(root_after.heap_redo_start_ts, root_before.heap_redo_start_ts);
+        assert_eq!(
+            root_after.heap_redo_start_ts,
+            root_before.heap_redo_start_ts
+        );
 
         drop(session);
         drop(table_file);
@@ -1018,10 +1008,7 @@ fn test_data_checkpoint_heartbeat() {
         insert_rows(&sys, &mut session, 0, 40, &name).await;
 
         let root_before = sys.table.file.active_root().clone();
-        sys.table
-            .data_checkpoint(sys.engine.trx_sys)
-            .await
-            .unwrap();
+        sys.table.data_checkpoint(sys.engine.trx_sys).await.unwrap();
         let root_after = sys.table.file.active_root();
 
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
@@ -1046,10 +1033,7 @@ fn test_data_checkpoint_gc_verification() {
 
         let allocated_before = sys.engine.data_pool.allocated();
         sys.table.freeze(usize::MAX).await;
-        sys.table
-            .data_checkpoint(sys.engine.trx_sys)
-            .await
-            .unwrap();
+        sys.table.data_checkpoint(sys.engine.trx_sys).await.unwrap();
         let allocated_after = sys.engine.data_pool.allocated();
         let mut reclaimed = allocated_after < allocated_before;
         for _ in 0..20 {
@@ -1085,7 +1069,10 @@ fn test_data_checkpoint_error_rollback() {
 
         let root_after = sys.table.file.active_root();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
-        assert_eq!(root_after.heap_redo_start_ts, root_before.heap_redo_start_ts);
+        assert_eq!(
+            root_after.heap_redo_start_ts,
+            root_before.heap_redo_start_ts
+        );
         assert_eq!(
             root_after.column_block_index_root,
             root_before.column_block_index_root
