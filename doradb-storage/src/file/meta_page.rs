@@ -11,7 +11,7 @@ use std::mem;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaPage {
     pub pivot_row_id: RowID,
-    pub heap_redo_start_cts: TrxID,
+    pub heap_redo_start_ts: TrxID,
     pub delta_rec_ts: TrxID,
     pub schema: TableMetadata,
     pub column_block_index_root: PageID,
@@ -23,7 +23,7 @@ impl Deser for MetaPage {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, pivot_row_id) = input.deser_u64(start_idx)?;
-        let (idx, heap_redo_start_cts) = input.deser_u64(idx)?;
+        let (idx, heap_redo_start_ts) = input.deser_u64(idx)?;
         let (idx, delta_rec_ts) = input.deser_u64(idx)?;
         let (idx, space_map) = AllocMap::deser(input, idx)?;
         let (idx, gc_page_list) = LwcPrimitiveDeser::<PageID>::deser(input, idx)?;
@@ -33,7 +33,7 @@ impl Deser for MetaPage {
             idx,
             MetaPage {
                 pivot_row_id,
-                heap_redo_start_cts,
+                heap_redo_start_ts,
                 delta_rec_ts,
                 schema: TableMetadata::from(meta),
                 column_block_index_root,
@@ -46,7 +46,7 @@ impl Deser for MetaPage {
 
 pub struct MetaPageSerView<'a> {
     pub pivot_row_id: RowID,
-    pub heap_redo_start_cts: TrxID,
+    pub heap_redo_start_ts: TrxID,
     pub delta_rec_ts: TrxID,
     pub schema: TableBriefMetadataSerView<'a>,
     pub column_block_index_root: PageID,
@@ -62,12 +62,12 @@ impl<'a> MetaPageSerView<'a> {
         space_map: &'a AllocMap,
         gc_page_list: &'a [PageID],
         pivot_row_id: RowID,
-        heap_redo_start_cts: TrxID,
+        heap_redo_start_ts: TrxID,
         delta_rec_ts: TrxID,
     ) -> Self {
         MetaPageSerView {
             pivot_row_id,
-            heap_redo_start_cts,
+            heap_redo_start_ts,
             delta_rec_ts,
             schema,
             column_block_index_root,
@@ -92,7 +92,7 @@ impl<'a> Ser<'a> for MetaPageSerView<'a> {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = out.ser_u64(start_idx, self.pivot_row_id);
-        let idx = out.ser_u64(idx, self.heap_redo_start_cts);
+        let idx = out.ser_u64(idx, self.heap_redo_start_ts);
         let idx = out.ser_u64(idx, self.delta_rec_ts);
         let idx = self.space_map.ser(out, idx);
         let idx = self.gc_page_list.ser(out, idx);
@@ -159,10 +159,7 @@ mod tests {
         assert_eq!(meta_page.space_map, active_root.alloc_map);
         assert_eq!(meta_page.gc_page_list, active_root.gc_page_list);
         assert_eq!(meta_page.pivot_row_id, active_root.pivot_row_id);
-        assert_eq!(
-            meta_page.heap_redo_start_cts,
-            active_root.heap_redo_start_cts
-        );
+        assert_eq!(meta_page.heap_redo_start_ts, active_root.heap_redo_start_ts);
         assert_eq!(meta_page.delta_rec_ts, 0);
     }
 }

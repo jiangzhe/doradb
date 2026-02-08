@@ -28,6 +28,7 @@ pub mod sys_trx;
 pub mod undo;
 pub mod ver_map;
 
+use crate::buffer::page::PageID;
 use crate::engine::EngineRef;
 use crate::error::Result;
 use crate::session::SessionState;
@@ -149,6 +150,8 @@ pub struct ActiveTrx {
     pub(crate) index_undo: IndexUndoLogs,
     // transaction-level redo logs.
     pub(crate) redo: RedoLogs,
+    // row pages to be GCed after commit.
+    pub(crate) gc_row_pages: Vec<PageID>,
 }
 
 impl ActiveTrx {
@@ -170,6 +173,7 @@ impl ActiveTrx {
             row_undo: RowUndoLogs::empty(),
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
+            gc_row_pages: Vec::new(),
         }
     }
 
@@ -206,7 +210,12 @@ impl ActiveTrx {
     /// Returns whether the transaction is readonly.
     #[inline]
     pub fn readonly(&self) -> bool {
-        self.redo.is_empty() && self.row_undo.is_empty()
+        self.redo.is_empty() && self.row_undo.is_empty() && self.gc_row_pages.is_empty()
+    }
+
+    #[inline]
+    pub fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
+        self.gc_row_pages.extend(pages);
     }
 
     /// Prepare current transaction for committing.
@@ -227,6 +236,7 @@ impl ActiveTrx {
                     gc_no: self.gc_no,
                     row_undo: RowUndoLogs::empty(),
                     index_undo: IndexUndoLogs::empty(),
+                    gc_row_pages: Vec::new(),
                 }),
                 session: self.session.take(),
             };
@@ -239,7 +249,7 @@ impl ActiveTrx {
             self.status.preparing.store(true, Ordering::SeqCst);
         }
         // use bincode to serialize redo log
-        let redo_bin = if self.redo.is_empty() {
+        let redo_bin = if self.redo.is_empty() && self.gc_row_pages.is_empty() {
             None
         } else {
             Some(TrxLog::new(
@@ -252,6 +262,7 @@ impl ActiveTrx {
         };
         let row_undo = mem::take(&mut self.row_undo);
         let index_undo = mem::take(&mut self.index_undo);
+        let gc_row_pages = mem::take(&mut self.gc_row_pages);
         PreparedTrx {
             sts: Some(self.sts),
             redo_bin,
@@ -262,6 +273,7 @@ impl ActiveTrx {
                 gc_no: self.gc_no,
                 row_undo,
                 index_undo,
+                gc_row_pages,
             }),
             session: self.session.take(),
         }
@@ -311,6 +323,10 @@ impl Drop for ActiveTrx {
         assert!(self.redo.is_empty(), "redo should be cleared");
         assert!(self.row_undo.is_empty(), "row undo should be cleared");
         assert!(self.index_undo.is_empty(), "index undo should be cleared");
+        assert!(
+            self.gc_row_pages.is_empty(),
+            "gc row pages should be cleared"
+        );
         assert!(self.session.is_none(), "session should be cleared");
     }
 }
@@ -325,6 +341,7 @@ pub struct PreparedTrxPayload {
     gc_no: usize,
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
+    gc_row_pages: Vec<PageID>,
 }
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
@@ -357,6 +374,7 @@ impl PreparedTrx {
                 gc_no,
                 row_undo,
                 mut index_undo,
+                gc_row_pages,
             }) => {
                 // Once we get a concrete CTS, we won't rollback this transaction.
                 // So we convert IndexUndo to IndexGC, and let purge threads to
@@ -371,6 +389,7 @@ impl PreparedTrx {
                         gc_no,
                         row_undo,
                         index_gc,
+                        gc_row_pages,
                     }),
                     session: self.session.take(),
                 }
@@ -394,7 +413,7 @@ impl PreparedTrx {
             && self
                 .payload
                 .as_ref()
-                .map(|p| p.row_undo.is_empty())
+                .map(|p| p.row_undo.is_empty() && p.gc_row_pages.is_empty())
                 .unwrap_or(true)
     }
 }
@@ -414,6 +433,7 @@ pub struct PrecommitTrxPayload {
     pub gc_no: usize,
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurgeEntry>,
+    pub gc_row_pages: Vec<PageID>,
 }
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
@@ -449,6 +469,7 @@ impl PrecommitTrx {
                 gc_no,
                 row_undo,
                 index_gc,
+                gc_row_pages,
             }) => {
                 // For user transaction, we need to notify readers that this transaction is committed,
                 // and readers can continue their work.
@@ -471,6 +492,7 @@ impl PrecommitTrx {
                         gc_no,
                         row_undo,
                         index_gc,
+                        gc_row_pages,
                     }),
                 }
             }
@@ -500,6 +522,7 @@ pub struct CommittedTrxPayload {
     pub gc_no: usize,
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurgeEntry>,
+    pub gc_row_pages: Vec<PageID>,
 }
 
 pub struct CommittedTrx {
@@ -527,6 +550,11 @@ impl CommittedTrx {
     #[inline]
     pub fn index_gc(&self) -> Option<&[IndexPurgeEntry]> {
         self.payload.as_ref().map(|p| &p.index_gc[..])
+    }
+
+    #[inline]
+    pub fn gc_row_pages(&self) -> Option<&[PageID]> {
+        self.payload.as_ref().map(|p| &p.gc_row_pages[..])
     }
 }
 

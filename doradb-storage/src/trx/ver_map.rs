@@ -154,6 +154,12 @@ impl RowVersionMap {
         self.max_sts.load(Ordering::Acquire)
     }
 
+    /// Returns maximum STS of insert or update on this page.
+    #[inline]
+    pub fn max_ins_sts(&self) -> TrxID {
+        self.max_ins_sts.load(Ordering::Acquire)
+    }
+
     /// Acquire a read latch on given row.
     #[inline]
     pub fn read_latch(&self, row_idx: usize) -> RowVersionReadGuard<'_> {

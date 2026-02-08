@@ -1,5 +1,8 @@
 use crate::buffer::BufferPool;
+use crate::buffer::page::PageID;
 use crate::catalog::TableMetadata;
+use crate::error::{Error, Result};
+use crate::file::table_file::MutableTableFile;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{
@@ -7,9 +10,11 @@ use crate::row::ops::{
     UpdateIndex, UpdateMvcc,
 };
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
+use crate::session::Session;
 use crate::stmt::Statement;
 use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
+use crate::trx::redo::DDLRedo;
 use crate::trx::row::{ReadAllRows, RowReadAccess};
 use crate::trx::undo::RowUndoKind;
 use crate::value::Val;
@@ -121,6 +126,12 @@ pub trait TableAccess {
     /// Freeze row pages.
     /// Returns number of pages that are frozen.
     fn freeze(&self, max_rows: usize) -> impl Future<Output = usize>;
+
+    /// Convert frozen row pages to LWC pages and persist to table file.
+    fn data_checkpoint(
+        &self,
+        session: &mut Session,
+    ) -> impl Future<Output = Result<()>>;
 }
 
 impl TableAccess for Table {
@@ -576,5 +587,78 @@ impl TableAccess for Table {
         })
         .await;
         rows
+    }
+
+    async fn data_checkpoint(&self, session: &mut Session) -> Result<()> {
+        let trx_sys = session.engine().trx_sys;
+        // Step 1: collect a contiguous range of frozen pages after the pivot row id.
+        let pivot_row_id = self.file.active_root().pivot_row_id;
+        let (frozen_pages, heap_redo_start_ts) = self.collect_frozen_pages(pivot_row_id).await;
+
+        // Step 2: wait until frozen pages are stable, then move them to transition.
+        if !frozen_pages.is_empty() {
+            self.wait_for_frozen_pages_stable(trx_sys, &frozen_pages)
+                .await;
+            self.set_frozen_pages_to_transition(&frozen_pages).await;
+        }
+
+        // Step 3: begin a checkpoint transaction and compute the new pivot row id.
+        let mut trx = session
+            .begin_trx()
+            .ok_or(Error::NotSupported("checkpoint requires idle session"))?;
+        let sts = trx.sts;
+        let new_pivot_row_id = frozen_pages
+            .last()
+            .map(|page| page.end_row_id)
+            .unwrap_or(pivot_row_id);
+        trx.redo.ddl = Some(Box::new(DDLRedo::DataCheckpoint {
+            table_id: self.table_id(),
+            pivor_row_id: new_pivot_row_id,
+            sts,
+        }));
+
+        // Step 4: build LWC pages and compute heap redo start CTS; rollback on error.
+        let (lwc_pages, heap_redo_start_ts) =
+            match self.build_lwc_pages(trx_sys, sts, &frozen_pages).await {
+                Ok(lwc_pages) => (lwc_pages, heap_redo_start_ts.unwrap_or(sts)),
+                Err(err) => {
+                    trx_sys.rollback(trx, self.data_pool).await;
+                    return Err(err);
+                }
+            };
+        let mut lwc_pages = lwc_pages;
+        if let Some(last) = lwc_pages.last_mut()
+            && last.end_row_id < new_pivot_row_id
+        {
+            last.end_row_id = new_pivot_row_id;
+        }
+
+        // Step 5: attach retired row pages to the checkpoint transaction for GC.
+        let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
+        trx.extend_gc_row_pages(gc_pages);
+
+        // Step 6: persist LWC pages (or heartbeat checkpoint) and refresh file root.
+        let checkpoint_ts = sts;
+        let table_file = MutableTableFile::fork(&self.file);
+        let (table_file, old_root) = if !lwc_pages.is_empty() {
+            table_file
+                .persist_lwc_pages(lwc_pages, heap_redo_start_ts, checkpoint_ts)
+                .await?
+        } else {
+            table_file
+                .update_checkpoint(new_pivot_row_id, heap_redo_start_ts, checkpoint_ts)
+                .await?
+        };
+        self.blk_idx
+            .update_file_root(table_file.active_root())
+            .await;
+        drop(old_root);
+
+        // Step 7: commit the checkpoint transaction to get CTS.
+        let _cts = match trx_sys.commit(trx, self.data_pool).await {
+            Ok(cts) => cts,
+            Err(err) => return Err(err),
+        };
+        Ok(())
     }
 }

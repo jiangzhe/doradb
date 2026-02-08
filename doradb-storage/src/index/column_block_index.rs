@@ -215,6 +215,7 @@ impl<'a> DeletionList<'a> {
         DeletionList { data }
     }
 
+    #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
         self.data[1] as usize
@@ -237,9 +238,7 @@ impl<'a> DeletionList<'a> {
     #[inline]
     pub fn contains(&self, delta: u32) -> bool {
         if self.is_format_u32() {
-            self.deltas_u32()
-                .binary_search(&delta)
-                .is_ok()
+            self.deltas_u32().binary_search(&delta).is_ok()
         } else if delta > u16::MAX as u32 {
             false
         } else {
@@ -308,8 +307,7 @@ impl<'a> DeletionList<'a> {
 
     #[inline]
     pub fn iter_row_ids(&self, start_row_id: RowID) -> impl Iterator<Item = RowID> + '_ {
-        self.iter()
-            .map(move |delta| start_row_id + delta as RowID)
+        self.iter().map(move |delta| start_row_id + delta as RowID)
     }
 
     #[inline]
@@ -462,13 +460,9 @@ impl ColumnBlockIndex {
         debug_assert!(
             entries
                 .first()
-                .map_or(true, |entry| entry.0 >= self.end_row_id)
+                .is_none_or(|entry| entry.0 >= self.end_row_id)
         );
-        debug_assert!(
-            entries
-                .last()
-                .map_or(true, |entry| entry.0 < new_end_row_id)
-        );
+        debug_assert!(entries.last().is_none_or(|entry| entry.0 < new_end_row_id));
         debug_assert!(new_end_row_id >= self.end_row_id);
         if entries.is_empty() {
             return Ok(self.root_page_id);
@@ -960,7 +954,10 @@ mod tests {
         assert_eq!(list.add(u16::MAX as u32 + 4).unwrap(), true);
         assert!(list.contains(u16::MAX as u32 + 4));
         assert_eq!(list.len(), 3);
-        assert_eq!(list.iter().collect::<Vec<_>>(), vec![5, 10, u16::MAX as u32 + 4]);
+        assert_eq!(
+            list.iter().collect::<Vec<_>>(),
+            vec![5, 10, u16::MAX as u32 + 4]
+        );
     }
 
     #[test]

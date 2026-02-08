@@ -26,8 +26,7 @@ pub const BLOCK_PAGE_SIZE: usize = PAGE_SIZE;
 pub const BLOCK_HEADER_SIZE: usize = mem::size_of::<BlockNodeHeader>();
 pub const NBR_ENTRIES_IN_BRANCH: usize = 4093;
 pub const ENTRY_SIZE: usize = mem::size_of::<PageEntry>();
-pub const NBR_PAGE_ENTRIES_IN_LEAF: usize =
-    (BLOCK_PAGE_SIZE - BLOCK_HEADER_SIZE) / ENTRY_SIZE;
+pub const NBR_PAGE_ENTRIES_IN_LEAF: usize = (BLOCK_PAGE_SIZE - BLOCK_HEADER_SIZE) / ENTRY_SIZE;
 
 const _: () = assert!(
     { mem::size_of::<BlockNode>() == BLOCK_PAGE_SIZE },
@@ -337,6 +336,17 @@ impl BlockIndex {
         self.page_committer.lock().is_some()
     }
 
+    #[inline]
+    pub async fn update_file_root(&self, active_root: &ActiveRoot) {
+        let _g = self.root.latch.exclusive_async().await;
+        unsafe {
+            *self.root.pivot.get() = active_root.pivot_row_id;
+        }
+        self.root
+            .file
+            .store(active_root as *const _ as *mut _, Ordering::Release);
+    }
+
     /// Get row page for insertion.
     /// Caller should cache insert page id to avoid invoking this method frequently.
     #[inline]
@@ -439,11 +449,9 @@ impl BlockIndex {
                         Some(root) => root,
                         None => return RowLocation::NotFound,
                     };
-                    match find_in_file(&self.table_file, file_root, row_id)
-                    .await
-                    {
+                    match find_in_file(&self.table_file, file_root, row_id).await {
                         Ok(Some(payload)) => {
-                            return RowLocation::LwcPage(payload.block_id as PageID)
+                            return RowLocation::LwcPage(payload.block_id as PageID);
                         }
                         Ok(None) | Err(_) => return RowLocation::NotFound,
                     }
@@ -750,9 +758,9 @@ impl BlockIndex {
         let root = match self.root.guide(row_id) {
             Left(file_root) => {
                 let payload = match find_in_file(&self.table_file, file_root, row_id).await {
-                        Ok(payload) => payload,
-                        Err(_) => return Valid(RowLocation::NotFound),
-                    };
+                    Ok(payload) => payload,
+                    Err(_) => return Valid(RowLocation::NotFound),
+                };
                 return Valid(match payload {
                     Some(payload) => RowLocation::LwcPage(payload.block_id as PageID),
                     None => RowLocation::NotFound,

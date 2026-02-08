@@ -153,6 +153,7 @@ pub enum DDLRedoCode {
     CreateIndex = 133,
     DropIndex = 134,
     CreateRowPage = 135,
+    DataCheckpoint = 136,
 }
 
 impl From<u8> for DDLRedoCode {
@@ -179,6 +180,11 @@ pub enum DDLRedo {
         start_row_id: RowID,
         end_row_id: RowID,
     },
+    DataCheckpoint {
+        table_id: TableID,
+        pivor_row_id: RowID,
+        sts: TrxID,
+    },
 }
 
 impl DDLRedo {
@@ -193,6 +199,7 @@ impl DDLRedo {
             DDLRedo::CreateIndex { .. } => DDLRedoCode::CreateIndex,
             DDLRedo::DropIndex { .. } => DDLRedoCode::DropIndex,
             DDLRedo::CreateRowPage { .. } => DDLRedoCode::CreateRowPage,
+            DDLRedo::DataCheckpoint { .. } => DDLRedoCode::DataCheckpoint,
         }
     }
 }
@@ -212,6 +219,9 @@ impl Ser<'_> for DDLRedo {
                     mem::size_of::<TableID>()
                         + mem::size_of::<PageID>()
                         + mem::size_of::<RowID>() * 2
+                }
+                DDLRedo::DataCheckpoint { .. } => {
+                    mem::size_of::<TableID>() + mem::size_of::<RowID>() + mem::size_of::<TrxID>()
                 }
             }
     }
@@ -249,6 +259,15 @@ impl Ser<'_> for DDLRedo {
                 idx = out.ser_u64(idx, *page_id);
                 idx = out.ser_u64(idx, *start_row_id);
                 idx = out.ser_u64(idx, *end_row_id);
+            }
+            DDLRedo::DataCheckpoint {
+                table_id,
+                pivor_row_id,
+                sts,
+            } => {
+                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u64(idx, *pivor_row_id);
+                idx = out.ser_u64(idx, *sts);
             }
         }
         idx
@@ -296,6 +315,19 @@ impl Deser for DDLRedo {
                         page_id,
                         start_row_id,
                         end_row_id,
+                    },
+                ))
+            }
+            DDLRedoCode::DataCheckpoint => {
+                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, pivor_row_id) = input.deser_u64(idx)?;
+                let (idx, sts) = input.deser_u64(idx)?;
+                Ok((
+                    idx,
+                    DDLRedo::DataCheckpoint {
+                        table_id,
+                        pivor_row_id,
+                        sts,
                     },
                 ))
             }
@@ -903,6 +935,30 @@ mod tests {
                 assert_eq!(table_id, 5);
             }
             _ => panic!("Expected DropTable"),
+        }
+
+        // 测试用例6：DataCheckpoint
+        let data_checkpoint = DDLRedo::DataCheckpoint {
+            table_id: 9,
+            pivor_row_id: 128,
+            sts: 42,
+        };
+        let mut buf = vec![0; data_checkpoint.ser_len()];
+        data_checkpoint.ser(&mut buf[..], 0);
+        assert_eq!(buf[0], DDLRedoCode::DataCheckpoint as u8);
+
+        let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
+        match deserialized {
+            DDLRedo::DataCheckpoint {
+                table_id,
+                pivor_row_id,
+                sts,
+            } => {
+                assert_eq!(table_id, 9);
+                assert_eq!(pivor_row_id, 128);
+                assert_eq!(sts, 42);
+            }
+            _ => panic!("Expected DataCheckpoint"),
         }
     }
 }

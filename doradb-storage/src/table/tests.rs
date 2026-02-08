@@ -10,6 +10,8 @@ use crate::table::{Table, TableAccess};
 use crate::trx::ActiveTrx;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::value::Val;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
@@ -889,6 +891,203 @@ fn test_table_freeze() {
     });
 }
 
+#[test]
+fn test_data_checkpoint_basic_flow() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        let name = "x".repeat(1024);
+        insert_rows(&sys, &mut session, 0, 200, &name).await;
+
+        let old_root = sys.table.file.active_root().clone();
+        sys.table.freeze(usize::MAX).await;
+        let pivot_row_id = sys.table.file.active_root().pivot_row_id;
+        let (frozen_pages, _) = sys.table.collect_frozen_pages(pivot_row_id).await;
+        assert!(!frozen_pages.is_empty());
+
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let new_root = sys.table.file.active_root();
+        assert!(new_root.pivot_row_id > old_root.pivot_row_id);
+        assert!(new_root.column_block_index_root > 0);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_data_checkpoint_snapshot_consistency() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        let name = "y".repeat(256);
+        insert_rows(&sys, &mut session, 0, 120, &name).await;
+
+        sys.table.freeze(1).await;
+
+        let mut read_trx = session.begin_trx().unwrap();
+        {
+            let key = SelectKey::new(0, vec![Val::from(1)]);
+            let stmt = read_trx.start_stmt();
+            let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+            assert!(res.is_ok());
+            read_trx = stmt.succeed();
+        }
+
+        let mut write_session = sys.new_session();
+        let mut write_trx = write_session.begin_trx().unwrap();
+        {
+            let mut stmt = write_trx.start_stmt();
+            let insert = vec![Val::from(10_000i32), Val::from("new")];
+            let res = stmt.insert_row(&sys.table, insert).await;
+            assert!(res.is_ok());
+            write_trx = stmt.succeed();
+        }
+
+        let mut checkpoint_session = sys.new_session();
+        sys.table
+            .data_checkpoint(&mut checkpoint_session)
+            .await
+            .unwrap();
+
+        {
+            let key = SelectKey::new(0, vec![Val::from(10_000i32)]);
+            let stmt = read_trx.start_stmt();
+            let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+            assert!(res.not_found());
+            read_trx = stmt.succeed();
+        }
+
+        write_trx.rollback().await;
+        read_trx.commit().await.unwrap();
+
+        drop(session);
+        drop(write_session);
+        drop(checkpoint_session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_data_checkpoint_persistence_recovery() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let TestSys {
+            engine,
+            table,
+            _temp_dir,
+        } = sys;
+        let table_id = table.table_id();
+        let mut session = engine.new_session();
+        let name = "z".repeat(512);
+        insert_rows_direct(&table, &mut session, 0, 150, &name).await;
+
+        table.freeze(usize::MAX).await;
+        table.data_checkpoint(&mut session).await.unwrap();
+
+        let root_before = table.file.active_root().clone();
+        drop(table);
+
+        let table_file = engine.table_fs.open_table_file(table_id).await.unwrap();
+        let root_after = table_file.active_root();
+        assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
+        assert_eq!(
+            root_after.heap_redo_start_ts,
+            root_before.heap_redo_start_ts
+        );
+
+        drop(session);
+        drop(table_file);
+        drop(engine);
+        drop(_temp_dir);
+    });
+}
+
+#[test]
+fn test_data_checkpoint_heartbeat() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        let name = "h".repeat(128);
+        insert_rows(&sys, &mut session, 0, 40, &name).await;
+
+        let root_before = sys.table.file.active_root().clone();
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+        let root_after = sys.table.file.active_root();
+
+        assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
+        assert!(root_after.heap_redo_start_ts > root_before.heap_redo_start_ts);
+        assert_eq!(
+            root_after.column_block_index_root,
+            root_before.column_block_index_root
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_data_checkpoint_gc_verification() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        let name = "g".repeat(1024);
+        insert_rows(&sys, &mut session, 0, 200, &name).await;
+
+        let allocated_before = sys.engine.data_pool.allocated();
+        sys.table.freeze(usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+        let allocated_after = sys.engine.data_pool.allocated();
+        let mut reclaimed = allocated_after < allocated_before;
+        for _ in 0..20 {
+            smol::Timer::after(Duration::from_millis(200)).await;
+            let allocated_now = sys.engine.data_pool.allocated();
+            if allocated_now < allocated_before {
+                reclaimed = true;
+                break;
+            }
+        }
+        assert!(reclaimed, "row pages should be reclaimed after purge");
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_data_checkpoint_error_rollback() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        let name = "e".repeat(256);
+        insert_rows(&sys, &mut session, 0, 80, &name).await;
+
+        sys.table.freeze(usize::MAX).await;
+        let root_before = sys.table.file.active_root().clone();
+
+        super::TEST_FORCE_LWC_BUILD_ERROR.store(true, Ordering::SeqCst);
+        let res = sys.table.data_checkpoint(&mut session).await;
+        super::TEST_FORCE_LWC_BUILD_ERROR.store(false, Ordering::SeqCst);
+        assert!(res.is_err());
+
+        let root_after = sys.table.file.active_root();
+        assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
+        assert_eq!(
+            root_after.heap_redo_start_ts,
+            root_before.heap_redo_start_ts
+        );
+        assert_eq!(
+            root_after.column_block_index_root,
+            root_before.column_block_index_root
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
 struct TestSys {
     engine: Engine,
     table: Table,
@@ -1047,4 +1246,31 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
         index_no: 0,
         vals: vec![value.into()],
     }
+}
+
+async fn insert_rows(sys: &TestSys, session: &mut Session, start: i32, count: i32, name: &str) {
+    let mut trx = session.begin_trx().unwrap();
+    for i in 0..count {
+        let insert = vec![Val::from(start + i), Val::from(name)];
+        trx = sys.trx_insert(trx, insert).await;
+    }
+    trx.commit().await.unwrap();
+}
+
+async fn insert_rows_direct(
+    table: &Table,
+    session: &mut Session,
+    start: i32,
+    count: i32,
+    name: &str,
+) {
+    let mut trx = session.begin_trx().unwrap();
+    for i in 0..count {
+        let insert = vec![Val::from(start + i), Val::from(name)];
+        let mut stmt = trx.start_stmt();
+        let res = stmt.insert_row(table, insert).await;
+        assert!(res.is_ok());
+        trx = stmt.succeed();
+    }
+    trx.commit().await.unwrap();
 }

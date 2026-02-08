@@ -56,7 +56,7 @@ pub struct MetaPage {
     pub gc_page_list: Vec<PageID>, // Replaces SuperPageFree? (Needs verification)
     
     // Watermark
-    pub last_checkpoint_cts: TrxID,
+    pub last_checkpoint_sts: TrxID,
 }
 ```
 
