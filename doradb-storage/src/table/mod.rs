@@ -133,7 +133,7 @@ impl Table {
     ) -> (Vec<FrozenPage>, Option<TrxID>) {
         let mut frozen_pages = Vec::new();
         let mut expected_row_id = pivot_row_id;
-        let mut heap_redo_start_cts = None;
+        let mut heap_redo_start_ts = None;
         self.mem_scan(pivot_row_id, |page_guard| {
             let page = page_guard.page();
             if page.header.start_row_id != expected_row_id {
@@ -143,7 +143,8 @@ impl Table {
             let row_ver = ctx.row_ver().unwrap();
             if row_ver.state() != RowPageState::Frozen {
                 if row_ver.state() == RowPageState::Active {
-                    heap_redo_start_cts = Some(row_ver.create_cts());
+                    // heap redo start ts is creation cts of first remaining active page. 
+                    heap_redo_start_ts = Some(row_ver.create_cts());
                 }
                 return false;
             }
@@ -157,7 +158,7 @@ impl Table {
             true
         })
         .await;
-        (frozen_pages, heap_redo_start_cts)
+        (frozen_pages, heap_redo_start_ts)
     }
 
     async fn wait_for_frozen_pages_stable(

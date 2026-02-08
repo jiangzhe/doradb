@@ -591,7 +591,7 @@ impl TableAccess for Table {
     async fn data_checkpoint(&self, trx_sys: &'static TransactionSystem) -> Result<()> {
         // Step 1: collect a contiguous range of frozen pages after the pivot row id.
         let pivot_row_id = self.file.active_root().pivot_row_id;
-        let (frozen_pages, heap_redo_start_cts) =
+        let (frozen_pages, heap_redo_start_ts) =
             self.collect_frozen_pages(pivot_row_id).await;
 
         // Step 2: wait until frozen pages are stable, then move them to transition.
@@ -608,21 +608,22 @@ impl TableAccess for Table {
             .last()
             .map(|page| page.end_row_id)
             .unwrap_or(pivot_row_id);
+
         // Step 4: build LWC pages and compute heap redo start CTS; rollback on error.
-        let (lwc_pages, heap_redo_start_cts) =
+        let (lwc_pages, heap_redo_start_ts) =
             match self.build_lwc_pages(trx_sys, sts, &frozen_pages).await {
-                Ok(lwc_pages) => (lwc_pages, heap_redo_start_cts.unwrap_or(sts)),
+                Ok(lwc_pages) => (lwc_pages, heap_redo_start_ts.unwrap_or(sts)),
                 Err(err) => {
                     trx_sys.rollback(trx, self.data_pool).await;
                     return Err(err);
                 }
             };
         let mut lwc_pages = lwc_pages;
-        if let Some(last) = lwc_pages.last_mut() {
-            if last.end_row_id < new_pivot_row_id {
+        if let Some(last) = lwc_pages.last_mut()
+            && last.end_row_id < new_pivot_row_id {
                 last.end_row_id = new_pivot_row_id;
-            }
         }
+        
         // Step 5: attach retired row pages to the checkpoint transaction for GC.
         let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
         trx.extend_gc_row_pages(gc_pages);
@@ -637,11 +638,11 @@ impl TableAccess for Table {
         let table_file = MutableTableFile::fork(&self.file);
         let (table_file, old_root) = if !lwc_pages.is_empty() {
             table_file
-                .persist_lwc_pages(lwc_pages, heap_redo_start_cts, cts)
+                .persist_lwc_pages(lwc_pages, heap_redo_start_ts, cts)
                 .await?
         } else {
             table_file
-                .update_checkpoint(new_pivot_row_id, heap_redo_start_cts, cts)
+                .update_checkpoint(new_pivot_row_id, heap_redo_start_ts, cts)
                 .await?
         };
         self.blk_idx.update_file_root(table_file.active_root()).await;

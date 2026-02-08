@@ -8,7 +8,7 @@ Implement the `data_checkpoint` method for `Table` to migrate committed data fro
 
 The Data Checkpoint (executed by the Tuple Mover) is responsible for:
 1.  **Memory Reclamation**: Converting hot `RowPage`s into compact, immutable `LWC` blocks.
-2.  **Log Truncation**: Advancing the `pivot_row_id` and `heap_redo_start_cts` to allow WAL truncation.
+2.  **Log Truncation**: Advancing the `pivot_row_id` and `heap_redo_start_ts` to allow WAL truncation.
 3.  **Read Optimization**: Transforming data into a columnar format for faster analytical scans.
 
 The process follows a strict state machine for `RowPage`s: `ACTIVE` -> `FROZEN` -> `TRANSITION` -> `Retired` (GC).
@@ -36,7 +36,7 @@ The process follows a strict state machine for `RowPage`s: `ACTIVE` -> `FROZEN` 
   fn data_checkpoint(&self, trx_sys: &'static TransactionSystem) -> impl Future<Output=Result<()>>
   ```
 - Implement `data_checkpoint` in `Table`.
-- The method relies on the preceding `freeze` call. If no pages are frozen, it should still start a transaction and update `heap_redo_start_cts` in the table file (Heartbeat Checkpoint).
+- The method relies on the preceding `freeze` call. If no pages are frozen, it should still start a transaction and update `heap_redo_start_ts` in the table file (Heartbeat Checkpoint).
 
 ### 2. Stabilization Loop
 - `data_checkpoint` should:
@@ -53,7 +53,7 @@ The process follows a strict state machine for `RowPage`s: `ACTIVE` -> `FROZEN` 
     - Collect `(start_row_id, lwc_block_id)` pairs.
 
 ### 4. Persistence and Metadata Update
-- Calculate new `heap_redo_start_cts` (creation CTS of the oldest remaining `ACTIVE` page, or `trx.sts` if none).
+- Calculate new `heap_redo_start_ts` (creation CTS of the oldest remaining `ACTIVE` page, or `trx.sts` if none).
 - If `LWC` blocks were generated:
     - Use `MutableTableFile::persist_lwc_pages` to write blocks, update `ColumnBlockIndex`.
     - This generates a new `TableFile` root.
@@ -82,8 +82,8 @@ The process follows a strict state machine for `RowPage`s: `ACTIVE` -> `FROZEN` 
 
 1.  **Basic Checkpoint Flow**: Insert rows -> Freeze pages -> Run `data_checkpoint` -> Verify `pivot_row_id` updated, `ColumnBlockIndex` has entries, and `RowPage`s are converted.
 2.  **Snapshot Consistency**: Start a long-running read transaction -> Insert more rows -> Freeze & Checkpoint. Verify the read transaction sees consistent data (old versions in LWC or correctly filtered). Verify uncommitted data at checkpoint start is excluded.
-3.  **Persistence Recovery**: Run checkpoint -> Drop `Table` struct (keeping file) -> Re-open `TableFile`. Verify `heap_redo_start_cts` and `pivot_row_id` are persisted correctly.
-4.  **Heartbeat Checkpoint**: No frozen pages -> Run `data_checkpoint`. Verify `heap_redo_start_cts` advances but `pivot_row_id` stays same.
+3.  **Persistence Recovery**: Run checkpoint -> Drop `Table` struct (keeping file) -> Re-open `TableFile`. Verify `heap_redo_start_ts` and `pivot_row_id` are persisted correctly.
+4.  **Heartbeat Checkpoint**: No frozen pages -> Run `data_checkpoint`. Verify `heap_redo_start_ts` advances but `pivot_row_id` stays same.
 5.  **GC Verification**: Run checkpoint -> Wait for purge. Verify `allocated()` count in `BufferPool` decreases (indicating `RowPage`s were freed).
 6.  **Error & Rollback**: Mock failure during LWC conversion -> Verify transaction rollback -> Verify `TableFile` root remains unchanged.
 

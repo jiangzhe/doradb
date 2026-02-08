@@ -192,7 +192,7 @@ impl TableFile {
             page_no: super_page.header.page_no,
             trx_id: super_page.header.checkpoint_cts,
             pivot_row_id: meta_page.pivot_row_id,
-            heap_redo_start_cts: meta_page.heap_redo_start_cts,
+            heap_redo_start_ts: meta_page.heap_redo_start_ts,
             alloc_map: meta_page.space_map,
             gc_page_list: meta_page.gc_page_list,
             metadata: Arc::new(meta_page.schema),
@@ -415,7 +415,7 @@ impl MutableTableFile {
     pub async fn persist_lwc_pages(
         mut self,
         lwc_pages: Vec<LwcPagePersist>,
-        heap_redo_start_cts: TrxID,
+        heap_redo_start_ts: TrxID,
         ts: TrxID,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         let mut max_row_id = self.active_root.pivot_row_id;
@@ -453,7 +453,7 @@ impl MutableTableFile {
             .await?;
         self.active_root.column_block_index_root = new_root;
         self.active_root.pivot_row_id = max_row_id;
-        self.active_root.heap_redo_start_cts = heap_redo_start_cts;
+        self.active_root.heap_redo_start_ts = heap_redo_start_ts;
 
         self.commit(ts, false).await
     }
@@ -461,14 +461,14 @@ impl MutableTableFile {
     pub async fn update_checkpoint(
         mut self,
         pivot_row_id: RowID,
-        heap_redo_start_cts: TrxID,
+        heap_redo_start_ts: TrxID,
         ts: TrxID,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         if pivot_row_id < self.active_root.pivot_row_id {
             return Err(Error::InvalidArgument);
         }
         self.active_root.pivot_row_id = pivot_row_id;
-        self.active_root.heap_redo_start_cts = heap_redo_start_cts;
+        self.active_root.heap_redo_start_ts = heap_redo_start_ts;
         self.commit(ts, false).await
     }
 
@@ -501,7 +501,7 @@ pub struct ActiveRoot {
     /// according the first row page which is not transfered.
     pub pivot_row_id: RowID,
     /// Redo log start point for in-memory heap.
-    pub heap_redo_start_cts: TrxID,
+    pub heap_redo_start_ts: TrxID,
     /// Page allocation map.
     pub alloc_map: AllocMap,
     /// Pages that became obsolete in this version.
@@ -533,7 +533,7 @@ impl ActiveRoot {
             page_no: DEFALT_ROOT_PAGE_NO,
             trx_id,
             pivot_row_id: 0,
-            heap_redo_start_cts: trx_id,
+            heap_redo_start_ts: trx_id,
             alloc_map,
             gc_page_list: vec![],
             metadata,
@@ -565,7 +565,7 @@ impl ActiveRoot {
             &self.alloc_map,
             &self.gc_page_list,
             self.pivot_row_id,
-            self.heap_redo_start_cts,
+            self.heap_redo_start_ts,
             0,
         )
     }
@@ -749,7 +749,7 @@ mod tests {
             let active_root = table_file.active_root();
             assert_eq!(active_root.trx_id, 2);
             assert_eq!(active_root.pivot_row_id, 20);
-            assert_eq!(active_root.heap_redo_start_cts, 7);
+            assert_eq!(active_root.heap_redo_start_ts, 7);
             assert_ne!(active_root.column_block_index_root, 0);
 
             let column_index = crate::index::ColumnBlockIndex::new(

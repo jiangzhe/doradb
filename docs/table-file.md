@@ -68,7 +68,7 @@ The **MetaPage** holds the complete state of the table at a specific point in ti
 | `space_map_root` | PageID of the **SpaceMap**. |
 | `pivot_rowid` | The watermark separating Disk Store (<) and Memory Store (>=). |
 | **`watermarks`** | A structure containing all component watermarks for recovery log truncation. |
-| | &nbsp;&nbsp;**`heap_redo_start_cts`** | Redo log start point for the in-memory RowStore. |
+| | &nbsp;&nbsp;**`heap_redo_start_ts`** | Redo log start point for the in-memory RowStore. |
 | | &nbsp;&nbsp;**`deletion_rec_cts`** | Persistence watermark for the on-disk delete bitmaps. |
 | | &nbsp;&nbsp;**`index_rec_cts`** | Map `<IndexID, CTS>` of persistence watermarks for each index. |
 | **`last_checkpoint_sts`** | The logical watermark (Start Timestamp) of the transaction that created this snapshot. Crucial for recovery filtering. |
@@ -156,7 +156,7 @@ All checkpoint workflows follow a similar commit protocol:
 4.  **Populate New MetaPage**:
     *   **Copy**: Copy all root pointers and watermarks from `ActiveMeta` to `NewMeta`.
     *   **Update**: Overwrite the specific fields managed by this checkpoint. For example:
-        *   A **Data Checkpoint** updates `block_index_root`, `pivot_rowid`, and `watermarks.heap_redo_start_cts`.
+        *   A **Data Checkpoint** updates `block_index_root`, `pivot_rowid`, and `watermarks.heap_redo_start_ts`.
         *   An **Index Checkpoint** updates `disktree_roots` and `watermarks.index_rec_cts`.
         *   A **Deletion Checkpoint** updates `bitmap_tree_root` and `watermarks.deletion_rec_cts`.
     *   **Set Timestamp**: Set `last_checkpoint_sts` to the `STS` of the system transaction coordinating the checkpoint.

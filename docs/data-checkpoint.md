@@ -45,10 +45,10 @@ The Tuple Mover executes the checkpoint in a **System Transaction** context. The
 1.  **Begin Transaction**: Acquire a Start Timestamp (`CP.STS`).
     *   **Significance**: `CP.STS` acts as the **Logical Snapshot Time**. All data committed before this timestamp in the selected pages will be materialized into the LWC blocks.
 2.  **State Transition**: Atomic `CAS(State, FROZEN, TRANSITION)`.
-3.  **Calculate Log Watermark (`Heap_Redo_Start_CTS`)**:
+3.  **Calculate Log Watermark (`Heap_Redo_Start_TS`)**:
     *   Scan the remaining `ACTIVE` pages (those *not* selected for this checkpoint).
-    *   If active pages exist: `Heap_Redo_Start_CTS = Min(Remaining_Pages.Creation_CTS)`.
-    *   If no active pages exist (Full Checkpoint): `Heap_Redo_Start_CTS = CP.STS`.
+    *   If active pages exist: `Heap_Redo_Start_TS = Min(Remaining_Pages.Creation_CTS)`.
+    *   If no active pages exist (Full Checkpoint): `Heap_Redo_Start_TS = CP.STS`.
 
 ### Phase 3: Vectorized Conversion (Row to LWC)
 Once stabilized, the page state is set to `TRANSITION`. The conversion pipeline runs in memory without holding page locks.
@@ -78,7 +78,7 @@ Once stabilized, the page state is set to `TRANSITION`. The conversion pipeline 
 1.  **Commit Transaction**: Acquire a Commit Timestamp (`CP.CTS`).
 2.  **Construct New MetaPage**:
     *   **`Pivot_RowID`**: Advanced to the end of the converted range.
-    *   **`Heap_Redo_Start_CTS`**: The value calculated in Phase 2.
+    *   **`Heap_Redo_Start_TS`**: The value calculated in Phase 2.
     *   **`Last_Checkpoint_STS`**: Set to **`CP.STS`**. (Crucial for recovery).
     *   **`Block_Index_Root`**: Point to the new index root.
 3.  **Atomic Persistence**:
@@ -95,19 +95,19 @@ During crash recovery, the system uses the persisted metadata to determine which
 
 **Inputs from MetaPage:**
 1.  `Pivot_RowID`: The boundary separating the on-disk ColumnStore from the in-memory RowStore.
-2.  `Heap_Redo_Start_CTS`: The **physical starting point** for scanning the log. This is a coarse-grained filter that allows the Log Manager to skip old log files entirely.
+2.  `Heap_Redo_Start_TS`: The **physical starting point** for scanning the log. This is a coarse-grained filter that allows the Log Manager to skip old log files entirely.
 3.  `Last_Checkpoint_STS`: The **logical snapshot time** of the persistent ColumnStore. This is a fine-grained filter used to determine if a specific change within the log is already reflected in the on-disk data.
 
 **Replay Algorithm:**
 
-The recovery process begins by seeking to the `Heap_Redo_Start_CTS` in the commit log. It then reads logs sequentially from that point. For each log entry $L$ (with timestamp $L.CTS$ and target $L.RowID$), the following logic is applied:
+The recovery process begins by seeking to the `Heap_Redo_Start_TS` in the commit log. It then reads logs sequentially from that point. For each log entry $L$ (with timestamp $L.CTS$ and target $L.RowID$), the following logic is applied:
 
 ```rust
 // First-level check: Is the log entry for hot or cold data?
 if L.RowID >= MetaPage.Pivot_RowID {
     // Case 1: Hot Data (In-Memory RowStore)
     // The row belongs to an Active RowPage that was not checkpointed.
-    // The Heap_Redo_Start_CTS check was already implicitly handled by the
+    // The Heap_Redo_Start_TS check was already implicitly handled by the
     // initial log seek. We must replay all subsequent records to rebuild
     // the in-memory RowStore.
     replay_into_row_store(L);
@@ -143,7 +143,7 @@ To support this logic, the **MetaPage** (referenced by SuperPage) must strictly 
 | :--- | :--- | :--- |
 | `Pivot_RowID` | High watermark of ColumnStore. | Separates Hot vs. Cold data. |
 | `Block_Index_Root` | Root PageID of Block Index. | locating LWC blocks. |
-| `Heap_Redo_Start_CTS` | Min CTS of oldest active page. | Tells Log Manager where to truncate. |
+| `Heap_Redo_Start_TS` | Min CTS of oldest active page. | Tells Log Manager where to truncate. |
 | **`Last_Checkpoint_STS`** | STS of the last CP transaction. | **Recovery Filter**: Distinguishes "Baked-in" data from "Deletion" data. |
 
 ## 6. Concurrency Handling

@@ -1000,7 +1000,7 @@ fn test_data_checkpoint_persistence_recovery() {
             .unwrap();
         let root_after = table_file.active_root();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
-        assert_eq!(root_after.heap_redo_start_cts, root_before.heap_redo_start_cts);
+        assert_eq!(root_after.heap_redo_start_ts, root_before.heap_redo_start_ts);
 
         drop(session);
         drop(table_file);
@@ -1025,7 +1025,7 @@ fn test_data_checkpoint_heartbeat() {
         let root_after = sys.table.file.active_root();
 
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
-        assert!(root_after.heap_redo_start_cts > root_before.heap_redo_start_cts);
+        assert!(root_after.heap_redo_start_ts > root_before.heap_redo_start_ts);
         assert_eq!(
             root_after.column_block_index_root,
             root_before.column_block_index_root
@@ -1085,7 +1085,7 @@ fn test_data_checkpoint_error_rollback() {
 
         let root_after = sys.table.file.active_root();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
-        assert_eq!(root_after.heap_redo_start_cts, root_before.heap_redo_start_cts);
+        assert_eq!(root_after.heap_redo_start_ts, root_before.heap_redo_start_ts);
         assert_eq!(
             root_after.column_block_index_root,
             root_before.column_block_index_root

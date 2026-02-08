@@ -5,7 +5,6 @@ use crate::lifetime::StaticLifetime;
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
 use libc::EINTR;
-use libc::c_void;
 #[cfg(feature = "libaio")]
 use libc::{EAGAIN, c_long};
 use std::collections::VecDeque;

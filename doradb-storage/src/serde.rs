@@ -802,7 +802,7 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixSerView<'a, H, P> {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        debug_assert!(self.data_len as usize == self.header.ser_len() + self.payload.ser_len());
+        debug_assert!(self.data_len == self.header.ser_len() + self.payload.ser_len());
         let mut idx = start_idx;
         idx = out.ser_u64(idx, self.data_len as u64);
         idx = self.header.ser(out, idx);

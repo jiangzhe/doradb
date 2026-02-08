@@ -22,15 +22,15 @@ Each Table object maintains the following structures to coordinate checkpoints:
 
 Each table maintains three types of watermarks, corresponding to its three persistence components. The minimum of these defines the table's retention requirement.
 
-1. Heap Watermark: `Heap_Redo_Start_CTS`
+1. Heap Watermark: `Heap_Redo_Start_TS`
     *   **Definition**: The creation timestamp (CTS) of the **oldest active RowPage** currently resident in the in-memory RowStore.
     *   **Purpose**: To rebuild the volatile RowStore, the system must replay all heap operations (Insert/Update) that occurred since the creation of the oldest surviving page.
     *   **Maintenance**:
         *   When a new RowPage is allocated, its `Creation_CTS` is set to the current system clock.
         *   When the **Tuple Mover** successfully converts a batch of frozen RowPages into LWC blocks and persists them:
             1.  It identifies the *next* oldest active RowPage remaining in memory.
-            2.  It updates `Heap_Redo_Start_CTS` in the Table Metadata to that page's `Creation_CTS`.
-        *   *Edge Case*: If the RowStore becomes empty (all data flushed to LWC), `Heap_Redo_Start_CTS` is advanced to the current system CTS.
+            2.  It updates `Heap_Redo_Start_TS` in the Table Metadata to that page's `Creation_CTS`.
+        *   *Edge Case*: If the RowStore becomes empty (all data flushed to LWC), `Heap_Redo_Start_TS` is advanced to the current system CTS.
 
 2. Deletion Watermark: `Deletion_Rec_CTS`
     *   **Definition**: The maximum CTS such that all deletions with `CTS <= Deletion_Rec_CTS` targeting cold data (`RowID < Pivot`) have been persisted into on-disk Delete Bitmaps.
@@ -197,7 +197,7 @@ Upon system restart, the recovery process uses these persistent watermarks to de
 
 #### 6.2.1 Metadata Load & Start Point Determination
 1.  The system scans the headers of all Table Files and Index Files.
-2.  It constructs an in-memory view of all watermarks (`Heap_Redo_Start_CTS`, `Deletion_Rec_CTS`, `Index.Rec_CTS`).
+2.  It constructs an in-memory view of all watermarks (`Heap_Redo_Start_TS`, `Deletion_Rec_CTS`, `Index.Rec_CTS`).
 3.  It calculates the global **Recovery Start Point**:
     $$ \text{Replay\_Start\_CTS} = \min(\text{All Loaded Watermarks}) $$
 4.  The Log Reader seeks to the log file/offset corresponding to `Replay_Start_CTS`.
@@ -209,9 +209,9 @@ For each log entry read from the log, a second, finer-grained check is performed
 
 *   **Heap Operations (Affecting the In-Memory RowStore)**:
     *   **Filter**: An operation on a table `T` is a candidate if its `RowID >= T.Pivot_RowID`.
-    *   **Rule**: Replay if `Entry.CTS >= T.Heap_Redo_Start_CTS`.
+    *   **Rule**: Replay if `Entry.CTS >= T.Heap_Redo_Start_TS`.
     *   **Action**: Re-apply the Insert or Update to reconstruct the in-memory RowPage.
-    *   **Clarification**: The `Heap_Redo_Start_CTS` specifically marks the point from which the *volatile* part of the heap needs to be reconstructed. There is an additional filter for *cold* data (see `data-checkpoint.md` for `Last_Checkpoint_STS` logic).
+    *   **Clarification**: The `Heap_Redo_Start_TS` specifically marks the point from which the *volatile* part of the heap needs to be reconstructed. There is an additional filter for *cold* data (see `data-checkpoint.md` for `Last_Checkpoint_STS` logic).
 
 *   **Deletion Operations (Affecting the On-Disk ColumnStore)**:
     *   **Filter**: An operation on a table `T` is a candidate if its `RowID < T.Pivot_RowID`.

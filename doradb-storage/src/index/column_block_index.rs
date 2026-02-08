@@ -215,6 +215,7 @@ impl<'a> DeletionList<'a> {
         DeletionList { data }
     }
 
+    #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
         self.data[1] as usize
@@ -462,12 +463,12 @@ impl ColumnBlockIndex {
         debug_assert!(
             entries
                 .first()
-                .map_or(true, |entry| entry.0 >= self.end_row_id)
+                .is_none_or(|entry| entry.0 >= self.end_row_id)
         );
         debug_assert!(
             entries
                 .last()
-                .map_or(true, |entry| entry.0 < new_end_row_id)
+                .is_none_or(|entry| entry.0 < new_end_row_id)
         );
         debug_assert!(new_end_row_id >= self.end_row_id);
         if entries.is_empty() {

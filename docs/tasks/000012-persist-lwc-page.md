@@ -17,8 +17,8 @@ The persistence of LWC pages must adhere to the Copy-on-Write principle to maint
 3.  Allocate new pages in the Table File using the `AllocMap` within the `ActiveRoot` for each LWC page.
 4.  Perform asynchronous I/O to write the LWC page data to the allocated PageIDs. The writes should be executed in parallel.
 5.  Update the `BlockIndexArray` in the `ActiveRoot` with the RowID range and PageID for each newly persisted LWC page.
-6.  Update `pivot_row_id` and `heap_redo_start_cts` in the new `MetaPage` to reflect the newly persisted data and advance the recovery watermark.
-7.  Construct and write the new `MetaPage` containing the updated `BlockIndexArray`, `pivot_row_id`, and `heap_redo_start_cts`.
+6.  Update `pivot_row_id` and `heap_redo_start_ts` in the new `MetaPage` to reflect the newly persisted data and advance the recovery watermark.
+7.  Construct and write the new `MetaPage` containing the updated `BlockIndexArray`, `pivot_row_id`, and `heap_redo_start_ts`.
 8.  Atomically swap the `SuperPage` to commit the new `MetaPage`, making the LWC pages durable.
 
 ## Non-Goals
@@ -31,7 +31,7 @@ The persistence of LWC pages must adhere to the Copy-on-Write principle to maint
 
 ## Plan
 
-1.  **Integration Point**: A new method will be added, likely within `MutableTableFile` or a struct that operates on it. This method will accept the list of serialized LWC pages (`DirectBuf`s with their `RowID` ranges), the new `heap_redo_start_cts`, and the checkpoint timestamp (`ts`).
+1.  **Integration Point**: A new method will be added, likely within `MutableTableFile` or a struct that operates on it. This method will accept the list of serialized LWC pages (`DirectBuf`s with their `RowID` ranges), the new `heap_redo_start_ts`, and the checkpoint timestamp (`ts`).
 2.  **Concurrency Guard**: Creation of the `MutableTableFile` instance is assumed to be guarded externally by a single-writer lock (e.g., an atomic flag) to prevent concurrent metadata mutations.
 3.  **Obtain `MutableTableFile`**: The process will start by taking an `Arc<TableFile>` and calling `MutableTableFile::fork(&table_file)` to create a mutable working copy.
 4.  **Page Allocation**: For each `DirectBuf` representing a serialized LWC page, call `active_root.alloc_map.try_allocate()` to get a new `PageID`.
@@ -40,7 +40,7 @@ The persistence of LWC pages must adhere to the Copy-on-Write principle to maint
 7.  **Update `BlockIndexArray`**: Create a `BlockIndexArrayBuilder` by extending the existing `BlockIndexArray`. For each successfully persisted LWC page, call `builder.push(start_row_id, end_row_id, page_id)`. After all pushes, `builder.build()` will create the new `BlockIndexArray`. Update `mutable_table_file.active_root.block_index` with this new array.
 8.  **Update Watermarks**:
     *   Set `mutable_table_file.active_root.row_id_bound` to the maximum `RowID` from the converted pages.
-    *   The `heap_redo_start_cts` will be passed into the new `MetaPageSerView` during serialization.
+    *   The `heap_redo_start_ts` will be passed into the new `MetaPageSerView` during serialization.
     *   The input timestamp `ts` will be used to update `mutable_table_file.active_root.trx_id`.
 9.  **Size Check**: Before committing, the `commit` method in `MutableTableFile` already checks if the serialized `MetaPage` (including the new `BlockIndexArray`) fits within a single page. If it doesn't, the commit fails, which in turn should fail the checkpoint process. This check is sufficient for the short-term `BlockIndexArray` workaround.
 10. **Commit Changes**: Call `mutable_table_file.commit(ts, false)`. This handles the serialization of the new `MetaPage` (with the updated watermarks) and the atomic `SuperPage` update.
@@ -49,13 +49,13 @@ The persistence of LWC pages must adhere to the Copy-on-Write principle to maint
 
 *   **Files**:
     *   `doradb-storage/src/file/table_file.rs`: A new method (e.g., `persist_lwc_pages`) will be added to or called by a new module to orchestrate the LWC persistence on a `MutableTableFile`. The `commit` method will be used as is.
-    *   `doradb-storage/src/file/meta_page.rs`: `MetaPageSerView` will be directly impacted as the `heap_redo_start_cts` will be passed to it during `MetaPage` serialization.
+    *   `doradb-storage/src/file/meta_page.rs`: `MetaPageSerView` will be directly impacted as the `heap_redo_start_ts` will be passed to it during `MetaPage` serialization.
 *   **Structs/Traits/Functions**:
     *   `MutableTableFile`: New method (e.g., `persist_lwc_pages`) or an extension trait.
     *   `ActiveRoot`: `block_index`, `row_id_bound`, `trx_id`, and `alloc_map` will be modified.
     *   `BlockIndexArray` / `BlockIndexArrayBuilder`: Used for constructing the updated index.
     *   `TableFile::write_page`: Used for writing LWC data in parallel.
-    *   `MetaPageSerView`: Its `new` method might need to be adjusted to accept `heap_redo_start_cts` if it doesn't already.
+    *   `MetaPageSerView`: Its `new` method might need to be adjusted to accept `heap_redo_start_ts` if it doesn't already.
 
 ## Open Questions
 
