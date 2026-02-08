@@ -28,7 +28,7 @@ To enable non-blocking persistence, in-memory RowPages transition through three 
 
 ## 3. Detailed Process Flow
 
-The Tuple Mover executes the checkpoint in a **System Transaction** context. The process consists of five phases.
+The Tuple Mover executes the checkpoint in a **checkpoint transaction** context. The process consists of five phases.
 
 ### Phase 1: Stabilization (Non-Transactional)
 *Context: No transaction active.*
@@ -40,7 +40,7 @@ The Tuple Mover executes the checkpoint in a **System Transaction** context. The
     *   **Uncommitted Delete/Lock**: **Mark for Offload**. The payload is clean; the intent will be migrated later.
 
 ### Phase 2: Transaction Initiation
-*Context: Start System Transaction ($T_{cp}$).*
+*Context: Start checkpoint transaction ($T_{cp}$).*
 
 1.  **Begin Transaction**: Acquire a Start Timestamp (`CP.STS`).
     *   **Significance**: `CP.STS` acts as the **Logical Snapshot Time**. All data committed before this timestamp in the selected pages will be materialized into the LWC blocks.
@@ -72,19 +72,19 @@ Once stabilized, the page state is set to `TRANSITION`. The conversion pipeline 
     *   **Compress**: Apply datatype-specific encoding (Bitpacking for Ints, Dictionary/FSST for Strings).
     *   **Write**: Append to the LWC Buffer.
 
-### Phase 4: Commit & Atomic Switch
-*Context: Commit $T_{cp}$.*
+### Phase 4: Persist & Commit
+*Context: Persist checkpoint metadata, then commit $T_{cp}$.*
 
-1.  **Commit Transaction**: Acquire a Commit Timestamp (`CP.CTS`).
-2.  **Construct New MetaPage**:
+1.  **Construct New MetaPage**:
     *   **`Pivot_RowID`**: Advanced to the end of the converted range.
     *   **`Heap_Redo_Start_TS`**: The value calculated in Phase 2.
     *   **`Last_Checkpoint_STS`**: Set to **`CP.STS`**. (Crucial for recovery).
     *   **`Block_Index_Root`**: Point to the new index root.
-3.  **Atomic Persistence**:
+2.  **Atomic Persistence**:
     *   Write the new MetaPage to disk.
     *   Update **SuperPage** to point to the new MetaPage.
     *   Perform `fdatasync`.
+3.  **Commit Transaction**: Commit $T_{cp}$ after the file root update.
 4.  **Completion**:
     *   Update in-memory metadata (Pivot, Block Index).
     *   Mark `TRANSITION` pages as **Retired** (hand over to Epoch-based GC).
