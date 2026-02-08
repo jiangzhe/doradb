@@ -26,6 +26,7 @@ jobs:
         RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
         LLVM_PROFILE_FILE: "coverage/default/coverage-%p-%m.profraw"
         CARGO_TARGET_DIR: "target/coverage-default"
+        RUST_BACKTRACE: "full"
       run: |
         mkdir -p coverage/default
         cargo build --verbose --all
