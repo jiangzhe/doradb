@@ -167,6 +167,8 @@ impl Table {
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             let mut stabilized = true;
             for page_info in frozen_pages {
+                // A potential optimization is to check row version map without loading
+                // row page back. This requires interface change of buffer pool.
                 let page_guard = self
                     .data_pool
                     .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
@@ -175,6 +177,9 @@ impl Table {
                     .await;
                 let (ctx, _) = page_guard.ctx_and_page();
                 let row_ver = ctx.row_ver().unwrap();
+                // Check whether all insert and updates on this page are committed.
+                // This may be blocked by a long-running irrelevant transaction
+                // but we accept it now.
                 if row_ver.max_ins_sts() >= min_active_sts {
                     stabilized = false;
                     break;
