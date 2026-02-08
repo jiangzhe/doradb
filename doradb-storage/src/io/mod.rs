@@ -21,7 +21,7 @@ pub use libaio_abi::*;
 #[cfg(not(feature = "libaio"))]
 mod no_libaio {
     use super::*;
-    use libc::off_t;
+    use libc::{off_t, c_void};
 
     pub(super) struct Completion {
         pub(super) key: AIOKey,
@@ -946,7 +946,7 @@ impl<T> AIOEventLoop<T> {
 #[cfg(feature = "mlock")]
 #[inline]
 pub unsafe fn mlock(ptr: *mut u8, len: usize) -> bool {
-    let res = libc::mlock(ptr as *const c_void, len);
+    let res = libc::mlock(ptr as *const libc::c_void, len);
     res == 0
 }
 
@@ -969,7 +969,7 @@ pub unsafe fn mlock(_ptr: *mut u8, _len: usize) -> bool {
 #[cfg(feature = "mlock")]
 #[inline]
 pub unsafe fn munlock(ptr: *mut u8, len: usize) -> bool {
-    let res = libc::munlock(ptr as *const c_void, len);
+    let res = libc::munlock(ptr as *const libc::c_void, len);
     res == 0
 }
 
