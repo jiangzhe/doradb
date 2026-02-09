@@ -1,5 +1,5 @@
 use crate::buffer::BufferPool;
-use crate::buffer::page::PageID;
+use crate::buffer::page::{PageID, INVALID_PAGE_ID};
 use crate::catalog::TableMetadata;
 use crate::error::{Error, Result};
 use crate::file::table_file::MutableTableFile;
@@ -12,11 +12,11 @@ use crate::row::ops::{
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::session::Session;
 use crate::stmt::Statement;
-use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
+use crate::table::{DeleteInternal, DeletionError, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
-use crate::trx::redo::DDLRedo;
+use crate::trx::redo::{DDLRedo, RowRedo, RowRedoKind};
 use crate::trx::row::{ReadAllRows, RowReadAccess};
-use crate::trx::undo::RowUndoKind;
+use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use crate::value::Val;
 use std::future::Future;
 
@@ -493,7 +493,37 @@ impl TableAccess for Table {
                 None => return DeleteMvcc::NotFound,
                 Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
-                    RowLocation::LwcPage(..) => todo!("lwc page"),
+                    RowLocation::LwcPage(..) => {
+                        match self.deletion_buffer.put(row_id, stmt.trx.status()) {
+                            Ok(()) => {
+                                let undo = OwnedRowUndo::new(
+                                    self.table_id(),
+                                    INVALID_PAGE_ID,
+                                    row_id,
+                                    RowUndoKind::Delete,
+                                );
+                                stmt.row_undo.push(undo);
+                                let redo_kind = if log_by_key {
+                                    RowRedoKind::DeleteByUniqueKey(key.clone())
+                                } else {
+                                    RowRedoKind::Delete
+                                };
+                                let redo = RowRedo {
+                                    page_id: INVALID_PAGE_ID,
+                                    row_id,
+                                    kind: redo_kind,
+                                };
+                                stmt.redo.insert_dml(self.table_id(), redo);
+                                return DeleteMvcc::Ok;
+                            }
+                            Err(DeletionError::WriteConflict) => {
+                                return DeleteMvcc::WriteConflict;
+                            }
+                            Err(DeletionError::AlreadyDeleted) => {
+                                return DeleteMvcc::NotFound;
+                            }
+                        }
+                    }
                     RowLocation::RowPage(page_id) => {
                         let page_guard = self
                             .data_pool
