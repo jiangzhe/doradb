@@ -7,6 +7,7 @@ use crate::row::{RowID, RowPage};
 use crate::trx::row::RowWriteAccess;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -113,13 +114,17 @@ impl RowUndoLogs {
         sts: Option<TrxID>,
     ) {
         let mut table_cache = TableCache::new(catalog);
+        let mut pivot_cache: HashMap<TableID, RowID> = HashMap::new();
         while let Some(entry) = self.0.pop() {
             let table = table_cache
                 .get_table(entry.table_id)
                 .await
                 .as_ref()
                 .expect("table exists");
-            if entry.row_id < table.pivot_row_id() {
+            let pivot_row_id = *pivot_cache
+                .entry(entry.table_id)
+                .or_insert_with(|| table.pivot_row_id());
+            if entry.row_id < pivot_row_id {
                 table.deletion_buffer().remove(entry.row_id);
                 continue;
             }
@@ -130,6 +135,8 @@ impl RowUndoLogs {
                 .await;
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
+            // TODO: we should retry or wait for notification if rollback happens on a page
+            // in transition state. This will be handled in a future task.
             let row_idx = page.row_idx(entry.row_id);
             let mut access = RowWriteAccess::new(page, ctx, row_idx, sts, false);
             access.rollback_first_undo(metadata, entry);
