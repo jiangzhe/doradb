@@ -364,7 +364,7 @@ mod tests {
                 let key = SelectKey::new(1, vec![Val::from(1i32)]);
                 let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.len() == 1);
+                assert!(res.unwrap().len() == 1);
                 // update val = 0 where id = 1
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
@@ -382,7 +382,7 @@ mod tests {
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
                 let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.len() == 2);
+                assert!(res.unwrap().len() == 2);
                 // delete where id = 0
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
@@ -396,7 +396,7 @@ mod tests {
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
                 let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
                 _ = stmt.succeed().commit().await.unwrap();
-                assert!(res.len() == 1);
+                assert!(res.unwrap().len() == 1);
             }
             drop(engine);
         })

@@ -103,9 +103,7 @@ impl LwcPage {
         }
         let start_idx = self.header.col_count() as usize * mem::size_of::<u16>();
         let end_idx = self.header.first_col_offset() as usize;
-        if start_idx > end_idx || end_idx > self.body.len() {
-            return Err(Error::InvalidCompressedData);
-        }
+        debug_assert!(start_idx <= end_idx && end_idx <= self.body.len());
         let row_id_set = RowIDSet::from_bytes(&self.body[start_idx..end_idx])?;
         Ok(row_id_set.position(row_id))
     }

@@ -65,7 +65,7 @@ pub trait TableAccess {
         stmt: &Statement,
         key: &SelectKey,
         user_read_set: &[usize],
-    ) -> impl Future<Output = ScanMvcc>;
+    ) -> impl Future<Output = Result<ScanMvcc>>;
 
     /// Insert row in transaction.
     fn insert_mvcc(&self, stmt: &mut Statement, cols: Vec<Val>)
@@ -264,7 +264,7 @@ impl TableAccess for Table {
         stmt: &Statement,
         key: &SelectKey,
         user_read_set: &[usize],
-    ) -> ScanMvcc {
+    ) -> Result<ScanMvcc> {
         debug_assert!(key.index_no < self.sec_idx.len());
         // Index scan should be applied to non-unique index.
         // todo: support partial key scan on unique index.
@@ -294,10 +294,10 @@ impl TableAccess for Table {
                 SelectMvcc::Ok(vals) => {
                     res.push(vals);
                 }
-                SelectMvcc::Err(_) => (),
+                SelectMvcc::Err(err) => return Err(err),
             }
         }
-        res
+        Ok(res)
     }
 
     async fn insert_mvcc(&self, stmt: &mut Statement, cols: Vec<Val>) -> InsertMvcc {
