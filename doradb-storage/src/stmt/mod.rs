@@ -66,7 +66,7 @@ impl Statement {
         // todo: group by page level may be better.
         let engine = self.trx.engine().unwrap();
         self.row_undo
-            .rollback(engine.data_pool, Some(self.trx.sts))
+            .rollback(engine.data_pool, engine.catalog(), Some(self.trx.sts))
             .await;
         // rollback index data.
         self.index_undo

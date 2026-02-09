@@ -1,9 +1,11 @@
 mod access;
+mod deletion_buffer;
 mod recover;
 #[cfg(test)]
 mod tests;
 
 pub use access::*;
+pub use deletion_buffer::*;
 pub use recover::*;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
@@ -19,7 +21,7 @@ use crate::index::{
     RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::LwcBuilder;
+use crate::lwc::{LwcBuilder, LwcPage, RowIDSet};
 use crate::row::ops::{
     InsertIndex, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex, SelectKey, SelectMvcc,
     UndoCol, UpdateCol, UpdateIndex, UpdateRow,
@@ -31,7 +33,7 @@ use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, 
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{IndexBranch, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use crate::trx::{MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use std::collections::HashMap;
 use std::mem;
@@ -82,6 +84,7 @@ pub struct Table {
     pub file: Arc<TableFile>,
     pub blk_idx: Arc<BlockIndex>,
     pub sec_idx: Arc<[SecondaryIndex]>,
+    deletion_buffer: Arc<ColumnDeletionBuffer>,
 }
 
 struct FrozenPage {
@@ -118,6 +121,7 @@ impl Table {
             file,
             blk_idx: Arc::new(blk_idx),
             sec_idx: Arc::from(sec_idx.into_boxed_slice()),
+            deletion_buffer: Arc::new(ColumnDeletionBuffer::new()),
         }
     }
 
@@ -125,6 +129,17 @@ impl Table {
     #[inline]
     pub fn table_id(&self) -> TableID {
         self.blk_idx.table_id
+    }
+
+    /// Returns current pivot row id for row-store/column-store boundary.
+    #[inline]
+    pub fn pivot_row_id(&self) -> RowID {
+        self.file.active_root().pivot_row_id
+    }
+
+    #[inline]
+    pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
+        &self.deletion_buffer
     }
 
     async fn collect_frozen_pages(&self, pivot_row_id: RowID) -> (Vec<FrozenPage>, Option<TrxID>) {
@@ -294,7 +309,22 @@ impl Table {
     ) -> SelectMvcc {
         match self.blk_idx.find_row(row_id).await {
             RowLocation::NotFound => SelectMvcc::NotFound,
-            RowLocation::LwcPage(..) => todo!("lwc page"),
+            RowLocation::LwcPage(page_id) => {
+                if let Some(status) = self.deletion_buffer.get(row_id) {
+                    let ts = status.ts();
+                    if trx_is_committed(ts) {
+                        if ts <= stmt.trx.sts {
+                            return SelectMvcc::NotFound;
+                        }
+                    } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
+                        return SelectMvcc::NotFound;
+                    }
+                }
+                match self.read_lwc_row(page_id, row_id, user_read_set).await {
+                    Some(vals) => SelectMvcc::Ok(vals),
+                    None => SelectMvcc::NotFound,
+                }
+            }
             RowLocation::RowPage(page_id) => {
                 let page_guard = self
                     .data_pool
@@ -314,6 +344,45 @@ impl Table {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn lwc_row_idx(page: &LwcPage, row_id: RowID) -> Option<usize> {
+        if row_id < page.header.first_row_id() || row_id > page.header.last_row_id() {
+            return None;
+        }
+        let start_idx = page.header.col_count() as usize * mem::size_of::<u16>();
+        let end_idx = page.header.first_col_offset() as usize;
+        if start_idx > end_idx || end_idx > page.body.len() {
+            return None;
+        }
+        let row_id_set = RowIDSet::from_bytes(&page.body[start_idx..end_idx]).ok()?;
+        row_id_set.position(row_id)
+    }
+
+    #[inline]
+    async fn read_lwc_row(
+        &self,
+        page_id: PageID,
+        row_id: RowID,
+        read_set: &[usize],
+    ) -> Option<Vec<Val>> {
+        let buf = self.file.read_page(page_id).await.ok()?;
+        let page = unsafe { &*(buf.data().as_ptr() as *const LwcPage) };
+        let row_idx = Self::lwc_row_idx(page, row_id)?;
+        let metadata = self.metadata();
+        let mut vals = Vec::with_capacity(read_set.len());
+        for &col_idx in read_set {
+            let column = page.column(metadata, col_idx).ok()?;
+            if column.is_null(row_idx) {
+                vals.push(Val::Null);
+                continue;
+            }
+            let data = column.data().ok()?;
+            let val = data.value(row_idx)?;
+            vals.push(val);
+        }
+        Some(vals)
     }
 
     async fn mem_scan<F>(&self, start_row_id: RowID, mut page_action: F)
@@ -2082,6 +2151,7 @@ impl Clone for Table {
             file: Arc::clone(&self.file),
             blk_idx: Arc::clone(&self.blk_idx),
             sec_idx: Arc::clone(&self.sec_idx),
+            deletion_buffer: Arc::clone(&self.deletion_buffer),
         }
     }
 }

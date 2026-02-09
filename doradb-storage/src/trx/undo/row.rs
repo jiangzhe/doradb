@@ -1,6 +1,6 @@
 use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
-use crate::catalog::TableID;
+use crate::catalog::{Catalog, TableCache, TableID};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
@@ -106,8 +106,23 @@ impl RowUndoLogs {
     }
 
     #[inline]
-    pub async fn rollback<P: BufferPool>(&mut self, buf_pool: &'static P, sts: Option<TrxID>) {
+    pub async fn rollback<P: BufferPool>(
+        &mut self,
+        buf_pool: &'static P,
+        catalog: &Catalog,
+        sts: Option<TrxID>,
+    ) {
+        let mut table_cache = TableCache::new(catalog);
         while let Some(entry) = self.0.pop() {
+            let table = table_cache
+                .get_table(entry.table_id)
+                .await
+                .as_ref()
+                .expect("table exists");
+            if entry.row_id < table.pivot_row_id() {
+                table.deletion_buffer().remove(entry.row_id);
+                continue;
+            }
             let page_guard = buf_pool
                 .get_page::<RowPage>(entry.page_id, LatchFallbackMode::Shared)
                 .await
