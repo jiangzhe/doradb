@@ -13,7 +13,7 @@ use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::Maskable;
 use crate::index::{
@@ -21,7 +21,7 @@ use crate::index::{
     RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::{LwcBuilder, LwcPage, RowIDSet};
+use crate::lwc::{LwcBuilder, LwcPage};
 use crate::row::ops::{
     InsertIndex, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex, SelectKey, SelectMvcc,
     UndoCol, UpdateCol, UpdateIndex, UpdateRow,
@@ -321,8 +321,9 @@ impl Table {
                     }
                 }
                 match self.read_lwc_row(page_id, row_id, user_read_set).await {
-                    Some(vals) => SelectMvcc::Ok(vals),
-                    None => SelectMvcc::NotFound,
+                    Ok(vals) => SelectMvcc::Ok(vals),
+                    Err(Error::RowNotFound) => SelectMvcc::NotFound,
+                    Err(err) => SelectMvcc::Err(err),
                 }
             }
             RowLocation::RowPage(page_id) => {
@@ -347,42 +348,28 @@ impl Table {
     }
 
     #[inline]
-    fn lwc_row_idx(page: &LwcPage, row_id: RowID) -> Option<usize> {
-        if row_id < page.header.first_row_id() || row_id > page.header.last_row_id() {
-            return None;
-        }
-        let start_idx = page.header.col_count() as usize * mem::size_of::<u16>();
-        let end_idx = page.header.first_col_offset() as usize;
-        if start_idx > end_idx || end_idx > page.body.len() {
-            return None;
-        }
-        let row_id_set = RowIDSet::from_bytes(&page.body[start_idx..end_idx]).ok()?;
-        row_id_set.position(row_id)
-    }
-
-    #[inline]
     async fn read_lwc_row(
         &self,
         page_id: PageID,
         row_id: RowID,
         read_set: &[usize],
-    ) -> Option<Vec<Val>> {
-        let buf = self.file.read_page(page_id).await.ok()?;
+    ) -> Result<Vec<Val>> {
+        let buf = self.file.read_page(page_id).await?;
         let page = unsafe { &*(buf.data().as_ptr() as *const LwcPage) };
-        let row_idx = Self::lwc_row_idx(page, row_id)?;
+        let row_idx = page.row_idx(row_id)?.ok_or(Error::RowNotFound)?;
         let metadata = self.metadata();
         let mut vals = Vec::with_capacity(read_set.len());
         for &col_idx in read_set {
-            let column = page.column(metadata, col_idx).ok()?;
+            let column = page.column(metadata, col_idx)?;
             if column.is_null(row_idx) {
                 vals.push(Val::Null);
                 continue;
             }
-            let data = column.data().ok()?;
-            let val = data.value(row_idx)?;
+            let data = column.data()?;
+            let val = data.value(row_idx).ok_or(Error::InvalidCompressedData)?;
             vals.push(val);
         }
-        Some(vals)
+        Ok(vals)
     }
 
     async fn mem_scan<F>(&self, start_row_id: RowID, mut page_action: F)

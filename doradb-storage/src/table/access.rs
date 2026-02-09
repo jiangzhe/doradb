@@ -294,6 +294,7 @@ impl TableAccess for Table {
                 SelectMvcc::Ok(vals) => {
                     res.push(vals);
                 }
+                SelectMvcc::Err(_) => (),
             }
         }
         res

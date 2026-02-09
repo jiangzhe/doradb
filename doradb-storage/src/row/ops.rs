@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::row::{Row, RowID, RowMut};
 use crate::serde::{Deser, Ser, Serde};
+use crate::error::Error;
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
 use std::mem;
@@ -99,6 +100,7 @@ impl SelectResult for SelectUncommitted {
 pub enum SelectMvcc {
     Ok(Vec<Val>),
     NotFound,
+    Err(Error),
 }
 
 impl SelectMvcc {
@@ -113,10 +115,16 @@ impl SelectMvcc {
     }
 
     #[inline]
+    pub fn is_err(&self) -> bool {
+        matches!(self, SelectMvcc::Err(_))
+    }
+
+    #[inline]
     pub fn unwrap(self) -> Vec<Val> {
         match self {
             SelectMvcc::Ok(vals) => vals,
             SelectMvcc::NotFound => panic!("empty select result"),
+            SelectMvcc::Err(err) => panic!("select error: {err}"),
         }
     }
 }
