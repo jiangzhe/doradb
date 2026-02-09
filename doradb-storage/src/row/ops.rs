@@ -133,7 +133,31 @@ impl SelectResult for SelectMvcc {
     const NOT_FOUND: SelectMvcc = SelectMvcc::NotFound;
 }
 
-pub type ScanMvcc = Vec<Vec<Val>>;
+#[derive(Debug)]
+pub enum ScanMvcc {
+    Ok(Vec<Vec<Val>>),
+    Err(Error),
+}
+
+impl ScanMvcc {
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        matches!(self, ScanMvcc::Ok(_))
+    }
+
+    #[inline]
+    pub fn is_err(&self) -> bool {
+        matches!(self, ScanMvcc::Err(_))
+    }
+
+    #[inline]
+    pub fn unwrap(self) -> Vec<Vec<Val>> {
+        match self {
+            ScanMvcc::Ok(vals) => vals,
+            ScanMvcc::Err(err) => panic!("scan error: {err}"),
+        }
+    }
+}
 
 pub enum ReadRow {
     Ok(Vec<Val>),

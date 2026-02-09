@@ -321,8 +321,8 @@ impl Table {
                     }
                 }
                 match self.read_lwc_row(page_id, row_id, user_read_set).await {
-                    Ok(vals) => SelectMvcc::Ok(vals),
-                    Err(Error::RowNotFound) => SelectMvcc::NotFound,
+                    Ok(Some(vals)) => SelectMvcc::Ok(vals),
+                    Ok(None) => SelectMvcc::NotFound,
                     Err(err) => SelectMvcc::Err(err),
                 }
             }
@@ -353,10 +353,12 @@ impl Table {
         page_id: PageID,
         row_id: RowID,
         read_set: &[usize],
-    ) -> Result<Vec<Val>> {
+    ) -> Result<Option<Vec<Val>>> {
         let buf = self.file.read_page(page_id).await?;
         let page = unsafe { &*(buf.data().as_ptr() as *const LwcPage) };
-        let row_idx = page.row_idx(row_id)?.ok_or(Error::RowNotFound)?;
+        let Some(row_idx) = page.row_idx(row_id) else {
+            return Ok(None);
+        };
         let metadata = self.metadata();
         let mut vals = Vec::with_capacity(read_set.len());
         for &col_idx in read_set {
@@ -369,7 +371,7 @@ impl Table {
             let val = data.value(row_idx).ok_or(Error::InvalidCompressedData)?;
             vals.push(val);
         }
-        Ok(vals)
+        Ok(Some(vals))
     }
 
     async fn mem_scan<F>(&self, start_row_id: RowID, mut page_action: F)

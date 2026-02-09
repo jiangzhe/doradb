@@ -1,9 +1,10 @@
 use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
-use crate::catalog::{Catalog, TableCache, TableID};
+use crate::catalog::{Catalog, TableID};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
+use crate::table::Table;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
@@ -113,17 +114,20 @@ impl RowUndoLogs {
         catalog: &Catalog,
         sts: Option<TrxID>,
     ) {
-        let mut table_cache = TableCache::new(catalog);
-        let mut pivot_cache: HashMap<TableID, RowID> = HashMap::new();
+        let mut table_cache: HashMap<TableID, (RowID, Table)> = HashMap::new();
         while let Some(entry) = self.0.pop() {
-            let table = table_cache
-                .get_table(entry.table_id)
-                .await
-                .as_ref()
-                .expect("table exists");
-            let pivot_row_id = *pivot_cache
-                .entry(entry.table_id)
-                .or_insert_with(|| table.pivot_row_id());
+            let (pivot_row_id, table) = match table_cache.get(&entry.table_id) {
+                Some((pivot_row_id, table)) => (*pivot_row_id, table.clone()),
+                None => {
+                    let table = catalog
+                        .get_table(entry.table_id)
+                        .await
+                        .expect("table exists");
+                    let pivot_row_id = table.pivot_row_id();
+                    table_cache.insert(entry.table_id, (pivot_row_id, table.clone()));
+                    (pivot_row_id, table)
+                }
+            };
             if entry.row_id < pivot_row_id {
                 table.deletion_buffer().remove(entry.row_id);
                 continue;
