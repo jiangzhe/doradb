@@ -31,7 +31,7 @@ use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
 use crate::trx::sys::TransactionSystem;
-use crate::trx::undo::{IndexBranch, RowUndoKind};
+use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
@@ -247,6 +247,7 @@ impl Table {
                     .shared_async()
                     .await;
                 let (ctx, page) = page_guard.ctx_and_page();
+                self.capture_uncommitted_deletes(page, ctx);
                 let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
                 if view.rows_non_deleted() == 0 {
                     continue;
@@ -283,6 +284,37 @@ impl Table {
             }
         }
         Ok(lwc_pages)
+    }
+
+    fn capture_uncommitted_deletes(&self, page: &RowPage, ctx: &crate::buffer::frame::FrameContext) {
+        let Some(map) = ctx.row_ver() else {
+            return;
+        };
+        let row_count = page.header.row_count();
+        for row_idx in 0..row_count {
+            let undo_guard = map.read_latch(row_idx);
+            let Some(head) = undo_guard.as_ref() else {
+                continue;
+            };
+            let mut status = &head.next.main.status;
+            let mut entry = head.next.main.entry.clone();
+            loop {
+                if matches!(entry.as_ref().kind, RowUndoKind::Delete) {
+                    if let UndoStatus::Ref(trx_status) = status {
+                        if !trx_is_committed(trx_status.ts()) {
+                            let row_id = page.row_id(row_idx);
+                            let _ = self.deletion_buffer.put(row_id, trx_status.clone());
+                        }
+                    }
+                    break;
+                }
+                let Some(next) = entry.as_ref().next.as_ref() else {
+                    break;
+                };
+                status = &next.main.status;
+                entry = next.main.entry.clone();
+            }
+        }
     }
 
     /// Returns total number of row pages.
