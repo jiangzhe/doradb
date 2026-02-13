@@ -299,14 +299,20 @@ impl Table {
             let mut status = &head.next.main.status;
             let mut entry = head.next.main.entry.clone();
             loop {
-                if matches!(entry.as_ref().kind, RowUndoKind::Delete) {
-                    if let UndoStatus::Ref(trx_status) = status {
-                        if !trx_is_committed(trx_status.ts()) {
-                            let row_id = page.row_id(row_idx);
-                            let _ = self.deletion_buffer.put(row_id, trx_status.clone());
+                match entry.as_ref().kind {
+                    RowUndoKind::Delete => {
+                        if let UndoStatus::Ref(trx_status) = status {
+                            if !trx_is_committed(trx_status.ts()) {
+                                let row_id = page.row_id(row_idx);
+                                let _ = self.deletion_buffer.put(row_id, trx_status.clone());
+                            }
                         }
+                        break;
                     }
-                    break;
+                    RowUndoKind::Insert | RowUndoKind::Update(_) => {
+                        break;
+                    }
+                    RowUndoKind::Lock => {}
                 }
                 let Some(next) = entry.as_ref().next.as_ref() else {
                     break;
