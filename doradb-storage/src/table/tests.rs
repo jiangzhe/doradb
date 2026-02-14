@@ -1,14 +1,15 @@
-use super::{DeleteInternal, UpdateRowInplace};
+use super::{DeleteInternal, FrozenPage, UpdateRowInplace};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
 use crate::index::{RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
-use crate::row::{RowID, RowPage};
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol};
+use crate::row::{RowID, RowPage};
 use crate::session::Session;
 use crate::table::{Table, TableAccess};
-use crate::trx::{ActiveTrx, TrxID};
+use crate::trx::row::LockRowForWrite;
 use crate::trx::sys_conf::TrxSysConfig;
+use crate::trx::{ActiveTrx, TrxID};
 use crate::value::Val;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -257,10 +258,11 @@ fn test_column_delete_rollback() {
         trx.rollback().await;
 
         let mut trx = session.begin_trx().unwrap();
-        trx = sys.trx_select(trx, &key, |row| {
-            assert_eq!(row[0], Val::from(2i32));
-        })
-        .await;
+        trx = sys
+            .trx_select(trx, &key, |row| {
+                assert_eq!(row[0], Val::from(2i32));
+            })
+            .await;
         trx.commit().await.unwrap();
 
         drop(session);
@@ -300,10 +302,11 @@ fn test_column_delete_rollback_after_checkpoint() {
         trx_delete.rollback().await;
 
         let mut trx = session.begin_trx().unwrap();
-        trx = sys.trx_select(trx, &key, |row| {
-            assert_eq!(row[0], Val::from(3i32));
-        })
-        .await;
+        trx = sys
+            .trx_select(trx, &key, |row| {
+                assert_eq!(row[0], Val::from(3i32));
+            })
+            .await;
         trx.commit().await.unwrap();
 
         drop(checkpoint_session);
@@ -371,10 +374,11 @@ fn test_column_delete_mvcc_visibility() {
         trx_delete = stmt_delete.succeed();
         trx_delete.commit().await.unwrap();
 
-        trx_reader = sys.trx_select(trx_reader, &key, |row| {
-            assert_eq!(row[0], Val::from(5i32));
-        })
-        .await;
+        trx_reader = sys
+            .trx_select(trx_reader, &key, |row| {
+                assert_eq!(row[0], Val::from(5i32));
+            })
+            .await;
         trx_reader.commit().await.unwrap();
 
         let mut trx_new = session.begin_trx().unwrap();
@@ -1068,6 +1072,64 @@ fn test_table_freeze() {
         assert!(row_pages == 3);
 
         drop(session1);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 1, 1, "lock").await;
+
+        let key = single_key(1i32);
+        let mut trx = session.begin_trx().unwrap();
+        let mut stmt = trx.start_stmt();
+        let index = sys.table.sec_idx[key.index_no].unique().unwrap();
+        let (row_id, _) = index.lookup(&key.vals, stmt.trx.sts).await.unwrap();
+        let page_id = match sys.table.blk_idx.find_row(row_id).await {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::NotFound => panic!("row should exist"),
+            RowLocation::LwcPage(..) => unreachable!("row page expected"),
+        };
+
+        let page_guard = sys
+            .engine
+            .data_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .await
+            .shared_async()
+            .await;
+        let (ctx, page) = page_guard.ctx_and_page();
+        let mut lock_row = sys
+            .table
+            .lock_row_for_write(&mut stmt, &page_guard, row_id, Some(&key))
+            .await;
+        match &mut lock_row {
+            LockRowForWrite::Ok(access) => {
+                drop(access.take());
+            }
+            _ => panic!("lock should succeed"),
+        }
+
+        let frozen_page = FrozenPage {
+            page_id,
+            start_row_id: page.header.start_row_id,
+            end_row_id: page.header.start_row_id + page.header.max_row_count as u64,
+        };
+        ctx.row_ver().unwrap().set_frozen();
+        sys.table
+            .set_frozen_pages_to_transition(&[frozen_page])
+            .await;
+
+        let status = sys.table.deletion_buffer().get(row_id).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&status, &stmt.trx.status()));
+
+        trx = stmt.fail().await;
+        trx.rollback().await;
+
+        drop(session);
         sys.clean_all();
     });
 }
