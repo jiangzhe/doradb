@@ -1050,9 +1050,6 @@ impl Table {
             return UpdateRowInplace::RowNotFound;
         }
         let row_state = ctx.row_ver().unwrap().state();
-        if row_state == RowPageState::Transition {
-            return UpdateRowInplace::RetryInTransition;
-        }
         let frozen = row_state == RowPageState::Frozen;
         let mut lock_row = self
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
@@ -1061,13 +1058,9 @@ impl Table {
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound,
             LockRowForWrite::WriteConflict => UpdateRowInplace::WriteConflict,
+            LockRowForWrite::RetryInTransition => UpdateRowInplace::RetryInTransition,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
-                if ctx.row_ver().unwrap().is_transition() {
-                    drop(access);
-                    drop(lock_row);
-                    return UpdateRowInplace::RetryInTransition;
-                }
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }
@@ -1160,10 +1153,7 @@ impl Table {
         log_by_key: bool,
     ) -> DeleteInternal {
         let page_id = page_guard.page_id();
-        let (ctx, page) = page_guard.ctx_and_page();
-        if ctx.row_ver().unwrap().is_transition() {
-            return DeleteInternal::RetryInTransition;
-        }
+        let (_, page) = page_guard.ctx_and_page();
         if !page.row_id_in_valid_range(row_id) {
             return DeleteInternal::NotFound;
         }
@@ -1173,13 +1163,9 @@ impl Table {
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
             LockRowForWrite::WriteConflict => DeleteInternal::WriteConflict,
+            LockRowForWrite::RetryInTransition => DeleteInternal::RetryInTransition,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
-                if ctx.row_ver().unwrap().is_transition() {
-                    drop(access);
-                    drop(lock_row);
-                    return DeleteInternal::RetryInTransition;
-                }
                 if access.row().is_deleted() {
                     return DeleteInternal::NotFound;
                 }
@@ -1241,9 +1227,20 @@ impl Table {
         key: Option<&SelectKey>,
     ) -> LockRowForWrite<'a> {
         let (ctx, page) = page_guard.ctx_and_page();
+        let ver_map = ctx.row_ver().unwrap();
         loop {
-            let mut access =
-                RowWriteAccess::new(page, ctx, page.row_idx(row_id), Some(stmt.trx.sts), false);
+            let state_guard = ver_map.read_state();
+            if *state_guard == RowPageState::Transition {
+                return LockRowForWrite::RetryInTransition;
+            }
+            let mut access = RowWriteAccess::new_with_state_guard(
+                page,
+                ctx,
+                page.row_idx(row_id),
+                Some(stmt.trx.sts),
+                false,
+                state_guard,
+            );
             let lock_undo = access.lock_undo(
                 stmt,
                 self.metadata(),
