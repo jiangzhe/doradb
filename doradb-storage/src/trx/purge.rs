@@ -1,6 +1,7 @@
 use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
 use crate::catalog::{Catalog, TableCache, TableID};
+use crate::index::RowLocation;
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
 use crate::table::TableAccess;
@@ -15,6 +16,7 @@ use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
@@ -100,36 +102,49 @@ impl TransactionSystem {
         log_no: usize,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
-    ) {
+    ) -> HashSet<PageID> {
         let partition = &self.log_partitions[log_no];
         let mut table_cache = TableCache::new(catalog);
         let purge_trx_count = trx_list.len();
         let mut purge_row_count = 0;
         let mut purge_index_count = 0;
-        // First, we collect pages and row ids to purge row undo.
-        let mut target: HashMap<(TableID, PageID), HashSet<RowID>> = HashMap::new();
+        // First, we collect row ids to purge row undo.
+        // Resolve latest row location via block index because page ids in undo can
+        // become stale after row-page GC/checkpoint.
+        let mut target: HashMap<TableID, HashSet<RowID>> = HashMap::new();
         for trx in &trx_list {
             if let Some(row_undo) = trx.row_undo() {
                 purge_row_count += row_undo.len();
                 for undo in &**row_undo {
-                    target
-                        .entry((undo.table_id, undo.page_id))
-                        .or_default()
-                        .insert(undo.row_id);
+                    target.entry(undo.table_id).or_default().insert(undo.row_id);
                 }
             }
         }
-        for ((_table_id, page_id), row_ids) in target {
-            let page_guard = buf_pool
-                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                .await
-                .shared_async()
-                .await;
-            let (ctx, page) = page_guard.ctx_and_page();
+        for (table_id, row_ids) in target {
+            let Some(table) = table_cache.get_table(table_id).await else {
+                continue;
+            };
+            let mut page_targets: HashMap<PageID, Vec<RowID>> = HashMap::new();
             for row_id in row_ids {
-                let row_idx = page.row_idx(row_id);
-                let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
-                access.purge_undo_chain(min_active_sts);
+                if let RowLocation::RowPage(page_id) = table.blk_idx.find_row(row_id).await {
+                    page_targets.entry(page_id).or_default().push(row_id);
+                }
+            }
+            for (page_id, row_ids) in page_targets {
+                let page_guard = buf_pool
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await
+                    .shared_async()
+                    .await;
+                let (ctx, page) = page_guard.ctx_and_page();
+                for row_id in row_ids {
+                    if !page.row_id_in_valid_range(row_id) {
+                        continue;
+                    }
+                    let row_idx = page.row_idx(row_id);
+                    let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
+                    access.purge_undo_chain(min_active_sts);
+                }
             }
         }
 
@@ -152,14 +167,6 @@ impl TransactionSystem {
                 gc_row_pages.extend(pages.iter().copied());
             }
         }
-        for page_id in gc_row_pages {
-            let page_guard = buf_pool
-                .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
-                .await
-                .exclusive_async()
-                .await;
-            buf_pool.deallocate_page(page_guard);
-        }
 
         // Finally, delete all transactions
         drop(trx_list);
@@ -176,6 +183,23 @@ impl TransactionSystem {
             .stats
             .purge_index_count
             .fetch_add(purge_index_count, Ordering::Relaxed);
+        gc_row_pages
+    }
+
+    #[inline]
+    async fn deallocate_gc_row_pages<P: BufferPool>(
+        &self,
+        buf_pool: &'static P,
+        gc_row_pages: HashSet<PageID>,
+    ) {
+        for page_id in gc_row_pages {
+            let page_guard = buf_pool
+                .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+                .await
+                .exclusive_async()
+                .await;
+            buf_pool.deallocate_page(page_guard);
+        }
     }
 }
 
@@ -376,6 +400,7 @@ struct PurgeTask {
     gc_no: usize,
     min_active_sts: TrxID,
     signal: Sender<()>,
+    gc_row_pages: Arc<Mutex<Vec<PageID>>>,
 }
 
 trait PurgeLoop {
@@ -422,9 +447,10 @@ impl PurgeLoop for PurgeSingleThreaded {
                                 gc_bucket.get_purge_list(curr_sts, &mut trx_list);
                             }
                             let log_no = partition.log_no;
-                            trx_sys
+                            let gc_row_pages = trx_sys
                                 .purge_trx_list(buf_pool, catalog, log_no, trx_list, curr_sts)
                                 .await;
+                            trx_sys.deallocate_gc_row_pages(buf_pool, gc_row_pages).await;
                         }
                     }
                     // Once GC is finished, update global_visible_sts so other threads can use it to
@@ -443,7 +469,7 @@ impl PurgeLoop for PurgeDispatcher {
     #[inline]
     async fn purge_loop<P: BufferPool>(
         &mut self,
-        _buf_pool: &'static P,
+        buf_pool: &'static P,
         _catalog: &Catalog,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -465,6 +491,7 @@ impl PurgeLoop for PurgeDispatcher {
                     if curr_sts > min_sts {
                         // dispatch tasks to executors
                         let (signal, notify) = flume::unbounded();
+                        let gc_row_pages = Arc::new(Mutex::new(vec![]));
                         for partition in &*trx_sys.log_partitions {
                             let log_no = partition.log_no;
                             for gc_no in 0..partition.gc_buckets.len() {
@@ -473,6 +500,7 @@ impl PurgeLoop for PurgeDispatcher {
                                     gc_no,
                                     min_active_sts: curr_sts,
                                     signal: signal.clone(),
+                                    gc_row_pages: Arc::clone(&gc_row_pages),
                                 };
                                 let _ = self.0[dispatch_no % self.0.len()].send(task);
                                 dispatch_no += 1;
@@ -481,6 +509,11 @@ impl PurgeLoop for PurgeDispatcher {
                         drop(signal);
                         // wait for all executors finish their tasks.
                         let _ = notify.recv_async().await;
+                        let gc_row_pages = {
+                            let mut g = gc_row_pages.lock();
+                            g.drain(..).collect::<HashSet<PageID>>()
+                        };
+                        trx_sys.deallocate_gc_row_pages(buf_pool, gc_row_pages).await;
 
                         // Once GC is finished, update global_visible_sts so other threads can use it to
                         // speed up visibility check.
@@ -513,15 +546,19 @@ impl PurgeExecutor {
             gc_no,
             min_active_sts,
             signal,
+            gc_row_pages,
         }) = purge_chan.recv()
         {
             let mut trx_list = vec![];
             let partition = &trx_sys.log_partitions[log_no];
             partition.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
             // actual purge here
-            trx_sys
+            let gc_pages = trx_sys
                 .purge_trx_list(buf_pool, catalog, log_no, trx_list, min_active_sts)
                 .await;
+            if !gc_pages.is_empty() {
+                gc_row_pages.lock().extend(gc_pages);
+            }
             drop(signal); // notify dispatcher
         }
     }

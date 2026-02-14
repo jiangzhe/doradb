@@ -39,11 +39,18 @@ use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 use std::time::Duration;
 
 #[cfg(test)]
-static TEST_FORCE_LWC_BUILD_ERROR: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
+    TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
+}
 
 /// Table is a logical data set of rows.
 /// It combines components such as row page, undo map, block index, secondary
@@ -229,7 +236,7 @@ impl Table {
     ) -> Result<Vec<LwcPagePersist>> {
         #[cfg(test)]
         {
-            if TEST_FORCE_LWC_BUILD_ERROR.load(Ordering::SeqCst) {
+            if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
                 return Err(crate::error::Error::InvalidState);
             }
         }
@@ -964,7 +971,9 @@ impl Table {
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page();
-        if ctx.row_ver().unwrap().is_frozen() {
+        let ver_map = ctx.row_ver().unwrap();
+        let state_guard = ver_map.read_state();
+        if *state_guard != RowPageState::Active {
             return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
         }
         debug_assert!(metadata.col_count() == page.header.col_count as usize);
@@ -979,7 +988,14 @@ impl Table {
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new(page, ctx, row_idx, Some(stmt.trx.sts), true);
+        let mut access = RowWriteAccess::new_with_state_guard(
+            page,
+            ctx,
+            row_idx,
+            Some(stmt.trx.sts),
+            true,
+            state_guard,
+        );
         let res = access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
         debug_assert!(res.is_ok());
         // Apply insert
@@ -1023,7 +1039,7 @@ impl Table {
         mut update: Vec<UpdateCol>,
     ) -> UpdateRowInplace {
         let page_id = page_guard.page_id();
-        let (ctx, page) = page_guard.ctx_and_page();
+        let (_, page) = page_guard.ctx_and_page();
         // column indexes must be in range
         debug_assert!(
             {
@@ -1049,8 +1065,6 @@ impl Table {
         {
             return UpdateRowInplace::RowNotFound;
         }
-        let row_state = ctx.row_ver().unwrap().state();
-        let frozen = row_state == RowPageState::Frozen;
         let mut lock_row = self
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
@@ -1061,6 +1075,7 @@ impl Table {
             LockRowForWrite::RetryInTransition => UpdateRowInplace::RetryInTransition,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
+                let frozen = access.page_state() == RowPageState::Frozen;
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }

@@ -634,6 +634,11 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
+    pub fn page_state(&self) -> RowPageState {
+        *self._state_guard
+    }
+
+    #[inline]
     pub fn delete_row(&mut self) {
         let res = self.page.set_deleted(self.row_idx, true);
         debug_assert!(res);

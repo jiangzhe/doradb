@@ -1,4 +1,4 @@
-use super::{DeleteInternal, FrozenPage, UpdateRowInplace};
+use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
 use crate::index::{RowLocation, UniqueIndex};
@@ -9,9 +9,9 @@ use crate::session::Session;
 use crate::table::{Table, TableAccess};
 use crate::trx::row::LockRowForWrite;
 use crate::trx::sys_conf::TrxSysConfig;
+use crate::trx::undo::RowUndoKind;
 use crate::trx::{ActiveTrx, TrxID};
 use crate::value::Val;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -422,6 +422,26 @@ fn test_row_page_transition_retries_update_delete() {
         let row_ver = ctx.row_ver().unwrap();
         row_ver.set_frozen();
         row_ver.set_transition();
+
+        let insert_page_guard = sys
+            .engine
+            .data_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .await
+            .shared_async()
+            .await;
+        let insert = vec![Val::from(2i32), Val::from("insert")];
+        let insert_res = sys.table.insert_row_to_page(
+            &mut stmt,
+            insert_page_guard,
+            insert,
+            RowUndoKind::Insert,
+            vec![],
+        );
+        assert!(matches!(
+            insert_res,
+            InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
+        ));
 
         let update = vec![UpdateCol {
             idx: 1,
@@ -1129,6 +1149,8 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         trx = stmt.fail().await;
         trx.rollback().await;
 
+        drop(lock_row);
+        drop(page_guard);
         drop(session);
         sys.clean_all();
     });
@@ -1310,9 +1332,9 @@ fn test_data_checkpoint_error_rollback() {
         sys.table.freeze(usize::MAX).await;
         let root_before = sys.table.file.active_root().clone();
 
-        super::TEST_FORCE_LWC_BUILD_ERROR.store(true, Ordering::SeqCst);
+        super::set_test_force_lwc_build_error(true);
         let res = sys.table.data_checkpoint(&mut session).await;
-        super::TEST_FORCE_LWC_BUILD_ERROR.store(false, Ordering::SeqCst);
+        super::set_test_force_lwc_build_error(false);
         assert!(res.is_err());
 
         let root_after = sys.table.file.active_root();
