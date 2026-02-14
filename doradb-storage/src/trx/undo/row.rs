@@ -128,12 +128,12 @@ impl RowUndoLogs {
                     (pivot_row_id, table)
                 }
             };
-            if entry.row_id < pivot_row_id {
+            if entry.page_id.is_none() || entry.row_id < pivot_row_id {
                 table.deletion_buffer().remove(entry.row_id);
                 continue;
             }
             let page_guard = buf_pool
-                .get_page::<RowPage>(entry.page_id, LatchFallbackMode::Shared)
+                .get_page::<RowPage>(entry.page_id.unwrap(), LatchFallbackMode::Shared)
                 .await
                 .shared_async()
                 .await;
@@ -189,7 +189,12 @@ impl DerefMut for OwnedRowUndo {
 
 impl OwnedRowUndo {
     #[inline]
-    pub fn new(table_id: TableID, page_id: PageID, row_id: RowID, kind: RowUndoKind) -> Self {
+    pub fn new(
+        table_id: TableID,
+        page_id: Option<PageID>,
+        row_id: RowID,
+        kind: RowUndoKind,
+    ) -> Self {
         let entry = RowUndo {
             table_id,
             page_id,
@@ -256,7 +261,7 @@ impl Clone for RowUndoRef {
 
 pub struct RowUndo {
     pub table_id: TableID,
-    pub page_id: PageID,
+    pub page_id: Option<PageID>,
     pub row_id: RowID,
     pub kind: RowUndoKind,
     pub next: Option<NextRowUndo>,

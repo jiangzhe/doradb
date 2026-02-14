@@ -6,7 +6,7 @@ use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage};
 use crate::session::Session;
-use crate::table::{Table, TableAccess};
+use crate::table::{DeleteMarker, Table, TableAccess};
 use crate::trx::row::LockRowForWrite;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::undo::RowUndoKind;
@@ -1140,11 +1140,16 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         };
         ctx.row_ver().unwrap().set_frozen();
         sys.table
-            .set_frozen_pages_to_transition(&[frozen_page])
+            .set_frozen_pages_to_transition(&[frozen_page], stmt.trx.sts)
             .await;
 
-        let status = sys.table.deletion_buffer().get(row_id).unwrap();
-        assert!(std::sync::Arc::ptr_eq(&status, &stmt.trx.status()));
+        let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+        match marker {
+            DeleteMarker::Ref(status) => {
+                assert!(std::sync::Arc::ptr_eq(&status, &stmt.trx.status()));
+            }
+            DeleteMarker::Committed(_) => panic!("uncommitted lock should remain as marker ref"),
+        }
 
         trx = stmt.fail().await;
         trx.rollback().await;

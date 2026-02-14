@@ -4,12 +4,13 @@ use crate::catalog::{Catalog, TableCache, TableID};
 use crate::index::RowLocation;
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
-use crate::table::TableAccess;
+use crate::table::{DeleteMarker, TableAccess};
 use crate::thread;
 use crate::trx::log::LogPartition;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, TrxID};
+use crate::trx::undo::RowUndoKind;
+use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, TrxID, trx_is_committed};
 use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
@@ -111,19 +112,45 @@ impl TransactionSystem {
         // First, we collect row ids to purge row undo.
         // Resolve latest row location via block index because page ids in undo can
         // become stale after row-page GC/checkpoint.
-        let mut target: HashMap<TableID, HashSet<RowID>> = HashMap::new();
+        let mut row_purge_target: HashMap<TableID, HashSet<RowID>> = HashMap::new();
+        let mut marker_promote_target: HashMap<TableID, HashSet<RowID>> = HashMap::new();
         for trx in &trx_list {
             if let Some(row_undo) = trx.row_undo() {
                 purge_row_count += row_undo.len();
                 for undo in &**row_undo {
-                    target.entry(undo.table_id).or_default().insert(undo.row_id);
+                    row_purge_target
+                        .entry(undo.table_id)
+                        .or_default()
+                        .insert(undo.row_id);
+                    if matches!(&undo.kind, RowUndoKind::Delete) {
+                        marker_promote_target
+                            .entry(undo.table_id)
+                            .or_default()
+                            .insert(undo.row_id);
+                    }
                 }
             }
         }
-        for (table_id, row_ids) in target {
+        for (table_id, mut row_ids) in row_purge_target {
             let Some(table) = table_cache.get_table(table_id).await else {
                 continue;
             };
+            if let Some(promote_row_ids) = marker_promote_target.remove(&table_id) {
+                for row_id in promote_row_ids {
+                    if let Some(DeleteMarker::Ref(status)) = table.deletion_buffer().get(row_id) {
+                        let ts = status.ts();
+                        if trx_is_committed(ts)
+                            && table
+                                .deletion_buffer()
+                                .promote_ref_to_committed(row_id, &status, ts)
+                        {
+                            // Once marker has been normalized to committed in column deletion
+                            // buffer, we don't need row-page undo purge for this row.
+                            row_ids.remove(&row_id);
+                        }
+                    }
+                }
+            }
             let mut page_targets: HashMap<PageID, Vec<RowID>> = HashMap::new();
             for row_id in row_ids {
                 if let RowLocation::RowPage(page_id) = table.blk_idx.find_row(row_id).await {
@@ -450,7 +477,9 @@ impl PurgeLoop for PurgeSingleThreaded {
                             let gc_row_pages = trx_sys
                                 .purge_trx_list(buf_pool, catalog, log_no, trx_list, curr_sts)
                                 .await;
-                            trx_sys.deallocate_gc_row_pages(buf_pool, gc_row_pages).await;
+                            trx_sys
+                                .deallocate_gc_row_pages(buf_pool, gc_row_pages)
+                                .await;
                         }
                     }
                     // Once GC is finished, update global_visible_sts so other threads can use it to
@@ -513,7 +542,9 @@ impl PurgeLoop for PurgeDispatcher {
                             let mut g = gc_row_pages.lock();
                             g.drain(..).collect::<HashSet<PageID>>()
                         };
-                        trx_sys.deallocate_gc_row_pages(buf_pool, gc_row_pages).await;
+                        trx_sys
+                            .deallocate_gc_row_pages(buf_pool, gc_row_pages)
+                            .await;
 
                         // Once GC is finished, update global_visible_sts so other threads can use it to
                         // speed up visibility check.

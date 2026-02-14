@@ -1,7 +1,7 @@
+use crate::error::Error;
 use crate::error::Result;
 use crate::row::{Row, RowID, RowMut};
 use crate::serde::{Deser, Ser, Serde};
-use crate::error::Error;
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
 use std::mem;

@@ -707,14 +707,15 @@ impl<'a> RowWriteAccess<'a> {
         let row = self.page.row(self.row_idx);
         match &mut *self.guard {
             None => {
-                let entry = OwnedRowUndo::new(table_id, page_id, row_id, RowUndoKind::Lock);
+                let entry = OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                 self.add_undo_head(stmt.trx.status(), entry.leak());
                 stmt.row_undo.push(entry);
                 LockUndo::Ok
             }
             Some(undo_head) => {
                 if stmt.trx.is_same_trx(undo_head) {
-                    let mut entry = OwnedRowUndo::new(table_id, page_id, row_id, RowUndoKind::Lock);
+                    let mut entry =
+                        OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
                         entry: entry.leak(),
                         status: UndoStatus::Ref(stmt.trx.status()),
@@ -775,7 +776,8 @@ impl<'a> RowWriteAccess<'a> {
                     {
                         return LockUndo::InvalidIndex;
                     }
-                    let mut entry = OwnedRowUndo::new(table_id, page_id, row_id, RowUndoKind::Lock);
+                    let mut entry =
+                        OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
                         entry: entry.leak(),
                         status: UndoStatus::Ref(stmt.trx.status()),
