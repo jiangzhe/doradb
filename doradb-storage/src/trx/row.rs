@@ -599,6 +599,21 @@ impl<'a> RowWriteAccess<'a> {
             .row_ver()
             .expect("write_row not supported without undo map");
         let state_guard = ver_map.read_state();
+        Self::new_with_state_guard(page, ctx, row_idx, sts, ins_or_update, state_guard)
+    }
+
+    #[inline]
+    pub fn new_with_state_guard(
+        page: &'a RowPage,
+        ctx: &'a FrameContext,
+        row_idx: usize,
+        sts: Option<TrxID>,
+        ins_or_update: bool,
+        state_guard: RwLockReadGuard<'a, RowPageState>,
+    ) -> Self {
+        let ver_map = ctx
+            .row_ver()
+            .expect("write_row not supported without undo map");
         let guard = ver_map.write_latch(row_idx, sts, ins_or_update);
         RowWriteAccess {
             page,
@@ -935,6 +950,8 @@ pub enum LockRowForWrite<'a> {
     // this can happen when index entry is not garbage collected,
     // so some old key points to new version.
     InvalidIndex,
+    // row page is transitioning, caller should retry.
+    RetryInTransition,
 }
 
 impl<'a> LockRowForWrite<'a> {
