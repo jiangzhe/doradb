@@ -215,8 +215,9 @@ impl Table {
                 .await
                 .shared_async()
                 .await;
-            let (ctx, _) = page_guard.ctx_and_page();
+            let (ctx, page) = page_guard.ctx_and_page();
             ctx.row_ver().unwrap().set_transition();
+            self.capture_uncommitted_deletes(page, ctx);
         }
     }
 
@@ -247,7 +248,6 @@ impl Table {
                     .shared_async()
                     .await;
                 let (ctx, page) = page_guard.ctx_and_page();
-                self.capture_uncommitted_deletes(page, ctx);
                 let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
                 if view.rows_non_deleted() == 0 {
                     continue;
@@ -286,7 +286,11 @@ impl Table {
         Ok(lwc_pages)
     }
 
-    fn capture_uncommitted_deletes(&self, page: &RowPage, ctx: &crate::buffer::frame::FrameContext) {
+    fn capture_uncommitted_deletes(
+        &self,
+        page: &RowPage,
+        ctx: &crate::buffer::frame::FrameContext,
+    ) {
         let Some(map) = ctx.row_ver() else {
             return;
         };
@@ -300,19 +304,20 @@ impl Table {
             let mut entry = head.next.main.entry.clone();
             loop {
                 match entry.as_ref().kind {
-                    RowUndoKind::Delete => {
+                    RowUndoKind::Delete | RowUndoKind::Lock => {
                         if let UndoStatus::Ref(trx_status) = status {
                             if !trx_is_committed(trx_status.ts()) {
                                 let row_id = page.row_id(row_idx);
                                 let _ = self.deletion_buffer.put(row_id, trx_status.clone());
                             }
                         }
-                        break;
+                        if matches!(&entry.as_ref().kind, RowUndoKind::Delete) {
+                            break;
+                        }
                     }
                     RowUndoKind::Insert | RowUndoKind::Update(_) => {
                         break;
                     }
-                    RowUndoKind::Lock => {}
                 }
                 let Some(next) = entry.as_ref().next.as_ref() else {
                     break;
