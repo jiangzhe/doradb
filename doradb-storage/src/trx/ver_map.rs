@@ -4,7 +4,7 @@ use crate::trx::undo::RowUndoHead;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// RowVersionMap is a page-level hash map to store
 /// old versions of rows in row page.
@@ -46,9 +46,9 @@ pub struct RowVersionMap {
     // transformed to LWC block.
     max_ins_sts: AtomicU64,
     // Row page state indicates the write status of the page.
-    // No lock is used because state is just a transitional
-    // period to restrict incoming transactions.
-    state: AtomicU8,
+    // It is guarded by rwlock so that checkpointer can block incoming
+    // writers when switching frozen page to transition state.
+    state: RwLock<RowPageState>,
 }
 
 #[repr(u8)]
@@ -57,18 +57,6 @@ pub enum RowPageState {
     Active = 0,
     Frozen = 1,
     Transition = 2,
-}
-
-impl RowPageState {
-    #[inline]
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => RowPageState::Active,
-            1 => RowPageState::Frozen,
-            2 => RowPageState::Transition,
-            _ => unreachable!("invalid row page state"),
-        }
-    }
 }
 
 impl RowVersionMap {
@@ -83,14 +71,20 @@ impl RowVersionMap {
             create_cts: AtomicU64::new(0),
             max_sts: AtomicU64::new(0),
             max_ins_sts: AtomicU64::new(0),
-            state: AtomicU8::new(RowPageState::Active as u8),
+            state: RwLock::new(RowPageState::Active),
         }
     }
 
     /// Returns current row page state.
     #[inline]
     pub fn state(&self) -> RowPageState {
-        RowPageState::from_u8(self.state.load(Ordering::Acquire))
+        *self.state.read()
+    }
+
+    /// Acquire shared lock of page state.
+    #[inline]
+    pub fn read_state(&self) -> RwLockReadGuard<'_, RowPageState> {
+        self.state.read()
     }
 
     /// Returns whether this page is frozen.
@@ -105,29 +99,25 @@ impl RowVersionMap {
     /// Returns whether this page is in transition.
     #[inline]
     pub fn is_transition(&self) -> bool {
-        self.state.load(Ordering::Acquire) == RowPageState::Transition as u8
+        self.state() == RowPageState::Transition
     }
 
     /// Freeze current row page.
     #[inline]
     pub fn set_frozen(&self) {
-        let _ = self.state.compare_exchange(
-            RowPageState::Active as u8,
-            RowPageState::Frozen as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut state = self.state.write();
+        if *state == RowPageState::Active {
+            *state = RowPageState::Frozen;
+        }
     }
 
     /// Set current row page to transition.
     #[inline]
     pub fn set_transition(&self) {
-        let _ = self.state.compare_exchange(
-            RowPageState::Frozen as u8,
-            RowPageState::Transition as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut state = self.state.write();
+        if *state == RowPageState::Frozen {
+            *state = RowPageState::Transition;
+        }
     }
 
     /// Set commit timestamp of page creation.

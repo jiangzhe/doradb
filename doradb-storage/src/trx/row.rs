@@ -9,10 +9,11 @@ use crate::trx::undo::{
     IndexBranch, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRef,
     UndoStatus,
 };
-use crate::trx::ver_map::{RowVersionReadGuard, RowVersionWriteGuard};
+use crate::trx::ver_map::{RowPageState, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{ActiveTrx, SharedTrxStatus, TrxID, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
+use parking_lot::RwLockReadGuard;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem;
 use std::sync::Arc;
@@ -582,6 +583,7 @@ pub struct RowWriteAccess<'a> {
     page: &'a RowPage,
     row_idx: usize,
     guard: RowVersionWriteGuard<'a>,
+    _state_guard: RwLockReadGuard<'a, RowPageState>,
 }
 
 impl<'a> RowWriteAccess<'a> {
@@ -596,11 +598,13 @@ impl<'a> RowWriteAccess<'a> {
         let ver_map = ctx
             .row_ver()
             .expect("write_row not supported without undo map");
+        let state_guard = ver_map.read_state();
         let guard = ver_map.write_latch(row_idx, sts, ins_or_update);
         RowWriteAccess {
             page,
             row_idx,
             guard,
+            _state_guard: state_guard,
         }
     }
 

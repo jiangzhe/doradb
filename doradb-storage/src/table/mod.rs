@@ -300,16 +300,19 @@ impl Table {
             let Some(head) = undo_guard.as_ref() else {
                 continue;
             };
-            let mut status = &head.next.main.status;
+            let mut status = match &head.next.main.status {
+                UndoStatus::Ref(status) => Some(status.clone()),
+                UndoStatus::CTS(_) => None,
+            };
             let mut entry = head.next.main.entry.clone();
             loop {
                 match entry.as_ref().kind {
                     RowUndoKind::Delete | RowUndoKind::Lock => {
-                        if let UndoStatus::Ref(trx_status) = status {
-                            if !trx_is_committed(trx_status.ts()) {
-                                let row_id = page.row_id(row_idx);
-                                let _ = self.deletion_buffer.put(row_id, trx_status.clone());
-                            }
+                        if let Some(trx_status) = status.as_ref()
+                            && !trx_is_committed(trx_status.ts())
+                        {
+                            let row_id = page.row_id(row_idx);
+                            let _ = self.deletion_buffer.put(row_id, trx_status.clone());
                         }
                         if matches!(&entry.as_ref().kind, RowUndoKind::Delete) {
                             break;
@@ -319,11 +322,18 @@ impl Table {
                         break;
                     }
                 }
-                let Some(next) = entry.as_ref().next.as_ref() else {
+                let next = entry.as_ref().next.as_ref().map(|next| {
+                    let status = match &next.main.status {
+                        UndoStatus::Ref(status) => Some(status.clone()),
+                        UndoStatus::CTS(_) => None,
+                    };
+                    (status, next.main.entry.clone())
+                });
+                let Some((next_status, next_entry)) = next else {
                     break;
                 };
-                status = &next.main.status;
-                entry = next.main.entry.clone();
+                status = next_status;
+                entry = next_entry;
             }
         }
     }
