@@ -1,16 +1,17 @@
-use super::{DeleteInternal, UpdateRowInplace};
+use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
 use crate::index::{RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
-use crate::row::RowPage;
-use crate::row::ops::{InsertMvcc, SelectKey, UpdateCol};
+use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol};
+use crate::row::{RowID, RowPage};
 use crate::session::Session;
-use crate::table::{Table, TableAccess};
-use crate::trx::ActiveTrx;
+use crate::table::{DeleteMarker, Table, TableAccess};
+use crate::trx::row::LockRowForWrite;
 use crate::trx::sys_conf::TrxSysConfig;
+use crate::trx::undo::RowUndoKind;
+use crate::trx::{ActiveTrx, TrxID};
 use crate::value::Val;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -206,6 +207,190 @@ fn test_mvcc_delete_normal() {
 }
 
 #[test]
+fn test_column_delete_basic() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let mut trx = session.begin_trx().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let mut stmt = trx.start_stmt();
+        let res = stmt.delete_row(&sys.table, &key).await;
+        assert!(res.is_ok());
+        trx = stmt.succeed();
+        trx.commit().await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        trx = sys.trx_select_not_found(trx, &key).await;
+        trx.commit().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_column_delete_rollback() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(2i32);
+        let mut trx = session.begin_trx().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let mut stmt = trx.start_stmt();
+        let res = stmt.delete_row(&sys.table, &key).await;
+        assert!(res.is_ok());
+        trx = stmt.succeed();
+        trx.rollback().await;
+
+        let mut trx = session.begin_trx().unwrap();
+        trx = sys
+            .trx_select(trx, &key, |row| {
+                assert_eq!(row[0], Val::from(2i32));
+            })
+            .await;
+        trx.commit().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_column_delete_rollback_after_checkpoint() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+
+        let key = single_key(3i32);
+        let mut trx_delete = session.begin_trx().unwrap();
+        let mut stmt = trx_delete.start_stmt();
+        let res = stmt.delete_row(&sys.table, &key).await;
+        assert!(res.is_ok());
+        trx_delete = stmt.succeed();
+
+        sys.table.freeze(usize::MAX).await;
+        let mut checkpoint_session = sys.new_session();
+        sys.table
+            .data_checkpoint(&mut checkpoint_session)
+            .await
+            .unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let stmt = trx_delete.start_stmt();
+        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        assert!(res.not_found());
+        trx_delete = stmt.succeed();
+        trx_delete.rollback().await;
+
+        let mut trx = session.begin_trx().unwrap();
+        trx = sys
+            .trx_select(trx, &key, |row| {
+                assert_eq!(row[0], Val::from(3i32));
+            })
+            .await;
+        trx.commit().await.unwrap();
+
+        drop(checkpoint_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_column_delete_write_conflict() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(4i32);
+        let mut trx = session.begin_trx().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let mut trx1 = session.begin_trx().unwrap();
+        let mut stmt1 = trx1.start_stmt();
+        let res1 = stmt1.delete_row(&sys.table, &key).await;
+        assert!(res1.is_ok());
+        trx1 = stmt1.succeed();
+
+        let mut session2 = sys.new_session();
+        let mut trx2 = session2.begin_trx().unwrap();
+        let mut stmt2 = trx2.start_stmt();
+        let res2 = stmt2.delete_row(&sys.table, &key).await;
+        assert!(matches!(res2, DeleteMvcc::WriteConflict));
+        trx2 = stmt2.fail().await;
+        trx2.rollback().await;
+        drop(session2);
+
+        trx1.rollback().await;
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_column_delete_mvcc_visibility() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(5i32);
+        let mut trx = session.begin_trx().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let mut trx_reader = session.begin_trx().unwrap();
+
+        let mut trx_delete = session.begin_trx().unwrap();
+        let mut stmt_delete = trx_delete.start_stmt();
+        let res = stmt_delete.delete_row(&sys.table, &key).await;
+        assert!(res.is_ok());
+        trx_delete = stmt_delete.succeed();
+        trx_delete.commit().await.unwrap();
+
+        trx_reader = sys
+            .trx_select(trx_reader, &key, |row| {
+                assert_eq!(row[0], Val::from(5i32));
+            })
+            .await;
+        trx_reader.commit().await.unwrap();
+
+        let mut trx_new = session.begin_trx().unwrap();
+        trx_new = sys.trx_select_not_found(trx_new, &key).await;
+        trx_new.commit().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_row_page_transition_retries_update_delete() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -237,6 +422,26 @@ fn test_row_page_transition_retries_update_delete() {
         let row_ver = ctx.row_ver().unwrap();
         row_ver.set_frozen();
         row_ver.set_transition();
+
+        let insert_page_guard = sys
+            .engine
+            .data_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .await
+            .shared_async()
+            .await;
+        let insert = vec![Val::from(2i32), Val::from("insert")];
+        let insert_res = sys.table.insert_row_to_page(
+            &mut stmt,
+            insert_page_guard,
+            insert,
+            RowUndoKind::Insert,
+            vec![],
+        );
+        assert!(matches!(
+            insert_res,
+            InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
+        ));
 
         let update = vec![UpdateCol {
             idx: 1,
@@ -892,6 +1097,71 @@ fn test_table_freeze() {
 }
 
 #[test]
+fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 1, 1, "lock").await;
+
+        let key = single_key(1i32);
+        let mut trx = session.begin_trx().unwrap();
+        let mut stmt = trx.start_stmt();
+        let index = sys.table.sec_idx[key.index_no].unique().unwrap();
+        let (row_id, _) = index.lookup(&key.vals, stmt.trx.sts).await.unwrap();
+        let page_id = match sys.table.blk_idx.find_row(row_id).await {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::NotFound => panic!("row should exist"),
+            RowLocation::LwcPage(..) => unreachable!("row page expected"),
+        };
+
+        let page_guard = sys
+            .engine
+            .data_pool
+            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .await
+            .shared_async()
+            .await;
+        let (ctx, page) = page_guard.ctx_and_page();
+        let mut lock_row = sys
+            .table
+            .lock_row_for_write(&mut stmt, &page_guard, row_id, Some(&key))
+            .await;
+        match &mut lock_row {
+            LockRowForWrite::Ok(access) => {
+                drop(access.take());
+            }
+            _ => panic!("lock should succeed"),
+        }
+
+        let frozen_page = FrozenPage {
+            page_id,
+            start_row_id: page.header.start_row_id,
+            end_row_id: page.header.start_row_id + page.header.max_row_count as u64,
+        };
+        ctx.row_ver().unwrap().set_frozen();
+        sys.table
+            .set_frozen_pages_to_transition(&[frozen_page], stmt.trx.sts)
+            .await;
+
+        let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+        match marker {
+            DeleteMarker::Ref(status) => {
+                assert!(std::sync::Arc::ptr_eq(&status, &stmt.trx.status()));
+            }
+            DeleteMarker::Committed(_) => panic!("uncommitted lock should remain as marker ref"),
+        }
+
+        trx = stmt.fail().await;
+        trx.rollback().await;
+
+        drop(lock_row);
+        drop(page_guard);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_data_checkpoint_basic_flow() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -1067,9 +1337,9 @@ fn test_data_checkpoint_error_rollback() {
         sys.table.freeze(usize::MAX).await;
         let root_before = sys.table.file.active_root().clone();
 
-        super::TEST_FORCE_LWC_BUILD_ERROR.store(true, Ordering::SeqCst);
+        super::set_test_force_lwc_build_error(true);
         let res = sys.table.data_checkpoint(&mut session).await;
-        super::TEST_FORCE_LWC_BUILD_ERROR.store(false, Ordering::SeqCst);
+        super::set_test_force_lwc_build_error(false);
         assert!(res.is_err());
 
         let root_after = sys.table.file.active_root();
@@ -1245,6 +1515,19 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
     SelectKey {
         index_no: 0,
         vals: vec![value.into()],
+    }
+}
+
+async fn assert_row_in_lwc(table: &Table, key: &SelectKey, sts: TrxID) -> RowID {
+    let index = table.sec_idx[key.index_no].unique().unwrap();
+    let (row_id, _) = index
+        .lookup(&key.vals, sts)
+        .await
+        .expect("row should exist");
+    match table.blk_idx.find_row(row_id).await {
+        RowLocation::LwcPage(..) => row_id,
+        RowLocation::RowPage(..) => panic!("row should be in lwc"),
+        RowLocation::NotFound => panic!("row should exist"),
     }
 }
 

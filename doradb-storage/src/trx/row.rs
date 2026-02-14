@@ -9,10 +9,11 @@ use crate::trx::undo::{
     IndexBranch, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRef,
     UndoStatus,
 };
-use crate::trx::ver_map::{RowVersionReadGuard, RowVersionWriteGuard};
+use crate::trx::ver_map::{RowPageState, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{ActiveTrx, SharedTrxStatus, TrxID, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
+use parking_lot::RwLockReadGuard;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem;
 use std::sync::Arc;
@@ -582,6 +583,7 @@ pub struct RowWriteAccess<'a> {
     page: &'a RowPage,
     row_idx: usize,
     guard: RowVersionWriteGuard<'a>,
+    _state_guard: RwLockReadGuard<'a, RowPageState>,
 }
 
 impl<'a> RowWriteAccess<'a> {
@@ -596,11 +598,28 @@ impl<'a> RowWriteAccess<'a> {
         let ver_map = ctx
             .row_ver()
             .expect("write_row not supported without undo map");
+        let state_guard = ver_map.read_state();
+        Self::new_with_state_guard(page, ctx, row_idx, sts, ins_or_update, state_guard)
+    }
+
+    #[inline]
+    pub fn new_with_state_guard(
+        page: &'a RowPage,
+        ctx: &'a FrameContext,
+        row_idx: usize,
+        sts: Option<TrxID>,
+        ins_or_update: bool,
+        state_guard: RwLockReadGuard<'a, RowPageState>,
+    ) -> Self {
+        let ver_map = ctx
+            .row_ver()
+            .expect("write_row not supported without undo map");
         let guard = ver_map.write_latch(row_idx, sts, ins_or_update);
         RowWriteAccess {
             page,
             row_idx,
             guard,
+            _state_guard: state_guard,
         }
     }
 
@@ -612,6 +631,11 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub fn row_mut(&self, var_offset: usize, var_end: usize) -> RowMut<'_> {
         self.page.row_mut(self.row_idx, var_offset, var_end)
+    }
+
+    #[inline]
+    pub fn page_state(&self) -> RowPageState {
+        *self._state_guard
     }
 
     #[inline]
@@ -683,14 +707,15 @@ impl<'a> RowWriteAccess<'a> {
         let row = self.page.row(self.row_idx);
         match &mut *self.guard {
             None => {
-                let entry = OwnedRowUndo::new(table_id, page_id, row_id, RowUndoKind::Lock);
+                let entry = OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                 self.add_undo_head(stmt.trx.status(), entry.leak());
                 stmt.row_undo.push(entry);
                 LockUndo::Ok
             }
             Some(undo_head) => {
                 if stmt.trx.is_same_trx(undo_head) {
-                    let mut entry = OwnedRowUndo::new(table_id, page_id, row_id, RowUndoKind::Lock);
+                    let mut entry =
+                        OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
                         entry: entry.leak(),
                         status: UndoStatus::Ref(stmt.trx.status()),
@@ -751,7 +776,8 @@ impl<'a> RowWriteAccess<'a> {
                     {
                         return LockUndo::InvalidIndex;
                     }
-                    let mut entry = OwnedRowUndo::new(table_id, page_id, row_id, RowUndoKind::Lock);
+                    let mut entry =
+                        OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
                         entry: entry.leak(),
                         status: UndoStatus::Ref(stmt.trx.status()),
@@ -931,6 +957,8 @@ pub enum LockRowForWrite<'a> {
     // this can happen when index entry is not garbage collected,
     // so some old key points to new version.
     InvalidIndex,
+    // row page is transitioning, caller should retry.
+    RetryInTransition,
 }
 
 impl<'a> LockRowForWrite<'a> {

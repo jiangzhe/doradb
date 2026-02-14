@@ -1,9 +1,11 @@
 mod access;
+mod deletion_buffer;
 mod recover;
 #[cfg(test)]
 mod tests;
 
 pub use access::*;
+pub use deletion_buffer::*;
 pub use recover::*;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
@@ -11,7 +13,7 @@ use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::Maskable;
 use crate::index::{
@@ -19,7 +21,7 @@ use crate::index::{
     RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::LwcBuilder;
+use crate::lwc::{LwcBuilder, LwcPage};
 use crate::row::ops::{
     InsertIndex, LinkForUniqueIndex, ReadRow, Recover, RecoverIndex, SelectKey, SelectMvcc,
     UndoCol, UpdateCol, UpdateIndex, UpdateRow,
@@ -29,19 +31,26 @@ use crate::stmt::Statement;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{FindOldVersion, LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
 use crate::trx::sys::TransactionSystem;
-use crate::trx::undo::{IndexBranch, RowUndoKind};
+use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use crate::trx::{MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(test)]
-static TEST_FORCE_LWC_BUILD_ERROR: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
+    TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
+}
 
 /// Table is a logical data set of rows.
 /// It combines components such as row page, undo map, block index, secondary
@@ -82,6 +91,7 @@ pub struct Table {
     pub file: Arc<TableFile>,
     pub blk_idx: Arc<BlockIndex>,
     pub sec_idx: Arc<[SecondaryIndex]>,
+    deletion_buffer: Arc<ColumnDeletionBuffer>,
 }
 
 struct FrozenPage {
@@ -118,6 +128,7 @@ impl Table {
             file,
             blk_idx: Arc::new(blk_idx),
             sec_idx: Arc::from(sec_idx.into_boxed_slice()),
+            deletion_buffer: Arc::new(ColumnDeletionBuffer::new()),
         }
     }
 
@@ -125,6 +136,17 @@ impl Table {
     #[inline]
     pub fn table_id(&self) -> TableID {
         self.blk_idx.table_id
+    }
+
+    /// Returns current pivot row id for row-store/column-store boundary.
+    #[inline]
+    pub fn pivot_row_id(&self) -> RowID {
+        self.file.active_root().pivot_row_id
+    }
+
+    #[inline]
+    pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
+        &self.deletion_buffer
     }
 
     async fn collect_frozen_pages(&self, pivot_row_id: RowID) -> (Vec<FrozenPage>, Option<TrxID>) {
@@ -192,7 +214,7 @@ impl Table {
         }
     }
 
-    async fn set_frozen_pages_to_transition(&self, frozen_pages: &[FrozenPage]) {
+    async fn set_frozen_pages_to_transition(&self, frozen_pages: &[FrozenPage], cutoff_ts: TrxID) {
         for page_info in frozen_pages {
             let page_guard = self
                 .data_pool
@@ -200,26 +222,25 @@ impl Table {
                 .await
                 .shared_async()
                 .await;
-            let (ctx, _) = page_guard.ctx_and_page();
+            let (ctx, page) = page_guard.ctx_and_page();
             ctx.row_ver().unwrap().set_transition();
+            self.capture_delete_markers_for_transition(page, ctx, cutoff_ts);
         }
     }
 
     async fn build_lwc_pages(
         &self,
-        trx_sys: &'static TransactionSystem,
-        sts: TrxID,
+        cutoff_ts: TrxID,
         frozen_pages: &[FrozenPage],
     ) -> Result<Vec<LwcPagePersist>> {
         #[cfg(test)]
         {
-            if TEST_FORCE_LWC_BUILD_ERROR.load(Ordering::SeqCst) {
+            if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
                 return Err(crate::error::Error::InvalidState);
             }
         }
         let mut lwc_pages = Vec::new();
         if !frozen_pages.is_empty() {
-            let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             let metadata = self.metadata();
             let mut builder = LwcBuilder::new(metadata);
             let mut current_start: RowID = 0;
@@ -232,7 +253,7 @@ impl Table {
                     .shared_async()
                     .await;
                 let (ctx, page) = page_guard.ctx_and_page();
-                let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
+                let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                 if view.rows_non_deleted() == 0 {
                     continue;
                 }
@@ -250,7 +271,7 @@ impl Table {
                     builder = LwcBuilder::new(metadata);
                     current_start = page_info.start_row_id;
                     current_end = page_info.end_row_id;
-                    let view = page.vector_view_in_transition(metadata, ctx, sts, min_active_sts);
+                    let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                     if !builder.append_view(page, view)? {
                         return Err(crate::error::Error::InvalidState);
                     }
@@ -268,6 +289,81 @@ impl Table {
             }
         }
         Ok(lwc_pages)
+    }
+
+    fn capture_delete_markers_for_transition(
+        &self,
+        page: &RowPage,
+        ctx: &crate::buffer::frame::FrameContext,
+        cutoff_ts: TrxID,
+    ) {
+        let Some(map) = ctx.row_ver() else {
+            return;
+        };
+        let row_count = page.header.row_count();
+        for row_idx in 0..row_count {
+            let undo_guard = map.read_latch(row_idx);
+            let Some(head) = undo_guard.as_ref() else {
+                continue;
+            };
+            let mut ts = head.next.main.status.ts();
+            let mut status = match &head.next.main.status {
+                UndoStatus::Ref(status) => Some(status.clone()),
+                UndoStatus::CTS(_) => None,
+            };
+            let mut entry = head.next.main.entry.clone();
+            loop {
+                let row_id = page.row_id(row_idx);
+                match entry.as_ref().kind {
+                    RowUndoKind::Lock => {
+                        if let Some(trx_status) = status.as_ref()
+                            && !trx_is_committed(trx_status.ts())
+                        {
+                            let _ = self.deletion_buffer.put_ref(row_id, trx_status.clone());
+                        }
+                    }
+                    RowUndoKind::Delete => {
+                        match status.as_ref() {
+                            Some(trx_status) => {
+                                let status_ts = trx_status.ts();
+                                if trx_is_committed(status_ts) {
+                                    if status_ts >= cutoff_ts {
+                                        let _ =
+                                            self.deletion_buffer.put_committed(row_id, status_ts);
+                                    }
+                                } else {
+                                    let _ =
+                                        self.deletion_buffer.put_ref(row_id, trx_status.clone());
+                                }
+                            }
+                            None => {
+                                if ts >= cutoff_ts {
+                                    let _ = self.deletion_buffer.put_committed(row_id, ts);
+                                }
+                            }
+                        };
+                        break;
+                    }
+                    RowUndoKind::Insert | RowUndoKind::Update(_) => {
+                        break;
+                    }
+                }
+                let next = entry.as_ref().next.as_ref().map(|next| {
+                    let ts = next.main.status.ts();
+                    let status = match &next.main.status {
+                        UndoStatus::Ref(status) => Some(status.clone()),
+                        UndoStatus::CTS(_) => None,
+                    };
+                    (ts, status, next.main.entry.clone())
+                });
+                let Some((next_ts, next_status, next_entry)) = next else {
+                    break;
+                };
+                ts = next_ts;
+                status = next_status;
+                entry = next_entry;
+            }
+        }
     }
 
     /// Returns total number of row pages.
@@ -294,7 +390,32 @@ impl Table {
     ) -> SelectMvcc {
         match self.blk_idx.find_row(row_id).await {
             RowLocation::NotFound => SelectMvcc::NotFound,
-            RowLocation::LwcPage(..) => todo!("lwc page"),
+            RowLocation::LwcPage(page_id) => {
+                if let Some(marker) = self.deletion_buffer.get(row_id) {
+                    match marker {
+                        DeleteMarker::Committed(ts) => {
+                            if ts <= stmt.trx.sts {
+                                return SelectMvcc::NotFound;
+                            }
+                        }
+                        DeleteMarker::Ref(status) => {
+                            let ts = status.ts();
+                            if trx_is_committed(ts) {
+                                if ts <= stmt.trx.sts {
+                                    return SelectMvcc::NotFound;
+                                }
+                            } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
+                                return SelectMvcc::NotFound;
+                            }
+                        }
+                    }
+                }
+                match self.read_lwc_row(page_id, row_id, user_read_set).await {
+                    Ok(Some(vals)) => SelectMvcc::Ok(vals),
+                    Ok(None) => SelectMvcc::NotFound,
+                    Err(err) => SelectMvcc::Err(err),
+                }
+            }
             RowLocation::RowPage(page_id) => {
                 let page_guard = self
                     .data_pool
@@ -314,6 +435,33 @@ impl Table {
                 }
             }
         }
+    }
+
+    #[inline]
+    async fn read_lwc_row(
+        &self,
+        page_id: PageID,
+        row_id: RowID,
+        read_set: &[usize],
+    ) -> Result<Option<Vec<Val>>> {
+        let buf = self.file.read_page(page_id).await?;
+        let page = unsafe { &*(buf.data().as_ptr() as *const LwcPage) };
+        let Some(row_idx) = page.row_idx(row_id) else {
+            return Ok(None);
+        };
+        let metadata = self.metadata();
+        let mut vals = Vec::with_capacity(read_set.len());
+        for &col_idx in read_set {
+            let column = page.column(metadata, col_idx)?;
+            if column.is_null(row_idx) {
+                vals.push(Val::Null);
+                continue;
+            }
+            let data = column.data()?;
+            let val = data.value(row_idx).ok_or(Error::InvalidCompressedData)?;
+            vals.push(val);
+        }
+        Ok(Some(vals))
     }
 
     async fn mem_scan<F>(&self, start_row_id: RowID, mut page_action: F)
@@ -853,7 +1001,9 @@ impl Table {
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page();
-        if ctx.row_ver().unwrap().is_frozen() {
+        let ver_map = ctx.row_ver().unwrap();
+        let state_guard = ver_map.read_state();
+        if *state_guard != RowPageState::Active {
             return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
         }
         debug_assert!(metadata.col_count() == page.header.col_count as usize);
@@ -868,7 +1018,14 @@ impl Table {
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new(page, ctx, row_idx, Some(stmt.trx.sts), true);
+        let mut access = RowWriteAccess::new_with_state_guard(
+            page,
+            ctx,
+            row_idx,
+            Some(stmt.trx.sts),
+            true,
+            state_guard,
+        );
         let res = access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
         debug_assert!(res.is_ok());
         // Apply insert
@@ -912,7 +1069,7 @@ impl Table {
         mut update: Vec<UpdateCol>,
     ) -> UpdateRowInplace {
         let page_id = page_guard.page_id();
-        let (ctx, page) = page_guard.ctx_and_page();
+        let (_, page) = page_guard.ctx_and_page();
         // column indexes must be in range
         debug_assert!(
             {
@@ -938,11 +1095,6 @@ impl Table {
         {
             return UpdateRowInplace::RowNotFound;
         }
-        let row_state = ctx.row_ver().unwrap().state();
-        if row_state == RowPageState::Transition {
-            return UpdateRowInplace::RetryInTransition;
-        }
-        let frozen = row_state == RowPageState::Frozen;
         let mut lock_row = self
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
@@ -950,13 +1102,10 @@ impl Table {
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound,
             LockRowForWrite::WriteConflict => UpdateRowInplace::WriteConflict,
+            LockRowForWrite::RetryInTransition => UpdateRowInplace::RetryInTransition,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
-                if ctx.row_ver().unwrap().is_transition() {
-                    drop(access);
-                    drop(lock_row);
-                    return UpdateRowInplace::RetryInTransition;
-                }
+                let frozen = access.page_state() == RowPageState::Frozen;
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }
@@ -1049,10 +1198,7 @@ impl Table {
         log_by_key: bool,
     ) -> DeleteInternal {
         let page_id = page_guard.page_id();
-        let (ctx, page) = page_guard.ctx_and_page();
-        if ctx.row_ver().unwrap().is_transition() {
-            return DeleteInternal::RetryInTransition;
-        }
+        let (_, page) = page_guard.ctx_and_page();
         if !page.row_id_in_valid_range(row_id) {
             return DeleteInternal::NotFound;
         }
@@ -1062,13 +1208,9 @@ impl Table {
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
             LockRowForWrite::WriteConflict => DeleteInternal::WriteConflict,
+            LockRowForWrite::RetryInTransition => DeleteInternal::RetryInTransition,
             LockRowForWrite::Ok(access) => {
                 let mut access = access.take().unwrap();
-                if ctx.row_ver().unwrap().is_transition() {
-                    drop(access);
-                    drop(lock_row);
-                    return DeleteInternal::RetryInTransition;
-                }
                 if access.row().is_deleted() {
                     return DeleteInternal::NotFound;
                 }
@@ -1121,6 +1263,8 @@ impl Table {
     }
 
     // lock row will check write conflict on given row and lock it.
+    // clippy can not find the guard is actually dropped before await point.
+    #[allow(clippy::await_holding_lock)]
     #[inline]
     async fn lock_row_for_write<'a>(
         &self,
@@ -1130,9 +1274,20 @@ impl Table {
         key: Option<&SelectKey>,
     ) -> LockRowForWrite<'a> {
         let (ctx, page) = page_guard.ctx_and_page();
+        let ver_map = ctx.row_ver().unwrap();
         loop {
-            let mut access =
-                RowWriteAccess::new(page, ctx, page.row_idx(row_id), Some(stmt.trx.sts), false);
+            let state_guard = ver_map.read_state();
+            if *state_guard == RowPageState::Transition {
+                return LockRowForWrite::RetryInTransition;
+            }
+            let mut access = RowWriteAccess::new_with_state_guard(
+                page,
+                ctx,
+                page.row_idx(row_id),
+                Some(stmt.trx.sts),
+                false,
+                state_guard,
+            );
             let lock_undo = access.lock_undo(
                 stmt,
                 self.metadata(),
@@ -2082,6 +2237,7 @@ impl Clone for Table {
             file: Arc::clone(&self.file),
             blk_idx: Arc::clone(&self.blk_idx),
             sec_idx: Arc::clone(&self.sec_idx),
+            deletion_buffer: Arc::clone(&self.deletion_buffer),
         }
     }
 }

@@ -1,0 +1,32 @@
+description = "quick review on current code change"
+prompt = """
+## Goal
+
+Quickly review the current code change using `git --no-pager diff`.
+brief description of the change (may not be provided): {{args}}
+
+## Workflow
+
+1. Understand the technical background.
+You may want to read one or more document(s) related to this task in `docs/`:
+- `docs/architecture.md`
+- `docs/transaction-system.md`
+- `docs/index-design.md`
+- `docs/checkpoint-and-recovery.md`
+- `docs/table-file.md`
+
+2. If brief description of the change is provided, please investigate the related codebase first to get a deep understanding of current implementation.
+
+3. review the code change with following checklist.
+- Critical bugs (blocking)
+- Security issues (blocking)
+- Architectural problems (blocking)
+- Logic bug or vulnerability (blocking)
+- Thread safety, concurrent problems, data race and dead lock, etc (blocking)
+- Style, optimizations, documentation improvements (non-blocking)
+
+4. summarize a concise report on the review.
+
+## Important
+- Do not modify any source code file.
+"""

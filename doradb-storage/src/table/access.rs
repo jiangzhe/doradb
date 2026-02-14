@@ -1,5 +1,5 @@
 use crate::buffer::BufferPool;
-use crate::buffer::page::PageID;
+use crate::buffer::page::{INVALID_PAGE_ID, PageID};
 use crate::catalog::TableMetadata;
 use crate::error::{Error, Result};
 use crate::file::table_file::MutableTableFile;
@@ -12,11 +12,11 @@ use crate::row::ops::{
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::session::Session;
 use crate::stmt::Statement;
-use crate::table::{DeleteInternal, Table, UpdateRowInplace, row_len};
+use crate::table::{DeleteInternal, DeletionError, Table, UpdateRowInplace, row_len};
 use crate::trx::MIN_SNAPSHOT_TS;
-use crate::trx::redo::DDLRedo;
+use crate::trx::redo::{DDLRedo, RowRedo, RowRedoKind};
 use crate::trx::row::{ReadAllRows, RowReadAccess};
-use crate::trx::undo::RowUndoKind;
+use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use crate::value::Val;
 use std::future::Future;
 
@@ -128,10 +128,7 @@ pub trait TableAccess {
     fn freeze(&self, max_rows: usize) -> impl Future<Output = usize>;
 
     /// Convert frozen row pages to LWC pages and persist to table file.
-    fn data_checkpoint(
-        &self,
-        session: &mut Session,
-    ) -> impl Future<Output = Result<()>>;
+    fn data_checkpoint(&self, session: &mut Session) -> impl Future<Output = Result<()>>;
 }
 
 impl TableAccess for Table {
@@ -294,9 +291,10 @@ impl TableAccess for Table {
                 SelectMvcc::Ok(vals) => {
                     res.push(vals);
                 }
+                SelectMvcc::Err(err) => return ScanMvcc::Err(err),
             }
         }
-        res
+        ScanMvcc::Ok(res)
     }
 
     async fn insert_mvcc(&self, stmt: &mut Statement, cols: Vec<Val>) -> InsertMvcc {
@@ -493,7 +491,37 @@ impl TableAccess for Table {
                 None => return DeleteMvcc::NotFound,
                 Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
-                    RowLocation::LwcPage(..) => todo!("lwc page"),
+                    RowLocation::LwcPage(..) => {
+                        match self.deletion_buffer.put_ref(row_id, stmt.trx.status()) {
+                            Ok(()) => {
+                                let undo = OwnedRowUndo::new(
+                                    self.table_id(),
+                                    None,
+                                    row_id,
+                                    RowUndoKind::Delete,
+                                );
+                                stmt.row_undo.push(undo);
+                                let redo_kind = if log_by_key {
+                                    RowRedoKind::DeleteByUniqueKey(key.clone())
+                                } else {
+                                    RowRedoKind::Delete
+                                };
+                                let redo = RowRedo {
+                                    page_id: INVALID_PAGE_ID,
+                                    row_id,
+                                    kind: redo_kind,
+                                };
+                                stmt.redo.insert_dml(self.table_id(), redo);
+                                return DeleteMvcc::Ok;
+                            }
+                            Err(DeletionError::WriteConflict) => {
+                                return DeleteMvcc::WriteConflict;
+                            }
+                            Err(DeletionError::AlreadyDeleted) => {
+                                return DeleteMvcc::NotFound;
+                            }
+                        }
+                    }
                     RowLocation::RowPage(page_id) => {
                         let page_guard = self
                             .data_pool
@@ -596,10 +624,13 @@ impl TableAccess for Table {
         let (frozen_pages, heap_redo_start_ts) = self.collect_frozen_pages(pivot_row_id).await;
 
         // Step 2: wait until frozen pages are stable, then move them to transition.
+        let mut cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
         if !frozen_pages.is_empty() {
             self.wait_for_frozen_pages_stable(trx_sys, &frozen_pages)
                 .await;
-            self.set_frozen_pages_to_transition(&frozen_pages).await;
+            cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
+            self.set_frozen_pages_to_transition(&frozen_pages, cutoff_ts)
+                .await;
         }
 
         // Step 3: begin a checkpoint transaction and compute the new pivot row id.
@@ -619,7 +650,7 @@ impl TableAccess for Table {
 
         // Step 4: build LWC pages and compute heap redo start CTS; rollback on error.
         let (lwc_pages, heap_redo_start_ts) =
-            match self.build_lwc_pages(trx_sys, sts, &frozen_pages).await {
+            match self.build_lwc_pages(cutoff_ts, &frozen_pages).await {
                 Ok(lwc_pages) => (lwc_pages, heap_redo_start_ts.unwrap_or(sts)),
                 Err(err) => {
                     trx_sys.rollback(trx, self.data_pool).await;

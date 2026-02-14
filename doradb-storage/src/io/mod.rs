@@ -21,7 +21,7 @@ pub use libaio_abi::*;
 #[cfg(not(feature = "libaio"))]
 mod no_libaio {
     use super::*;
-    use libc::{off_t, c_void};
+    use libc::{c_void, off_t};
 
     pub(super) struct Completion {
         pub(super) key: AIOKey,

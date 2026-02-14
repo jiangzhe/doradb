@@ -95,6 +95,25 @@ impl LwcPage {
         Ok(res)
     }
 
+    /// Returns row index for given row id.
+    #[inline]
+    pub fn row_idx(&self, row_id: RowID) -> Option<usize> {
+        if row_id < self.header.first_row_id() || row_id > self.header.last_row_id() {
+            return None;
+        }
+        let start_idx = self.header.col_count() as usize * mem::size_of::<u16>();
+        let end_idx = self.header.first_col_offset() as usize;
+        debug_assert!(start_idx <= end_idx && end_idx <= self.body.len());
+        let row_id_set = match RowIDSet::from_bytes(&self.body[start_idx..end_idx]) {
+            Ok(set) => set,
+            Err(_) => {
+                debug_assert!(false, "invalid LWC row id set");
+                return None;
+            }
+        };
+        row_id_set.position(row_id)
+    }
+
     #[inline]
     fn row_id_set(&self) -> Result<RowIDSet<'_>> {
         let start_idx = self.header.col_count() as usize * mem::size_of::<u16>();

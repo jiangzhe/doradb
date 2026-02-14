@@ -297,7 +297,7 @@ impl RowPage {
         &'p self,
         metadata: &'m TableMetadata,
         ctx: &FrameContext,
-        read_ts: TrxID,
+        cutoff_ts: TrxID,
         global_min_active_sts: TrxID,
     ) -> PageVectorView<'p, 'm> {
         let Some(map) = ctx.row_ver() else {
@@ -323,7 +323,7 @@ impl RowPage {
                 match &entry.as_ref().kind {
                     RowUndoKind::Lock => {}
                     RowUndoKind::Delete => {
-                        if !trx_is_committed(ts) || ts > read_ts {
+                        if !trx_is_committed(ts) || ts >= cutoff_ts {
                             del_bitmap.bitmap_unset(row_idx);
                         } else {
                             del_bitmap.bitmap_set(row_idx);
@@ -331,7 +331,7 @@ impl RowPage {
                         break;
                     }
                     RowUndoKind::Insert | RowUndoKind::Update(_) => {
-                        if !trx_is_committed(ts) || ts > read_ts {
+                        if !trx_is_committed(ts) || ts >= cutoff_ts {
                             panic!("Uncommitted/Future Insert/Update found in Checkpoint");
                         }
                         del_bitmap.bitmap_unset(row_idx);
@@ -772,7 +772,7 @@ mod tests {
         assert!(matches!(page.delete(0), Delete::Ok));
 
         let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
-        let undo = OwnedRowUndo::new(0, 0, page.row_id(0), RowUndoKind::Delete);
+        let undo = OwnedRowUndo::new(0, Some(0), page.row_id(0), RowUndoKind::Delete);
         let undo_ref = undo.leak();
         let head = RowUndoHead {
             next: NextRowUndo {
@@ -835,7 +835,7 @@ mod tests {
 
         let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
         let uncommitted_ts = MIN_ACTIVE_TRX_ID + 1;
-        let undo = OwnedRowUndo::new(0, 0, page.row_id(0), RowUndoKind::Insert);
+        let undo = OwnedRowUndo::new(0, Some(0), page.row_id(0), RowUndoKind::Insert);
         let undo_ref = undo.leak();
         let head = RowUndoHead {
             next: NextRowUndo {
