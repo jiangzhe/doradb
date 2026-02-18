@@ -411,6 +411,7 @@ pub enum ValArrayRef<'a> {
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
+    use crate::buffer::page::VersionedPageID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::row::tests::create_row_page;
     use crate::row::{Delete, InsertRow};
@@ -772,7 +773,15 @@ mod tests {
         assert!(matches!(page.delete(0), Delete::Ok));
 
         let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
-        let undo = OwnedRowUndo::new(0, Some(0), page.row_id(0), RowUndoKind::Delete);
+        let undo = OwnedRowUndo::new(
+            0,
+            Some(VersionedPageID {
+                page_id: 0,
+                generation: 0,
+            }),
+            page.row_id(0),
+            RowUndoKind::Delete,
+        );
         let undo_ref = undo.leak();
         let head = RowUndoHead {
             next: NextRowUndo {
@@ -835,7 +844,15 @@ mod tests {
 
         let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
         let uncommitted_ts = MIN_ACTIVE_TRX_ID + 1;
-        let undo = OwnedRowUndo::new(0, Some(0), page.row_id(0), RowUndoKind::Insert);
+        let undo = OwnedRowUndo::new(
+            0,
+            Some(VersionedPageID {
+                page_id: 0,
+                generation: 0,
+            }),
+            page.row_id(0),
+            RowUndoKind::Insert,
+        );
         let undo_ref = undo.leak();
         let head = RowUndoHead {
             next: NextRowUndo {

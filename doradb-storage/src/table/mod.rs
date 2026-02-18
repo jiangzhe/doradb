@@ -1000,6 +1000,7 @@ impl Table {
         debug_assert!(matches!(undo_kind, RowUndoKind::Insert));
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
+        let versioned_page_id = page_guard.bf().versioned_page_id();
         let (ctx, page) = page_guard.ctx_and_page();
         let ver_map = ctx.row_ver().unwrap();
         let state_guard = ver_map.read_state();
@@ -1026,7 +1027,14 @@ impl Table {
             true,
             state_guard,
         );
-        let res = access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
+        let res = access.lock_undo(
+            stmt,
+            metadata,
+            self.table_id(),
+            versioned_page_id,
+            row_id,
+            None,
+        );
         debug_assert!(res.is_ok());
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
@@ -1292,7 +1300,7 @@ impl Table {
                 stmt,
                 self.metadata(),
                 self.table_id(),
-                page_guard.page_id(),
+                page_guard.bf().versioned_page_id(),
                 row_id,
                 key,
             );

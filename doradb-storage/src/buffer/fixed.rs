@@ -1,8 +1,8 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
-use crate::buffer::frame::BufferFrame;
+use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, Page, PageID};
+use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, Page, PageID, VersionedPageID};
 use crate::buffer::util::{init_bf_exclusive_guard, mmap_allocate, mmap_deallocate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
@@ -46,6 +46,14 @@ impl FixedBufferPool {
                 }
             }
         } as *mut Page;
+        unsafe {
+            for i in 0..size {
+                let bf_ptr = frames.offset(i as isize);
+                std::ptr::write(bf_ptr, BufferFrame::default());
+                (*bf_ptr).page_id = i as PageID;
+                (*bf_ptr).page = pages.offset(i as isize);
+            }
+        }
         Ok(FixedBufferPool {
             frames,
             pages,
@@ -105,9 +113,6 @@ impl FixedBufferPool {
     unsafe fn get_new_frame(&'static self, page_id: PageID) -> UnsafePtr<BufferFrame> {
         unsafe {
             let bf_ptr = self.frames.offset(page_id as isize);
-            std::ptr::write(bf_ptr, BufferFrame::default());
-            // assign page pointer.
-            (*bf_ptr).page = self.pages.offset(page_id as isize);
             UnsafePtr(bf_ptr)
         }
     }
@@ -129,7 +134,11 @@ impl FixedBufferPool {
             let bf = self.get_new_frame(page_id as PageID);
             (*bf.0).page_id = page_id as PageID;
             let mut g = init_bf_exclusive_guard::<T>(bf);
+            g.bf_mut().ctx = None;
             T::init_frame(g.bf_mut());
+            g.bf_mut().bump_generation();
+            g.bf_mut().next_free = INVALID_PAGE_ID;
+            g.bf_mut().set_dirty(true);
             g.page_mut().zero();
             g
         }
@@ -185,12 +194,34 @@ impl BufferPool for FixedBufferPool {
         self.get_page_internal(page_id, mode).await
     }
 
+    #[inline]
+    async fn try_get_page_versioned<T: BufferPage>(
+        &'static self,
+        id: VersionedPageID,
+        mode: LatchFallbackMode,
+    ) -> Option<FacadePageGuard<T>> {
+        if !self.alloc_map.is_allocated(id.page_id as usize) {
+            return None;
+        }
+        let g = self.get_page_internal(id.page_id, mode).await;
+        let bf = g.bf();
+        if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
+            if g.is_exclusive() {
+                unsafe { g.rollback_exclusive_version_change() };
+            }
+            return None;
+        }
+        Some(g)
+    }
+
     /// Deallocate page.
     #[inline]
     fn deallocate_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
         let page_id = g.page_id();
         g.page_mut().zero();
+        g.bf_mut().ctx = None;
         T::deinit_frame(g.bf_mut());
+        g.bf_mut().bump_generation();
         let res = self.alloc_map.deallocate(page_id as usize);
         debug_assert!(res);
     }
@@ -294,6 +325,32 @@ mod tests {
                     .await;
                 let c = c.unwrap();
                 drop(c);
+            }
+            {
+                let g = pool.allocate_page::<BlockNode>().await;
+                let page_id = g.page_id();
+                let stale_versioned = g.bf().versioned_page_id();
+                let first_generation = stale_versioned.generation;
+                pool.deallocate_page(g);
+
+                let g = pool.allocate_page::<BlockNode>().await;
+                assert_eq!(g.page_id(), page_id);
+                assert_eq!(g.bf().generation(), first_generation + 2);
+                let current_versioned = g.bf().versioned_page_id();
+                drop(g);
+
+                let g = pool
+                    .try_get_page_versioned::<BlockNode>(
+                        current_versioned,
+                        LatchFallbackMode::Shared,
+                    )
+                    .await;
+                assert!(g.is_some());
+
+                let g = pool
+                    .try_get_page_versioned::<BlockNode>(stale_versioned, LatchFallbackMode::Shared)
+                    .await;
+                assert!(g.is_none());
             }
             unsafe {
                 StaticLifetime::drop_static(pool);

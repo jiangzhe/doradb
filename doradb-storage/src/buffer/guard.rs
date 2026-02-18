@@ -141,6 +141,11 @@ impl<T: 'static> FacadePageGuard<T> {
         unsafe { (*self.bf.0).page_id }
     }
 
+    #[inline]
+    pub fn bf(&self) -> &BufferFrame {
+        unsafe { &*self.bf.0 }
+    }
+
     /// Try exclusive lock will do additional version check after the lock acquisition to ensure
     /// during the optimistic lock and shared lock, there is no change on protected object.
     /// If lock acquisition fails, refresh version of the optimistic lock, so next acquisition

@@ -1,5 +1,5 @@
 use crate::buffer::BufferPool;
-use crate::buffer::page::PageID;
+use crate::buffer::page::VersionedPageID;
 use crate::catalog::{Catalog, TableID};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
@@ -132,11 +132,16 @@ impl RowUndoLogs {
                 table.deletion_buffer().remove(entry.row_id);
                 continue;
             }
-            let page_guard = buf_pool
-                .get_page::<RowPage>(entry.page_id.unwrap(), LatchFallbackMode::Shared)
+            let Some(page_guard) = buf_pool
+                .try_get_page_versioned::<RowPage>(
+                    entry.page_id.unwrap(),
+                    LatchFallbackMode::Shared,
+                )
                 .await
-                .shared_async()
-                .await;
+            else {
+                continue;
+            };
+            let page_guard = page_guard.shared_async().await;
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             // TODO: we should retry or wait for notification if rollback happens on a page
@@ -191,7 +196,7 @@ impl OwnedRowUndo {
     #[inline]
     pub fn new(
         table_id: TableID,
-        page_id: Option<PageID>,
+        page_id: Option<VersionedPageID>,
         row_id: RowID,
         kind: RowUndoKind,
     ) -> Self {
@@ -261,7 +266,7 @@ impl Clone for RowUndoRef {
 
 pub struct RowUndo {
     pub table_id: TableID,
-    pub page_id: Option<PageID>,
+    pub page_id: Option<VersionedPageID>,
     pub row_id: RowID,
     pub kind: RowUndoKind,
     pub next: Option<NextRowUndo>,

@@ -1,11 +1,11 @@
-use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID};
+use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID, VersionedPageID};
 use crate::catalog::TableMetadata;
 use crate::latch::HybridLatch;
 use crate::trx::TrxID;
 use crate::trx::recover::RecoverMap;
 use crate::trx::ver_map::RowVersionMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 const _: () = assert!(
     { std::mem::size_of::<BufferFrame>().is_multiple_of(64) },
@@ -27,6 +27,7 @@ pub struct BufferFrame {
     pub page_id: PageID,
     pub next_free: PageID,
     frame_kind: AtomicU8,
+    generation: AtomicU64,
     dirty: AtomicBool,
     /// Context of this buffer frame. It can store additinal contextual information
     /// about the page, e.g. undo map of row page.
@@ -65,6 +66,24 @@ impl BufferFrame {
     }
 
     #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    #[inline]
+    pub fn versioned_page_id(&self) -> VersionedPageID {
+        VersionedPageID {
+            page_id: self.page_id,
+            generation: self.generation(),
+        }
+    }
+
+    #[inline]
     pub fn set_dirty(&self, dirty: bool) {
         self.dirty.store(dirty, Ordering::Release);
     }
@@ -92,6 +111,7 @@ impl Default for BufferFrame {
             page_id: 0,
             next_free: INVALID_PAGE_ID,
             frame_kind: AtomicU8::new(FrameKind::Uninitialized as u8),
+            generation: AtomicU64::new(0),
             // by default the page is dirty because no copy on disk.
             dirty: AtomicBool::new(true),
             ctx: None,

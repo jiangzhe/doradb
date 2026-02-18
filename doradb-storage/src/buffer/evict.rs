@@ -2,7 +2,9 @@ use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, IOKind, PAGE_SIZE, Page, PageID, PageIO};
+use crate::buffer::page::{
+    BufferPage, INVALID_PAGE_ID, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID,
+};
 use crate::buffer::util::{
     init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate,
 };
@@ -315,10 +317,69 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
+    async fn try_get_page_versioned<T: BufferPage>(
+        &'static self,
+        id: VersionedPageID,
+        mode: LatchFallbackMode,
+    ) -> Option<FacadePageGuard<T>> {
+        loop {
+            unsafe {
+                let bf = self.frames.frame_ptr(id.page_id);
+                let frame = &mut *bf.0;
+                if frame.generation() != id.generation {
+                    return None;
+                }
+                match frame.kind() {
+                    FrameKind::Uninitialized => return None,
+                    FrameKind::Fixed | FrameKind::Hot => {
+                        let g = frame.latch.optimistic_fallback(mode).await;
+                        let g = FacadePageGuard::new(bf, g);
+                        let bf = g.bf();
+                        if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation
+                        {
+                            if g.is_exclusive() {
+                                g.rollback_exclusive_version_change();
+                            }
+                            return None;
+                        }
+                        return Some(g);
+                    }
+                    FrameKind::Cool => {
+                        let g = frame.latch.optimistic_fallback(mode).await;
+                        if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
+                            != FrameKind::Cool
+                        {
+                            continue;
+                        }
+                        let g = FacadePageGuard::new(bf, g);
+                        let bf = g.bf();
+                        if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation
+                        {
+                            if g.is_exclusive() {
+                                g.rollback_exclusive_version_change();
+                            }
+                            return None;
+                        }
+                        return Some(g);
+                    }
+                    FrameKind::Evicting => {
+                        self.try_wait_for_io_write(id.page_id).await;
+                    }
+                    FrameKind::Evicted => {
+                        self.try_dispatch_io_read(id.page_id).await;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
     fn deallocate_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
         let page_id = g.page_id();
         g.page_mut().zero(); // zero the page
+        g.bf_mut().ctx = None;
         T::deinit_frame(g.bf_mut());
+        g.bf_mut().bump_generation();
         self.in_mem.unpin(page_id);
         self.in_mem.mark_page_dontneed(g);
         self.alloc_map.deallocate(page_id as usize);
@@ -459,8 +520,11 @@ impl BufferFrames {
         unsafe {
             let bf = self.frame_ptr(page_id);
             let frame = &mut *bf.0;
+            frame.ctx = None;
             T::init_frame(frame);
+            frame.bump_generation();
             frame.next_free = INVALID_PAGE_ID;
+            frame.set_dirty(true);
             let mut guard = init_bf_exclusive_guard::<T>(bf);
             guard.page_mut().zero();
             guard
@@ -1442,10 +1506,23 @@ mod tests {
             {
                 let g = pool.allocate_page::<RowPage>().await;
                 assert_eq!(g.page_id(), 1);
+                let stale_versioned = g.bf().versioned_page_id();
                 pool.deallocate_page(g);
                 let g = pool.allocate_page::<RowPage>().await;
                 assert_eq!(g.page_id(), 1);
+                assert_eq!(g.bf().generation(), stale_versioned.generation + 2);
+                let current_versioned = g.bf().versioned_page_id();
                 drop(g);
+
+                let g = pool
+                    .try_get_page_versioned::<RowPage>(current_versioned, LatchFallbackMode::Shared)
+                    .await;
+                assert!(g.is_some());
+
+                let g = pool
+                    .try_get_page_versioned::<RowPage>(stale_versioned, LatchFallbackMode::Shared)
+                    .await;
+                assert!(g.is_none());
             }
             {
                 let g = pool

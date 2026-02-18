@@ -1,10 +1,9 @@
 use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
-use crate::catalog::{Catalog, TableCache, TableID};
-use crate::index::RowLocation;
+use crate::catalog::{Catalog, TableCache};
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
-use crate::table::{DeleteMarker, TableAccess};
+use crate::table::{DeleteMarker, Table, TableAccess};
 use crate::thread;
 use crate::trx::log::LogPartition;
 use crate::trx::row::RowWriteAccess;
@@ -109,66 +108,35 @@ impl TransactionSystem {
         let purge_trx_count = trx_list.len();
         let mut purge_row_count = 0;
         let mut purge_index_count = 0;
-        // First, we collect row ids to purge row undo.
-        // Resolve latest row location via block index because page ids in undo can
-        // become stale after row-page GC/checkpoint.
-        let mut row_purge_target: HashMap<TableID, HashSet<RowID>> = HashMap::new();
-        let mut marker_promote_target: HashMap<TableID, HashSet<RowID>> = HashMap::new();
+        // First, purge row undo logs by versioned page identity.
         for trx in &trx_list {
             if let Some(row_undo) = trx.row_undo() {
                 purge_row_count += row_undo.len();
                 for undo in &**row_undo {
-                    row_purge_target
-                        .entry(undo.table_id)
-                        .or_default()
-                        .insert(undo.row_id);
-                    if matches!(&undo.kind, RowUndoKind::Delete) {
-                        marker_promote_target
-                            .entry(undo.table_id)
-                            .or_default()
-                            .insert(undo.row_id);
-                    }
-                }
-            }
-        }
-        for (table_id, mut row_ids) in row_purge_target {
-            let Some(table) = table_cache.get_table(table_id).await else {
-                continue;
-            };
-            if let Some(promote_row_ids) = marker_promote_target.remove(&table_id) {
-                for row_id in promote_row_ids {
-                    if let Some(DeleteMarker::Ref(status)) = table.deletion_buffer().get(row_id) {
-                        let ts = status.ts();
-                        if trx_is_committed(ts)
-                            && table
-                                .deletion_buffer()
-                                .promote_ref_to_committed(row_id, &status, ts)
-                        {
-                            // Once marker has been normalized to committed in column deletion
-                            // buffer, we don't need row-page undo purge for this row.
-                            row_ids.remove(&row_id);
+                    let Some(table) = table_cache.get_table(undo.table_id).await else {
+                        continue;
+                    };
+                    let Some(page_id) = undo.page_id else {
+                        if matches!(&undo.kind, RowUndoKind::Delete) {
+                            Self::promote_delete_marker_if_committed(&table, undo.row_id);
                         }
-                    }
-                }
-            }
-            let mut page_targets: HashMap<PageID, Vec<RowID>> = HashMap::new();
-            for row_id in row_ids {
-                if let RowLocation::RowPage(page_id) = table.blk_idx.find_row(row_id).await {
-                    page_targets.entry(page_id).or_default().push(row_id);
-                }
-            }
-            for (page_id, row_ids) in page_targets {
-                let page_guard = buf_pool
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                    .await
-                    .shared_async()
-                    .await;
-                let (ctx, page) = page_guard.ctx_and_page();
-                for row_id in row_ids {
-                    if !page.row_id_in_valid_range(row_id) {
+                        continue;
+                    };
+                    let Some(page_guard) = buf_pool
+                        .try_get_page_versioned::<RowPage>(page_id, LatchFallbackMode::Shared)
+                        .await
+                    else {
+                        if matches!(&undo.kind, RowUndoKind::Delete) {
+                            Self::promote_delete_marker_if_committed(&table, undo.row_id);
+                        }
+                        continue;
+                    };
+                    let page_guard = page_guard.shared_async().await;
+                    let (ctx, page) = page_guard.ctx_and_page();
+                    if !page.row_id_in_valid_range(undo.row_id) {
                         continue;
                     }
-                    let row_idx = page.row_idx(row_id);
+                    let row_idx = page.row_idx(undo.row_id);
                     let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
                     access.purge_undo_chain(min_active_sts);
                 }
@@ -211,6 +179,18 @@ impl TransactionSystem {
             .purge_index_count
             .fetch_add(purge_index_count, Ordering::Relaxed);
         gc_row_pages
+    }
+
+    #[inline]
+    fn promote_delete_marker_if_committed(table: &Table, row_id: RowID) {
+        if let Some(DeleteMarker::Ref(status)) = table.deletion_buffer().get(row_id) {
+            let ts = status.ts();
+            if trx_is_committed(ts) {
+                let _ = table
+                    .deletion_buffer()
+                    .promote_ref_to_committed(row_id, &status, ts);
+            }
+        }
     }
 
     #[inline]
