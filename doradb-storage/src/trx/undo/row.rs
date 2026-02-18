@@ -141,7 +141,9 @@ impl RowUndoLogs {
             else {
                 continue;
             };
-            let page_guard = page_guard.shared_async().await;
+            let Some(page_guard) = page_guard.lock_shared_async().await else {
+                continue;
+            };
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             // TODO: we should retry or wait for notification if rollback happens on a page

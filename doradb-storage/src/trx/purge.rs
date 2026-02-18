@@ -131,7 +131,12 @@ impl TransactionSystem {
                         }
                         continue;
                     };
-                    let page_guard = page_guard.shared_async().await;
+                    let Some(page_guard) = page_guard.lock_shared_async().await else {
+                        if matches!(&undo.kind, RowUndoKind::Delete) {
+                            Self::promote_delete_marker_if_committed(&table, undo.row_id);
+                        }
+                        continue;
+                    };
                     let (ctx, page) = page_guard.ctx_and_page();
                     if !page.row_id_in_valid_range(undo.row_id) {
                         continue;
@@ -203,8 +208,9 @@ impl TransactionSystem {
             let page_guard = buf_pool
                 .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                 .await
-                .exclusive_async()
-                .await;
+                .lock_exclusive_async()
+                .await
+                .unwrap();
             buf_pool.deallocate_page(page_guard);
         }
     }
@@ -800,8 +806,9 @@ mod tests {
                     .data_pool
                     .get_page(page_id, LatchFallbackMode::Shared)
                     .await
-                    .shared_async()
-                    .await;
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
                 let (ctx, page) = page_guard.ctx_and_page();
                 let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
                 let ts = access.ts();

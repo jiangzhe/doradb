@@ -416,8 +416,9 @@ fn test_row_page_transition_retries_update_delete() {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
-            .shared_async()
-            .await;
+            .lock_shared_async()
+            .await
+            .unwrap();
         let (ctx, _) = page_guard.ctx_and_page();
         let row_ver = ctx.row_ver().unwrap();
         row_ver.set_frozen();
@@ -428,8 +429,9 @@ fn test_row_page_transition_retries_update_delete() {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
-            .shared_async()
-            .await;
+            .lock_shared_async()
+            .await
+            .unwrap();
         let insert = vec![Val::from(2i32), Val::from("insert")];
         let insert_res = sys.table.insert_row_to_page(
             &mut stmt,
@@ -462,8 +464,9 @@ fn test_row_page_transition_retries_update_delete() {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
-            .shared_async()
-            .await;
+            .lock_shared_async()
+            .await
+            .unwrap();
         let res = sys
             .table
             .delete_row_internal(&mut stmt, page_guard, row_id, &key, false)
@@ -1119,8 +1122,9 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
-            .shared_async()
-            .await;
+            .lock_shared_async()
+            .await
+            .unwrap();
         let (ctx, page) = page_guard.ctx_and_page();
         let mut lock_row = sys
             .table

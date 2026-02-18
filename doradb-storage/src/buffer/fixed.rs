@@ -352,6 +352,30 @@ mod tests {
                     .await;
                 assert!(g.is_none());
             }
+            {
+                let g = pool.allocate_page::<BlockNode>().await;
+                let page_id = g.page_id();
+                let versioned = g.bf().versioned_page_id();
+                drop(g);
+
+                // Keep an optimistic guard, then reuse the page slot.
+                let stale_guard = pool
+                    .try_get_page_versioned::<BlockNode>(versioned, LatchFallbackMode::Shared)
+                    .await
+                    .unwrap();
+                let g = pool
+                    .get_page::<BlockNode>(page_id, LatchFallbackMode::Exclusive)
+                    .await
+                    .lock_exclusive_async()
+                    .await
+                    .unwrap();
+                pool.deallocate_page(g);
+                let g = pool.allocate_page::<BlockNode>().await;
+                assert_eq!(g.page_id(), page_id);
+                drop(g);
+
+                assert!(stale_guard.lock_shared_async().await.is_none());
+            }
             unsafe {
                 StaticLifetime::drop_static(pool);
             }

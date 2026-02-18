@@ -107,11 +107,14 @@ impl IndexUndoLogs {
                         RowLocation::NotFound => unreachable!(),
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let page_guard = data_pool
+                            let Some(page_guard) = data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
-                                .shared_async()
-                                .await;
+                                .lock_shared_async()
+                                .await
+                            else {
+                                continue;
+                            };
                             // acquire row latch to avoid race condition.
                             let (ctx, page) = page_guard.ctx_and_page();
                             let access = RowReadAccess::new(page, ctx, page.row_idx(old_row_id));

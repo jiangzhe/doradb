@@ -225,8 +225,9 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
-            .exclusive_async()
-            .await;
+            .lock_exclusive_async()
+            .await
+            .unwrap();
 
         let create_cts = page_guard
             .bf()

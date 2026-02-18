@@ -233,8 +233,9 @@ impl TableAccess for Table {
                         .data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
-                        .shared_async()
-                        .await;
+                        .lock_shared_async()
+                        .await
+                        .unwrap();
                     (page_guard, row_id)
                 }
             },
@@ -395,8 +396,9 @@ impl TableAccess for Table {
                             .data_pool
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
-                            .shared_async()
-                            .await;
+                            .lock_shared_async()
+                            .await
+                            .unwrap();
                         (page_guard, row_id)
                     }
                 },
@@ -527,8 +529,9 @@ impl TableAccess for Table {
                             .data_pool
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
-                            .shared_async()
-                            .await;
+                            .lock_shared_async()
+                            .await
+                            .unwrap();
                         (page_guard, row_id)
                     }
                 },
@@ -568,8 +571,9 @@ impl TableAccess for Table {
                         .data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                         .await
-                        .exclusive_async()
-                        .await;
+                        .lock_exclusive_async()
+                        .await
+                        .unwrap();
                     (page_guard, row_id)
                 }
             },

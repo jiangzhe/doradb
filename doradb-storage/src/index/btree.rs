@@ -101,8 +101,9 @@ impl BTree {
             .pool
             .get_page::<BTreeNode>(self.root, LatchFallbackMode::Exclusive)
             .await
-            .exclusive_async()
-            .await;
+            .lock_exclusive_async()
+            .await
+            .unwrap();
         let p_node = g.page();
         match p_node.height() {
             0 => {
@@ -138,8 +139,9 @@ impl BTree {
                         .pool
                         .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
                         .await
-                        .exclusive_async()
-                        .await;
+                        .lock_exclusive_async()
+                        .await
+                        .unwrap();
                     pos.idx += 1;
                     stack.push(ParentPosition {
                         g: c_guard,
@@ -406,7 +408,7 @@ impl BTree {
             }
             // should shrink tree height as there is no keys in root.
             // The only child is associated with lower fence key.
-            let mut g = g.exclusive_async().await;
+            let mut g = g.lock_exclusive_async().await.unwrap();
             // re-check condition
             let root = g.page_mut();
             if root.height() == 0 || root.count() > 0 {
@@ -417,8 +419,9 @@ impl BTree {
                 .pool
                 .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
                 .await
-                .exclusive_async()
-                .await;
+                .lock_exclusive_async()
+                .await
+                .unwrap();
             let c_node = c_guard.page_mut();
             debug_assert!(root.lower_fence_key() == c_node.lower_fence_key());
             debug_assert!(root.has_no_upper_fence());
@@ -532,7 +535,7 @@ impl BTree {
         let c_page_id = c_guard.page_id();
         let c_lower_fence_key = c_guard.page().lower_fence_key();
         let c_optimistic_guard = c_guard.downgrade();
-        let mut p_guard = p_guard.exclusive_async().await;
+        let mut p_guard = p_guard.lock_exclusive_async().await.unwrap();
         let p_node = p_guard.page();
         match p_node.search_key(&c_lower_fence_key) {
             Ok(idx) => {
@@ -601,8 +604,9 @@ impl BTree {
                             .pool
                             .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
                             .await
-                            .exclusive_async()
-                            .await;
+                            .lock_exclusive_async()
+                            .await
+                            .unwrap();
                         let c_node = c_guard.page_mut();
                         if c_node.can_insert(sep_key) {
                             // The node to split can insert original separator key,
@@ -1022,7 +1026,7 @@ impl BTree {
                 LookupChild::Slot(_, c_page_id) | LookupChild::LowerFence(c_page_id) => {
                     verify!(g.validate());
                     if c_page_id == page_id {
-                        let g = g.exclusive_async().await;
+                        let g = g.lock_exclusive_async().await.unwrap();
                         return Valid(Some(g));
                     }
                     if height <= 1 {
@@ -1056,8 +1060,9 @@ impl BTree {
                 .pool
                 .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
                 .await
-                .exclusive_async()
-                .await;
+                .lock_exclusive_async()
+                .await
+                .unwrap();
             self.pool.deallocate_page::<BTreeNode>(c_guard);
         }
         // Deallocate all children.
@@ -1067,8 +1072,9 @@ impl BTree {
                 .pool
                 .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
                 .await
-                .exclusive_async()
-                .await;
+                .lock_exclusive_async()
+                .await
+                .unwrap();
             self.pool.deallocate_page::<BTreeNode>(c_guard);
         }
         // Deallocate self.
@@ -1305,8 +1311,9 @@ impl<'a> BTreeNodeCursor<'a> {
                 .pool
                 .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Shared)
                 .await
-                .shared_async()
-                .await;
+                .lock_shared_async()
+                .await
+                .unwrap();
             return Some(c_guard);
         }
         None
@@ -1587,8 +1594,9 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
                 .pool
                 .get_page(c_page_id, LatchFallbackMode::Exclusive)
                 .await
-                .exclusive_async()
-                .await;
+                .lock_exclusive_async()
+                .await
+                .unwrap();
 
             self.coupling.parent.as_mut().unwrap().idx = next_idx as isize;
             self.coupling.node.replace(c_guard);
@@ -1611,8 +1619,9 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
                 .pool
                 .get_page(c_page_id, LatchFallbackMode::Exclusive)
                 .await
-                .exclusive_async()
-                .await;
+                .lock_exclusive_async()
+                .await
+                .unwrap();
             return Some((next_idx, c_guard));
         }
         None
@@ -1635,8 +1644,9 @@ impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
                 .pool
                 .get_page(c_page_id, LatchFallbackMode::Exclusive)
                 .await
-                .exclusive_async()
-                .await;
+                .lock_exclusive_async()
+                .await
+                .unwrap();
             self.coupling.node = Some(c_guard);
             return true;
         }
@@ -2154,7 +2164,7 @@ mod tests {
                             let (c_guard, p_guard) = res.unwrap();
                             drop(c_guard);
                             let p_guard = p_guard.unwrap();
-                            let shared_guard = p_guard.shared_async().await;
+                            let shared_guard = p_guard.lock_shared_async().await.unwrap();
                             event.notify(1);
                             smol::Timer::after(Duration::from_millis(1000)).await;
                             println!("going to drop");
