@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task Design"
+  short_description: "Deep-research, multi-round task design with approval gates"
+  default_prompt: "Use $task to research docs/code, compare proposals, run two review rounds, and only write docs/tasks after explicit approval."
