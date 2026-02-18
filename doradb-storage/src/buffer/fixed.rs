@@ -381,4 +381,168 @@ mod tests {
             }
         })
     }
+
+    #[test]
+    fn test_facade_page_guard_lock_shared_and_try_into_shared() {
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let g = pool.allocate_page::<BlockNode>().await;
+            let page_id = g.page_id();
+            drop(g);
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await;
+            let g = g.lock_shared_async().await;
+            assert!(g.is_some());
+            let g = g.unwrap();
+            assert_eq!(g.page_id(), page_id);
+
+            let g = g.facade(false);
+            let g = g.try_into_shared();
+            assert!(g.is_some());
+            let g = g.unwrap();
+            assert_eq!(g.page_id(), page_id);
+            drop(g);
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await;
+            assert!(g.try_into_shared().is_none());
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            let versioned = g.bf().versioned_page_id();
+            drop(g);
+
+            let stale_guard = pool
+                .try_get_page_versioned::<BlockNode>(versioned, LatchFallbackMode::Shared)
+                .await
+                .unwrap();
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            pool.deallocate_page(g);
+            let g = pool.allocate_page::<BlockNode>().await;
+            assert_eq!(g.page_id(), page_id);
+            drop(g);
+
+            assert!(stale_guard.lock_shared_async().await.is_none());
+
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_facade_page_guard_lock_exclusive_and_try_into_exclusive() {
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let g = pool.allocate_page::<BlockNode>().await;
+            let page_id = g.page_id();
+            drop(g);
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await;
+            let g = g.lock_exclusive_async().await;
+            assert!(g.is_some());
+            let g = g.unwrap();
+            assert_eq!(g.page_id(), page_id);
+
+            let g = g.facade(false);
+            let g = g.try_into_exclusive();
+            assert!(g.is_some());
+            let g = g.unwrap();
+            assert_eq!(g.page_id(), page_id);
+            drop(g);
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await;
+            assert!(g.try_into_exclusive().is_none());
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            let versioned = g.bf().versioned_page_id();
+            drop(g);
+
+            let stale_guard = pool
+                .try_get_page_versioned::<BlockNode>(versioned, LatchFallbackMode::Shared)
+                .await
+                .unwrap();
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            pool.deallocate_page(g);
+            let g = pool.allocate_page::<BlockNode>().await;
+            assert_eq!(g.page_id(), page_id);
+            drop(g);
+
+            assert!(stale_guard.lock_exclusive_async().await.is_none());
+
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    #[should_panic(expected = "block until exclusive by shared lock is not allowed")]
+    fn test_facade_page_guard_lock_exclusive_async_panics_on_shared_state() {
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let g = pool.allocate_page::<BlockNode>().await;
+            let page_id = g.page_id();
+            drop(g);
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await
+                .lock_shared_async()
+                .await
+                .unwrap();
+            let g = g.facade(false);
+
+            let _ = g.lock_exclusive_async().await;
+        })
+    }
+
+    #[test]
+    #[should_panic(expected = "block until exclusive by shared lock is not allowed")]
+    fn test_facade_page_guard_lock_shared_async_panics_on_exclusive_state() {
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let g = pool.allocate_page::<BlockNode>().await;
+            let page_id = g.page_id();
+            drop(g);
+
+            let g = pool
+                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .await
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            let g = g.facade(false);
+
+            let _ = g.lock_shared_async().await;
+        })
+    }
 }
