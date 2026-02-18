@@ -584,7 +584,6 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
-    use crate::row::RowID;
     use crate::row::RowPage;
     use crate::row::ops::SelectKey;
     use crate::table::DeleteMarker;
@@ -648,7 +647,21 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let row_id: RowID = 42;
+            let mut session = engine.new_session();
+            let mut trx = session.begin_trx().unwrap();
+            let mut stmt = trx.start_stmt();
+            stmt.insert_row(&table, vec![Val::from(1001i32)]).await.unwrap();
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+            drop(session);
+            let key = vec![Val::from(1001i32)];
+            let (row_id, _) = table
+                .sec_idx[0]
+                .unique()
+                .unwrap()
+                .lookup(&key, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
             let status = Arc::new(SharedTrxStatus::global_visible());
             table
                 .deletion_buffer()
@@ -657,7 +670,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
-                table_id,
+                table.table_id(),
                 None,
                 row_id,
                 RowUndoKind::Delete,
@@ -717,7 +730,21 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let row_id: RowID = 43;
+            let mut session = engine.new_session();
+            let mut trx = session.begin_trx().unwrap();
+            let mut stmt = trx.start_stmt();
+            stmt.insert_row(&table, vec![Val::from(1002i32)]).await.unwrap();
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+            drop(session);
+            let key = vec![Val::from(1002i32)];
+            let (row_id, _) = table
+                .sec_idx[0]
+                .unique()
+                .unwrap()
+                .lookup(&key, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
             let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
             table
                 .deletion_buffer()
@@ -726,7 +753,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
-                table_id,
+                table.table_id(),
                 None,
                 row_id,
                 RowUndoKind::Delete,
