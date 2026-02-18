@@ -1,5 +1,5 @@
 use crate::buffer::frame::FrameContext;
-use crate::buffer::page::PageID;
+use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableID, TableMetadata};
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
@@ -700,7 +700,7 @@ impl<'a> RowWriteAccess<'a> {
         stmt: &mut Statement,
         metadata: &TableMetadata,
         table_id: TableID,
-        page_id: PageID,
+        page_id: VersionedPageID,
         row_id: RowID,
         key: Option<&SelectKey>,
     ) -> LockUndo {

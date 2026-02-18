@@ -195,8 +195,9 @@ impl Table {
                     .data_pool
                     .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                     .await
-                    .shared_async()
-                    .await;
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
                 let (ctx, _) = page_guard.ctx_and_page();
                 let row_ver = ctx.row_ver().unwrap();
                 // Check whether all insert and updates on this page are committed.
@@ -220,8 +221,9 @@ impl Table {
                 .data_pool
                 .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                 .await
-                .shared_async()
-                .await;
+                .lock_shared_async()
+                .await
+                .unwrap();
             let (ctx, page) = page_guard.ctx_and_page();
             ctx.row_ver().unwrap().set_transition();
             self.capture_delete_markers_for_transition(page, ctx, cutoff_ts);
@@ -250,8 +252,9 @@ impl Table {
                     .data_pool
                     .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                     .await
-                    .shared_async()
-                    .await;
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
                 let (ctx, page) = page_guard.ctx_and_page();
                 let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                 if view.rows_non_deleted() == 0 {
@@ -373,7 +376,7 @@ impl Table {
         let mut cursor = self.blk_idx.mem_cursor();
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
-            let g = leaf.shared_async().await;
+            let g = leaf.lock_shared_async().await.unwrap();
             debug_assert!(g.page().is_leaf());
             res += g.page().leaf_entries().len();
         }
@@ -421,8 +424,9 @@ impl Table {
                     .data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
-                    .shared_async()
-                    .await;
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
                 let page = page_guard.page();
                 if !page.row_id_in_valid_range(row_id) {
                     return SelectMvcc::NotFound;
@@ -473,7 +477,7 @@ impl Table {
         let mut cursor = self.blk_idx.mem_cursor();
         cursor.seek(start_row_id).await;
         while let Some(leaf) = cursor.next().await {
-            let g = leaf.shared_async().await;
+            let g = leaf.lock_shared_async().await.unwrap();
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
             for page_entry in entries {
@@ -481,8 +485,9 @@ impl Table {
                     .data_pool
                     .get_page(page_entry.page_id, LatchFallbackMode::Shared)
                     .await
-                    .shared_async()
-                    .await;
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
                 if !page_action(page_guard) {
                     return;
                 }
@@ -732,8 +737,9 @@ impl Table {
                                 .data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
-                                .shared_async()
-                                .await;
+                                .lock_shared_async()
+                                .await
+                                .unwrap();
                             if validate_page_row_range(&page_guard, page_id, row_id) {
                                 break (page_guard, row_id);
                             }
@@ -789,8 +795,9 @@ impl Table {
                                 .data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
-                                .shared_async()
-                                .await;
+                                .lock_shared_async()
+                                .await
+                                .unwrap();
                             if validate_page_row_range(&page_guard, page_id, row_id) {
                                 break (page_guard, row_id);
                             }
@@ -926,8 +933,9 @@ impl Table {
                         .data_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
-                        .shared_async()
-                        .await;
+                        .lock_shared_async()
+                        .await
+                        .unwrap();
                     if validate_page_row_range(&old_guard, page_id, old_id) {
                         break (old_guard, old_id);
                     }
@@ -1000,6 +1008,7 @@ impl Table {
         debug_assert!(matches!(undo_kind, RowUndoKind::Insert));
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
+        let versioned_page_id = page_guard.bf().versioned_page_id();
         let (ctx, page) = page_guard.ctx_and_page();
         let ver_map = ctx.row_ver().unwrap();
         let state_guard = ver_map.read_state();
@@ -1026,7 +1035,14 @@ impl Table {
             true,
             state_guard,
         );
-        let res = access.lock_undo(stmt, metadata, self.table_id(), page_id, row_id, None);
+        let res = access.lock_undo(
+            stmt,
+            metadata,
+            self.table_id(),
+            versioned_page_id,
+            row_id,
+            None,
+        );
         debug_assert!(res.is_ok());
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
@@ -1247,8 +1263,9 @@ impl Table {
                 .data_pool
                 .get_page(page_id, LatchFallbackMode::Shared)
                 .await
-                .shared_async()
-                .await;
+                .lock_shared_async()
+                .await
+                .unwrap();
             // because we save last insert page in session and meanwhile other thread may access this page
             // and do some modification, even worse, buffer pool may evict it and reload other data into
             // this page. so here, we do not require that no change should happen, but if something change,
@@ -1292,7 +1309,7 @@ impl Table {
                 stmt,
                 self.metadata(),
                 self.table_id(),
-                page_guard.page_id(),
+                page_guard.bf().versioned_page_id(),
                 row_id,
                 key,
             );
@@ -1563,8 +1580,9 @@ impl Table {
                     .data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
-                    .shared_async()
-                    .await;
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
                 debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));
                 let (ctx, page) = page_guard.ctx_and_page();
                 let row_idx = page.row_idx(row_id);

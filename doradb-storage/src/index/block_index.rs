@@ -495,8 +495,9 @@ impl BlockIndex {
         let page_guard = buf_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
-            .shared_async()
-            .await;
+            .lock_shared_async()
+            .await
+            .unwrap();
         Ok(page_guard)
     }
 
@@ -515,8 +516,9 @@ impl BlockIndex {
         let page_guard = buf_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
-            .exclusive_async()
-            .await;
+            .lock_exclusive_async()
+            .await
+            .unwrap();
         Ok(page_guard)
     }
 
@@ -949,8 +951,8 @@ pub enum RowLocation {
 pub struct BlockIndexMemCursor<'a> {
     blk_idx: &'a BlockIndex,
     // The parent node of current located
-    parent: Option<ParentPosition<FacadePageGuard<BlockNode>>>,
-    child: Option<FacadePageGuard<BlockNode>>,
+    parent: Option<ParentPosition<PageSharedGuard<BlockNode>>>,
+    child: Option<PageSharedGuard<BlockNode>>,
 }
 
 impl BlockIndexMemCursor<'_> {
@@ -967,13 +969,10 @@ impl BlockIndexMemCursor<'_> {
     #[inline]
     pub async fn next(&mut self) -> Option<FacadePageGuard<BlockNode>> {
         if let Some(child) = self.child.take() {
-            debug_assert!(child.is_shared());
-            return Some(child);
+            return Some(child.facade(false));
         }
         if let Some(parent) = self.parent.as_ref() {
-            debug_assert!(parent.g.is_shared());
-            let p_guard = unsafe { parent.g.as_shared() };
-            let page = p_guard.page();
+            let page = parent.g.page();
             let entries = page.branch_entries();
             let next_idx = (parent.idx + 1) as usize;
             if next_idx == entries.len() {
@@ -989,8 +988,7 @@ impl BlockIndexMemCursor<'_> {
                     self.reset();
                 }
                 let child = self.child.take().unwrap();
-                debug_assert!(child.is_shared());
-                return Some(child);
+                return Some(child.facade(false));
             }
             // otherwise, we jump to next slot and get leaf node.
             let page_id = entries[next_idx].page_id;
@@ -1000,8 +998,9 @@ impl BlockIndexMemCursor<'_> {
                 .pool
                 .get_page::<BlockNode>(page_id, LatchFallbackMode::Shared)
                 .await
-                .shared_async()
-                .await;
+                .lock_shared_async()
+                .await
+                .unwrap();
             return Some(child.facade(false));
         }
         None
@@ -1025,16 +1024,13 @@ impl BlockIndexMemCursor<'_> {
             let pu = unsafe { g.page_unchecked() };
             if pu.is_leaf() {
                 // share lock for read
-                if let Some(mut parent) = self.parent.take() {
-                    // we first lock parent for share, to make sure
-                    // the range is fixed on child node.
-                    verify!(parent.g.try_shared());
+                if let Some(parent) = self.parent.take() {
                     self.parent = Some(parent);
                 }
                 match g.try_shared_either() {
                     Left(c) => {
                         // share lock on child succeeds
-                        self.child = Some(c.facade(false));
+                        self.child = Some(c);
                         return Valid(());
                     }
                     Right(new_g) => {
@@ -1062,8 +1058,11 @@ impl BlockIndexMemCursor<'_> {
                 .get_child_page::<BlockNode>(&g, page_id, LatchFallbackMode::Spin)
                 .await;
             let c = verify!(c);
+            let Some(parent_g) = g.lock_shared_async().await else {
+                return Invalid;
+            };
             self.parent = Some(ParentPosition {
-                g,
+                g: parent_g,
                 idx: idx as isize,
             });
             g = c;
@@ -1249,7 +1248,7 @@ mod tests {
                 cursor.seek(0).await;
                 while let Some(res) = cursor.next().await {
                     count += 1;
-                    let g = unsafe { res.as_shared() };
+                    let g = res.try_into_shared().unwrap();
                     let node = g.page();
                     assert!(node.is_leaf());
                     let row_pages: usize = node.leaf_entries().len();
@@ -1329,7 +1328,7 @@ mod tests {
                         .meta_pool
                         .get_page::<BlockNode>(blk_idx.root.mem, LatchFallbackMode::Spin)
                         .await;
-                    let p = res.shared_async().await;
+                    let p = res.lock_shared_async().await.unwrap();
                     let bn = p.page();
                     println!("root is leaf ? {:?}", bn.is_leaf());
                     println!(
@@ -1349,7 +1348,7 @@ mod tests {
                                 .data_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await;
-                            let g = g.shared_async().await;
+                            let g = g.lock_shared_async().await.unwrap();
                             let p = g.page();
                             assert!(p.header.start_row_id as usize == i * rows_per_page);
                         }
@@ -1451,8 +1450,9 @@ mod tests {
                 assert!(blk_idx.height() == 1);
                 let mut root = pool
                     .get_page_spin::<BlockNode>(blk_idx.root.mem)
-                    .exclusive_async()
-                    .await;
+                    .lock_exclusive_async()
+                    .await
+                    .unwrap();
                 // mark root as full to trigger split.
                 root.page_mut().header.count = NBR_ENTRIES_IN_BRANCH as u32;
                 // assign right-most leaf node

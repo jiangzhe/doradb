@@ -69,8 +69,9 @@ impl TableRecover for Table {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
-            .exclusive_async()
-            .await;
+            .lock_exclusive_async()
+            .await
+            .unwrap();
 
         let res = self.recover_row_insert_to_page(&mut page_guard, row_id, cols, cts);
         assert!(res.is_ok());
@@ -99,8 +100,9 @@ impl TableRecover for Table {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
-            .exclusive_async()
-            .await;
+            .lock_exclusive_async()
+            .await
+            .unwrap();
 
         if disable_index {
             let res = self.recover_row_update_to_page(&mut page_guard, row_id, update, cts, None);
@@ -124,8 +126,9 @@ impl TableRecover for Table {
                     .data_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
-                    .shared_async()
-                    .await;
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
 
                 let metadata = self.metadata();
                 for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
@@ -161,8 +164,9 @@ impl TableRecover for Table {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
-            .exclusive_async()
-            .await;
+            .lock_exclusive_async()
+            .await
+            .unwrap();
 
         if disable_index {
             let res = self.recover_row_delete_to_page(&mut page_guard, row_id, cts, None);
@@ -199,8 +203,9 @@ impl TableRecover for Table {
             .data_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
-            .shared_async()
-            .await;
+            .lock_shared_async()
+            .await
+            .unwrap();
         let metadata = self.metadata();
         let (ctx, page) = page_guard.ctx_and_page();
         for (index_spec, sec_idx) in metadata.index_specs.iter().zip(&*self.sec_idx) {

@@ -5,6 +5,13 @@ use std::mem;
 pub const PAGE_SIZE: usize = 64 * 1024;
 pub type Page = [u8; PAGE_SIZE];
 pub type PageID = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionedPageID {
+    pub page_id: PageID,
+    pub generation: u64,
+}
+
 pub const INVALID_PAGE_ID: PageID = !0;
 
 /// BufferPage is a trait for types that can be treated

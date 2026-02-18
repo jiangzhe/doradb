@@ -9,7 +9,7 @@ pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use fixed::FixedBufferPool;
 
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, PageID};
+use crate::buffer::page::{BufferPage, PageID, VersionedPageID};
 use crate::error::Result;
 use crate::error::Validation;
 use crate::latch::LatchFallbackMode;
@@ -43,6 +43,14 @@ pub trait BufferPool: Send + Sync + StaticLifetime + 'static {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> impl Future<Output = FacadePageGuard<T>> + Send;
+
+    /// Get page by versioned page identity.
+    /// Returns None if page is unavailable or version mismatches.
+    fn try_get_page_versioned<T: BufferPage>(
+        &'static self,
+        id: VersionedPageID,
+        mode: LatchFallbackMode,
+    ) -> impl Future<Output = Option<FacadePageGuard<T>>> + Send;
 
     /// Deallocate page.
     fn deallocate_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>);
