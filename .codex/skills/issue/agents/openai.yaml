@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Automation"
+  short_description: "Automate GitHub issue lifecycle workflows"
+  default_prompt: "Use $issue to automate GitHub issue lifecycle from docs/tasks or docs/rfcs."
