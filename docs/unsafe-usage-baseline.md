@@ -1,0 +1,70 @@
+# Unsafe Usage Baseline
+
+- Generated on: `2026-02-18`
+- Command: `cargo +nightly -Zscript tools/unsafe_inventory.rs`
+- Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
+
+## Module Summary
+
+| module | files | unsafe | transmute | new_unchecked | assume_init | // SAFETY: |
+|---|---:|---:|---:|---:|---:|---:|
+| buffer | 7 | 106 | 5 | 0 | 0 | 3 |
+| latch | 4 | 44 | 0 | 0 | 0 | 3 |
+| row | 3 | 8 | 2 | 0 | 1 | 3 |
+| index | 13 | 114 | 0 | 0 | 5 | 2 |
+| io | 3 | 46 | 2 | 0 | 0 | 3 |
+| trx | 15 | 12 | 3 | 2 | 0 | 4 |
+| lwc | 2 | 8 | 6 | 0 | 3 | 0 |
+| file | 5 | 22 | 0 | 0 | 2 | 3 |
+| **total** | **52** | **360** | **18** | **2** | **11** | **21** |
+
+## File Hotspots (top 40)
+
+| file | module | unsafe | // SAFETY: |
+|---|---|---:|---:|
+| `doradb-storage/src/index/btree_node.rs` | index | 53 | 0 |
+| `doradb-storage/src/buffer/guard.rs` | buffer | 42 | 3 |
+| `doradb-storage/src/buffer/evict.rs` | buffer | 30 | 0 |
+| `doradb-storage/src/io/mod.rs` | io | 30 | 3 |
+| `doradb-storage/src/buffer/fixed.rs` | buffer | 22 | 0 |
+| `doradb-storage/src/index/btree.rs` | index | 21 | 2 |
+| `doradb-storage/src/latch/mutex.rs` | latch | 18 | 0 |
+| `doradb-storage/src/latch/rwlock.rs` | latch | 18 | 0 |
+| `doradb-storage/src/file/mod.rs` | file | 17 | 3 |
+| `doradb-storage/src/index/block_index.rs` | index | 16 | 0 |
+| `doradb-storage/src/index/column_block_index.rs` | index | 13 | 0 |
+| `doradb-storage/src/io/libaio_abi.rs` | io | 12 | 0 |
+| `doradb-storage/src/buffer/util.rs` | buffer | 9 | 0 |
+| `doradb-storage/src/latch/hybrid.rs` | latch | 8 | 3 |
+| `doradb-storage/src/row/mod.rs` | row | 8 | 3 |
+| `doradb-storage/src/trx/undo/row.rs` | trx | 7 | 4 |
+| `doradb-storage/src/index/btree_hint.rs` | index | 6 | 0 |
+| `doradb-storage/src/lwc/mod.rs` | lwc | 5 | 0 |
+| `doradb-storage/src/file/table_file.rs` | file | 4 | 0 |
+| `doradb-storage/src/io/buf.rs` | io | 4 | 0 |
+| `doradb-storage/src/lwc/page.rs` | lwc | 3 | 0 |
+| `doradb-storage/src/trx/redo.rs` | trx | 3 | 0 |
+| `doradb-storage/src/buffer/frame.rs` | buffer | 2 | 0 |
+| `doradb-storage/src/index/btree_scan.rs` | index | 2 | 0 |
+| `doradb-storage/src/index/unique_index.rs` | index | 2 | 0 |
+| `doradb-storage/src/buffer/page.rs` | buffer | 1 | 0 |
+| `doradb-storage/src/file/table_fs.rs` | file | 1 | 0 |
+| `doradb-storage/src/index/non_unique_index.rs` | index | 1 | 0 |
+| `doradb-storage/src/trx/log_replay.rs` | trx | 1 | 0 |
+| `doradb-storage/src/trx/sys.rs` | trx | 1 | 0 |
+
+## Cast-Risk Candidates
+
+| file | module | transmute | new_unchecked | assume_init | total |
+|---|---|---:|---:|---:|---:|
+| `doradb-storage/src/buffer/guard.rs` | buffer | 5 | 0 | 0 | 5 |
+| `doradb-storage/src/lwc/mod.rs` | lwc | 2 | 0 | 3 | 5 |
+| `doradb-storage/src/lwc/page.rs` | lwc | 4 | 0 | 0 | 4 |
+| `doradb-storage/src/row/mod.rs` | row | 2 | 0 | 1 | 3 |
+| `doradb-storage/src/trx/redo.rs` | trx | 3 | 0 | 0 | 3 |
+| `doradb-storage/src/file/mod.rs` | file | 0 | 0 | 2 | 2 |
+| `doradb-storage/src/index/btree.rs` | index | 0 | 0 | 2 | 2 |
+| `doradb-storage/src/index/btree_node.rs` | index | 0 | 0 | 2 | 2 |
+| `doradb-storage/src/io/mod.rs` | io | 2 | 0 | 0 | 2 |
+| `doradb-storage/src/trx/undo/row.rs` | trx | 0 | 2 | 0 | 2 |
+| `doradb-storage/src/index/column_block_index.rs` | index | 0 | 0 | 1 | 1 |

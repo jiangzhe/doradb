@@ -214,6 +214,8 @@ impl OwnedRowUndo {
 
     #[inline]
     pub fn leak(&self) -> RowUndoRef {
+        // SAFETY: `Box<RowUndo>` is non-null and stable in memory until transaction-level
+        // GC reclaims the owning `OwnedRowUndo`.
         unsafe {
             RowUndoRef(NonNull::new_unchecked(
                 self.0.as_ref() as *const _ as *mut RowUndo
@@ -243,6 +245,8 @@ impl RowUndoRef {
     /// So we won't have chance to access a deleted undo log.
     #[inline]
     pub(crate) fn as_ref(&self) -> &RowUndo {
+        // SAFETY: `RowUndoRef` invariants guarantee the pointed entry stays valid while
+        // reachable from version chains.
         unsafe { self.0.as_ref() }
     }
 
@@ -255,6 +259,8 @@ impl RowUndoRef {
     /// access the version chain.
     #[inline]
     pub(crate) fn as_mut(&mut self) -> &mut RowUndo {
+        // SAFETY: mutable access is restricted to GC/row-lock-protected paths,
+        // so aliasing mutable references are not created.
         unsafe { self.0.as_mut() }
     }
 }
@@ -262,6 +268,7 @@ impl RowUndoRef {
 impl Clone for RowUndoRef {
     #[inline]
     fn clone(&self) -> Self {
+        // SAFETY: cloning preserves the same non-null pointer and ownership model.
         RowUndoRef(unsafe { NonNull::new_unchecked(self.0.as_ptr()) })
     }
 }

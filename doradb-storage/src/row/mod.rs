@@ -738,7 +738,7 @@ impl RowPage {
         if len <= PAGE_VAR_LEN_INLINE {
             return (PageVar::inline(input), var_offset);
         }
-        // SAFETY
+        // SAFETY:
         //
         // copy data to given offset.
         // this is safe because we atomically assign space for var-len data
@@ -807,7 +807,7 @@ impl RowPage {
     #[inline]
     pub(crate) fn set_deleted(&self, row_idx: usize, deleted: bool) -> bool {
         let offset = self.header.del_bit_offset(row_idx);
-        // SAFETY
+        // SAFETY:
         //
         // Row lock is always held when modifying null bitmap.
         let atom = unsafe {
@@ -914,7 +914,7 @@ impl RowPage {
             .header
             .null_bit_offset(metadata, row_idx, col_idx)
             .unwrap();
-        // SAFETY
+        // SAFETY:
         //
         // Row lock is always held when modifying null bitmap.
         let atom = unsafe {

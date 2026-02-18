@@ -130,6 +130,8 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub fn new(bf: UnsafePtr<BufferFrame>, guard: HybridGuard<'static>) -> Self {
         FacadePageGuard {
+            // SAFETY: `bf` points to a buffer frame allocated and owned by the buffer pool.
+            // Guard constructors only receive frame pointers from pool APIs.
             captured_generation: unsafe { (*bf.0).generation() },
             bf,
             guard,
@@ -244,6 +246,8 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub fn try_shared_either(mut self) -> Either<PageSharedGuard<T>, PageOptimisticGuard<T>> {
         match self.try_shared() {
+            // SAFETY: `UnsafePtr<BufferFrame>` and `&BufferFrame` have the same pointer value.
+            // The borrow contract is enforced by guard state transitions and generation checks.
             Valid(()) => Either::Left(PageSharedGuard {
                 bf: unsafe { mem::transmute::<UnsafePtr<BufferFrame>, &BufferFrame>(self.bf) },
                 guard: self.guard,
@@ -566,6 +570,8 @@ impl<T: 'static> PageSharedGuard<T> {
     /// with long lifetime.
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
+        // SAFETY: `UnsafePtr<BufferFrame>` is a repr-transparent raw pointer wrapper.
+        // This cast preserves the same frame address while releasing shared-lock state.
         PageOptimisticGuard {
             bf: unsafe { mem::transmute::<&BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
             guard: self.guard.downgrade(),

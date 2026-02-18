@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "${ROOT}" ]]; then
+  exit 0
+fi
+cd "${ROOT}"
+
+if [[ "${SKIP_UNSAFE_BASELINE_HOOK:-0}" == "1" ]]; then
+  exit 0
+fi
+
+tmp_before_fmt="$(mktemp)"
+tmp_after_fmt="$(mktemp)"
+tmp_fmt_log="$(mktemp)"
+tmp_clippy_log="$(mktemp)"
+tmp_baseline_log="/tmp/unsafe-baseline-hook.log"
+cleanup() {
+  rm -f "${tmp_before_fmt}" "${tmp_after_fmt}" "${tmp_fmt_log}" "${tmp_clippy_log}"
+}
+trap cleanup EXIT
+
+git diff >"${tmp_before_fmt}"
+echo "[pre-commit] Running cargo fmt"
+if ! cargo fmt >"${tmp_fmt_log}" 2>&1; then
+  echo "[pre-commit] cargo fmt failed."
+  cat "${tmp_fmt_log}"
+  exit 1
+fi
+git diff >"${tmp_after_fmt}"
+if ! cmp -s "${tmp_before_fmt}" "${tmp_after_fmt}"; then
+  echo "[pre-commit] cargo fmt produced changes. Stage formatted files and commit again."
+  git diff --name-only
+  exit 1
+fi
+
+echo "[pre-commit] Running cargo clippy -- -D warnings -A dead_code"
+if ! cargo clippy -- -D warnings -A dead_code >"${tmp_clippy_log}" 2>&1; then
+  echo "[pre-commit] cargo clippy failed."
+  cat "${tmp_clippy_log}"
+  exit 1
+fi
+
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+needs_baseline=0
+while IFS= read -r path; do
+  [[ -z "${path}" ]] && continue
+  case "${path}" in
+    doradb-storage/src/buffer/*|\
+    doradb-storage/src/latch/*|\
+    doradb-storage/src/row/*|\
+    doradb-storage/src/index/*|\
+    doradb-storage/src/io/*|\
+    doradb-storage/src/trx/*|\
+    doradb-storage/src/lwc/*|\
+    doradb-storage/src/file/*|\
+    tools/unsafe_inventory.rs|\
+    docs/unsafe-usage-baseline.md)
+      needs_baseline=1
+      break
+      ;;
+  esac
+done <<< "${staged}"
+
+if [[ "${needs_baseline}" -eq 0 ]]; then
+  exit 0
+fi
+
+echo "[unsafe-baseline] Refreshing docs/unsafe-usage-baseline.md"
+if ! cargo +nightly -Zscript tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md >"${tmp_baseline_log}" 2>&1; then
+  echo "[unsafe-baseline] Failed to run inventory script."
+  cat "${tmp_baseline_log}"
+  exit 1
+fi
+
+if ! git diff --quiet -- docs/unsafe-usage-baseline.md; then
+  echo "[unsafe-baseline] Baseline changed. Stage it and commit again:"
+  echo "  git add docs/unsafe-usage-baseline.md"
+  exit 1
+fi
+
+exit 0

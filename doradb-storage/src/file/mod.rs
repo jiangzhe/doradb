@@ -52,6 +52,8 @@ impl SparseFile {
     /// Note that space is allocated only when data is written to this file.
     #[inline]
     pub fn create_or_trunc(file_path: impl AsRef<str>, max_size: usize) -> AIOResult<SparseFile> {
+        // SAFETY: libc calls (`open`, `ftruncate`, `close`) are used with validated C string
+        // arguments and checked return codes before constructing `SparseFile`.
         unsafe {
             let c_string =
                 CString::new(file_path.as_ref()).map_err(|_| AIOError::CreateFileError)?;
@@ -228,6 +230,7 @@ impl SparseFile {
 impl Drop for SparseFile {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: `self.fd` is owned by this `SparseFile` instance and closed exactly once here.
         unsafe {
             close(self.fd);
         }
@@ -236,6 +239,8 @@ impl Drop for SparseFile {
 
 #[inline]
 pub fn sparse_file_size(fd: RawFd) -> std::io::Result<(usize, usize)> {
+    // SAFETY: `fstat` fully initializes `stat` on success; `assume_init_ref` is used only
+    // when return code is 0.
     unsafe {
         let mut s = MaybeUninit::<stat>::zeroed();
         let retcode = fstat(fd, s.as_mut_ptr());

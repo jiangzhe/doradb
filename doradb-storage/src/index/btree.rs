@@ -399,6 +399,8 @@ impl BTree {
                 .pool
                 .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
                 .await;
+            // SAFETY: this read is protected by optimistic validation below.
+            // `page_unchecked` is only used before `g.validate()` and retried on mismatch.
             let pu = unsafe { g.page_unchecked() };
             let height = pu.height();
             let count = pu.count();
@@ -438,6 +440,7 @@ impl BTree {
     #[inline]
     async fn try_lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Validation<Option<V>> {
         let g = self.find_leaf::<OptimisticStrategy>(key).await;
+        // SAFETY: this access is coupled with optimistic guard validation at each return path.
         let leaf = unsafe { g.page_unchecked() };
         match leaf.search_key(key) {
             Ok(idx) => {

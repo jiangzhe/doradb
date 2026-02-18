@@ -650,13 +650,14 @@ mod tests {
             let mut session = engine.new_session();
             let mut trx = session.begin_trx().unwrap();
             let mut stmt = trx.start_stmt();
-            stmt.insert_row(&table, vec![Val::from(1001i32)]).await.unwrap();
+            stmt.insert_row(&table, vec![Val::from(1001i32)])
+                .await
+                .unwrap();
             trx = stmt.succeed();
             trx.commit().await.unwrap();
             drop(session);
             let key = vec![Val::from(1001i32)];
-            let (row_id, _) = table
-                .sec_idx[0]
+            let (row_id, _) = table.sec_idx[0]
                 .unique()
                 .unwrap()
                 .lookup(&key, MAX_SNAPSHOT_TS)
@@ -733,13 +734,14 @@ mod tests {
             let mut session = engine.new_session();
             let mut trx = session.begin_trx().unwrap();
             let mut stmt = trx.start_stmt();
-            stmt.insert_row(&table, vec![Val::from(1002i32)]).await.unwrap();
+            stmt.insert_row(&table, vec![Val::from(1002i32)])
+                .await
+                .unwrap();
             trx = stmt.succeed();
             trx.commit().await.unwrap();
             drop(session);
             let key = vec![Val::from(1002i32)];
-            let (row_id, _) = table
-                .sec_idx[0]
+            let (row_id, _) = table.sec_idx[0]
                 .unique()
                 .unwrap()
                 .lookup(&key, MAX_SNAPSHOT_TS)
