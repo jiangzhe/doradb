@@ -48,10 +48,10 @@ impl FixedBufferPool {
         } as *mut Page;
         unsafe {
             for i in 0..size {
-                let bf_ptr = frames.offset(i as isize);
+                let bf_ptr = frames.add(i);
                 std::ptr::write(bf_ptr, BufferFrame::default());
                 (*bf_ptr).page_id = i as PageID;
-                (*bf_ptr).page = pages.offset(i as isize);
+                (*bf_ptr).page = pages.add(i);
             }
         }
         Ok(FixedBufferPool {
