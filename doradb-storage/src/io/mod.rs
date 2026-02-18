@@ -351,10 +351,14 @@ fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
     {
         let hook = IO_SUBMIT_HOOK.load(Ordering::SeqCst);
         if !hook.is_null() {
+            // SAFETY: hooks are installed only from `IoSubmitHook` function pointers via
+            // `set_io_submit_hook`, so restoring the same function-pointer type is valid.
             let hook: IoSubmitHook = unsafe { std::mem::transmute(hook) };
             return hook(ctx, nr, ios);
         }
     }
+    // SAFETY: `ctx`, `nr`, and `ios` are forwarded to libaio exactly as prepared
+    // by caller-side request construction.
     unsafe { io_submit(ctx, nr, ios) }
 }
 
@@ -373,6 +377,7 @@ fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
     if previous.is_null() {
         None
     } else {
+        // SAFETY: `previous` was produced by storing an `IoSubmitHook` pointer as `*mut ()`.
         Some(unsafe { std::mem::transmute(previous) })
     }
 }
