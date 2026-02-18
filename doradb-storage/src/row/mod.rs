@@ -726,17 +726,6 @@ impl RowPage {
     }
 
     #[inline]
-    fn copy_var_bytes(&self, offset: usize, input: &[u8]) {
-        debug_assert!(offset + input.len() <= self.data().len());
-        // SAFETY: caller reserves and bounds-checks the destination range before writing.
-        // Row/page lock protocol ensures no conflicting writer touches this range.
-        unsafe {
-            let dst = self.data().as_ptr().add(offset) as *mut u8;
-            std::ptr::copy_nonoverlapping(input.as_ptr(), dst, input.len());
-        }
-    }
-
-    #[inline]
     pub(crate) fn add_var(&self, input: &[u8], var_offset: usize) -> (PageVar, usize) {
         let len = input.len();
         if len <= PAGE_VAR_LEN_INLINE {
@@ -980,6 +969,17 @@ impl RowPage {
         bytemuck::cast_slice_mut::<u8, u16>(
             &mut self.data_mut()[offset..offset + col_count * mem::size_of::<u16>()],
         )
+    }
+
+    #[inline]
+    fn copy_var_bytes(&self, offset: usize, input: &[u8]) {
+        debug_assert!(offset + input.len() <= self.data().len());
+        // SAFETY: caller reserves and bounds-checks the destination range before writing.
+        // Row/page lock protocol ensures no conflicting writer touches this range.
+        unsafe {
+            let dst = self.data().as_ptr().add(offset) as *mut u8;
+            std::ptr::copy_nonoverlapping(input.as_ptr(), dst, input.len());
+        }
     }
 }
 

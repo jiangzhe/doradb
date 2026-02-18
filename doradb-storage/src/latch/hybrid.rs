@@ -237,32 +237,6 @@ impl<'a> HybridGuard<'a> {
         }
     }
 
-    #[inline]
-    fn unlock_exclusive_raw(&self) {
-        // SAFETY: callers only invoke this helper when the guard currently owns
-        // one exclusive raw lock acquisition.
-        unsafe {
-            self.lock.lock.unlock_exclusive();
-        }
-    }
-
-    #[inline]
-    fn unlock_shared_raw(&self) {
-        // SAFETY: callers only invoke this helper when the guard currently owns
-        // one shared raw lock acquisition.
-        unsafe {
-            self.lock.lock.unlock_shared();
-        }
-    }
-
-    #[inline]
-    fn downgrade_exclusive_raw(&self) {
-        // SAFETY: callers only invoke this helper when the guard is in exclusive state.
-        unsafe {
-            self.lock.lock.downgrade();
-        }
-    }
-
     /// Validate version is not changed.
     #[inline]
     pub fn validate(&self) -> bool {
@@ -456,6 +430,32 @@ impl<'a> HybridGuard<'a> {
     pub fn refresh_version(&mut self) {
         debug_assert!(self.state == GuardState::Optimistic);
         self.version = self.lock.version_acq();
+    }
+
+    #[inline]
+    fn unlock_exclusive_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard currently owns
+        // one exclusive raw lock acquisition.
+        unsafe {
+            self.lock.lock.unlock_exclusive();
+        }
+    }
+
+    #[inline]
+    fn unlock_shared_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard currently owns
+        // one shared raw lock acquisition.
+        unsafe {
+            self.lock.lock.unlock_shared();
+        }
+    }
+
+    #[inline]
+    fn downgrade_exclusive_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard is in exclusive state.
+        unsafe {
+            self.lock.lock.downgrade();
+        }
     }
 }
 

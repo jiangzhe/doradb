@@ -493,20 +493,6 @@ impl BufferFrames {
     }
 
     #[inline]
-    fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
-        debug_assert!(!ptr.0.is_null());
-        // SAFETY: `ptr` comes from `frame_ptr` and points into the pool-owned frame array.
-        unsafe { &*ptr.0 }
-    }
-
-    #[inline]
-    fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
-        debug_assert!(!ptr.0.is_null());
-        // SAFETY: mutable access is guarded by latch state transitions at call sites.
-        unsafe { &mut *ptr.0 }
-    }
-
-    #[inline]
     fn frame(&self, page_id: PageID) -> &BufferFrame {
         Self::frame_ref(self.frame_ptr(page_id))
     }
@@ -548,6 +534,20 @@ impl BufferFrames {
             .latch
             .try_exclusive()
             .map(|g| FacadePageGuard::new(bf, g).must_exclusive())
+    }
+
+    #[inline]
+    fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
+        debug_assert!(!ptr.0.is_null());
+        // SAFETY: `ptr` comes from `frame_ptr` and points into the pool-owned frame array.
+        unsafe { &*ptr.0 }
+    }
+
+    #[inline]
+    fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
+        debug_assert!(!ptr.0.is_null());
+        // SAFETY: mutable access is guarded by latch state transitions at call sites.
+        unsafe { &mut *ptr.0 }
     }
 }
 

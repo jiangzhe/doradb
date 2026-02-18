@@ -13,20 +13,6 @@ use std::mem;
 
 pub const SAFETY_PAGES: usize = 10;
 
-#[inline]
-fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
-    debug_assert!(!ptr.0.is_null());
-    // SAFETY: pointers are produced from the pool's mmap-allocated frame region.
-    unsafe { &*ptr.0 }
-}
-
-#[inline]
-fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
-    debug_assert!(!ptr.0.is_null());
-    // SAFETY: callers uphold exclusive access via latch/guard protocol.
-    unsafe { &mut *ptr.0 }
-}
-
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
 /// does not support swap/evict.
 pub struct FixedBufferPool {
@@ -278,6 +264,20 @@ unsafe impl Send for FixedBufferPool {}
 unsafe impl Sync for FixedBufferPool {}
 
 unsafe impl StaticLifetime for FixedBufferPool {}
+
+#[inline]
+fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
+    debug_assert!(!ptr.0.is_null());
+    // SAFETY: pointers are produced from the pool's mmap-allocated frame region.
+    unsafe { &*ptr.0 }
+}
+
+#[inline]
+fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
+    debug_assert!(!ptr.0.is_null());
+    // SAFETY: callers uphold exclusive access via latch/guard protocol.
+    unsafe { &mut *ptr.0 }
+}
 
 #[cfg(test)]
 mod tests {

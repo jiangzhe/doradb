@@ -826,19 +826,6 @@ pub union PageVar {
 }
 
 impl PageVar {
-    #[inline]
-    pub fn from_u64(raw: u64) -> Self {
-        PageVar {
-            b: raw.to_ne_bytes(),
-        }
-    }
-
-    #[inline]
-    pub fn into_u64(self) -> u64 {
-        // SAFETY: `PageVar` is an 8-byte tagged payload and any bit-pattern is allowed.
-        unsafe { u64::from_ne_bytes(self.b) }
-    }
-
     /// Create a new PageVar with inline data.
     /// The data length must be no more than 6 bytes.
     #[inline]
@@ -954,6 +941,19 @@ impl PageVar {
                 self.i.data[..val.len()].copy_from_slice(val);
             }
         }
+    }
+
+    #[inline]
+    pub fn from_u64(raw: u64) -> Self {
+        PageVar {
+            b: raw.to_ne_bytes(),
+        }
+    }
+
+    #[inline]
+    pub fn into_u64(self) -> u64 {
+        // SAFETY: `PageVar` is an 8-byte tagged payload and any bit-pattern is allowed.
+        unsafe { u64::from_ne_bytes(self.b) }
     }
 }
 

@@ -10,45 +10,6 @@ use either::Either;
 use std::future::Future;
 use std::marker::PhantomData;
 
-#[inline]
-fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
-    debug_assert!(!ptr.0.is_null());
-    // SAFETY: buffer pools allocate frames in a single mmap region and only pass
-    // valid frame pointers to guards.
-    unsafe { &*ptr.0 }
-}
-
-#[inline]
-fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
-    debug_assert!(!ptr.0.is_null());
-    // SAFETY: callers must uphold latch/guard invariants for mutable frame access.
-    unsafe { &mut *ptr.0 }
-}
-
-#[inline]
-fn frame_ptr_from_ref(frame: &'static BufferFrame) -> UnsafePtr<BufferFrame> {
-    UnsafePtr(frame as *const BufferFrame as *mut BufferFrame)
-}
-
-#[inline]
-fn frame_ptr_from_mut(frame: &'static mut BufferFrame) -> UnsafePtr<BufferFrame> {
-    UnsafePtr(frame as *mut BufferFrame)
-}
-
-#[inline]
-fn page_ref<T>(bf: &BufferFrame) -> &T {
-    // SAFETY: page memory is initialized and associated with this frame;
-    // caller selects `T` that matches the page type.
-    unsafe { &*(bf.page as *const T) }
-}
-
-#[inline]
-fn page_mut<T>(bf: &mut BufferFrame) -> &mut T {
-    // SAFETY: page memory is initialized and associated with this frame;
-    // caller selects `T` that matches the page type and has exclusive access.
-    unsafe { &mut *(bf.page as *mut T) }
-}
-
 pub trait PageGuard<T: 'static> {
     fn page(&self) -> &T;
 }
@@ -755,3 +716,42 @@ impl<T: 'static> PageExclusiveGuard<T> {
 
 unsafe impl<T: 'static> Send for PageExclusiveGuard<T> {}
 unsafe impl<T: 'static> Sync for PageExclusiveGuard<T> {}
+
+#[inline]
+fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
+    debug_assert!(!ptr.0.is_null());
+    // SAFETY: buffer pools allocate frames in a single mmap region and only pass
+    // valid frame pointers to guards.
+    unsafe { &*ptr.0 }
+}
+
+#[inline]
+fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
+    debug_assert!(!ptr.0.is_null());
+    // SAFETY: callers must uphold latch/guard invariants for mutable frame access.
+    unsafe { &mut *ptr.0 }
+}
+
+#[inline]
+fn frame_ptr_from_ref(frame: &'static BufferFrame) -> UnsafePtr<BufferFrame> {
+    UnsafePtr(frame as *const BufferFrame as *mut BufferFrame)
+}
+
+#[inline]
+fn frame_ptr_from_mut(frame: &'static mut BufferFrame) -> UnsafePtr<BufferFrame> {
+    UnsafePtr(frame as *mut BufferFrame)
+}
+
+#[inline]
+fn page_ref<T>(bf: &BufferFrame) -> &T {
+    // SAFETY: page memory is initialized and associated with this frame;
+    // caller selects `T` that matches the page type.
+    unsafe { &*(bf.page as *const T) }
+}
+
+#[inline]
+fn page_mut<T>(bf: &mut BufferFrame) -> &mut T {
+    // SAFETY: page memory is initialized and associated with this frame;
+    // caller selects `T` that matches the page type and has exclusive access.
+    unsafe { &mut *(bf.page as *mut T) }
+}
