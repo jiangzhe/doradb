@@ -464,6 +464,10 @@ mod tests {
             assert!(g.is_some());
             let g = g.unwrap();
             assert_eq!(g.page_id(), page_id);
+
+            let g = g.facade(false);
+            let g = g.lock_exclusive_async().await;
+            assert!(g.is_some());
             drop(g);
 
             let g = pool

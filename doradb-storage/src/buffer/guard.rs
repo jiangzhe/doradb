@@ -226,10 +226,7 @@ impl<T: 'static> FacadePageGuard<T> {
             GuardState::Exclusive => {
                 let guard = self.guard;
                 let bf = unsafe { &mut *self.bf.0 };
-                if bf.generation() != self.captured_generation {
-                    unsafe { guard.rollback_exclusive_bit() };
-                    return None;
-                }
+                debug_assert!(bf.generation() == self.captured_generation);
                 Some(PageExclusiveGuard {
                     bf,
                     guard,
@@ -314,9 +311,7 @@ impl<T: 'static> FacadePageGuard<T> {
             GuardState::Shared => {
                 let guard = self.guard;
                 let bf = unsafe { &*self.bf.0 };
-                if bf.generation() != self.captured_generation {
-                    return None;
-                }
+                debug_assert!(bf.generation() == self.captured_generation);
                 Some(PageSharedGuard {
                     bf,
                     guard,
