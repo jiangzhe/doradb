@@ -237,6 +237,32 @@ impl<'a> HybridGuard<'a> {
         }
     }
 
+    #[inline]
+    fn unlock_exclusive_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard currently owns
+        // one exclusive raw lock acquisition.
+        unsafe {
+            self.lock.lock.unlock_exclusive();
+        }
+    }
+
+    #[inline]
+    fn unlock_shared_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard currently owns
+        // one shared raw lock acquisition.
+        unsafe {
+            self.lock.lock.unlock_shared();
+        }
+    }
+
+    #[inline]
+    fn downgrade_exclusive_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard is in exclusive state.
+        unsafe {
+            self.lock.lock.downgrade();
+        }
+    }
+
     /// Validate version is not changed.
     #[inline]
     pub fn validate(&self) -> bool {
@@ -250,21 +276,13 @@ impl<'a> HybridGuard<'a> {
             GuardState::Exclusive => {
                 let ver = self.version + LATCH_EXCLUSIVE_BIT;
                 self.lock.version.store(ver, Ordering::Release);
-                // SAFETY: `GuardState::Exclusive` guarantees this guard currently owns
-                // the exclusive raw lock and is responsible for unlocking it once.
-                unsafe {
-                    self.lock.lock.unlock_exclusive();
-                }
+                self.unlock_exclusive_raw();
                 self.version = ver;
                 self.state = GuardState::Optimistic;
                 self
             }
             GuardState::Shared => {
-                // SAFETY: `GuardState::Shared` guarantees this guard currently owns
-                // one shared raw lock acquisition.
-                unsafe {
-                    self.lock.lock.unlock_shared();
-                }
+                self.unlock_shared_raw();
                 self.state = GuardState::Optimistic;
                 self
             }
@@ -278,9 +296,7 @@ impl<'a> HybridGuard<'a> {
         debug_assert!(self.state == GuardState::Exclusive);
         let ver = self.version + LATCH_EXCLUSIVE_BIT;
         self.lock.version.store(ver, Ordering::Release);
-        unsafe {
-            self.lock.lock.downgrade();
-        }
+        self.downgrade_exclusive_raw();
         self.version = ver;
         self.state = GuardState::Shared;
         self
@@ -411,13 +427,11 @@ impl<'a> HybridGuard<'a> {
     /// Caller must make sure the exclusive lock is already acquired.
     #[inline]
     pub unsafe fn rollback_exclusive_bit(mut self) {
-        unsafe {
-            self.lock
-                .version
-                .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
-            self.lock.lock.unlock_exclusive();
-            self.state = GuardState::Optimistic;
-        }
+        self.lock
+            .version
+            .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+        self.unlock_exclusive_raw();
+        self.state = GuardState::Optimistic;
     }
 
     #[inline]
@@ -452,13 +466,9 @@ impl Drop for HybridGuard<'_> {
             GuardState::Exclusive => {
                 let ver = self.version + LATCH_EXCLUSIVE_BIT;
                 self.lock.version.store(ver, Ordering::Release);
-                unsafe {
-                    self.lock.lock.unlock_exclusive();
-                }
+                self.unlock_exclusive_raw();
             }
-            GuardState::Shared => unsafe {
-                self.lock.lock.unlock_shared();
-            },
+            GuardState::Shared => self.unlock_shared_raw(),
             GuardState::Optimistic => (),
         }
     }

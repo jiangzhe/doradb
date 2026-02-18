@@ -9,7 +9,45 @@ use crate::ptr::UnsafePtr;
 use either::Either;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::mem;
+
+#[inline]
+fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
+    debug_assert!(!ptr.0.is_null());
+    // SAFETY: buffer pools allocate frames in a single mmap region and only pass
+    // valid frame pointers to guards.
+    unsafe { &*ptr.0 }
+}
+
+#[inline]
+fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
+    debug_assert!(!ptr.0.is_null());
+    // SAFETY: callers must uphold latch/guard invariants for mutable frame access.
+    unsafe { &mut *ptr.0 }
+}
+
+#[inline]
+fn frame_ptr_from_ref(frame: &'static BufferFrame) -> UnsafePtr<BufferFrame> {
+    UnsafePtr(frame as *const BufferFrame as *mut BufferFrame)
+}
+
+#[inline]
+fn frame_ptr_from_mut(frame: &'static mut BufferFrame) -> UnsafePtr<BufferFrame> {
+    UnsafePtr(frame as *mut BufferFrame)
+}
+
+#[inline]
+fn page_ref<T>(bf: &BufferFrame) -> &T {
+    // SAFETY: page memory is initialized and associated with this frame;
+    // caller selects `T` that matches the page type.
+    unsafe { &*(bf.page as *const T) }
+}
+
+#[inline]
+fn page_mut<T>(bf: &mut BufferFrame) -> &mut T {
+    // SAFETY: page memory is initialized and associated with this frame;
+    // caller selects `T` that matches the page type and has exclusive access.
+    unsafe { &mut *(bf.page as *mut T) }
+}
 
 pub trait PageGuard<T: 'static> {
     fn page(&self) -> &T;
@@ -130,9 +168,7 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub fn new(bf: UnsafePtr<BufferFrame>, guard: HybridGuard<'static>) -> Self {
         FacadePageGuard {
-            // SAFETY: `bf` points to a buffer frame allocated and owned by the buffer pool.
-            // Guard constructors only receive frame pointers from pool APIs.
-            captured_generation: unsafe { (*bf.0).generation() },
+            captured_generation: frame_ref(bf.clone()).generation(),
             bf,
             guard,
             _marker: PhantomData,
@@ -142,12 +178,12 @@ impl<T: 'static> FacadePageGuard<T> {
     /// Returns id of this page.
     #[inline]
     pub fn page_id(&self) -> PageID {
-        unsafe { (*self.bf.0).page_id }
+        self.bf().page_id
     }
 
     #[inline]
     pub fn bf(&self) -> &BufferFrame {
-        unsafe { &*self.bf.0 }
+        frame_ref(self.bf.clone())
     }
 
     /// Try exclusive lock will do additional version check after the lock acquisition to ensure
@@ -158,7 +194,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn try_exclusive_either(mut self) -> Either<PageExclusiveGuard<T>, PageOptimisticGuard<T>> {
         match self.try_exclusive() {
             Valid(()) => Either::Left(PageExclusiveGuard {
-                bf: unsafe { &mut *self.bf.0 },
+                bf: frame_mut(self.bf),
                 guard: self.guard,
                 captured_generation: self.captured_generation,
                 _marker: PhantomData,
@@ -198,7 +234,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn must_exclusive(self) -> PageExclusiveGuard<T> {
         debug_assert!(self.is_exclusive());
         PageExclusiveGuard {
-            bf: unsafe { &mut *self.bf.0 },
+            bf: frame_mut(self.bf),
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -212,7 +248,7 @@ impl<T: 'static> FacadePageGuard<T> {
         match self.guard.state {
             GuardState::Optimistic => {
                 let guard = self.guard.exclusive_async().await;
-                let bf = unsafe { &mut *self.bf.0 };
+                let bf = frame_mut(self.bf);
                 if bf.generation() != self.captured_generation {
                     unsafe { guard.rollback_exclusive_bit() };
                     return None;
@@ -227,7 +263,7 @@ impl<T: 'static> FacadePageGuard<T> {
             GuardState::Shared => panic!("block until exclusive by shared lock is not allowed"),
             GuardState::Exclusive => {
                 let guard = self.guard;
-                let bf = unsafe { &mut *self.bf.0 };
+                let bf = frame_mut(self.bf);
                 debug_assert!(bf.generation() == self.captured_generation);
                 Some(PageExclusiveGuard {
                     bf,
@@ -246,10 +282,8 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub fn try_shared_either(mut self) -> Either<PageSharedGuard<T>, PageOptimisticGuard<T>> {
         match self.try_shared() {
-            // SAFETY: `UnsafePtr<BufferFrame>` and `&BufferFrame` have the same pointer value.
-            // The borrow contract is enforced by guard state transitions and generation checks.
             Valid(()) => Either::Left(PageSharedGuard {
-                bf: unsafe { mem::transmute::<UnsafePtr<BufferFrame>, &BufferFrame>(self.bf) },
+                bf: frame_ref(self.bf),
                 guard: self.guard,
                 captured_generation: self.captured_generation,
                 _marker: PhantomData,
@@ -287,7 +321,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn must_shared(self) -> PageSharedGuard<T> {
         debug_assert!(self.is_shared());
         PageSharedGuard {
-            bf: unsafe { &*self.bf.0 },
+            bf: frame_ref(self.bf),
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -301,7 +335,7 @@ impl<T: 'static> FacadePageGuard<T> {
         match self.guard.state {
             GuardState::Optimistic => {
                 let guard = self.guard.shared_async().await;
-                let bf = unsafe { &*self.bf.0 };
+                let bf = frame_ref(self.bf);
                 if bf.generation() != self.captured_generation {
                     return None;
                 }
@@ -314,7 +348,7 @@ impl<T: 'static> FacadePageGuard<T> {
             }
             GuardState::Shared => {
                 let guard = self.guard;
-                let bf = unsafe { &*self.bf.0 };
+                let bf = frame_ref(self.bf);
                 debug_assert!(bf.generation() == self.captured_generation);
                 Some(PageSharedGuard {
                     bf,
@@ -335,7 +369,7 @@ impl<T: 'static> FacadePageGuard<T> {
         if self.guard.state != GuardState::Shared {
             return None;
         }
-        let bf = unsafe { &*self.bf.0 };
+        let bf = frame_ref(self.bf);
         if bf.generation() != self.captured_generation {
             return None;
         }
@@ -355,7 +389,7 @@ impl<T: 'static> FacadePageGuard<T> {
         if self.guard.state != GuardState::Exclusive {
             return None;
         }
-        let bf = unsafe { &mut *self.bf.0 };
+        let bf = frame_mut(self.bf);
         if bf.generation() != self.captured_generation {
             return None;
         }
@@ -402,10 +436,7 @@ impl<T: 'static> FacadePageGuard<T> {
     /// All values must be validated before use.
     #[inline]
     pub unsafe fn page_unchecked(&self) -> &T {
-        unsafe {
-            let page = (*self.bf.0).page;
-            &*(page as *mut T)
-        }
+        page_ref(self.bf())
     }
 
     #[inline]
@@ -449,13 +480,13 @@ pub struct PageOptimisticGuard<T: 'static> {
 impl<T> PageOptimisticGuard<T> {
     #[inline]
     pub fn page_id(&self) -> PageID {
-        unsafe { (*self.bf.0).page_id }
+        frame_ref(self.bf.clone()).page_id
     }
 
     #[inline]
     pub fn try_shared(mut self) -> Validation<PageSharedGuard<T>> {
         self.guard.try_shared().map(|_| PageSharedGuard {
-            bf: unsafe { &*self.bf.0 },
+            bf: frame_ref(self.bf),
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -466,7 +497,7 @@ impl<T> PageOptimisticGuard<T> {
     pub async fn shared_async(self) -> PageSharedGuard<T> {
         let guard = self.guard.shared_async().await;
         PageSharedGuard {
-            bf: unsafe { &*self.bf.0 },
+            bf: frame_ref(self.bf),
             guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -476,7 +507,7 @@ impl<T> PageOptimisticGuard<T> {
     #[inline]
     pub fn try_exclusive(mut self) -> Validation<PageExclusiveGuard<T>> {
         self.guard.try_exclusive().map(|_| PageExclusiveGuard {
-            bf: unsafe { &mut *self.bf.0 },
+            bf: frame_mut(self.bf),
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -487,7 +518,7 @@ impl<T> PageOptimisticGuard<T> {
     pub async fn exclusive_async(self) -> PageExclusiveGuard<T> {
         let guard = self.guard.exclusive_async().await;
         PageExclusiveGuard {
-            bf: unsafe { &mut *self.bf.0 },
+            bf: frame_mut(self.bf),
             guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -501,10 +532,7 @@ impl<T> PageOptimisticGuard<T> {
     /// All values must be validated before use.
     #[inline]
     pub unsafe fn page_unchecked(&self) -> &T {
-        unsafe {
-            let page = (*self.bf.0).page;
-            &*(page as *mut T)
-        }
+        page_ref(frame_ref(self.bf.clone()))
     }
 
     /// Validates version not change.
@@ -560,8 +588,7 @@ pub struct PageSharedGuard<T: 'static> {
 impl<T: 'static> PageGuard<T> for PageSharedGuard<T> {
     #[inline]
     fn page(&self) -> &T {
-        let page = self.bf.page;
-        unsafe { &*(page as *mut T) }
+        page_ref(self.bf)
     }
 }
 
@@ -570,10 +597,8 @@ impl<T: 'static> PageSharedGuard<T> {
     /// with long lifetime.
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
-        // SAFETY: `UnsafePtr<BufferFrame>` is a repr-transparent raw pointer wrapper.
-        // This cast preserves the same frame address while releasing shared-lock state.
         PageOptimisticGuard {
-            bf: unsafe { mem::transmute::<&BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
+            bf: frame_ptr_from_ref(self.bf),
             guard: self.guard.downgrade(),
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -596,8 +621,7 @@ impl<T: 'static> PageSharedGuard<T> {
     pub fn ctx_and_page(&self) -> (&FrameContext, &T) {
         let bf = self.bf();
         let undo_map = bf.ctx.as_ref().unwrap();
-        let page = bf.page;
-        let page = unsafe { &*(page as *mut T) };
+        let page = page_ref(bf);
         (undo_map, page)
     }
 
@@ -608,7 +632,7 @@ impl<T: 'static> PageSharedGuard<T> {
             self.bf.set_dirty(true);
         }
         FacadePageGuard {
-            bf: unsafe { mem::transmute::<&BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
+            bf: frame_ptr_from_ref(self.bf),
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -636,8 +660,7 @@ pub struct PageExclusiveGuard<T: 'static> {
 impl<T: 'static> PageGuard<T> for PageExclusiveGuard<T> {
     #[inline]
     fn page(&self) -> &T {
-        let page = self.bf.page;
-        unsafe { &*(page as *mut T) }
+        page_ref(self.bf)
     }
 }
 
@@ -647,7 +670,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
-            bf: unsafe { mem::transmute::<&mut BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
+            bf: frame_ptr_from_mut(self.bf),
             guard: self.guard.downgrade(),
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -673,8 +696,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
     /// Returns mutable page.
     #[inline]
     pub fn page_mut(&mut self) -> &mut T {
-        let page = self.bf.page;
-        unsafe { &mut *(page as *mut T) }
+        page_mut(self.bf)
     }
 
     /// Returns current buffer frame.
@@ -711,7 +733,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
             self.bf.set_dirty(true);
         }
         FacadePageGuard {
-            bf: unsafe { mem::transmute::<&mut BufferFrame, UnsafePtr<BufferFrame>>(self.bf) },
+            bf: frame_ptr_from_mut(self.bf),
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
