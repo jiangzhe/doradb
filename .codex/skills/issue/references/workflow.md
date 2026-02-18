@@ -27,7 +27,8 @@ Priority labels:
 - `priority:medium`
 - `priority:low`
 
-Require at least one `type:*` and one `priority:*` on new issues.
+Require at least one `type:*` on new issues.
+If no `priority:*` label is provided, default to `priority:medium`.
 
 ## Epic and Child Linking
 

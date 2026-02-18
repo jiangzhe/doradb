@@ -1,6 +1,6 @@
 ---
 name: issue
-description: Automate GitHub Issues lifecycle workflows with deterministic scripts. Use when creating, triaging, assigning, updating, linking, or closing issues in this repository, especially when converting planning documents in docs/tasks or docs/rfcs into trackable GitHub issues with required type/priority labels.
+description: Automate GitHub Issues lifecycle workflows with deterministic scripts. Use when creating, triaging, assigning, updating, linking, or closing issues in this repository, especially when converting planning documents in docs/tasks or docs/rfcs into trackable GitHub issues with required type labels and default priority handling.
 ---
 
 # GitHub Issue Automation
@@ -35,11 +35,12 @@ For child issues linked to an epic:
 ```bash
 python3 .codex/skills/issue/scripts/create_issue_from_doc.py \
   --doc docs/tasks/000002-subtask.md \
-  --labels "type:task,priority:medium" \
+  --labels "type:task" \
   --parent 42
 ```
 
 This script always uses `--body-file` to avoid body-length command issues.
+If `priority:*` is omitted, it automatically adds `priority:medium`.
 
 ## List Issues
 

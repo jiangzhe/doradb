@@ -15,12 +15,14 @@ def split_labels(csv: str) -> list[str]:
     return [x.strip() for x in csv.split(",") if x.strip()]
 
 
-def validate_labels(labels: list[str]) -> tuple[bool, str | None]:
+def normalize_labels(labels: list[str]) -> tuple[list[str], bool, str | None]:
     has_type = any(label.startswith("type:") for label in labels)
     has_priority = any(label.startswith("priority:") for label in labels)
-    if not has_type or not has_priority:
-        return False, "labels must include at least one type:* and one priority:* label"
-    return True, None
+    if not has_type:
+        return labels, False, "labels must include at least one type:* label"
+    if not has_priority:
+        labels = [*labels, "priority:medium"]
+    return labels, True, None
 
 
 def build_body(doc_path: str, doc_type: str, doc_id: str, doc_title: str | None, parent: int | None) -> str:
@@ -69,7 +71,7 @@ def main() -> int:
         return 1
 
     labels = split_labels(args.labels)
-    ok, err = validate_labels(labels)
+    labels, ok, err = normalize_labels(labels)
     if not ok:
         print(json.dumps({"created": False, "error": err}, ensure_ascii=True))
         return 1
