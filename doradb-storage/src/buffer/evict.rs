@@ -1,11 +1,11 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
-use crate::buffer::frame::{BufferFrame, FrameKind};
+use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{
     BufferPage, INVALID_PAGE_ID, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID,
 };
-use crate::buffer::util::{BufferFrames, madvise_dontneed, mmap_allocate, mmap_deallocate};
+use crate::buffer::util::{madvise_dontneed, mmap_allocate, mmap_deallocate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;

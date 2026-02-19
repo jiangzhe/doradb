@@ -1,9 +1,9 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
-use crate::buffer::frame::{BufferFrame, FrameKind};
+use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
-use crate::buffer::util::{BufferFrames, mmap_allocate, mmap_deallocate};
+use crate::buffer::util::{mmap_allocate, mmap_deallocate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
@@ -106,21 +106,6 @@ impl FixedBufferPool {
         let g = BufferFrames::frame_ref(bf.clone()).latch.optimistic_spin();
         FacadePageGuard::new(bf, g)
     }
-
-    // #[inline]
-    // fn allocate_internal<T: BufferPage>(&'static self, page_id: PageID) -> PageExclusiveGuard<T> {
-    //     let bf = self.frames.frame_ptr(page_id);
-    //     let mut g = BufferFrames::init_bf_exclusive_guard::<T>(bf.clone());
-    //     with_frame_mut(bf, &mut g, |frame| {
-    //         frame.page_id = page_id;
-    //         frame.ctx = None;
-    //         T::init_frame(frame);
-    //         frame.next_free = INVALID_PAGE_ID;
-    //         frame.set_dirty(true);
-    //     });
-    //     g.page_mut().zero();
-    //     g
-    // }
 }
 
 impl BufferPool for FixedBufferPool {
