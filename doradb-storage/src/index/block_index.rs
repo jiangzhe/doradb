@@ -11,8 +11,7 @@ use crate::error::{
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::index::find_in_file;
 use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
-use crate::latch::HybridLatch;
-use crate::latch::LatchFallbackMode;
+use crate::latch::{HybridGuard, HybridLatch, LatchFallbackMode};
 use crate::row::{INVALID_ROW_ID, RowID, RowPage};
 use crate::trx::sys::TransactionSystem;
 use either::Either::{self, Left, Right};
@@ -116,14 +115,14 @@ impl BlockNode {
     #[inline]
     pub fn branch_entries(&self) -> &[PageEntry] {
         debug_assert!(self.is_branch());
-        unsafe { std::slice::from_raw_parts(self.data_ptr(), self.header.count as usize) }
+        self.data_slice(self.header.count as usize)
     }
 
     /// Returns mutable entry slice in branch node.
     #[inline]
     pub fn branch_entries_mut(&mut self) -> &mut [PageEntry] {
         debug_assert!(self.is_branch());
-        unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), self.header.count as usize) }
+        self.data_slice_mut(self.header.count as usize)
     }
 
     /// Returns entry in branch node by given index.
@@ -177,7 +176,7 @@ impl BlockNode {
     #[inline]
     pub fn leaf_entries(&self) -> &[PageEntry] {
         debug_assert!(self.is_leaf());
-        unsafe { std::slice::from_raw_parts(self.data_ptr(), self.header.count as usize) }
+        self.data_slice(self.header.count as usize)
     }
 
     /// Returns entry in leaf node by given index.
@@ -205,7 +204,7 @@ impl BlockNode {
     #[inline]
     pub fn leaf_entries_mut(&mut self) -> &mut [PageEntry] {
         debug_assert!(self.is_leaf());
-        unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), self.header.count as usize) }
+        self.data_slice_mut(self.header.count as usize)
     }
 
     /// Add a new entry in leaf node.
@@ -218,6 +217,19 @@ impl BlockNode {
         entry.row_id = start_row_id;
         entry.page_id = page_id;
         self.header.end_row_id = start_row_id + count;
+    }
+
+    #[inline]
+    fn data_slice<T>(&self, len: usize) -> &[T] {
+        // SAFETY: `BlockNode` stores packed `PageEntry` arrays in `data`.
+        // Callers guarantee `T` layout/length by node type and count checks.
+        unsafe { std::slice::from_raw_parts(self.data_ptr(), len) }
+    }
+
+    #[inline]
+    fn data_slice_mut<T>(&mut self, len: usize) -> &mut [T] {
+        // SAFETY: same invariant as `data_slice`, plus caller holds `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), len) }
     }
 }
 
@@ -725,38 +737,40 @@ impl BlockIndex {
             .pool
             .get_page::<BlockNode>(self.root.mem, LatchFallbackMode::Spin)
             .await;
-        // optimistic mode, should always check version before using protected data.
-        let mut pu = unsafe { p_guard.page_unchecked() };
-        let height = pu.header.height;
-        while !pu.is_leaf() {
-            let count = pu.header.count;
-            let idx = 1.max(count as usize).min(NBR_ENTRIES_IN_BRANCH) - 1;
-            let page_id = pu.branch_entries()[idx].page_id;
-            // fields on page are read, validate them.
-            verify!(p_guard.validate());
-            debug_assert!(height >= 1);
-            p_guard = if height == 1 {
-                let g = self
-                    .pool
-                    .get_child_page::<BlockNode>(&p_guard, page_id, mode)
-                    .await;
-                stack.push(p_guard.downgrade());
-                verify!(g)
-            } else {
-                let g = self
-                    .pool
-                    .get_child_page::<BlockNode>(&p_guard, page_id, LatchFallbackMode::Spin)
-                    .await;
-                stack.push(p_guard.downgrade());
-                verify!(g)
+        loop {
+            let step = verify!(p_guard.with_page_ref_validated(|page| {
+                if page.is_leaf() {
+                    return None;
+                }
+                let count = page.header.count;
+                let idx = 1.max(count as usize).min(NBR_ENTRIES_IN_BRANCH) - 1;
+                Some((page.header.height, page.branch_entries()[idx].page_id))
+            }));
+            let Some((height, page_id)) = step else {
+                return Valid(p_guard);
             };
-            pu = unsafe { p_guard.page_unchecked() };
+            debug_assert!(height >= 1);
+            let c_guard = if height == 1 {
+                self.pool
+                    .get_child_page::<BlockNode>(&p_guard, page_id, mode)
+                    .await
+            } else {
+                self.pool
+                    .get_child_page::<BlockNode>(&p_guard, page_id, LatchFallbackMode::Spin)
+                    .await
+            };
+            stack.push(p_guard.downgrade());
+            p_guard = verify!(c_guard);
         }
-        Valid(p_guard)
     }
 
     #[inline]
     async fn try_find_row(&self, row_id: RowID) -> Validation<RowLocation> {
+        enum SearchStep {
+            Found(RowLocation),
+            Next(PageID),
+        }
+
         let root = match self.root.guide(row_id) {
             Left(file_root) => {
                 let payload = match find_in_file(&self.table_file, file_root, row_id).await {
@@ -775,66 +789,62 @@ impl BlockIndex {
             .get_page::<BlockNode>(root, LatchFallbackMode::Spin)
             .await;
         loop {
-            let pu = unsafe { g.page_unchecked() };
-            if pu.is_leaf() {
-                // for leaf node, end_row_id is always correct,
-                // so we can quickly determine if row id exists
-                // in current node.
-                if pu.leaf_is_empty() || row_id >= pu.header.end_row_id {
-                    verify!(g.validate());
-                    return Valid(RowLocation::NotFound);
-                }
-                let entries = pu.leaf_entries();
-                let idx = match entries.binary_search_by_key(&row_id, |entry| entry.row_id) {
-                    Ok(idx) => idx,
-                    Err(0) => {
-                        verify!(g.validate());
-                        return Valid(RowLocation::NotFound);
+            let step = verify!(g.with_page_ref_validated(|page| {
+                if page.is_leaf() {
+                    // for leaf node, end_row_id is always correct,
+                    // so we can quickly determine if row id exists
+                    // in current node.
+                    if page.leaf_is_empty() || row_id >= page.header.end_row_id {
+                        return SearchStep::Found(RowLocation::NotFound);
                     }
-                    Err(idx) => idx - 1,
-                };
-                let entry_end_row_id = entries
-                    .get(idx + 1)
-                    .map(|entry| entry.row_id)
-                    .unwrap_or(pu.header.end_row_id);
-                if row_id >= entry_end_row_id {
-                    verify!(g.validate());
-                    return Valid(RowLocation::NotFound);
+                    let entries = page.leaf_entries();
+                    let idx = match entries.binary_search_by_key(&row_id, |entry| entry.row_id) {
+                        Ok(idx) => idx,
+                        Err(0) => return SearchStep::Found(RowLocation::NotFound),
+                        Err(idx) => idx - 1,
+                    };
+                    let entry_end_row_id = entries
+                        .get(idx + 1)
+                        .map(|entry| entry.row_id)
+                        .unwrap_or(page.header.end_row_id);
+                    if row_id >= entry_end_row_id {
+                        return SearchStep::Found(RowLocation::NotFound);
+                    }
+                    return SearchStep::Found(RowLocation::RowPage(entries[idx].page_id));
                 }
-                verify!(g.validate());
-                return Valid(RowLocation::RowPage(entries[idx].page_id));
+
+                // For branch node, end_row_id is not always correct.
+                //
+                // With current page insert logic, at most time end_row_id
+                // equals to its right-most child's start_row_id plus
+                // row count of one row page.
+                //
+                // All leaf nodes maintain correct row id range.
+                // so if input row id exceeds end_row_id, we just redirect
+                // it to right-most leaf.
+                let page_id = if row_id >= page.header.end_row_id {
+                    page.branch_last_entry().page_id
+                } else {
+                    let entries = page.branch_entries();
+                    let idx = match entries.binary_search_by_key(&row_id, |entry| entry.row_id) {
+                        Ok(idx) => idx,
+                        Err(0) => return SearchStep::Found(RowLocation::NotFound),
+                        Err(idx) => idx - 1,
+                    };
+                    entries[idx].page_id
+                };
+                SearchStep::Next(page_id)
+            }));
+            match step {
+                SearchStep::Found(found) => return Valid(found),
+                SearchStep::Next(page_id) => {
+                    g = verify!(
+                        self.pool
+                            .get_child_page(&g, page_id, LatchFallbackMode::Spin)
+                            .await
+                    );
+                }
             }
-            // For branch node, end_row_id is not always correct.
-            //
-            // With current page insert logic, at most time end_row_id
-            // equals to its right-most child's start_row_id plus
-            // row count of one row page.
-            //
-            // All leaf nodes maintain correct row id range.
-            // so if input row id exceeds end_row_id, we just redirect
-            // it to right-most leaf.
-            let page_id = if row_id >= pu.header.end_row_id {
-                pu.branch_last_entry().page_id
-            } else {
-                let entries = pu.branch_entries();
-                let idx = match entries.binary_search_by_key(&row_id, |entry| entry.row_id) {
-                    Ok(idx) => idx,
-                    Err(0) => {
-                        verify!(g.validate());
-                        return Valid(RowLocation::NotFound);
-                    }
-                    Err(idx) => idx - 1,
-                };
-                entries[idx].page_id
-            };
-            verify!(g.validate());
-            g = {
-                let v = self
-                    .pool
-                    .get_child_page(&g, page_id, LatchFallbackMode::Spin)
-                    .await;
-                verify!(v)
-            };
         }
     }
 }
@@ -875,23 +885,19 @@ impl BlockIndexRoot {
     #[inline]
     pub fn guide(&self, row_id: RowID) -> Either<PageID, PageID> {
         loop {
-            unsafe {
-                let g = self.latch.optimistic_spin();
-                let pivot = *self.pivot.get();
-                if row_id < pivot {
-                    // go to file
-                    let file_root = self.file.load(Ordering::Acquire);
-                    if g.validate() {
-                        // safe to dereference if version is unchanged.
-                        return Left((*file_root).column_block_index_root);
-                    } else {
-                        continue; // retry
-                    }
-                }
-                // go to mem
+            let g = self.optimistic_guard();
+            let pivot = self.pivot_value();
+            if row_id < pivot {
+                // go to file
+                let file_root = self.file_root_ptr(Ordering::Acquire);
                 if g.validate() {
-                    return Right(self.mem);
+                    return Left(Self::column_block_index_root(file_root));
                 }
+                continue; // retry
+            }
+            // go to mem
+            if g.validate() {
+                return Right(self.mem);
             }
         }
     }
@@ -900,42 +906,64 @@ impl BlockIndexRoot {
     #[inline]
     pub fn try_file(&self, row_id: RowID) -> Option<PageID> {
         loop {
-            unsafe {
-                let g = self.latch.optimistic_spin();
-                let pivot = *self.pivot.get();
-                if row_id < pivot {
-                    // go to file
-                    let file_root = self.file.load(Ordering::Acquire);
-                    if g.validate() {
-                        // safe to dereference if version is unchanged.
-                        return Some((*file_root).column_block_index_root);
-                    } else {
-                        continue; // retry
-                    }
+            let g = self.optimistic_guard();
+            let pivot = self.pivot_value();
+            if row_id < pivot {
+                // go to file
+                let file_root = self.file_root_ptr(Ordering::Acquire);
+                if g.validate() {
+                    return Some(Self::column_block_index_root(file_root));
                 }
-                return None;
+                continue; // retry
             }
+            return None;
         }
     }
 
     #[inline]
     pub fn metadata(&self) -> Option<&TableMetadata> {
-        let ptr = self.file.load(Ordering::Relaxed);
-        if ptr.is_null() {
-            None
-        } else {
-            unsafe { Some(&(*ptr).metadata) }
-        }
+        self.file_root_ref(Ordering::Relaxed)
+            .map(|root| root.metadata.as_ref())
     }
 
     #[inline]
     pub fn clone_metadata(&self) -> Option<Arc<TableMetadata>> {
-        let ptr = self.file.load(Ordering::Relaxed);
+        self.file_root_ref(Ordering::Relaxed)
+            .map(|root| Arc::clone(&root.metadata))
+    }
+
+    #[inline]
+    fn optimistic_guard(&self) -> HybridGuard<'_> {
+        self.latch.optimistic_spin()
+    }
+
+    #[inline]
+    fn pivot_value(&self) -> RowID {
+        // SAFETY: pivot reads are validated by latch optimistic version checks.
+        unsafe { *self.pivot.get() }
+    }
+
+    #[inline]
+    fn file_root_ptr(&self, ordering: Ordering) -> *const ActiveRoot {
+        self.file.load(ordering) as *const ActiveRoot
+    }
+
+    #[inline]
+    fn file_root_ref(&self, ordering: Ordering) -> Option<&ActiveRoot> {
+        let ptr = self.file_root_ptr(ordering);
         if ptr.is_null() {
-            None
-        } else {
-            unsafe { Some(Arc::clone(&(*ptr).metadata)) }
+            return None;
         }
+        // SAFETY: pointer is published by table-file root management and stays
+        // valid while referenced by block index root.
+        Some(unsafe { &*ptr })
+    }
+
+    #[inline]
+    fn column_block_index_root(ptr: *const ActiveRoot) -> PageID {
+        debug_assert!(!ptr.is_null());
+        // SAFETY: caller ensures `ptr` was loaded from `self.file` and validated.
+        unsafe { (*ptr).column_block_index_root }
     }
 }
 
@@ -1014,6 +1042,11 @@ impl BlockIndexMemCursor<'_> {
 
     #[inline]
     async fn try_find_leaf_with_parent_in_mem(&mut self, row_id: RowID) -> Validation<()> {
+        enum TraverseStep {
+            Leaf,
+            Branch { idx: usize, page_id: PageID },
+        }
+
         debug_assert!(row_id != INVALID_ROW_ID); // every row id other than MAX_ROW_ID can find a leaf.
         let mut g = self
             .blk_idx
@@ -1021,8 +1054,22 @@ impl BlockIndexMemCursor<'_> {
             .get_page::<BlockNode>(self.blk_idx.root.mem, LatchFallbackMode::Shared)
             .await;
         'SEARCH: loop {
-            let pu = unsafe { g.page_unchecked() };
-            if pu.is_leaf() {
+            let step = verify!(g.with_page_ref_validated(|page| {
+                if page.is_leaf() {
+                    return TraverseStep::Leaf;
+                }
+                let entries = page.branch_entries();
+                let idx = match entries.binary_search_by_key(&row_id, |block| block.row_id) {
+                    Ok(idx) => idx,
+                    Err(0) => 0, // even it's out of range, we assign first page.
+                    Err(idx) => idx - 1,
+                };
+                TraverseStep::Branch {
+                    idx,
+                    page_id: entries[idx].page_id,
+                }
+            }));
+            if matches!(step, TraverseStep::Leaf) {
                 // share lock for read
                 if let Some(parent) = self.parent.take() {
                     self.parent = Some(parent);
@@ -1044,14 +1091,9 @@ impl BlockIndexMemCursor<'_> {
                     }
                 }
             }
-            let entries = pu.branch_entries();
-            let idx = match entries.binary_search_by_key(&row_id, |block| block.row_id) {
-                Ok(idx) => idx,
-                Err(0) => 0, // even it's out of range, we assign first page.
-                Err(idx) => idx - 1,
+            let TraverseStep::Branch { idx, page_id } = step else {
+                unreachable!();
             };
-            let page_id = entries[idx].page_id;
-            verify!(g.validate());
             let c = self
                 .blk_idx
                 .pool

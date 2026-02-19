@@ -723,13 +723,13 @@ impl BTreeNode {
     #[inline]
     pub(super) fn slots(&self) -> &[BTreeSlot] {
         let len = self.header.count as usize;
-        unsafe { std::slice::from_raw_parts(self.body() as *const BTreeSlot, len) }
+        unsafe { std::slice::from_raw_parts(self.slot_ptr(0), len) }
     }
 
     #[inline]
     pub(super) fn slots_and_hints(&mut self) -> (&[BTreeSlot], &mut BTreeHints) {
         let len = self.header.count as usize;
-        let slots = unsafe { std::slice::from_raw_parts(self.body() as *const BTreeSlot, len) };
+        let slots = unsafe { std::slice::from_raw_parts(self.slot_ptr(0), len) };
         (slots, &mut self.header.hints)
     }
 
@@ -742,7 +742,7 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn slot_unchecked(&self, idx: usize) -> &BTreeSlot {
-        unsafe { &*(self.body() as *const BTreeSlot).add(idx) }
+        unsafe { &*self.slot_ptr(idx) }
     }
 
     #[inline]
@@ -753,7 +753,7 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn slot_mut_unchecked(&mut self, idx: usize) -> &mut BTreeSlot {
-        unsafe { &mut *(self.body_mut() as *mut BTreeSlot).add(idx) }
+        unsafe { &mut *self.slot_ptr_mut(idx) }
     }
 
     /// insert slot at given position.
@@ -761,7 +761,7 @@ impl BTreeNode {
     #[inline]
     unsafe fn insert_slot_at(&mut self, idx: usize, slot: BTreeSlot) {
         unsafe {
-            let dst = (self.body_mut() as *mut BTreeSlot).add(idx);
+            let dst = self.slot_ptr_mut(idx);
             if idx < self.header.count as usize {
                 // shift all elements starting from destination by one position.
                 let next = dst.add(1);
@@ -918,7 +918,7 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn payload(&self, offset: usize, len: usize) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.body().add(offset), len) }
+        unsafe { std::slice::from_raw_parts(self.payload_ptr(offset), len) }
     }
 
     #[inline]
@@ -1046,17 +1046,14 @@ impl BTreeNode {
 
     #[inline]
     unsafe fn slot_value<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
-        unsafe {
-            let offset = if slot.len as usize <= KEY_HEAD_LEN {
-                // key is inlined.
-                slot.offset
-            } else {
-                // should shift key length.
-                slot.offset + slot.len
-            } as usize;
-            let ptr = self.body().add(offset);
-            std::ptr::read_unaligned::<V>(ptr as *const V)
-        }
+        let offset = if slot.len as usize <= KEY_HEAD_LEN {
+            // key is inlined.
+            slot.offset
+        } else {
+            // should shift key length.
+            slot.offset + slot.len
+        } as usize;
+        unsafe { self.read_value_unaligned(offset) }
     }
 
     /// Returns all values in this node.
@@ -1080,9 +1077,8 @@ impl BTreeNode {
             slot.offset + slot.len
         } as usize;
         unsafe {
-            let ptr = self.body_mut().add(offset);
-            let old_value = std::ptr::read_unaligned::<V>(ptr as *const V);
-            std::ptr::write_unaligned::<V>(ptr as *mut V, value);
+            let old_value = self.read_value_unaligned::<V>(offset);
+            self.write_value_unaligned::<V>(offset, value);
             old_value
         }
     }
@@ -1317,11 +1313,11 @@ impl BTreeNode {
             // no change on effective space.
             return;
         }
-        let value = unsafe { (self.body().add(old_offset + old_len) as *const V).read_unaligned() };
+        let value = unsafe { self.read_value_unaligned::<V>(old_offset + old_len) };
         if k.len() <= KEY_HEAD_LEN {
             // update value
             unsafe {
-                (self.body_mut().add(old_offset) as *mut V).write_unaligned(value);
+                self.write_value_unaligned::<V>(old_offset, value);
             }
             // update head
             let slot = self.slot_mut(idx);
@@ -1336,7 +1332,7 @@ impl BTreeNode {
         // update extra payload and value
         unsafe {
             std::ptr::copy_nonoverlapping(k.as_ptr(), self.body_mut().add(old_offset), k.len());
-            (self.body_mut().add(old_offset + k.len()) as *mut V).write_unaligned(value);
+            self.write_value_unaligned::<V>(old_offset + k.len(), value);
         }
         // update head
         let slot = self.slot_mut(idx);
@@ -1402,6 +1398,40 @@ impl BTreeNode {
             return &slot.head_bytes()[..k.len()] == k;
         }
         &self.long_key_suffix(slot)[..k.len()] == k
+    }
+
+    #[inline]
+    fn slot_ptr(&self, idx: usize) -> *const BTreeSlot {
+        // SAFETY: slot area starts at body head and caller ensures `idx` bounds.
+        unsafe { (self.body() as *const BTreeSlot).add(idx) }
+    }
+
+    #[inline]
+    fn slot_ptr_mut(&mut self, idx: usize) -> *mut BTreeSlot {
+        // SAFETY: slot area starts at body head and caller ensures `idx` bounds.
+        unsafe { (self.body_mut() as *mut BTreeSlot).add(idx) }
+    }
+
+    #[inline]
+    fn payload_ptr(&self, offset: usize) -> *const u8 {
+        // SAFETY: caller ensures `offset` is within node body payload area.
+        unsafe { self.body().add(offset) }
+    }
+
+    #[inline]
+    fn payload_ptr_mut(&mut self, offset: usize) -> *mut u8 {
+        // SAFETY: caller ensures `offset` is within node body payload area.
+        unsafe { self.body_mut().add(offset) }
+    }
+
+    #[inline]
+    unsafe fn read_value_unaligned<V: BTreeValue>(&self, offset: usize) -> V {
+        unsafe { std::ptr::read_unaligned::<V>(self.payload_ptr(offset) as *const V) }
+    }
+
+    #[inline]
+    unsafe fn write_value_unaligned<V: BTreeValue>(&mut self, offset: usize, value: V) {
+        unsafe { std::ptr::write_unaligned::<V>(self.payload_ptr_mut(offset) as *mut V, value) }
     }
 }
 

@@ -399,12 +399,8 @@ impl BTree {
                 .pool
                 .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
                 .await;
-            // SAFETY: this read is protected by optimistic validation below.
-            // `page_unchecked` is only used before `g.validate()` and retried on mismatch.
-            let pu = unsafe { g.page_unchecked() };
-            let height = pu.height();
-            let count = pu.count();
-            verify_continue!(g.validate());
+            let (height, count) =
+                verify_continue!(g.with_page_ref_validated(|page| (page.height(), page.count())));
             if height == 0 || count > 0 {
                 return;
             }
@@ -440,19 +436,13 @@ impl BTree {
     #[inline]
     async fn try_lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Validation<Option<V>> {
         let g = self.find_leaf::<OptimisticStrategy>(key).await;
-        // SAFETY: this access is coupled with optimistic guard validation at each return path.
-        let leaf = unsafe { g.page_unchecked() };
-        match leaf.search_key(key) {
-            Ok(idx) => {
-                let value = leaf.value::<V>(idx);
-                verify!(g.validate());
-                Valid(Some(value))
-            }
-            Err(_) => {
-                verify!(g.validate());
-                Valid(None)
-            }
-        }
+        let value = verify!(
+            g.with_page_ref_validated(|leaf| match leaf.search_key(key) {
+                Ok(idx) => Some(leaf.value::<V>(idx)),
+                Err(_) => None,
+            })
+        );
+        Valid(value)
     }
 
     /// Try to split node bottom up.
@@ -692,23 +682,17 @@ impl BTree {
         );
         right_node.extend_slots_from::<V>(root, sep_idx, root.count() - sep_idx);
         right_node.update_hints();
-        // Initialize temporary root node and insert separator key.
-        let mut tmp_root = unsafe {
-            let mut new = std::mem::MaybeUninit::<BTreeNode>::zeroed();
-            new.assume_init_mut().init(
-                height + 1,
-                ts,
-                &lower_fence_key,
-                BTreeU64::from(left_page_id),
-                &[],
-                hints_enabled,
-            );
-            new.assume_init()
-        };
-        let slot_idx = tmp_root.insert(&sep_key, BTreeU64::from(right_page_id));
+        // Re-initialize root in place as branch root and insert right child separator.
+        root.init(
+            height + 1,
+            ts,
+            &lower_fence_key,
+            BTreeU64::from(left_page_id),
+            &[],
+            hints_enabled,
+        );
+        let slot_idx = root.insert(&sep_key, BTreeU64::from(right_page_id));
         debug_assert!(slot_idx == 0);
-        // Overwrite original root.
-        *root = tmp_root;
         self.height.store(root.height(), Ordering::SeqCst);
     }
 
@@ -898,9 +882,7 @@ impl BTree {
             .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
             .await;
         // check root page separately.
-        let pu = unsafe { p_guard.page_unchecked() };
-        let height = pu.height();
-        verify!(p_guard.validate());
+        let height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
         if height == 0 {
             // root is leaf.
             verify!(S::try_lock(&mut p_guard));
@@ -908,11 +890,11 @@ impl BTree {
         }
         loop {
             // Current node is not leaf node.
-            let pu = unsafe { p_guard.page_unchecked() };
-            let height = pu.height();
-            match pu.lookup_child(key) {
+            let (height, child) = verify!(
+                p_guard.with_page_ref_validated(|page| (page.height(), page.lookup_child(key)))
+            );
+            match child {
                 LookupChild::Slot(_, page_id) | LookupChild::LowerFence(page_id) => {
-                    verify!(p_guard.validate());
                     // As version validation passes, the height must not be 0.
                     debug_assert!(height != 0);
                     if height == 1 {
@@ -932,7 +914,6 @@ impl BTree {
                     p_guard = c_guard;
                 }
                 LookupChild::NotFound => {
-                    verify!(p_guard.validate());
                     unreachable!("BTree should always find one leaf for any key");
                 }
             }
@@ -949,9 +930,7 @@ impl BTree {
             .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
             .await;
         // check root page separately.
-        let pu = unsafe { p_guard.page_unchecked() };
-        let height = pu.height();
-        verify!(p_guard.validate());
+        let height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
         if height == 0 {
             // root is leaf.
             verify!(S::try_lock(&mut p_guard));
@@ -959,11 +938,11 @@ impl BTree {
         }
         loop {
             // Current node is not leaf node.
-            let pu = unsafe { p_guard.page_unchecked() };
-            let height = pu.height();
-            match pu.lookup_child(key) {
+            let (height, child) = verify!(
+                p_guard.with_page_ref_validated(|page| (page.height(), page.lookup_child(key)))
+            );
+            match child {
                 LookupChild::Slot(_, page_id) | LookupChild::LowerFence(page_id) => {
-                    verify!(p_guard.validate());
                     // As version validation passes, the height must not be 0.
                     debug_assert!(height != 0);
                     if height == 1 {
@@ -983,7 +962,6 @@ impl BTree {
                     p_guard = c_guard;
                 }
                 LookupChild::NotFound => {
-                    verify!(p_guard.validate());
                     unreachable!("BTree should always find one leaf for any key");
                 }
             }
@@ -1015,19 +993,19 @@ impl BTree {
             .pool
             .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
             .await;
-        let mut pu = unsafe { g.page_unchecked() };
-        let mut height = pu.height();
-        verify!(g.validate());
+        let mut height = verify!(g.with_page_ref_validated(|page| page.height()));
         if height == 0 {
             // single-node tree
             return Valid(None);
         }
         loop {
-            pu = unsafe { g.page_unchecked() };
-            height = pu.height();
-            match pu.lookup_child(lower_fence_key) {
+            let (new_height, child) = verify!(g.with_page_ref_validated(|page| (
+                page.height(),
+                page.lookup_child(lower_fence_key)
+            )));
+            height = new_height;
+            match child {
                 LookupChild::Slot(_, c_page_id) | LookupChild::LowerFence(c_page_id) => {
-                    verify!(g.validate());
                     if c_page_id == page_id {
                         let g = g.lock_exclusive_async().await.unwrap();
                         return Valid(Some(g));
@@ -1044,7 +1022,6 @@ impl BTree {
                     g = verify!(c_guard);
                 }
                 LookupChild::NotFound => {
-                    verify!(g.validate());
                     return Valid(None);
                 }
             }
@@ -1137,10 +1114,8 @@ where
         mut p_guard: FacadePageGuard<BTreeNode>,
     ) -> Validation<()> {
         loop {
-            let pu = unsafe { p_guard.page_unchecked() };
-            let curr_height = pu.height();
+            let curr_height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
             if curr_height < height {
-                verify!(p_guard.validate());
                 // tree height is smaller than searched height.
                 return Valid(());
             }
@@ -1167,12 +1142,14 @@ where
                 self.node = Some(c_guard);
                 return Valid(());
             }
-            let c_page_id = match pu.lookup_child(key) {
-                LookupChild::Slot(_, c_page_id) => c_page_id,
-                LookupChild::LowerFence(c_page_id) => c_page_id,
-                LookupChild::NotFound => unreachable!(),
-            };
-            verify!(p_guard.validate());
+            let c_page_id =
+                verify!(
+                    p_guard.with_page_ref_validated(|page| match page.lookup_child(key) {
+                        LookupChild::Slot(_, c_page_id) => c_page_id,
+                        LookupChild::LowerFence(c_page_id) => c_page_id,
+                        LookupChild::NotFound => unreachable!(),
+                    })
+                );
             // Before access parent node, we always use optimistic spin lock.
             let c_guard = tree
                 .pool

@@ -408,6 +408,23 @@ impl<T: 'static> FacadePageGuard<T> {
         self.guard.validate()
     }
 
+    /// Read page and validate guard version before returning extracted value.
+    ///
+    /// This helper keeps optimistic access scoped to a closure and only returns
+    /// owned/copied data (`R` cannot borrow from page because of HRTB).
+    #[inline]
+    pub fn with_page_ref_validated<R, F>(&self, f: F) -> Validation<R>
+    where
+        F: for<'a> FnOnce(&'a T) -> R,
+    {
+        let out = f(page_ref(self.bf()));
+        if self.guard.validate() {
+            Valid(out)
+        } else {
+            Invalid
+        }
+    }
+
     /// Rollback version change by exclusive lock acquisition.
     ///
     /// # Safety
@@ -515,6 +532,23 @@ impl<T> PageOptimisticGuard<T> {
             guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
+        }
+    }
+
+    /// Read page and validate guard version before returning extracted value.
+    ///
+    /// This helper keeps optimistic access scoped to a closure and only returns
+    /// owned/copied data (`R` cannot borrow from page because of HRTB).
+    #[inline]
+    pub fn with_page_ref_validated<R, F>(&self, f: F) -> Validation<R>
+    where
+        F: for<'a> FnOnce(&'a T) -> R,
+    {
+        let out = f(page_ref(BufferFrames::frame_ref(self.bf.clone())));
+        if self.guard.validate() {
+            Valid(out)
+        } else {
+            Invalid
         }
     }
 

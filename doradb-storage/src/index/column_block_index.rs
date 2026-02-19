@@ -104,50 +104,40 @@ impl ColumnBlockNode {
     #[inline]
     pub fn leaf_start_row_ids(&self) -> &[RowID] {
         debug_assert!(self.is_leaf());
-        unsafe {
-            slice::from_raw_parts(self.data_ptr() as *const RowID, self.header.count as usize)
-        }
+        self.data_slice(self.header.count as usize)
     }
 
     #[inline]
     pub fn leaf_start_row_ids_mut(&mut self) -> &mut [RowID] {
         debug_assert!(self.is_leaf());
-        unsafe {
-            slice::from_raw_parts_mut(
-                self.data_ptr_mut() as *mut RowID,
-                self.header.count as usize,
-            )
-        }
+        self.data_slice_mut(self.header.count as usize)
     }
 
     #[inline]
     pub fn leaf_payloads(&self) -> &[ColumnPagePayload] {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
-        let payload_ptr = unsafe {
-            self.data_ptr().add(count * mem::size_of::<RowID>()) as *const ColumnPagePayload
-        };
-        unsafe { slice::from_raw_parts(payload_ptr, count) }
+        // SAFETY: payload region starts after `count` RowID entries.
+        unsafe { slice::from_raw_parts(self.leaf_payload_ptr(count), count) }
     }
 
     #[inline]
     pub fn leaf_payloads_mut(&mut self) -> &mut [ColumnPagePayload] {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
-        let payload_ptr = unsafe {
-            self.data_ptr_mut().add(count * mem::size_of::<RowID>()) as *mut ColumnPagePayload
-        };
-        unsafe { slice::from_raw_parts_mut(payload_ptr, count) }
+        // SAFETY: payload region starts after `count` RowID entries.
+        unsafe { slice::from_raw_parts_mut(self.leaf_payload_ptr_mut(count), count) }
     }
 
     #[inline]
     pub fn leaf_arrays_mut(&mut self) -> (&mut [RowID], &mut [ColumnPagePayload]) {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
-        let row_ptr = self.data_ptr_mut() as *mut RowID;
-        let payload_ptr = unsafe {
-            self.data_ptr_mut().add(count * mem::size_of::<RowID>()) as *mut ColumnPagePayload
-        };
+        let data_ptr = self.data_ptr_mut();
+        let row_ptr = data_ptr as *mut RowID;
+        let payload_ptr =
+            unsafe { data_ptr.add(count * mem::size_of::<RowID>()) as *mut ColumnPagePayload };
+        // SAFETY: row-id and payload regions are disjoint contiguous ranges.
         unsafe {
             (
                 slice::from_raw_parts_mut(row_ptr, count),
@@ -159,23 +149,13 @@ impl ColumnBlockNode {
     #[inline]
     pub fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
         debug_assert!(self.is_branch());
-        unsafe {
-            slice::from_raw_parts(
-                self.data_ptr() as *const ColumnBlockBranchEntry,
-                self.header.count as usize,
-            )
-        }
+        self.data_slice(self.header.count as usize)
     }
 
     #[inline]
     pub fn branch_entries_mut(&mut self) -> &mut [ColumnBlockBranchEntry] {
         debug_assert!(self.is_branch());
-        unsafe {
-            slice::from_raw_parts_mut(
-                self.data_ptr_mut() as *mut ColumnBlockBranchEntry,
-                self.header.count as usize,
-            )
-        }
+        self.data_slice_mut(self.header.count as usize)
     }
 
     #[inline]
@@ -188,6 +168,32 @@ impl ColumnBlockNode {
             start_row_id,
             page_id,
         };
+    }
+
+    #[inline]
+    fn data_slice<T>(&self, count: usize) -> &[T] {
+        // SAFETY: caller guarantees node layout for `T` and bounds by `count`.
+        unsafe { slice::from_raw_parts(self.data_ptr() as *const T, count) }
+    }
+
+    #[inline]
+    fn data_slice_mut<T>(&mut self, count: usize) -> &mut [T] {
+        // SAFETY: caller guarantees node layout for `T` and bounds by `count`.
+        unsafe { slice::from_raw_parts_mut(self.data_ptr_mut() as *mut T, count) }
+    }
+
+    #[inline]
+    fn leaf_payload_ptr(&self, count: usize) -> *const ColumnPagePayload {
+        // SAFETY: offset is within `data` and aligned for repr(C) payload access.
+        unsafe { self.data_ptr().add(count * mem::size_of::<RowID>()) as *const ColumnPagePayload }
+    }
+
+    #[inline]
+    fn leaf_payload_ptr_mut(&mut self, count: usize) -> *mut ColumnPagePayload {
+        // SAFETY: offset is within `data` and aligned for repr(C) payload access.
+        unsafe {
+            self.data_ptr_mut().add(count * mem::size_of::<RowID>()) as *mut ColumnPagePayload
+        }
     }
 }
 
