@@ -14,6 +14,7 @@ use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
 use crate::latch::{HybridGuard, HybridLatch, LatchFallbackMode};
 use crate::row::{INVALID_ROW_ID, RowID, RowPage};
 use crate::trx::sys::TransactionSystem;
+use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use either::Either::{self, Left, Right};
 use parking_lot::Mutex;
 use std::cell::UnsafeCell;
@@ -40,6 +41,16 @@ const _: () = assert!(
 const _: () = assert!(
     { BLOCK_HEADER_SIZE + NBR_PAGE_ENTRIES_IN_LEAF * ENTRY_SIZE <= BLOCK_PAGE_SIZE },
     "Size of leaf node of BlockIndex can be at most 64KB"
+);
+
+const _: () = assert!(
+    { BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<PageEntry>()) },
+    "BlockNode data area must align with PageEntry alignment"
+);
+
+const _: () = assert!(
+    { mem::size_of::<PageEntry>() == ENTRY_SIZE },
+    "ENTRY_SIZE must match PageEntry size"
 );
 
 /// BlockNode is B-Tree node of block index.
@@ -85,16 +96,6 @@ impl BlockNode {
         !self.is_leaf()
     }
 
-    #[inline]
-    fn data_ptr<T>(&self) -> *const T {
-        self.data.as_ptr() as *const _
-    }
-
-    #[inline]
-    fn data_ptr_mut<T>(&mut self) -> *mut T {
-        self.data.as_mut_ptr() as *mut _
-    }
-
     /* branch methods */
 
     /// Returns whether the branch node is full.
@@ -115,14 +116,14 @@ impl BlockNode {
     #[inline]
     pub fn branch_entries(&self) -> &[PageEntry] {
         debug_assert!(self.is_branch());
-        self.data_slice(self.header.count as usize)
+        self.entries(self.header.count as usize)
     }
 
     /// Returns mutable entry slice in branch node.
     #[inline]
     pub fn branch_entries_mut(&mut self) -> &mut [PageEntry] {
         debug_assert!(self.is_branch());
-        self.data_slice_mut(self.header.count as usize)
+        self.entries_mut(self.header.count as usize)
     }
 
     /// Returns entry in branch node by given index.
@@ -176,7 +177,7 @@ impl BlockNode {
     #[inline]
     pub fn leaf_entries(&self) -> &[PageEntry] {
         debug_assert!(self.is_leaf());
-        self.data_slice(self.header.count as usize)
+        self.entries(self.header.count as usize)
     }
 
     /// Returns entry in leaf node by given index.
@@ -204,7 +205,7 @@ impl BlockNode {
     #[inline]
     pub fn leaf_entries_mut(&mut self) -> &mut [PageEntry] {
         debug_assert!(self.is_leaf());
-        self.data_slice_mut(self.header.count as usize)
+        self.entries_mut(self.header.count as usize)
     }
 
     /// Add a new entry in leaf node.
@@ -220,16 +221,15 @@ impl BlockNode {
     }
 
     #[inline]
-    fn data_slice<T>(&self, len: usize) -> &[T] {
-        // SAFETY: `BlockNode` stores packed `PageEntry` arrays in `data`.
-        // Callers guarantee `T` layout/length by node type and count checks.
-        unsafe { std::slice::from_raw_parts(self.data_ptr(), len) }
+    fn entries(&self, len: usize) -> &[PageEntry] {
+        let bytes_len = len * mem::size_of::<PageEntry>();
+        cast_slice(&self.data[..bytes_len])
     }
 
     #[inline]
-    fn data_slice_mut<T>(&mut self, len: usize) -> &mut [T] {
-        // SAFETY: same invariant as `data_slice`, plus caller holds `&mut self`.
-        unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), len) }
+    fn entries_mut(&mut self, len: usize) -> &mut [PageEntry] {
+        let bytes_len = len * mem::size_of::<PageEntry>();
+        cast_slice_mut(&mut self.data[..bytes_len])
     }
 }
 
@@ -250,7 +250,7 @@ pub struct BlockNodeHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct PageEntry {
     pub row_id: RowID,
     pub page_id: PageID,
