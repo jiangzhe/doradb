@@ -214,13 +214,7 @@ impl OwnedRowUndo {
 
     #[inline]
     pub fn leak(&self) -> RowUndoRef {
-        // SAFETY: `Box<RowUndo>` is non-null and stable in memory until transaction-level
-        // GC reclaims the owning `OwnedRowUndo`.
-        unsafe {
-            RowUndoRef(NonNull::new_unchecked(
-                self.0.as_ref() as *const _ as *mut RowUndo
-            ))
-        }
+        RowUndoRef(NonNull::from(self.0.as_ref()))
     }
 }
 
@@ -268,8 +262,7 @@ impl RowUndoRef {
 impl Clone for RowUndoRef {
     #[inline]
     fn clone(&self) -> Self {
-        // SAFETY: cloning preserves the same non-null pointer and ownership model.
-        RowUndoRef(unsafe { NonNull::new_unchecked(self.0.as_ptr()) })
+        RowUndoRef(self.0)
     }
 }
 

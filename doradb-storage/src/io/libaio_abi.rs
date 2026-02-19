@@ -1,5 +1,4 @@
 use libc::{c_int, c_long, timespec};
-use std::alloc::{Layout, alloc};
 
 #[allow(non_camel_case_types)]
 pub enum io_iocb_cmd {
@@ -34,25 +33,25 @@ pub struct iocb {
 }
 
 impl iocb {
-    /// Created a new heap-allocated iocb.
-    /// The returned pointer is leaked.
-    /// That means caller can use Box::from_raw() to
-    /// regain the ownership and drop it.
-    ///
-    /// # Safety
-    ///
-    /// Memory is manually allocated. Caller should
-    /// guarantee it's valid during syscall, and has
-    /// to release it once IO is done.
+    /// Creates an owned iocb allocated on heap.
     #[inline]
-    pub unsafe fn alloc<'a>() -> &'a mut Self {
-        unsafe {
-            const LAYOUT: Layout = Layout::new::<iocb>();
-            let ptr = alloc(LAYOUT) as *mut Self;
-            let this = &mut *ptr;
-            this.init();
-            this
-        }
+    pub fn boxed() -> Box<Self> {
+        let mut this = Box::new(iocb {
+            data: 0,
+            key: 0,
+            _aio_rw_flags: 0,
+            aio_lio_opcode: io_iocb_cmd::IO_CMD_NOOP as u16,
+            aio_reqprio: 0,
+            aio_fildes: !0,
+            buf: std::ptr::null_mut(),
+            count: 0,
+            offset: 0,
+            _padding: 0,
+            flags: 0,
+            resfd: 0,
+        });
+        this.init();
+        this
     }
 
     #[inline]
@@ -69,6 +68,11 @@ impl iocb {
         self._padding = 0;
         self.flags = 0;
         self.resfd = 0;
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut iocb {
+        self as *const _ as *mut _
     }
 }
 

@@ -140,6 +140,7 @@ impl EvictableBufferPool {
                             kind: IOKind::Read,
                             event: Some(event),
                             page_guard: None, // will update later
+                            uio: None,
                         });
                         self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
                         let _ = self
@@ -501,10 +502,11 @@ impl AIOEventListener for EvictableBufferPoolListener {
                 debug_assert!(self.inflight_io.contains(page_id));
                 debug_assert!(page_guard.bf().kind() == FrameKind::Evicted);
                 let uio = self.file_io.prepare_read(page_id, page_guard.page_mut());
-                let iocb = uio.iocb().load(Ordering::Relaxed);
+                let iocb = uio.iocb_raw();
                 let sub = PageIO {
                     page_guard,
                     kind: IOKind::Read,
+                    uio,
                 };
                 queue.push(iocb, sub);
             }
@@ -514,10 +516,11 @@ impl AIOEventListener for EvictableBufferPoolListener {
                     debug_assert!(self.inflight_io.contains(page_id));
                     debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
                     let uio = self.file_io.prepare_write(page_id, page_guard.page_mut());
-                    let iocb = uio.iocb().load(Ordering::Relaxed);
+                    let iocb = uio.iocb_raw();
                     let req = PageIO {
                         page_guard,
                         kind: IOKind::Write,
+                        uio,
                     };
                     queue.push(iocb, req);
                 }
@@ -530,7 +533,7 @@ impl AIOEventListener for EvictableBufferPoolListener {
         // attach page guard to inflight map so
         // other thread can not acquire exlusive lock when
         // IO is being performed.
-        let res = self.inflight_io.attach_page_guard(sub.page_guard);
+        let res = self.inflight_io.attach_page_io(sub);
         debug_assert!(res);
     }
 
@@ -543,6 +546,7 @@ impl AIOEventListener for EvictableBufferPoolListener {
                 debug_assert!(len == PAGE_SIZE);
                 let mut g = self.inflight_io.map.lock();
                 let mut status = g.remove(&page_id).unwrap();
+                let _uio = status.uio.take().unwrap();
                 let page_guard = status.page_guard.take().unwrap();
                 let bf = page_guard.bf();
                 match status.kind {
@@ -1234,6 +1238,7 @@ struct IOStatus {
     kind: IOKind,
     event: Option<Event>,
     page_guard: Option<PageExclusiveGuard<Page>>,
+    uio: Option<UnsafeAIO>,
 }
 
 struct InflightIO {
@@ -1278,6 +1283,7 @@ impl InflightIO {
                             kind: IOKind::ReadWaitForWrite,
                             event: Some(event),
                             page_guard: None, // will update later.
+                            uio: None,
                         });
                         drop(g); // explicit drop guard before await.
                         listener.await;
@@ -1317,6 +1323,7 @@ impl InflightIO {
                         kind: IOKind::Write,
                         event: None,
                         page_guard: None, // will update later.
+                        uio: None,
                     });
                 }
                 Entry::Occupied(mut occ) => {
@@ -1331,11 +1338,18 @@ impl InflightIO {
     }
 
     #[inline]
-    fn attach_page_guard(&self, page_guard: PageExclusiveGuard<Page>) -> bool {
+    fn attach_page_io(&self, page_io: PageIO) -> bool {
+        let PageIO {
+            page_guard,
+            uio,
+            kind: _,
+        } = page_io;
         let page_id = page_guard.page_id();
         let mut g = self.map.lock();
         if let Some(status) = g.get_mut(&page_id) {
             let res = status.page_guard.replace(page_guard);
+            debug_assert!(res.is_none());
+            let res = status.uio.replace(uio);
             debug_assert!(res.is_none());
             return true;
         }

@@ -65,7 +65,7 @@ fn worker(id: usize, aio_mgr: &'static AIOContext, args: Args, stop: Arc<AtomicB
             let buf = DirectBuf::zeroed(args.max_io_size);
             let (offset, _) = file.alloc(buf.capacity()).unwrap();
             let aio = file.pwrite_direct(id, offset, buf);
-            reqs.push(aio.iocb().load(Ordering::Relaxed));
+            reqs.push(aio.iocb_raw());
             inflight.insert(aio.key, aio);
         }
         let submit_count = aio_mgr.submit_limit(&reqs, usize::MAX);

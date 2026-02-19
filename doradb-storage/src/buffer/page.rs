@@ -1,5 +1,6 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
+use crate::io::UnsafeAIO;
 use std::mem;
 
 pub const PAGE_SIZE: usize = 64 * 1024;
@@ -61,6 +62,7 @@ pub enum IOKind {
 pub struct PageIO {
     pub page_guard: PageExclusiveGuard<Page>,
     pub kind: IOKind,
+    pub uio: UnsafeAIO,
 }
 
 /// Convenient for IO thread to process, no matter

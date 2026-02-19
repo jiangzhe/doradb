@@ -401,7 +401,7 @@ impl AIOEventListener for FileIOListener {
             AIOKind::Read => pread_direct(key, req.fd, req.offset, buf),
             AIOKind::Write => pwrite_direct(key, req.fd, req.offset, buf),
         };
-        let iocb = aio.iocb().load(Ordering::Relaxed);
+        let iocb = aio.iocb_raw();
         *g = FileIOState::Running(aio);
         drop(g);
         queue.push(iocb, req);
