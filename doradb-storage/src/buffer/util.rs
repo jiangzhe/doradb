@@ -1,6 +1,7 @@
-use crate::buffer::frame::BufferFrame;
+use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::BufferPage;
+use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID};
 use crate::error::{Error, Result};
 use crate::ptr::UnsafePtr;
 use libc::{
@@ -8,13 +9,86 @@ use libc::{
     MAP_PRIVATE, PROT_READ, PROT_WRITE, c_void, madvise, mmap, munmap,
 };
 
-#[inline]
-pub(super) fn init_bf_exclusive_guard<T: BufferPage>(
-    bf: UnsafePtr<BufferFrame>,
-) -> PageExclusiveGuard<T> {
-    unsafe {
-        let g = (*bf.0).latch.try_exclusive().unwrap();
-        FacadePageGuard::new(bf, g).must_exclusive()
+pub(super) struct BufferFrames(pub(super) *mut BufferFrame);
+
+impl BufferFrames {
+    #[inline]
+    pub(super) fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
+        // SAFETY: frame memory is allocated as a contiguous mmap region and indexed by page id.
+        unsafe { UnsafePtr(self.0.add(page_id as usize)) }
+    }
+
+    #[inline]
+    pub(super) fn frame(&self, page_id: PageID) -> &BufferFrame {
+        Self::frame_ref(self.frame_ptr(page_id))
+    }
+
+    #[inline]
+    pub(super) fn frame_kind(&self, page_id: PageID) -> FrameKind {
+        Self::frame_ref(self.frame_ptr(page_id)).kind()
+    }
+
+    #[inline]
+    pub(super) fn init_page<T: BufferPage>(
+        &'static self,
+        page_id: PageID,
+    ) -> PageExclusiveGuard<T> {
+        let bf = self.frame_ptr(page_id);
+        let mut guard = {
+            let g = Self::frame_ref(bf.clone()).latch.try_exclusive().unwrap();
+            Self::frame_ref(bf.clone()).bump_generation();
+            FacadePageGuard::<T>::new(bf.clone(), g).must_exclusive()
+        };
+        Self::with_frame_mut(bf, &mut guard, |frame| {
+            frame.page_id = page_id;
+            frame.ctx = None;
+            T::init_frame(frame);
+            frame.next_free = INVALID_PAGE_ID;
+            frame.set_dirty(true);
+        });
+        guard.page_mut().zero();
+        guard
+    }
+
+    #[inline]
+    pub(super) fn compare_exchange_frame_kind(
+        &self,
+        page_id: PageID,
+        old_kind: FrameKind,
+        new_kind: FrameKind,
+    ) -> FrameKind {
+        Self::frame_ref(self.frame_ptr(page_id)).compare_exchange_kind(old_kind, new_kind)
+    }
+
+    #[inline]
+    pub(super) fn try_lock_page_exclusive(
+        &self,
+        page_id: PageID,
+    ) -> Option<PageExclusiveGuard<Page>> {
+        let bf = self.frame_ptr(page_id);
+        let frame = Self::frame_ref(bf.clone());
+        frame
+            .latch
+            .try_exclusive()
+            .map(|g| FacadePageGuard::new(bf, g).must_exclusive())
+    }
+
+    #[inline]
+    pub(super) fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
+        debug_assert!(!ptr.0.is_null());
+        // SAFETY: `ptr` comes from `frame_ptr` and points into the pool-owned frame array.
+        unsafe { &*ptr.0 }
+    }
+
+    #[inline]
+    pub(super) fn with_frame_mut<T: 'static, R>(
+        bf: UnsafePtr<BufferFrame>,
+        guard: &mut PageExclusiveGuard<T>,
+        f: impl FnOnce(&mut BufferFrame) -> R,
+    ) -> R {
+        let frame = guard.bf_mut();
+        debug_assert_eq!(frame as *mut BufferFrame, bf.0);
+        f(frame)
     }
 }
 

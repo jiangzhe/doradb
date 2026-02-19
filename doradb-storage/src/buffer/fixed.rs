@@ -2,13 +2,12 @@ use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, Page, PageID, VersionedPageID};
-use crate::buffer::util::{init_bf_exclusive_guard, mmap_allocate, mmap_deallocate};
+use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
+use crate::buffer::util::{BufferFrames, mmap_allocate, mmap_deallocate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
-use crate::ptr::UnsafePtr;
 use std::mem;
 
 pub const SAFETY_PAGES: usize = 10;
@@ -16,7 +15,7 @@ pub const SAFETY_PAGES: usize = 10;
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
 /// does not support swap/evict.
 pub struct FixedBufferPool {
-    frames: *mut BufferFrame,
+    frames: BufferFrames,
     pages: *mut Page,
     size: usize,
     // free_list: Mutex<PageID>,
@@ -55,7 +54,7 @@ impl FixedBufferPool {
             }
         }
         Ok(FixedBufferPool {
-            frames,
+            frames: BufferFrames(frames),
             pages,
             size,
             alloc_map: AllocMap::new(size),
@@ -82,8 +81,11 @@ impl FixedBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
-        let bf = self.frame_ptr(page_id);
-        let g = frame_ref(bf.clone()).latch.optimistic_fallback(mode).await;
+        let bf = self.frames.frame_ptr(page_id);
+        let g = BufferFrames::frame_ref(bf.clone())
+            .latch
+            .optimistic_fallback(mode)
+            .await;
         FacadePageGuard::new(bf, g)
     }
 
@@ -100,33 +102,25 @@ impl FixedBufferPool {
 
     #[inline]
     fn get_page_spin_internal<T: 'static>(&'static self, page_id: PageID) -> FacadePageGuard<T> {
-        let bf = self.frame_ptr(page_id);
-        let g = frame_ref(bf.clone()).latch.optimistic_spin();
+        let bf = self.frames.frame_ptr(page_id);
+        let g = BufferFrames::frame_ref(bf.clone()).latch.optimistic_spin();
         FacadePageGuard::new(bf, g)
     }
 
-    #[inline]
-    fn frame_ptr(&'static self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        debug_assert!((page_id as usize) < self.size);
-        // SAFETY: `page_id` is validated by allocation map checks and pool capacity.
-        unsafe { UnsafePtr(self.frames.add(page_id as usize)) }
-    }
-
-    #[inline]
-    fn allocate_internal<T: BufferPage>(&'static self, page_id: PageID) -> PageExclusiveGuard<T> {
-        let bf = self.frame_ptr(page_id);
-        frame_ref(bf.clone()).bump_generation();
-        let mut g = init_bf_exclusive_guard::<T>(bf.clone());
-        with_frame_mut(bf, &mut g, |frame| {
-            frame.page_id = page_id;
-            frame.ctx = None;
-            T::init_frame(frame);
-            frame.next_free = INVALID_PAGE_ID;
-            frame.set_dirty(true);
-        });
-        g.page_mut().zero();
-        g
-    }
+    // #[inline]
+    // fn allocate_internal<T: BufferPage>(&'static self, page_id: PageID) -> PageExclusiveGuard<T> {
+    //     let bf = self.frames.frame_ptr(page_id);
+    //     let mut g = BufferFrames::init_bf_exclusive_guard::<T>(bf.clone());
+    //     with_frame_mut(bf, &mut g, |frame| {
+    //         frame.page_id = page_id;
+    //         frame.ctx = None;
+    //         T::init_frame(frame);
+    //         frame.next_free = INVALID_PAGE_ID;
+    //         frame.set_dirty(true);
+    //     });
+    //     g.page_mut().zero();
+    //     g
+    // }
 }
 
 impl BufferPool for FixedBufferPool {
@@ -144,7 +138,7 @@ impl BufferPool for FixedBufferPool {
     #[inline]
     async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
         match self.alloc_map.try_allocate() {
-            Some(page_id) => self.allocate_internal(page_id as PageID),
+            Some(page_id) => self.frames.init_page(page_id as PageID),
             None => {
                 panic!("buffer pool full");
             }
@@ -157,7 +151,7 @@ impl BufferPool for FixedBufferPool {
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
         if self.alloc_map.allocate_at(page_id as usize) {
-            Ok(self.allocate_internal(page_id as PageID))
+            Ok(self.frames.init_page(page_id as PageID))
         } else {
             Err(Error::BufferPageAlreadyAllocated)
         }
@@ -247,13 +241,13 @@ impl Drop for FixedBufferPool {
             // in the frame.
             for allocated_range in self.alloc_map.allocated_ranges() {
                 for page_id in allocated_range {
-                    let frame_ptr = self.frames.add(page_id);
+                    let frame_ptr = self.frames.0.add(page_id);
                     std::ptr::drop_in_place(frame_ptr);
                 }
             }
             // Deallocate memory of frames.
             let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.size + SAFETY_PAGES);
-            mmap_deallocate(self.frames as *mut u8, frame_total_bytes);
+            mmap_deallocate(self.frames.0 as *mut u8, frame_total_bytes);
             // Deallocate memory of pages.
             let page_total_bytes = mem::size_of::<Page>() * (self.size + SAFETY_PAGES);
             mmap_deallocate(self.pages as *mut u8, page_total_bytes);
@@ -266,24 +260,6 @@ unsafe impl Send for FixedBufferPool {}
 unsafe impl Sync for FixedBufferPool {}
 
 unsafe impl StaticLifetime for FixedBufferPool {}
-
-#[inline]
-fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
-    debug_assert!(!ptr.0.is_null());
-    // SAFETY: pointers are produced from the pool's mmap-allocated frame region.
-    unsafe { &*ptr.0 }
-}
-
-#[inline]
-fn with_frame_mut<T: 'static, R>(
-    bf: UnsafePtr<BufferFrame>,
-    guard: &mut PageExclusiveGuard<T>,
-    f: impl FnOnce(&mut BufferFrame) -> R,
-) -> R {
-    let frame = guard.bf_mut();
-    debug_assert_eq!(frame as *mut BufferFrame, bf.0);
-    f(frame)
-}
 
 #[cfg(test)]
 mod tests {
