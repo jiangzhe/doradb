@@ -667,16 +667,6 @@ impl BTreeNode {
         self.body.as_ptr()
     }
 
-    #[inline]
-    unsafe fn body_end(&self) -> *const u8 {
-        unsafe { self.body().add(mem::size_of::<BTreeBody>()) }
-    }
-
-    #[inline]
-    unsafe fn body_end_mut(&mut self) -> *mut u8 {
-        unsafe { self.body_mut().add(mem::size_of::<BTreeBody>()) }
-    }
-
     /// Returns mutable start pointer of body.
     #[inline]
     fn body_mut(&mut self) -> *mut u8 {
@@ -765,16 +755,16 @@ impl BTreeNode {
     /// The common prefix is stored at end of the node.
     #[inline]
     pub fn common_prefix(&self) -> &[u8] {
-        unsafe {
-            let len = self.header.prefix_len as usize;
-            if len == 0 {
-                return &[];
-            }
-            if len <= INLINE_PREFIX_LEN {
-                return &self.header.inline_prefix[..len];
-            }
-            std::slice::from_raw_parts(self.body_end().sub(len), len)
+        let len = self.header.prefix_len as usize;
+        if len == 0 {
+            return &[];
         }
+        if len <= INLINE_PREFIX_LEN {
+            return &self.header.inline_prefix[..len];
+        }
+        debug_assert!(len <= self.body.len());
+        let start = self.body.len() - len;
+        &self.body[start..]
     }
 
     #[inline]
@@ -789,10 +779,9 @@ impl BTreeNode {
             return;
         }
         // not inline, stored at end of page.
-        unsafe {
-            let dst = self.body_end_mut().sub(l);
-            std::ptr::copy_nonoverlapping(common_prefix.as_ptr(), dst, l);
-        }
+        debug_assert!(l <= self.body.len());
+        let start = self.body.len() - l;
+        self.body[start..].copy_from_slice(common_prefix);
         self.header.end_offset -= l as u16;
         self.header.effective_space += l as u32;
     }
