@@ -1,14 +1,13 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
-use crate::buffer::frame::{BufferFrame, FrameKind};
+use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, Page, PageID, VersionedPageID};
-use crate::buffer::util::{init_bf_exclusive_guard, mmap_allocate, mmap_deallocate};
+use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
+use crate::buffer::util::{mmap_allocate, mmap_deallocate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
-use crate::ptr::UnsafePtr;
 use std::mem;
 
 pub const SAFETY_PAGES: usize = 10;
@@ -16,7 +15,7 @@ pub const SAFETY_PAGES: usize = 10;
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
 /// does not support swap/evict.
 pub struct FixedBufferPool {
-    frames: *mut BufferFrame,
+    frames: BufferFrames,
     pages: *mut Page,
     size: usize,
     // free_list: Mutex<PageID>,
@@ -55,7 +54,7 @@ impl FixedBufferPool {
             }
         }
         Ok(FixedBufferPool {
-            frames,
+            frames: BufferFrames(frames),
             pages,
             size,
             alloc_map: AllocMap::new(size),
@@ -82,11 +81,12 @@ impl FixedBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
-        unsafe {
-            let bf = self.get_frame(page_id);
-            let g = (*bf.0).latch.optimistic_fallback(mode).await;
-            FacadePageGuard::new(bf, g)
-        }
+        let bf = self.frames.frame_ptr(page_id);
+        let g = BufferFrames::frame_ref(bf.clone())
+            .latch
+            .optimistic_fallback(mode)
+            .await;
+        FacadePageGuard::new(bf, g)
     }
 
     /// Since all pages are kept in memory, we can use spin mode to eliminate
@@ -102,46 +102,9 @@ impl FixedBufferPool {
 
     #[inline]
     fn get_page_spin_internal<T: 'static>(&'static self, page_id: PageID) -> FacadePageGuard<T> {
-        unsafe {
-            let bf = self.get_frame(page_id);
-            let g = (*bf.0).latch.optimistic_spin();
-            FacadePageGuard::new(bf, g)
-        }
-    }
-
-    #[inline]
-    unsafe fn get_new_frame(&'static self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        unsafe {
-            let bf_ptr = self.frames.offset(page_id as isize);
-            UnsafePtr(bf_ptr)
-        }
-    }
-
-    #[inline]
-    unsafe fn get_frame(&'static self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        unsafe {
-            let bf_ptr = self.frames.offset(page_id as isize);
-            UnsafePtr(bf_ptr)
-        }
-    }
-
-    #[inline]
-    unsafe fn allocate_internal<T: BufferPage>(
-        &'static self,
-        page_id: PageID,
-    ) -> PageExclusiveGuard<T> {
-        unsafe {
-            let bf = self.get_new_frame(page_id as PageID);
-            (*bf.0).page_id = page_id as PageID;
-            let mut g = init_bf_exclusive_guard::<T>(bf);
-            g.bf_mut().ctx = None;
-            T::init_frame(g.bf_mut());
-            g.bf_mut().bump_generation();
-            g.bf_mut().next_free = INVALID_PAGE_ID;
-            g.bf_mut().set_dirty(true);
-            g.page_mut().zero();
-            g
-        }
+        let bf = self.frames.frame_ptr(page_id);
+        let g = BufferFrames::frame_ref(bf.clone()).latch.optimistic_spin();
+        FacadePageGuard::new(bf, g)
     }
 }
 
@@ -160,7 +123,7 @@ impl BufferPool for FixedBufferPool {
     #[inline]
     async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
         match self.alloc_map.try_allocate() {
-            Some(page_id) => unsafe { self.allocate_internal(page_id as PageID) },
+            Some(page_id) => self.frames.init_page(page_id as PageID),
             None => {
                 panic!("buffer pool full");
             }
@@ -173,7 +136,7 @@ impl BufferPool for FixedBufferPool {
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
         if self.alloc_map.allocate_at(page_id as usize) {
-            Ok(unsafe { self.allocate_internal(page_id as PageID) })
+            Ok(self.frames.init_page(page_id as PageID))
         } else {
             Err(Error::BufferPageAlreadyAllocated)
         }
@@ -231,7 +194,7 @@ impl BufferPool for FixedBufferPool {
     /// id concurrently, and the input page id may not be valid through the function
     /// call. So version must be validated before returning the buffer frame.
     #[inline]
-    async fn get_child_page<T>(
+    async fn get_child_page<T: BufferPage>(
         &'static self,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
@@ -263,13 +226,13 @@ impl Drop for FixedBufferPool {
             // in the frame.
             for allocated_range in self.alloc_map.allocated_ranges() {
                 for page_id in allocated_range {
-                    let frame_ptr = self.frames.add(page_id);
+                    let frame_ptr = self.frames.0.add(page_id);
                     std::ptr::drop_in_place(frame_ptr);
                 }
             }
             // Deallocate memory of frames.
             let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.size + SAFETY_PAGES);
-            mmap_deallocate(self.frames as *mut u8, frame_total_bytes);
+            mmap_deallocate(self.frames.0 as *mut u8, frame_total_bytes);
             // Deallocate memory of pages.
             let page_total_bytes = mem::size_of::<Page>() * (self.size + SAFETY_PAGES);
             mmap_deallocate(self.pages as *mut u8, page_total_bytes);

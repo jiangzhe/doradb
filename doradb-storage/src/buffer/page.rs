@@ -22,7 +22,7 @@ pub const INVALID_PAGE_ID: PageID = !0;
 /// exist.
 /// Additionally, this type should not impl Drop because we
 /// don't expect to drop it when it is swapped to disk.
-pub trait BufferPage: Sized + 'static {
+pub trait BufferPage: Sized + Send + Sync + 'static {
     /// zero the page.
     /// Default implementation is to zero all bytes.
     #[inline]

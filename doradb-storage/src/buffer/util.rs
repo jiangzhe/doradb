@@ -1,22 +1,8 @@
-use crate::buffer::frame::BufferFrame;
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::BufferPage;
 use crate::error::{Error, Result};
-use crate::ptr::UnsafePtr;
 use libc::{
     MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MADV_REMOVE, MAP_ANONYMOUS, MAP_FAILED,
     MAP_PRIVATE, PROT_READ, PROT_WRITE, c_void, madvise, mmap, munmap,
 };
-
-#[inline]
-pub(super) fn init_bf_exclusive_guard<T: BufferPage>(
-    bf: UnsafePtr<BufferFrame>,
-) -> PageExclusiveGuard<T> {
-    unsafe {
-        let g = (*bf.0).latch.try_exclusive().unwrap();
-        FacadePageGuard::new(bf, g).must_exclusive()
-    }
-}
 
 #[inline]
 pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {

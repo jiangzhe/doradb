@@ -2,7 +2,7 @@ description = "quick review on current code change"
 prompt = """
 ## Goal
 
-Quickly review the current code change using `git --no-pager diff`.
+Quickly review the current code change using `git --no-pager diff origin/main`.
 brief description of the change (may not be provided): {{args}}
 
 ## Workflow

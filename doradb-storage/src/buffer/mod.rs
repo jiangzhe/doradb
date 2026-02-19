@@ -59,7 +59,7 @@ pub trait BufferPool: Send + Sync + StaticLifetime + 'static {
     /// This method is used for tree-like data structure with lock coupling support.
     /// The implementation has to validate the parent page when child page is returned,
     /// to ensure no change happens in-between.
-    fn get_child_page<T>(
+    fn get_child_page<T: BufferPage>(
         &'static self,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,

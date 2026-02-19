@@ -11,7 +11,6 @@ use crate::value::*;
 use ordered_float::OrderedFloat;
 use std::fmt;
 use std::mem;
-use std::slice;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 pub type RowID = u64;
@@ -521,7 +520,7 @@ impl RowPage {
             }
             ValKind::VarByte => {
                 let b: [u8; 8] = bs.try_into().unwrap();
-                let var = bytemuck::cast::<[u8; 8], PageVar>(b);
+                let var = PageVar::from_u64(u64::from_ne_bytes(b));
                 Val::VarByte(MemVar::from(var.as_bytes(self.data())))
             }
         }
@@ -718,18 +717,12 @@ impl RowPage {
 
     #[inline]
     pub(crate) fn update_var(&self, row_idx: usize, col_idx: usize, var: PageVar) {
-        debug_assert!(mem::size_of::<PageVar>() == mem::size_of::<u64>());
-        self.update_val::<u64>(row_idx, col_idx, unsafe {
-            mem::transmute::<PageVar, u64>(var)
-        });
+        self.update_val::<u64>(row_idx, col_idx, var.into_u64());
     }
 
     #[inline]
     pub(crate) fn update_var_exclusive(&mut self, row_idx: usize, col_idx: usize, var: PageVar) {
-        debug_assert!(mem::size_of::<PageVar>() == mem::size_of::<u64>());
-        self.update_val_exclusive::<u64>(row_idx, col_idx, unsafe {
-            mem::transmute::<PageVar, u64>(var)
-        });
+        self.update_val_exclusive::<u64>(row_idx, col_idx, var.into_u64());
     }
 
     #[inline]
@@ -738,17 +731,7 @@ impl RowPage {
         if len <= PAGE_VAR_LEN_INLINE {
             return (PageVar::inline(input), var_offset);
         }
-        // SAFETY:
-        //
-        // copy data to given offset.
-        // this is safe because we atomically assign space for var-len data
-        // so that no conflict will occur when modifing the allocated memory area.
-        // for read, row lock will protect all row data.
-        unsafe {
-            let ptr = (&self.data()[var_offset]) as *const u8;
-            let target = slice::from_raw_parts_mut(ptr as *mut _, len);
-            target.copy_from_slice(input);
-        }
+        self.copy_var_bytes(var_offset, input);
         (
             PageVar::outline(len as u16, var_offset as u16, &input[..PAGE_VAR_LEN_PREFIX]),
             var_offset + len,
@@ -986,6 +969,17 @@ impl RowPage {
         bytemuck::cast_slice_mut::<u8, u16>(
             &mut self.data_mut()[offset..offset + col_count * mem::size_of::<u16>()],
         )
+    }
+
+    #[inline]
+    fn copy_var_bytes(&self, offset: usize, input: &[u8]) {
+        debug_assert!(offset + input.len() <= self.data().len());
+        // SAFETY: caller reserves and bounds-checks the destination range before writing.
+        // Row/page lock protocol ensures no conflicting writer touches this range.
+        unsafe {
+            let dst = self.data().as_ptr().add(offset) as *mut u8;
+            std::ptr::copy_nonoverlapping(input.as_ptr(), dst, input.len());
+        }
     }
 }
 

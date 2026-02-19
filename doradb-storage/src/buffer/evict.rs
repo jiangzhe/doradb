@@ -1,13 +1,11 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
-use crate::buffer::frame::{BufferFrame, FrameKind};
+use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{
     BufferPage, INVALID_PAGE_ID, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID,
 };
-use crate::buffer::util::{
-    init_bf_exclusive_guard, madvise_dontneed, mmap_allocate, mmap_deallocate,
-};
+use crate::buffer::util::{madvise_dontneed, mmap_allocate, mmap_deallocate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -17,7 +15,6 @@ use crate::io::{
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::lifetime::StaticLifetime;
-use crate::ptr::UnsafePtr;
 use crate::thread;
 use byte_unit::Byte;
 use event_listener::{Event, Listener, listener};
@@ -97,7 +94,7 @@ impl EvictableBufferPool {
     #[inline]
     async fn try_wait_for_io_write(&self, page_id: PageID) {
         self.inflight_io
-            .wait_for_write(page_id, unsafe { self.frames.frame(page_id) })
+            .wait_for_write(page_id, self.frames.frame(page_id))
             .await
     }
 
@@ -233,14 +230,14 @@ impl BufferPool for EvictableBufferPool {
             match self.alloc_map.try_allocate() {
                 Some(page_id) => {
                     self.in_mem.pin(page_id as PageID);
-                    return unsafe { self.frames.init_page(page_id as PageID) };
+                    return self.frames.init_page(page_id as PageID);
                 }
                 None => {
                     listener!(self.alloc_ev => listener);
                     // re-check
                     if let Some(page_id) = self.alloc_map.try_allocate() {
                         self.in_mem.pin(page_id as PageID);
-                        return unsafe { self.frames.init_page(page_id as PageID) };
+                        return self.frames.init_page(page_id as PageID);
                     }
 
                     // Here we cannot find a free page to load, we should cancel reservation of a page
@@ -261,7 +258,7 @@ impl BufferPool for EvictableBufferPool {
 
         if self.alloc_map.allocate_at(page_id as usize) {
             self.in_mem.pin(page_id);
-            Ok(unsafe { self.frames.init_page(page_id) })
+            Ok(self.frames.init_page(page_id))
         } else {
             self.in_mem.dec();
             Err(Error::BufferPageAlreadyAllocated)
@@ -275,42 +272,40 @@ impl BufferPool for EvictableBufferPool {
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
         loop {
-            unsafe {
-                let bf = self.frames.frame_ptr(page_id);
-                let frame = &mut *bf.0;
-                match frame.kind() {
-                    FrameKind::Uninitialized => {
-                        panic!("get an uninitialized page");
+            let bf = self.frames.frame_ptr(page_id);
+            let frame = BufferFrames::frame_ref(bf.clone());
+            match frame.kind() {
+                FrameKind::Uninitialized => {
+                    panic!("get an uninitialized page");
+                }
+                FrameKind::Fixed | FrameKind::Hot => {
+                    let g = frame.latch.optimistic_fallback(mode).await;
+                    return FacadePageGuard::new(bf, g);
+                }
+                FrameKind::Cool => {
+                    // Try to mark this page as HOT.
+                    if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
+                        != FrameKind::Cool
+                    {
+                        // This page is going to be evicted. we have to retry and probably wait.
+                        continue;
                     }
-                    FrameKind::Fixed | FrameKind::Hot => {
-                        let g = frame.latch.optimistic_fallback(mode).await;
-                        return FacadePageGuard::new(bf, g);
-                    }
-                    FrameKind::Cool => {
-                        // Try to mark this page as HOT.
-                        if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
-                            != FrameKind::Cool
-                        {
-                            // This page is going to be evicted. we have to retry and probably wait.
-                            continue;
-                        }
-                        let g = frame.latch.optimistic_fallback(mode).await;
-                        return FacadePageGuard::new(bf, g);
-                    }
-                    FrameKind::Evicting => {
-                        // The page is marked evicting in order to be evicted to disk in near future.
-                        // Here we do not break the write operation,
-                        // Instead, we wait for it to complete.
-                        // And then, reload it in memory.
-                        self.try_wait_for_io_write(page_id).await;
-                    }
-                    FrameKind::Evicted => {
-                        // The page is already on disk.
-                        // This means we should let one thread to exclusively lock this page
-                        // and initiate a IO read.
-                        // Other threads can wait for the initiator to finish.
-                        self.try_dispatch_io_read(page_id).await;
-                    }
+                    let g = frame.latch.optimistic_fallback(mode).await;
+                    return FacadePageGuard::new(bf, g);
+                }
+                FrameKind::Evicting => {
+                    // The page is marked evicting in order to be evicted to disk in near future.
+                    // Here we do not break the write operation,
+                    // Instead, we wait for it to complete.
+                    // And then, reload it in memory.
+                    self.try_wait_for_io_write(page_id).await;
+                }
+                FrameKind::Evicted => {
+                    // The page is already on disk.
+                    // This means we should let one thread to exclusively lock this page
+                    // and initiate a IO read.
+                    // Other threads can wait for the initiator to finish.
+                    self.try_dispatch_io_read(page_id).await;
                 }
             }
         }
@@ -323,51 +318,49 @@ impl BufferPool for EvictableBufferPool {
         mode: LatchFallbackMode,
     ) -> Option<FacadePageGuard<T>> {
         loop {
-            unsafe {
-                let bf = self.frames.frame_ptr(id.page_id);
-                let frame = &mut *bf.0;
-                if frame.generation() != id.generation {
-                    return None;
+            let bf = self.frames.frame_ptr(id.page_id);
+            let frame = BufferFrames::frame_ref(bf.clone());
+            if frame.generation() != id.generation {
+                return None;
+            }
+            match frame.kind() {
+                FrameKind::Uninitialized => return None,
+                FrameKind::Fixed | FrameKind::Hot => {
+                    let g = frame.latch.optimistic_fallback(mode).await;
+                    let g = FacadePageGuard::new(bf, g);
+                    let bf = g.bf();
+                    if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
+                        if g.is_exclusive() {
+                            // SAFETY: checked guard state above.
+                            unsafe { g.rollback_exclusive_version_change() };
+                        }
+                        return None;
+                    }
+                    return Some(g);
                 }
-                match frame.kind() {
-                    FrameKind::Uninitialized => return None,
-                    FrameKind::Fixed | FrameKind::Hot => {
-                        let g = frame.latch.optimistic_fallback(mode).await;
-                        let g = FacadePageGuard::new(bf, g);
-                        let bf = g.bf();
-                        if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation
-                        {
-                            if g.is_exclusive() {
-                                g.rollback_exclusive_version_change();
-                            }
-                            return None;
+                FrameKind::Cool => {
+                    let g = frame.latch.optimistic_fallback(mode).await;
+                    if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
+                        != FrameKind::Cool
+                    {
+                        continue;
+                    }
+                    let g = FacadePageGuard::new(bf, g);
+                    let bf = g.bf();
+                    if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
+                        if g.is_exclusive() {
+                            // SAFETY: checked guard state above.
+                            unsafe { g.rollback_exclusive_version_change() };
                         }
-                        return Some(g);
+                        return None;
                     }
-                    FrameKind::Cool => {
-                        let g = frame.latch.optimistic_fallback(mode).await;
-                        if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
-                            != FrameKind::Cool
-                        {
-                            continue;
-                        }
-                        let g = FacadePageGuard::new(bf, g);
-                        let bf = g.bf();
-                        if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation
-                        {
-                            if g.is_exclusive() {
-                                g.rollback_exclusive_version_change();
-                            }
-                            return None;
-                        }
-                        return Some(g);
-                    }
-                    FrameKind::Evicting => {
-                        self.try_wait_for_io_write(id.page_id).await;
-                    }
-                    FrameKind::Evicted => {
-                        self.try_dispatch_io_read(id.page_id).await;
-                    }
+                    return Some(g);
+                }
+                FrameKind::Evicting => {
+                    self.try_wait_for_io_write(id.page_id).await;
+                }
+                FrameKind::Evicted => {
+                    self.try_dispatch_io_read(id.page_id).await;
                 }
             }
         }
@@ -387,60 +380,59 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    async fn get_child_page<T>(
+    async fn get_child_page<T: BufferPage>(
         &'static self,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> Validation<FacadePageGuard<T>> {
         loop {
-            unsafe {
-                let bf = self.frames.frame_ptr(page_id);
-                let frame = &mut *bf.0;
-                match frame.kind() {
-                    FrameKind::Uninitialized => {
-                        panic!("get an uninitialized page");
+            let bf = self.frames.frame_ptr(page_id);
+            let frame = BufferFrames::frame_ref(bf.clone());
+            match frame.kind() {
+                FrameKind::Uninitialized => {
+                    panic!("get an uninitialized page");
+                }
+                FrameKind::Fixed | FrameKind::Hot => {
+                    let g = frame.latch.optimistic_fallback(mode).await;
+                    // apply lock coupling.
+                    // the validation make sure parent page does not change until child
+                    // page is acquired.
+                    if p_guard.validate_bool() {
+                        return Valid(FacadePageGuard::new(bf, g));
                     }
-                    FrameKind::Fixed | FrameKind::Hot => {
-                        let g = frame.latch.optimistic_fallback(mode).await;
-                        // apply lock coupling.
-                        // the validation make sure parent page does not change until child
-                        // page is acquired.
-                        if p_guard.validate_bool() {
-                            return Valid(FacadePageGuard::new(bf, g));
-                        }
-                        if g.state == GuardState::Exclusive {
-                            g.rollback_exclusive_bit();
-                        }
-                        return Validation::Invalid;
+                    if g.state == GuardState::Exclusive {
+                        // SAFETY: guard state is checked above.
+                        unsafe { g.rollback_exclusive_bit() };
                     }
-                    FrameKind::Cool => {
-                        let g = frame.latch.optimistic_fallback(mode).await;
-                        // Try to mark this page as HOT.
-                        if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
-                            != FrameKind::Cool
-                        {
-                            // This page is going to be evicted.
-                            continue;
-                        }
-                        // apply lock coupling.
-                        // the validation make sure parent page does not change until child
-                        // page is acquired.
-                        return p_guard
-                            .validate()
-                            .and_then(|_| Valid(FacadePageGuard::new(bf, g)));
+                    return Validation::Invalid;
+                }
+                FrameKind::Cool => {
+                    let g = frame.latch.optimistic_fallback(mode).await;
+                    // Try to mark this page as HOT.
+                    if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
+                        != FrameKind::Cool
+                    {
+                        // This page is going to be evicted.
+                        continue;
                     }
-                    FrameKind::Evicting => {
-                        // The page is being evicted to disk.
-                        self.try_wait_for_io_write(page_id).await;
-                    }
-                    FrameKind::Evicted => {
-                        // The page is already on disk.
-                        // This means we should let one thread to exclusively lock this page
-                        // and initiate a IO read.
-                        // Other threads can wait for the initiator to finish.
-                        self.try_dispatch_io_read(page_id).await;
-                    }
+                    // apply lock coupling.
+                    // the validation make sure parent page does not change until child
+                    // page is acquired.
+                    return p_guard
+                        .validate()
+                        .and_then(|_| Valid(FacadePageGuard::new(bf, g)));
+                }
+                FrameKind::Evicting => {
+                    // The page is being evicted to disk.
+                    self.try_wait_for_io_write(page_id).await;
+                }
+                FrameKind::Evicted => {
+                    // The page is already on disk.
+                    // This means we should let one thread to exclusively lock this page
+                    // and initiate a IO read.
+                    // Other threads can wait for the initiator to finish.
+                    self.try_dispatch_io_read(page_id).await;
                 }
             }
         }
@@ -487,75 +479,6 @@ unsafe impl Send for EvictableBufferPool {}
 unsafe impl Sync for EvictableBufferPool {}
 
 unsafe impl StaticLifetime for EvictableBufferPool {}
-
-struct BufferFrames(*mut BufferFrame);
-
-impl BufferFrames {
-    #[inline]
-    unsafe fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        unsafe {
-            let bf_ptr = self.0.offset(page_id as isize);
-            UnsafePtr(bf_ptr)
-        }
-    }
-
-    #[inline]
-    unsafe fn frame(&self, page_id: PageID) -> &BufferFrame {
-        unsafe {
-            let bf_ptr = self.frame_ptr(page_id);
-            &*bf_ptr.0
-        }
-    }
-
-    #[inline]
-    fn frame_kind(&self, page_id: PageID) -> FrameKind {
-        unsafe {
-            let bf_ptr = self.0.offset(page_id as isize);
-            (*bf_ptr).kind()
-        }
-    }
-
-    #[inline]
-    unsafe fn init_page<T: BufferPage>(&'static self, page_id: PageID) -> PageExclusiveGuard<T> {
-        unsafe {
-            let bf = self.frame_ptr(page_id);
-            let frame = &mut *bf.0;
-            frame.ctx = None;
-            T::init_frame(frame);
-            frame.bump_generation();
-            frame.next_free = INVALID_PAGE_ID;
-            frame.set_dirty(true);
-            let mut guard = init_bf_exclusive_guard::<T>(bf);
-            guard.page_mut().zero();
-            guard
-        }
-    }
-
-    #[inline]
-    fn compare_exchange_frame_kind(
-        &self,
-        page_id: PageID,
-        old_kind: FrameKind,
-        new_kind: FrameKind,
-    ) -> FrameKind {
-        unsafe {
-            let bf_ptr = self.0.offset(page_id as isize);
-            (*bf_ptr).compare_exchange_kind(old_kind, new_kind)
-        }
-    }
-
-    #[inline]
-    fn try_lock_page_exclusive(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
-        unsafe {
-            let bf = self.frame_ptr(page_id);
-            let frame = &mut *bf.0;
-            frame
-                .latch
-                .try_exclusive()
-                .map(|g| FacadePageGuard::new(bf, g).must_exclusive())
-        }
-    }
-}
 
 pub struct EvictableBufferPoolListener {
     inflight_io: Arc<InflightIO>,
