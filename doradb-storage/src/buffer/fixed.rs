@@ -115,13 +115,15 @@ impl FixedBufferPool {
     #[inline]
     fn allocate_internal<T: BufferPage>(&'static self, page_id: PageID) -> PageExclusiveGuard<T> {
         let bf = self.frame_ptr(page_id);
-        frame_mut(bf.clone()).page_id = page_id;
-        let mut g = init_bf_exclusive_guard::<T>(bf);
-        g.bf_mut().ctx = None;
-        T::init_frame(g.bf_mut());
-        g.bf_mut().bump_generation();
-        g.bf_mut().next_free = INVALID_PAGE_ID;
-        g.bf_mut().set_dirty(true);
+        frame_ref(bf.clone()).bump_generation();
+        let mut g = init_bf_exclusive_guard::<T>(bf.clone());
+        with_frame_mut(bf, &mut g, |frame| {
+            frame.page_id = page_id;
+            frame.ctx = None;
+            T::init_frame(frame);
+            frame.next_free = INVALID_PAGE_ID;
+            frame.set_dirty(true);
+        });
         g.page_mut().zero();
         g
     }
@@ -273,10 +275,14 @@ fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
 }
 
 #[inline]
-fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
-    debug_assert!(!ptr.0.is_null());
-    // SAFETY: callers uphold exclusive access via latch/guard protocol.
-    unsafe { &mut *ptr.0 }
+fn with_frame_mut<T: 'static, R>(
+    bf: UnsafePtr<BufferFrame>,
+    guard: &mut PageExclusiveGuard<T>,
+    f: impl FnOnce(&mut BufferFrame) -> R,
+) -> R {
+    let frame = guard.bf_mut();
+    debug_assert_eq!(frame as *mut BufferFrame, bf.0);
+    f(frame)
 }
 
 #[cfg(test)]

@@ -276,7 +276,7 @@ impl BufferPool for EvictableBufferPool {
     ) -> FacadePageGuard<T> {
         loop {
             let bf = self.frames.frame_ptr(page_id);
-            let frame = BufferFrames::frame_mut(bf.clone());
+            let frame = BufferFrames::frame_ref(bf.clone());
             match frame.kind() {
                 FrameKind::Uninitialized => {
                     panic!("get an uninitialized page");
@@ -322,7 +322,7 @@ impl BufferPool for EvictableBufferPool {
     ) -> Option<FacadePageGuard<T>> {
         loop {
             let bf = self.frames.frame_ptr(id.page_id);
-            let frame = BufferFrames::frame_mut(bf.clone());
+            let frame = BufferFrames::frame_ref(bf.clone());
             if frame.generation() != id.generation {
                 return None;
             }
@@ -391,7 +391,7 @@ impl BufferPool for EvictableBufferPool {
     ) -> Validation<FacadePageGuard<T>> {
         loop {
             let bf = self.frames.frame_ptr(page_id);
-            let frame = BufferFrames::frame_mut(bf.clone());
+            let frame = BufferFrames::frame_ref(bf.clone());
             match frame.kind() {
                 FrameKind::Uninitialized => {
                     panic!("get an uninitialized page");
@@ -505,13 +505,14 @@ impl BufferFrames {
     #[inline]
     fn init_page<T: BufferPage>(&'static self, page_id: PageID) -> PageExclusiveGuard<T> {
         let bf = self.frame_ptr(page_id);
-        let frame = Self::frame_mut(bf.clone());
-        frame.ctx = None;
-        T::init_frame(frame);
-        frame.bump_generation();
-        frame.next_free = INVALID_PAGE_ID;
-        frame.set_dirty(true);
-        let mut guard = init_bf_exclusive_guard::<T>(bf);
+        Self::frame_ref(bf.clone()).bump_generation();
+        let mut guard = init_bf_exclusive_guard::<T>(bf.clone());
+        Self::with_frame_mut(bf, &mut guard, |frame| {
+            frame.ctx = None;
+            T::init_frame(frame);
+            frame.next_free = INVALID_PAGE_ID;
+            frame.set_dirty(true);
+        });
         guard.page_mut().zero();
         guard
     }
@@ -523,13 +524,13 @@ impl BufferFrames {
         old_kind: FrameKind,
         new_kind: FrameKind,
     ) -> FrameKind {
-        Self::frame_mut(self.frame_ptr(page_id)).compare_exchange_kind(old_kind, new_kind)
+        Self::frame_ref(self.frame_ptr(page_id)).compare_exchange_kind(old_kind, new_kind)
     }
 
     #[inline]
     fn try_lock_page_exclusive(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
         let bf = self.frame_ptr(page_id);
-        let frame = Self::frame_mut(bf.clone());
+        let frame = Self::frame_ref(bf.clone());
         frame
             .latch
             .try_exclusive()
@@ -544,10 +545,14 @@ impl BufferFrames {
     }
 
     #[inline]
-    fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
-        debug_assert!(!ptr.0.is_null());
-        // SAFETY: mutable access is guarded by latch state transitions at call sites.
-        unsafe { &mut *ptr.0 }
+    fn with_frame_mut<T: 'static, R>(
+        bf: UnsafePtr<BufferFrame>,
+        guard: &mut PageExclusiveGuard<T>,
+        f: impl FnOnce(&mut BufferFrame) -> R,
+    ) -> R {
+        let frame = guard.bf_mut();
+        debug_assert_eq!(frame as *mut BufferFrame, bf.0);
+        f(frame)
     }
 }
 
