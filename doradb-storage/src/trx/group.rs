@@ -11,7 +11,6 @@ use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// GroupCommit with mutex and condition variable.
@@ -119,7 +118,7 @@ impl CommitGroup {
         // we always write a complete page instead of partial data.
         let log_bytes = buf.capacity();
         let aio = pwrite(self.max_cts, self.fd, self.offset, buf);
-        let iocb_ptr = aio.iocb().load(Ordering::Relaxed);
+        let iocb_ptr = aio.iocb_raw();
         let sync_group = SyncGroup {
             trx_list: self.trx_list,
             max_cts: self.max_cts,

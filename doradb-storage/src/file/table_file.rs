@@ -18,6 +18,7 @@ use futures::future::try_join_all;
 use std::fs;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -103,8 +104,7 @@ impl TableFile {
     /// Returns active root of the table file.
     #[inline]
     pub fn active_root(&self) -> &ActiveRoot {
-        let ptr = self.active_root.load(Ordering::Relaxed);
-        unsafe { &*ptr }
+        Self::active_root_from_raw(self.load_active_root_raw())
     }
 
     /// Returns copy of active root.
@@ -112,8 +112,7 @@ impl TableFile {
     /// which is guaranteed by GC logic.
     #[inline]
     pub fn active_root_ptr(&self) -> AtomicPtr<ActiveRoot> {
-        let ptr = self.active_root.load(Ordering::Relaxed);
-        AtomicPtr::new(ptr)
+        AtomicPtr::new(self.load_active_root_raw())
     }
 
     #[inline]
@@ -167,12 +166,9 @@ impl TableFile {
     /// Replace active root with new root, and return old root.
     #[inline]
     pub fn swap_active_root(&self, active_root: ActiveRoot) -> Option<OldRoot> {
-        let new = Box::leak(Box::new(active_root)) as *mut ActiveRoot;
+        let new = Self::allocate_active_root(active_root);
         let old = self.active_root.swap(new, Ordering::SeqCst);
-        if old.is_null() {
-            return None;
-        }
-        Some(OldRoot(old))
+        NonNull::new(old).map(OldRoot)
     }
 
     /// Load active root from two super pages.
@@ -262,15 +258,44 @@ impl TableFile {
     pub fn delete(self) {
         let _ = remove_file_by_fd(self.file.as_raw_fd());
     }
+
+    #[inline]
+    fn load_active_root_raw(&self) -> *mut ActiveRoot {
+        self.active_root.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn active_root_from_raw<'a>(ptr: *mut ActiveRoot) -> &'a ActiveRoot {
+        match NonNull::new(ptr) {
+            Some(ptr) => {
+                // SAFETY: active root pointers are created from `Box<ActiveRoot>` and remain
+                // valid until reclaimed by swap/drop.
+                unsafe { ptr.as_ref() }
+            }
+            None => panic!("active root is not initialized"),
+        }
+    }
+
+    #[inline]
+    fn allocate_active_root(active_root: ActiveRoot) -> *mut ActiveRoot {
+        Box::into_raw(Box::new(active_root))
+    }
+
+    #[inline]
+    fn reclaim_active_root(ptr: *mut ActiveRoot) {
+        if let Some(ptr) = NonNull::new(ptr) {
+            // SAFETY: pointer was allocated by `allocate_active_root` and must be reclaimed once.
+            unsafe {
+                drop(Box::from_raw(ptr.as_ptr()));
+            }
+        }
+    }
 }
 
 impl Drop for TableFile {
     #[inline]
     fn drop(&mut self) {
-        let active_root_ptr = self.active_root.load(Ordering::Relaxed);
-        unsafe {
-            drop(Box::from_raw(active_root_ptr));
-        }
+        TableFile::reclaim_active_root(self.load_active_root_raw());
     }
 }
 
@@ -579,14 +604,14 @@ impl ActiveRoot {
     }
 }
 
-pub struct OldRoot(*mut ActiveRoot);
+pub struct OldRoot(NonNull<ActiveRoot>);
 
 impl Drop for OldRoot {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: old roots are created from previous active-root pointers and reclaimed once.
         unsafe {
-            let res = Box::from_raw(self.0);
-            drop(res);
+            drop(Box::from_raw(self.0.as_ptr()));
         }
     }
 }

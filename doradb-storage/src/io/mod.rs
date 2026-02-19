@@ -10,7 +10,6 @@ use libc::{EAGAIN, c_long};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use thiserror::Error;
@@ -349,11 +348,8 @@ impl AIOContext {
 fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
     #[cfg(test)]
     {
-        let hook = IO_SUBMIT_HOOK.load(Ordering::SeqCst);
-        if !hook.is_null() {
-            // SAFETY: hooks are installed only from `IoSubmitHook` function pointers via
-            // `set_io_submit_hook`, so restoring the same function-pointer type is valid.
-            let hook: IoSubmitHook = unsafe { std::mem::transmute(hook) };
+        let hook = *IO_SUBMIT_HOOK.lock().unwrap();
+        if let Some(hook) = hook {
             return hook(ctx, nr, ios);
         }
     }
@@ -366,20 +362,12 @@ fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
 type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
 
 #[cfg(all(test, feature = "libaio"))]
-static IO_SUBMIT_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+static IO_SUBMIT_HOOK: std::sync::Mutex<Option<IoSubmitHook>> = std::sync::Mutex::new(None);
 
 #[cfg(all(test, feature = "libaio"))]
 fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
-    let ptr = hook
-        .map(|func| func as *mut ())
-        .unwrap_or(std::ptr::null_mut());
-    let previous = IO_SUBMIT_HOOK.swap(ptr, Ordering::SeqCst);
-    if previous.is_null() {
-        None
-    } else {
-        // SAFETY: `previous` was produced by storing an `IoSubmitHook` pointer as `*mut ()`.
-        Some(unsafe { std::mem::transmute(previous) })
-    }
+    let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
+    std::mem::replace(&mut *guard, hook)
 }
 
 unsafe impl StaticLifetime for AIOContext {}
@@ -394,12 +382,11 @@ impl Drop for AIOContext {
     }
 }
 
-pub type IocbPtr = AtomicPtr<iocb>;
 pub type IocbRawPtr = *mut iocb;
 
 /// AIO backed by an owned aligned buffer.
 pub struct AIO<T> {
-    iocb: IocbPtr,
+    iocb: Box<iocb>,
     // this is essential because libaio requires the pointer
     // to buffer keep valid during async processing.
     buf: Option<T>,
@@ -417,7 +404,7 @@ impl<T: AIOBuf> AIO<T> {
         flags: u32,
         opcode: io_iocb_cmd,
     ) -> Self {
-        let iocb = unsafe { iocb::alloc() };
+        let mut iocb = iocb::boxed();
         iocb.aio_fildes = fd as u32;
         iocb.aio_lio_opcode = opcode as u16;
         iocb.aio_reqprio = priority;
@@ -429,13 +416,13 @@ impl<T: AIOBuf> AIO<T> {
         AIO {
             key,
             buf: Some(buf),
-            iocb: AtomicPtr::new(iocb),
+            iocb,
         }
     }
 
     #[inline]
-    pub fn iocb(&self) -> &IocbPtr {
-        &self.iocb
+    pub fn iocb_raw(&self) -> IocbRawPtr {
+        self.iocb.as_mut_ptr()
     }
 
     #[inline]
@@ -449,15 +436,6 @@ impl<T: AIOBuf> AIO<T> {
     }
 }
 
-impl<T> Drop for AIO<T> {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            drop(Box::from_raw(self.iocb.load(Ordering::Relaxed)));
-        }
-    }
-}
-
 /// AIO backed by a raw pointer.
 /// The raw pointer must be aigned to page and
 /// has outlive the async IO call.
@@ -467,7 +445,7 @@ impl<T> Drop for AIO<T> {
 /// not release any of them. So the IO request is guaranteed
 /// to be safe.
 pub struct UnsafeAIO {
-    iocb: IocbPtr,
+    iocb: Box<iocb>,
     pub key: AIOKey,
 }
 
@@ -490,7 +468,7 @@ impl UnsafeAIO {
         flags: u32,
         opcode: io_iocb_cmd,
     ) -> Self {
-        let iocb = unsafe { iocb::alloc() };
+        let mut iocb = iocb::boxed();
         iocb.aio_fildes = fd as u32;
         iocb.aio_lio_opcode = opcode as u16;
         iocb.aio_reqprio = priority;
@@ -499,15 +477,12 @@ impl UnsafeAIO {
         iocb.offset = offset as u64;
         iocb.flags = flags;
         iocb.data = key; // store and send back via io_event
-        UnsafeAIO {
-            iocb: AtomicPtr::new(iocb),
-            key,
-        }
+        UnsafeAIO { iocb, key }
     }
 
     #[inline]
-    pub fn iocb(&self) -> &IocbPtr {
-        &self.iocb
+    pub fn iocb_raw(&self) -> IocbRawPtr {
+        self.iocb.as_mut_ptr()
     }
 }
 
@@ -1032,7 +1007,7 @@ mod tests {
         let buf = DirectBuf::with_data(b"hello, world");
         let (offset, _) = file.alloc(buf.capacity()).unwrap();
         let aio = file.pwrite_direct(100, offset, buf);
-        let mut reqs = vec![aio.iocb.load(Ordering::Relaxed)];
+        let mut reqs = vec![aio.iocb_raw()];
         let limit = reqs.len();
         let submit_count = ctx.submit_limit(&mut reqs, limit);
         println!("submit_count={}", submit_count);
@@ -1112,12 +1087,9 @@ mod tests {
     fn test_submit_limit_eagain_no_panic() {
         let ctx = AIOContext::try_default().unwrap();
         let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
-        let iocb = unsafe { iocb::alloc() } as *mut iocb;
-        let reqs = vec![iocb];
+        let iocb = iocb::boxed();
+        let reqs = vec![iocb.as_mut_ptr()];
         let submit_count = ctx.submit_limit(&reqs, 1);
-        unsafe {
-            drop(Box::from_raw(iocb));
-        }
         set_io_submit_hook(previous);
         assert_eq!(submit_count, 0);
     }
@@ -1147,12 +1119,12 @@ mod tests {
             let (iocb, aio) = match req.kind {
                 AIOKind::Read => {
                     let aio = self.file.pread_direct(key, req.offset, req.buf);
-                    let iocb = aio.iocb().load(Ordering::Relaxed);
+                    let iocb = aio.iocb_raw();
                     (iocb, aio)
                 }
                 AIOKind::Write => {
                     let aio = self.file.pwrite_direct(key, req.offset, req.buf);
-                    let iocb = aio.iocb().load(Ordering::Relaxed);
+                    let iocb = aio.iocb_raw();
                     (iocb, aio)
                 }
             };

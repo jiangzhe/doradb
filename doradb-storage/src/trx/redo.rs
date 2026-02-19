@@ -1,6 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::catalog::{IndexID, SchemaID, TableID};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::row::RowID;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::serde::{Deser, Ser, Serde};
@@ -20,10 +20,18 @@ pub enum RowRedoCode {
     DeleteByUniqueKey = 4,
 }
 
-impl From<u8> for RowRedoCode {
+impl TryFrom<u8> for RowRedoCode {
+    type Error = ();
+
     #[inline]
-    fn from(code: u8) -> Self {
-        unsafe { mem::transmute(code) }
+    fn try_from(code: u8) -> std::result::Result<Self, Self::Error> {
+        match code {
+            1 => Ok(RowRedoCode::Insert),
+            2 => Ok(RowRedoCode::Delete),
+            3 => Ok(RowRedoCode::Update),
+            4 => Ok(RowRedoCode::DeleteByUniqueKey),
+            _ => Err(()),
+        }
     }
 }
 
@@ -85,7 +93,8 @@ impl Deser for RowRedoKind {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
-        match RowRedoCode::from(code) {
+        let code = RowRedoCode::try_from(code).map_err(|_| Error::InvalidFormat)?;
+        match code {
             RowRedoCode::Insert => {
                 let (idx, vals) = Vec::<Val>::deser(input, idx)?;
                 Ok((idx, RowRedoKind::Insert(vals)))
@@ -156,10 +165,22 @@ pub enum DDLRedoCode {
     DataCheckpoint = 136,
 }
 
-impl From<u8> for DDLRedoCode {
+impl TryFrom<u8> for DDLRedoCode {
+    type Error = ();
+
     #[inline]
-    fn from(code: u8) -> Self {
-        unsafe { mem::transmute(code) }
+    fn try_from(code: u8) -> std::result::Result<Self, Self::Error> {
+        match code {
+            129 => Ok(DDLRedoCode::CreateSchema),
+            130 => Ok(DDLRedoCode::DropSchema),
+            131 => Ok(DDLRedoCode::CreateTable),
+            132 => Ok(DDLRedoCode::DropTable),
+            133 => Ok(DDLRedoCode::CreateIndex),
+            134 => Ok(DDLRedoCode::DropIndex),
+            135 => Ok(DDLRedoCode::CreateRowPage),
+            136 => Ok(DDLRedoCode::DataCheckpoint),
+            _ => Err(()),
+        }
     }
 }
 
@@ -278,7 +299,8 @@ impl Deser for DDLRedo {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
-        match DDLRedoCode::from(code) {
+        let code = DDLRedoCode::try_from(code).map_err(|_| Error::InvalidFormat)?;
+        match code {
             DDLRedoCode::CreateSchema => {
                 let (idx, schema_id) = input.deser_u64(idx)?;
                 Ok((idx, DDLRedo::CreateSchema(schema_id)))
@@ -427,10 +449,16 @@ pub enum RedoTrxKind {
     System = 1,
 }
 
-impl From<u8> for RedoTrxKind {
+impl TryFrom<u8> for RedoTrxKind {
+    type Error = ();
+
     #[inline]
-    fn from(code: u8) -> Self {
-        unsafe { mem::transmute(code) }
+    fn try_from(code: u8) -> std::result::Result<Self, Self::Error> {
+        match code {
+            0 => Ok(RedoTrxKind::User),
+            1 => Ok(RedoTrxKind::System),
+            _ => Err(()),
+        }
     }
 }
 
@@ -460,13 +488,8 @@ impl Deser for RedoHeader {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, cts) = TrxID::deser(input, start_idx)?;
         let (idx, code) = u8::deser(input, idx)?;
-        Ok((
-            idx,
-            RedoHeader {
-                cts,
-                trx_kind: RedoTrxKind::from(code),
-            },
-        ))
+        let trx_kind = RedoTrxKind::try_from(code).map_err(|_| Error::InvalidFormat)?;
+        Ok((idx, RedoHeader { cts, trx_kind }))
     }
 }
 
@@ -960,5 +983,27 @@ mod tests {
             }
             _ => panic!("Expected DataCheckpoint"),
         }
+    }
+
+    #[test]
+    fn test_row_redo_kind_deser_invalid_code() {
+        let buf = [255u8];
+        let res = RowRedoKind::deser(&buf[..], 0);
+        assert!(matches!(res, Err(Error::InvalidFormat)));
+    }
+
+    #[test]
+    fn test_ddl_redo_deser_invalid_code() {
+        let buf = [255u8];
+        let res = DDLRedo::deser(&buf[..], 0);
+        assert!(matches!(res, Err(Error::InvalidFormat)));
+    }
+
+    #[test]
+    fn test_redo_header_deser_invalid_trx_kind_code() {
+        let mut buf = [0u8; 9];
+        buf[8] = 255;
+        let res = RedoHeader::deser(&buf[..], 0);
+        assert!(matches!(res, Err(Error::InvalidFormat)));
     }
 }
