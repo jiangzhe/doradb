@@ -13,10 +13,9 @@ use crate::memcmp::BytesExtendable;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
-use std::alloc::{Layout, alloc_zeroed};
 use std::cmp;
 use std::cmp::Ordering;
-use std::mem::{self, MaybeUninit};
+use std::mem;
 use std::ops::{Deref, DerefMut};
 
 const _: () = assert!(mem::size_of::<BTreeHeader>().is_multiple_of(mem::size_of::<BTreeSlot>()));
@@ -408,7 +407,7 @@ impl BTreeNode {
             }
             Err(_) => return BTreeDelete::NotFound,
         };
-        self.delete_at(idx, mem::size_of::<V>());
+        self.delete_at(idx, V::ENCODED_LEN);
         BTreeDelete::Ok
     }
 
@@ -454,13 +453,8 @@ impl BTreeNode {
     }
 
     /// Compact source node into target node.
-    ///
-    /// # Safety
-    ///
-    /// Target node must be unitialized.
     #[inline]
-    pub unsafe fn compact_into<V: BTreeValue>(&self, dst: &mut BTreeNode) {
-        debug_assert!(!dst.header.initialized);
+    pub fn compact_into<V: BTreeValue>(&self, dst: &mut BTreeNode) {
         let lower_fence_key = self.lower_fence_key();
         let upper_fence_key = self.upper_fence_key();
         dst.init(
@@ -478,13 +472,19 @@ impl BTreeNode {
     /// Self compact.
     #[inline]
     pub fn self_compact<V: BTreeValue>(&mut self) {
-        let tmp_node = unsafe {
-            let mut tmp = MaybeUninit::<BTreeNode>::zeroed();
-            self.compact_into::<V>(tmp.assume_init_mut());
-            tmp.assume_init()
-        };
+        let lower_fence_key = self.lower_fence_key();
+        let upper_fence_key = self.upper_fence_key();
+        let mut tmp_node = BTreeNodeBox::alloc(
+            self.height() as u16,
+            self.ts(),
+            &lower_fence_key,
+            self.lower_fence_value(),
+            &upper_fence_key,
+            self.header.hints_enabled,
+        );
+        tmp_node.extend_slots_from::<V>(self, 0, self.count());
         debug_assert!(self.free_space_after_compaction() == tmp_node.free_space());
-        *self = tmp_node;
+        mem::swap(self, tmp_node.deref_mut());
     }
 
     /// Delete key value at given position.
@@ -595,13 +595,9 @@ impl BTreeNode {
         let head = head_int(k);
         if k.len() <= KEY_HEAD_LEN {
             // Only value inserted at end of page.
-            // Copy value.
-            self.header.end_offset -= mem::size_of::<V>() as u16;
-            unsafe {
-                (self.body_mut().add(self.header.end_offset as usize) as *mut V)
-                    .write_unaligned(value);
-            }
-            self.header.effective_space += mem::size_of::<V>() as u32;
+            self.header.end_offset -= V::ENCODED_LEN as u16;
+            self.write_value_le(self.header.end_offset as usize, value);
+            self.header.effective_space += V::ENCODED_LEN as u32;
             return BTreeSlot {
                 len: k.len() as u16,
                 offset: self.header.end_offset,
@@ -609,15 +605,12 @@ impl BTreeNode {
             };
         }
         // Key suffix and value inserted at end of page.
-        // copy value.
-        self.header.end_offset -= (k.len() + mem::size_of::<V>()) as u16;
-        unsafe {
-            let dst = self.body_mut().add(self.header.end_offset as usize);
-            std::ptr::copy_nonoverlapping(k.as_ptr(), dst, k.len());
-            let dst = dst.add(k.len());
-            (dst as *mut V).write_unaligned(value);
-        }
-        self.header.effective_space += (k.len() + mem::size_of::<V>()) as u32;
+        self.header.end_offset -= (k.len() + V::ENCODED_LEN) as u16;
+        let offset = self.header.end_offset as usize;
+        let value_offset = offset + k.len();
+        self.body[offset..value_offset].copy_from_slice(k);
+        self.write_value_le(value_offset, value);
+        self.header.effective_space += (k.len() + V::ENCODED_LEN) as u32;
         BTreeSlot {
             len: k.len() as u16,
             offset: self.header.end_offset,
@@ -641,10 +634,8 @@ impl BTreeNode {
         // Key suffix inserted at end of page.
         // copy key suffix.
         self.header.end_offset -= k.len() as u16;
-        unsafe {
-            let dst = self.body_mut().add(self.header.end_offset as usize);
-            std::ptr::copy_nonoverlapping(k.as_ptr(), dst, k.len());
-        }
+        let offset = self.header.end_offset as usize;
+        self.body[offset..offset + k.len()].copy_from_slice(k);
         self.header.effective_space += k.len() as u32;
         BTreeSlot {
             len: k.len() as u16,
@@ -659,18 +650,6 @@ impl BTreeNode {
         let space_needed = self.space_needed(key);
         // todo: compact if neccessary.
         space_needed <= self.free_space()
-    }
-
-    /// Returns start pointer of body.
-    #[inline]
-    fn body(&self) -> *const u8 {
-        self.body.as_ptr()
-    }
-
-    /// Returns mutable start pointer of body.
-    #[inline]
-    fn body_mut(&mut self) -> *mut u8 {
-        self.body.as_mut_ptr()
     }
 
     /// Returns how many bytes a new key value pair is needed.
@@ -889,12 +868,14 @@ impl BTreeNode {
     #[inline]
     fn long_key_suffix(&self, slot: &BTreeSlot) -> &[u8] {
         debug_assert!(slot.len as usize > KEY_HEAD_LEN);
-        unsafe { self.payload(slot.offset as usize, slot.len as usize) }
+        self.payload(slot.offset as usize, slot.len as usize)
     }
 
     #[inline]
-    unsafe fn payload(&self, offset: usize, len: usize) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.payload_ptr(offset), len) }
+    fn payload(&self, offset: usize, len: usize) -> &[u8] {
+        let end = offset + len;
+        debug_assert!(end <= self.body.len());
+        &self.body[offset..end]
     }
 
     #[inline]
@@ -981,37 +962,37 @@ impl BTreeNode {
     /// This method is used to unpack value from end of key.
     #[inline]
     pub(super) fn unpack_value<V: BTreeValuePackable>(&self, slot: &BTreeSlot) -> V {
-        if slot.len as usize >= mem::size_of::<V>() {
+        if slot.len as usize >= V::ENCODED_LEN {
             // all bytes packed in the key suffix.
             if slot.len as usize <= KEY_HEAD_LEN {
                 // This branch won't be touched because currently we only allow
                 // RowID to be packed into key, which is longer than key head.
                 let src = &slot.head_bytes()[..slot.len as usize];
-                return V::unpack(&src[src.len() - mem::size_of::<V>()..]);
+                return V::unpack(&src[src.len() - V::ENCODED_LEN..]);
             }
             let src = self.long_key_suffix(slot);
-            return V::unpack(&src[src.len() - mem::size_of::<V>()..]);
+            return V::unpack(&src[src.len() - V::ENCODED_LEN..]);
         }
         // we have to concat common prefix and key suffix
         let mut src = [0u8; BTREE_VALUE_PACK_MAX_LEN];
-        let pl = mem::size_of::<V>() - slot.len as usize;
+        let pl = V::ENCODED_LEN - slot.len as usize;
         let prefix = self.common_prefix();
         src[0..pl].copy_from_slice(&prefix[prefix.len() - pl..]);
         if slot.len as usize <= KEY_HEAD_LEN {
             let suffix = &slot.head_bytes()[..slot.len as usize];
-            src[pl..mem::size_of::<V>()].copy_from_slice(suffix);
+            src[pl..V::ENCODED_LEN].copy_from_slice(suffix);
         } else {
             let suffix = self.long_key_suffix(slot);
-            src[pl..mem::size_of::<V>()].copy_from_slice(suffix);
+            src[pl..V::ENCODED_LEN].copy_from_slice(suffix);
         }
-        V::unpack(&src[..mem::size_of::<V>()])
+        V::unpack(&src[..V::ENCODED_LEN])
     }
 
     #[inline]
     pub(super) fn value<V: BTreeValue>(&self, idx: usize) -> V {
         debug_assert!(idx < self.header.count as usize);
         let slot = self.slot(idx);
-        unsafe { self.slot_value(slot) }
+        self.slot_value(slot)
     }
 
     /// Convenient method to get value as page id.
@@ -1021,7 +1002,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    unsafe fn slot_value<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
+    fn slot_value<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
         let offset = if slot.len as usize <= KEY_HEAD_LEN {
             // key is inlined.
             slot.offset
@@ -1029,16 +1010,17 @@ impl BTreeNode {
             // should shift key length.
             slot.offset + slot.len
         } as usize;
-        unsafe { self.read_value_unaligned(offset) }
+        self.read_value_le(offset)
     }
 
     /// Returns all values in this node.
     #[inline]
     pub(super) fn values<V: BTreeValue, T, F: Fn(V) -> T>(&self, res: &mut Vec<T>, f: F) {
-        res.extend(self.slots().iter().map(|slot| {
-            let v = unsafe { self.slot_value::<V>(slot) };
-            f(v)
-        }));
+        res.extend(
+            self.slots()
+                .iter()
+                .map(|slot| f(self.slot_value::<V>(slot))),
+        );
     }
 
     #[inline]
@@ -1052,11 +1034,9 @@ impl BTreeNode {
             // should shift key length.
             slot.offset + slot.len
         } as usize;
-        unsafe {
-            let old_value = self.read_value_unaligned::<V>(offset);
-            self.write_value_unaligned::<V>(offset, value);
-            old_value
-        }
+        let old_value = self.read_value_le::<V>(offset);
+        self.write_value_le::<V>(offset, value);
+        old_value
     }
 
     /// Returns separate key of given position.
@@ -1098,7 +1078,7 @@ impl BTreeNode {
             if diff_len <= KEY_HEAD_LEN {
                 g[self.header.prefix_len as usize..].copy_from_slice(&s1.head_bytes()[..diff_len]);
             } else {
-                let src = unsafe { self.payload(s1.offset as usize, diff_len) };
+                let src = self.payload(s1.offset as usize, diff_len);
                 g[self.header.prefix_len as usize..].copy_from_slice(src);
             }
             drop(g);
@@ -1154,18 +1134,17 @@ impl BTreeNode {
             let mut offset = self.header.end_offset as usize;
             for (i, s) in src_slots.iter().enumerate() {
                 let len = if s.len as usize <= KEY_HEAD_LEN {
-                    mem::size_of::<V>()
+                    V::ENCODED_LEN
                 } else {
-                    s.len as usize + mem::size_of::<V>()
+                    s.len as usize + V::ENCODED_LEN
                 };
+                let src_offset = s.offset as usize;
+                let src_end = src_offset + len;
                 offset -= len;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src_node.body().add(s.offset as usize),
-                        self.body_mut().add(offset),
-                        len,
-                    );
-                }
+                let dst_end = offset + len;
+                debug_assert!(src_end <= src_node.body.len());
+                debug_assert!(dst_end <= self.body.len());
+                self.body[offset..dst_end].copy_from_slice(&src_node.body[src_offset..src_end]);
 
                 // update slot offset
                 self.slot_mut(dst_slot_idx + i).offset = offset as u16;
@@ -1184,7 +1163,7 @@ impl BTreeNode {
         for slot in &src_node.slots()[src_slot_idx..src_slot_idx + count] {
             key_buf.clear();
             src_node.extend_slot_key(slot, &mut key_buf);
-            let value = unsafe { src_node.slot_value::<V>(slot) };
+            let value = src_node.slot_value::<V>(slot);
             self.insert_at_end(&key_buf, value);
         }
     }
@@ -1217,7 +1196,7 @@ impl BTreeNode {
         if kl <= slot.len as usize {
             return true;
         }
-        if kl + mem::size_of::<V>() <= self.free_space() {
+        if kl + V::ENCODED_LEN <= self.free_space() {
             return true;
         }
         false
@@ -1238,7 +1217,7 @@ impl BTreeNode {
         }
         // out of place update
         let value = self.value::<V>(idx);
-        let old_payload_len = self.payload_len(idx, mem::size_of::<V>());
+        let old_payload_len = self.payload_len(idx, V::ENCODED_LEN);
         let slot = self.new_slot_with_value(key, value);
         *self.slot_mut(idx) = slot;
         self.header.effective_space -= old_payload_len as u32;
@@ -1276,9 +1255,9 @@ impl BTreeNode {
         // old value has extra payload.
         if k.len() == old_len {
             // update extra payload
-            unsafe {
-                std::ptr::copy_nonoverlapping(k.as_ptr(), self.body_mut().add(old_offset), k.len());
-            }
+            let end = old_offset + k.len();
+            debug_assert!(end <= self.body.len());
+            self.body[old_offset..end].copy_from_slice(k);
             // update head.
             let slot = self.slot_mut(idx);
             slot.head = head;
@@ -1286,12 +1265,10 @@ impl BTreeNode {
             // no change on effective space.
             return;
         }
-        let value = unsafe { self.read_value_unaligned::<V>(old_offset + old_len) };
+        let value = self.read_value_le::<V>(old_offset + old_len);
         if k.len() <= KEY_HEAD_LEN {
             // update value
-            unsafe {
-                self.write_value_unaligned::<V>(old_offset, value);
-            }
+            self.write_value_le::<V>(old_offset, value);
             // update head
             let slot = self.slot_mut(idx);
             slot.head = head;
@@ -1303,10 +1280,10 @@ impl BTreeNode {
         }
         debug_assert!(k.len() < old_len);
         // update extra payload and value
-        unsafe {
-            std::ptr::copy_nonoverlapping(k.as_ptr(), self.body_mut().add(old_offset), k.len());
-            self.write_value_unaligned::<V>(old_offset + k.len(), value);
-        }
+        let end = old_offset + k.len();
+        debug_assert!(end <= self.body.len());
+        self.body[old_offset..end].copy_from_slice(k);
+        self.write_value_le::<V>(old_offset + k.len(), value);
         // update head
         let slot = self.slot_mut(idx);
         slot.head = head;
@@ -1386,25 +1363,17 @@ impl BTreeNode {
     }
 
     #[inline]
-    fn payload_ptr(&self, offset: usize) -> *const u8 {
-        // SAFETY: caller ensures `offset` is within node body payload area.
-        unsafe { self.body().add(offset) }
+    fn read_value_le<V: BTreeValue>(&self, offset: usize) -> V {
+        let end = offset + V::ENCODED_LEN;
+        debug_assert!(end <= self.body.len());
+        V::decode_le(&self.body[offset..end])
     }
 
     #[inline]
-    fn payload_ptr_mut(&mut self, offset: usize) -> *mut u8 {
-        // SAFETY: caller ensures `offset` is within node body payload area.
-        unsafe { self.body_mut().add(offset) }
-    }
-
-    #[inline]
-    unsafe fn read_value_unaligned<V: BTreeValue>(&self, offset: usize) -> V {
-        unsafe { std::ptr::read_unaligned::<V>(self.payload_ptr(offset) as *const V) }
-    }
-
-    #[inline]
-    unsafe fn write_value_unaligned<V: BTreeValue>(&mut self, offset: usize, value: V) {
-        unsafe { std::ptr::write_unaligned::<V>(self.payload_ptr_mut(offset) as *mut V, value) }
+    fn write_value_le<V: BTreeValue>(&mut self, offset: usize, value: V) {
+        let end = offset + V::ENCODED_LEN;
+        debug_assert!(end <= self.body.len());
+        value.encode_le(&mut self.body[offset..end]);
     }
 }
 
@@ -1443,9 +1412,10 @@ impl BTreeNodeBox {
         upper_fence: &[u8],
         hints_enabled: bool,
     ) -> Self {
+        let mut node = Box::<BTreeNode>::new_zeroed();
+        // SAFETY: `init` fully initializes the node before `assume_init`.
         unsafe {
-            let ptr = alloc_zeroed(Layout::new::<BTreeNode>()) as *mut BTreeNode;
-            (*ptr).init(
+            (*node.as_mut_ptr()).init(
                 height,
                 ts,
                 lower_fence,
@@ -1453,8 +1423,7 @@ impl BTreeNodeBox {
                 upper_fence,
                 hints_enabled,
             );
-            let node = Box::from_raw(ptr);
-            BTreeNodeBox(node)
+            BTreeNodeBox(node.assume_init())
         }
     }
 }
@@ -1822,7 +1791,7 @@ mod tests {
                 let dst_node = dst_guard.page_mut();
 
                 // Compact source to destination
-                unsafe { src_node.compact_into::<BTreeU64>(dst_node) };
+                src_node.compact_into::<BTreeU64>(dst_node);
 
                 // Verify compaction results
                 assert_eq!(dst_node.height(), 0);
@@ -1864,7 +1833,7 @@ mod tests {
                 let dst_node = dst_guard.page_mut();
 
                 // Compact source to destination
-                unsafe { src_node.compact_into::<BTreeU64>(dst_node) };
+                src_node.compact_into::<BTreeU64>(dst_node);
 
                 // Verify compaction results
                 assert_eq!(dst_node.height(), 0);
