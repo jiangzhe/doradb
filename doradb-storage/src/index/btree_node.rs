@@ -366,9 +366,7 @@ impl BTreeNode {
             }
         };
         let slot = self.new_slot_with_value(key, value);
-        unsafe {
-            self.insert_slot_at(slot_idx, slot);
-        }
+        self.insert_slot_at(slot_idx, slot);
         // debug_assert!(self.head_in_order());
         slot_idx
     }
@@ -387,9 +385,7 @@ impl BTreeNode {
     pub fn insert_at<V: BTreeValue>(&mut self, idx: usize, key: &[u8], value: V) {
         debug_assert!(idx <= self.header.count as usize);
         let slot = self.new_slot_with_value(key, value);
-        unsafe {
-            self.insert_slot_at(idx, slot);
-        }
+        self.insert_slot_at(idx, slot);
         // debug_assert!(self.head_in_order());
     }
 
@@ -526,9 +522,7 @@ impl BTreeNode {
         debug_assert!(self.can_insert(key));
         debug_assert!(self.within_boundary(key));
         let slot = self.new_slot_with_value(key, value);
-        unsafe {
-            self.insert_slot_at(self.header.count as usize, slot);
-        }
+        self.insert_slot_at(self.header.count as usize, slot);
         debug_assert!(&self.key(self.header.count as usize - 1)[..] == key);
         // single entry or in order.
         debug_assert!(
@@ -748,10 +742,9 @@ impl BTreeNode {
         &mut self.slots_mut_with_len(self.header.count as usize)[idx]
     }
 
-    /// insert slot at given position.
-    /// If overwrite is set to true, the old value is overwritten.
+    /// Insert slot at given position.
     #[inline]
-    unsafe fn insert_slot_at(&mut self, idx: usize, slot: BTreeSlot) {
+    fn insert_slot_at(&mut self, idx: usize, slot: BTreeSlot) {
         let old_count = self.header.count as usize;
         debug_assert!(idx <= old_count);
         let new_count = old_count + 1;
