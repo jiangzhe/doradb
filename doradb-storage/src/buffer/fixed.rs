@@ -215,7 +215,7 @@ impl BufferPool for FixedBufferPool {
     /// id concurrently, and the input page id may not be valid through the function
     /// call. So version must be validated before returning the buffer frame.
     #[inline]
-    async fn get_child_page<T>(
+    async fn get_child_page<T: BufferPage>(
         &'static self,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,

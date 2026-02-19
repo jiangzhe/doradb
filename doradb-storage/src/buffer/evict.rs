@@ -383,7 +383,7 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    async fn get_child_page<T>(
+    async fn get_child_page<T: BufferPage>(
         &'static self,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,

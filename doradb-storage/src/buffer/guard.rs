@@ -422,8 +422,8 @@ impl<T: 'static> FacadePageGuard<T> {
     }
 }
 
-unsafe impl<T: 'static> Send for FacadePageGuard<T> {}
-unsafe impl<T: 'static> Sync for FacadePageGuard<T> {}
+unsafe impl<T: Sync + 'static> Send for FacadePageGuard<T> {}
+unsafe impl<T: Sync + 'static> Sync for FacadePageGuard<T> {}
 
 pub struct PageOptimisticGuard<T: 'static> {
     bf: UnsafePtr<BufferFrame>,
@@ -530,8 +530,8 @@ impl<T> PageOptimisticGuard<T> {
     }
 }
 
-unsafe impl<T: 'static> Send for PageOptimisticGuard<T> {}
-unsafe impl<T: 'static> Sync for PageOptimisticGuard<T> {}
+unsafe impl<T: Sync + 'static> Send for PageOptimisticGuard<T> {}
+unsafe impl<T: Sync + 'static> Sync for PageOptimisticGuard<T> {}
 
 pub struct PageSharedGuard<T: 'static> {
     bf: UnsafePtr<BufferFrame>,
@@ -609,8 +609,8 @@ impl<T: 'static> PageSharedGuard<T> {
     }
 }
 
-unsafe impl<T: 'static> Send for PageSharedGuard<T> {}
-unsafe impl<T: 'static> Sync for PageSharedGuard<T> {}
+unsafe impl<T: Sync + 'static> Send for PageSharedGuard<T> {}
+unsafe impl<T: Sync + 'static> Sync for PageSharedGuard<T> {}
 
 pub struct PageExclusiveGuard<T: 'static> {
     bf: UnsafePtr<BufferFrame>,
@@ -730,8 +730,8 @@ impl<T: 'static> PageExclusiveGuard<T> {
     }
 }
 
-unsafe impl<T: 'static> Send for PageExclusiveGuard<T> {}
-unsafe impl<T: 'static> Sync for PageExclusiveGuard<T> {}
+unsafe impl<T: Send + 'static> Send for PageExclusiveGuard<T> {}
+unsafe impl<T: Sync + 'static> Sync for PageExclusiveGuard<T> {}
 
 #[inline]
 fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
