@@ -12,6 +12,7 @@ use crate::index::util::Maskable;
 use crate::memcmp::BytesExtendable;
 use crate::row::RowID;
 use crate::trx::TrxID;
+use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use std::alloc::{Layout, alloc_zeroed};
 use std::cmp;
 use std::cmp::Ordering;
@@ -19,6 +20,7 @@ use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 
 const _: () = assert!(mem::size_of::<BTreeHeader>().is_multiple_of(mem::size_of::<BTreeSlot>()));
+const _: () = assert!(mem::size_of::<BTreeHeader>().is_multiple_of(mem::align_of::<BTreeSlot>()));
 
 const _: () = assert!(mem::size_of::<BTreeNode>() == PAGE_SIZE);
 
@@ -122,7 +124,7 @@ pub type KeyHeadBytes = [u8; 4];
 const _: () = assert!(mem::size_of::<BTreeSlot>() == 8);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct BTreeSlot {
     len: u16,
     offset: u16,
@@ -492,14 +494,12 @@ impl BTreeNode {
     /// Delete key value at given position.
     #[inline]
     pub fn delete_at(&mut self, idx: usize, value_size: usize) {
+        let count = self.header.count as usize;
         let payload_len = self.payload_len(idx, value_size);
-        if idx + 1 < self.header.count as usize {
+        if idx + 1 < count {
             // not last row, shift one slot left.
-            unsafe {
-                let dst = (self.body_mut() as *mut BTreeSlot).add(idx);
-                let src = dst.add(1);
-                std::ptr::copy(src, dst, self.header.count as usize - idx - 1);
-            }
+            self.slots_mut_with_len(count)
+                .copy_within(idx + 1..count, idx);
         }
         self.header.count -= 1;
         self.header.start_offset -= mem::size_of::<BTreeSlot>() as u16;
@@ -723,55 +723,49 @@ impl BTreeNode {
     #[inline]
     pub(super) fn slots(&self) -> &[BTreeSlot] {
         let len = self.header.count as usize;
-        unsafe { std::slice::from_raw_parts(self.slot_ptr(0), len) }
+        self.slots_with_len(len)
     }
 
     #[inline]
     pub(super) fn slots_and_hints(&mut self) -> (&[BTreeSlot], &mut BTreeHints) {
-        let len = self.header.count as usize;
-        let slots = unsafe { std::slice::from_raw_parts(self.slot_ptr(0), len) };
-        (slots, &mut self.header.hints)
+        let (header, body) = (&mut self.header, &self.body);
+        let len = header.count as usize;
+        let bytes_len = len * mem::size_of::<BTreeSlot>();
+        let slots = cast_slice(&body[..bytes_len]);
+        (slots, &mut header.hints)
     }
 
     /// Returns reference to slot at given position.
     #[inline]
     pub(super) fn slot(&self, idx: usize) -> &BTreeSlot {
         debug_assert!(idx < self.header.count as usize);
-        unsafe { self.slot_unchecked(idx) }
-    }
-
-    #[inline]
-    unsafe fn slot_unchecked(&self, idx: usize) -> &BTreeSlot {
-        unsafe { &*self.slot_ptr(idx) }
+        &self.slots_with_len(self.header.count as usize)[idx]
     }
 
     #[inline]
     fn slot_mut(&mut self, idx: usize) -> &mut BTreeSlot {
         debug_assert!(idx < self.header.count as usize);
-        unsafe { self.slot_mut_unchecked(idx) }
-    }
-
-    #[inline]
-    unsafe fn slot_mut_unchecked(&mut self, idx: usize) -> &mut BTreeSlot {
-        unsafe { &mut *self.slot_ptr_mut(idx) }
+        &mut self.slots_mut_with_len(self.header.count as usize)[idx]
     }
 
     /// insert slot at given position.
     /// If overwrite is set to true, the old value is overwritten.
     #[inline]
     unsafe fn insert_slot_at(&mut self, idx: usize, slot: BTreeSlot) {
-        unsafe {
-            let dst = self.slot_ptr_mut(idx);
-            if idx < self.header.count as usize {
+        let old_count = self.header.count as usize;
+        debug_assert!(idx <= old_count);
+        let new_count = old_count + 1;
+        {
+            let slots = self.slots_mut_with_len(new_count);
+            if idx < old_count {
                 // shift all elements starting from destination by one position.
-                let next = dst.add(1);
-                std::ptr::copy(dst, next, self.header.count as usize - idx);
+                slots.copy_within(idx..old_count, idx + 1);
             }
-            self.header.count += 1;
-            self.header.start_offset += mem::size_of::<BTreeSlot>() as u16;
-            self.header.effective_space += mem::size_of::<BTreeSlot>() as u32;
-            *dst = slot;
+            slots[idx] = slot;
         }
+        self.header.count += 1;
+        self.header.start_offset += mem::size_of::<BTreeSlot>() as u16;
+        self.header.effective_space += mem::size_of::<BTreeSlot>() as u32;
     }
 
     /// Returns common prefix of all values in this node.
@@ -1162,46 +1156,43 @@ impl BTreeNode {
         if self.header.prefix_len == src_node.header.prefix_len {
             // only allow copy to end of current node.
             let dst_slot_idx = self.header.count as usize;
-            unsafe {
-                // fast path to memcpy slots.
-                let src_slot = (src_node.body() as *const BTreeSlot).add(src_slot_idx);
-                let dst_slot = (self.body_mut() as *mut BTreeSlot).add(dst_slot_idx);
-                std::ptr::copy_nonoverlapping(src_slot, dst_slot, count);
-                {
-                    // update space and offset.
-                    let slot_space = mem::size_of::<BTreeSlot>() * count;
-                    self.header.start_offset += slot_space as u16;
-                    self.header.effective_space += slot_space as u32;
-                }
+            let dst_slot_end = dst_slot_idx + count;
+            let src_slots = &src_node.slots()[src_slot_idx..src_slot_idx + count];
+            self.slots_mut_with_len(dst_slot_end)[dst_slot_idx..dst_slot_end]
+                .copy_from_slice(src_slots);
+            {
+                // update space and offset.
+                let slot_space = mem::size_of::<BTreeSlot>() * count;
+                self.header.start_offset += slot_space as u16;
+                self.header.effective_space += slot_space as u32;
+                self.header.count += count as u16;
+            }
 
-                // copy keys and values.
-                let mut offset = self.header.end_offset as usize;
-                for i in 0..count {
-                    let s = &*src_slot.add(i);
-                    let len = if s.len as usize <= KEY_HEAD_LEN {
-                        mem::size_of::<V>()
-                    } else {
-                        s.len as usize + mem::size_of::<V>()
-                    };
-                    offset -= len;
-
+            // copy keys and values.
+            let mut offset = self.header.end_offset as usize;
+            for (i, s) in src_slots.iter().enumerate() {
+                let len = if s.len as usize <= KEY_HEAD_LEN {
+                    mem::size_of::<V>()
+                } else {
+                    s.len as usize + mem::size_of::<V>()
+                };
+                offset -= len;
+                unsafe {
                     std::ptr::copy_nonoverlapping(
                         src_node.body().add(s.offset as usize),
                         self.body_mut().add(offset),
                         len,
                     );
+                }
 
-                    // update slot offset
-                    let d = &mut *dst_slot.add(i);
-                    d.offset = offset as u16;
-                }
-                // update space and offset.
-                {
-                    let payload_space = self.header.end_offset - offset as u16;
-                    self.header.end_offset = offset as u16;
-                    self.header.effective_space += payload_space as u32;
-                }
-                self.header.count += count as u16;
+                // update slot offset
+                self.slot_mut(dst_slot_idx + i).offset = offset as u16;
+            }
+            // update space and offset.
+            {
+                let payload_space = self.header.end_offset - offset as u16;
+                self.header.end_offset = offset as u16;
+                self.header.effective_space += payload_space as u32;
             }
             debug_assert!(self.header.start_offset <= self.header.end_offset);
             return;
@@ -1401,15 +1392,15 @@ impl BTreeNode {
     }
 
     #[inline]
-    fn slot_ptr(&self, idx: usize) -> *const BTreeSlot {
-        // SAFETY: slot area starts at body head and caller ensures `idx` bounds.
-        unsafe { (self.body() as *const BTreeSlot).add(idx) }
+    fn slots_with_len(&self, len: usize) -> &[BTreeSlot] {
+        let bytes_len = len * mem::size_of::<BTreeSlot>();
+        cast_slice(&self.body[..bytes_len])
     }
 
     #[inline]
-    fn slot_ptr_mut(&mut self, idx: usize) -> *mut BTreeSlot {
-        // SAFETY: slot area starts at body head and caller ensures `idx` bounds.
-        unsafe { (self.body_mut() as *mut BTreeSlot).add(idx) }
+    fn slots_mut_with_len(&mut self, len: usize) -> &mut [BTreeSlot] {
+        let bytes_len = len * mem::size_of::<BTreeSlot>();
+        cast_slice_mut(&mut self.body[..bytes_len])
     }
 
     #[inline]

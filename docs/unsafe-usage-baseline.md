@@ -11,18 +11,18 @@
 | buffer | 7 | 59 | 0 | 0 | 0 | 8 |
 | latch | 4 | 41 | 0 | 0 | 0 | 4 |
 | row | 3 | 6 | 0 | 0 | 1 | 3 |
-| index | 13 | 101 | 0 | 0 | 3 | 14 |
+| index | 13 | 89 | 0 | 0 | 3 | 12 |
 | io | 3 | 37 | 0 | 0 | 0 | 1 |
 | trx | 15 | 7 | 0 | 0 | 0 | 2 |
 | lwc | 2 | 8 | 6 | 0 | 3 | 0 |
 | file | 5 | 22 | 0 | 0 | 2 | 6 |
-| **total** | **52** | **281** | **6** | **0** | **9** | **38** |
+| **total** | **52** | **269** | **6** | **0** | **9** | **36** |
 
 ## File Hotspots (top 40)
 
 | file | module | unsafe | // SAFETY: |
 |---|---|---:|---:|
-| `doradb-storage/src/index/btree_node.rs` | index | 61 | 4 |
+| `doradb-storage/src/index/btree_node.rs` | index | 49 | 2 |
 | `doradb-storage/src/io/mod.rs` | io | 23 | 1 |
 | `doradb-storage/src/latch/mutex.rs` | latch | 18 | 0 |
 | `doradb-storage/src/latch/rwlock.rs` | latch | 18 | 0 |
