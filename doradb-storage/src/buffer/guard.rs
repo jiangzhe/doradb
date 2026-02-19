@@ -155,7 +155,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn try_exclusive_either(mut self) -> Either<PageExclusiveGuard<T>, PageOptimisticGuard<T>> {
         match self.try_exclusive() {
             Valid(()) => Either::Left(PageExclusiveGuard {
-                bf: frame_mut(self.bf),
+                bf: self.bf,
                 guard: self.guard,
                 captured_generation: self.captured_generation,
                 _marker: PhantomData,
@@ -195,7 +195,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn must_exclusive(self) -> PageExclusiveGuard<T> {
         debug_assert!(self.is_exclusive());
         PageExclusiveGuard {
-            bf: frame_mut(self.bf),
+            bf: self.bf,
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -209,13 +209,12 @@ impl<T: 'static> FacadePageGuard<T> {
         match self.guard.state {
             GuardState::Optimistic => {
                 let guard = self.guard.exclusive_async().await;
-                let bf = frame_mut(self.bf);
-                if bf.generation() != self.captured_generation {
+                if frame_ref(self.bf.clone()).generation() != self.captured_generation {
                     unsafe { guard.rollback_exclusive_bit() };
                     return None;
                 }
                 Some(PageExclusiveGuard {
-                    bf,
+                    bf: self.bf,
                     guard,
                     captured_generation: self.captured_generation,
                     _marker: PhantomData,
@@ -224,10 +223,9 @@ impl<T: 'static> FacadePageGuard<T> {
             GuardState::Shared => panic!("block until exclusive by shared lock is not allowed"),
             GuardState::Exclusive => {
                 let guard = self.guard;
-                let bf = frame_mut(self.bf);
-                debug_assert!(bf.generation() == self.captured_generation);
+                debug_assert!(frame_ref(self.bf.clone()).generation() == self.captured_generation);
                 Some(PageExclusiveGuard {
-                    bf,
+                    bf: self.bf,
                     guard,
                     captured_generation: self.captured_generation,
                     _marker: PhantomData,
@@ -244,7 +242,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn try_shared_either(mut self) -> Either<PageSharedGuard<T>, PageOptimisticGuard<T>> {
         match self.try_shared() {
             Valid(()) => Either::Left(PageSharedGuard {
-                bf: frame_ref(self.bf),
+                bf: self.bf,
                 guard: self.guard,
                 captured_generation: self.captured_generation,
                 _marker: PhantomData,
@@ -282,7 +280,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn must_shared(self) -> PageSharedGuard<T> {
         debug_assert!(self.is_shared());
         PageSharedGuard {
-            bf: frame_ref(self.bf),
+            bf: self.bf,
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -296,12 +294,11 @@ impl<T: 'static> FacadePageGuard<T> {
         match self.guard.state {
             GuardState::Optimistic => {
                 let guard = self.guard.shared_async().await;
-                let bf = frame_ref(self.bf);
-                if bf.generation() != self.captured_generation {
+                if frame_ref(self.bf.clone()).generation() != self.captured_generation {
                     return None;
                 }
                 Some(PageSharedGuard {
-                    bf,
+                    bf: self.bf,
                     guard,
                     captured_generation: self.captured_generation,
                     _marker: PhantomData,
@@ -309,10 +306,9 @@ impl<T: 'static> FacadePageGuard<T> {
             }
             GuardState::Shared => {
                 let guard = self.guard;
-                let bf = frame_ref(self.bf);
-                debug_assert!(bf.generation() == self.captured_generation);
+                debug_assert!(frame_ref(self.bf.clone()).generation() == self.captured_generation);
                 Some(PageSharedGuard {
-                    bf,
+                    bf: self.bf,
                     guard,
                     captured_generation: self.captured_generation,
                     _marker: PhantomData,
@@ -330,12 +326,11 @@ impl<T: 'static> FacadePageGuard<T> {
         if self.guard.state != GuardState::Shared {
             return None;
         }
-        let bf = frame_ref(self.bf);
-        if bf.generation() != self.captured_generation {
+        if self.bf().generation() != self.captured_generation {
             return None;
         }
         Some(PageSharedGuard {
-            bf,
+            bf: self.bf,
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -350,12 +345,11 @@ impl<T: 'static> FacadePageGuard<T> {
         if self.guard.state != GuardState::Exclusive {
             return None;
         }
-        let bf = frame_mut(self.bf);
-        if bf.generation() != self.captured_generation {
+        if self.bf().generation() != self.captured_generation {
             return None;
         }
         Some(PageExclusiveGuard {
-            bf,
+            bf: self.bf,
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -447,7 +441,7 @@ impl<T> PageOptimisticGuard<T> {
     #[inline]
     pub fn try_shared(mut self) -> Validation<PageSharedGuard<T>> {
         self.guard.try_shared().map(|_| PageSharedGuard {
-            bf: frame_ref(self.bf),
+            bf: self.bf,
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -458,7 +452,7 @@ impl<T> PageOptimisticGuard<T> {
     pub async fn shared_async(self) -> PageSharedGuard<T> {
         let guard = self.guard.shared_async().await;
         PageSharedGuard {
-            bf: frame_ref(self.bf),
+            bf: self.bf,
             guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -468,7 +462,7 @@ impl<T> PageOptimisticGuard<T> {
     #[inline]
     pub fn try_exclusive(mut self) -> Validation<PageExclusiveGuard<T>> {
         self.guard.try_exclusive().map(|_| PageExclusiveGuard {
-            bf: frame_mut(self.bf),
+            bf: self.bf,
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -479,7 +473,7 @@ impl<T> PageOptimisticGuard<T> {
     pub async fn exclusive_async(self) -> PageExclusiveGuard<T> {
         let guard = self.guard.exclusive_async().await;
         PageExclusiveGuard {
-            bf: frame_mut(self.bf),
+            bf: self.bf,
             guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -540,7 +534,7 @@ unsafe impl<T: 'static> Send for PageOptimisticGuard<T> {}
 unsafe impl<T: 'static> Sync for PageOptimisticGuard<T> {}
 
 pub struct PageSharedGuard<T: 'static> {
-    bf: &'static BufferFrame,
+    bf: UnsafePtr<BufferFrame>,
     guard: HybridGuard<'static>,
     captured_generation: u64,
     _marker: PhantomData<&'static T>,
@@ -549,7 +543,7 @@ pub struct PageSharedGuard<T: 'static> {
 impl<T: 'static> PageGuard<T> for PageSharedGuard<T> {
     #[inline]
     fn page(&self) -> &T {
-        page_ref(self.bf)
+        page_ref(self.frame_ref())
     }
 }
 
@@ -559,7 +553,7 @@ impl<T: 'static> PageSharedGuard<T> {
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
-            bf: frame_ptr_from_ref(self.bf),
+            bf: self.bf,
             guard: self.guard.downgrade(),
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -569,13 +563,13 @@ impl<T: 'static> PageSharedGuard<T> {
     /// Returns the buffer frame current page associated.
     #[inline]
     pub fn bf(&self) -> &BufferFrame {
-        self.bf
+        self.frame_ref()
     }
 
     /// Returns current page id.
     #[inline]
     pub fn page_id(&self) -> PageID {
-        self.bf.page_id
+        self.frame_ref().page_id
     }
 
     #[inline]
@@ -589,11 +583,12 @@ impl<T: 'static> PageSharedGuard<T> {
     /// Returns facade guard.
     #[inline]
     pub fn facade(self, dirty: bool) -> FacadePageGuard<T> {
-        if dirty && !self.bf.is_dirty() {
-            self.bf.set_dirty(true);
+        let bf = self.bf();
+        if dirty && !bf.is_dirty() {
+            bf.set_dirty(true);
         }
         FacadePageGuard {
-            bf: frame_ptr_from_ref(self.bf),
+            bf: self.bf,
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -602,9 +597,15 @@ impl<T: 'static> PageSharedGuard<T> {
 
     #[inline]
     pub fn set_dirty(self) {
-        if !self.bf.is_dirty() {
-            self.bf.set_dirty(true);
+        let bf = frame_ref(self.bf);
+        if !bf.is_dirty() {
+            bf.set_dirty(true);
         }
+    }
+
+    #[inline]
+    fn frame_ref(&self) -> &BufferFrame {
+        frame_ref(self.bf.clone())
     }
 }
 
@@ -612,7 +613,7 @@ unsafe impl<T: 'static> Send for PageSharedGuard<T> {}
 unsafe impl<T: 'static> Sync for PageSharedGuard<T> {}
 
 pub struct PageExclusiveGuard<T: 'static> {
-    bf: &'static mut BufferFrame,
+    bf: UnsafePtr<BufferFrame>,
     guard: HybridGuard<'static>,
     captured_generation: u64,
     _marker: PhantomData<&'static mut T>,
@@ -621,17 +622,30 @@ pub struct PageExclusiveGuard<T: 'static> {
 impl<T: 'static> PageGuard<T> for PageExclusiveGuard<T> {
     #[inline]
     fn page(&self) -> &T {
-        page_ref(self.bf)
+        page_ref(self.frame_ref())
     }
 }
 
 impl<T: 'static> PageExclusiveGuard<T> {
+    #[inline]
+    fn frame_ref(&self) -> &BufferFrame {
+        frame_ref(self.bf.clone())
+    }
+
+    #[inline]
+    fn frame_mut(&mut self) -> &mut BufferFrame {
+        debug_assert!(self.guard.state == GuardState::Exclusive);
+        // SAFETY: PageExclusiveGuard is only constructed from an exclusive HybridGuard and
+        // mutable access is borrowed from &mut self, ensuring one mutable borrow per guard handle.
+        unsafe { &mut *self.bf.0 }
+    }
+
     /// Convert a page exclusive guard to optimistic guard
     /// with long lifetime.
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
-            bf: frame_ptr_from_mut(self.bf),
+            bf: self.bf,
             guard: self.guard.downgrade(),
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -651,36 +665,36 @@ impl<T: 'static> PageExclusiveGuard<T> {
     /// Returns current page id.
     #[inline]
     pub fn page_id(&self) -> PageID {
-        self.bf.page_id
+        self.frame_ref().page_id
     }
 
     /// Returns mutable page.
     #[inline]
     pub fn page_mut(&mut self) -> &mut T {
-        page_mut(self.bf)
+        page_mut(self.frame_mut())
     }
 
     /// Returns current buffer frame.
     #[inline]
     pub fn bf(&self) -> &BufferFrame {
-        self.bf
+        self.frame_ref()
     }
 
     /// Returns mutable buffer frame.
     #[inline]
     pub fn bf_mut(&mut self) -> &mut BufferFrame {
-        self.bf
+        self.frame_mut()
     }
 
     /// Set next free page.
     #[inline]
     pub fn set_next_free(&mut self, next_free: PageID) {
-        self.bf.next_free = next_free;
+        self.frame_mut().next_free = next_free;
     }
 
     #[inline]
     pub fn ctx_and_page_mut(&mut self) -> (&mut FrameContext, &mut T) {
-        let bf = &mut self.bf;
+        let bf = self.frame_mut();
         let ctx = bf.ctx.as_mut().unwrap().as_mut();
         let page = bf.page;
         let page = unsafe { &mut *(page as *mut T) };
@@ -690,11 +704,12 @@ impl<T: 'static> PageExclusiveGuard<T> {
     /// Returns facade guard.
     #[inline]
     pub fn facade(self, dirty: bool) -> FacadePageGuard<T> {
-        if dirty && !self.bf.is_dirty() {
-            self.bf.set_dirty(true);
+        let bf = self.bf();
+        if dirty && !bf.is_dirty() {
+            bf.set_dirty(true);
         }
         FacadePageGuard {
-            bf: frame_ptr_from_mut(self.bf),
+            bf: self.bf,
             guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
@@ -703,14 +718,15 @@ impl<T: 'static> PageExclusiveGuard<T> {
 
     #[inline]
     pub fn set_dirty(self) {
-        if !self.bf.is_dirty() {
-            self.bf.set_dirty(true);
+        let bf = frame_ref(self.bf);
+        if !bf.is_dirty() {
+            bf.set_dirty(true);
         }
     }
 
     #[inline]
     pub fn is_dirty(&self) -> bool {
-        self.bf.is_dirty()
+        self.frame_ref().is_dirty()
     }
 }
 
@@ -723,23 +739,6 @@ fn frame_ref(ptr: UnsafePtr<BufferFrame>) -> &'static BufferFrame {
     // SAFETY: buffer pools allocate frames in a single mmap region and only pass
     // valid frame pointers to guards.
     unsafe { &*ptr.0 }
-}
-
-#[inline]
-fn frame_mut(ptr: UnsafePtr<BufferFrame>) -> &'static mut BufferFrame {
-    debug_assert!(!ptr.0.is_null());
-    // SAFETY: callers must uphold latch/guard invariants for mutable frame access.
-    unsafe { &mut *ptr.0 }
-}
-
-#[inline]
-fn frame_ptr_from_ref(frame: &'static BufferFrame) -> UnsafePtr<BufferFrame> {
-    UnsafePtr(frame as *const BufferFrame as *mut BufferFrame)
-}
-
-#[inline]
-fn frame_ptr_from_mut(frame: &'static mut BufferFrame) -> UnsafePtr<BufferFrame> {
-    UnsafePtr(frame as *mut BufferFrame)
 }
 
 #[inline]
