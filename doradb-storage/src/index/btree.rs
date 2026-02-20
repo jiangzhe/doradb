@@ -1652,7 +1652,7 @@ enum BTreeCompact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifetime::StaticLifetime;
+    use crate::lifetime::StaticLifetimeScope;
     use event_listener::Event;
     use rand_distr::{Distribution, Uniform};
     use std::collections::{BTreeMap, HashMap};
@@ -1670,7 +1670,10 @@ mod tests {
     #[test]
     fn test_btree_single_node() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, false, 200).await;
                 // insert 1, 2, 3.
@@ -1725,10 +1728,6 @@ mod tests {
                 let res = tree.delete(&5u64.to_be_bytes(), five, true, 255).await;
                 assert_eq!(res, BTreeDelete::ValueMismatch);
             }
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -1737,7 +1736,10 @@ mod tests {
         const ROWS: u64 = 90089;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, false, 200).await;
 
@@ -1798,10 +1800,6 @@ mod tests {
                 assert!(map[&2].keys + 1 == map[&1].nodes);
                 assert!(map[&1].keys + 1 == map[&0].nodes);
             }
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -1810,7 +1808,10 @@ mod tests {
         const ROWS: u64 = 90122;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, false, 200).await;
 
@@ -1869,10 +1870,6 @@ mod tests {
                 assert!(map[&2].keys + 1 == map[&1].nodes);
                 assert!(map[&1].keys + 1 == map[&0].nodes);
             }
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -1881,7 +1878,10 @@ mod tests {
         const ROWS: u64 = 90089;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, false, 200).await;
 
@@ -1951,10 +1951,6 @@ mod tests {
                     assert!(map[&h].keys + 1 == map[&(h - 1)].nodes);
                 }
             }
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -1963,7 +1959,10 @@ mod tests {
         const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, false, 200).await;
                 let mut map = BTreeMap::new();
@@ -1994,10 +1993,6 @@ mod tests {
                     }
                 }
             }
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -2009,7 +2004,10 @@ mod tests {
         const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, true, 200).await;
                 let mut map = BTreeMap::new();
@@ -2043,10 +2041,6 @@ mod tests {
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -2055,7 +2049,10 @@ mod tests {
         smol::block_on(async {
             const ROWS: u64 = 10_000;
             const MAX_VALUE: u64 = 100_000;
-            let pool = FixedBufferPool::with_capacity_static(20 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(20 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, false, 1).await;
 
@@ -2107,9 +2104,6 @@ mod tests {
                     op_nanos
                 );
             }
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -2119,7 +2113,10 @@ mod tests {
         const ROWS: u64 = 90088;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = Arc::new(BTree::new(pool, false, 200).await);
 
@@ -2163,10 +2160,6 @@ mod tests {
                 let stat = tree.collect_space_statistics().await;
                 println!("tree space statistics: {:?}", stat)
             }
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -2176,7 +2169,10 @@ mod tests {
         const ROWS: u64 = 90088;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = Arc::new(BTree::new(pool, false, 200).await);
 
@@ -2213,10 +2209,6 @@ mod tests {
                 let stat = tree.collect_space_statistics().await;
                 println!("tree space statistics: {:?}", stat)
             }
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -2225,7 +2217,10 @@ mod tests {
         const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, false, 200).await;
                 // number less than 10 million
@@ -2254,10 +2249,6 @@ mod tests {
                     space_stat
                 );
             }
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -2268,7 +2259,10 @@ mod tests {
         const H2_ROWS: u64 = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let pool = FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             assert!(pool.allocated() == 0);
             // height=0
             {
@@ -2317,9 +2311,6 @@ mod tests {
                 );
                 tree.destory().await;
                 assert!(pool.allocated() == 0);
-            }
-            unsafe {
-                StaticLifetime::drop_static(pool);
             }
         })
     }

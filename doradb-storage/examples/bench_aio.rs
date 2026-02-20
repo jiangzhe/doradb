@@ -1,7 +1,7 @@
 use clap::Parser;
 use doradb_storage::file::SparseFile;
 use doradb_storage::io::{AIOContext, AIOKind, DirectBuf};
-use doradb_storage::lifetime::StaticLifetime;
+use doradb_storage::lifetime::{StaticLifetime, StaticLifetimeScope};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,14 +12,16 @@ use std::time::{Duration, Instant};
 fn main() {
     let args = Args::parse();
     let stop = Arc::new(AtomicBool::new(false));
+    let scope = StaticLifetimeScope::new();
     let ctx = AIOContext::new(args.io_depth).unwrap();
-    let ctx = StaticLifetime::new_static(ctx);
+    let ctx = scope.adopt(StaticLifetime::new_static(ctx));
+    let ctx = ctx.as_static();
     let mut handles = vec![];
     let start = Instant::now();
     for id in 0..args.log_partitions {
         let args = args.clone();
         let stop = Arc::clone(&stop);
-        let handle = thread::spawn(move || worker(id, &ctx, args, stop));
+        let handle = thread::spawn(move || worker(id, ctx, args, stop));
         handles.push(handle);
     }
 
@@ -37,10 +39,6 @@ fn main() {
         dur.as_millis(),
         log_bytes as f64 / dur.as_micros() as f64
     );
-
-    unsafe {
-        StaticLifetime::drop_static(ctx);
-    }
 }
 
 fn worker(id: usize, aio_mgr: &'static AIOContext, args: Args, stop: Arc<AtomicBool>) -> usize {

@@ -351,7 +351,7 @@ mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
     use crate::index::secondary_index::multi_key_encoder;
-    use crate::lifetime::StaticLifetime;
+    use crate::lifetime::StaticLifetimeScope;
     use crate::value::{ValKind, ValType};
 
     #[test]
@@ -383,7 +383,10 @@ mod tests {
     #[test]
     fn test_single_key_btree_unique_index() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool = scope
+                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let index = UniqueBTreeIndex {
                     tree: BTree::new(pool, false, 100).await,
@@ -394,16 +397,16 @@ mod tests {
                 };
                 run_test_suit_for_single_key_unique_index(&index).await;
             }
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         });
     }
 
     #[test]
     fn test_multi_key_btree_unique_index() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool = scope
+                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let index = UniqueBTreeIndex {
                     tree: BTree::new(pool, false, 100).await,
@@ -419,9 +422,6 @@ mod tests {
                     ]),
                 };
                 run_test_suit_for_multi_key_unique_index(&index).await;
-            }
-            unsafe {
-                StaticLifetime::drop_static(pool);
             }
         });
     }

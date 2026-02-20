@@ -187,13 +187,16 @@ impl BTreeSlotCallback for CollectRowID<'_> {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
-    use crate::lifetime::StaticLifetime;
+    use crate::lifetime::StaticLifetimeScope;
     use crate::value::{ValKind, ValType};
 
     #[test]
     fn test_non_unique_index() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool = scope
+                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 // i32 column and row id
                 let index = NonUniqueBTreeIndex {
@@ -210,9 +213,6 @@ mod tests {
                     ]),
                 };
                 run_test_suit_for_non_unique_index(&index).await;
-            }
-            unsafe {
-                StaticLifetime::drop_static(pool);
             }
         })
     }

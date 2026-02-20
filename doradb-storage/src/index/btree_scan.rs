@@ -143,14 +143,17 @@ mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
     use crate::index::btree_value::BTreeU64;
-    use crate::lifetime::StaticLifetime;
+    use crate::lifetime::StaticLifetimeScope;
     use rand::prelude::IndexedRandom;
     use std::collections::HashMap;
 
     #[test]
     fn test_btree_scan_single_node() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let tree = BTree::new(pool, true, 200).await;
                 let keys = vec![
@@ -187,9 +190,6 @@ mod tests {
                 scanner.scan_prefix(b"a").await;
                 assert!(scanner.count() == 2);
             }
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -198,7 +198,10 @@ mod tests {
         const ALPHABETA: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
         const COUNT: usize = 100000;
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 // generate random data
                 let tree = BTree::new(pool, true, 200).await;
@@ -231,9 +234,6 @@ mod tests {
                     println!("prefix={}, count={}", *b as char, scanner.count());
                     assert_eq!(map[b], scanner.count());
                 }
-            }
-            unsafe {
-                StaticLifetime::drop_static(pool);
             }
         })
     }

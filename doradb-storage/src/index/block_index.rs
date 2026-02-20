@@ -1119,7 +1119,7 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::engine::EngineConfig;
     use crate::file::table_fs::TableFileSystemConfig;
-    use crate::lifetime::StaticLifetime;
+    use crate::lifetime::StaticLifetimeScope;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::ValKind;
     use semistr::SemiStr;
@@ -1312,7 +1312,10 @@ mod tests {
     #[test]
     fn test_block_index_cursor_two_level_tree() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool = scope
+                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
                 .with_main_dir(temp_dir.path())
@@ -1374,9 +1377,6 @@ mod tests {
                 assert_eq!(leaf_headers[1].2, overflow_entries);
                 assert_eq!(cursor_leaf_page_ids, root_leaf_page_ids);
                 assert!(cursor.next().await.is_none());
-            }
-            unsafe {
-                StaticLifetime::drop_static(pool);
             }
         })
     }
@@ -1570,7 +1570,10 @@ mod tests {
     #[test]
     fn test_block_index_split() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool = scope
+                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
                 .with_main_dir(temp_dir.path())
@@ -1619,9 +1622,6 @@ mod tests {
                 drop(root);
                 blk_idx.insert_row_page(100, 20000).await;
                 assert!(blk_idx.height() == 2);
-            }
-            unsafe {
-                StaticLifetime::drop_static(pool);
             }
         })
     }
