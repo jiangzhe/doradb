@@ -170,7 +170,7 @@ impl BufferPool for FixedBufferPool {
         let bf = g.bf();
         if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
             if g.is_exclusive() {
-                unsafe { g.rollback_exclusive_version_change() };
+                g.rollback_exclusive_version_change();
             }
             return None;
         }
@@ -212,7 +212,7 @@ impl BufferPool for FixedBufferPool {
             return Valid(g);
         }
         if g.is_exclusive() {
-            unsafe { g.rollback_exclusive_version_change() };
+            g.rollback_exclusive_version_change();
         }
         Validation::Invalid
     }

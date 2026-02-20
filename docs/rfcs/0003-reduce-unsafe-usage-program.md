@@ -1,7 +1,7 @@
 ---
 id: 0003
 title: Reduce Unsafe Usage Program
-status: proposal
+status: implemented
 github_issue: 326
 tags: [safety, storage-engine, refactor]
 created: 2026-02-18
@@ -170,6 +170,10 @@ Non-goals:
 
 Clean up remaining low-risk unsafe primarily in tests and conversions.
 
+Implemented task tracking:
+- Task doc: `docs/tasks/000028-lwc-and-test-safety-phase-5.md`
+- Task issue: [#334](https://github.com/jiangzhe/doradb/issues/334)
+
 Scope:
 - `doradb-storage/src/lwc/mod.rs`
 - `doradb-storage/src/lwc/page.rs`
@@ -185,6 +189,10 @@ Non-goals:
 ### Phase 6: Static Lifetime Test Teardown Safety (`lifetime`, tests)
 
 Centralize test-side `StaticLifetime::drop_static` unsafe usage behind scoped helpers.
+
+Implemented task tracking:
+- Task doc: `docs/tasks/000029-static-lifetime-test-teardown-safety-phase-6.md`
+- Task issue: [#336](https://github.com/jiangzhe/doradb/issues/336)
 
 Scope:
 - `doradb-storage/src/lifetime.rs`
@@ -205,6 +213,10 @@ Non-goals:
 ### Phase 7: Validation and Closeout
 
 Run full validation, summarize reductions, and document remaining justified unsafe boundaries.
+
+Implemented task tracking:
+- Task doc: `docs/tasks/000030-unsafe-usage-validation-phase-7.md`
+- Task issue: [#338](https://github.com/jiangzhe/doradb/issues/338)
 
 Scope:
 - Module-focused test suites per phase + full crate tests.
@@ -255,7 +267,7 @@ Non-goals:
 - `docs/table-file.md`
 - `docs/rfcs/0001-thread-pool-async-direct-io.md`
 - `docs/rfcs/0002-column-block-index.md`
-- `docs/unsafe-usage-principles.md` (planned in Phase 7)
+- `docs/unsafe-usage-principles.md`
 - `doradb-storage/src/buffer/*`
 - `doradb-storage/src/latch/hybrid.rs`
 - `doradb-storage/src/row/mod.rs`
