@@ -535,23 +535,6 @@ impl<T> PageOptimisticGuard<T> {
         }
     }
 
-    /// Read page and validate guard version before returning extracted value.
-    ///
-    /// This helper keeps optimistic access scoped to a closure and only returns
-    /// owned/copied data (`R` cannot borrow from page because of HRTB).
-    #[inline]
-    pub fn with_page_ref_validated<R, F>(&self, f: F) -> Validation<R>
-    where
-        F: for<'a> FnOnce(&'a T) -> R,
-    {
-        let out = f(page_ref(BufferFrames::frame_ref(self.bf.clone())));
-        if self.guard.validate() {
-            Valid(out)
-        } else {
-            Invalid
-        }
-    }
-
     /// Returns facade guard.
     #[inline]
     pub fn facade(self) -> FacadePageGuard<T> {

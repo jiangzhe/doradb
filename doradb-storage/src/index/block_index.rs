@@ -1309,8 +1309,119 @@ mod tests {
         })
     }
 
-    fn first_i32_unique_index() -> IndexSpec {
-        IndexSpec::new("idx_id", vec![IndexKey::new(0)], IndexAttributes::UK)
+    #[test]
+    fn test_block_index_cursor_two_level_tree() {
+        smol::block_on(async {
+            let pool = FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let metadata = make_test_metadata();
+            let uninit_table_file = fs.create_table_file(1, metadata, true).unwrap();
+            let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
+            {
+                let blk_idx = BlockIndex::new(
+                    pool,
+                    1,
+                    0,
+                    table_file.active_root_ptr(),
+                    Arc::clone(&table_file),
+                )
+                .await;
+                let overflow_entries = 3usize;
+                let row_pages = NBR_PAGE_ENTRIES_IN_LEAF + overflow_entries;
+                for row_page_id in 0..row_pages {
+                    let _ = blk_idx.insert_row_page(1, row_page_id as PageID).await;
+                }
+                assert_eq!(blk_idx.height(), 1);
+
+                let mut root_leaf_page_ids = vec![];
+                {
+                    let root = pool
+                        .get_page_spin::<BlockNode>(blk_idx.root.mem)
+                        .lock_shared_async()
+                        .await
+                        .unwrap();
+                    let page = root.page();
+                    assert!(page.is_branch());
+                    assert_eq!(page.branch_entries().len(), 2);
+                    root_leaf_page_ids.extend(page.branch_entries().iter().map(|e| e.page_id));
+                }
+
+                let mut cursor_leaf_page_ids = vec![];
+                let mut leaf_headers = vec![];
+                let mut cursor = blk_idx.mem_cursor();
+                cursor.seek(0).await;
+                while let Some(res) = cursor.next().await {
+                    let g = res.try_into_shared().unwrap();
+                    let node = g.page();
+                    assert!(node.is_leaf());
+                    cursor_leaf_page_ids.push(g.page_id());
+                    leaf_headers.push((
+                        node.header.start_row_id,
+                        node.header.end_row_id,
+                        node.header.count as usize,
+                    ));
+                }
+
+                assert_eq!(leaf_headers.len(), 2);
+                assert_eq!(leaf_headers[0].0, 0);
+                assert_eq!(leaf_headers[0].2, NBR_PAGE_ENTRIES_IN_LEAF);
+                assert_eq!(leaf_headers[1].0, leaf_headers[0].1);
+                assert_eq!(leaf_headers[1].1, row_pages as RowID);
+                assert_eq!(leaf_headers[1].2, overflow_entries);
+                assert_eq!(cursor_leaf_page_ids, root_leaf_page_ids);
+                assert!(cursor.next().await.is_none());
+            }
+            unsafe {
+                StaticLifetime::drop_static(pool);
+            }
+        })
+    }
+
+    #[test]
+    fn test_block_index_root_try_file_boundary_and_file_root() {
+        let metadata = make_test_metadata();
+        let mut active_root = ActiveRoot::new(1, 128, Arc::clone(&metadata));
+        active_root.column_block_index_root = 777;
+        let root_ptr = Box::into_raw(Box::new(active_root));
+        let root = BlockIndexRoot::new(123, 1000, AtomicPtr::new(root_ptr));
+        assert_eq!(root.try_file(999), Some(777));
+        assert_eq!(root.try_file(1000), None);
+        assert_eq!(root.try_file(1001), None);
+        // SAFETY: root_ptr is allocated by Box::into_raw above and reclaimed once here.
+        unsafe {
+            drop(Box::from_raw(root_ptr));
+        }
+    }
+
+    #[test]
+    fn test_block_index_root_try_file_none_when_file_ptr_null() {
+        let root = BlockIndexRoot::new(1, 1000, AtomicPtr::new(std::ptr::null_mut()));
+        assert_eq!(root.try_file(1000), None);
+        assert_eq!(root.try_file(2000), None);
+    }
+
+    #[test]
+    fn test_block_index_root_metadata_some_and_none() {
+        let expected_metadata = make_test_metadata();
+        let active_root = ActiveRoot::new(1, 128, Arc::clone(&expected_metadata));
+        let root_ptr = Box::into_raw(Box::new(active_root));
+        let root = BlockIndexRoot::new(123, 1000, AtomicPtr::new(root_ptr));
+        let metadata = root.metadata().expect("metadata should be available");
+        assert_eq!(metadata.col_count(), expected_metadata.col_count());
+        assert_eq!(metadata.val_kind(0), ValKind::I32);
+        assert_eq!(metadata.index_specs.len(), 1);
+        assert!(std::ptr::eq(metadata, expected_metadata.as_ref()));
+        // SAFETY: root_ptr is allocated by Box::into_raw above and reclaimed once here.
+        unsafe {
+            drop(Box::from_raw(root_ptr));
+        }
+
+        let root_none = BlockIndexRoot::new(123, 1000, AtomicPtr::new(std::ptr::null_mut()));
+        assert!(root_none.metadata().is_none());
     }
 
     #[test]
@@ -1513,5 +1624,20 @@ mod tests {
                 StaticLifetime::drop_static(pool);
             }
         })
+    }
+
+    fn first_i32_unique_index() -> IndexSpec {
+        IndexSpec::new("idx_id", vec![IndexKey::new(0)], IndexAttributes::UK)
+    }
+
+    fn make_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("id"),
+                column_type: ValKind::I32,
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![first_i32_unique_index()],
+        ))
     }
 }
