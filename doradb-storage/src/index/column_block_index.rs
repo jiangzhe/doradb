@@ -81,19 +81,6 @@ pub struct ColumnBlockNode {
 
 impl ColumnBlockNode {
     #[inline]
-    pub fn new(height: u32, start_row_id: RowID, create_ts: u64) -> Self {
-        ColumnBlockNode {
-            header: ColumnBlockNodeHeader {
-                height,
-                count: 0,
-                start_row_id,
-                create_ts,
-            },
-            data: [0u8; COLUMN_BLOCK_DATA_SIZE],
-        }
-    }
-
-    #[inline]
     fn new_boxed(height: u32, start_row_id: RowID, create_ts: u64) -> Box<Self> {
         // SAFETY: zeroed bytes are valid for `ColumnBlockNode` (all integer/byte fields).
         let mut node = unsafe { Box::<ColumnBlockNode>::new_zeroed().assume_init() };
@@ -909,7 +896,7 @@ mod tests {
 
     #[test]
     fn test_leaf_layout_offsets() {
-        let mut node = ColumnBlockNode::new(0, 0, 0);
+        let mut node = ColumnBlockNode::new_boxed(0, 0, 0);
         node.header.count = 2;
 
         let start_ptr = node.leaf_start_row_ids().as_ptr() as usize;
@@ -930,7 +917,7 @@ mod tests {
 
     #[test]
     fn test_branch_add_entry() {
-        let mut node = ColumnBlockNode::new(1, 0, 0);
+        let mut node = ColumnBlockNode::new_boxed(1, 0, 0);
         node.branch_add_entry(5, 7);
         assert_eq!(node.header.count, 1);
         assert_eq!(
@@ -1318,7 +1305,7 @@ mod tests {
                 let index = ColumnBlockIndex::new(Arc::clone(&table_file), 0, 0);
                 let mut mutable = MutableTableFile::fork(&table_file);
                 let obsolete_page_id = mutable.allocate_page_id().unwrap();
-                let mut node = ColumnBlockNode::new(1, 0, 0);
+                let mut node = ColumnBlockNode::new_boxed(1, 0, 0);
                 let mut entries = Vec::with_capacity(COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
                 for idx in 0..COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
                     entries.push(ColumnBlockBranchEntry {
@@ -1345,7 +1332,7 @@ mod tests {
                     .append_to_branch_with_child(
                         &mut mutable,
                         obsolete_page_id,
-                        Box::new(node),
+                        node,
                         NodeAppendResult {
                             new_page_id: child_page_id,
                             start_row_id: 0,

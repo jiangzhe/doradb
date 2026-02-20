@@ -20,6 +20,7 @@ use crate::index::{
     BlockIndex, IndexCompareExchange, IndexInsert, NonUniqueBTreeIndex, NonUniqueIndex,
     RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
 };
+use crate::io::AIOBuf;
 use crate::latch::LatchFallbackMode;
 use crate::lwc::{LwcBuilder, LwcPage};
 use crate::row::ops::{
@@ -449,7 +450,7 @@ impl Table {
         read_set: &[usize],
     ) -> Result<Option<Vec<Val>>> {
         let buf = self.file.read_page(page_id).await?;
-        let page = unsafe { &*(buf.data().as_ptr() as *const LwcPage) };
+        let page = LwcPage::try_from_bytes(buf.as_bytes())?;
         let Some(row_idx) = page.row_idx(row_id) else {
             return Ok(None);
         };

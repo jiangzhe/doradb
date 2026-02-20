@@ -11,6 +11,7 @@ use crate::lwc::{
 use crate::row::RowID;
 use crate::serde::{Ser, Serde};
 use crate::value::ValKind;
+use bytemuck::{Pod, Zeroable};
 use std::mem;
 
 const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>() - 32;
@@ -19,9 +20,8 @@ const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcP
 /// Its size is same as in-memory row page.
 /// The differences between LwcPage and row(PAX) page
 /// are:
-/// 1. Fields in row page is well aligned, so transmute
-///    is safe to performed to access single field.
-///    Fields in lwc page is not aligned, and often compressed
+/// 1. Fields in row page are well aligned for typed access.
+///    Fields in lwc page are not aligned, and often compressed
 ///    via dict/bitpacking. So access single field is often directly
 ///    performed on compressed data.
 /// 2. Row page is mutable so there is always a hybried lock associated
@@ -71,6 +71,8 @@ const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcP
 /// | b3sum                   | 32        |
 /// |-------------------------|-----------|
 /// ```
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct LwcPage {
     // The conversion from disk page to mem page is not safe.
     // We should use Ser and Deser for endianess safety.
@@ -78,8 +80,24 @@ pub struct LwcPage {
     pub body: [u8; TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>()],
 }
 
+// SAFETY: `LwcPage` is `repr(C)` and consists only of byte-array based fields.
+// Any bit pattern is valid and there is no interior mutability or drop glue.
+unsafe impl Zeroable for LwcPage {}
+// SAFETY: same reasoning as above; plain immutable byte data layout.
+unsafe impl Pod for LwcPage {}
+
 impl LwcPage {
     pub const BODY_SIZE: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>();
+
+    #[inline]
+    pub fn try_from_bytes(input: &[u8]) -> Result<&Self> {
+        bytemuck::try_from_bytes::<Self>(input).map_err(|_| Error::InvalidCompressedData)
+    }
+
+    #[inline]
+    pub fn try_from_bytes_mut(input: &mut [u8]) -> Result<&mut Self> {
+        bytemuck::try_from_bytes_mut::<Self>(input).map_err(|_| Error::InvalidCompressedData)
+    }
 
     /// Read row from this page.
     #[inline]
@@ -237,13 +255,14 @@ impl ColOffsets<'_> {
 
 const LWC_PAGE_HEADER_SIZE: usize = 24;
 const _: () = assert!(mem::size_of::<LwcPageHeader>() == LWC_PAGE_HEADER_SIZE);
+const _: () = assert!(mem::size_of::<LwcPage>() == TABLE_FILE_PAGE_SIZE);
 
 /// Header of Lwc Page.
 /// The fields are all defined as byte array
 /// to avoid endianess mistake in serialization
 /// and deserialization.
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct LwcPageHeader {
     /// Id of first row.
     first_row_id: [u8; 8],
@@ -401,6 +420,7 @@ impl<'a> RowIDSet<'a> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::io::DirectBuf;
     use crate::lwc::LwcPrimitiveSer;
 
     #[test]
@@ -477,8 +497,8 @@ mod tests {
 
     #[test]
     fn test_lwc_page() {
-        let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];
-        let page = unsafe { std::mem::transmute::<&mut [u8; 65536], &mut LwcPage>(&mut bytes) };
+        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         page.header = LwcPageHeader::new(100, 200, 50, 2, 312);
         assert!(page.header.first_row_id() == 100);
         assert!(page.header.last_row_id() == 200);
@@ -488,7 +508,7 @@ mod tests {
         let mut header_vec = vec![0u8; page.header.ser_len()];
         let ser_idx = page.header.ser(&mut header_vec[..], 0);
         assert!(ser_idx == header_vec.len());
-        assert_eq!(&header_vec, &bytes[..header_vec.len()]);
+        assert_eq!(&header_vec, bytemuck::bytes_of(&page.header));
     }
 
     #[test]
@@ -516,8 +536,8 @@ mod tests {
         let idx = null_ser.ser(&mut column_bytes[..], 0);
         column_bytes[idx..].copy_from_slice(&values_bytes);
 
-        let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];
-        let page = unsafe { std::mem::transmute::<&mut [u8; 65536], &mut LwcPage>(&mut bytes) };
+        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         let col_offsets_len = mem::size_of::<u16>();
         let col_start = col_offsets_len + row_id_bytes.len();
         let col_end = col_start + column_bytes.len();
@@ -551,8 +571,8 @@ mod tests {
             )],
             vec![],
         );
-        let mut bytes = [0u8; TABLE_FILE_PAGE_SIZE];
-        let page = unsafe { std::mem::transmute::<&mut [u8; 65536], &mut LwcPage>(&mut bytes) };
+        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         let col_offsets_len = mem::size_of::<u16>() * 2;
         let end_offset = col_offsets_len as u16;
         page.header = LwcPageHeader::new(1, 1, 0, 2, end_offset);
@@ -561,5 +581,31 @@ mod tests {
 
         let err = page.column(&metadata, 1);
         assert!(matches!(err, Err(Error::IndexOutOfBound)));
+    }
+
+    #[test]
+    fn test_lwc_page_try_from_bytes_invalid_len() {
+        let bytes = [0u8; TABLE_FILE_PAGE_SIZE - 1];
+        let err = LwcPage::try_from_bytes(&bytes);
+        assert!(matches!(err, Err(Error::InvalidCompressedData)));
+    }
+
+    #[test]
+    fn test_lwc_page_try_from_bytes_mut_roundtrip() {
+        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        {
+            let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
+            page.header = LwcPageHeader::new(11, 19, 2, 1, 32);
+            page.body[0] = 0xAB;
+            page.body[1] = 0xCD;
+        }
+        let page = LwcPage::try_from_bytes(buf.data()).unwrap();
+        assert_eq!(page.header.first_row_id(), 11);
+        assert_eq!(page.header.last_row_id(), 19);
+        assert_eq!(page.header.row_count(), 2);
+        assert_eq!(page.header.col_count(), 1);
+        assert_eq!(page.header.first_col_offset(), 32);
+        assert_eq!(page.body[0], 0xAB);
+        assert_eq!(page.body[1], 0xCD);
     }
 }

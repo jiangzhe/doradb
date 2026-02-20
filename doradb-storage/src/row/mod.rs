@@ -981,6 +981,27 @@ impl RowPage {
             std::ptr::copy_nonoverlapping(input.as_ptr(), dst, input.len());
         }
     }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn new_test_page() -> Self {
+        RowPage {
+            header: RowPageHeader {
+                start_row_id: 0,
+                row_count_and_var_field_offset: AtomicU32::new(0),
+                max_row_count: 0,
+                col_count: 0,
+                del_bitmap_offset: 0,
+                null_bitmap_list_offset: 0,
+                col_offset_list_offset: 0,
+                fix_field_offset: 0,
+                fix_field_end: 0,
+                approx_deleted: AtomicU16::new(0),
+                padding: [0; 6],
+            },
+            data: [0; PAGE_SIZE - mem::size_of::<RowPageHeader>()],
+        }
+    }
 }
 
 impl BufferPage for RowPage {}
@@ -1571,7 +1592,6 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
     };
     use crate::value::ValKind;
-    use mem::MaybeUninit;
     use semistr::SemiStr;
 
     use super::*;
@@ -1793,9 +1813,6 @@ mod tests {
     }
 
     pub(super) fn create_row_page() -> RowPage {
-        unsafe {
-            let new = MaybeUninit::<RowPage>::zeroed();
-            new.assume_init()
-        }
+        RowPage::new_test_page()
     }
 }

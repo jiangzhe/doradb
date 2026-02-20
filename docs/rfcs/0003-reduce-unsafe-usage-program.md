@@ -2,11 +2,15 @@
 id: 0003
 title: Reduce Unsafe Usage Program
 status: proposal
+github_issue: 326
 tags: [safety, storage-engine, refactor]
 created: 2026-02-18
 ---
 
 # RFC-0003: Reduce Unsafe Usage Program
+
+Issue tracking:
+- RFC issue: [#326](https://github.com/jiangzhe/doradb/issues/326)
 
 ## Summary
 
@@ -65,6 +69,10 @@ This RFC is a refactoring and safety-hardening program only.
 
 Create a baseline unsafe inventory for target modules and define review guardrails.
 
+Implemented task tracking:
+- Task doc: `docs/tasks/000024-unsafe-usage-baseline-phase-1.md`
+- Task issue: [#325](https://github.com/jiangzhe/doradb/issues/325)
+
 Scope:
 - Capture file-level unsafe counts for:
   - `buffer`, `latch`, `row`, `index`, `io`, `trx`, `lwc`, `file`
@@ -81,6 +89,10 @@ Non-goals:
 ### Phase 2: Core Runtime Hotspots (`buffer`, `latch`, `row`)
 
 Reduce unsafe usage in the most frequently exercised in-memory paths.
+
+Implemented task tracking:
+- Task doc: `docs/tasks/000025-reduce-unsafe-usage-runtime-hotspots-phase-2.md`
+- Task issue: [#328](https://github.com/jiangzhe/doradb/issues/328)
 
 Scope:
 - `doradb-storage/src/buffer/guard.rs`
@@ -102,6 +114,10 @@ Non-goals:
 ### Phase 3: I/O, File, and Transaction Safety Cleanup (`io`, `file`, `trx`)
 
 Address high-value unsafe patterns with low behavior risk.
+
+Implemented task tracking:
+- Task doc: `docs/tasks/000026-io-file-trx-safety-phase-3.md`
+- Task issue: [#330](https://github.com/jiangzhe/doradb/issues/330)
 
 Scope:
 - `doradb-storage/src/io/mod.rs`
@@ -127,6 +143,10 @@ Non-goals:
 ### Phase 4: Index Unsafe Encapsulation (`index`)
 
 Reduce and encapsulate unsafe in index internals without format/algorithm changes.
+
+Implemented task tracking:
+- Task doc: `docs/tasks/000027-index-safety-phase-4.md`
+- Task issue: [#332](https://github.com/jiangzhe/doradb/issues/332)
 
 Scope:
 - `doradb-storage/src/index/btree.rs`
