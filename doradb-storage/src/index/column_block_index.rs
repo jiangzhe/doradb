@@ -38,7 +38,7 @@ const _: () =
 const _: () = assert!(mem::size_of::<RowID>().is_multiple_of(mem::align_of::<ColumnPagePayload>()));
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct ColumnBlockNodeHeader {
     pub height: u32,
     pub count: u32,
@@ -91,6 +91,19 @@ impl ColumnBlockNode {
             },
             data: [0u8; COLUMN_BLOCK_DATA_SIZE],
         }
+    }
+
+    #[inline]
+    fn new_boxed(height: u32, start_row_id: RowID, create_ts: u64) -> Box<Self> {
+        // SAFETY: zeroed bytes are valid for `ColumnBlockNode` (all integer/byte fields).
+        let mut node = unsafe { Box::<ColumnBlockNode>::new_zeroed().assume_init() };
+        node.header = ColumnBlockNodeHeader {
+            height,
+            count: 0,
+            start_row_id,
+            create_ts,
+        };
+        node
     }
 
     #[inline]
@@ -523,7 +536,7 @@ impl ColumnBlockIndex {
         create_ts: u64,
     ) -> Result<(PageID, Box<ColumnBlockNode>)> {
         let page_id = table_file.allocate_page_id()?;
-        let node = Box::new(ColumnBlockNode::new(height, start_row_id, create_ts));
+        let node = ColumnBlockNode::new_boxed(height, start_row_id, create_ts);
         Ok((page_id, node))
     }
 
@@ -547,13 +560,10 @@ impl ColumnBlockIndex {
 
     async fn write_node(&self, page_id: PageID, node: &ColumnBlockNode) -> Result<()> {
         let mut buf = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                node as *const ColumnBlockNode as *const u8,
-                buf.data_mut().as_mut_ptr(),
-                COLUMN_BLOCK_PAGE_SIZE,
-            );
-        }
+        let dst = buf.data_mut();
+        let header_bytes = cast_slice(std::slice::from_ref(&node.header));
+        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
+        dst[COLUMN_BLOCK_HEADER_SIZE..].copy_from_slice(&node.data);
         self.table_file.write_page(page_id, buf).await
     }
 
@@ -816,16 +826,14 @@ async fn read_node_from_file(
     page_id: PageID,
 ) -> Result<Box<ColumnBlockNode>> {
     let buf = table_file.read_page(page_id).await?;
-    let mut node = Box::<ColumnBlockNode>::new_uninit();
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            buf.data().as_ptr(),
-            node.as_mut_ptr() as *mut u8,
-            COLUMN_BLOCK_PAGE_SIZE,
-        );
-    }
+    let src = buf.data();
+    let header = cast_slice::<u8, ColumnBlockNodeHeader>(&src[..COLUMN_BLOCK_HEADER_SIZE])[0];
+    let mut node = ColumnBlockNode::new_boxed(header.height, header.start_row_id, header.create_ts);
+    node.header = header;
+    node.data
+        .copy_from_slice(&src[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_PAGE_SIZE]);
     table_file.buf_list().recycle(buf);
-    Ok(unsafe { node.assume_init() })
+    Ok(node)
 }
 
 /// Find the payload for a row id using the column block index stored in file.

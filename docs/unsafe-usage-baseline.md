@@ -11,12 +11,12 @@
 | buffer | 7 | 59 | 0 | 0 | 0 | 8 |
 | latch | 4 | 41 | 0 | 0 | 0 | 4 |
 | row | 3 | 6 | 0 | 0 | 1 | 3 |
-| index | 13 | 45 | 0 | 0 | 3 | 6 |
+| index | 13 | 43 | 0 | 0 | 3 | 7 |
 | io | 3 | 37 | 0 | 0 | 0 | 1 |
 | trx | 15 | 7 | 0 | 0 | 0 | 2 |
 | lwc | 2 | 8 | 6 | 0 | 3 | 0 |
 | file | 5 | 22 | 0 | 0 | 2 | 6 |
-| **total** | **52** | **225** | **6** | **0** | **9** | **30** |
+| **total** | **52** | **223** | **6** | **0** | **9** | **31** |
 
 ## File Hotspots (top 40)
 
@@ -36,13 +36,13 @@
 | `doradb-storage/src/index/block_index.rs` | index | 7 | 3 |
 | `doradb-storage/src/index/btree_hint.rs` | index | 6 | 0 |
 | `doradb-storage/src/row/mod.rs` | row | 6 | 3 |
-| `doradb-storage/src/index/column_block_index.rs` | index | 5 | 2 |
 | `doradb-storage/src/latch/hybrid.rs` | latch | 5 | 4 |
 | `doradb-storage/src/lwc/mod.rs` | lwc | 5 | 0 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 5 | 2 |
 | `doradb-storage/src/buffer/frame.rs` | buffer | 4 | 2 |
 | `doradb-storage/src/file/table_file.rs` | file | 4 | 3 |
 | `doradb-storage/src/io/buf.rs` | io | 4 | 0 |
+| `doradb-storage/src/index/column_block_index.rs` | index | 3 | 3 |
 | `doradb-storage/src/lwc/page.rs` | lwc | 3 | 0 |
 | `doradb-storage/src/index/btree_scan.rs` | index | 2 | 0 |
 | `doradb-storage/src/index/unique_index.rs` | index | 2 | 0 |
