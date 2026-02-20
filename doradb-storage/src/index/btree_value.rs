@@ -25,7 +25,13 @@ use std::ops::Deref;
 ///    If we want to retrieve value, we can always
 ///    extract last 8 byte from key and convert it
 ///    to RowID.
-pub trait BTreeValue: Maskable {}
+pub trait BTreeValue: Maskable {
+    const ENCODED_LEN: usize;
+
+    fn encode_le(self, dst: &mut [u8]);
+
+    fn decode_le(src: &[u8]) -> Self;
+}
 
 pub const BTREE_VALUE_PACK_MAX_LEN: usize = 8;
 
@@ -87,7 +93,21 @@ impl Maskable for BTreeU64 {
     }
 }
 
-impl BTreeValue for BTreeU64 {}
+impl BTreeValue for BTreeU64 {
+    const ENCODED_LEN: usize = mem::size_of::<u64>();
+
+    #[inline]
+    fn encode_le(self, dst: &mut [u8]) {
+        debug_assert!(dst.len() == Self::ENCODED_LEN);
+        dst.copy_from_slice(&self.0.to_le_bytes());
+    }
+
+    #[inline]
+    fn decode_le(src: &[u8]) -> Self {
+        debug_assert!(src.len() == Self::ENCODED_LEN);
+        BTreeU64(u64::from_le_bytes(src.try_into().unwrap()))
+    }
+}
 
 impl BTreeValuePackable for BTreeU64 {
     #[inline]
@@ -126,4 +146,18 @@ impl Maskable for BTreeByte {
     }
 }
 
-impl BTreeValue for BTreeByte {}
+impl BTreeValue for BTreeByte {
+    const ENCODED_LEN: usize = mem::size_of::<u8>();
+
+    #[inline]
+    fn encode_le(self, dst: &mut [u8]) {
+        debug_assert!(dst.len() == Self::ENCODED_LEN);
+        dst[0] = self.0;
+    }
+
+    #[inline]
+    fn decode_le(src: &[u8]) -> Self {
+        debug_assert!(src.len() == Self::ENCODED_LEN);
+        BTreeByte(src[0])
+    }
+}
