@@ -1597,10 +1597,10 @@ fn read_i8(input: &[u8]) -> Result<(i8, &[u8])> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::io::AIOBuf;
     use crate::row::{Delete, InsertRow, RowPage};
     use crate::value::{MemVar, Val};
     use ordered_float::OrderedFloat;
-    use std::mem::MaybeUninit;
 
     #[test]
     fn test_lwc_primitive_serde() {
@@ -1904,7 +1904,7 @@ mod tests {
             ],
             vec![],
         );
-        let mut page: RowPage = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut page = RowPage::new_test_page();
         page.init(100, 20, &metadata);
 
         let mut expected_rows = Vec::new();
@@ -1940,9 +1940,7 @@ mod tests {
         assert!(appended);
         let buf = builder.build().unwrap();
 
-        let mut bytes = [0u8; 65536];
-        bytes[..buf.data().len()].copy_from_slice(buf.data());
-        let lwc_page = unsafe { std::mem::transmute::<&[u8; 65536], &LwcPage>(&bytes) };
+        let lwc_page = LwcPage::try_from_bytes(buf.as_bytes()).unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, expected_rows.len());
         assert_eq!(
             lwc_page.header.first_row_id(),
@@ -1977,7 +1975,7 @@ mod tests {
             ],
             vec![],
         );
-        let mut page: RowPage = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut page = RowPage::new_test_page();
         page.init(1, 4, &metadata);
 
         for offset in 0..2u64 {
@@ -2059,7 +2057,7 @@ mod tests {
             ],
             vec![],
         );
-        let mut page: RowPage = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut page = RowPage::new_test_page();
         page.init(10, 6, &metadata);
 
         let rows = vec![
@@ -2112,9 +2110,7 @@ mod tests {
         assert!(builder.append_row_page(&page).unwrap());
         let buf = builder.build().unwrap();
 
-        let mut bytes = [0u8; 65536];
-        bytes[..buf.data().len()].copy_from_slice(buf.data());
-        let lwc_page = unsafe { std::mem::transmute::<&[u8; 65536], &LwcPage>(&bytes) };
+        let lwc_page = LwcPage::try_from_bytes(buf.as_bytes()).unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, rows.len());
 
         for (col_idx, expected_kind) in [
