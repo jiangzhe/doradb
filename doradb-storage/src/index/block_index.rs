@@ -778,7 +778,7 @@ impl BlockIndex {
                     Err(_) => return Valid(RowLocation::NotFound),
                 };
                 return Valid(match payload {
-                    Some(payload) => RowLocation::LwcPage(payload.block_id as PageID),
+                    Some(payload) => RowLocation::LwcPage(payload.block_id),
                     None => RowLocation::NotFound,
                 });
             }
