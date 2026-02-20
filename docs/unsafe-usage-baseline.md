@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-02-19`
+- Generated on: `2026-02-20`
 - Command: `cargo +nightly -Zscript tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
 
@@ -11,12 +11,12 @@
 | buffer | 7 | 59 | 0 | 0 | 0 | 8 |
 | latch | 4 | 41 | 0 | 0 | 0 | 4 |
 | row | 3 | 6 | 0 | 0 | 1 | 3 |
-| index | 13 | 51 | 0 | 0 | 3 | 11 |
+| index | 13 | 45 | 0 | 0 | 3 | 6 |
 | io | 3 | 37 | 0 | 0 | 0 | 1 |
 | trx | 15 | 7 | 0 | 0 | 0 | 2 |
 | lwc | 2 | 8 | 6 | 0 | 3 | 0 |
 | file | 5 | 22 | 0 | 0 | 2 | 6 |
-| **total** | **52** | **231** | **6** | **0** | **9** | **35** |
+| **total** | **52** | **225** | **6** | **0** | **9** | **30** |
 
 ## File Hotspots (top 40)
 
@@ -31,12 +31,12 @@
 | `doradb-storage/src/buffer/fixed.rs` | buffer | 12 | 0 |
 | `doradb-storage/src/index/btree.rs` | index | 11 | 0 |
 | `doradb-storage/src/index/btree_node.rs` | index | 11 | 1 |
-| `doradb-storage/src/index/column_block_index.rs` | index | 11 | 7 |
 | `doradb-storage/src/io/libaio_abi.rs` | io | 10 | 0 |
 | `doradb-storage/src/buffer/util.rs` | buffer | 8 | 0 |
 | `doradb-storage/src/index/block_index.rs` | index | 7 | 3 |
 | `doradb-storage/src/index/btree_hint.rs` | index | 6 | 0 |
 | `doradb-storage/src/row/mod.rs` | row | 6 | 3 |
+| `doradb-storage/src/index/column_block_index.rs` | index | 5 | 2 |
 | `doradb-storage/src/latch/hybrid.rs` | latch | 5 | 4 |
 | `doradb-storage/src/lwc/mod.rs` | lwc | 5 | 0 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 5 | 2 |

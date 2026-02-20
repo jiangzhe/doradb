@@ -3,9 +3,8 @@ use crate::error::{Error, Result};
 use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE, TableFile};
 use crate::io::DirectBuf;
 use crate::row::RowID;
-use bytemuck::{cast_slice, cast_slice_mut};
+use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use std::mem;
-use std::slice;
 use std::sync::Arc;
 
 pub const COLUMN_BLOCK_PAGE_SIZE: usize = TABLE_FILE_PAGE_SIZE;
@@ -29,6 +28,14 @@ const _: () = assert!(
     mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_PAGE_SIZE,
     "ColumnBlockNode size must match table file page size"
 );
+const _: () = assert!(mem::size_of::<ColumnPagePayload>() == 128);
+const _: () = assert!(mem::size_of::<ColumnBlockBranchEntry>() == 16);
+const _: () = assert!(COLUMN_BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<RowID>()));
+const _: () =
+    assert!(COLUMN_BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<ColumnPagePayload>()));
+const _: () =
+    assert!(COLUMN_BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<ColumnBlockBranchEntry>()));
+const _: () = assert!(mem::size_of::<RowID>().is_multiple_of(mem::align_of::<ColumnPagePayload>()));
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,6 +53,11 @@ pub struct ColumnPagePayload {
     pub deletion_field: [u8; 120],
 }
 
+// SAFETY: `ColumnPagePayload` is `repr(C)` and contains only plain-data fields.
+unsafe impl Zeroable for ColumnPagePayload {}
+// SAFETY: `ColumnPagePayload` has no padding-sensitive or pointer/reference fields.
+unsafe impl Pod for ColumnPagePayload {}
+
 impl ColumnPagePayload {
     #[inline]
     pub fn deletion_list(&mut self) -> DeletionList<'_> {
@@ -54,7 +66,7 @@ impl ColumnPagePayload {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
 pub struct ColumnBlockBranchEntry {
     pub start_row_id: RowID,
     pub page_id: PageID,
@@ -92,70 +104,53 @@ impl ColumnBlockNode {
     }
 
     #[inline]
-    fn data_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
-    }
-
-    #[inline]
-    fn data_ptr_mut(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr()
-    }
-
-    #[inline]
     pub fn leaf_start_row_ids(&self) -> &[RowID] {
         debug_assert!(self.is_leaf());
-        self.data_slice(self.header.count as usize)
+        self.leaf_row_ids_with_count(self.header.count as usize)
     }
 
     #[inline]
     pub fn leaf_start_row_ids_mut(&mut self) -> &mut [RowID] {
         debug_assert!(self.is_leaf());
-        self.data_slice_mut(self.header.count as usize)
+        self.leaf_row_ids_mut_with_count(self.header.count as usize)
     }
 
     #[inline]
     pub fn leaf_payloads(&self) -> &[ColumnPagePayload] {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
-        // SAFETY: payload region starts after `count` RowID entries.
-        unsafe { slice::from_raw_parts(self.leaf_payload_ptr(count), count) }
+        self.leaf_payloads_with_count(count)
     }
 
     #[inline]
     pub fn leaf_payloads_mut(&mut self) -> &mut [ColumnPagePayload] {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
-        // SAFETY: payload region starts after `count` RowID entries.
-        unsafe { slice::from_raw_parts_mut(self.leaf_payload_ptr_mut(count), count) }
+        self.leaf_payloads_mut_with_count(count)
     }
 
     #[inline]
     pub fn leaf_arrays_mut(&mut self) -> (&mut [RowID], &mut [ColumnPagePayload]) {
         debug_assert!(self.is_leaf());
         let count = self.header.count as usize;
-        let data_ptr = self.data_ptr_mut();
-        let row_ptr = data_ptr as *mut RowID;
-        let payload_ptr =
-            unsafe { data_ptr.add(count * mem::size_of::<RowID>()) as *mut ColumnPagePayload };
-        // SAFETY: row-id and payload regions are disjoint contiguous ranges.
-        unsafe {
-            (
-                slice::from_raw_parts_mut(row_ptr, count),
-                slice::from_raw_parts_mut(payload_ptr, count),
-            )
-        }
+        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+        let row_bytes = count * mem::size_of::<RowID>();
+        let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
+        let (row_region, remain) = self.data.split_at_mut(row_bytes);
+        let (payload_region, _) = remain.split_at_mut(payload_bytes);
+        (cast_slice_mut(row_region), cast_slice_mut(payload_region))
     }
 
     #[inline]
     pub fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
         debug_assert!(self.is_branch());
-        self.data_slice(self.header.count as usize)
+        self.branch_entries_with_count(self.header.count as usize)
     }
 
     #[inline]
     pub fn branch_entries_mut(&mut self) -> &mut [ColumnBlockBranchEntry] {
         debug_assert!(self.is_branch());
-        self.data_slice_mut(self.header.count as usize)
+        self.branch_entries_mut_with_count(self.header.count as usize)
     }
 
     #[inline]
@@ -171,29 +166,47 @@ impl ColumnBlockNode {
     }
 
     #[inline]
-    fn data_slice<T>(&self, count: usize) -> &[T] {
-        // SAFETY: caller guarantees node layout for `T` and bounds by `count`.
-        unsafe { slice::from_raw_parts(self.data_ptr() as *const T, count) }
+    fn leaf_row_ids_with_count(&self, count: usize) -> &[RowID] {
+        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+        let row_bytes = count * mem::size_of::<RowID>();
+        cast_slice(&self.data[..row_bytes])
     }
 
     #[inline]
-    fn data_slice_mut<T>(&mut self, count: usize) -> &mut [T] {
-        // SAFETY: caller guarantees node layout for `T` and bounds by `count`.
-        unsafe { slice::from_raw_parts_mut(self.data_ptr_mut() as *mut T, count) }
+    fn leaf_row_ids_mut_with_count(&mut self, count: usize) -> &mut [RowID] {
+        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+        let row_bytes = count * mem::size_of::<RowID>();
+        cast_slice_mut(&mut self.data[..row_bytes])
     }
 
     #[inline]
-    fn leaf_payload_ptr(&self, count: usize) -> *const ColumnPagePayload {
-        // SAFETY: offset is within `data` and aligned for repr(C) payload access.
-        unsafe { self.data_ptr().add(count * mem::size_of::<RowID>()) as *const ColumnPagePayload }
+    fn leaf_payloads_with_count(&self, count: usize) -> &[ColumnPagePayload] {
+        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+        let row_bytes = count * mem::size_of::<RowID>();
+        let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
+        cast_slice(&self.data[row_bytes..row_bytes + payload_bytes])
     }
 
     #[inline]
-    fn leaf_payload_ptr_mut(&mut self, count: usize) -> *mut ColumnPagePayload {
-        // SAFETY: offset is within `data` and aligned for repr(C) payload access.
-        unsafe {
-            self.data_ptr_mut().add(count * mem::size_of::<RowID>()) as *mut ColumnPagePayload
-        }
+    fn leaf_payloads_mut_with_count(&mut self, count: usize) -> &mut [ColumnPagePayload] {
+        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+        let row_bytes = count * mem::size_of::<RowID>();
+        let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
+        cast_slice_mut(&mut self.data[row_bytes..row_bytes + payload_bytes])
+    }
+
+    #[inline]
+    fn branch_entries_with_count(&self, count: usize) -> &[ColumnBlockBranchEntry] {
+        debug_assert!(count <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
+        let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
+        cast_slice(&self.data[..bytes_len])
+    }
+
+    #[inline]
+    fn branch_entries_mut_with_count(&mut self, count: usize) -> &mut [ColumnBlockBranchEntry] {
+        debug_assert!(count <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
+        let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
+        cast_slice_mut(&mut self.data[..bytes_len])
     }
 }
 
