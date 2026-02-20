@@ -8,15 +8,15 @@
 
 | module | files | unsafe | transmute | new_unchecked | assume_init | // SAFETY: |
 |---|---:|---:|---:|---:|---:|---:|
-| buffer | 7 | 59 | 0 | 0 | 0 | 8 |
+| buffer | 7 | 53 | 0 | 0 | 0 | 8 |
 | latch | 4 | 41 | 0 | 0 | 0 | 4 |
 | row | 3 | 5 | 0 | 0 | 0 | 3 |
-| index | 13 | 46 | 0 | 0 | 3 | 9 |
+| index | 13 | 18 | 0 | 0 | 3 | 9 |
 | io | 3 | 37 | 0 | 0 | 0 | 1 |
 | trx | 15 | 7 | 0 | 0 | 0 | 2 |
 | lwc | 2 | 2 | 0 | 0 | 0 | 2 |
 | file | 5 | 22 | 0 | 0 | 2 | 6 |
-| **total** | **52** | **219** | **0** | **0** | **5** | **35** |
+| **total** | **52** | **185** | **0** | **0** | **5** | **35** |
 
 ## File Hotspots (top 40)
 
@@ -25,15 +25,13 @@
 | `doradb-storage/src/io/mod.rs` | io | 23 | 1 |
 | `doradb-storage/src/latch/mutex.rs` | latch | 18 | 0 |
 | `doradb-storage/src/latch/rwlock.rs` | latch | 18 | 0 |
-| `doradb-storage/src/buffer/evict.rs` | buffer | 17 | 3 |
 | `doradb-storage/src/buffer/guard.rs` | buffer | 17 | 3 |
 | `doradb-storage/src/file/mod.rs` | file | 17 | 3 |
-| `doradb-storage/src/buffer/fixed.rs` | buffer | 12 | 0 |
-| `doradb-storage/src/index/btree.rs` | index | 11 | 0 |
-| `doradb-storage/src/index/btree_node.rs` | index | 11 | 1 |
-| `doradb-storage/src/index/block_index.rs` | index | 10 | 5 |
+| `doradb-storage/src/buffer/evict.rs` | buffer | 14 | 3 |
 | `doradb-storage/src/io/libaio_abi.rs` | io | 10 | 0 |
+| `doradb-storage/src/buffer/fixed.rs` | buffer | 9 | 0 |
 | `doradb-storage/src/buffer/util.rs` | buffer | 8 | 0 |
+| `doradb-storage/src/index/block_index.rs` | index | 8 | 5 |
 | `doradb-storage/src/index/btree_hint.rs` | index | 6 | 0 |
 | `doradb-storage/src/latch/hybrid.rs` | latch | 5 | 4 |
 | `doradb-storage/src/row/mod.rs` | row | 5 | 3 |
@@ -42,12 +40,10 @@
 | `doradb-storage/src/file/table_file.rs` | file | 4 | 3 |
 | `doradb-storage/src/io/buf.rs` | io | 4 | 0 |
 | `doradb-storage/src/index/column_block_index.rs` | index | 3 | 3 |
-| `doradb-storage/src/index/btree_scan.rs` | index | 2 | 0 |
-| `doradb-storage/src/index/unique_index.rs` | index | 2 | 0 |
 | `doradb-storage/src/lwc/page.rs` | lwc | 2 | 2 |
 | `doradb-storage/src/buffer/page.rs` | buffer | 1 | 0 |
 | `doradb-storage/src/file/table_fs.rs` | file | 1 | 0 |
-| `doradb-storage/src/index/non_unique_index.rs` | index | 1 | 0 |
+| `doradb-storage/src/index/btree_node.rs` | index | 1 | 1 |
 | `doradb-storage/src/trx/log_replay.rs` | trx | 1 | 0 |
 | `doradb-storage/src/trx/sys.rs` | trx | 1 | 0 |
 

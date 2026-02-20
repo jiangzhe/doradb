@@ -1572,14 +1572,17 @@ fn head_int(k: &[u8]) -> KeyHeadInt {
 mod tests {
     use super::*;
     use crate::buffer::{BufferPool, FixedBufferPool};
-    use crate::lifetime::StaticLifetime;
+    use crate::lifetime::StaticLifetimeScope;
     use rand_distr::{Distribution, Uniform};
     use std::collections::BTreeMap;
 
     #[test]
     fn test_btree_node_insert() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
@@ -1600,17 +1603,16 @@ mod tests {
                 let res = node.search_key(&11u64.to_be_bytes());
                 assert_eq!(res, Err(10));
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
     #[test]
     fn test_btree_node_delete() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
@@ -1650,17 +1652,16 @@ mod tests {
                     BTreeDelete::ValueMismatch
                 );
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
     #[test]
     fn test_btree_node_mark_as_deleted() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
@@ -1704,17 +1705,16 @@ mod tests {
                     BTreeUpdate::ValueMismatch(BTreeU64::from(4))
                 );
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
     #[test]
     fn test_btree_node_update() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
@@ -1762,17 +1762,16 @@ mod tests {
                     BTreeUpdate::ValueMismatch(BTreeU64::from(7))
                 );
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
     #[test]
     fn test_btree_node_compact_non_empty() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
 
             {
                 // Create source leaf node with data
@@ -1810,17 +1809,16 @@ mod tests {
                     assert_eq!(dst_node.value::<BTreeU64>(i), src_node.value::<BTreeU64>(i));
                 }
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
     #[test]
     fn test_btree_node_compact_empty() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
 
             {
                 // Create empty source node
@@ -1846,10 +1844,6 @@ mod tests {
                     src_node.free_space_after_compaction()
                 );
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
@@ -1866,7 +1860,10 @@ mod tests {
     #[test]
     fn test_btree_node_space_estimation() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
 
             {
                 let mut page1_guard = buf_pool.allocate_page::<BTreeNode>().await;
@@ -1925,17 +1922,16 @@ mod tests {
                 // prefix length may be reduced.
                 println!("merged={}", estimation.total_space());
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
     #[test]
     fn test_btree_node_update_key() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
@@ -2014,17 +2010,16 @@ mod tests {
                     assert!(node.cmp_slot_key(i, i - 1) == Ordering::Greater);
                 }
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
     #[test]
     fn test_btree_node_enable_hints_seq() {
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
                 let node = page_guard.page_mut();
@@ -2045,10 +2040,6 @@ mod tests {
                 let res = node.search_key(&300u64.to_be_bytes());
                 assert_eq!(res, Err(300));
             }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
-            }
         })
     }
 
@@ -2058,7 +2049,10 @@ mod tests {
         use rand_chacha::ChaCha8Rng;
         const COUNT: usize = 100;
         smol::block_on(async {
-            let buf_pool = FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let buf_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = buf_pool.as_static();
             {
                 let mut rng = ChaCha8Rng::seed_from_u64(0u64);
                 let uniform = Uniform::new(0u64, 1u64 << 63).unwrap();
@@ -2086,10 +2080,6 @@ mod tests {
                         panic!("debug-only mismatch");
                     }
                 }
-            }
-
-            unsafe {
-                StaticLifetime::drop_static(buf_pool);
             }
         })
     }

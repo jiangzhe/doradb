@@ -14,7 +14,7 @@ Issue tracking:
 
 ## Summary
 
-This RFC proposes a multi-phase program to reduce unsafe usage in `doradb-storage` while preserving current behavior and performance. The program focuses on the highest-risk unsafe patterns first (buffer pool, latch, row page), then expands to `io`, `trx`, `index`, `lwc`, and `file`. The goal is not to eliminate all unsafe code, but to eliminate avoidable unsafe code and strictly encapsulate unavoidable unsafe code behind audited boundaries with explicit invariants.
+This RFC proposes a multi-phase program to reduce unsafe usage in `doradb-storage` while preserving current behavior and performance. The program focuses on the highest-risk unsafe patterns first (buffer pool, latch, row page), then expands to `io`, `trx`, `index`, `lwc`, `lifetime` test teardown, and `file`. The goal is not to eliminate all unsafe code, but to eliminate avoidable unsafe code and strictly encapsulate unavoidable unsafe code behind audited boundaries with explicit invariants.
 
 ## Context
 
@@ -182,7 +182,27 @@ Goals:
 Non-goals:
 - Change LWC page on-disk representation.
 
-### Phase 6: Validation and Closeout
+### Phase 6: Static Lifetime Test Teardown Safety (`lifetime`, tests)
+
+Centralize test-side `StaticLifetime::drop_static` unsafe usage behind scoped helpers.
+
+Scope:
+- `doradb-storage/src/lifetime.rs`
+- test modules currently invoking `unsafe { StaticLifetime::drop_static(...) }`
+
+Goals:
+- Introduce a scoped helper (for example `StaticLifetimeScope`) that registers leaked static objects and drops them in reverse registration order.
+- Provide ergonomic typed references (for example `StaticLifetimeScopeRef<T>`) to avoid changing test call-site semantics.
+- Support both:
+  - objects created within scope from owned values
+  - already-leaked `&'static T` objects produced by existing `*_static` constructors
+- Remove repetitive explicit unsafe teardown blocks from tests by centralizing unsafe drop logic in one audited location.
+
+Non-goals:
+- Replace static-lifetime architecture with non-static lifetimes.
+- Change production teardown paths where explicit drop order is already intentional (for example `Engine::drop`).
+
+### Phase 7: Validation and Closeout
 
 Run full validation, summarize reductions, and document remaining justified unsafe boundaries.
 
@@ -235,7 +255,7 @@ Non-goals:
 - `docs/table-file.md`
 - `docs/rfcs/0001-thread-pool-async-direct-io.md`
 - `docs/rfcs/0002-column-block-index.md`
-- `docs/unsafe-usage-principles.md` (planned in Phase 6)
+- `docs/unsafe-usage-principles.md` (planned in Phase 7)
 - `doradb-storage/src/buffer/*`
 - `doradb-storage/src/latch/hybrid.rs`
 - `doradb-storage/src/row/mod.rs`

@@ -1421,6 +1421,7 @@ pub enum PoolRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifetime::StaticLifetimeScope;
     use crate::row::RowPage;
     use std::thread;
     use std::time::Duration;
@@ -1430,12 +1431,16 @@ mod tests {
     fn test_evict_buffer_pool_simple() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let pool = EvictableBufferPoolConfig::default()
-                .with_main_dir(temp_dir.path())
-                .max_mem_size(1024u64 * 1024 * 128)
-                .max_file_size(1024u64 * 1024 * 256)
-                .build_static()
-                .unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool = scope.adopt(
+                EvictableBufferPoolConfig::default()
+                    .with_main_dir(temp_dir.path())
+                    .max_mem_size(1024u64 * 1024 * 128)
+                    .max_file_size(1024u64 * 1024 * 256)
+                    .build_static()
+                    .unwrap(),
+            );
+            let pool = pool.as_static();
             {
                 let g = pool.allocate_page::<RowPage>().await;
                 assert_eq!(g.page_id(), 0);
@@ -1521,9 +1526,6 @@ mod tests {
                     .await;
                 assert!(c.is_invalid());
             }
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -1531,12 +1533,17 @@ mod tests {
     fn test_evict_buffer_pool_full() {
         // 100 in-mem pages and 200 total pages.
         let temp_dir = TempDir::new().unwrap();
-        let pool: &EvictableBufferPool = EvictableBufferPoolConfig::default()
-            .with_main_dir(temp_dir.path())
-            .max_mem_size(64u64 * 1024 * 130)
-            .max_file_size(128u64 * 1024 * 130)
-            .build_static()
-            .unwrap();
+        let scope = StaticLifetimeScope::new();
+        let pool: &EvictableBufferPool = scope
+            .adopt(
+                EvictableBufferPoolConfig::default()
+                    .with_main_dir(temp_dir.path())
+                    .max_mem_size(64u64 * 1024 * 130)
+                    .max_file_size(128u64 * 1024 * 130)
+                    .build_static()
+                    .unwrap(),
+            )
+            .as_static();
 
         let (tx, rx) = flume::unbounded();
         let handle1 = {
@@ -1569,22 +1576,22 @@ mod tests {
         });
 
         handle1.join().unwrap();
-
-        unsafe {
-            StaticLifetime::drop_static(pool);
-        }
     }
 
     #[test]
     fn test_evict_buffer_pool_alloc() {
         // max pages 16k, max in-mem 1k
         let temp_dir = TempDir::new().unwrap();
-        let pool = EvictableBufferPoolConfig::default()
-            .with_main_dir(temp_dir.path())
-            .max_mem_size(1024u64 * 1024 * 64)
-            .max_file_size(1024u64 * 1024 * 128)
-            .build_static()
-            .unwrap();
+        let scope = StaticLifetimeScope::new();
+        let pool = scope.adopt(
+            EvictableBufferPoolConfig::default()
+                .with_main_dir(temp_dir.path())
+                .max_mem_size(1024u64 * 1024 * 64)
+                .max_file_size(1024u64 * 1024 * 128)
+                .build_static()
+                .unwrap(),
+        );
+        let pool = pool.as_static();
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
@@ -1606,12 +1613,17 @@ mod tests {
         use rand::{Rng, prelude::IndexedRandom};
         // max pages 2k, max in-mem 1k
         let temp_dir = TempDir::new().unwrap();
-        let pool = EvictableBufferPoolConfig::default()
-            .with_main_dir(temp_dir.path())
-            .max_mem_size(64u64 * 1024 * 1024)
-            .max_file_size(64u64 * 1024 * 2048)
-            .build_static()
-            .unwrap();
+        let scope = StaticLifetimeScope::new();
+        let pool = scope
+            .adopt(
+                EvictableBufferPoolConfig::default()
+                    .with_main_dir(temp_dir.path())
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(64u64 * 1024 * 2048)
+                    .build_static()
+                    .unwrap(),
+            )
+            .as_static();
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
@@ -1669,9 +1681,6 @@ mod tests {
         }
         for h in handles {
             h.join().unwrap();
-        }
-        unsafe {
-            StaticLifetime::drop_static(pool);
         }
     }
 }

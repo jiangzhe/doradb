@@ -250,11 +250,15 @@ unsafe impl StaticLifetime for FixedBufferPool {}
 mod tests {
     use super::*;
     use crate::index::BlockNode;
+    use crate::lifetime::StaticLifetimeScope;
 
     #[test]
     fn test_fixed_buffer_pool() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             {
                 let g = pool.allocate_page::<BlockNode>().await;
                 assert_eq!(g.page_id(), 0);
@@ -339,16 +343,16 @@ mod tests {
 
                 assert!(stale_guard.lock_shared_async().await.is_none());
             }
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
     #[test]
     fn test_facade_page_guard_lock_shared_and_try_into_shared() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             let g = pool.allocate_page::<BlockNode>().await;
             let page_id = g.page_id();
             drop(g);
@@ -399,17 +403,16 @@ mod tests {
             drop(g);
 
             assert!(stale_guard.lock_shared_async().await.is_none());
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
     #[test]
     fn test_facade_page_guard_lock_exclusive_and_try_into_exclusive() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             let g = pool.allocate_page::<BlockNode>().await;
             let page_id = g.page_id();
             drop(g);
@@ -464,10 +467,6 @@ mod tests {
             drop(g);
 
             assert!(stale_guard.lock_exclusive_async().await.is_none());
-
-            unsafe {
-                StaticLifetime::drop_static(pool);
-            }
         })
     }
 
@@ -475,7 +474,10 @@ mod tests {
     #[should_panic(expected = "block until exclusive by shared lock is not allowed")]
     fn test_facade_page_guard_lock_exclusive_async_panics_on_shared_state() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             let g = pool.allocate_page::<BlockNode>().await;
             let page_id = g.page_id();
             drop(g);
@@ -496,7 +498,10 @@ mod tests {
     #[should_panic(expected = "block until exclusive by shared lock is not allowed")]
     fn test_facade_page_guard_lock_shared_async_panics_on_exclusive_state() {
         smol::block_on(async {
-            let pool = FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
             let g = pool.allocate_page::<BlockNode>().await;
             let page_id = g.page_id();
             drop(g);
