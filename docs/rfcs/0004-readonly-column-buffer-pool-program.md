@@ -51,9 +51,10 @@ We will implement readonly buffering as a two-level architecture.
 ### 1. Two-Level Buffering Model
 
 - `GlobalReadonlyBufferPool`
-  - Owns frame/page arena, global mapping, inflight read deduplication, and eviction.
+  - Owns frame/page arena, forward global mapping, inflight read deduplication, and eviction.
   - Performs direct pread into frame memory on cache miss.
   - Applies drop-only eviction (no write-back path).
+  - Stores reverse key metadata inline in `BufferFrame` (`table_id`, `block_id`) for frame->key checks during invalidation/reuse.
 
 - Per-table `ReadonlyBufferPool`
   - Binds `(table_id, Arc<TableFile>, &'static GlobalReadonlyBufferPool)`.
@@ -129,10 +130,10 @@ The implementation must enforce these invariants:
 
 1. **Frame ownership invariant**:
    - Each frame slot has exactly one logical state at a time (free/loading/resident/evicting).
-   - Reverse mapping and frame state transitions are atomic with respect to cache map updates.
+   - Frame key metadata updates and frame state transitions are atomic with respect to forward cache map updates.
 
 2. **Key mapping invariant**:
-   - `disk_to_frame[key] = frame_id` implies reverse mapping of `frame_id` points to exactly `key`.
+   - `disk_to_frame[key] = frame_id` implies `frame_id`'s inline key metadata in `BufferFrame` points to exactly `key`.
    - Key removal and frame reuse happen in one critical transition.
 
 3. **IO lifetime invariant**:
@@ -189,7 +190,7 @@ Non-goals:
 - **Phase 2: Global Readonly Pool Core**
 
 Scope:
-- Implement `GlobalReadonlyBufferPool` core: frame arena, key mapping, reverse mapping, inflight dedup, direct pread miss load, drop-only eviction.
+- Implement `GlobalReadonlyBufferPool` core: frame arena, forward key mapping + inline frame key metadata, inflight dedup, direct pread miss load, drop-only eviction.
 - Implement explicit invalidation API for reused physical page ids.
 - Add focused unit tests for concurrency and state transitions.
 
