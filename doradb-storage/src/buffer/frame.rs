@@ -28,7 +28,6 @@ pub struct BufferFrame {
     /* header part */
     pub latch: HybridLatch, // lock proctects free list and page.
     pub page_id: PageID,
-    pub next_free: PageID,
     frame_kind: AtomicU8,
     generation: AtomicU64,
     dirty: AtomicBool,
@@ -143,7 +142,6 @@ impl Default for BufferFrame {
         BufferFrame {
             latch: HybridLatch::new(),
             page_id: 0,
-            next_free: INVALID_PAGE_ID,
             frame_kind: AtomicU8::new(FrameKind::Uninitialized as u8),
             generation: AtomicU64::new(0),
             // by default the page is dirty because no copy on disk.
@@ -258,7 +256,6 @@ impl BufferFrames {
             frame.page_id = page_id;
             frame.ctx = None;
             T::init_frame(frame);
-            frame.next_free = INVALID_PAGE_ID;
             frame.set_dirty(true);
             frame.clear_readonly_key();
         });

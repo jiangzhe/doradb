@@ -2,11 +2,9 @@ use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{
-    BufferPage, INVALID_PAGE_ID, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID,
-};
+use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{
-    allocate_frame_and_page_arrays, deallocate_frame_and_page_arrays, frame_total_bytes,
+    deallocate_frame_and_page_arrays, frame_total_bytes, initialize_frame_and_page_arrays,
     madvise_dontneed,
 };
 use crate::error::Validation::Valid;
@@ -1159,7 +1157,7 @@ impl EvictableBufferPoolConfig {
         }
 
         // 2. Initialize memory of frames and pages.
-        let (frames, pages) = unsafe { allocate_frame_and_page_arrays(max_nbr)? };
+        let (frames, pages) = unsafe { initialize_frame_and_page_arrays(max_nbr)? };
 
         // 3. Create file and initialize AIO manager.
         let io_ctx = AIOContext::new(self.max_io_depth)?;
@@ -1167,21 +1165,6 @@ impl EvictableBufferPoolConfig {
 
         let file = SparseFile::create_or_trunc(&self.file_path, max_file_size)?;
         let file_io = SingleFileIO::new(file);
-
-        // 4. Initialize frames.
-        // NOTE: we need to initialize all frames, not only maximum number that can be held in memory.
-        unsafe {
-            for i in 0..max_nbr {
-                let f_ptr = frames.add(i);
-                std::ptr::write(f_ptr, BufferFrame::default());
-                let frame = &mut *f_ptr;
-                frame.page_id = i as PageID;
-                frame.page = pages.add(i);
-                frame.next_free = i as PageID + 1;
-            }
-            // Update last frame's next_free
-            (*frames.add(max_nbr - 1)).next_free = INVALID_PAGE_ID;
-        }
 
         let pool = EvictableBufferPool {
             frames: BufferFrames(frames),

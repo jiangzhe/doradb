@@ -672,12 +672,6 @@ impl<T: 'static> PageExclusiveGuard<T> {
         self.frame_mut()
     }
 
-    /// Set next free page.
-    #[inline]
-    pub fn set_next_free(&mut self, next_free: PageID) {
-        self.frame_mut().next_free = next_free;
-    }
-
     #[inline]
     pub fn ctx_and_page_mut(&mut self) -> (&mut FrameContext, &mut T) {
         let bf = self.frame_mut();

@@ -3,7 +3,7 @@ use crate::buffer::BufferPool;
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
-use crate::buffer::util::{allocate_frame_and_page_arrays, deallocate_frame_and_page_arrays};
+use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
@@ -30,15 +30,7 @@ impl FixedBufferPool {
     #[inline]
     pub fn with_capacity(pool_size: usize) -> Result<Self> {
         let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
-        let (frames, pages) = unsafe { allocate_frame_and_page_arrays(size)? };
-        unsafe {
-            for i in 0..size {
-                let bf_ptr = frames.add(i);
-                std::ptr::write(bf_ptr, BufferFrame::default());
-                (*bf_ptr).page_id = i as PageID;
-                (*bf_ptr).page = pages.add(i);
-            }
-        }
+        let (frames, pages) = unsafe { initialize_frame_and_page_arrays(size)? };
         Ok(FixedBufferPool {
             frames: BufferFrames(frames),
             pages,
