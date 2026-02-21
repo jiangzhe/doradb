@@ -16,6 +16,17 @@ Describe the exact goal of this task.
 
 List things that are relevant but we do not implement in this task.
 
+## Unsafe Considerations (If Applicable)
+
+If this task touches `unsafe` code:
+1. Describe affected modules/paths and why `unsafe` is required or reducible.
+2. Describe invariant checks and `// SAFETY:` contract updates.
+3. Include inventory refresh command and validation scope.
+
+Reference:
+- `docs/unsafe-usage-principles.md`
+- `docs/process/unsafe-review-checklist.md`
+
 ## Plan
 
 Describe implementation plan, including important changes on files, structs, traits, functions, etc.

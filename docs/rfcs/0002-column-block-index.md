@@ -1,7 +1,7 @@
 ---
 id: 0002
 title: Column Block Index
-status: proposal
+status: implemented
 tags: [storage-engine, index]
 created: 2026-01-19
 ---

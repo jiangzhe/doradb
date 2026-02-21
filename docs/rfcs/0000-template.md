@@ -21,6 +21,18 @@ Why is this decision needed?
 
 What we're going to do. Technical details, process flow, data structure, etc.
 
+## Unsafe Considerations (If Applicable)
+
+If this RFC touches `unsafe` code:
+1. Define unsafe scope and boundaries.
+2. State which unsafe patterns are expected to be removed vs retained.
+3. State required `// SAFETY:` and invariant enforcement expectations.
+4. Define validation and inventory strategy.
+
+Reference:
+- `docs/unsafe-usage-principles.md`
+- `docs/process/unsafe-review-checklist.md`
+
 ## Implementation Phases
 
 - [ ] **Phase 1: Name**

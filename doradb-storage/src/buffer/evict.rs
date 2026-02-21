@@ -332,8 +332,7 @@ impl BufferPool for EvictableBufferPool {
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
                         if g.is_exclusive() {
-                            // SAFETY: checked guard state above.
-                            unsafe { g.rollback_exclusive_version_change() };
+                            g.rollback_exclusive_version_change();
                         }
                         return None;
                     }
@@ -350,8 +349,7 @@ impl BufferPool for EvictableBufferPool {
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
                         if g.is_exclusive() {
-                            // SAFETY: checked guard state above.
-                            unsafe { g.rollback_exclusive_version_change() };
+                            g.rollback_exclusive_version_change();
                         }
                         return None;
                     }
@@ -403,8 +401,7 @@ impl BufferPool for EvictableBufferPool {
                         return Valid(FacadePageGuard::new(bf, g));
                     }
                     if g.state == GuardState::Exclusive {
-                        // SAFETY: guard state is checked above.
-                        unsafe { g.rollback_exclusive_bit() };
+                        g.rollback_exclusive_bit();
                     }
                     return Validation::Invalid;
                 }

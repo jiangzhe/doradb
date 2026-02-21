@@ -211,7 +211,7 @@ impl<T: 'static> FacadePageGuard<T> {
                 let guard = self.guard.exclusive_async().await;
                 if BufferFrames::frame_ref(self.bf.clone()).generation() != self.captured_generation
                 {
-                    unsafe { guard.rollback_exclusive_bit() };
+                    guard.rollback_exclusive_bit();
                     return None;
                 }
                 Some(PageExclusiveGuard {
@@ -384,16 +384,6 @@ impl<T: 'static> FacadePageGuard<T> {
         self.guard.state == GuardState::Shared
     }
 
-    /// Returns page with optimistic read.
-    ///
-    /// # Safety
-    ///
-    /// All values must be validated before use.
-    #[inline]
-    pub unsafe fn page_unchecked(&self) -> &T {
-        page_ref(self.bf())
-    }
-
     #[inline]
     pub fn validate(&self) -> Validation<()> {
         if self.guard.validate() {
@@ -425,17 +415,16 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
-    /// Rollback version change by exclusive lock acquisition.
+    /// Roll back version change by exclusive lock acquisition.
     ///
-    /// # Safety
-    ///
-    /// Caller must guarantee the lock is in exclusive mode.
+    /// Panics if guard state is not exclusive.
     #[inline]
-    pub unsafe fn rollback_exclusive_version_change(self) {
-        unsafe {
-            debug_assert!(self.guard.state == GuardState::Exclusive);
-            self.guard.rollback_exclusive_bit();
-        }
+    pub fn rollback_exclusive_version_change(self) {
+        assert!(
+            self.guard.state == GuardState::Exclusive,
+            "rollback_exclusive_version_change requires exclusive guard"
+        );
+        self.guard.rollback_exclusive_bit();
     }
 }
 
@@ -495,16 +484,6 @@ impl<T> PageOptimisticGuard<T> {
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
-    }
-
-    /// Returns page with optimistic read.
-    ///
-    /// # Safety
-    ///
-    /// All values must be validated before use.
-    #[inline]
-    pub unsafe fn page_unchecked(&self) -> &T {
-        page_ref(BufferFrames::frame_ref(self.bf.clone()))
     }
 
     /// Validates version not change.

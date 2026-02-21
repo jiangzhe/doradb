@@ -381,9 +381,7 @@ impl<'a> HybridGuard<'a> {
                 // recheck version.
                 if !self.lock.version_match(self.version + LATCH_EXCLUSIVE_BIT) {
                     // rollback lock version to avoid unneccessary version bumping.
-                    // SAFETY: `g` was acquired as exclusive in this branch, so rolling back
-                    // the exclusive bit and unlocking is valid.
-                    unsafe { g.rollback_exclusive_bit() };
+                    g.rollback_exclusive_bit();
                     return Invalid;
                 }
                 *self = g;
@@ -394,13 +392,15 @@ impl<'a> HybridGuard<'a> {
         }
     }
 
-    /// rollback exclusive bit set by exclusive lock.
+    /// Roll back exclusive bit set by exclusive lock.
     ///
-    /// # Safety
-    ///
-    /// Caller must make sure the exclusive lock is already acquired.
+    /// Panics if guard state is not exclusive.
     #[inline]
-    pub unsafe fn rollback_exclusive_bit(mut self) {
+    pub fn rollback_exclusive_bit(mut self) {
+        assert!(
+            self.state == GuardState::Exclusive,
+            "rollback_exclusive_bit requires exclusive guard"
+        );
         self.lock
             .version
             .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);

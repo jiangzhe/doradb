@@ -1,7 +1,7 @@
 ---
 id: 0001
 title: Thread Pool Backed Async Direct IO Framework
-status: proposal
+status: implemented
 tags: [io, async, directio]
 created: 2026-01-17
 ---

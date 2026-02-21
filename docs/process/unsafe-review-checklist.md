@@ -3,6 +3,9 @@
 Use this checklist for every PR that touches `unsafe` blocks/functions in:
 `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`.
 
+Policy reference:
+- `docs/unsafe-usage-principles.md`
+
 ## Git Hook Enforcement
 
 Enable repository hook path once per clone:
@@ -41,6 +44,7 @@ Hook behavior (`.githooks/pre-commit`):
    - [ ] If target modules are affected, baseline inventory is re-run:
          `cargo +nightly -Zscript tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
    - [ ] Any unexpected metric increase is explained.
+   - [ ] If an existing `unsafe fn` can be converted to a safe API with internal checks, it is refactored.
 
 5. Validation
    - [ ] Behavior-preserving tests pass:
