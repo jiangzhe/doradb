@@ -5,7 +5,10 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{
     BufferPage, INVALID_PAGE_ID, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID,
 };
-use crate::buffer::util::{madvise_dontneed, mmap_allocate, mmap_deallocate};
+use crate::buffer::util::{
+    allocate_frame_and_page_arrays, deallocate_frame_and_page_arrays, frame_total_bytes,
+    madvise_dontneed,
+};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -30,7 +33,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-pub const SAFETY_PAGES: usize = 10;
 const EVICT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 // min buffer pool size is 64KB * 128 = 8MB.
 const MIN_IN_MEM_PAGES: usize = 128;
@@ -460,14 +462,7 @@ impl Drop for EvictableBufferPool {
                 let frame_ptr = self.frames.0.add(page_id);
                 std::ptr::drop_in_place(frame_ptr);
             }
-
-            // Deallocate memory of frames.
-            let frame_total_bytes =
-                mem::size_of::<BufferFrame>() * (self.capacity() + SAFETY_PAGES);
-            mmap_deallocate(self.frames.0 as *mut u8, frame_total_bytes);
-            // Deallocate memory of pages.
-            let page_total_bytes = mem::size_of::<Page>() * (self.capacity() + SAFETY_PAGES);
-            mmap_deallocate(self.pages as *mut u8, page_total_bytes);
+            deallocate_frame_and_page_arrays(self.frames.0, self.pages, self.capacity());
         }
     }
 }
@@ -1149,7 +1144,7 @@ impl EvictableBufferPoolConfig {
         let max_nbr = max_file_size / mem::size_of::<Page>();
         // We need to hold all frames in-memory, even if many pages
         // can not be loaded into memory at the same time.
-        let frame_total_bytes = mem::size_of::<BufferFrame>() * (max_nbr + SAFETY_PAGES);
+        let frame_total_bytes = frame_total_bytes(max_nbr);
         assert!(
             max_mem_size <= max_file_size,
             "max mem size of buffer pool should be no more than max file size"
@@ -1163,22 +1158,8 @@ impl EvictableBufferPoolConfig {
             return Err(Error::BufferPoolSizeTooSmall);
         }
 
-        // We allocate a much larger memory area to support 1:1 file page mapping.
-        // And buffer pool will control memory usage within limit.
-        let page_total_bytes = mem::size_of::<Page>() * (max_nbr + SAFETY_PAGES);
-
         // 2. Initialize memory of frames and pages.
-        let frames = unsafe { mmap_allocate(frame_total_bytes)? } as *mut BufferFrame;
-        let pages = unsafe {
-            match mmap_allocate(page_total_bytes) {
-                Ok(ptr) => ptr,
-                Err(e) => {
-                    // cleanup previous allocated memory
-                    mmap_deallocate(frames as *mut u8, frame_total_bytes);
-                    return Err(e);
-                }
-            }
-        } as *mut Page;
+        let (frames, pages) = unsafe { allocate_frame_and_page_arrays(max_nbr)? };
 
         // 3. Create file and initialize AIO manager.
         let io_ctx = AIOContext::new(self.max_io_depth)?;

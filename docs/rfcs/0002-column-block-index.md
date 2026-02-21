@@ -135,20 +135,20 @@ The `try_file` method will be updated to query the `ColumnBlockIndex`.
 
 ## Implementation Phases
 
-- [ ] **Phase 1: Basic CoW B+Tree Structure**
+- **Phase 1: Basic CoW B+Tree Structure**
     - Create the new file `doradb-storage/src/index/column_block_index.rs`.
     - Implement the on-disk `ColumnBlockNode` and `ColumnPageEntry` structs (initially without complex `deletion_field` logic).
     - Implement the basic CoW B+Tree structure capable of creating nodes and handling page allocations within the table file.
 
-- [ ] **Phase 2: Insertion and Query Logic**
+- **Phase 2: Insertion and Query Logic**
     - Implement the `insert` method, which will be called during a data checkpoint to add a new LWC block mapping. This will include the CoW path-copying logic.
     - Implement the `find` method to locate the `block_id` for a given `RowID`.
 
-- [ ] **Phase 3: Inline Deletion Field**
+- **Phase 3: Inline Deletion Field**
     - Implement the logic within `ColumnPageEntry` to manage the 120-byte `deletion_field`.
     - This includes adding/reading delta `RowID`s and switching between 2-byte and 4-byte formats.
 
-- [ ] **Phase 4: Integration with `BlockIndexRoot`**
+- **Phase 4: Integration with `BlockIndexRoot`**
     - Modify the `BlockIndexRoot` struct in `block_index.rs` to hold the root of the `ColumnBlockIndex`.
     - Update the `guide` and `try_file` methods to correctly route `RowID` lookups to either the in-memory `RowPageIndex` or the new on-disk `ColumnBlockIndex` based on the pivot `RowID`.
 

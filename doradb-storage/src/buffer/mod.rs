@@ -3,10 +3,12 @@ mod fixed;
 pub mod frame;
 pub mod guard;
 pub mod page;
+mod readonly;
 mod util;
 
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use fixed::FixedBufferPool;
+pub use readonly::{GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey};
 
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, PageID, VersionedPageID};

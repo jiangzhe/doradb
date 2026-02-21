@@ -3,14 +3,12 @@ use crate::buffer::BufferPool;
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
-use crate::buffer::util::{mmap_allocate, mmap_deallocate};
+use crate::buffer::util::{allocate_frame_and_page_arrays, deallocate_frame_and_page_arrays};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
 use std::mem;
-
-pub const SAFETY_PAGES: usize = 10;
 
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
 /// does not support swap/evict.
@@ -32,19 +30,7 @@ impl FixedBufferPool {
     #[inline]
     pub fn with_capacity(pool_size: usize) -> Result<Self> {
         let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
-        let frame_total_bytes = mem::size_of::<BufferFrame>() * (size + SAFETY_PAGES);
-        let page_total_bytes = mem::size_of::<Page>() * (size + SAFETY_PAGES);
-        let frames = unsafe { mmap_allocate(frame_total_bytes)? } as *mut BufferFrame;
-        let pages = unsafe {
-            match mmap_allocate(page_total_bytes) {
-                Ok(ptr) => ptr,
-                Err(e) => {
-                    // cleanup previous allocated memory
-                    mmap_deallocate(frames as *mut u8, frame_total_bytes);
-                    return Err(e);
-                }
-            }
-        } as *mut Page;
+        let (frames, pages) = unsafe { allocate_frame_and_page_arrays(size)? };
         unsafe {
             for i in 0..size {
                 let bf_ptr = frames.add(i);
@@ -230,12 +216,7 @@ impl Drop for FixedBufferPool {
                     std::ptr::drop_in_place(frame_ptr);
                 }
             }
-            // Deallocate memory of frames.
-            let frame_total_bytes = mem::size_of::<BufferFrame>() * (self.size + SAFETY_PAGES);
-            mmap_deallocate(self.frames.0 as *mut u8, frame_total_bytes);
-            // Deallocate memory of pages.
-            let page_total_bytes = mem::size_of::<Page>() * (self.size + SAFETY_PAGES);
-            mmap_deallocate(self.pages as *mut u8, page_total_bytes);
+            deallocate_frame_and_page_arrays(self.frames.0, self.pages, self.size);
         }
     }
 }
