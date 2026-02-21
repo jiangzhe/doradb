@@ -1,7 +1,7 @@
 use crate::buffer::BufferPage;
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID, VersionedPageID};
-use crate::catalog::TableMetadata;
+use crate::catalog::{TableID, TableMetadata};
 use crate::latch::HybridLatch;
 use crate::ptr::UnsafePtr;
 use crate::trx::TrxID;
@@ -28,10 +28,12 @@ pub struct BufferFrame {
     /* header part */
     pub latch: HybridLatch, // lock proctects free list and page.
     pub page_id: PageID,
-    pub next_free: PageID,
     frame_kind: AtomicU8,
     generation: AtomicU64,
     dirty: AtomicBool,
+    readonly_table_id: AtomicU64,
+    readonly_block_id: AtomicU64,
+    has_readonly_key: AtomicBool,
     /// Context of this buffer frame. It can store additinal contextual information
     /// about the page, e.g. undo map of row page.
     pub ctx: Option<Box<FrameContext>>,
@@ -91,6 +93,34 @@ impl BufferFrame {
         self.dirty.store(dirty, Ordering::Release);
     }
 
+    /// Returns readonly cache key stored in this frame, if present.
+    #[inline]
+    pub fn readonly_key(&self) -> Option<(TableID, PageID)> {
+        if !self.has_readonly_key.load(Ordering::Acquire) {
+            return None;
+        }
+        let table_id = self.readonly_table_id.load(Ordering::Acquire);
+        let block_id = self.readonly_block_id.load(Ordering::Acquire);
+        Some((table_id, block_id))
+    }
+
+    /// Updates readonly cache key metadata for this frame.
+    #[inline]
+    pub fn set_readonly_key(&self, table_id: TableID, block_id: PageID) {
+        self.readonly_table_id.store(table_id, Ordering::Release);
+        self.readonly_block_id.store(block_id, Ordering::Release);
+        self.has_readonly_key.store(true, Ordering::Release);
+    }
+
+    /// Clears readonly cache key metadata for this frame.
+    #[inline]
+    pub fn clear_readonly_key(&self) {
+        self.has_readonly_key.store(false, Ordering::Release);
+        self.readonly_table_id.store(0, Ordering::Release);
+        self.readonly_block_id
+            .store(INVALID_PAGE_ID, Ordering::Release);
+    }
+
     #[inline]
     pub fn init_undo_map(&mut self, metadata: Arc<TableMetadata>, max_size: usize) {
         self.ctx = Some(Box::new(FrameContext::RowVerMap(RowVersionMap::new(
@@ -112,11 +142,13 @@ impl Default for BufferFrame {
         BufferFrame {
             latch: HybridLatch::new(),
             page_id: 0,
-            next_free: INVALID_PAGE_ID,
             frame_kind: AtomicU8::new(FrameKind::Uninitialized as u8),
             generation: AtomicU64::new(0),
             // by default the page is dirty because no copy on disk.
             dirty: AtomicBool::new(true),
+            readonly_table_id: AtomicU64::new(0),
+            readonly_block_id: AtomicU64::new(INVALID_PAGE_ID),
+            has_readonly_key: AtomicBool::new(false),
             ctx: None,
             page: std::ptr::null_mut(),
         }
@@ -224,8 +256,8 @@ impl BufferFrames {
             frame.page_id = page_id;
             frame.ctx = None;
             T::init_frame(frame);
-            frame.next_free = INVALID_PAGE_ID;
             frame.set_dirty(true);
+            frame.clear_readonly_key();
         });
         guard.page_mut().zero();
         guard

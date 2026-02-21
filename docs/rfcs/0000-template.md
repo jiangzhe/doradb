@@ -20,6 +20,7 @@ Why is this decision needed?
 ## Decision
 
 What we're going to do. Technical details, process flow, data structure, etc.
+Design rationales. Goals, scope, trade-offs, technical difficulties, comparison with alternatives.
 
 ## Unsafe Considerations (If Applicable)
 
@@ -35,12 +36,12 @@ Reference:
 
 ## Implementation Phases
 
-- [ ] **Phase 1: Name**
+- **Phase 1: Name**
 
 Description of this phase, should be equivalent to a simple task.
 Focus on the scope of this task: context, goals, non-goals.
 
-- [ ] **Phase 2: Name**
+- **Phase 2: Name**
 
 ...
 
