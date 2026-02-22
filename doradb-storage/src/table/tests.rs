@@ -1,6 +1,7 @@
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
+use crate::file::table_fs::TableFileSystemConfig;
 use crate::index::{RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol};
@@ -1422,6 +1423,12 @@ impl TestSys {
                 TrxSysConfig::default()
                     .log_file_prefix("redo_testsys")
                     .skip_recovery(true),
+            )
+            .file(
+                TableFileSystemConfig::default()
+                    .io_depth(16)
+                    .readonly_buffer_size(128 * 1024 * 1024)
+                    .data_dir("."),
             )
             .build()
             .await

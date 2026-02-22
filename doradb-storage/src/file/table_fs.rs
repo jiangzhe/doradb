@@ -94,7 +94,6 @@ pub struct TableFileSystemConfig {
     // Base directory.
     pub base_dir: String,
     // Global readonly buffer pool size in bytes.
-    #[serde(default = "default_table_file_readonly_buffer_size")]
     pub readonly_buffer_size: usize,
 }
 
@@ -139,9 +138,4 @@ impl Default for TableFileSystemConfig {
             readonly_buffer_size: DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
         }
     }
-}
-
-#[inline]
-fn default_table_file_readonly_buffer_size() -> usize {
-    DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE
 }
