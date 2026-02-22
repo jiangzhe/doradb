@@ -260,7 +260,7 @@ pub enum FileIOState {
     RequestBuf(DirectBuf),
     RunningBuf(AIO<DirectBuf>),
     RequestStaticRead { ptr: UnsafePtr<u8>, len: usize },
-    RunningStaticRead(UnsafeAIO),
+    RunningStaticRead { aio: UnsafeAIO, len: usize },
     Result(FileIOResult),
     Invalid,
 }
@@ -274,7 +274,7 @@ impl FileIOState {
             FileIOState::RunningBuf(mut aio) => aio.take_buf(),
             FileIOState::Result(FileIOResult::ReadOk(buf)) => Some(buf),
             FileIOState::Result(_) | FileIOState::Invalid => None,
-            FileIOState::RequestStaticRead { .. } | FileIOState::RunningStaticRead(_) => None,
+            FileIOState::RequestStaticRead { .. } | FileIOState::RunningStaticRead { .. } => None,
         }
     }
 
@@ -282,7 +282,7 @@ impl FileIOState {
     pub fn aio_key(&self) -> Option<AIOKey> {
         match self {
             FileIOState::RunningBuf(aio) => Some(aio.key),
-            FileIOState::RunningStaticRead(aio) => Some(aio.key),
+            FileIOState::RunningStaticRead { aio, .. } => Some(aio.key),
             _ => None,
         }
     }
@@ -386,7 +386,7 @@ impl FileIOPromise {
             | FileIOState::RequestBuf(_)
             | FileIOState::RunningBuf(_)
             | FileIOState::RequestStaticRead { .. }
-            | FileIOState::RunningStaticRead(_) => {
+            | FileIOState::RunningStaticRead { .. } => {
                 panic!("invalid state");
             }
         }
@@ -402,7 +402,7 @@ impl FileIOPromise {
             | FileIOState::RequestBuf(_)
             | FileIOState::RunningBuf(_)
             | FileIOState::RequestStaticRead { .. }
-            | FileIOState::RunningStaticRead(_) => {
+            | FileIOState::RunningStaticRead { .. } => {
                 panic!("invalid state");
             }
         }
@@ -454,13 +454,13 @@ impl AIOEventListener for FileIOListener {
                 // alignment for the whole async IO operation.
                 let aio = unsafe { pread_unchecked(key, req.fd, req.offset, ptr.0, len) };
                 let iocb = aio.iocb_raw();
-                *g = FileIOState::RunningStaticRead(aio);
+                *g = FileIOState::RunningStaticRead { aio, len };
                 iocb
             }
             FileIOState::Result(_)
             | FileIOState::Invalid
             | FileIOState::RunningBuf(_)
-            | FileIOState::RunningStaticRead(_) => {
+            | FileIOState::RunningStaticRead { .. } => {
                 panic!("invalid file io request state")
             }
         };
@@ -509,9 +509,18 @@ impl AIOEventListener for FileIOListener {
                     }
                 }
             }
-            FileIOState::RunningStaticRead(_aio) => match res {
-                Ok(_) => {
+            FileIOState::RunningStaticRead { aio: _aio, len } => match res {
+                Ok(read_len) if read_len == len => {
                     *g = FileIOState::Result(FileIOResult::ReadStaticOk);
+                }
+                Ok(read_len) => {
+                    *g = FileIOState::Result(FileIOResult::Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "static read completed with short length: expected={}, actual={}",
+                            len, read_len
+                        ),
+                    )));
                 }
                 Err(err) => {
                     *g = FileIOState::Result(FileIOResult::Err(err));

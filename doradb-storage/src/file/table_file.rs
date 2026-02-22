@@ -720,6 +720,37 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_into_ptr_validates_byte_count() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let table_file = fs
+                .create_table_file(145, build_test_metadata(), false)
+                .unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let mut page = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+            let out_of_range_page_id = 1_000_000;
+            let res = unsafe {
+                table_file
+                    .read_page_into_ptr(
+                        out_of_range_page_id,
+                        UnsafePtr(page.as_bytes_mut().as_mut_ptr()),
+                    )
+                    .await
+            };
+            assert!(res.is_err());
+
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
     fn test_table_file_system() {
         smol::block_on(async {
             let fs = TableFileSystemConfig::default().build().unwrap();
