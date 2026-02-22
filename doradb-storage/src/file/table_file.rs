@@ -11,6 +11,7 @@ use crate::file::super_page::{
 use crate::file::{FileIO, FileIOResult, SparseFile};
 use crate::io::DirectBuf;
 use crate::io::{AIOBuf, AIOClient, AIOKind};
+use crate::ptr::UnsafePtr;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
@@ -131,6 +132,37 @@ impl TableFile {
         let res = promise.wait_async().await;
         match res {
             FileIOResult::ReadOk(buf) => Ok(buf),
+            FileIOResult::ReadStaticOk => panic!("invalid state"),
+            FileIOResult::WriteOk => panic!("invalid state"),
+            FileIOResult::Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Reads one table-file page directly into caller-provided memory.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `ptr` points to writable, sector-aligned memory
+    /// of at least `TABLE_FILE_PAGE_SIZE` bytes, and remains valid until
+    /// async completion.
+    #[inline]
+    pub async unsafe fn read_page_into_ptr(
+        &self,
+        page_id: PageID,
+        ptr: UnsafePtr<u8>,
+    ) -> Result<()> {
+        let offset = page_id as usize * TABLE_FILE_PAGE_SIZE;
+        // SAFETY: caller upholds pointer validity/alignment until promise resolves.
+        let (fio, promise) = unsafe {
+            FileIO::prepare_static_read(self.file.as_raw_fd(), offset, ptr, TABLE_FILE_PAGE_SIZE)
+        };
+        if self.io_client.send_async(fio).await.is_err() {
+            return Err(Error::SendError);
+        }
+        let res = promise.wait_async().await;
+        match res {
+            FileIOResult::ReadStaticOk => Ok(()),
+            FileIOResult::ReadOk(_) => panic!("invalid state"),
             FileIOResult::WriteOk => panic!("invalid state"),
             FileIOResult::Err(err) => Err(err.into()),
         }
@@ -158,6 +190,7 @@ impl TableFile {
         let res = promise.wait_async().await;
         match res {
             FileIOResult::WriteOk => Ok(()),
+            FileIOResult::ReadStaticOk => panic!("invalid state"),
             FileIOResult::ReadOk(_) => panic!("invalid state"),
             FileIOResult::Err(err) => Err(err.into()),
         }

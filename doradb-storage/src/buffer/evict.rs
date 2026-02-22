@@ -4,8 +4,8 @@ use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{
-    deallocate_frame_and_page_arrays, frame_total_bytes, initialize_frame_and_page_arrays,
-    madvise_dontneed,
+    ClockHand, clock_collect, clock_sweep_candidate, deallocate_frame_and_page_arrays,
+    frame_total_bytes, initialize_frame_and_page_arrays, madvise_dontneed,
 };
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
@@ -24,7 +24,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
-use std::ops::{Range, RangeFrom, RangeTo};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -789,36 +788,7 @@ impl BufferPoolEvictor {
 
     #[inline]
     fn clock_sweep(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
-        match self.frames.frame_kind(page_id) {
-            FrameKind::Uninitialized
-            | FrameKind::Fixed
-            | FrameKind::Evicting
-            | FrameKind::Evicted => (),
-            FrameKind::Cool => {
-                // Acquire exclusive lock first, in order to block other thread to access
-                // this page at the same time. If fails, we just skip.
-                if let Some(page_guard) = self.frames.try_lock_page_exclusive(page_id) {
-                    if page_guard
-                        .bf()
-                        .compare_exchange_kind(FrameKind::Cool, FrameKind::Evicting)
-                        != FrameKind::Cool
-                    {
-                        // Some other thread access this page and mark it as hot, so we skip it
-                        return None;
-                    }
-                    return Some(page_guard);
-                }
-            }
-            FrameKind::Hot => {
-                // follow clock-sweep strategy, mark it as cool.
-                let _ = self.frames.compare_exchange_frame_kind(
-                    page_id,
-                    FrameKind::Hot,
-                    FrameKind::Cool,
-                );
-            }
-        }
-        None
+        clock_sweep_candidate(&self.frames, page_id)
     }
 }
 
@@ -949,78 +919,7 @@ impl InMemPageSet {
         mut callback: F,
     ) -> Option<ClockHand> {
         let g = self.set.lock();
-        match clock_hand {
-            ClockHand::From(from) => {
-                let mut range = g.range(from);
-                while let Some(page_id) = range.next() {
-                    // page_ids.push(*page_id);
-                    let stop = callback(*page_id);
-                    if stop {
-                        // check if we have next page id
-                        if let Some(page_id) = range.next() {
-                            return Some(ClockHand::From(*page_id..));
-                        }
-                        // all pages exhausted
-                        return None;
-                    }
-                }
-                // whole buffer pool exhausted but still not enough pages.
-                None
-            }
-            ClockHand::FromTo(from, to) => {
-                let mut range = g.range(from);
-                while let Some(page_id) = range.next() {
-                    let stop = callback(*page_id);
-                    if stop {
-                        // check if we have next page id
-                        if let Some(page_id) = range.next() {
-                            return Some(ClockHand::FromTo(*page_id.., to));
-                        }
-                        return Some(ClockHand::To(to));
-                    }
-                }
-                range = g.range(to);
-                while let Some(page_id) = range.next() {
-                    let stop = callback(*page_id);
-                    if stop {
-                        // check if we have next page id
-                        if let Some(page_id) = range.next() {
-                            return Some(ClockHand::Between(*page_id..to.end));
-                        }
-                        return None;
-                    }
-                }
-                None
-            }
-            ClockHand::To(to) => {
-                let mut range = g.range(to);
-                while let Some(page_id) = range.next() {
-                    let stop = callback(*page_id);
-                    if stop {
-                        // check if we have next page id
-                        if let Some(page_id) = range.next() {
-                            return Some(ClockHand::Between(*page_id..to.end));
-                        }
-                        return None;
-                    }
-                }
-                None
-            }
-            ClockHand::Between(between) => {
-                let mut range = g.range(between.clone());
-                while let Some(page_id) = range.next() {
-                    let stop = callback(*page_id);
-                    if stop {
-                        // check if we have next page id
-                        if let Some(page_id) = range.next() {
-                            return Some(ClockHand::Between(*page_id..between.end));
-                        }
-                        return None;
-                    }
-                }
-                None
-            }
-        }
+        clock_collect(&g, clock_hand, &mut callback)
     }
 
     #[inline]
@@ -1334,44 +1233,6 @@ pub struct EvictableBufferPoolStats {
     io_submit_nanos: AtomicUsize,
     io_wait_calls: AtomicUsize,
     io_wait_nanos: AtomicUsize,
-}
-
-#[derive(Debug, Clone)]
-enum ClockHand {
-    From(RangeFrom<PageID>),
-    FromTo(RangeFrom<PageID>, RangeTo<PageID>),
-    To(RangeTo<PageID>),
-    Between(Range<PageID>),
-}
-
-impl Default for ClockHand {
-    #[inline]
-    fn default() -> Self {
-        ClockHand::From(0..)
-    }
-}
-
-impl ClockHand {
-    /// Returns start pointer of clock hand.
-    #[inline]
-    fn start(&self) -> PageID {
-        match self {
-            ClockHand::Between(between) => between.start,
-            ClockHand::From(from) => from.start,
-            ClockHand::To(_) => 0,
-            ClockHand::FromTo(from, _) => from.start,
-        }
-    }
-
-    #[inline]
-    fn reset(&mut self) {
-        let start = self.start();
-        if start == 0 {
-            *self = ClockHand::default()
-        } else {
-            *self = ClockHand::FromTo(start.., ..start)
-        }
-    }
 }
 
 pub enum PoolRequest {

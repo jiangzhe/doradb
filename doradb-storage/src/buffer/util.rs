@@ -1,13 +1,159 @@
-use crate::buffer::frame::BufferFrame;
+use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
+use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::{Page, PageID};
 use crate::error::{Error, Result};
 use libc::{
     MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MADV_REMOVE, MAP_ANONYMOUS, MAP_FAILED,
     MAP_PRIVATE, PROT_READ, PROT_WRITE, c_void, madvise, mmap, munmap,
 };
+use std::collections::BTreeSet;
 use std::mem;
+use std::ops::{Range, RangeFrom, RangeTo};
 
 pub(super) const SHARED_SAFETY_PAGES: usize = 10;
+
+/// Shared clock hand state for clock-sweep eviction.
+#[derive(Debug, Clone)]
+pub(super) enum ClockHand {
+    From(RangeFrom<PageID>),
+    FromTo(RangeFrom<PageID>, RangeTo<PageID>),
+    To(RangeTo<PageID>),
+    Between(Range<PageID>),
+}
+
+impl Default for ClockHand {
+    #[inline]
+    fn default() -> Self {
+        ClockHand::From(0..)
+    }
+}
+
+impl ClockHand {
+    /// Resets the hand and preserves sweep locality.
+    #[inline]
+    pub(super) fn reset(&mut self) {
+        let start = self.start();
+        if start == 0 {
+            *self = ClockHand::default()
+        } else {
+            *self = ClockHand::FromTo(start.., ..start)
+        }
+    }
+
+    #[inline]
+    fn start(&self) -> PageID {
+        match self {
+            ClockHand::Between(between) => between.start,
+            ClockHand::From(from) => from.start,
+            ClockHand::To(_) => 0,
+            ClockHand::FromTo(from, _) => from.start,
+        }
+    }
+}
+
+/// Iterates the ordered resident-set according to clock-hand position.
+///
+/// The callback returns true to stop scanning and preserve next hand position.
+#[inline]
+pub(super) fn clock_collect<F>(
+    set: &BTreeSet<PageID>,
+    clock_hand: ClockHand,
+    mut callback: F,
+) -> Option<ClockHand>
+where
+    F: FnMut(PageID) -> bool,
+{
+    match clock_hand {
+        ClockHand::From(from) => {
+            let mut range = set.range(from);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::From(*page_id..));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::FromTo(from, to) => {
+            let mut range = set.range(from);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::FromTo(*page_id.., to));
+                    }
+                    return Some(ClockHand::To(to));
+                }
+            }
+            range = set.range(to);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..to.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::To(to) => {
+            let mut range = set.range(to);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..to.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::Between(between) => {
+            let mut range = set.range(between.clone());
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..between.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Applies one clock-sweep step and returns a page guard when a frame
+/// is selected for eviction.
+#[inline]
+pub(super) fn clock_sweep_candidate(
+    frames: &BufferFrames,
+    page_id: PageID,
+) -> Option<PageExclusiveGuard<Page>> {
+    match frames.frame_kind(page_id) {
+        FrameKind::Uninitialized | FrameKind::Fixed | FrameKind::Evicting | FrameKind::Evicted => {
+            None
+        }
+        FrameKind::Cool => {
+            if let Some(page_guard) = frames.try_lock_page_exclusive(page_id) {
+                if page_guard
+                    .bf()
+                    .compare_exchange_kind(FrameKind::Cool, FrameKind::Evicting)
+                    != FrameKind::Cool
+                {
+                    return None;
+                }
+                return Some(page_guard);
+            }
+            None
+        }
+        FrameKind::Hot => {
+            let _ = frames.compare_exchange_frame_kind(page_id, FrameKind::Hot, FrameKind::Cool);
+            None
+        }
+    }
+}
 
 /// Calculates total mmap bytes needed for frame headers with safety padding.
 #[inline]
