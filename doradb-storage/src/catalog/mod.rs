@@ -111,7 +111,7 @@ impl Catalog {
         &self,
         index_pool: &'static FixedBufferPool,
         table_fs: &'static TableFileSystem,
-        readonly_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
         table_id: TableID,
     ) -> Result<()> {
         // todo
@@ -187,9 +187,9 @@ impl Catalog {
                 )
                 .await;
                 let table = Table::new(
-                    self.storage.data_pool,
+                    self.storage.mem_pool,
                     index_pool,
-                    readonly_pool,
+                    global_disk_pool,
                     blk_idx,
                     table_file,
                 )

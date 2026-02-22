@@ -39,10 +39,7 @@ mod no_libaio {
             code if code == io_iocb_cmd::IO_CMD_PWRITE as u16 => unsafe {
                 blocking_pwrite(fd, iocb.buf, len, offset)
             },
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "unsupported iocb opcode",
-            )),
+            _ => Err(std::io::Error::other("unsupported iocb opcode")),
         };
         Completion {
             key: iocb.data,

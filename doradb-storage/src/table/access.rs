@@ -230,7 +230,7 @@ impl TableAccess for Table {
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self
-                        .data_pool
+                        .mem_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .lock_shared_async()
@@ -345,7 +345,7 @@ impl TableAccess for Table {
             // acquire insert page from block index.
             let mut page_guard = self
                 .blk_idx
-                .get_insert_page_exclusive(self.data_pool, row_count)
+                .get_insert_page_exclusive(self.mem_pool, row_count)
                 .await;
             let page = page_guard.page_mut();
             debug_assert!(metadata.col_count() == page.header.col_count as usize);
@@ -393,7 +393,7 @@ impl TableAccess for Table {
                     RowLocation::LwcPage(..) => todo!("lwc page"),
                     RowLocation::RowPage(page_id) => {
                         let page_guard = self
-                            .data_pool
+                            .mem_pool
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
                             .lock_shared_async()
@@ -526,7 +526,7 @@ impl TableAccess for Table {
                     }
                     RowLocation::RowPage(page_id) => {
                         let page_guard = self
-                            .data_pool
+                            .mem_pool
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
                             .lock_shared_async()
@@ -568,7 +568,7 @@ impl TableAccess for Table {
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self
-                        .data_pool
+                        .mem_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                         .await
                         .lock_exclusive_async()
@@ -657,7 +657,7 @@ impl TableAccess for Table {
             match self.build_lwc_pages(cutoff_ts, &frozen_pages).await {
                 Ok(lwc_pages) => (lwc_pages, heap_redo_start_ts.unwrap_or(sts)),
                 Err(err) => {
-                    trx_sys.rollback(trx, self.data_pool).await;
+                    trx_sys.rollback(trx, self.mem_pool).await;
                     return Err(err);
                 }
             };
@@ -690,7 +690,7 @@ impl TableAccess for Table {
         drop(old_root);
 
         // Step 7: commit the checkpoint transaction to get CTS.
-        let _cts = match trx_sys.commit(trx, self.data_pool).await {
+        let _cts = match trx_sys.commit(trx, self.mem_pool).await {
             Ok(cts) => cts,
             Err(err) => return Err(err),
         };

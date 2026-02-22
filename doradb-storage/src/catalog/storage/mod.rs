@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
-    pub(super) data_pool: &'static EvictableBufferPool,
+    pub(super) mem_pool: &'static EvictableBufferPool,
     tables: Box<[Table]>,
 }
 
@@ -30,9 +30,9 @@ impl CatalogStorage {
     pub async fn new(
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
-        data_pool: &'static EvictableBufferPool,
+        mem_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
-        readonly_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
     ) -> Result<Self> {
         let mut cat: Vec<Table> = vec![];
         for CatalogDefinition { table_id, metadata } in [
@@ -58,12 +58,13 @@ impl CatalogStorage {
                 Arc::clone(&table_file),
             )
             .await;
-            let table = Table::new(data_pool, index_pool, readonly_pool, blk_idx, table_file).await;
+            let table =
+                Table::new(mem_pool, index_pool, global_disk_pool, blk_idx, table_file).await;
             cat.push(table);
         }
         Ok(CatalogStorage {
             meta_pool,
-            data_pool,
+            mem_pool,
             tables: cat.into_boxed_slice(),
         })
     }

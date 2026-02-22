@@ -161,9 +161,9 @@ impl TrxSysConfig {
         self,
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
-        data_pool: &'static EvictableBufferPool,
+        mem_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
-        readonly_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
     ) -> Result<&'static TransactionSystem> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
@@ -172,16 +172,17 @@ impl TrxSysConfig {
         }
 
         let catalog_storage =
-            CatalogStorage::new(meta_pool, index_pool, data_pool, table_fs, readonly_pool).await?;
+            CatalogStorage::new(meta_pool, index_pool, mem_pool, table_fs, global_disk_pool)
+                .await?;
         let mut catalog = Catalog::new(catalog_storage);
 
         // Now we have an empty catalog, all log partitions and buffer pool.
         // Recover all committed data if required.
         let (log_partitions, gc_rxs) = log_recover(
             index_pool,
-            data_pool,
+            mem_pool,
             table_fs,
-            readonly_pool,
+            global_disk_pool,
             &mut catalog,
             log_partition_initializers,
             self.skip_recovery,
@@ -198,7 +199,7 @@ impl TrxSysConfig {
             .await;
         trx_sys.start_io_threads();
         trx_sys.start_gc_threads(gc_rxs);
-        trx_sys.start_purge_threads(data_pool, purge_rx);
+        trx_sys.start_purge_threads(mem_pool, purge_rx);
 
         Ok(trx_sys)
     }

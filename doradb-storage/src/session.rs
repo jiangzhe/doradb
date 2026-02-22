@@ -300,9 +300,9 @@ impl Session {
         )
         .await;
         let table = Table::new(
-            engine.data_pool,
+            engine.mem_pool,
             engine.index_pool,
-            engine.readonly_pool,
+            engine.disk_pool,
             blk_idx,
             table_file,
         )

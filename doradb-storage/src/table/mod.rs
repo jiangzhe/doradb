@@ -89,8 +89,8 @@ pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
 /// index does not contain version information, and out-of-date index entry
 /// should ignored if visible data version does not match index key.
 pub struct Table {
-    pub data_pool: &'static EvictableBufferPool,
-    readonly_pool: ReadonlyBufferPool,
+    pub mem_pool: &'static EvictableBufferPool,
+    disk_pool: ReadonlyBufferPool,
     pub file: Arc<TableFile>,
     pub blk_idx: Arc<BlockIndex>,
     pub sec_idx: Arc<[SecondaryIndex]>,
@@ -107,9 +107,9 @@ impl Table {
     /// Create a new table.
     #[inline]
     pub async fn new(
-        data_pool: &'static EvictableBufferPool,
+        mem_pool: &'static EvictableBufferPool,
         index_pool: &'static FixedBufferPool,
-        global_readonly_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
     ) -> Self {
@@ -128,11 +128,10 @@ impl Table {
             .await;
             sec_idx.push(si);
         }
-        let readonly_pool =
-            ReadonlyBufferPool::new(table_id, Arc::clone(&file), global_readonly_pool);
+        let disk_pool = ReadonlyBufferPool::new(table_id, Arc::clone(&file), global_disk_pool);
         Table {
-            data_pool,
-            readonly_pool,
+            mem_pool,
+            disk_pool,
             file,
             blk_idx: Arc::new(blk_idx),
             sec_idx: Arc::from(sec_idx.into_boxed_slice()),
@@ -200,7 +199,7 @@ impl Table {
                 // A potential optimization is to check row version map without loading
                 // row page back. This requires interface change of buffer pool.
                 let page_guard = self
-                    .data_pool
+                    .mem_pool
                     .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -226,7 +225,7 @@ impl Table {
     async fn set_frozen_pages_to_transition(&self, frozen_pages: &[FrozenPage], cutoff_ts: TrxID) {
         for page_info in frozen_pages {
             let page_guard = self
-                .data_pool
+                .mem_pool
                 .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
@@ -257,7 +256,7 @@ impl Table {
             let mut current_end: RowID = 0;
             for page_info in frozen_pages {
                 let page_guard = self
-                    .data_pool
+                    .mem_pool
                     .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -429,7 +428,7 @@ impl Table {
             }
             RowLocation::RowPage(page_id) => {
                 let page_guard = self
-                    .data_pool
+                    .mem_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -456,7 +455,7 @@ impl Table {
         row_id: RowID,
         read_set: &[usize],
     ) -> Result<Option<Vec<Val>>> {
-        let page_guard = self.readonly_pool.get_page_shared::<Page>(page_id).await;
+        let page_guard = self.disk_pool.get_page_shared::<Page>(page_id).await;
         let page = LwcPage::try_from_bytes(page_guard.page())?;
         let Some(row_idx) = page.row_idx(row_id) else {
             return Ok(None);
@@ -490,7 +489,7 @@ impl Table {
             let entries = g.page().leaf_entries();
             for page_entry in entries {
                 let page_guard: PageSharedGuard<RowPage> = self
-                    .data_pool
+                    .mem_pool
                     .get_page(page_entry.page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -742,7 +741,7 @@ impl Table {
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let page_guard = self
-                                .data_pool
+                                .mem_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .lock_shared_async()
@@ -800,7 +799,7 @@ impl Table {
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let page_guard = self
-                                .data_pool
+                                .mem_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .lock_shared_async()
@@ -938,7 +937,7 @@ impl Table {
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let old_guard = self
-                        .data_pool
+                        .mem_pool
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .lock_shared_async()
@@ -1268,7 +1267,7 @@ impl Table {
     ) -> PageSharedGuard<RowPage> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
             let page_guard = self
-                .data_pool
+                .mem_pool
                 .get_page(page_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
@@ -1282,9 +1281,7 @@ impl Table {
                 return page_guard;
             }
         }
-        self.blk_idx
-            .get_insert_page(self.data_pool, row_count)
-            .await
+        self.blk_idx.get_insert_page(self.mem_pool, row_count).await
     }
 
     // lock row will check write conflict on given row and lock it.
@@ -1585,7 +1582,7 @@ impl Table {
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
                 let page_guard = self
-                    .data_pool
+                    .mem_pool
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -2259,8 +2256,8 @@ impl Clone for Table {
     #[inline]
     fn clone(&self) -> Self {
         Table {
-            data_pool: self.data_pool,
-            readonly_pool: self.readonly_pool.clone(),
+            mem_pool: self.mem_pool,
+            disk_pool: self.disk_pool.clone(),
             file: Arc::clone(&self.file),
             blk_idx: Arc::clone(&self.blk_idx),
             sec_idx: Arc::clone(&self.sec_idx),

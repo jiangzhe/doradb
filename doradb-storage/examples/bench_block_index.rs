@@ -64,7 +64,7 @@ fn main() {
 
             for _ in 0..args.pages {
                 let _ = blk_idx
-                    .get_insert_page(engine.data_pool, args.rows_per_page)
+                    .get_insert_page(engine.mem_pool, args.rows_per_page)
                     .await;
             }
             let start = Instant::now();

@@ -1168,12 +1168,12 @@ mod tests {
                     Arc::clone(&table_file),
                 )
                 .await;
-                let p1 = blk_idx.get_insert_page(engine.data_pool, 100).await;
+                let p1 = blk_idx.get_insert_page(engine.mem_pool, 100).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.cache_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
-                let p2 = blk_idx.get_insert_page(engine.data_pool, 100).await;
+                let p2 = blk_idx.get_insert_page(engine.mem_pool, 100).await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
@@ -1224,12 +1224,12 @@ mod tests {
                     Arc::clone(&table_file),
                 )
                 .await;
-                let p1 = blk_idx.get_insert_page(engine.data_pool, 100).await;
+                let p1 = blk_idx.get_insert_page(engine.mem_pool, 100).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.cache_exclusive_insert_page(p1);
                 assert!(blk_idx.insert_free_list.lock().len() == 1);
-                let p2 = blk_idx.get_insert_page(engine.data_pool, 100).await;
+                let p2 = blk_idx.get_insert_page(engine.mem_pool, 100).await;
                 assert!(pid1 == p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
@@ -1283,7 +1283,7 @@ mod tests {
                 )
                 .await;
                 for _ in 0..row_pages {
-                    let _ = blk_idx.get_insert_page(engine.data_pool, 100).await;
+                    let _ = blk_idx.get_insert_page(engine.mem_pool, 100).await;
                 }
                 let mut count = 0usize;
                 let mut cursor = blk_idx.mem_cursor();
@@ -1473,7 +1473,7 @@ mod tests {
                 .await;
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(engine.data_pool, rows_per_page)
+                        .get_insert_page(engine.mem_pool, rows_per_page)
                         .await;
                 }
                 {
@@ -1498,7 +1498,7 @@ mod tests {
                     match res {
                         RowLocation::RowPage(page_id) => {
                             let g = engine
-                                .data_pool
+                                .mem_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await;
                             let g = g.lock_shared_async().await.unwrap();
@@ -1559,7 +1559,7 @@ mod tests {
                 .await;
                 // create a new page for rowid=0..100
                 let _ = blk_idx
-                    .get_insert_page(engine.data_pool, rows_per_page)
+                    .get_insert_page(engine.mem_pool, rows_per_page)
                     .await;
                 // todo: analyze log to see the log is persisted.
             }

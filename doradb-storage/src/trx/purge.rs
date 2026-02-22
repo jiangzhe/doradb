@@ -690,7 +690,7 @@ mod tests {
             engine
                 .trx_sys
                 .purge_trx_list(
-                    engine.data_pool,
+                    engine.mem_pool,
                     engine.catalog(),
                     0,
                     vec![trx],
@@ -774,7 +774,7 @@ mod tests {
             engine
                 .trx_sys
                 .purge_trx_list(
-                    engine.data_pool,
+                    engine.mem_pool,
                     engine.catalog(),
                     0,
                     vec![trx],
@@ -974,7 +974,7 @@ mod tests {
                     _ => unreachable!(),
                 };
                 let page_guard: PageSharedGuard<RowPage> = engine
-                    .data_pool
+                    .mem_pool
                     .get_page(page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
