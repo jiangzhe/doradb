@@ -14,7 +14,7 @@
 //! 2. DML-only transactions
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::catalog::{Catalog, TableID, TableMetadata};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
@@ -114,6 +114,7 @@ pub(super) async fn log_recover<P: BufferPool>(
     index_pool: &'static FixedBufferPool,
     data_pool: &'static P,
     table_fs: &'static TableFileSystem,
+    readonly_pool: &'static GlobalReadonlyBufferPool,
     catalog: &mut Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
@@ -128,7 +129,14 @@ pub(super) async fn log_recover<P: BufferPool>(
             let stream = initializer.stream();
             log_merger.add_stream(stream)?;
         }
-        let log_recovery = LogRecovery::new(index_pool, data_pool, table_fs, catalog, log_merger);
+        let log_recovery = LogRecovery::new(
+            index_pool,
+            data_pool,
+            table_fs,
+            readonly_pool,
+            catalog,
+            log_merger,
+        );
         let log_streams = log_recovery.recover_all().await?;
         log_partition_initializers = log_streams
             .into_iter()
@@ -151,6 +159,7 @@ pub struct LogRecovery<'a, P: BufferPool> {
     index_pool: &'static FixedBufferPool,
     data_pool: &'static P,
     table_fs: &'static TableFileSystem,
+    readonly_pool: &'static GlobalReadonlyBufferPool,
     catalog: &'a mut Catalog,
     log_merger: LogMerger,
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
@@ -162,6 +171,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
         index_pool: &'static FixedBufferPool,
         data_pool: &'static P,
         table_fs: &'static TableFileSystem,
+        readonly_pool: &'static GlobalReadonlyBufferPool,
         catalog: &'a mut Catalog,
         log_merger: LogMerger,
     ) -> Self {
@@ -169,6 +179,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             index_pool,
             data_pool,
             table_fs,
+            readonly_pool,
             catalog,
             log_merger,
             recovered_tables: HashMap::new(),
@@ -261,7 +272,12 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             DDLRedo::CreateTable(table_id) => {
                 self.replay_catalog_modifications(dml).await?;
                 self.catalog
-                    .reload_create_table(self.index_pool, self.table_fs, *table_id)
+                    .reload_create_table(
+                        self.index_pool,
+                        self.table_fs,
+                        self.readonly_pool,
+                        *table_id,
+                    )
                     .await?;
             }
             DDLRedo::CreateRowPage {

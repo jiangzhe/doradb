@@ -237,6 +237,42 @@ fn test_column_delete_basic() {
 }
 
 #[test]
+fn test_lwc_read_uses_readonly_buffer_pool() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let mut trx = session.begin_trx().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        assert_eq!(sys.engine.readonly_pool.allocated(), 0);
+
+        sys.new_trx_select(&mut session, &key, |vals| {
+            assert_eq!(vals[0], Val::from(1i32));
+            assert_eq!(vals[1], Val::from("name"));
+        })
+        .await;
+        let allocated_after_first = sys.engine.readonly_pool.allocated();
+        assert!(allocated_after_first >= 1);
+
+        sys.new_trx_select(&mut session, &key, |vals| {
+            assert_eq!(vals[0], Val::from(1i32));
+            assert_eq!(vals[1], Val::from("name"));
+        })
+        .await;
+        assert_eq!(sys.engine.readonly_pool.allocated(), allocated_after_first);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_column_delete_rollback() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;

@@ -1,4 +1,4 @@
-use crate::buffer::{EvictableBufferPool, FixedBufferPool};
+use crate::buffer::{EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::catalog::Catalog;
 use crate::catalog::storage::CatalogStorage;
 use crate::error::Result;
@@ -163,6 +163,7 @@ impl TrxSysConfig {
         index_pool: &'static FixedBufferPool,
         data_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
+        readonly_pool: &'static GlobalReadonlyBufferPool,
     ) -> Result<&'static TransactionSystem> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
@@ -171,7 +172,7 @@ impl TrxSysConfig {
         }
 
         let catalog_storage =
-            CatalogStorage::new(meta_pool, index_pool, data_pool, table_fs).await?;
+            CatalogStorage::new(meta_pool, index_pool, data_pool, table_fs, readonly_pool).await?;
         let mut catalog = Catalog::new(catalog_storage);
 
         // Now we have an empty catalog, all log partitions and buffer pool.
@@ -180,6 +181,7 @@ impl TrxSysConfig {
             index_pool,
             data_pool,
             table_fs,
+            readonly_pool,
             &mut catalog,
             log_partition_initializers,
             self.skip_recovery,

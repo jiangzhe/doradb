@@ -2,7 +2,9 @@
 //!
 //! This module provides the main entry point of the storage engine,
 //! including start, stop, recover, and execute commands.
-use crate::buffer::{EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
+use crate::buffer::{
+    EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool, GlobalReadonlyBufferPool,
+};
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
@@ -56,6 +58,7 @@ impl Drop for Engine {
             StaticLifetime::drop_static(self.meta_pool);
             StaticLifetime::drop_static(self.index_pool);
             StaticLifetime::drop_static(self.table_fs);
+            StaticLifetime::drop_static(self.readonly_pool);
         }
     }
 }
@@ -94,6 +97,8 @@ pub struct EngineInner {
     pub data_pool: &'static EvictableBufferPool,
     // Table file system to handle async IO of files on disk.
     pub table_fs: &'static TableFileSystem,
+    // Global readonly buffer pool for table-file page reads.
+    pub readonly_pool: &'static GlobalReadonlyBufferPool,
 }
 
 unsafe impl Send for Engine {}
@@ -167,6 +172,7 @@ impl EngineConfig {
     pub async fn build(self) -> Result<Engine> {
         std::fs::create_dir_all(&self.main_dir)?;
         let file = self.file.with_main_dir(&self.main_dir);
+        let readonly_buffer_size = file.readonly_buffer_size;
         std::fs::create_dir_all(&file.base_dir)?;
         let table_fs = file.build()?;
         let table_fs = StaticLifetime::new_static(table_fs);
@@ -177,10 +183,11 @@ impl EngineConfig {
             FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
         let data_pool = self.data_buffer.with_main_dir(&self.main_dir).build()?;
         let data_pool = StaticLifetime::new_static(data_pool);
+        let readonly_pool = GlobalReadonlyBufferPool::with_capacity_static(readonly_buffer_size)?;
         let trx_sys = self
             .trx
             .with_main_dir(&self.main_dir)
-            .build_static(meta_pool, index_pool, data_pool, table_fs)
+            .build_static(meta_pool, index_pool, data_pool, table_fs, readonly_pool)
             .await?;
         Ok(Engine(Arc::new(EngineInner {
             trx_sys,
@@ -188,6 +195,7 @@ impl EngineConfig {
             index_pool,
             data_pool,
             table_fs,
+            readonly_pool,
         })))
     }
 }

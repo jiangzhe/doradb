@@ -9,8 +9,10 @@ pub use deletion_buffer::*;
 pub use recover::*;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
-use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
+use crate::buffer::page::{Page, PageID};
+use crate::buffer::{
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool,
+};
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
 use crate::error::{Error, Result};
@@ -20,7 +22,6 @@ use crate::index::{
     BlockIndex, IndexCompareExchange, IndexInsert, NonUniqueBTreeIndex, NonUniqueIndex,
     RowLocation, SecondaryIndex, UniqueBTreeIndex, UniqueIndex,
 };
-use crate::io::AIOBuf;
 use crate::latch::LatchFallbackMode;
 use crate::lwc::{LwcBuilder, LwcPage};
 use crate::row::ops::{
@@ -89,6 +90,7 @@ pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
 /// should ignored if visible data version does not match index key.
 pub struct Table {
     pub data_pool: &'static EvictableBufferPool,
+    readonly_pool: ReadonlyBufferPool,
     pub file: Arc<TableFile>,
     pub blk_idx: Arc<BlockIndex>,
     pub sec_idx: Arc<[SecondaryIndex]>,
@@ -107,9 +109,11 @@ impl Table {
     pub async fn new(
         data_pool: &'static EvictableBufferPool,
         index_pool: &'static FixedBufferPool,
+        global_readonly_pool: &'static GlobalReadonlyBufferPool,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
     ) -> Self {
+        let table_id = blk_idx.table_id;
         let active_root = file.active_root();
         let mut sec_idx = Vec::with_capacity(active_root.metadata.index_specs.len());
         for (index_no, index_spec) in active_root.metadata.index_specs.iter().enumerate() {
@@ -124,8 +128,11 @@ impl Table {
             .await;
             sec_idx.push(si);
         }
+        let readonly_pool =
+            ReadonlyBufferPool::new(table_id, Arc::clone(&file), global_readonly_pool);
         Table {
             data_pool,
+            readonly_pool,
             file,
             blk_idx: Arc::new(blk_idx),
             sec_idx: Arc::from(sec_idx.into_boxed_slice()),
@@ -449,8 +456,8 @@ impl Table {
         row_id: RowID,
         read_set: &[usize],
     ) -> Result<Option<Vec<Val>>> {
-        let buf = self.file.read_page(page_id).await?;
-        let page = LwcPage::try_from_bytes(buf.as_bytes())?;
+        let page_guard = self.readonly_pool.get_page_shared::<Page>(page_id).await;
+        let page = LwcPage::try_from_bytes(page_guard.page())?;
         let Some(row_idx) = page.row_idx(row_id) else {
             return Ok(None);
         };
@@ -2253,6 +2260,7 @@ impl Clone for Table {
     fn clone(&self) -> Self {
         Table {
             data_pool: self.data_pool,
+            readonly_pool: self.readonly_pool.clone(),
             file: Arc::clone(&self.file),
             blk_idx: Arc::clone(&self.blk_idx),
             sec_idx: Arc::clone(&self.sec_idx),

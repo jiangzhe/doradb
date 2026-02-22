@@ -4,7 +4,7 @@ mod object;
 mod schemas;
 mod tables;
 
-use crate::buffer::{EvictableBufferPool, FixedBufferPool};
+use crate::buffer::{EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::catalog::TableID;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
@@ -32,6 +32,7 @@ impl CatalogStorage {
         index_pool: &'static FixedBufferPool,
         data_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
+        readonly_pool: &'static GlobalReadonlyBufferPool,
     ) -> Result<Self> {
         let mut cat: Vec<Table> = vec![];
         for CatalogDefinition { table_id, metadata } in [
@@ -57,7 +58,7 @@ impl CatalogStorage {
                 Arc::clone(&table_file),
             )
             .await;
-            let table = Table::new(data_pool, index_pool, blk_idx, table_file).await;
+            let table = Table::new(data_pool, index_pool, readonly_pool, blk_idx, table_file).await;
             cat.push(table);
         }
         Ok(CatalogStorage {
