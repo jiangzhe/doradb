@@ -11,6 +11,7 @@ use crate::io::{
     IOQueue, STORAGE_SECTOR_SIZE, UnsafeAIO, align_to_sector_size,
 };
 use crate::notify::EventNotifyOnDrop;
+use crate::ptr::UnsafePtr;
 use event_listener::{EventListener, Listener};
 use libc::{
     O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
@@ -256,8 +257,10 @@ pub fn sparse_file_size(fd: RawFd) -> std::io::Result<(usize, usize)> {
 }
 
 pub enum FileIOState {
-    Request(DirectBuf),
-    Running(AIO<DirectBuf>),
+    RequestBuf(DirectBuf),
+    RunningBuf(AIO<DirectBuf>),
+    RequestStaticRead { ptr: UnsafePtr<u8>, len: usize },
+    RunningStaticRead { aio: UnsafeAIO, len: usize },
     Result(FileIOResult),
     Invalid,
 }
@@ -267,17 +270,19 @@ impl FileIOState {
     pub fn take_buf(&mut self) -> Option<DirectBuf> {
         let state = std::mem::replace(self, FileIOState::Invalid);
         match state {
-            FileIOState::Request(buf) => Some(buf),
-            FileIOState::Running(mut aio) => aio.take_buf(),
+            FileIOState::RequestBuf(buf) => Some(buf),
+            FileIOState::RunningBuf(mut aio) => aio.take_buf(),
             FileIOState::Result(FileIOResult::ReadOk(buf)) => Some(buf),
             FileIOState::Result(_) | FileIOState::Invalid => None,
+            FileIOState::RequestStaticRead { .. } | FileIOState::RunningStaticRead { .. } => None,
         }
     }
 
     #[inline]
     pub fn aio_key(&self) -> Option<AIOKey> {
         match self {
-            FileIOState::Running(aio) => Some(aio.key),
+            FileIOState::RunningBuf(aio) => Some(aio.key),
+            FileIOState::RunningStaticRead { aio, .. } => Some(aio.key),
             _ => None,
         }
     }
@@ -292,6 +297,7 @@ impl Default for FileIOState {
 
 pub enum FileIOResult {
     ReadOk(DirectBuf),
+    ReadStaticOk,
     WriteOk,
     Err(std::io::Error),
 }
@@ -316,7 +322,7 @@ impl FileIO {
     ) -> (Self, FileIOPromise) {
         let ev = EventNotifyOnDrop::new();
         let listener = ev.listen();
-        let state = Arc::new(Mutex::new(FileIOState::Request(buf)));
+        let state = Arc::new(Mutex::new(FileIOState::RequestBuf(buf)));
         let fio = FileIO {
             kind,
             fd,
@@ -324,6 +330,34 @@ impl FileIO {
             state: state.clone(),
             ev,
             recycle,
+        };
+        let promise = FileIOPromise { state, listener };
+        (fio, promise)
+    }
+
+    /// Prepares an async read that targets caller-owned memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep `ptr..ptr+len` valid and sector-aligned until
+    /// the returned promise is resolved.
+    #[inline]
+    pub unsafe fn prepare_static_read(
+        fd: RawFd,
+        offset: usize,
+        ptr: UnsafePtr<u8>,
+        len: usize,
+    ) -> (Self, FileIOPromise) {
+        let ev = EventNotifyOnDrop::new();
+        let listener = ev.listen();
+        let state = Arc::new(Mutex::new(FileIOState::RequestStaticRead { ptr, len }));
+        let fio = FileIO {
+            kind: AIOKind::Read,
+            fd,
+            offset,
+            state: state.clone(),
+            ev,
+            recycle: false,
         };
         let promise = FileIOPromise { state, listener };
         (fio, promise)
@@ -348,7 +382,11 @@ impl FileIOPromise {
         let mut g = self.state.lock();
         match std::mem::take(&mut *g) {
             FileIOState::Result(res) => res,
-            FileIOState::Invalid | FileIOState::Request(_) | FileIOState::Running(_) => {
+            FileIOState::Invalid
+            | FileIOState::RequestBuf(_)
+            | FileIOState::RunningBuf(_)
+            | FileIOState::RequestStaticRead { .. }
+            | FileIOState::RunningStaticRead { .. } => {
                 panic!("invalid state");
             }
         }
@@ -360,7 +398,11 @@ impl FileIOPromise {
         let mut g = self.state.lock();
         match std::mem::take(&mut *g) {
             FileIOState::Result(res) => res,
-            FileIOState::Invalid | FileIOState::Request(_) | FileIOState::Running(_) => {
+            FileIOState::Invalid
+            | FileIOState::RequestBuf(_)
+            | FileIOState::RunningBuf(_)
+            | FileIOState::RequestStaticRead { .. }
+            | FileIOState::RunningStaticRead { .. } => {
                 panic!("invalid state");
             }
         }
@@ -395,14 +437,33 @@ impl AIOEventListener for FileIOListener {
         let key = self.key;
         self.key += 1;
         let mut g = req.state.lock();
-        let mut state = std::mem::replace(&mut *g, FileIOState::Invalid);
-        let buf = state.take_buf().unwrap();
-        let aio = match req.kind {
-            AIOKind::Read => pread_direct(key, req.fd, req.offset, buf),
-            AIOKind::Write => pwrite_direct(key, req.fd, req.offset, buf),
+        let state = std::mem::replace(&mut *g, FileIOState::Invalid);
+        let iocb = match state {
+            FileIOState::RequestBuf(buf) => {
+                let aio = match req.kind {
+                    AIOKind::Read => pread_direct(key, req.fd, req.offset, buf),
+                    AIOKind::Write => pwrite_direct(key, req.fd, req.offset, buf),
+                };
+                let iocb = aio.iocb_raw();
+                *g = FileIOState::RunningBuf(aio);
+                iocb
+            }
+            FileIOState::RequestStaticRead { ptr, len } => {
+                debug_assert!(matches!(req.kind, AIOKind::Read));
+                // SAFETY: caller of `prepare_static_read` guarantees pointer validity and
+                // alignment for the whole async IO operation.
+                let aio = unsafe { pread_unchecked(key, req.fd, req.offset, ptr.0, len) };
+                let iocb = aio.iocb_raw();
+                *g = FileIOState::RunningStaticRead { aio, len };
+                iocb
+            }
+            FileIOState::Result(_)
+            | FileIOState::Invalid
+            | FileIOState::RunningBuf(_)
+            | FileIOState::RunningStaticRead { .. } => {
+                panic!("invalid file io request state")
+            }
         };
-        let iocb = aio.iocb_raw();
-        *g = FileIOState::Running(aio);
         drop(g);
         queue.push(iocb, req);
     }
@@ -421,28 +482,55 @@ impl AIOEventListener for FileIOListener {
     fn on_complete(&mut self, key: AIOKey, res: std::io::Result<usize>) -> AIOKind {
         let sub = self.inflight_io.remove(&key).unwrap();
         let mut g = sub.state.lock();
-        let mut state = std::mem::replace(&mut *g, FileIOState::Invalid);
-        let mut buf = state.take_buf().unwrap();
-        match res {
-            Ok(len) => {
-                debug_assert!(len == buf.capacity());
-                match sub.kind {
-                    AIOKind::Read => {
-                        buf.truncate(len);
-                        *g = FileIOState::Result(FileIOResult::ReadOk(buf));
-                    }
-                    AIOKind::Write => {
-                        // recycle write buffer.
-                        if sub.recycle {
-                            self.buf_list.recycle(buf);
+        let state = std::mem::replace(&mut *g, FileIOState::Invalid);
+        match state {
+            FileIOState::RunningBuf(mut aio) => {
+                let mut buf = aio.take_buf().unwrap();
+                match res {
+                    Ok(len) => {
+                        debug_assert!(len == buf.capacity());
+                        match sub.kind {
+                            AIOKind::Read => {
+                                buf.truncate(len);
+                                *g = FileIOState::Result(FileIOResult::ReadOk(buf));
+                            }
+                            AIOKind::Write => {
+                                // recycle write buffer.
+                                if sub.recycle {
+                                    self.buf_list.recycle(buf);
+                                }
+                                *g = FileIOState::Result(FileIOResult::WriteOk);
+                            }
                         }
-                        *g = FileIOState::Result(FileIOResult::WriteOk);
+                    }
+                    Err(err) => {
+                        self.buf_list.recycle(buf);
+                        *g = FileIOState::Result(FileIOResult::Err(err));
                     }
                 }
             }
-            Err(err) => {
-                self.buf_list.recycle(buf);
-                *g = FileIOState::Result(FileIOResult::Err(err));
+            FileIOState::RunningStaticRead { aio: _aio, len } => match res {
+                Ok(read_len) if read_len == len => {
+                    *g = FileIOState::Result(FileIOResult::ReadStaticOk);
+                }
+                Ok(read_len) => {
+                    *g = FileIOState::Result(FileIOResult::Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "static read completed with short length: expected={}, actual={}",
+                            len, read_len
+                        ),
+                    )));
+                }
+                Err(err) => {
+                    *g = FileIOState::Result(FileIOResult::Err(err));
+                }
+            },
+            FileIOState::RequestBuf(_)
+            | FileIOState::RequestStaticRead { .. }
+            | FileIOState::Result(_)
+            | FileIOState::Invalid => {
+                panic!("invalid file io completion state");
             }
         }
         drop(g);
