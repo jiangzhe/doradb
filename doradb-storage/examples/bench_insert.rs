@@ -53,7 +53,7 @@ fn main() {
             .build()
             .await
             .unwrap();
-        println!("buffer pool size is {}", engine.data_pool.capacity());
+        println!("buffer pool size is {}", engine.mem_pool.capacity());
 
         let table_id = sbtest(&engine).await;
         // start benchmark

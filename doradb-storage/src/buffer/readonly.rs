@@ -1,6 +1,6 @@
 use crate::buffer::BufferPool;
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::{
     ClockHand, clock_collect, clock_sweep_candidate, deallocate_frame_and_page_arrays,
@@ -734,6 +734,7 @@ unsafe impl Send for ReadonlyBufferPoolEvictor {}
 ///
 /// This wrapper translates table-local `PageID` into global physical cache key
 /// and delegates to `GlobalReadonlyBufferPool`.
+#[derive(Clone)]
 pub struct ReadonlyBufferPool {
     table_id: TableID,
     table_file: Arc<TableFile>,
@@ -758,6 +759,46 @@ impl ReadonlyBufferPool {
     #[inline]
     fn cache_key(&self, block_id: PageID) -> ReadonlyCacheKey {
         ReadonlyCacheKey::new(self.table_id, block_id)
+    }
+
+    #[inline]
+    async fn get_page_facade<T: BufferPage>(
+        &self,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> FacadePageGuard<T> {
+        let key = self.cache_key(page_id);
+        loop {
+            let frame_id = self
+                .global
+                .get_or_load_frame_id(key, &self.table_file)
+                .await;
+            let guard = self.global.get_page_internal(frame_id, mode).await;
+            if self.global.validate_guarded_frame_key(&guard, key) {
+                return guard;
+            }
+            self.global
+                .invalidate_stale_mapping_if_same_frame(key, frame_id);
+        }
+    }
+
+    /// Returns a shared lock guard for a cached page.
+    ///
+    /// This helper is intended for runtime call sites that hold `&self`
+    /// instead of `&'static self`.
+    #[inline]
+    pub(crate) async fn get_page_shared<T: BufferPage>(
+        &self,
+        page_id: PageID,
+    ) -> PageSharedGuard<T> {
+        loop {
+            let guard = self
+                .get_page_facade::<T>(page_id, LatchFallbackMode::Shared)
+                .await;
+            if let Some(shared) = guard.lock_shared_async().await {
+                return shared;
+            }
+        }
     }
 
     /// Invalidates one block for this table from the global readonly cache.
@@ -803,19 +844,7 @@ impl BufferPool for ReadonlyBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
-        let key = self.cache_key(page_id);
-        loop {
-            let frame_id = self
-                .global
-                .get_or_load_frame_id(key, &self.table_file)
-                .await;
-            let guard = self.global.get_page_internal(frame_id, mode).await;
-            if self.global.validate_guarded_frame_key(&guard, key) {
-                return guard;
-            }
-            self.global
-                .invalidate_stale_mapping_if_same_frame(key, frame_id);
-        }
+        self.get_page_facade(page_id, mode).await
     }
 
     #[inline]

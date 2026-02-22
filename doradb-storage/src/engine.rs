@@ -2,7 +2,9 @@
 //!
 //! This module provides the main entry point of the storage engine,
 //! including start, stop, recover, and execute commands.
-use crate::buffer::{EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool};
+use crate::buffer::{
+    EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool, GlobalReadonlyBufferPool,
+};
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
@@ -52,10 +54,11 @@ impl Drop for Engine {
         }
         unsafe {
             StaticLifetime::drop_static(self.trx_sys);
-            StaticLifetime::drop_static(self.data_pool);
+            StaticLifetime::drop_static(self.mem_pool);
             StaticLifetime::drop_static(self.meta_pool);
             StaticLifetime::drop_static(self.index_pool);
             StaticLifetime::drop_static(self.table_fs);
+            StaticLifetime::drop_static(self.disk_pool);
         }
     }
 }
@@ -91,9 +94,11 @@ pub struct EngineInner {
     // This pool will be optimized to support CoW B+tree index.
     pub index_pool: &'static FixedBufferPool,
     // data pool is used for data tables.
-    pub data_pool: &'static EvictableBufferPool,
+    pub mem_pool: &'static EvictableBufferPool,
     // Table file system to handle async IO of files on disk.
     pub table_fs: &'static TableFileSystem,
+    // Global readonly buffer pool for table-file page reads.
+    pub disk_pool: &'static GlobalReadonlyBufferPool,
 }
 
 unsafe impl Send for Engine {}
@@ -167,6 +172,7 @@ impl EngineConfig {
     pub async fn build(self) -> Result<Engine> {
         std::fs::create_dir_all(&self.main_dir)?;
         let file = self.file.with_main_dir(&self.main_dir);
+        let readonly_buffer_size = file.readonly_buffer_size;
         std::fs::create_dir_all(&file.base_dir)?;
         let table_fs = file.build()?;
         let table_fs = StaticLifetime::new_static(table_fs);
@@ -175,19 +181,21 @@ impl EngineConfig {
         // todo: implement index pool
         let index_pool =
             FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
-        let data_pool = self.data_buffer.with_main_dir(&self.main_dir).build()?;
-        let data_pool = StaticLifetime::new_static(data_pool);
+        let mem_pool = self.data_buffer.with_main_dir(&self.main_dir).build()?;
+        let mem_pool = StaticLifetime::new_static(mem_pool);
+        let disk_pool = GlobalReadonlyBufferPool::with_capacity_static(readonly_buffer_size)?;
         let trx_sys = self
             .trx
             .with_main_dir(&self.main_dir)
-            .build_static(meta_pool, index_pool, data_pool, table_fs)
+            .build_static(meta_pool, index_pool, mem_pool, table_fs, disk_pool)
             .await?;
         Ok(Engine(Arc::new(EngineInner {
             trx_sys,
             meta_pool,
             index_pool,
-            data_pool,
+            mem_pool,
             table_fs,
+            disk_pool,
         })))
     }
 }

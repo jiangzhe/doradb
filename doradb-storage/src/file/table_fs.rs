@@ -85,6 +85,7 @@ unsafe impl StaticLifetime for TableFileSystem {}
 
 const DEFAULT_TABLE_FILE_IO_DEPTH: usize = 64;
 const DEFAULT_TABLE_FILE_BASE_DIR: &str = ".";
+const DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableFileSystemConfig {
@@ -92,6 +93,8 @@ pub struct TableFileSystemConfig {
     pub io_depth: usize,
     // Base directory.
     pub base_dir: String,
+    // Global readonly buffer pool size in bytes.
+    pub readonly_buffer_size: usize,
 }
 
 impl TableFileSystemConfig {
@@ -115,6 +118,12 @@ impl TableFileSystemConfig {
     }
 
     #[inline]
+    pub fn readonly_buffer_size(mut self, readonly_buffer_size: usize) -> Self {
+        self.readonly_buffer_size = readonly_buffer_size;
+        self
+    }
+
+    #[inline]
     pub fn build(self) -> Result<TableFileSystem> {
         TableFileSystem::new(self.io_depth, self.base_dir)
     }
@@ -126,6 +135,7 @@ impl Default for TableFileSystemConfig {
         TableFileSystemConfig {
             io_depth: DEFAULT_TABLE_FILE_IO_DEPTH,
             base_dir: String::from(DEFAULT_TABLE_FILE_BASE_DIR),
+            readonly_buffer_size: DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
         }
     }
 }

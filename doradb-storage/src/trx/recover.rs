@@ -14,7 +14,7 @@
 //! 2. DML-only transactions
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::catalog::{Catalog, TableID, TableMetadata};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
@@ -110,10 +110,11 @@ mod basic_tests {
     }
 }
 
-pub(super) async fn log_recover<P: BufferPool>(
+pub(super) async fn log_recover(
     index_pool: &'static FixedBufferPool,
-    data_pool: &'static P,
+    mem_pool: &'static EvictableBufferPool,
     table_fs: &'static TableFileSystem,
+    global_disk_pool: &'static GlobalReadonlyBufferPool,
     catalog: &mut Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
@@ -128,7 +129,14 @@ pub(super) async fn log_recover<P: BufferPool>(
             let stream = initializer.stream();
             log_merger.add_stream(stream)?;
         }
-        let log_recovery = LogRecovery::new(index_pool, data_pool, table_fs, catalog, log_merger);
+        let log_recovery = LogRecovery::new(
+            index_pool,
+            mem_pool,
+            table_fs,
+            global_disk_pool,
+            catalog,
+            log_merger,
+        );
         let log_streams = log_recovery.recover_all().await?;
         log_partition_initializers = log_streams
             .into_iter()
@@ -147,28 +155,31 @@ pub(super) async fn log_recover<P: BufferPool>(
     Ok((partitions, gc_rxs))
 }
 
-pub struct LogRecovery<'a, P: BufferPool> {
+pub struct LogRecovery<'a> {
     index_pool: &'static FixedBufferPool,
-    data_pool: &'static P,
+    mem_pool: &'static EvictableBufferPool,
     table_fs: &'static TableFileSystem,
+    global_disk_pool: &'static GlobalReadonlyBufferPool,
     catalog: &'a mut Catalog,
     log_merger: LogMerger,
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
 }
 
-impl<'a, P: BufferPool> LogRecovery<'a, P> {
+impl<'a> LogRecovery<'a> {
     #[inline]
     pub fn new(
         index_pool: &'static FixedBufferPool,
-        data_pool: &'static P,
+        mem_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
         catalog: &'a mut Catalog,
         log_merger: LogMerger,
     ) -> Self {
         LogRecovery {
             index_pool,
-            data_pool,
+            mem_pool,
             table_fs,
+            global_disk_pool,
             catalog,
             log_merger,
             recovered_tables: HashMap::new(),
@@ -222,7 +233,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
 
     async fn refresh_page(&self, metadata: Arc<TableMetadata>, page_id: PageID) {
         let mut page_guard = self
-            .data_pool
+            .mem_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
@@ -261,7 +272,12 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
             DDLRedo::CreateTable(table_id) => {
                 self.replay_catalog_modifications(dml).await?;
                 self.catalog
-                    .reload_create_table(self.index_pool, self.table_fs, *table_id)
+                    .reload_create_table(
+                        self.index_pool,
+                        self.table_fs,
+                        self.global_disk_pool,
+                        *table_id,
+                    )
                     .await?;
             }
             DDLRedo::CreateRowPage {
@@ -281,7 +297,7 @@ impl<'a, P: BufferPool> LogRecovery<'a, P> {
                 let count = end_row_id - start_row_id;
                 let mut page_guard = table
                     .blk_idx
-                    .allocate_row_page_at(self.data_pool, count as usize, *page_id)
+                    .allocate_row_page_at(self.mem_pool, count as usize, *page_id)
                     .await;
                 // Here we switch row page to recover mode.
                 page_guard.bf_mut().init_recover_map(cts);

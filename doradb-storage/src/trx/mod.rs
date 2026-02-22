@@ -283,14 +283,14 @@ impl ActiveTrx {
     #[inline]
     pub async fn commit(self) -> Result<TrxID> {
         let engine = self.engine().cloned().unwrap();
-        engine.trx_sys.commit(self, engine.data_pool).await
+        engine.trx_sys.commit(self, engine.mem_pool).await
     }
 
     /// Rollback the transaction.
     #[inline]
     pub async fn rollback(self) {
         let engine = self.engine().cloned().unwrap();
-        engine.trx_sys.rollback(self, engine.data_pool).await
+        engine.trx_sys.rollback(self, engine.mem_pool).await
     }
 
     /// Add one redo log entry.

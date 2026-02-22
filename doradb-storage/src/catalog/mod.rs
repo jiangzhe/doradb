@@ -7,7 +7,7 @@ pub use spec::*;
 pub use storage::*;
 pub use table::*;
 
-use crate::buffer::FixedBufferPool;
+use crate::buffer::{FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
@@ -111,6 +111,7 @@ impl Catalog {
         &self,
         index_pool: &'static FixedBufferPool,
         table_fs: &'static TableFileSystem,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
         table_id: TableID,
     ) -> Result<()> {
         // todo
@@ -185,8 +186,14 @@ impl Catalog {
                     Arc::clone(&table_file),
                 )
                 .await;
-                let table =
-                    Table::new(self.storage.data_pool, index_pool, blk_idx, table_file).await;
+                let table = Table::new(
+                    self.storage.mem_pool,
+                    index_pool,
+                    global_disk_pool,
+                    blk_idx,
+                    table_file,
+                )
+                .await;
                 // Update table into cache
                 let mut table_cache_g = self.cache.tables.write().await;
                 let res = table_cache_g.insert(table_id, table);

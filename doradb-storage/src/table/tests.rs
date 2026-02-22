@@ -1,6 +1,7 @@
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
+use crate::file::table_fs::TableFileSystemConfig;
 use crate::index::{RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol};
@@ -237,6 +238,42 @@ fn test_column_delete_basic() {
 }
 
 #[test]
+fn test_lwc_read_uses_readonly_buffer_pool() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let mut trx = session.begin_trx().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        assert_eq!(sys.engine.disk_pool.allocated(), 0);
+
+        sys.new_trx_select(&mut session, &key, |vals| {
+            assert_eq!(vals[0], Val::from(1i32));
+            assert_eq!(vals[1], Val::from("name"));
+        })
+        .await;
+        let allocated_after_first = sys.engine.disk_pool.allocated();
+        assert!(allocated_after_first >= 1);
+
+        sys.new_trx_select(&mut session, &key, |vals| {
+            assert_eq!(vals[0], Val::from(1i32));
+            assert_eq!(vals[1], Val::from("name"));
+        })
+        .await;
+        assert_eq!(sys.engine.disk_pool.allocated(), allocated_after_first);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_column_delete_rollback() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -413,7 +450,7 @@ fn test_row_page_transition_retries_update_delete() {
         };
         let page_guard = sys
             .engine
-            .data_pool
+            .mem_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
             .lock_shared_async()
@@ -426,7 +463,7 @@ fn test_row_page_transition_retries_update_delete() {
 
         let insert_page_guard = sys
             .engine
-            .data_pool
+            .mem_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
             .lock_shared_async()
@@ -461,7 +498,7 @@ fn test_row_page_transition_retries_update_delete() {
         let mut stmt = trx.start_stmt();
         let page_guard = sys
             .engine
-            .data_pool
+            .mem_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
             .lock_shared_async()
@@ -1119,7 +1156,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
 
         let page_guard = sys
             .engine
-            .data_pool
+            .mem_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
             .lock_shared_async()
@@ -1310,14 +1347,14 @@ fn test_data_checkpoint_gc_verification() {
         let name = "g".repeat(1024);
         insert_rows(&sys, &mut session, 0, 200, &name).await;
 
-        let allocated_before = sys.engine.data_pool.allocated();
+        let allocated_before = sys.engine.mem_pool.allocated();
         sys.table.freeze(usize::MAX).await;
         sys.table.data_checkpoint(&mut session).await.unwrap();
-        let allocated_after = sys.engine.data_pool.allocated();
+        let allocated_after = sys.engine.mem_pool.allocated();
         let mut reclaimed = allocated_after < allocated_before;
         for _ in 0..20 {
             smol::Timer::after(Duration::from_millis(200)).await;
-            let allocated_now = sys.engine.data_pool.allocated();
+            let allocated_now = sys.engine.mem_pool.allocated();
             if allocated_now < allocated_before {
                 reclaimed = true;
                 break;
@@ -1386,6 +1423,12 @@ impl TestSys {
                 TrxSysConfig::default()
                     .log_file_prefix("redo_testsys")
                     .skip_recovery(true),
+            )
+            .file(
+                TableFileSystemConfig::default()
+                    .io_depth(16)
+                    .readonly_buffer_size(128 * 1024 * 1024)
+                    .data_dir("."),
             )
             .build()
             .await
