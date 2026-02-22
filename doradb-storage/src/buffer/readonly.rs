@@ -478,6 +478,26 @@ impl GlobalReadonlyBufferPool {
             .await;
         FacadePageGuard::new(bf, g)
     }
+
+    #[inline]
+    fn validate_guarded_frame_key<T: 'static>(
+        &self,
+        guard: &FacadePageGuard<T>,
+        expected_key: ReadonlyCacheKey,
+    ) -> bool {
+        let frame = guard.bf();
+        frame.kind() != FrameKind::Uninitialized
+            && frame.readonly_key() == Some((expected_key.table_id, expected_key.block_id))
+    }
+
+    #[inline]
+    fn invalidate_stale_mapping_if_same_frame(&self, key: ReadonlyCacheKey, frame_id: PageID) {
+        if let Entry::Occupied(occ) = self.mappings.entry(key)
+            && *occ.get() == frame_id
+        {
+            occ.remove();
+        }
+    }
 }
 
 impl Drop for GlobalReadonlyBufferPool {
@@ -784,11 +804,18 @@ impl BufferPool for ReadonlyBufferPool {
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
         let key = self.cache_key(page_id);
-        let frame_id = self
-            .global
-            .get_or_load_frame_id(key, &self.table_file)
-            .await;
-        self.global.get_page_internal(frame_id, mode).await
+        loop {
+            let frame_id = self
+                .global
+                .get_or_load_frame_id(key, &self.table_file)
+                .await;
+            let guard = self.global.get_page_internal(frame_id, mode).await;
+            if self.global.validate_guarded_frame_key(&guard, key) {
+                return guard;
+            }
+            self.global
+                .invalidate_stale_mapping_if_same_frame(key, frame_id);
+        }
     }
 
     #[inline]
@@ -945,6 +972,54 @@ mod tests {
             let shared = g.downgrade_shared();
             let _ = global.invalidate_key_strict(&key);
             drop(shared);
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_reloads_when_mapping_points_to_uninitialized_frame() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let table_file = fs.create_table_file(111, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+            write_payload(&table_file, 9, b"reload").await;
+
+            let scope = StaticLifetimeScope::new();
+            let global = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(2)).unwrap(),
+            );
+            let global = global.as_static();
+            let key = ReadonlyCacheKey::new(111, 9);
+
+            let mut g0 = global.frames.try_lock_page_exclusive(0).unwrap();
+            global.bind_frame(key, &mut g0).unwrap();
+            g0.page_mut().zero();
+            let frame = g0.bf_mut();
+            frame.clear_readonly_key();
+            frame.bump_generation();
+            frame.set_kind(FrameKind::Uninitialized);
+            drop(g0);
+
+            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+                111,
+                Arc::clone(&table_file),
+                global,
+            )));
+            let page: FacadePageGuard<Page> = pool
+                .as_static()
+                .get_page::<Page>(9, LatchFallbackMode::Shared)
+                .await;
+            let page = page.lock_shared_async().await.unwrap();
+            assert_eq!(&page.page()[..6], b"reload");
+            drop(page);
+
+            assert_eq!(global.try_get_frame_id(&key), Some(1));
+            drop(table_file);
+            drop(fs);
         });
     }
 
