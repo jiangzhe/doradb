@@ -998,8 +998,10 @@ impl BTreeNode {
     /// Returns value at `idx` without asserting.
     ///
     /// This is intended for optimistic-read paths where another thread may
-    /// modify the node between two reads in the same closure. In that case,
-    /// the caller should treat `None` as an optimistic inconsistency and retry.
+    /// modify the node between two reads in the same closure.
+    ///
+    /// Returning `None` lets caller mark the optimistic read as invalid and
+    /// retry, instead of panicking on transient `idx` stale cases.
     #[inline]
     pub(super) fn value_checked<V: BTreeValue>(&self, idx: usize) -> Option<V> {
         self.slots().get(idx).map(|slot| self.slot_value(slot))
