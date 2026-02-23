@@ -33,3 +33,18 @@ impl Deref for EventNotifyOnDrop {
         &self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use event_listener::Listener;
+
+    #[test]
+    fn test_event_notify_on_drop() {
+        let ev = EventNotifyOnDrop::default();
+        let listener = ev.listen();
+        drop(ev);
+        // event dropped, so listener.wait() will immediately return.
+        listener.wait();
+    }
+}
