@@ -96,6 +96,7 @@ unsafe impl Sync for BlockIndexRoot {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_root_guide_and_try_column() {
@@ -136,6 +137,48 @@ mod tests {
             }
             assert_eq!(root.try_column(10), Some((2000, 88)));
             assert_eq!(root.try_column(2000), None);
+        });
+    }
+
+    #[test]
+    fn test_root_concurrent_guide_and_update() {
+        smol::block_on(async {
+            let root = Arc::new(BlockIndexRoot::new(1000, 77));
+            let reader_root = Arc::clone(&root);
+            let writer_root = Arc::clone(&root);
+
+            let reader = smol::spawn(async move {
+                for i in 0..20_000u64 {
+                    let row_id = i % 2_000;
+                    match reader_root.guide(row_id) {
+                        BlockIndexRoute::Column {
+                            pivot_row_id,
+                            root_page_id: _,
+                        } => assert!(row_id < pivot_row_id),
+                        BlockIndexRoute::Row => {
+                            if let Some((pivot_row_id, _)) = reader_root.try_column(row_id) {
+                                assert!(row_id < pivot_row_id);
+                            }
+                        }
+                    }
+                }
+            });
+
+            let writer = smol::spawn(async move {
+                for i in 0..2_000u64 {
+                    let pivot_row_id = 600 + (i % 800);
+                    let root_page_id = 80 + i;
+                    writer_root
+                        .update_column_root(pivot_row_id, root_page_id)
+                        .await;
+                    let snapshot = writer_root.try_column(pivot_row_id - 1).unwrap();
+                    assert_eq!(snapshot.0, pivot_row_id);
+                    assert_eq!(snapshot.1, root_page_id);
+                }
+            });
+
+            reader.await;
+            writer.await;
         });
     }
 }

@@ -494,8 +494,8 @@ impl<'a> ColumnBlockIndex<'a> {
         loop {
             let g = self
                 .disk_pool
-                .get_page_shared::<ColumnBlockNode>(page_id)
-                .await;
+                .try_get_page_shared::<ColumnBlockNode>(page_id)
+                .await?;
             let node = g.page();
             if node.is_leaf() {
                 let start_row_ids = node.leaf_start_row_ids();
@@ -545,8 +545,8 @@ impl<'a> ColumnBlockIndex<'a> {
         let root_height = {
             let g = self
                 .disk_pool
-                .get_page_shared::<ColumnBlockNode>(self.root_page_id)
-                .await;
+                .try_get_page_shared::<ColumnBlockNode>(self.root_page_id)
+                .await?;
             g.page().header.height
         };
         let append_result = self
@@ -698,8 +698,8 @@ impl<'a> ColumnBlockIndex<'a> {
         loop {
             let g = self
                 .disk_pool
-                .get_page_shared::<ColumnBlockNode>(page_id)
-                .await;
+                .try_get_page_shared::<ColumnBlockNode>(page_id)
+                .await?;
             let node = g.page();
             path.push(page_id);
             if node.is_leaf() {
@@ -739,8 +739,8 @@ impl<'a> ColumnBlockIndex<'a> {
         let (new_page_id, new_node, start_row_id, mut remaining) = {
             let g = self
                 .disk_pool
-                .get_page_shared::<ColumnBlockNode>(page_id)
-                .await;
+                .try_get_page_shared::<ColumnBlockNode>(page_id)
+                .await?;
             let node = g.page();
             if !node.is_leaf() {
                 return Err(Error::InvalidState);
@@ -822,8 +822,8 @@ impl<'a> ColumnBlockIndex<'a> {
         let (height, start_row_id, new_entries) = {
             let g = self
                 .disk_pool
-                .get_page_shared::<ColumnBlockNode>(page_id)
-                .await;
+                .try_get_page_shared::<ColumnBlockNode>(page_id)
+                .await?;
             let node = g.page();
             if !node.is_branch() {
                 return Err(Error::InvalidState);
@@ -924,7 +924,7 @@ fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool};
+    use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableMetadata,
     };
@@ -1409,6 +1409,75 @@ mod tests {
                 drop(table_file);
                 drop(fs);
                 let _ = std::fs::remove_file("205.tbl");
+            })
+        });
+    }
+
+    #[test]
+    fn test_cache_reuse_for_unchanged_leaf_across_root_swap() {
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let metadata = build_test_metadata();
+                let _ = std::fs::remove_file("206.tbl");
+                let table_file = fs.create_table_file(206, metadata, false).unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
+                let disk_pool = readonly_pool(206, &table_file);
+                let global = global_readonly_pool();
+
+                // Build at least two leaves so right-most append can preserve left leaf pages.
+                let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
+                let entries = build_entries(0, initial_count, 5000);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+                drop(old_root);
+
+                let root_node = read_node_from_file(&table_file, root_v1).await.unwrap();
+                assert!(root_node.is_branch());
+                let left_leaf_page_id = root_node.branch_entries()[0].page_id;
+
+                let index_v1 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool);
+                assert_eq!(index_v1.find(0).await.unwrap().unwrap().block_id, 5000);
+
+                let left_leaf_key = ReadonlyCacheKey::new(206, left_leaf_page_id);
+                let frame_before = global
+                    .try_get_frame_id(&left_leaf_key)
+                    .expect("left leaf should be cached after first lookup");
+
+                let append = build_entries(initial_count as RowID, 16, 9000);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v2 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool)
+                    .batch_insert(
+                        &mut mutable,
+                        &append,
+                        initial_count as RowID + append.len() as RowID,
+                        3,
+                    )
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
+                drop(old_root);
+
+                let index_v2 = ColumnBlockIndex::new(
+                    root_v2,
+                    initial_count as RowID + append.len() as RowID,
+                    &disk_pool,
+                );
+                assert_eq!(index_v2.find(0).await.unwrap().unwrap().block_id, 5000);
+
+                let frame_after = global
+                    .try_get_frame_id(&left_leaf_key)
+                    .expect("left leaf cache entry should remain valid");
+                assert_eq!(frame_before, frame_after);
+
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("206.tbl");
             })
         });
     }

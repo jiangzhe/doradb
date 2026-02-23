@@ -1,5 +1,6 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
+use crate::buffer::evictor::{EvictionTuning, FailureRateTracker, decide_eviction};
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
@@ -115,10 +116,12 @@ impl EvictableBufferPool {
                     Some(page_guard) => {
                         // Page is locked, so we dispatch read request to IO thread.
                         if !self.in_mem.try_inc() {
+                            self.in_mem.record_alloc_failure();
                             // we do not have memory budget to load the page.
                             listener!(self.in_mem.load_ev => listener);
                             // re-check
                             if !self.in_mem.try_inc() {
+                                self.in_mem.record_alloc_failure();
                                 // still no budget.
                                 // we can only wait for signal and retry.
                                 // before waiting, notify evict thread to work.
@@ -131,6 +134,9 @@ impl EvictableBufferPool {
                                 self.in_mem.load_ev.notify(1); // notify next reader to retry.
                                 return; // now retry.
                             }
+                            self.in_mem.record_alloc_success();
+                        } else {
+                            self.in_mem.record_alloc_success();
                         }
                         // we have memory budget now.
                         let event = Event::new();
@@ -194,15 +200,19 @@ impl EvictableBufferPool {
     #[inline]
     async fn reserve_page(&self) {
         if self.in_mem.try_inc() {
+            self.in_mem.record_alloc_success();
             return;
         }
+        self.in_mem.record_alloc_failure();
         // Slow path. Wait for other to release memory.
         loop {
             listener!(self.in_mem.load_ev => listener);
             if self.in_mem.try_inc() {
+                self.in_mem.record_alloc_success();
                 self.in_mem.load_ev.notify(1);
                 return;
             }
+            self.in_mem.record_alloc_failure();
             // Notify evictor thread to work.
             self.in_mem.evict_ev.notify(1);
             listener.await;
@@ -655,12 +665,14 @@ impl BufferPoolEvictor {
                 return;
             }
 
-            let mut batch_size = match self.in_mem.pages_to_evict() {
+            let inflight_writes = self.inflight_io.writes.load(Ordering::Relaxed);
+            let mut batch_size = match self.in_mem.pages_to_evict(inflight_writes) {
                 Some(n) => n.min(EVICT_BATCH),
                 None => {
                     listener!(self.in_mem.evict_ev => listener);
                     // re-check
-                    match self.in_mem.pages_to_evict() {
+                    let inflight_writes = self.inflight_io.writes.load(Ordering::Relaxed);
+                    match self.in_mem.pages_to_evict(inflight_writes) {
                         Some(n) => n.min(EVICT_BATCH),
                         None => {
                             // Because we don't specify wait timeout,
@@ -681,10 +693,6 @@ impl BufferPoolEvictor {
                     }
                 }
             };
-
-            // There might be IO writes in-progress and queued,
-            // we should ignore these numbers.
-            batch_size = batch_size.saturating_sub(self.inflight_io.writes.load(Ordering::Relaxed));
             if batch_size == 0 {
                 // Unnecessary to evict more pages because many page evictions are in progress.
                 listener!(self.in_mem.evict_ev => listener);
@@ -799,8 +807,10 @@ struct InMemPageSet {
     count: AtomicUsize,
     // Maximum page number held in memory.
     max_count: usize,
-    // Evict threshold.
-    evict_threshold: usize,
+    // Shared pressure-delta eviction tuning.
+    eviction_tuning: EvictionTuning,
+    // Sliding-window allocation failure tracker.
+    alloc_failures: FailureRateTracker,
     // Ordered page id set, used for evict thread.
     set: Mutex<BTreeSet<PageID>>,
     // Event to notify thread that loading a page is available.
@@ -813,13 +823,12 @@ struct InMemPageSet {
 
 impl InMemPageSet {
     #[inline]
-    fn new(max_count: usize) -> Self {
-        const EVICT_THRESHOLD: f64 = 0.9;
-        let evict_threshold = (max_count as f64 * EVICT_THRESHOLD) as usize;
+    fn new(max_count: usize, eviction_tuning: EvictionTuning) -> Self {
         InMemPageSet {
             count: AtomicUsize::new(0),
             max_count,
-            evict_threshold,
+            alloc_failures: FailureRateTracker::new(eviction_tuning.failure_window),
+            eviction_tuning,
             set: Mutex::new(BTreeSet::new()),
             load_ev: Event::new(),
             evict_ev: Event::new(),
@@ -857,17 +866,36 @@ impl InMemPageSet {
         }
     }
 
-    /// Returns number of pages which would be evicted.
+    /// Returns current failure rate in allocation attempts.
     #[inline]
-    fn pages_to_evict(&self) -> Option<usize> {
+    fn alloc_failure_rate(&self) -> f64 {
+        self.alloc_failures.failure_rate()
+    }
+
+    /// Computes target eviction batch size under current pressure.
+    #[inline]
+    fn pages_to_evict(&self, inflight_writes: usize) -> Option<usize> {
         let curr_count = self.count.load(Ordering::Acquire);
-        if curr_count < MIN_IN_MEM_PAGES / 2 {
-            // do not evict if page count is too small.
-            return None;
-        } else if curr_count > self.evict_threshold {
-            return Some(curr_count - self.evict_threshold);
-        }
-        None
+        let failure_rate = self.alloc_failure_rate();
+        decide_eviction(
+            curr_count,
+            self.max_count,
+            inflight_writes,
+            failure_rate,
+            self.eviction_tuning,
+            MIN_IN_MEM_PAGES / 2,
+        )
+        .map(|decision| decision.batch_size)
+    }
+
+    #[inline]
+    fn record_alloc_success(&self) {
+        self.alloc_failures.record_success();
+    }
+
+    #[inline]
+    fn record_alloc_failure(&self) {
+        self.alloc_failures.record_failure();
     }
 
     /// Pin given page in memory.
@@ -981,6 +1009,7 @@ pub struct EvictableBufferPoolConfig {
     max_file_size: Byte,
     max_mem_size: Byte,
     max_io_depth: usize,
+    eviction_tuning: EvictionTuning,
 }
 
 impl Default for EvictableBufferPoolConfig {
@@ -991,6 +1020,7 @@ impl Default for EvictableBufferPoolConfig {
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             max_mem_size: DEFAULT_MAX_MEM_SIZE,
             max_io_depth: DEFAULT_MAX_IO_DEPTH,
+            eviction_tuning: EvictionTuning::default(),
         }
     }
 }
@@ -1034,6 +1064,43 @@ impl EvictableBufferPoolConfig {
     }
 
     #[inline]
+    pub fn eviction_tuning(mut self, eviction_tuning: EvictionTuning) -> Self {
+        self.eviction_tuning = eviction_tuning;
+        self
+    }
+
+    #[inline]
+    pub fn target_free(mut self, target_free: usize) -> Self {
+        self.eviction_tuning.target_free = target_free;
+        self
+    }
+
+    #[inline]
+    pub fn hysteresis(mut self, hysteresis: usize) -> Self {
+        self.eviction_tuning.hysteresis = hysteresis;
+        self
+    }
+
+    #[inline]
+    pub fn failure_rate_threshold(mut self, threshold: f64) -> Self {
+        self.eviction_tuning.failure_rate_threshold = threshold;
+        self
+    }
+
+    #[inline]
+    pub fn failure_window(mut self, window: usize) -> Self {
+        self.eviction_tuning.failure_window = window;
+        self
+    }
+
+    #[inline]
+    pub fn dynamic_batch_bounds(mut self, min_batch: usize, max_batch: usize) -> Self {
+        self.eviction_tuning.min_batch = min_batch;
+        self.eviction_tuning.max_batch = max_batch;
+        self
+    }
+
+    #[inline]
     pub fn build(self) -> Result<EvictableBufferPool> {
         // 1. Calculate memory usage.
         let max_file_size = self.max_file_size.as_u64() as usize;
@@ -1073,7 +1140,7 @@ impl EvictableBufferPoolConfig {
             io_client,
             io_thread: Mutex::new(None),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
-            in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem)),
+            in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, self.eviction_tuning)),
             inflight_io: Arc::new(InflightIO::default()),
             stats: Arc::new(EvictableBufferPoolStats::default()),
         };
@@ -1465,12 +1532,12 @@ mod tests {
                         let g = pool.allocate_page::<RowPage>().await;
                         pages.push(g.page_id());
                         println!(
-                            "thread {} alloc page end page_id {}, allocated {}, in-mem {}, threshold {}, reads {}, writes {}",
+                            "thread {} alloc page end page_id {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
                             thread_id,
                             g.page_id(),
                             pool.allocated(),
                             pool.in_mem.count.load(Ordering::Relaxed),
-                            pool.in_mem.evict_threshold,
+                            pool.in_mem.eviction_tuning.target_free,
                             pool.inflight_io.reads.load(Ordering::Relaxed),
                             pool.inflight_io.writes.load(Ordering::Relaxed),
                         );
@@ -1480,12 +1547,12 @@ mod tests {
                             // choose one page and try to lock it.
                             let page_id = pages.choose(&mut rng).cloned().unwrap();
                             println!(
-                                "thread {} read page {}, allocated {}, in-mem {}, threshold {}, reads {}, writes {}",
+                                "thread {} read page {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
                                 thread_id,
                                 page_id,
                                 pool.allocated(),
                                 pool.in_mem.count.load(Ordering::Relaxed),
-                                pool.in_mem.evict_threshold,
+                                pool.in_mem.eviction_tuning.target_free,
                                 pool.inflight_io.reads.load(Ordering::Relaxed),
                                 pool.inflight_io.writes.load(Ordering::Relaxed),
                             );

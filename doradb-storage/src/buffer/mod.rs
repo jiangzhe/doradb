@@ -1,4 +1,5 @@
 mod evict;
+mod evictor;
 mod fixed;
 pub mod frame;
 pub mod guard;
@@ -7,6 +8,7 @@ mod readonly;
 mod util;
 
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
+pub use evictor::EvictionTuning;
 pub use fixed::FixedBufferPool;
 pub use readonly::{GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey};
 

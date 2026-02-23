@@ -171,7 +171,12 @@ impl BlockIndex {
         let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, &self.disk_pool);
         match index.find(row_id).await {
             Ok(Some(payload)) => RowLocation::LwcPage(payload.block_id as PageID),
-            Ok(None) | Err(_) => RowLocation::NotFound,
+            Ok(None) => RowLocation::NotFound,
+            Err(err) => todo!(
+                "block-index column-path error policy is deferred (row_id={}, err={})",
+                row_id,
+                err
+            ),
         }
     }
 }
