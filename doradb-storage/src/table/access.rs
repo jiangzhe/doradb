@@ -657,7 +657,7 @@ impl TableAccess for Table {
             match self.build_lwc_pages(cutoff_ts, &frozen_pages).await {
                 Ok(lwc_pages) => (lwc_pages, heap_redo_start_ts.unwrap_or(sts)),
                 Err(err) => {
-                    trx_sys.rollback(trx, self.mem_pool).await;
+                    trx_sys.rollback(trx).await;
                     return Err(err);
                 }
             };
@@ -677,20 +677,29 @@ impl TableAccess for Table {
         let table_file = MutableTableFile::fork(&self.file);
         let (table_file, old_root) = if !lwc_pages.is_empty() {
             table_file
-                .persist_lwc_pages(lwc_pages, heap_redo_start_ts, checkpoint_ts)
+                .persist_lwc_pages(
+                    lwc_pages,
+                    heap_redo_start_ts,
+                    checkpoint_ts,
+                    &self.disk_pool,
+                )
                 .await?
         } else {
             table_file
                 .update_checkpoint(new_pivot_row_id, heap_redo_start_ts, checkpoint_ts)
                 .await?
         };
+        let active_root = table_file.active_root();
         self.blk_idx
-            .update_file_root(table_file.active_root())
+            .update_column_root(
+                active_root.pivot_row_id,
+                active_root.column_block_index_root,
+            )
             .await;
         drop(old_root);
 
         // Step 7: commit the checkpoint transaction to get CTS.
-        let _cts = match trx_sys.commit(trx, self.mem_pool).await {
+        let _cts = match trx_sys.commit(trx).await {
             Ok(cts) => cts,
             Err(err) => return Err(err),
         };

@@ -1,4 +1,5 @@
 use crate::bitmap::AllocMap;
+use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::catalog::table::TableMetadata;
 use crate::error::{Error, Result};
@@ -383,6 +384,12 @@ impl MutableTableFile {
         self.active_root.gc_page_list.push(page_id);
     }
 
+    /// Write one page into the underlying table file.
+    #[inline]
+    pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
+        self.table_file.write_page(page_id, buf).await
+    }
+
     /// Commit the modification of table file.
     /// Returns the new table file and previous
     /// active root if exists.
@@ -475,6 +482,7 @@ impl MutableTableFile {
         lwc_pages: Vec<LwcPagePersist>,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
+        disk_pool: &ReadonlyBufferPool,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         let mut max_row_id = self.active_root.pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_pages.len());
@@ -502,9 +510,9 @@ impl MutableTableFile {
         try_join_all(writes).await?;
 
         let column_index = crate::index::ColumnBlockIndex::new(
-            Arc::clone(&self.table_file),
             self.active_root.column_block_index_root,
             self.active_root.pivot_row_id,
+            disk_pool,
         );
         let new_root = column_index
             .batch_insert(&mut self, &new_entries, max_row_id, ts)
@@ -661,12 +669,25 @@ fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::Error;
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
     use crate::value::ValKind;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    fn global_readonly_pool() -> &'static GlobalReadonlyBufferPool {
+        static GLOBAL: OnceLock<&'static GlobalReadonlyBufferPool> = OnceLock::new();
+        *GLOBAL.get_or_init(|| {
+            GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap()
+        })
+    }
+
+    fn readonly_pool(table_id: u64, table_file: &Arc<TableFile>) -> ReadonlyBufferPool {
+        ReadonlyBufferPool::new(table_id, Arc::clone(table_file), global_readonly_pool())
+    }
 
     #[test]
     fn test_table_file() {
@@ -829,8 +850,9 @@ mod tests {
                 },
             ];
 
+            let disk_pool = readonly_pool(43, &table_file);
             let (table_file, old_root) = MutableTableFile::fork(&table_file)
-                .persist_lwc_pages(lwc_pages, 7, 2)
+                .persist_lwc_pages(lwc_pages, 7, 2, &disk_pool)
                 .await
                 .unwrap();
             drop(old_root);
@@ -840,11 +862,12 @@ mod tests {
             assert_eq!(active_root.pivot_row_id, 20);
             assert_eq!(active_root.heap_redo_start_ts, 7);
             assert_ne!(active_root.column_block_index_root, 0);
+            let disk_pool = readonly_pool(43, &table_file);
 
             let column_index = crate::index::ColumnBlockIndex::new(
-                Arc::clone(&table_file),
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,
+                &disk_pool,
             );
             let payload1 = column_index.find(0).await.unwrap().unwrap();
             let payload2 = column_index.find(15).await.unwrap().unwrap();
@@ -885,8 +908,9 @@ mod tests {
                 },
             ];
 
+            let disk_pool = readonly_pool(44, &table_file);
             let result = MutableTableFile::fork(&table_file)
-                .persist_lwc_pages(lwc_pages, 7, 2)
+                .persist_lwc_pages(lwc_pages, 7, 2, &disk_pool)
                 .await;
 
             assert!(matches!(result, Err(Error::InvalidArgument)));

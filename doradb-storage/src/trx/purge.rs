@@ -1,5 +1,5 @@
-use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
+use crate::buffer::{BufferPool, EvictableBufferPool};
 use crate::catalog::{Catalog, TableCache};
 use crate::latch::LatchFallbackMode;
 use crate::row::RowPage;
@@ -22,9 +22,9 @@ use std::thread::JoinHandle;
 
 impl TransactionSystem {
     #[inline]
-    pub(super) fn start_purge_threads<P: BufferPool>(
+    pub(super) fn start_purge_threads(
         &'static self,
-        buf_pool: &'static P,
+        mem_pool: &'static EvictableBufferPool,
         purge_chan: Receiver<Purge>,
     ) {
         if self.config.purge_threads == 1 {
@@ -32,17 +32,17 @@ impl TransactionSystem {
             let handle = thread::spawn_named("Purge-Thread", move || {
                 let ex = LocalExecutor::new();
                 let mut purger = PurgeSingleThreaded;
-                smol::block_on(ex.run(purger.purge_loop(buf_pool, &self.catalog, self, purge_chan)))
+                smol::block_on(ex.run(purger.purge_loop(mem_pool, &self.catalog, self, purge_chan)))
             });
             let mut g = self.purge_threads.lock();
             g.push(handle);
         } else {
             // multi-threaded purger
-            let (mut dispatcher, executors) = self.dispatch_purge(buf_pool, &self.catalog);
+            let (mut dispatcher, executors) = self.dispatch_purge(&self.catalog);
             let handle = thread::spawn_named("Purge-Dispatcher", move || {
                 let ex = LocalExecutor::new();
                 smol::block_on(ex.run(dispatcher.purge_loop(
-                    buf_pool,
+                    mem_pool,
                     &self.catalog,
                     self,
                     purge_chan,
@@ -71,9 +71,8 @@ impl TransactionSystem {
     }
 
     #[inline]
-    pub(super) fn dispatch_purge<P: BufferPool>(
+    pub(super) fn dispatch_purge(
         &'static self,
-        buf_pool: &'static P,
         catalog: &'static Catalog,
     ) -> (PurgeDispatcher, Vec<JoinHandle<()>>) {
         let mut handles = vec![];
@@ -85,7 +84,7 @@ impl TransactionSystem {
             let handle = thread::spawn_named(thread_name, move || {
                 let mut purger = PurgeExecutor;
                 let ex = LocalExecutor::new();
-                smol::block_on(ex.run(purger.purge_task_loop(buf_pool, catalog, self, rx)));
+                smol::block_on(ex.run(purger.purge_task_loop(catalog, self, rx)));
             });
             handles.push(handle);
         }
@@ -95,9 +94,8 @@ impl TransactionSystem {
     /// Purge row undo logs and index entries according to given transaction
     /// list and minimum active STS.
     #[inline]
-    pub(super) async fn purge_trx_list<P: BufferPool>(
+    pub(super) async fn purge_trx_list(
         &self,
-        buf_pool: &'static P,
         catalog: &Catalog,
         log_no: usize,
         trx_list: Vec<CommittedTrx>,
@@ -113,7 +111,7 @@ impl TransactionSystem {
             if let Some(row_undo) = trx.row_undo() {
                 purge_row_count += row_undo.len();
                 for undo in &**row_undo {
-                    let Some(table) = table_cache.get_table(undo.table_id).await else {
+                    let Some(table) = table_cache.get_table_ref(undo.table_id).await else {
                         continue;
                     };
                     let Some(page_id) = undo.page_id else {
@@ -124,7 +122,8 @@ impl TransactionSystem {
                         }
                         continue;
                     };
-                    let Some(page_guard) = buf_pool
+                    let Some(page_guard) = table
+                        .mem_pool
                         .try_get_page_versioned::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                     else {
@@ -158,7 +157,7 @@ impl TransactionSystem {
         for trx in &trx_list {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
-                    if let Some(table) = table_cache.get_table(ip.table_id).await {
+                    if let Some(table) = table_cache.get_table_ref(ip.table_id).await {
                         // todo: index should stored in index pool, instead of data pool.
                         if table.delete_index(&ip.key, ip.row_id, ip.unique).await {
                             purge_index_count += 1;
@@ -193,19 +192,19 @@ impl TransactionSystem {
     }
 
     #[inline]
-    async fn deallocate_gc_row_pages<P: BufferPool>(
+    async fn deallocate_gc_row_pages(
         &self,
-        buf_pool: &'static P,
+        mem_pool: &'static EvictableBufferPool,
         gc_row_pages: HashSet<PageID>,
     ) {
         for page_id in gc_row_pages {
-            let page_guard = buf_pool
+            let page_guard = mem_pool
                 .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
                 .unwrap();
-            buf_pool.deallocate_page(page_guard);
+            mem_pool.deallocate_page(page_guard);
         }
     }
 }
@@ -406,14 +405,14 @@ struct PurgeTask {
     log_no: usize,
     gc_no: usize,
     min_active_sts: TrxID,
-    signal: Sender<()>,
+    done: Sender<()>,
     gc_row_pages: Arc<Mutex<Vec<PageID>>>,
 }
 
 trait PurgeLoop {
-    async fn purge_loop<P: BufferPool>(
+    async fn purge_loop(
         &mut self,
-        buf_pool: &'static P,
+        mem_pool: &'static EvictableBufferPool,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -425,9 +424,9 @@ pub struct PurgeSingleThreaded;
 
 impl PurgeLoop for PurgeSingleThreaded {
     #[inline]
-    async fn purge_loop<P: BufferPool>(
+    async fn purge_loop(
         &mut self,
-        buf_pool: &'static P,
+        mem_pool: &'static EvictableBufferPool,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -447,20 +446,23 @@ impl PurgeLoop for PurgeSingleThreaded {
                     }
                     let curr_sts = trx_sys.calc_min_active_sts_for_gc();
                     if curr_sts > min_sts {
-                        // Start GC.
+                        // Start GC. Purge undo/index for all partitions first, then
+                        // deallocate retired row pages once to avoid cross-partition ordering issue.
+                        let mut gc_row_pages = HashSet::new();
                         for partition in &*trx_sys.log_partitions {
                             let mut trx_list = vec![];
                             for gc_bucket in &partition.gc_buckets {
                                 gc_bucket.get_purge_list(curr_sts, &mut trx_list);
                             }
                             let log_no = partition.log_no;
-                            let gc_row_pages = trx_sys
-                                .purge_trx_list(buf_pool, catalog, log_no, trx_list, curr_sts)
+                            let partition_gc_pages = trx_sys
+                                .purge_trx_list(catalog, log_no, trx_list, curr_sts)
                                 .await;
-                            trx_sys
-                                .deallocate_gc_row_pages(buf_pool, gc_row_pages)
-                                .await;
+                            gc_row_pages.extend(partition_gc_pages);
                         }
+                        trx_sys
+                            .deallocate_gc_row_pages(mem_pool, gc_row_pages)
+                            .await;
                     }
                     // Once GC is finished, update global_visible_sts so other threads can use it to
                     // speed up visibility check.
@@ -476,9 +478,9 @@ pub struct PurgeDispatcher(Vec<Sender<PurgeTask>>);
 
 impl PurgeLoop for PurgeDispatcher {
     #[inline]
-    async fn purge_loop<P: BufferPool>(
+    async fn purge_loop(
         &mut self,
-        buf_pool: &'static P,
+        mem_pool: &'static EvictableBufferPool,
         _catalog: &Catalog,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<Purge>,
@@ -499,7 +501,8 @@ impl PurgeLoop for PurgeDispatcher {
                     let curr_sts = trx_sys.calc_min_active_sts_for_gc();
                     if curr_sts > min_sts {
                         // dispatch tasks to executors
-                        let (signal, notify) = flume::unbounded();
+                        let (done_tx, done_rx) = flume::unbounded();
+                        let mut expected_tasks = 0usize;
                         let gc_row_pages = Arc::new(Mutex::new(vec![]));
                         for partition in &*trx_sys.log_partitions {
                             let log_no = partition.log_no;
@@ -508,22 +511,28 @@ impl PurgeLoop for PurgeDispatcher {
                                     log_no,
                                     gc_no,
                                     min_active_sts: curr_sts,
-                                    signal: signal.clone(),
+                                    done: done_tx.clone(),
                                     gc_row_pages: Arc::clone(&gc_row_pages),
                                 };
-                                let _ = self.0[dispatch_no % self.0.len()].send(task);
+                                if self.0[dispatch_no % self.0.len()].send(task).is_ok() {
+                                    expected_tasks += 1;
+                                }
                                 dispatch_no += 1;
                             }
                         }
-                        drop(signal);
-                        // wait for all executors finish their tasks.
-                        let _ = notify.recv_async().await;
+                        drop(done_tx);
+                        // wait for all executors to finish their tasks in this cycle.
+                        for _ in 0..expected_tasks {
+                            if done_rx.recv_async().await.is_err() {
+                                break 'DISPATCH_LOOP;
+                            }
+                        }
                         let gc_row_pages = {
                             let mut g = gc_row_pages.lock();
                             g.drain(..).collect::<HashSet<PageID>>()
                         };
                         trx_sys
-                            .deallocate_gc_row_pages(buf_pool, gc_row_pages)
+                            .deallocate_gc_row_pages(mem_pool, gc_row_pages)
                             .await;
 
                         // Once GC is finished, update global_visible_sts so other threads can use it to
@@ -545,9 +554,8 @@ pub struct PurgeExecutor;
 
 impl PurgeExecutor {
     #[inline]
-    async fn purge_task_loop<P: BufferPool>(
+    async fn purge_task_loop(
         &mut self,
-        buf_pool: &'static P,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
         purge_chan: Receiver<PurgeTask>,
@@ -556,7 +564,7 @@ impl PurgeExecutor {
             log_no,
             gc_no,
             min_active_sts,
-            signal,
+            done,
             gc_row_pages,
         }) = purge_chan.recv()
         {
@@ -565,12 +573,12 @@ impl PurgeExecutor {
             partition.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
             // actual purge here
             let gc_pages = trx_sys
-                .purge_trx_list(buf_pool, catalog, log_no, trx_list, min_active_sts)
+                .purge_trx_list(catalog, log_no, trx_list, min_active_sts)
                 .await;
             if !gc_pages.is_empty() {
                 gc_row_pages.lock().extend(gc_pages);
             }
-            drop(signal); // notify dispatcher
+            let _ = done.send(());
         }
     }
 }
@@ -689,13 +697,7 @@ mod tests {
 
             engine
                 .trx_sys
-                .purge_trx_list(
-                    engine.mem_pool,
-                    engine.catalog(),
-                    0,
-                    vec![trx],
-                    MAX_SNAPSHOT_TS,
-                )
+                .purge_trx_list(engine.catalog(), 0, vec![trx], MAX_SNAPSHOT_TS)
                 .await;
 
             match table.deletion_buffer().get(row_id) {
@@ -773,13 +775,7 @@ mod tests {
 
             engine
                 .trx_sys
-                .purge_trx_list(
-                    engine.mem_pool,
-                    engine.catalog(),
-                    0,
-                    vec![trx],
-                    MAX_SNAPSHOT_TS,
-                )
+                .purge_trx_list(engine.catalog(), 0, vec![trx], MAX_SNAPSHOT_TS)
                 .await;
 
             match table.deletion_buffer().get(row_id) {

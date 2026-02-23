@@ -1,6 +1,6 @@
 use crate::buffer::page::PageID;
 
-use crate::catalog::{SchemaID, TableID, TableSpec};
+use crate::catalog::{SchemaID, TableCache, TableID, TableSpec};
 use crate::row::RowID;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::table::{Table, TableAccess};
@@ -65,12 +65,13 @@ impl Statement {
         // rollback row data.
         // todo: group by page level may be better.
         let engine = self.trx.engine().unwrap();
+        let mut table_cache = TableCache::new(engine.catalog());
         self.row_undo
-            .rollback(engine.mem_pool, engine.catalog(), Some(self.trx.sts))
+            .rollback(&mut table_cache, Some(self.trx.sts))
             .await;
         // rollback index data.
         self.index_undo
-            .rollback(engine.mem_pool, engine.catalog(), self.trx.sts)
+            .rollback(&mut table_cache, self.trx.sts)
             .await;
         // clear redo logs.
         self.redo.clear();

@@ -1,5 +1,4 @@
-use crate::buffer::BufferPool;
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, TableCache};
 use crate::error::Result;
 use crate::lifetime::StaticLifetime;
 use crate::session::SessionState;
@@ -158,11 +157,7 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub async fn commit<P: BufferPool>(
-        &self,
-        trx: ActiveTrx,
-        buf_pool: &'static P,
-    ) -> Result<TrxID> {
+    pub async fn commit(&self, trx: ActiveTrx) -> Result<TrxID> {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_no];
@@ -180,7 +175,7 @@ impl TransactionSystem {
             // page-level undo maps.
             // In such case, we can just rollback this transaction because it actually
             // do nothing.
-            self.rollback_prepared(prepared_trx, buf_pool).await;
+            self.rollback_prepared(prepared_trx).await;
             return Ok(0);
         }
         // start group commit
@@ -203,13 +198,10 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub async fn rollback<P: BufferPool>(&self, mut trx: ActiveTrx, buf_pool: &'static P) {
-        trx.index_undo
-            .rollback(buf_pool, &self.catalog, trx.sts)
-            .await;
-        trx.row_undo
-            .rollback(buf_pool, &self.catalog, Some(trx.sts))
-            .await;
+    pub async fn rollback(&self, mut trx: ActiveTrx) {
+        let mut table_cache = TableCache::new(&self.catalog);
+        trx.index_undo.rollback(&mut table_cache, trx.sts).await;
+        trx.row_undo.rollback(&mut table_cache, Some(trx.sts)).await;
         trx.redo.clear();
         trx.gc_row_pages.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
@@ -223,17 +215,15 @@ impl TransactionSystem {
     /// In such case, we do not need to go through entire commit process but just
     /// rollback the transaction, because it actually do nothing.
     #[inline]
-    async fn rollback_prepared<P: BufferPool>(&self, mut trx: PreparedTrx, buf_pool: &'static P) {
+    async fn rollback_prepared(&self, mut trx: PreparedTrx) {
         debug_assert!(trx.redo_bin.is_none());
         // Note: rollback can only happens to user transaction, so payload is always non-empty.
         let mut payload = trx.payload.take().unwrap();
-        payload
-            .row_undo
-            .rollback(buf_pool, &self.catalog, trx.sts)
-            .await;
+        let mut table_cache = TableCache::new(&self.catalog);
+        payload.row_undo.rollback(&mut table_cache, trx.sts).await;
         payload
             .index_undo
-            .rollback(buf_pool, &self.catalog, payload.sts)
+            .rollback(&mut table_cache, payload.sts)
             .await;
         trx.redo_bin.take();
         self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
