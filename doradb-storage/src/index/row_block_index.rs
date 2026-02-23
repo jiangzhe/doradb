@@ -963,3 +963,320 @@ impl RowBlockIndexMemCursor<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::EvictableBufferPoolConfig;
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::engine::EngineConfig;
+    use crate::latch::LatchFallbackMode;
+    use crate::lifetime::StaticLifetimeScope;
+    use crate::trx::sys_conf::TrxSysConfig;
+    use crate::value::ValKind;
+    use semistr::SemiStr;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_row_block_index_free_list_shared() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_row_blk_idx")
+                        .skip_recovery(true),
+                )
+                .build()
+                .await
+                .unwrap();
+            {
+                let blk_idx = RowBlockIndex::new(engine.meta_pool, 101, make_test_metadata()).await;
+                let p1 = blk_idx.get_insert_page(engine.mem_pool, 100).await;
+                let pid1 = p1.page_id();
+                let p1 = p1.downgrade().exclusive_async().await;
+                blk_idx.cache_exclusive_insert_page(p1);
+                assert_eq!(blk_idx.insert_free_list.lock().len(), 1);
+                let p2 = blk_idx.get_insert_page(engine.mem_pool, 100).await;
+                assert_eq!(pid1, p2.page_id());
+                assert!(blk_idx.insert_free_list.lock().is_empty());
+            }
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_row_block_index_free_list_exclusive() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_row_blk_idx")
+                        .skip_recovery(true),
+                )
+                .build()
+                .await
+                .unwrap();
+            {
+                let blk_idx = RowBlockIndex::new(engine.meta_pool, 102, make_test_metadata()).await;
+                let p1 = blk_idx
+                    .get_insert_page_exclusive(engine.mem_pool, 100)
+                    .await;
+                let pid1 = p1.page_id();
+                blk_idx.cache_exclusive_insert_page(p1);
+                assert_eq!(blk_idx.insert_free_list.lock().len(), 1);
+                let p2 = blk_idx
+                    .get_insert_page_exclusive(engine.mem_pool, 100)
+                    .await;
+                assert_eq!(pid1, p2.page_id());
+                assert!(blk_idx.insert_free_list.lock().is_empty());
+            }
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_row_block_index_cursor_shared() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let row_pages = 1024usize;
+            // 1024 row pages ~= 64MB.
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(100usize * 1024 * 1024)
+                        .max_file_size(1usize * 1024 * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_row_blk_idx")
+                        .skip_recovery(true),
+                )
+                .build()
+                .await
+                .unwrap();
+            {
+                let blk_idx = RowBlockIndex::new(engine.meta_pool, 103, make_test_metadata()).await;
+                for _ in 0..row_pages {
+                    let _ = blk_idx.get_insert_page(engine.mem_pool, 100).await;
+                }
+                let mut count = 0usize;
+                let mut cursor = blk_idx.mem_cursor();
+                cursor.seek(0).await;
+                while let Some(res) = cursor.next().await {
+                    count += 1;
+                    let g = res.try_into_shared().unwrap();
+                    assert!(g.page().is_leaf());
+                }
+                let row_pages_per_leaf = NBR_PAGE_ENTRIES_IN_LEAF;
+                assert_eq!(count, row_pages.div_ceil(row_pages_per_leaf));
+            }
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_row_block_index_cursor_two_level_tree() {
+        smol::block_on(async {
+            let scope = StaticLifetimeScope::new();
+            let pool = scope
+                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
+            let blk_idx = RowBlockIndex::new(pool, 1, make_test_metadata()).await;
+
+            let overflow_entries = 3usize;
+            let row_pages = NBR_PAGE_ENTRIES_IN_LEAF + overflow_entries;
+            for row_page_id in 0..row_pages {
+                loop {
+                    if let Valid(_) = blk_idx.insert_row_page(1, row_page_id as PageID).await {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(blk_idx.height(), 1);
+
+            let mut root_leaf_page_ids = vec![];
+            {
+                let root = pool
+                    .get_page_spin::<BlockNode>(blk_idx.root_page_id())
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
+                let page = root.page();
+                assert!(page.is_branch());
+                assert_eq!(page.branch_entries().len(), 2);
+                root_leaf_page_ids.extend(page.branch_entries().iter().map(|e| e.page_id));
+            }
+
+            let mut cursor_leaf_page_ids = vec![];
+            let mut leaf_headers = vec![];
+            let mut cursor = blk_idx.mem_cursor();
+            cursor.seek(0).await;
+            while let Some(res) = cursor.next().await {
+                let g = res.try_into_shared().unwrap();
+                let node = g.page();
+                assert!(node.is_leaf());
+                cursor_leaf_page_ids.push(g.page_id());
+                leaf_headers.push((
+                    node.header.start_row_id,
+                    node.header.end_row_id,
+                    node.header.count as usize,
+                ));
+            }
+
+            assert_eq!(leaf_headers.len(), 2);
+            assert_eq!(leaf_headers[0].0, 0);
+            assert_eq!(leaf_headers[0].2, NBR_PAGE_ENTRIES_IN_LEAF);
+            assert_eq!(leaf_headers[1].0, leaf_headers[0].1);
+            assert_eq!(leaf_headers[1].1, row_pages as RowID);
+            assert_eq!(leaf_headers[1].2, overflow_entries);
+            assert_eq!(cursor_leaf_page_ids, root_leaf_page_ids);
+            assert!(cursor.next().await.is_none());
+        })
+    }
+
+    #[test]
+    fn test_row_block_index_search() {
+        smol::block_on(async {
+            let scope = StaticLifetimeScope::new();
+            let pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(512usize * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
+            let blk_idx = RowBlockIndex::new(pool, 1, make_test_metadata()).await;
+            let row_pages = 5000usize;
+            let rows_per_page = 100usize;
+            for i in 0..row_pages {
+                loop {
+                    if let Valid(_) = blk_idx
+                        .insert_row_page(rows_per_page as u64, i as PageID)
+                        .await
+                    {
+                        break;
+                    }
+                }
+            }
+            for i in 0..row_pages {
+                let row_id = (i * rows_per_page + rows_per_page / 2) as RowID;
+                match blk_idx.find_row(row_id).await {
+                    RowLocation::RowPage(page_id) => assert_eq!(page_id, i as PageID),
+                    _ => panic!("invalid search result for i={i}"),
+                }
+            }
+            assert!(matches!(
+                blk_idx.find_row((row_pages * rows_per_page) as RowID).await,
+                RowLocation::NotFound
+            ));
+        })
+    }
+
+    #[test]
+    fn test_row_block_index_split() {
+        smol::block_on(async {
+            let scope = StaticLifetimeScope::new();
+            let pool = scope
+                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = pool.as_static();
+            let blk_idx = RowBlockIndex::new(pool, 1, make_test_metadata()).await;
+            assert!(!blk_idx.is_page_committer_enabled());
+            assert_eq!(blk_idx.height(), 0);
+
+            for row_page_id in 0..10000 {
+                loop {
+                    if let Valid(_) = blk_idx.insert_row_page(100, row_page_id).await {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(blk_idx.height(), 1);
+
+            let mut root = pool
+                .get_page::<BlockNode>(blk_idx.root_page_id(), LatchFallbackMode::Exclusive)
+                .await
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            // Mark root as full to trigger root split.
+            root.page_mut().header.count = NBR_ENTRIES_IN_BRANCH as u32;
+
+            // Assign right-most leaf node.
+            let mut r_g = pool.allocate_page::<BlockNode>().await;
+            r_g.page_mut().init(0, 50000, 10000, 10001);
+            r_g.page_mut().header.count = NBR_PAGE_ENTRIES_IN_LEAF as u32;
+            let r_page_id = r_g.page_id();
+            drop(r_g);
+            root.page_mut().branch_last_entry_mut().row_id = 50000;
+            root.page_mut().branch_last_entry_mut().page_id = r_page_id;
+            drop(root);
+
+            loop {
+                if let Valid(_) = blk_idx.insert_row_page(100, 20000).await {
+                    break;
+                }
+            }
+            assert_eq!(blk_idx.height(), 2);
+        })
+    }
+
+    #[test]
+    fn test_row_block_index_enable_page_committer() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("redo_row_blk_idx")
+                        .skip_recovery(true),
+                )
+                .build()
+                .await
+                .unwrap();
+            {
+                let blk_idx = RowBlockIndex::new(engine.meta_pool, 104, make_test_metadata()).await;
+                assert!(!blk_idx.is_page_committer_enabled());
+                blk_idx.enable_page_committer(engine.trx_sys);
+                assert!(blk_idx.is_page_committer_enabled());
+                let _ = blk_idx.get_insert_page(engine.mem_pool, 100).await;
+            }
+            drop(engine);
+        })
+    }
+
+    fn first_i32_unique_index() -> IndexSpec {
+        IndexSpec::new("idx_id", vec![IndexKey::new(0)], IndexAttributes::UK)
+    }
+
+    fn make_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("id"),
+                column_type: ValKind::I32,
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![first_i32_unique_index()],
+        ))
+    }
+}

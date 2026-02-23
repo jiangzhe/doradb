@@ -143,4 +143,25 @@ mod tests {
         assert_eq!(root.try_column(10), Some((1000, 77)));
         assert_eq!(root.try_column(1000), None);
     }
+
+    #[test]
+    fn test_root_update_column_root() {
+        smol::block_on(async {
+            let root = BlockIndexRoot::new(1000, 77);
+            root.update_column_root(2000, 88).await;
+
+            match root.guide(1999) {
+                BlockIndexRoute::Column {
+                    pivot_row_id,
+                    root_page_id,
+                } => {
+                    assert_eq!(pivot_row_id, 2000);
+                    assert_eq!(root_page_id, 88);
+                }
+                BlockIndexRoute::Row => panic!("unexpected row route"),
+            }
+            assert_eq!(root.try_column(10), Some((2000, 88)));
+            assert_eq!(root.try_column(2000), None);
+        });
+    }
 }
