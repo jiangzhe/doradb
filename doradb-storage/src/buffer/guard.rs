@@ -402,6 +402,12 @@ impl<T: 'static> FacadePageGuard<T> {
     ///
     /// This helper keeps optimistic access scoped to a closure and only returns
     /// owned/copied data (`R` cannot borrow from page because of HRTB).
+    ///
+    /// Note that validation happens after `f` returns. For optimistic guards,
+    /// `f` may observe transient intermediate state if a concurrent writer
+    /// acquires exclusive latch during the closure. Callers must treat such
+    /// inconsistent observations as retryable by returning `Validation::Invalid`
+    /// from inside `R` when needed.
     #[inline]
     pub fn with_page_ref_validated<R, F>(&self, f: F) -> Validation<R>
     where
