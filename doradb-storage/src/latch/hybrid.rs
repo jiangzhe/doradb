@@ -112,6 +112,24 @@ impl HybridLatch {
         HybridGuard::new(self, GuardState::Optimistic, ver)
     }
 
+    /// Reads data under optimistic mode and retries until version validates.
+    ///
+    /// The callback may be invoked multiple times. It must be side-effect free
+    /// and should return owned/copied data instead of references.
+    #[inline]
+    pub fn optimistic_read<R, F>(&self, mut read: F) -> R
+    where
+        F: FnMut() -> R,
+    {
+        loop {
+            let g = self.optimistic_spin();
+            let out = read();
+            if g.validate() {
+                return out;
+            }
+        }
+    }
+
     /// Try to acquire an optimistic lock.
     /// Fail if the lock is exclusive locked.
     #[inline]
@@ -489,6 +507,8 @@ mod tests {
             let opt_g1 = latch.optimistic_spin();
             assert!(opt_g1.validate());
             drop(opt_g1);
+            let read = latch.optimistic_read(|| 123usize);
+            assert_eq!(read, 123);
             // optimistic or shared
             let opt_g2 = latch.optimistic_or_shared().await;
             assert!(opt_g2.validate());

@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::latch::{HybridGuard, HybridLatch};
+use crate::latch::HybridLatch;
 use crate::row::RowID;
 use std::cell::UnsafeCell;
 
@@ -47,22 +47,14 @@ impl BlockIndexRoot {
     /// Guides one row-id lookup to row-store or column-store path.
     #[inline]
     pub fn guide(&self, row_id: RowID) -> BlockIndexRoute {
-        loop {
-            let g = self.optimistic_guard();
-            let pivot_row_id = self.pivot_row_id_value();
-            if row_id < pivot_row_id {
-                let root_page_id = self.column_root_page_id_value();
-                if g.validate() {
-                    return BlockIndexRoute::Column {
-                        pivot_row_id,
-                        root_page_id,
-                    };
-                }
-                continue;
+        let (pivot_row_id, root_page_id) = self.snapshot();
+        if row_id < pivot_row_id {
+            BlockIndexRoute::Column {
+                pivot_row_id,
+                root_page_id,
             }
-            if g.validate() {
-                return BlockIndexRoute::Row;
-            }
+        } else {
+            BlockIndexRoute::Row
         }
     }
 
@@ -71,18 +63,8 @@ impl BlockIndexRoot {
     /// This is used as a fallback path when row-store lookup misses.
     #[inline]
     pub fn try_column(&self, row_id: RowID) -> Option<(RowID, PageID)> {
-        loop {
-            let g = self.optimistic_guard();
-            let pivot_row_id = self.pivot_row_id_value();
-            if row_id < pivot_row_id {
-                let root_page_id = self.column_root_page_id_value();
-                if g.validate() {
-                    return Some((pivot_row_id, root_page_id));
-                }
-                continue;
-            }
-            return None;
-        }
+        let (pivot_row_id, root_page_id) = self.snapshot();
+        (row_id < pivot_row_id).then_some((pivot_row_id, root_page_id))
     }
 
     /// Atomically updates pivot row id and column root page id.
@@ -99,20 +81,12 @@ impl BlockIndexRoot {
     }
 
     #[inline]
-    fn optimistic_guard(&self) -> HybridGuard<'_> {
-        self.latch.optimistic_spin()
-    }
-
-    #[inline]
-    fn pivot_row_id_value(&self) -> RowID {
-        // SAFETY: reads validated by optimistic latch version checks.
-        unsafe { *self.pivot_row_id.get() }
-    }
-
-    #[inline]
-    fn column_root_page_id_value(&self) -> PageID {
-        // SAFETY: reads validated by optimistic latch version checks.
-        unsafe { *self.column_root_page_id.get() }
+    fn snapshot(&self) -> (RowID, PageID) {
+        self.latch.optimistic_read(|| {
+            // SAFETY: values are read under optimistic latch and validated
+            // before being returned from `optimistic_read`.
+            unsafe { (*self.pivot_row_id.get(), *self.column_root_page_id.get()) }
+        })
     }
 }
 
