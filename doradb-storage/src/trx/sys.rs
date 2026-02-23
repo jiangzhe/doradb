@@ -1,4 +1,3 @@
-use crate::buffer::BufferPool;
 use crate::catalog::{Catalog, TableCache};
 use crate::error::Result;
 use crate::lifetime::StaticLifetime;
@@ -158,11 +157,7 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub async fn commit<P: BufferPool>(
-        &self,
-        trx: ActiveTrx,
-        _buf_pool: &'static P,
-    ) -> Result<TrxID> {
+    pub async fn commit(&self, trx: ActiveTrx) -> Result<TrxID> {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_no];

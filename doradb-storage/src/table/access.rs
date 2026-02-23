@@ -699,7 +699,7 @@ impl TableAccess for Table {
         drop(old_root);
 
         // Step 7: commit the checkpoint transaction to get CTS.
-        let _cts = match trx_sys.commit(trx, self.mem_pool).await {
+        let _cts = match trx_sys.commit(trx).await {
             Ok(cts) => cts,
             Err(err) => return Err(err),
         };
