@@ -915,52 +915,6 @@ impl<T> AIOEventLoop<T> {
     }
 }
 
-/// mlock.
-///
-/// # Safety
-///
-/// Wrapper of mlock.
-#[cfg(feature = "mlock")]
-#[inline]
-pub unsafe fn mlock(ptr: *mut u8, len: usize) -> bool {
-    let res = libc::mlock(ptr as *const libc::c_void, len);
-    res == 0
-}
-
-/// mlock.
-///
-/// # Safety
-///
-/// Wrapper of mlock.
-#[cfg(not(feature = "mlock"))]
-#[inline]
-pub unsafe fn mlock(_ptr: *mut u8, _len: usize) -> bool {
-    true
-}
-
-/// munlock.
-///
-/// # Safety
-///
-/// Wrapper of munlock.
-#[cfg(feature = "mlock")]
-#[inline]
-pub unsafe fn munlock(ptr: *mut u8, len: usize) -> bool {
-    let res = libc::munlock(ptr as *const libc::c_void, len);
-    res == 0
-}
-
-/// munlock.
-///
-/// # Safety
-///
-/// Wrapper of munlock.
-#[cfg(not(feature = "mlock"))]
-#[inline]
-pub unsafe fn munlock(_ptr: *mut u8, _len: usize) -> bool {
-    true
-}
-
 #[inline]
 pub fn pread<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
     const PRIORITY: u16 = 0;

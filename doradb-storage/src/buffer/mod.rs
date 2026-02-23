@@ -8,7 +8,7 @@ mod readonly;
 mod util;
 
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
-pub use evictor::EvictionTuning;
+pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
 pub use readonly::{GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey};
 

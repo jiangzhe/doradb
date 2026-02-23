@@ -54,7 +54,7 @@ Key components:
 
 ### Eviction Strategy
 
-Eviction behavior is controlled by shared `EvictionTuning`:
+Eviction behavior is controlled by shared `EvictionArbiter`:
 
 1. `target_free`
 2. `hysteresis`

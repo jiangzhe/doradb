@@ -1,127 +1,414 @@
+use crate::buffer::frame::{BufferFrames, FrameKind};
+use crate::buffer::guard::PageExclusiveGuard;
+use crate::buffer::page::{Page, PageID};
+use crate::thread;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::ops::{Range, RangeFrom, RangeTo};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-/// Shared eviction tuning for evictable and readonly buffer pools.
+const EVICT_WAIT_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_TARGET_FREE_RATIO: f64 = 0.10;
+const DEFAULT_HYSTERESIS_RATIO: f64 = 0.30;
+
+/// Shared clock hand state for clock-sweep eviction.
+#[derive(Debug, Clone)]
+pub(super) enum ClockHand {
+    From(RangeFrom<PageID>),
+    FromTo(RangeFrom<PageID>, RangeTo<PageID>),
+    To(RangeTo<PageID>),
+    Between(Range<PageID>),
+}
+
+impl Default for ClockHand {
+    #[inline]
+    fn default() -> Self {
+        ClockHand::From(0..)
+    }
+}
+
+impl ClockHand {
+    /// Resets the hand and preserves sweep locality.
+    #[inline]
+    pub(super) fn reset(&mut self) {
+        let start = self.start();
+        if start == 0 {
+            *self = ClockHand::default()
+        } else {
+            *self = ClockHand::FromTo(start.., ..start)
+        }
+    }
+
+    #[inline]
+    fn start(&self) -> PageID {
+        match self {
+            ClockHand::Between(between) => between.start,
+            ClockHand::From(from) => from.start,
+            ClockHand::To(_) => 0,
+            ClockHand::FromTo(from, _) => from.start,
+        }
+    }
+}
+
+/// Iterates the ordered resident-set according to clock-hand position.
+///
+/// The callback returns true to stop scanning and preserve next hand position.
+#[inline]
+pub(super) fn clock_collect<F>(
+    set: &BTreeSet<PageID>,
+    clock_hand: ClockHand,
+    mut callback: F,
+) -> Option<ClockHand>
+where
+    F: FnMut(PageID) -> bool,
+{
+    match clock_hand {
+        ClockHand::From(from) => {
+            let mut range = set.range(from);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::From(*page_id..));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::FromTo(from, to) => {
+            let mut range = set.range(from);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::FromTo(*page_id.., to));
+                    }
+                    return Some(ClockHand::To(to));
+                }
+            }
+            range = set.range(to);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..to.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::To(to) => {
+            let mut range = set.range(to);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..to.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::Between(between) => {
+            let mut range = set.range(between.clone());
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..between.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Applies one clock-sweep step and returns a page guard when a frame
+/// is selected for eviction.
+#[inline]
+pub(super) fn clock_sweep_candidate(
+    frames: &BufferFrames,
+    page_id: PageID,
+) -> Option<PageExclusiveGuard<Page>> {
+    match frames.frame_kind(page_id) {
+        FrameKind::Uninitialized | FrameKind::Fixed | FrameKind::Evicting | FrameKind::Evicted => {
+            None
+        }
+        FrameKind::Cool => {
+            if let Some(page_guard) = frames.try_lock_page_exclusive(page_id) {
+                if page_guard
+                    .bf()
+                    .compare_exchange_kind(FrameKind::Cool, FrameKind::Evicting)
+                    != FrameKind::Cool
+                {
+                    return None;
+                }
+                return Some(page_guard);
+            }
+            None
+        }
+        FrameKind::Hot => {
+            let _ = frames.compare_exchange_frame_kind(page_id, FrameKind::Hot, FrameKind::Cool);
+            None
+        }
+    }
+}
+
+/// Eviction arbiter shared by evictable and readonly buffer pools.
 ///
 /// Semantics:
 /// - trigger eviction when `free_frames < target_free` OR failure-rate reaches threshold;
 /// - stop when `free_frames >= target_free + hysteresis` AND failure-rate recovers;
 /// - choose dynamic batch size within `[min_batch, max_batch]`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct EvictionTuning {
-    /// Target number of free frames to keep available.
-    ///
-    /// `0` means "derive from capacity" (10% of capacity, at least 1).
-    pub target_free: usize,
-    /// Extra free-frame margin required to stop active eviction.
-    ///
-    /// `0` means "derive from target_free" (`target_free / 2`, at least 1).
-    pub hysteresis: usize,
-    /// Allocation failure-rate threshold in range `[0.0, 1.0]`.
-    pub failure_rate_threshold: f64,
-    /// Sliding window size used by failure-rate tracking.
-    pub failure_window: usize,
-    /// Minimum eviction batch size when eviction is triggered.
-    pub min_batch: usize,
-    /// Maximum eviction batch size.
-    pub max_batch: usize,
+pub struct EvictionArbiter {
+    target_free: usize,
+    hysteresis: usize,
+    failure_rate_threshold: f64,
+    failure_window: usize,
+    min_batch: usize,
+    max_batch: usize,
 }
 
-impl Default for EvictionTuning {
+impl EvictionArbiter {
+    #[inline]
+    pub fn builder() -> EvictionArbiterBuilder {
+        EvictionArbiterBuilder::default()
+    }
+
+    #[inline]
+    pub fn failure_window(&self) -> usize {
+        self.failure_window
+    }
+
+    #[inline]
+    pub fn target_free(&self) -> usize {
+        self.target_free
+    }
+
+    #[inline]
+    pub fn hysteresis(&self) -> usize {
+        self.hysteresis
+    }
+
+    /// Shared pressure-delta + hysteresis eviction decision.
+    #[inline]
+    pub fn decide(
+        &self,
+        resident: usize,
+        capacity: usize,
+        inflight_evicts: usize,
+        failure_rate: f64,
+        min_resident: usize,
+    ) -> Option<EvictionDecision> {
+        // Keep a minimum resident floor so eviction cannot drain the pool below safety bounds.
+        if resident < min_resident {
+            return None;
+        }
+
+        // Compute free-frame pressure from the current residency snapshot.
+        let capacity = capacity.max(1);
+        let free_frames = capacity.saturating_sub(resident);
+
+        // Trigger eviction on either low free frames or sustained allocation failures.
+        let trigger_pressure = free_frames < self.target_free;
+        let trigger_failures = failure_rate >= self.failure_rate_threshold;
+        if !trigger_pressure && !trigger_failures {
+            return None;
+        }
+
+        // Stop once free frames recover past hysteresis and failure pressure subsides.
+        let stop_free = self.target_free.saturating_add(self.hysteresis);
+        let recovered = free_frames >= stop_free && failure_rate < self.failure_rate_threshold;
+        if recovered {
+            return None;
+        }
+
+        // Base batch is the distance to the stop target, with a configured minimum.
+        let delta = stop_free.saturating_sub(free_frames);
+        let mut batch = delta.max(self.min_batch);
+        if trigger_failures && self.failure_rate_threshold < 1.0 {
+            // Under high failure pressure, scale batch size toward max_batch.
+            let ratio = ((failure_rate - self.failure_rate_threshold)
+                / (1.0 - self.failure_rate_threshold))
+                .clamp(0.0, 1.0);
+            let span = self.max_batch.saturating_sub(self.min_batch);
+            let boosted = self.min_batch + ((span as f64) * ratio) as usize;
+            batch = batch.max(boosted);
+        }
+
+        // Enforce bounds and discount already in-flight evictions.
+        batch = batch.min(self.max_batch);
+        batch = batch.saturating_sub(inflight_evicts);
+        if batch == 0 {
+            return None;
+        }
+
+        // Emit a concrete batch decision for the evictor loop.
+        Some(EvictionDecision { batch_size: batch })
+    }
+}
+
+/// Builder for [`EvictionArbiter`].
+///
+/// If `target_free`/`hysteresis` are not explicitly set, they are derived from
+/// ratio fields and the runtime capacity passed to `build(capacity)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvictionArbiterBuilder {
+    target_free: Option<usize>,
+    target_free_ratio: f64,
+    hysteresis: Option<usize>,
+    hysteresis_ratio: f64,
+    failure_rate_threshold: f64,
+    failure_window: usize,
+    min_batch: usize,
+    max_batch: usize,
+}
+
+impl Default for EvictionArbiterBuilder {
     #[inline]
     fn default() -> Self {
-        EvictionTuning {
-            target_free: 0,
-            hysteresis: 0,
+        EvictionArbiterBuilder {
+            target_free: None,
+            target_free_ratio: DEFAULT_TARGET_FREE_RATIO,
+            hysteresis: None,
+            hysteresis_ratio: DEFAULT_HYSTERESIS_RATIO,
             failure_rate_threshold: 0.25,
-            failure_window: 1024,
+            failure_window: 256,
             min_batch: 8,
             max_batch: 64,
         }
     }
 }
 
-impl EvictionTuning {
+impl EvictionArbiterBuilder {
+    /// Creates a builder with default eviction settings.
     #[inline]
-    fn normalized(self, capacity: usize) -> Self {
-        let mut tuning = self;
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets an absolute free-frame target that triggers pressure eviction.
+    ///
+    /// If not set, `build()` derives it from `target_free_ratio * capacity`.
+    #[inline]
+    pub fn target_free(mut self, target_free: usize) -> Self {
+        self.target_free = Some(target_free);
+        self
+    }
+
+    /// Sets the free-frame target ratio used when `target_free` is unset.
+    ///
+    /// Values are normalized to `[0.0, 1.0]` during `build()`.
+    #[inline]
+    pub fn target_free_ratio(mut self, ratio: f64) -> Self {
+        self.target_free_ratio = ratio;
+        self
+    }
+
+    /// Sets an absolute hysteresis margin added to `target_free` for stop checks.
+    ///
+    /// If not set, `build()` derives it from `hysteresis_ratio * target_free`.
+    #[inline]
+    pub fn hysteresis(mut self, hysteresis: usize) -> Self {
+        self.hysteresis = Some(hysteresis);
+        self
+    }
+
+    /// Sets the hysteresis ratio used when `hysteresis` is unset.
+    ///
+    /// Values are normalized to `[0.0, 1.0]` during `build()`.
+    #[inline]
+    pub fn hysteresis_ratio(mut self, ratio: f64) -> Self {
+        self.hysteresis_ratio = ratio;
+        self
+    }
+
+    /// Sets allocation-failure threshold used to trigger/stop eviction.
+    ///
+    /// Values are normalized to `[0.0, 1.0]` during `build()`.
+    #[inline]
+    pub fn failure_rate_threshold(mut self, threshold: f64) -> Self {
+        self.failure_rate_threshold = threshold;
+        self
+    }
+
+    /// Sets sliding-window sample size for failure-rate tracking.
+    #[inline]
+    pub fn failure_window(mut self, window: usize) -> Self {
+        self.failure_window = window;
+        self
+    }
+
+    /// Sets minimum and maximum eviction batch size bounds.
+    #[inline]
+    pub fn dynamic_batch_bounds(mut self, min_batch: usize, max_batch: usize) -> Self {
+        self.min_batch = min_batch;
+        self.max_batch = max_batch;
+        self
+    }
+
+    /// Builds a normalized [`EvictionArbiter`] for a specific runtime capacity.
+    ///
+    /// This method clamps invalid values and fills unset fields from ratio-based defaults.
+    #[inline]
+    pub fn build(self, capacity: usize) -> EvictionArbiter {
         let capacity = capacity.max(1);
-        if tuning.target_free == 0 {
-            tuning.target_free = (capacity / 10).max(1);
+        let target_free_ratio = if self.target_free_ratio.is_finite() {
+            self.target_free_ratio.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_TARGET_FREE_RATIO
+        };
+        let mut target_free = self
+            .target_free
+            .unwrap_or(((capacity as f64) * target_free_ratio) as usize);
+        target_free = target_free.max(1).min(capacity);
+
+        let hysteresis_ratio = if self.hysteresis_ratio.is_finite() {
+            self.hysteresis_ratio.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_HYSTERESIS_RATIO
+        };
+        let mut hysteresis = self
+            .hysteresis
+            .unwrap_or(((target_free as f64) * hysteresis_ratio) as usize);
+        hysteresis = hysteresis.max(1);
+
+        let failure_window = self.failure_window.max(1);
+        let failure_rate_threshold = if self.failure_rate_threshold.is_finite() {
+            self.failure_rate_threshold.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        let min_batch = self.min_batch.max(1);
+        let mut max_batch = self.max_batch.max(1);
+        if max_batch < min_batch {
+            max_batch = min_batch;
         }
-        if tuning.hysteresis == 0 {
-            tuning.hysteresis = (tuning.target_free / 2).max(1);
+
+        EvictionArbiter {
+            target_free,
+            hysteresis,
+            failure_rate_threshold,
+            failure_window,
+            min_batch,
+            max_batch,
         }
-        if tuning.failure_window == 0 {
-            tuning.failure_window = 1;
-        }
-        if !tuning.failure_rate_threshold.is_finite() {
-            tuning.failure_rate_threshold = 1.0;
-        }
-        tuning.failure_rate_threshold = tuning.failure_rate_threshold.clamp(0.0, 1.0);
-        if tuning.min_batch == 0 {
-            tuning.min_batch = 1;
-        }
-        if tuning.max_batch == 0 {
-            tuning.max_batch = tuning.min_batch;
-        }
-        if tuning.max_batch < tuning.min_batch {
-            tuning.max_batch = tuning.min_batch;
-        }
-        tuning.target_free = tuning.target_free.min(capacity);
-        tuning
     }
 }
 
+/// Output of [`EvictionArbiter::decide`], consumed by the evictor loop.
+///
+/// `batch_size` is the number of resident pages the runtime should try to
+/// evict in the current pass.
 #[derive(Debug, Clone, Copy)]
 pub struct EvictionDecision {
     pub batch_size: usize,
-}
-
-/// Shared pressure-delta + hysteresis eviction decision.
-#[inline]
-pub fn decide_eviction(
-    resident: usize,
-    capacity: usize,
-    inflight_evicts: usize,
-    failure_rate: f64,
-    tuning: EvictionTuning,
-    min_resident: usize,
-) -> Option<EvictionDecision> {
-    if resident < min_resident {
-        return None;
-    }
-    let capacity = capacity.max(1);
-    let tuning = tuning.normalized(capacity);
-    let free_frames = capacity.saturating_sub(resident);
-    let trigger_pressure = free_frames < tuning.target_free;
-    let trigger_failures = failure_rate >= tuning.failure_rate_threshold;
-    if !trigger_pressure && !trigger_failures {
-        return None;
-    }
-
-    let stop_free = tuning.target_free.saturating_add(tuning.hysteresis);
-    let recovered = free_frames >= stop_free && failure_rate < tuning.failure_rate_threshold;
-    if recovered {
-        return None;
-    }
-
-    let delta = stop_free.saturating_sub(free_frames);
-    let mut batch = delta.max(tuning.min_batch);
-    if trigger_failures && tuning.failure_rate_threshold < 1.0 {
-        let ratio = ((failure_rate - tuning.failure_rate_threshold)
-            / (1.0 - tuning.failure_rate_threshold))
-            .clamp(0.0, 1.0);
-        let span = tuning.max_batch.saturating_sub(tuning.min_batch);
-        let boosted = tuning.min_batch + ((span as f64) * ratio) as usize;
-        batch = batch.max(boosted);
-    }
-    batch = batch.min(tuning.max_batch);
-    batch = batch.saturating_sub(inflight_evicts);
-    if batch == 0 {
-        return None;
-    }
-    Some(EvictionDecision { batch_size: batch })
 }
 
 struct FailureWindowState {
@@ -206,6 +493,177 @@ impl FailureRateTracker {
     }
 }
 
+/// Unified pool-specific eviction runtime.
+///
+/// Implemented by concrete buffer-pool runtimes to expose pressure state,
+/// candidate iteration/marking, and execution semantics.
+pub(super) trait EvictionRuntime {
+    fn resident_count(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn inflight_evicts(&self) -> usize;
+    fn allocation_failure_rate(&self) -> f64;
+    fn wait_for_work(&self, timeout: Duration);
+    fn notify_progress(&self);
+    fn collect_ids<F>(&self, hand: ClockHand, callback: F) -> Option<ClockHand>
+    where
+        F: FnMut(PageID) -> bool;
+    fn try_mark_evicting(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>>;
+    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>);
+    fn wait_execution_if_needed(&self);
+}
+
+/// Concrete pressure-delta + clock-sweep policy used by all pools.
+pub(super) struct PressureDeltaClockPolicy {
+    arbiter: EvictionArbiter,
+    min_resident: usize,
+    small_batch_threshold: usize,
+    clock_hand: ClockHand,
+    tmp_page_ids: Vec<PageID>,
+}
+
+impl PressureDeltaClockPolicy {
+    #[inline]
+    pub(super) fn new(arbiter: EvictionArbiter, min_resident: usize) -> Self {
+        PressureDeltaClockPolicy {
+            arbiter,
+            min_resident,
+            small_batch_threshold: 8,
+            clock_hand: ClockHand::default(),
+            tmp_page_ids: vec![],
+        }
+    }
+
+    #[inline]
+    fn decide_batch<T: EvictionRuntime>(&self, runtime: &T) -> Option<usize> {
+        self.arbiter
+            .decide(
+                runtime.resident_count(),
+                runtime.capacity(),
+                runtime.inflight_evicts(),
+                runtime.allocation_failure_rate(),
+                self.min_resident,
+            )
+            .map(|decision| decision.batch_size)
+    }
+
+    #[inline]
+    fn select_candidates<T: EvictionRuntime>(
+        &mut self,
+        runtime: &T,
+        target: usize,
+    ) -> Vec<PageExclusiveGuard<Page>> {
+        let mut batch_size = target;
+        let mut candidates = Vec::with_capacity(target);
+        let mut next_ch = None;
+        'SWEEP: for _ in 0..2 {
+            next_ch = Some(self.clock_hand.clone());
+            while let Some(ch) = next_ch.take() {
+                if batch_size <= self.small_batch_threshold {
+                    next_ch = runtime.collect_ids(ch, |page_id| {
+                        if let Some(page_guard) = runtime.try_mark_evicting(page_id) {
+                            candidates.push(page_guard);
+                            batch_size -= 1;
+                            return batch_size == 0;
+                        }
+                        false
+                    });
+                } else {
+                    self.tmp_page_ids.clear();
+                    next_ch = runtime.collect_ids(ch, |page_id| {
+                        self.tmp_page_ids.push(page_id);
+                        self.tmp_page_ids.len() == batch_size
+                    });
+                    for page_id in self.tmp_page_ids.drain(..) {
+                        if let Some(page_guard) = runtime.try_mark_evicting(page_id) {
+                            candidates.push(page_guard);
+                            batch_size -= 1;
+                        }
+                    }
+                }
+                if batch_size == 0 {
+                    break 'SWEEP;
+                }
+            }
+        }
+
+        if !candidates.is_empty() {
+            if let Some(mut ch) = next_ch {
+                ch.reset();
+                self.clock_hand = ch;
+            } else {
+                self.clock_hand.reset();
+            }
+        }
+        candidates
+    }
+}
+
+/// Generic eviction runner shared by mutable and readonly pools.
+pub(super) struct Evictor<T> {
+    runtime: T,
+    policy: PressureDeltaClockPolicy,
+    shutdown_flag: Arc<AtomicBool>,
+}
+
+impl<T> Evictor<T>
+where
+    T: EvictionRuntime + Send + 'static,
+{
+    #[inline]
+    pub(super) fn new(
+        runtime: T,
+        policy: PressureDeltaClockPolicy,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Self {
+        Evictor {
+            runtime,
+            policy,
+            shutdown_flag,
+        }
+    }
+
+    #[inline]
+    pub(super) fn start_thread(self, thread_name: &'static str) -> JoinHandle<()> {
+        thread::spawn_named(thread_name, move || self.run())
+    }
+
+    #[inline]
+    pub(super) fn run(mut self) {
+        loop {
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return;
+            }
+
+            let target = match self.policy.decide_batch(&self.runtime) {
+                Some(target) if target > 0 => target,
+                _ => {
+                    if self.shutdown_flag.load(Ordering::Acquire) {
+                        return;
+                    }
+                    self.runtime.wait_for_work(EVICT_WAIT_INTERVAL);
+                    continue;
+                }
+            };
+
+            let candidates = self.policy.select_candidates(&self.runtime, target);
+            if candidates.is_empty() {
+                if self.shutdown_flag.load(Ordering::Acquire) {
+                    return;
+                }
+                self.runtime.wait_for_work(EVICT_WAIT_INTERVAL);
+                continue;
+            }
+
+            self.runtime.execute(candidates);
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return;
+            }
+            self.runtime.wait_execution_if_needed();
+            self.runtime.notify_progress();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,42 +683,40 @@ mod tests {
     }
 
     #[test]
-    fn test_decide_eviction_pressure_delta_and_hysteresis() {
-        let tuning = EvictionTuning {
-            target_free: 10,
-            hysteresis: 4,
-            failure_rate_threshold: 0.3,
-            failure_window: 128,
-            min_batch: 4,
-            max_batch: 32,
-        };
+    fn test_arbiter_decide_pressure_delta_and_hysteresis() {
+        let arbiter = EvictionArbiterBuilder::new()
+            .target_free(10)
+            .hysteresis(4)
+            .failure_rate_threshold(0.3)
+            .failure_window(128)
+            .dynamic_batch_bounds(4, 32)
+            .build(100);
 
         // Triggered by low free frames.
-        let decision = decide_eviction(95, 100, 0, 0.0, tuning, 1).unwrap();
+        let decision = arbiter.decide(95, 100, 0, 0.0, 1).unwrap();
         assert!(decision.batch_size >= 9);
 
         // Stop condition satisfied.
-        let no_evict = decide_eviction(84, 100, 0, 0.0, tuning, 1);
+        let no_evict = arbiter.decide(84, 100, 0, 0.0, 1);
         assert!(no_evict.is_none());
     }
 
     #[test]
-    fn test_decide_eviction_failure_rate_trigger_and_dynamic_batch() {
-        let tuning = EvictionTuning {
-            target_free: 10,
-            hysteresis: 4,
-            failure_rate_threshold: 0.2,
-            failure_window: 128,
-            min_batch: 4,
-            max_batch: 40,
-        };
+    fn test_arbiter_decide_failure_rate_trigger_and_dynamic_batch() {
+        let arbiter = EvictionArbiterBuilder::new()
+            .target_free(10)
+            .hysteresis(4)
+            .failure_rate_threshold(0.2)
+            .failure_window(128)
+            .dynamic_batch_bounds(4, 40)
+            .build(100);
 
         // Plenty of free frames, but failure rate is high so eviction still triggers.
-        let decision = decide_eviction(50, 100, 0, 0.9, tuning, 1).unwrap();
+        let decision = arbiter.decide(50, 100, 0, 0.9, 1).unwrap();
         assert!(decision.batch_size >= 20);
 
         // Inflight evictions reduce effective batch.
-        let decision = decide_eviction(50, 100, 8, 0.9, tuning, 1).unwrap();
+        let decision = arbiter.decide(50, 100, 8, 0.9, 1).unwrap();
         assert!(decision.batch_size < 40);
     }
 }
