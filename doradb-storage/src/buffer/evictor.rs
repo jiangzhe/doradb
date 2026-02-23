@@ -222,7 +222,7 @@ impl EvictionArbiter {
         min_resident: usize,
     ) -> Option<EvictionDecision> {
         // Keep a minimum resident floor so eviction cannot drain the pool below safety bounds.
-        if resident < min_resident {
+        if resident <= min_resident {
             return None;
         }
 

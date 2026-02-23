@@ -102,82 +102,132 @@ impl EvictableBufferPool {
 
     /// Try to dispatch read IO on given page.
     /// This method may not succeed, and client should retry.
-    #[allow(clippy::await_holding_lock)]
     #[inline]
     async fn try_dispatch_io_read(&self, page_id: PageID) {
-        // Use sync lock because the critical section is small.
-        // make sure do not await when holding the guard.
-        let mut g = self.inflight_io.map.lock();
-        match g.entry(page_id) {
-            Entry::Vacant(vac) => {
-                // First thread to initialize IO read.
-                // Try lock page for IO.
-                match self.frames.try_lock_page_exclusive(page_id) {
-                    // If page lock can not be acquired, we just retry.
-                    None => (),
-                    Some(page_guard) => {
-                        // Page is locked, so we dispatch read request to IO thread.
-                        if !self.in_mem.try_inc() {
-                            self.in_mem.record_alloc_failure();
-                            // we do not have memory budget to load the page.
-                            listener!(self.in_mem.load_ev => listener);
-                            // re-check
+        enum DispatchAction {
+            RetryYield,
+            Wait(EventListener),
+            WaitForLoad(EventListener),
+            SendRead {
+                page_guard: PageExclusiveGuard<Page>,
+                done_listener: EventListener,
+            },
+        }
+
+        // Prepare state under lock, then perform async operations after lock release.
+        let action = {
+            let mut g = self.inflight_io.map.lock();
+            match g.entry(page_id) {
+                Entry::Vacant(vac) => {
+                    // First thread to initialize IO read.
+                    match self.frames.try_lock_page_exclusive(page_id) {
+                        // Retry path. Yield after lock release to avoid tight spin.
+                        None => DispatchAction::RetryYield,
+                        Some(page_guard) => {
+                            // Reserve one in-memory slot for this load.
                             if !self.in_mem.try_inc() {
-                                self.in_mem.record_alloc_failure();
-                                // still no budget.
-                                // we can only wait for signal and retry.
-                                // before waiting, notify evict thread to work.
-                                // this event may be ignored if evict thread is busy.
-                                self.in_mem.evict_ev.notify(1);
-                                // explicitly drop guards before await
-                                drop(page_guard);
-                                drop(g);
-                                listener.await;
-                                self.in_mem.load_ev.notify(1); // notify next reader to retry.
-                                return; // now retry.
+                                let listener = self.in_mem.load_ev.listen();
+                                if !self.in_mem.try_inc() {
+                                    self.in_mem.record_alloc_failure();
+                                    // Still no budget. Ask evictor to work and wait for progress.
+                                    self.in_mem.evict_ev.notify(1);
+                                    drop(page_guard);
+                                    DispatchAction::WaitForLoad(listener)
+                                } else {
+                                    self.in_mem.record_alloc_success();
+                                    let done = Event::new();
+                                    let done_listener = done.listen();
+                                    vac.insert(IOStatus {
+                                        kind: IOKind::Read,
+                                        done: Some(done),
+                                        page_guard: None,
+                                        uio: None,
+                                        batch_done: None,
+                                    });
+                                    self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
+                                    DispatchAction::SendRead {
+                                        page_guard,
+                                        done_listener,
+                                    }
+                                }
+                            } else {
+                                self.in_mem.record_alloc_success();
+                                let done = Event::new();
+                                let done_listener = done.listen();
+                                vac.insert(IOStatus {
+                                    kind: IOKind::Read,
+                                    done: Some(done),
+                                    page_guard: None,
+                                    uio: None,
+                                    batch_done: None,
+                                });
+                                self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
+                                DispatchAction::SendRead {
+                                    page_guard,
+                                    done_listener,
+                                }
                             }
-                            self.in_mem.record_alloc_success();
-                        } else {
-                            self.in_mem.record_alloc_success();
                         }
-                        // we have memory budget now.
-                        let event = Event::new();
-                        let listener = event.listen();
-                        vac.insert(IOStatus {
-                            kind: IOKind::Read,
-                            done: Some(event),
-                            page_guard: None, // will update later
-                            uio: None,
-                            batch_done: None,
-                        });
-                        self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
-                        let _ = self
-                            .io_client
-                            .send_async(PoolRequest::Read(page_guard))
-                            .await;
-                        drop(g); // explicitly drop guard before await
-                        listener.await;
                     }
+                }
+                Entry::Occupied(mut occ) => {
+                    let status = occ.get_mut();
+                    let done = status.done.get_or_insert_default();
+                    DispatchAction::Wait(done.listen())
                 }
             }
-            Entry::Occupied(mut occ) => {
-                let status = occ.get_mut();
-                match status.kind {
-                    IOKind::Read | IOKind::ReadWaitForWrite => {
-                        // Wait for existing signal.
-                        let listener = status.done.as_ref().unwrap().listen();
-                        drop(g); // explicitly drop guard before await
-                        listener.await;
+        };
+
+        match action {
+            DispatchAction::RetryYield => {
+                smol::future::yield_now().await;
+            }
+            DispatchAction::Wait(listener) => {
+                listener.await;
+            }
+            DispatchAction::WaitForLoad(listener) => {
+                listener.await;
+                self.in_mem.load_ev.notify(1);
+            }
+            DispatchAction::SendRead {
+                page_guard,
+                done_listener,
+            } => {
+                if let Err(send_err) = self
+                    .io_client
+                    .send_async(PoolRequest::Read(page_guard))
+                    .await
+                {
+                    let failed_req = send_err.0;
+                    let PoolRequest::Read(failed_page_guard) = failed_req else {
+                        unreachable!("unexpected request kind on read-dispatch failure");
+                    };
+                    drop(failed_page_guard);
+
+                    let done = {
+                        let mut g = self.inflight_io.map.lock();
+                        let mut status = g.remove(&page_id).unwrap_or_else(|| {
+                            panic!(
+                                "inflight read entry missing during send rollback: page_id={}",
+                                page_id
+                            )
+                        });
+                        debug_assert!(status.kind == IOKind::Read);
+                        self.inflight_io.reads.fetch_sub(1, Ordering::AcqRel);
+                        // Release memory reservation taken before dispatch.
+                        self.in_mem.dec();
+                        status.done.take()
+                    };
+                    if let Some(done) = done {
+                        done.notify(usize::MAX);
                     }
-                    IOKind::Write => {
-                        // Write IO in progress
-                        let event = Event::new();
-                        let listener = event.listen();
-                        status.done = Some(event);
-                        drop(g); // explicitly drop guard before await
-                        listener.await;
-                    }
+                    self.in_mem.load_ev.notify(1);
+                    unreachable!(
+                        "failed to enqueue read IO request after inflight install; shutdown ordering is violated (page_id={})",
+                        page_id
+                    );
                 }
+                done_listener.await;
             }
         }
     }
@@ -208,7 +258,6 @@ impl EvictableBufferPool {
             self.in_mem.record_alloc_success();
             return;
         }
-        self.in_mem.record_alloc_failure();
         // Slow path. Wait for other to release memory.
         loop {
             listener!(self.in_mem.load_ev => listener);
