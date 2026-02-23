@@ -113,7 +113,7 @@ impl TransactionSystem {
             if let Some(row_undo) = trx.row_undo() {
                 purge_row_count += row_undo.len();
                 for undo in &**row_undo {
-                    let Some(table) = table_cache.get_table(undo.table_id).await else {
+                    let Some(table) = table_cache.get_table_ref(undo.table_id).await else {
                         continue;
                     };
                     let Some(page_id) = undo.page_id else {
@@ -158,7 +158,7 @@ impl TransactionSystem {
         for trx in &trx_list {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
-                    if let Some(table) = table_cache.get_table(ip.table_id).await {
+                    if let Some(table) = table_cache.get_table_ref(ip.table_id).await {
                         // todo: index should stored in index pool, instead of data pool.
                         if table.delete_index(&ip.key, ip.row_id, ip.unique).await {
                             purge_index_count += 1;

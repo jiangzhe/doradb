@@ -251,7 +251,8 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
         trx.commit().await.unwrap();
 
-        assert_eq!(sys.engine.disk_pool.allocated(), 0);
+        let allocated_after_route = sys.engine.disk_pool.allocated();
+        assert!(allocated_after_route >= 1);
 
         sys.new_trx_select(&mut session, &key, |vals| {
             assert_eq!(vals[0], Val::from(1i32));
@@ -259,7 +260,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         })
         .await;
         let allocated_after_first = sys.engine.disk_pool.allocated();
-        assert!(allocated_after_first >= 1);
+        assert!(allocated_after_first >= allocated_after_route);
 
         sys.new_trx_select(&mut session, &key, |vals| {
             assert_eq!(vals[0], Val::from(1i32));

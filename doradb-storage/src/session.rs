@@ -295,8 +295,9 @@ impl Session {
             engine.meta_pool,
             table_id,
             table_file.active_root().pivot_row_id,
-            table_file.active_root_ptr(),
+            table_file.active_root().column_block_index_root,
             Arc::clone(&table_file),
+            engine.disk_pool,
         )
         .await;
         let table = Table::new(

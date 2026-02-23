@@ -15,7 +15,8 @@ use crate::latch::RwLock;
 use crate::lifetime::StaticLifetime;
 use crate::table::Table;
 use crate::trx::sys::TransactionSystem;
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -182,8 +183,9 @@ impl Catalog {
                     self.storage.meta_pool,
                     table.table_id,
                     row_id_bound,
-                    table_file.active_root_ptr(),
+                    table_file.active_root().column_block_index_root,
                     Arc::clone(&table_file),
+                    global_disk_pool,
                 )
                 .await;
                 let table = Table::new(
@@ -238,7 +240,8 @@ impl CatalogCache {
 
 pub struct TableCache<'a> {
     catalog: &'a Catalog,
-    map: HashMap<TableID, Option<Table>>,
+    tables: HashMap<TableID, Table>,
+    missing: HashSet<TableID>,
 }
 
 impl<'a> TableCache<'a> {
@@ -246,17 +249,50 @@ impl<'a> TableCache<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
         TableCache {
             catalog,
-            map: HashMap::new(),
+            tables: HashMap::new(),
+            missing: HashSet::new(),
         }
     }
 
+    /// Returns cached table handle for given id.
+    ///
+    /// If table is not cached, this method loads it from catalog and caches
+    /// positive/negative lookup result.
     #[inline]
-    pub async fn get_table(&mut self, table_id: TableID) -> &Option<Table> {
-        if self.map.contains_key(&table_id) {
-            return &self.map[&table_id];
+    pub async fn get_table_ref(&mut self, table_id: TableID) -> Option<&Table> {
+        match self.tables.entry(table_id) {
+            Entry::Vacant(vac) => {
+                if self.missing.contains(&table_id) {
+                    return None;
+                }
+                match self.catalog.get_table(table_id).await {
+                    Some(table) => {
+                        let res = vac.insert(table);
+                        Some(&*res)
+                    }
+                    None => {
+                        let _ = self.missing.insert(table_id);
+                        None
+                    }
+                }
+            }
+            Entry::Occupied(occ) => {
+                let res = occ.into_mut();
+                Some(&*res)
+            }
         }
-        let table = self.catalog.get_table(table_id).await;
-        self.map.entry(table_id).or_insert(table)
+    }
+
+    /// Returns cached table handle and requires table to exist.
+    ///
+    /// This method is intended for rollback paths where table id in undo log
+    /// must always map to an existing table.
+    #[inline]
+    pub async fn must_get_table(&mut self, table_id: TableID) -> &Table {
+        match self.get_table_ref(table_id).await {
+            Some(table) => table,
+            None => panic!("table {table_id} not found in catalog"),
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::buffer::BufferPool;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{Catalog, TableID};
+use crate::catalog::{TableCache, TableID};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::row::{RowID, RowPage};
@@ -8,7 +8,6 @@ use crate::table::Table;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -108,50 +107,37 @@ impl RowUndoLogs {
     }
 
     #[inline]
-    pub async fn rollback<P: BufferPool>(
-        &mut self,
-        buf_pool: &'static P,
-        catalog: &Catalog,
-        sts: Option<TrxID>,
-    ) {
-        let mut table_cache: HashMap<TableID, (RowID, Table)> = HashMap::new();
+    pub async fn rollback(&mut self, table_cache: &mut TableCache<'_>, sts: Option<TrxID>) {
         while let Some(entry) = self.0.pop() {
-            let (pivot_row_id, table) = match table_cache.get(&entry.table_id) {
-                Some((pivot_row_id, table)) => (*pivot_row_id, table.clone()),
-                None => {
-                    let table = catalog
-                        .get_table(entry.table_id)
-                        .await
-                        .expect("table exists");
-                    let pivot_row_id = table.pivot_row_id();
-                    table_cache.insert(entry.table_id, (pivot_row_id, table.clone()));
-                    (pivot_row_id, table)
-                }
-            };
-            if entry.page_id.is_none() || entry.row_id < pivot_row_id {
-                table.deletion_buffer().remove(entry.row_id);
-                continue;
-            }
-            let Some(page_guard) = buf_pool
-                .try_get_page_versioned::<RowPage>(
-                    entry.page_id.unwrap(),
-                    LatchFallbackMode::Shared,
-                )
-                .await
-            else {
-                continue;
-            };
-            let Some(page_guard) = page_guard.lock_shared_async().await else {
-                continue;
-            };
-            let (ctx, page) = page_guard.ctx_and_page();
-            let metadata = &*ctx.row_ver().unwrap().metadata;
-            // TODO: we should retry or wait for notification if rollback happens on a page
-            // in transition state. This will be handled in a future task.
-            let row_idx = page.row_idx(entry.row_id);
-            let mut access = RowWriteAccess::new(page, ctx, row_idx, sts, false);
-            access.rollback_first_undo(metadata, entry);
+            let table = table_cache.must_get_table(entry.table_id).await;
+            Self::rollback_entry_in_table(entry, table, sts).await;
         }
+    }
+
+    #[inline]
+    async fn rollback_entry_in_table(entry: OwnedRowUndo, table: &Table, sts: Option<TrxID>) {
+        let pivot_row_id = table.pivot_row_id();
+        if entry.page_id.is_none() || entry.row_id < pivot_row_id {
+            table.deletion_buffer().remove(entry.row_id);
+            return;
+        }
+        let Some(page_guard) = table
+            .mem_pool
+            .try_get_page_versioned::<RowPage>(entry.page_id.unwrap(), LatchFallbackMode::Shared)
+            .await
+        else {
+            return;
+        };
+        let Some(page_guard) = page_guard.lock_shared_async().await else {
+            return;
+        };
+        let (ctx, page) = page_guard.ctx_and_page();
+        let metadata = &*ctx.row_ver().unwrap().metadata;
+        // TODO: we should retry or wait for notification if rollback happens on a page
+        // in transition state. This will be handled in a future task.
+        let row_idx = page.row_idx(entry.row_id);
+        let mut access = RowWriteAccess::new(page, ctx, row_idx, sts, false);
+        access.rollback_first_undo(metadata, entry);
     }
 }
 

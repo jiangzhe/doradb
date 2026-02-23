@@ -1,10 +1,11 @@
 use crate::buffer::BufferPool;
-use crate::catalog::{Catalog, TableID};
+use crate::catalog::{TableCache, TableID};
 use crate::index::util::Maskable;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage, RowRead};
+use crate::table::Table;
 use crate::trx::TrxID;
 use crate::trx::row::RowReadAccess;
 
@@ -42,54 +43,54 @@ impl IndexUndoLogs {
     /// because other transaction can not update the same index entry
     /// concurrently.
     #[inline]
-    pub async fn rollback<P: BufferPool>(
-        &mut self,
-        data_pool: &'static P,
-        catalog: &Catalog,
-        ts: TrxID,
-    ) {
+    pub async fn rollback(&mut self, table_cache: &mut TableCache<'_>, ts: TrxID) {
         while let Some(entry) = self.0.pop() {
-            let table = catalog.get_table(entry.table_id).await.unwrap();
-            match entry.kind {
-                IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
+            let table = table_cache.must_get_table(entry.table_id).await;
+            Self::rollback_entry_in_table(entry, table, ts).await;
+        }
+    }
+
+    #[inline]
+    async fn rollback_entry_in_table(entry: IndexUndo, table: &Table, ts: TrxID) {
+        match entry.kind {
+            IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
+                let index = table.sec_idx[key.index_no].unique().unwrap();
+                if merge_old_deleted {
+                    // this is actually a update from deleted to non-deleted.
+                    // so we just mask it back to deleted.
+                    let res = index.mask_as_deleted(&key.vals, entry.row_id, ts).await;
+                    assert!(res);
+                } else {
+                    let res = index
+                        .compare_delete(&key.vals, entry.row_id, true, ts)
+                        .await;
+                    assert!(res);
+                }
+            }
+            IndexUndoKind::InsertNonUnique(key, merge_old_deleted) => {
+                let index = table.sec_idx[key.index_no].non_unique().unwrap();
+                if merge_old_deleted {
+                    let res = index.mask_as_deleted(&key.vals, entry.row_id, ts).await;
+                    assert!(res);
+                } else {
+                    let res = index
+                        .compare_delete(&key.vals, entry.row_id, true, ts)
+                        .await;
+                    assert!(res);
+                }
+            }
+            IndexUndoKind::UpdateUnique(key, old_row_id, deleted) => {
+                if !deleted {
+                    // The version of previous row is not deleted, means current transaction
+                    // must own the lock of old row.
+                    // So directly rollback index should be fine.
+                    let new_row_id = entry.row_id;
                     let index = table.sec_idx[key.index_no].unique().unwrap();
-                    if merge_old_deleted {
-                        // this is actually a update from deleted to non-deleted.
-                        // so we just mask it back to deleted.
-                        let res = index.mask_as_deleted(&key.vals, entry.row_id, ts).await;
-                        assert!(res);
-                    } else {
-                        let res = index
-                            .compare_delete(&key.vals, entry.row_id, true, ts)
-                            .await;
-                        assert!(res);
-                    }
-                }
-                IndexUndoKind::InsertNonUnique(key, merge_old_deleted) => {
-                    let index = table.sec_idx[key.index_no].non_unique().unwrap();
-                    if merge_old_deleted {
-                        let res = index.mask_as_deleted(&key.vals, entry.row_id, ts).await;
-                        assert!(res);
-                    } else {
-                        let res = index
-                            .compare_delete(&key.vals, entry.row_id, true, ts)
-                            .await;
-                        assert!(res);
-                    }
-                }
-                IndexUndoKind::UpdateUnique(key, old_row_id, deleted) => {
-                    if !deleted {
-                        // The version of previous row is not deleted, means current transaction
-                        // must own the lock of old row.
-                        // So directly rollback index should be fine.
-                        let new_row_id = entry.row_id;
-                        let index = table.sec_idx[key.index_no].unique().unwrap();
-                        let res = index
-                            .compare_exchange(&key.vals, new_row_id, old_row_id, ts)
-                            .await;
-                        debug_assert!(res.is_ok());
-                        return;
-                    }
+                    let res = index
+                        .compare_exchange(&key.vals, new_row_id, old_row_id, ts)
+                        .await;
+                    debug_assert!(res.is_ok());
+                } else {
                     // There is a race condition:
                     // Transaction A deleted a row{row_id=100, k=1} and committed.
                     // GC thread is trying to delete index entry.
@@ -107,13 +108,14 @@ impl IndexUndoLogs {
                         RowLocation::NotFound => unreachable!(),
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let Some(page_guard) = data_pool
+                            let Some(page_guard) = table
+                                .mem_pool
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .lock_shared_async()
                                 .await
                             else {
-                                continue;
+                                return;
                             };
                             // acquire row latch to avoid race condition.
                             let (ctx, page) = page_guard.ctx_and_page();
@@ -144,20 +146,20 @@ impl IndexUndoLogs {
                         }
                     }
                 }
-                IndexUndoKind::DeferDelete(key, unique) => {
-                    // Because we always mask index entry as deleted for each defer delete undo log.
-                    // We need to unmask it.
-                    if unique {
-                        let index = table.sec_idx[key.index_no].unique().unwrap();
-                        let res = index
-                            .compare_exchange(&key.vals, entry.row_id.deleted(), entry.row_id, ts)
-                            .await;
-                        assert!(res.is_ok());
-                    } else {
-                        let index = table.sec_idx[key.index_no].non_unique().unwrap();
-                        let res = index.mask_as_active(&key.vals, entry.row_id, ts).await;
-                        assert!(res);
-                    }
+            }
+            IndexUndoKind::DeferDelete(key, unique) => {
+                // Because we always mask index entry as deleted for each defer delete undo log.
+                // We need to unmask it.
+                if unique {
+                    let index = table.sec_idx[key.index_no].unique().unwrap();
+                    let res = index
+                        .compare_exchange(&key.vals, entry.row_id.deleted(), entry.row_id, ts)
+                        .await;
+                    assert!(res.is_ok());
+                } else {
+                    let index = table.sec_idx[key.index_no].non_unique().unwrap();
+                    let res = index.mask_as_active(&key.vals, entry.row_id, ts).await;
+                    assert!(res);
                 }
             }
         }
