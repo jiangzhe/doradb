@@ -438,9 +438,18 @@ impl BTree {
         let g = self.find_leaf::<OptimisticStrategy>(key).await;
         let value = verify!(
             g.with_page_ref_validated(|leaf| match leaf.search_key(key) {
-                Ok(idx) => Some(leaf.value::<V>(idx)),
-                Err(_) => None,
+                Ok(idx) => {
+                    // In optimistic mode, a writer can change node layout between
+                    // `search_key` and value read in this same closure. If `idx`
+                    // becomes stale, treat it as validation failure and retry.
+                    match leaf.value_checked::<V>(idx) {
+                        Some(v) => Valid(Some(v)),
+                        None => Invalid,
+                    }
+                }
+                Err(_) => Valid(None),
             })
+            .and_then(|inner| inner)
         );
         Valid(value)
     }
