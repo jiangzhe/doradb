@@ -1,7 +1,7 @@
 use crate::buffer::BufferPool;
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
-    FailureRateTracker, PressureDeltaClockPolicy, clock_collect, clock_sweep_candidate,
+    FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
@@ -18,7 +18,7 @@ use crate::lifetime::StaticLifetime;
 use crate::ptr::UnsafePtr;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use event_listener::{Event, Listener, listener};
+use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::mem;
@@ -671,13 +671,14 @@ impl ReadonlyResidency {
     }
 
     #[inline]
-    fn collect<F: FnMut(PageID) -> bool>(
+    fn collect_batch_ids(
         &self,
         hand: ClockHand,
-        mut callback: F,
+        limit: usize,
+        out: &mut Vec<PageID>,
     ) -> Option<ClockHand> {
         let g = self.set.lock();
-        clock_collect(&g, hand, &mut callback)
+        clock_collect_batch(&g, hand, limit, out)
     }
 }
 
@@ -740,9 +741,8 @@ impl EvictionRuntime for ReadonlyRuntime {
     }
 
     #[inline]
-    fn wait_for_work(&self, timeout: std::time::Duration) {
-        listener!(self.residency.evict_ev => listener);
-        listener.wait_timeout(timeout);
+    fn work_listener(&self) -> EventListener {
+        self.residency.evict_ev.listen()
     }
 
     #[inline]
@@ -751,11 +751,13 @@ impl EvictionRuntime for ReadonlyRuntime {
     }
 
     #[inline]
-    fn collect_ids<F>(&self, hand: ClockHand, callback: F) -> Option<ClockHand>
-    where
-        F: FnMut(PageID) -> bool,
-    {
-        self.residency.collect(hand, callback)
+    fn collect_batch_ids(
+        &self,
+        hand: ClockHand,
+        limit: usize,
+        out: &mut Vec<PageID>,
+    ) -> Option<ClockHand> {
+        self.residency.collect_batch_ids(hand, limit, out)
     }
 
     #[inline]
@@ -764,15 +766,11 @@ impl EvictionRuntime for ReadonlyRuntime {
     }
 
     #[inline]
-    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>) {
+    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>) -> Option<EventListener> {
         for page_guard in pages {
             self.drop_resident_page(page_guard);
         }
-    }
-
-    #[inline]
-    fn wait_execution_if_needed(&self) {
-        // no-op for readonly drop-only path.
+        None
     }
 }
 

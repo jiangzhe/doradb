@@ -2,7 +2,7 @@ use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
-    FailureRateTracker, PressureDeltaClockPolicy, clock_collect, clock_sweep_candidate,
+    FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
@@ -20,8 +20,9 @@ use crate::io::{
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::lifetime::StaticLifetime;
+use crate::notify::EventNotifyOnDrop;
 use byte_unit::Byte;
-use event_listener::{Event, Listener, listener};
+use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
@@ -80,7 +81,6 @@ impl EvictableBufferPool {
             in_mem: Arc::clone(&self.in_mem),
             io_client: self.io_client.clone(),
             inflight_io: Arc::clone(&self.inflight_io),
-            wait_for_writes: AtomicBool::new(false),
         };
         let policy =
             PressureDeltaClockPolicy::new(self.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
@@ -145,9 +145,10 @@ impl EvictableBufferPool {
                         let listener = event.listen();
                         vac.insert(IOStatus {
                             kind: IOKind::Read,
-                            event: Some(event),
+                            done: Some(event),
                             page_guard: None, // will update later
                             uio: None,
+                            batch_done: None,
                         });
                         self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
                         let _ = self
@@ -164,7 +165,7 @@ impl EvictableBufferPool {
                 match status.kind {
                     IOKind::Read | IOKind::ReadWaitForWrite => {
                         // Wait for existing signal.
-                        let listener = status.event.as_ref().unwrap().listen();
+                        let listener = status.done.as_ref().unwrap().listen();
                         drop(g); // explicitly drop guard before await
                         listener.await;
                     }
@@ -172,7 +173,7 @@ impl EvictableBufferPool {
                         // Write IO in progress
                         let event = Event::new();
                         let listener = event.listen();
-                        status.event = Some(event);
+                        status.done = Some(event);
                         drop(g); // explicitly drop guard before await
                         listener.await;
                     }
@@ -514,10 +515,12 @@ impl AIOEventListener for EvictableBufferPoolListener {
                     page_guard,
                     kind: IOKind::Read,
                     uio,
+                    batch_done: None,
                 };
                 queue.push(iocb, sub);
             }
-            PoolRequest::BatchWrite(page_guards) => {
+            PoolRequest::BatchWrite(page_guards, done_ev) => {
+                let done_ev = Arc::new(done_ev);
                 for mut page_guard in page_guards {
                     let page_id = page_guard.page_id();
                     debug_assert!(self.inflight_io.contains(page_id));
@@ -528,6 +531,7 @@ impl AIOEventListener for EvictableBufferPoolListener {
                         page_guard,
                         kind: IOKind::Write,
                         uio,
+                        batch_done: Some(Arc::clone(&done_ev)),
                     };
                     queue.push(iocb, req);
                 }
@@ -555,31 +559,34 @@ impl AIOEventListener for EvictableBufferPoolListener {
                 let mut status = g.remove(&page_id).unwrap();
                 let _uio = status.uio.take().unwrap();
                 let page_guard = status.page_guard.take().unwrap();
+                let batch_done = status.batch_done.take();
                 let bf = page_guard.bf();
                 match status.kind {
                     IOKind::Read => {
+                        debug_assert!(batch_done.is_none());
                         debug_assert!(bf.kind() == FrameKind::Evicted);
                         bf.set_dirty(false);
                         bf.compare_exchange_kind(FrameKind::Evicted, FrameKind::Hot);
-                        let event = status.event.take();
+                        let done = status.done.take();
                         self.inflight_io.reads.fetch_sub(1, Ordering::Relaxed);
                         self.in_mem.pin(page_id);
                         drop(page_guard);
-                        if let Some(event) = event {
-                            event.notify(usize::MAX);
+                        if let Some(done) = done {
+                            done.notify(usize::MAX);
                         }
                         drop(g);
                         AIOKind::Read
                     }
                     IOKind::Write => {
                         debug_assert!(bf.kind() == FrameKind::Evicting);
-                        let event = status.event.take();
+                        let done = status.done.take();
                         self.inflight_io.writes.fetch_sub(1, Ordering::Relaxed);
                         self.in_mem.evict_page(page_guard);
-                        if let Some(event) = event {
-                            event.notify(usize::MAX);
+                        if let Some(done) = done {
+                            done.notify(usize::MAX);
                         }
                         drop(g);
+                        drop(batch_done);
                         AIOKind::Write
                     }
                     IOKind::ReadWaitForWrite => {
@@ -591,14 +598,6 @@ impl AIOEventListener for EvictableBufferPoolListener {
             Err(err) => {
                 unimplemented!("AIO error: page_id={}, {}", key, err)
             }
-        }
-    }
-
-    #[inline]
-    fn on_batch_complete(&mut self, _read_count: usize, write_count: usize) {
-        if write_count > 0 {
-            // notify readers which wait for any inflight write.
-            self.inflight_io.writes_finish_ev.notify(1);
         }
     }
 
@@ -651,14 +650,18 @@ struct EvictableRuntime {
     in_mem: Arc<InMemPageSet>,
     inflight_io: Arc<InflightIO>,
     io_client: AIOClient<PoolRequest>,
-    wait_for_writes: AtomicBool,
 }
 
 impl EvictableRuntime {
     #[inline]
-    fn dispatch_io_writes(&self, page_guards: Vec<PageExclusiveGuard<Page>>) {
+    fn dispatch_io_writes(&self, page_guards: Vec<PageExclusiveGuard<Page>>) -> EventListener {
         self.inflight_io.batch_writes(&page_guards);
-        let _ = self.io_client.send(PoolRequest::BatchWrite(page_guards));
+        let done_ev = EventNotifyOnDrop::new();
+        let listener = done_ev.listen();
+        let _ = self
+            .io_client
+            .send(PoolRequest::BatchWrite(page_guards, done_ev));
+        listener
     }
 }
 
@@ -684,9 +687,8 @@ impl EvictionRuntime for EvictableRuntime {
     }
 
     #[inline]
-    fn wait_for_work(&self, timeout: std::time::Duration) {
-        listener!(self.in_mem.evict_ev => listener);
-        listener.wait_timeout(timeout);
+    fn work_listener(&self) -> EventListener {
+        self.in_mem.evict_ev.listen()
     }
 
     #[inline]
@@ -698,11 +700,13 @@ impl EvictionRuntime for EvictableRuntime {
     }
 
     #[inline]
-    fn collect_ids<F>(&self, hand: ClockHand, callback: F) -> Option<ClockHand>
-    where
-        F: FnMut(PageID) -> bool,
-    {
-        self.in_mem.clock_collect(hand, callback)
+    fn collect_batch_ids(
+        &self,
+        hand: ClockHand,
+        limit: usize,
+        out: &mut Vec<PageID>,
+    ) -> Option<ClockHand> {
+        self.in_mem.collect_batch_ids(hand, limit, out)
     }
 
     #[inline]
@@ -711,7 +715,7 @@ impl EvictionRuntime for EvictableRuntime {
     }
 
     #[inline]
-    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>) {
+    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>) -> Option<EventListener> {
         let mut dirty_pages = vec![];
         for page_guard in pages {
             if page_guard.is_dirty() {
@@ -719,29 +723,39 @@ impl EvictionRuntime for EvictableRuntime {
             } else {
                 // Page is a read-only copy of disk content.
                 // Keep inflight map ordering consistent with write path.
-                let g = self.inflight_io.map.lock();
-                debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
-                self.in_mem.evict_page(page_guard);
-                drop(g);
+                let page_id = page_guard.page_id();
+                let waiter_done = {
+                    let mut g = self.inflight_io.map.lock();
+                    let waiter_done = if matches!(
+                        g.get(&page_id).map(|status| status.kind),
+                        Some(IOKind::ReadWaitForWrite)
+                    ) {
+                        let mut status = g.remove(&page_id).unwrap();
+                        debug_assert!(status.page_guard.is_none());
+                        debug_assert!(status.uio.is_none());
+                        debug_assert!(status.batch_done.is_none());
+                        status.done.take()
+                    } else {
+                        if let Some(status) = g.get(&page_id) {
+                            debug_assert!(status.kind != IOKind::Write);
+                        }
+                        None
+                    };
+                    debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                    self.in_mem.evict_page(page_guard);
+                    waiter_done
+                };
+                if let Some(done) = waiter_done {
+                    done.notify(usize::MAX);
+                }
             }
         }
 
         if dirty_pages.is_empty() {
-            self.wait_for_writes.store(false, Ordering::Release);
-            return;
+            return None;
         }
 
-        self.dispatch_io_writes(dirty_pages);
-        self.wait_for_writes.store(true, Ordering::Release);
-    }
-
-    #[inline]
-    fn wait_execution_if_needed(&self) {
-        if !self.wait_for_writes.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        listener!(self.inflight_io.writes_finish_ev => writes_finish);
-        writes_finish.wait();
+        Some(self.dispatch_io_writes(dirty_pages))
     }
 }
 
@@ -867,13 +881,14 @@ impl InMemPageSet {
     }
 
     #[inline]
-    fn clock_collect<F: FnMut(PageID) -> bool>(
+    fn collect_batch_ids(
         &self,
         clock_hand: ClockHand,
-        mut callback: F,
+        limit: usize,
+        out: &mut Vec<PageID>,
     ) -> Option<ClockHand> {
         let g = self.set.lock();
-        clock_collect(&g, clock_hand, &mut callback)
+        clock_collect_batch(&g, clock_hand, limit, out)
     }
 
     #[inline]
@@ -1101,16 +1116,16 @@ impl EvictableBufferPoolConfig {
 
 struct IOStatus {
     kind: IOKind,
-    event: Option<Event>,
+    // Per-page completion event for readers waiting on this specific page IO.
+    done: Option<Event>,
     page_guard: Option<PageExclusiveGuard<Page>>,
     uio: Option<UnsafeAIO>,
+    // Shared batch-level completion token for writeback selected in one eviction pass.
+    batch_done: Option<Arc<EventNotifyOnDrop>>,
 }
 
 struct InflightIO {
     map: Mutex<HashMap<PageID, IOStatus>>,
-    // Signal to notify map change on IO writes.
-    // writes_submit_signal: Signal,
-    writes_finish_ev: Event,
     reads: AtomicUsize,
     writes: AtomicUsize,
 }
@@ -1120,8 +1135,6 @@ impl Default for InflightIO {
     fn default() -> Self {
         InflightIO {
             map: Mutex::new(HashMap::new()),
-            // writes_submit_signal: Signal::default(),
-            writes_finish_ev: Event::new(),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
         }
@@ -1146,9 +1159,10 @@ impl InflightIO {
                         let listener = event.listen();
                         vac.insert(IOStatus {
                             kind: IOKind::ReadWaitForWrite,
-                            event: Some(event),
+                            done: Some(event),
                             page_guard: None, // will update later.
                             uio: None,
+                            batch_done: None,
                         });
                         drop(g); // explicit drop guard before await.
                         listener.await;
@@ -1168,8 +1182,8 @@ impl InflightIO {
                     let kind = occ.get().kind;
                     kind == IOKind::ReadWaitForWrite || kind == IOKind::Write
                 });
-                let event = occ.get_mut().event.get_or_insert_default();
-                let listener = event.listen();
+                let done = occ.get_mut().done.get_or_insert_default();
+                let listener = done.listen();
                 drop(g); // explicitly drop guard before await.
                 listener.await;
             }
@@ -1186,9 +1200,10 @@ impl InflightIO {
                 Entry::Vacant(vac) => {
                     vac.insert(IOStatus {
                         kind: IOKind::Write,
-                        event: None,
+                        done: None,
                         page_guard: None, // will update later.
                         uio: None,
+                        batch_done: None,
                     });
                 }
                 Entry::Occupied(mut occ) => {
@@ -1208,6 +1223,7 @@ impl InflightIO {
             page_guard,
             uio,
             kind: _,
+            batch_done,
         } = page_io;
         let page_id = page_guard.page_id();
         let mut g = self.map.lock();
@@ -1216,6 +1232,12 @@ impl InflightIO {
             debug_assert!(res.is_none());
             let res = status.uio.replace(uio);
             debug_assert!(res.is_none());
+            if let Some(batch_done) = batch_done {
+                let res = status.batch_done.replace(batch_done);
+                debug_assert!(res.is_none());
+            } else {
+                debug_assert!(status.batch_done.is_none());
+            }
             return true;
         }
         false
@@ -1247,7 +1269,7 @@ pub struct EvictableBufferPoolStats {
 /// batch of dirty pages selected by eviction.
 pub enum PoolRequest {
     Read(PageExclusiveGuard<Page>),
-    BatchWrite(Vec<PageExclusiveGuard<Page>>),
+    BatchWrite(Vec<PageExclusiveGuard<Page>>, EventNotifyOnDrop),
 }
 
 #[cfg(test)]

@@ -539,11 +539,6 @@ impl AIOEventListener for FileIOListener {
     }
 
     #[inline]
-    fn on_batch_complete(&mut self, _read_count: usize, _write_count: usize) {
-        // do nothing
-    }
-
-    #[inline]
     fn on_stats(&mut self, stats: &AIOStats) {
         self.stats.merge(stats);
     }

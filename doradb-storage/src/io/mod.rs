@@ -603,9 +603,6 @@ pub trait AIOEventListener {
     /// In such way, the caller always keeps the buffer in valid state.
     fn on_complete(&mut self, key: AIOKey, res: std::io::Result<usize>) -> AIOKind;
 
-    /// Called when multiple IOs completed.
-    fn on_batch_complete(&mut self, read_count: usize, write_count: usize);
-
     /// Called when stats is collected.
     fn on_stats(&mut self, stats: &AIOStats);
 
@@ -784,7 +781,6 @@ impl<T> AIOEventLoop<T> {
                 let (read_count, write_count) =
                     self.ctx
                         .wait_at_least(&mut results, 1, |key, res| listener.on_complete(key, res));
-                listener.on_batch_complete(read_count, write_count);
                 self.submitted -= read_count + write_count;
                 (
                     1,
@@ -883,7 +879,6 @@ impl<T> AIOEventLoop<T> {
                     while let Ok(completion) = completion_rx.try_recv() {
                         handle_completion(completion);
                     }
-                    listener.on_batch_complete(read_count, write_count);
                     self.submitted -= read_count + write_count;
                     (
                         1,
@@ -1119,10 +1114,6 @@ mod tests {
                     panic!("{:?}", err);
                 }
             }
-        }
-
-        fn on_batch_complete(&mut self, read_count: usize, write_count: usize) {
-            println!("reads {}, writes {}", read_count, write_count);
         }
 
         fn on_stats(&mut self, stats: &AIOStats) {

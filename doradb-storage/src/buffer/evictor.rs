@@ -2,6 +2,7 @@ use crate::buffer::frame::{BufferFrames, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::{Page, PageID};
 use crate::thread;
+use event_listener::{EventListener, Listener};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -9,9 +10,6 @@ use std::ops::{Range, RangeFrom, RangeTo};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
-
-const EVICT_WAIT_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_TARGET_FREE_RATIO: f64 = 0.10;
 const DEFAULT_HYSTERESIS_RATIO: f64 = 0.30;
 
@@ -125,6 +123,24 @@ where
             None
         }
     }
+}
+
+/// Collects up to `limit` page ids from the resident-set according to
+/// clock-hand position and returns the next hand state.
+#[inline]
+pub(super) fn clock_collect_batch(
+    set: &BTreeSet<PageID>,
+    clock_hand: ClockHand,
+    limit: usize,
+    out: &mut Vec<PageID>,
+) -> Option<ClockHand> {
+    if limit == 0 {
+        return Some(clock_hand);
+    }
+    clock_collect(set, clock_hand, |page_id| {
+        out.push(page_id);
+        out.len() >= limit
+    })
 }
 
 /// Applies one clock-sweep step and returns a page guard when a frame
@@ -498,25 +514,48 @@ impl FailureRateTracker {
 /// Implemented by concrete buffer-pool runtimes to expose pressure state,
 /// candidate iteration/marking, and execution semantics.
 pub(super) trait EvictionRuntime {
+    /// Returns the number of pages currently considered resident by the pool.
     fn resident_count(&self) -> usize;
+
+    /// Returns the runtime page capacity used by the eviction policy.
     fn capacity(&self) -> usize;
+
+    /// Returns the number of pages already in-flight for eviction/writeback.
     fn inflight_evicts(&self) -> usize;
+
+    /// Returns recent allocation-failure ratio used as eviction pressure signal.
     fn allocation_failure_rate(&self) -> f64;
-    fn wait_for_work(&self, timeout: Duration);
+
+    /// Returns a listener notified when eviction work may become available.
+    fn work_listener(&self) -> EventListener;
+
+    /// Emits post-eviction progress notifications to blocked alloc/load waiters.
     fn notify_progress(&self);
-    fn collect_ids<F>(&self, hand: ClockHand, callback: F) -> Option<ClockHand>
-    where
-        F: FnMut(PageID) -> bool;
+
+    /// Collects up to `limit` resident page ids according to `hand` ordering.
+    ///
+    /// Implementations should only hold internal residency locks for the
+    /// duration of id collection and must not perform frame probing here.
+    fn collect_batch_ids(
+        &self,
+        hand: ClockHand,
+        limit: usize,
+        out: &mut Vec<PageID>,
+    ) -> Option<ClockHand>;
+
+    /// Tries to transition a candidate page to evicting state and returns its guard.
     fn try_mark_evicting(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>>;
-    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>);
-    fn wait_execution_if_needed(&self);
+
+    /// Executes eviction for selected pages and returns an optional completion waiter.
+    ///
+    /// `None` means no asynchronous completion phase is required.
+    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>) -> Option<EventListener>;
 }
 
 /// Concrete pressure-delta + clock-sweep policy used by all pools.
 pub(super) struct PressureDeltaClockPolicy {
     arbiter: EvictionArbiter,
     min_resident: usize,
-    small_batch_threshold: usize,
     clock_hand: ClockHand,
     tmp_page_ids: Vec<PageID>,
 }
@@ -527,7 +566,6 @@ impl PressureDeltaClockPolicy {
         PressureDeltaClockPolicy {
             arbiter,
             min_resident,
-            small_batch_threshold: 8,
             clock_hand: ClockHand::default(),
             tmp_page_ids: vec![],
         }
@@ -558,30 +596,19 @@ impl PressureDeltaClockPolicy {
         'SWEEP: for _ in 0..2 {
             next_ch = Some(self.clock_hand.clone());
             while let Some(ch) = next_ch.take() {
-                if batch_size <= self.small_batch_threshold {
-                    next_ch = runtime.collect_ids(ch, |page_id| {
-                        if let Some(page_guard) = runtime.try_mark_evicting(page_id) {
-                            candidates.push(page_guard);
-                            batch_size -= 1;
-                            return batch_size == 0;
-                        }
-                        false
-                    });
-                } else {
-                    self.tmp_page_ids.clear();
-                    next_ch = runtime.collect_ids(ch, |page_id| {
-                        self.tmp_page_ids.push(page_id);
-                        self.tmp_page_ids.len() == batch_size
-                    });
-                    for page_id in self.tmp_page_ids.drain(..) {
-                        if let Some(page_guard) = runtime.try_mark_evicting(page_id) {
-                            candidates.push(page_guard);
-                            batch_size -= 1;
+                // Step 1: collect candidate ids while holding residency lock only.
+                self.tmp_page_ids.clear();
+                next_ch = runtime.collect_batch_ids(ch, batch_size, &mut self.tmp_page_ids);
+
+                // Step 2: probe frame state and mark evicting after lock release.
+                for page_id in self.tmp_page_ids.drain(..) {
+                    if let Some(page_guard) = runtime.try_mark_evicting(page_id) {
+                        candidates.push(page_guard);
+                        batch_size -= 1;
+                        if batch_size == 0 {
+                            break 'SWEEP;
                         }
                     }
-                }
-                if batch_size == 0 {
-                    break 'SWEEP;
                 }
             }
         }
@@ -628,6 +655,20 @@ where
     }
 
     #[inline]
+    fn wait_for_work(&self) -> bool {
+        // Register listener before re-checking pressure to avoid missed wakeups.
+        let listener = self.runtime.work_listener();
+        if self.shutdown_flag.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.policy.decide_batch(&self.runtime).is_some() {
+            return true;
+        }
+        listener.wait();
+        !self.shutdown_flag.load(Ordering::Acquire)
+    }
+
+    #[inline]
     pub(super) fn run(mut self) {
         loop {
             if self.shutdown_flag.load(Ordering::Acquire) {
@@ -637,28 +678,28 @@ where
             let target = match self.policy.decide_batch(&self.runtime) {
                 Some(target) if target > 0 => target,
                 _ => {
-                    if self.shutdown_flag.load(Ordering::Acquire) {
+                    if !self.wait_for_work() {
                         return;
                     }
-                    self.runtime.wait_for_work(EVICT_WAIT_INTERVAL);
                     continue;
                 }
             };
 
             let candidates = self.policy.select_candidates(&self.runtime, target);
             if candidates.is_empty() {
-                if self.shutdown_flag.load(Ordering::Acquire) {
+                if !self.wait_for_work() {
                     return;
                 }
-                self.runtime.wait_for_work(EVICT_WAIT_INTERVAL);
                 continue;
             }
 
-            self.runtime.execute(candidates);
+            let waiter = self.runtime.execute(candidates);
             if self.shutdown_flag.load(Ordering::Acquire) {
                 return;
             }
-            self.runtime.wait_execution_if_needed();
+            if let Some(waiter) = waiter {
+                waiter.wait();
+            }
             self.runtime.notify_progress();
         }
     }
