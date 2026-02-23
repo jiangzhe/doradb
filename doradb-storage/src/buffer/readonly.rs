@@ -26,6 +26,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
+/// Minimum number of frames required for global readonly pool.
+///
+/// Very small pools provide little practical value and can stall eviction/load flow.
+const MIN_READONLY_POOL_PAGES: usize = 256;
+
 /// Physical cache identity for readonly table-file pages.
 ///
 /// This intentionally excludes root version to preserve cache hits across
@@ -79,7 +84,7 @@ impl GlobalReadonlyBufferPool {
     ) -> Result<Self> {
         let frame_plus_page = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
         let size = pool_size / frame_plus_page;
-        if size == 0 {
+        if size < MIN_READONLY_POOL_PAGES {
             return Err(Error::BufferPoolSizeTooSmall);
         }
         let eviction_arbiter = eviction_arbiter_builder.build(size);
@@ -947,7 +952,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn frame_page_bytes(cap: usize) -> usize {
-        cap * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
+        cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
     }
 
     fn make_metadata() -> Arc<TableMetadata> {
@@ -993,6 +998,14 @@ mod tests {
         drop(g3);
         assert_eq!(global.invalidate_key(&key), Some(3));
         assert_eq!(global.allocated(), 0);
+    }
+
+    #[test]
+    fn test_global_readonly_pool_rejects_too_small_capacity() {
+        let bytes = (MIN_READONLY_POOL_PAGES - 1)
+            * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
+        let res = GlobalReadonlyBufferPool::with_capacity(bytes);
+        assert!(matches!(res, Err(Error::BufferPoolSizeTooSmall)));
     }
 
     #[test]
@@ -1097,7 +1110,8 @@ mod tests {
             assert_eq!(&page.page()[..6], b"reload");
             drop(page);
 
-            assert_eq!(global.try_get_frame_id(&key), Some(1));
+            let reloaded_frame_id = global.try_get_frame_id(&key).unwrap();
+            assert_ne!(reloaded_frame_id, 0);
             drop(table_file);
             drop(fs);
         });
@@ -1228,8 +1242,6 @@ mod tests {
             let table_file = fs.create_table_file(103, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            write_payload(&table_file, 7, b"page-a").await;
-            write_payload(&table_file, 8, b"page-b").await;
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
@@ -1241,26 +1253,43 @@ mod tests {
                 global.as_static(),
             )));
             let pool = pool.as_static();
+            let capacity = global.as_static().capacity();
+            let base_page_id = 7u64;
 
-            let g1: FacadePageGuard<Page> =
-                pool.get_page::<Page>(7, LatchFallbackMode::Shared).await;
-            let g1 = g1.lock_shared_async().await.unwrap();
-            assert_eq!(&g1.page()[..6], b"page-a");
-            drop(g1);
+            // Prepare one more block than cache capacity to force drop-only eviction.
+            for i in 0..=capacity {
+                let page_id = base_page_id + i as u64;
+                let payload = format!("page-{i}");
+                write_payload(&table_file, page_id, payload.as_bytes()).await;
+            }
 
-            let g2: FacadePageGuard<Page> =
-                pool.get_page::<Page>(8, LatchFallbackMode::Shared).await;
-            let g2 = g2.lock_shared_async().await.unwrap();
-            assert_eq!(&g2.page()[..6], b"page-b");
-            drop(g2);
+            for i in 0..=capacity {
+                let page_id = base_page_id + i as u64;
+                let expected = format!("page-{i}");
+                let g: FacadePageGuard<Page> = pool
+                    .get_page::<Page>(page_id, LatchFallbackMode::Shared)
+                    .await;
+                let g = g.lock_shared_async().await.unwrap();
+                assert_eq!(&g.page()[..expected.len()], expected.as_bytes());
+                drop(g);
+            }
 
-            let g3: FacadePageGuard<Page> =
-                pool.get_page::<Page>(7, LatchFallbackMode::Shared).await;
-            let g3 = g3.lock_shared_async().await.unwrap();
-            assert_eq!(&g3.page()[..6], b"page-a");
-            drop(g3);
+            let loaded_count = capacity + 1;
+            let mapped_count = (0..=capacity)
+                .filter(|i| {
+                    let key = ReadonlyCacheKey::new(103, base_page_id + *i as u64);
+                    global.as_static().try_get_frame_id(&key).is_some()
+                })
+                .count();
+            assert!(mapped_count < loaded_count);
 
-            assert_eq!(global.as_static().allocated(), 1);
+            // Reload the first page after cache pressure; this should still return correct data.
+            let g: FacadePageGuard<Page> = pool
+                .get_page::<Page>(base_page_id, LatchFallbackMode::Shared)
+                .await;
+            let g = g.lock_shared_async().await.unwrap();
+            assert_eq!(&g.page()[..6], b"page-0");
+            drop(g);
             drop(table_file);
             drop(fs);
         });
