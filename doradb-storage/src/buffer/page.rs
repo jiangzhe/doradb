@@ -1,7 +1,9 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::io::UnsafeAIO;
+use crate::notify::EventNotifyOnDrop;
 use std::mem;
+use std::sync::Arc;
 
 pub const PAGE_SIZE: usize = 64 * 1024;
 pub type Page = [u8; PAGE_SIZE];
@@ -63,6 +65,9 @@ pub struct PageIO {
     pub page_guard: PageExclusiveGuard<Page>,
     pub kind: IOKind,
     pub uio: UnsafeAIO,
+    // Batch-level completion token cloned into each write submission.
+    // The last drop notifies the evictor waiting for the whole write batch.
+    pub(crate) batch_done: Option<Arc<EventNotifyOnDrop>>,
 }
 
 /// Convenient for IO thread to process, no matter

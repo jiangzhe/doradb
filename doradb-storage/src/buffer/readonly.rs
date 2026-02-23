@@ -1,10 +1,13 @@
 use crate::buffer::BufferPool;
+use crate::buffer::evictor::{
+    ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
+    FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
+};
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::{
-    ClockHand, clock_collect, clock_sweep_candidate, deallocate_frame_and_page_arrays,
-    initialize_frame_and_page_arrays, madvise_dontneed,
+    deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays, madvise_dontneed,
 };
 use crate::catalog::TableID;
 use crate::error::Validation::Valid;
@@ -13,20 +16,20 @@ use crate::file::table_file::TableFile;
 use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
 use crate::ptr::UnsafePtr;
-use crate::thread;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use event_listener::{Event, Listener, listener};
+use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
-const EVICT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-const EVICT_BATCH_SIZE: usize = 64;
+/// Minimum number of frames required for global readonly pool.
+///
+/// Very small pools provide little practical value and can stall eviction/load flow.
+const MIN_READONLY_POOL_PAGES: usize = 256;
 
 /// Physical cache identity for readonly table-file pages.
 ///
@@ -61,6 +64,7 @@ pub struct GlobalReadonlyBufferPool {
     mappings: Arc<DashMap<ReadonlyCacheKey, PageID>>,
     inflight_loads: Arc<DashMap<ReadonlyCacheKey, Arc<InflightLoad>>>,
     residency: Arc<ReadonlyResidency>,
+    eviction_arbiter: EvictionArbiter,
     shutdown_flag: Arc<AtomicBool>,
     evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -69,11 +73,21 @@ impl GlobalReadonlyBufferPool {
     /// Creates a global readonly pool with a target memory budget in bytes.
     #[inline]
     pub fn with_capacity(pool_size: usize) -> Result<Self> {
+        Self::with_capacity_and_arbiter_builder(pool_size, EvictionArbiter::builder())
+    }
+
+    /// Creates a global readonly pool with explicit eviction arbiter builder.
+    #[inline]
+    pub fn with_capacity_and_arbiter_builder(
+        pool_size: usize,
+        eviction_arbiter_builder: EvictionArbiterBuilder,
+    ) -> Result<Self> {
         let frame_plus_page = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
         let size = pool_size / frame_plus_page;
-        if size == 0 {
+        if size < MIN_READONLY_POOL_PAGES {
             return Err(Error::BufferPoolSizeTooSmall);
         }
+        let eviction_arbiter = eviction_arbiter_builder.build(size);
         // SAFETY: memory regions are released in `Drop`, and frame/page pointers are
         // initialized before exposure.
         let (frames, pages) = unsafe { initialize_frame_and_page_arrays(size)? };
@@ -83,7 +97,8 @@ impl GlobalReadonlyBufferPool {
             size,
             mappings: Arc::new(DashMap::new()),
             inflight_loads: Arc::new(DashMap::new()),
-            residency: Arc::new(ReadonlyResidency::new(size)),
+            residency: Arc::new(ReadonlyResidency::new(size, eviction_arbiter)),
+            eviction_arbiter,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             evict_thread: Mutex::new(None),
         };
@@ -95,6 +110,16 @@ impl GlobalReadonlyBufferPool {
     #[inline]
     pub fn with_capacity_static(pool_size: usize) -> Result<&'static Self> {
         let pool = Self::with_capacity(pool_size)?;
+        Ok(StaticLifetime::new_static(pool))
+    }
+
+    /// Creates and leaks a global readonly pool with explicit eviction arbiter builder.
+    #[inline]
+    pub fn with_capacity_and_arbiter_builder_static(
+        pool_size: usize,
+        eviction_arbiter_builder: EvictionArbiterBuilder,
+    ) -> Result<&'static Self> {
+        let pool = Self::with_capacity_and_arbiter_builder(pool_size, eviction_arbiter_builder)?;
         Ok(StaticLifetime::new_static(pool))
     }
 
@@ -273,13 +298,14 @@ impl GlobalReadonlyBufferPool {
 
     #[inline]
     fn start_evictor_thread(&self) {
-        let evictor = ReadonlyBufferPoolEvictor {
+        let runtime = ReadonlyRuntime {
             frames: BufferFrames(self.frames.0),
             mappings: Arc::clone(&self.mappings),
             residency: Arc::clone(&self.residency),
-            shutdown_flag: Arc::clone(&self.shutdown_flag),
         };
-        let handle = evictor.start_thread();
+        let policy = PressureDeltaClockPolicy::new(self.eviction_arbiter, 1);
+        let evictor = Evictor::new(runtime, policy, Arc::clone(&self.shutdown_flag));
+        let handle = evictor.start_thread("ReadonlyBufferPoolEvictor");
         let mut g = self.evict_thread.lock();
         *g = Some(handle);
     }
@@ -343,12 +369,16 @@ impl GlobalReadonlyBufferPool {
     async fn reserve_frame_id(&self) -> PageID {
         loop {
             if let Some(frame_id) = self.residency.try_reserve_frame() {
+                self.residency.record_alloc_success();
                 return frame_id;
             }
+            self.residency.record_alloc_failure();
             listener!(self.residency.free_ev => listener);
             if let Some(frame_id) = self.residency.try_reserve_frame() {
+                self.residency.record_alloc_success();
                 return frame_id;
             }
+            self.residency.record_alloc_failure();
             self.residency.evict_ev.notify(1);
             listener.await;
         }
@@ -361,10 +391,13 @@ impl GlobalReadonlyBufferPool {
         table_file: &TableFile,
     ) -> Result<PageID> {
         let frame_id = self.reserve_frame_id().await;
-        let mut page_guard = self
-            .frames
-            .try_lock_page_exclusive(frame_id)
-            .expect("reserved frame must be lockable");
+        let mut page_guard = match self.frames.try_lock_page_exclusive(frame_id) {
+            Some(page_guard) => page_guard,
+            None => {
+                self.residency.release_free(frame_id);
+                return Err(Error::InvalidState);
+            }
+        };
         {
             let frame = page_guard.bf_mut();
             frame.clear_readonly_key();
@@ -406,10 +439,14 @@ impl GlobalReadonlyBufferPool {
                 vac.insert(frame_id);
             }
             Entry::Occupied(_) => {
-                panic!(
-                    "readonly cache key already loaded unexpectedly: table_id={}, block_id={}",
-                    key.table_id, key.block_id
-                );
+                page_guard.page_mut().zero();
+                let frame = page_guard.bf_mut();
+                frame.clear_readonly_key();
+                frame.bump_generation();
+                frame.set_kind(FrameKind::Uninitialized);
+                drop(page_guard);
+                self.residency.release_free(frame_id);
+                return Err(Error::InvalidState);
             }
         }
         drop(page_guard);
@@ -425,10 +462,10 @@ impl GlobalReadonlyBufferPool {
         &'static self,
         key: ReadonlyCacheKey,
         table_file: &Arc<TableFile>,
-    ) -> PageID {
+    ) -> Result<PageID> {
         loop {
             if let Some(frame_id) = self.try_get_frame_id(&key) {
-                return frame_id;
+                return Ok(frame_id);
             }
 
             let (is_loader, inflight) = match self.inflight_loads.entry(key) {
@@ -446,12 +483,9 @@ impl GlobalReadonlyBufferPool {
                     inflight.ev.notify(usize::MAX);
                 }
                 match load_res {
-                    Ok(frame_id) => return frame_id,
+                    Ok(frame_id) => return Ok(frame_id),
                     Err(err) => {
-                        panic!(
-                            "readonly cache miss load failed: table_id={}, block_id={}, err={}",
-                            key.table_id, key.block_id, err
-                        );
+                        return Err(err);
                     }
                 }
             } else {
@@ -470,13 +504,16 @@ impl GlobalReadonlyBufferPool {
         &'static self,
         frame_id: PageID,
         mode: LatchFallbackMode,
-    ) -> FacadePageGuard<T> {
+    ) -> Result<FacadePageGuard<T>> {
+        if frame_id as usize >= self.size {
+            return Err(Error::InvalidArgument);
+        }
         let bf = self.frames.frame_ptr(frame_id);
         let g = BufferFrames::frame_ref(bf.clone())
             .latch
             .optimistic_fallback(mode)
             .await;
-        FacadePageGuard::new(bf, g)
+        Ok(FacadePageGuard::new(bf, g))
     }
 
     #[inline]
@@ -539,22 +576,26 @@ impl InflightLoad {
 }
 
 struct ReadonlyResidency {
+    capacity: usize,
     set: Mutex<BTreeSet<PageID>>,
     free: Mutex<Vec<PageID>>,
+    alloc_failures: FailureRateTracker,
     free_ev: Event,
     evict_ev: Event,
 }
 
 impl ReadonlyResidency {
     #[inline]
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, eviction_arbiter: EvictionArbiter) -> Self {
         let mut free = Vec::with_capacity(capacity);
         for frame_id in 0..capacity {
             free.push(frame_id as PageID);
         }
         ReadonlyResidency {
+            capacity,
             set: Mutex::new(BTreeSet::new()),
             free: Mutex::new(free),
+            alloc_failures: FailureRateTracker::new(eviction_arbiter.failure_window()),
             free_ev: Event::new(),
             evict_ev: Event::new(),
         }
@@ -615,89 +656,44 @@ impl ReadonlyResidency {
     }
 
     #[inline]
-    fn collect<F: FnMut(PageID) -> bool>(
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[inline]
+    fn record_alloc_success(&self) {
+        self.alloc_failures.record_success();
+    }
+
+    #[inline]
+    fn record_alloc_failure(&self) {
+        self.alloc_failures.record_failure();
+    }
+
+    #[inline]
+    fn alloc_failure_rate(&self) -> f64 {
+        self.alloc_failures.failure_rate()
+    }
+
+    #[inline]
+    fn collect_batch_ids(
         &self,
         hand: ClockHand,
-        mut callback: F,
+        limit: usize,
+        out: &mut Vec<PageID>,
     ) -> Option<ClockHand> {
         let g = self.set.lock();
-        clock_collect(&g, hand, &mut callback)
+        clock_collect_batch(&g, hand, limit, out)
     }
 }
 
-struct ReadonlyBufferPoolEvictor {
+struct ReadonlyRuntime {
     frames: BufferFrames,
     mappings: Arc<DashMap<ReadonlyCacheKey, PageID>>,
     residency: Arc<ReadonlyResidency>,
-    shutdown_flag: Arc<AtomicBool>,
 }
 
-impl ReadonlyBufferPoolEvictor {
-    #[inline]
-    fn start_thread(self) -> JoinHandle<()> {
-        thread::spawn_named("ReadonlyBufferPoolEvictor", move || self.run())
-    }
-
-    #[inline]
-    fn run(self) {
-        let mut clock_hand = ClockHand::default();
-        let mut candidates = vec![];
-        loop {
-            if self.shutdown_flag.load(Ordering::Acquire) {
-                return;
-            }
-            if !self.residency.no_free_frame() {
-                listener!(self.residency.evict_ev => listener);
-                if !self.residency.no_free_frame() {
-                    listener.wait_timeout(EVICT_CHECK_INTERVAL);
-                    continue;
-                }
-            }
-
-            let target = self.residency.resident_len().min(EVICT_BATCH_SIZE);
-            if target == 0 {
-                listener!(self.residency.evict_ev => listener);
-                listener.wait_timeout(EVICT_CHECK_INTERVAL);
-                continue;
-            }
-
-            let mut next_ch = Some(clock_hand.clone());
-            while candidates.len() < target {
-                let Some(ch) = next_ch.take() else {
-                    break;
-                };
-                next_ch = self.residency.collect(ch, |frame_id| {
-                    if let Some(page_guard) = clock_sweep_candidate(&self.frames, frame_id) {
-                        candidates.push(page_guard);
-                        candidates.len() == target
-                    } else {
-                        false
-                    }
-                });
-                if next_ch.is_none() {
-                    break;
-                }
-            }
-
-            if candidates.is_empty() {
-                listener!(self.residency.evict_ev => listener);
-                listener.wait_timeout(EVICT_CHECK_INTERVAL);
-                continue;
-            }
-
-            for page_guard in candidates.drain(..) {
-                self.drop_resident_page(page_guard);
-            }
-
-            if let Some(mut ch) = next_ch {
-                ch.reset();
-                clock_hand = ch;
-            } else {
-                clock_hand.reset();
-            }
-        }
-    }
-
+impl ReadonlyRuntime {
     #[inline]
     fn drop_resident_page(&self, mut page_guard: PageExclusiveGuard<Page>) {
         let frame_id = page_guard.page_id();
@@ -728,7 +724,62 @@ impl ReadonlyBufferPoolEvictor {
     }
 }
 
-unsafe impl Send for ReadonlyBufferPoolEvictor {}
+impl EvictionRuntime for ReadonlyRuntime {
+    #[inline]
+    fn resident_count(&self) -> usize {
+        self.residency.resident_len()
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.residency.capacity()
+    }
+
+    #[inline]
+    fn inflight_evicts(&self) -> usize {
+        0
+    }
+
+    #[inline]
+    fn allocation_failure_rate(&self) -> f64 {
+        self.residency.alloc_failure_rate()
+    }
+
+    #[inline]
+    fn work_listener(&self) -> EventListener {
+        self.residency.evict_ev.listen()
+    }
+
+    #[inline]
+    fn notify_progress(&self) {
+        // no-op for readonly drop-only path.
+    }
+
+    #[inline]
+    fn collect_batch_ids(
+        &self,
+        hand: ClockHand,
+        limit: usize,
+        out: &mut Vec<PageID>,
+    ) -> Option<ClockHand> {
+        self.residency.collect_batch_ids(hand, limit, out)
+    }
+
+    #[inline]
+    fn try_mark_evicting(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
+        clock_sweep_candidate(&self.frames, page_id)
+    }
+
+    #[inline]
+    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>) -> Option<EventListener> {
+        for page_guard in pages {
+            self.drop_resident_page(page_guard);
+        }
+        None
+    }
+}
+
+unsafe impl Send for ReadonlyRuntime {}
 
 /// Per-table readonly wrapper implementing the `BufferPool` contract.
 ///
@@ -766,16 +817,16 @@ impl ReadonlyBufferPool {
         &self,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> FacadePageGuard<T> {
+    ) -> Result<FacadePageGuard<T>> {
         let key = self.cache_key(page_id);
         loop {
             let frame_id = self
                 .global
                 .get_or_load_frame_id(key, &self.table_file)
-                .await;
-            let guard = self.global.get_page_internal(frame_id, mode).await;
+                .await?;
+            let guard = self.global.get_page_internal(frame_id, mode).await?;
             if self.global.validate_guarded_frame_key(&guard, key) {
-                return guard;
+                return Ok(guard);
             }
             self.global
                 .invalidate_stale_mapping_if_same_frame(key, frame_id);
@@ -787,16 +838,16 @@ impl ReadonlyBufferPool {
     /// This helper is intended for runtime call sites that hold `&self`
     /// instead of `&'static self`.
     #[inline]
-    pub(crate) async fn get_page_shared<T: BufferPage>(
+    pub(crate) async fn try_get_page_shared<T: BufferPage>(
         &self,
         page_id: PageID,
-    ) -> PageSharedGuard<T> {
+    ) -> Result<PageSharedGuard<T>> {
         loop {
             let guard = self
                 .get_page_facade::<T>(page_id, LatchFallbackMode::Shared)
-                .await;
+                .await?;
             if let Some(shared) = guard.lock_shared_async().await {
-                return shared;
+                return Ok(shared);
             }
         }
     }
@@ -844,7 +895,12 @@ impl BufferPool for ReadonlyBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
-        self.get_page_facade(page_id, mode).await
+        match self.get_page_facade(page_id, mode).await {
+            Ok(g) => g,
+            Err(err) => {
+                todo!("readonly BufferPool::get_page error policy is deferred: {err}");
+            }
+        }
     }
 
     #[inline]
@@ -896,7 +952,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn frame_page_bytes(cap: usize) -> usize {
-        cap * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
+        cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
     }
 
     fn make_metadata() -> Arc<TableMetadata> {
@@ -942,6 +998,14 @@ mod tests {
         drop(g3);
         assert_eq!(global.invalidate_key(&key), Some(3));
         assert_eq!(global.allocated(), 0);
+    }
+
+    #[test]
+    fn test_global_readonly_pool_rejects_too_small_capacity() {
+        let bytes = (MIN_READONLY_POOL_PAGES - 1)
+            * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
+        let res = GlobalReadonlyBufferPool::with_capacity(bytes);
+        assert!(matches!(res, Err(Error::BufferPoolSizeTooSmall)));
     }
 
     #[test]
@@ -1046,7 +1110,8 @@ mod tests {
             assert_eq!(&page.page()[..6], b"reload");
             drop(page);
 
-            assert_eq!(global.try_get_frame_id(&key), Some(1));
+            let reloaded_frame_id = global.try_get_frame_id(&key).unwrap();
+            assert_ne!(reloaded_frame_id, 0);
             drop(table_file);
             drop(fs);
         });
@@ -1137,6 +1202,36 @@ mod tests {
     }
 
     #[test]
+    fn test_readonly_pool_try_get_page_shared_returns_error() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let table_file = fs.create_table_file(106, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let scope = StaticLifetimeScope::new();
+            let global = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(4)).unwrap(),
+            );
+            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+                106,
+                Arc::clone(&table_file),
+                global.as_static(),
+            )));
+
+            let res = pool.as_static().try_get_page_shared::<Page>(100_000).await;
+            assert!(res.is_err());
+
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
     fn test_readonly_pool_drop_only_eviction_and_reload() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -1147,8 +1242,6 @@ mod tests {
             let table_file = fs.create_table_file(103, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            write_payload(&table_file, 7, b"page-a").await;
-            write_payload(&table_file, 8, b"page-b").await;
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
@@ -1160,26 +1253,43 @@ mod tests {
                 global.as_static(),
             )));
             let pool = pool.as_static();
+            let capacity = global.as_static().capacity();
+            let base_page_id = 7u64;
 
-            let g1: FacadePageGuard<Page> =
-                pool.get_page::<Page>(7, LatchFallbackMode::Shared).await;
-            let g1 = g1.lock_shared_async().await.unwrap();
-            assert_eq!(&g1.page()[..6], b"page-a");
-            drop(g1);
+            // Prepare one more block than cache capacity to force drop-only eviction.
+            for i in 0..=capacity {
+                let page_id = base_page_id + i as u64;
+                let payload = format!("page-{i}");
+                write_payload(&table_file, page_id, payload.as_bytes()).await;
+            }
 
-            let g2: FacadePageGuard<Page> =
-                pool.get_page::<Page>(8, LatchFallbackMode::Shared).await;
-            let g2 = g2.lock_shared_async().await.unwrap();
-            assert_eq!(&g2.page()[..6], b"page-b");
-            drop(g2);
+            for i in 0..=capacity {
+                let page_id = base_page_id + i as u64;
+                let expected = format!("page-{i}");
+                let g: FacadePageGuard<Page> = pool
+                    .get_page::<Page>(page_id, LatchFallbackMode::Shared)
+                    .await;
+                let g = g.lock_shared_async().await.unwrap();
+                assert_eq!(&g.page()[..expected.len()], expected.as_bytes());
+                drop(g);
+            }
 
-            let g3: FacadePageGuard<Page> =
-                pool.get_page::<Page>(7, LatchFallbackMode::Shared).await;
-            let g3 = g3.lock_shared_async().await.unwrap();
-            assert_eq!(&g3.page()[..6], b"page-a");
-            drop(g3);
+            let loaded_count = capacity + 1;
+            let mapped_count = (0..=capacity)
+                .filter(|i| {
+                    let key = ReadonlyCacheKey::new(103, base_page_id + *i as u64);
+                    global.as_static().try_get_frame_id(&key).is_some()
+                })
+                .count();
+            assert!(mapped_count < loaded_count);
 
-            assert_eq!(global.as_static().allocated(), 1);
+            // Reload the first page after cache pressure; this should still return correct data.
+            let g: FacadePageGuard<Page> = pool
+                .get_page::<Page>(base_page_id, LatchFallbackMode::Shared)
+                .await;
+            let g = g.lock_shared_async().await.unwrap();
+            assert_eq!(&g.page()[..6], b"page-0");
+            drop(g);
             drop(table_file);
             drop(fs);
         });
@@ -1246,5 +1356,42 @@ mod tests {
             )));
             let _ = pool.as_static().allocate_page::<Page>().await;
         });
+    }
+
+    #[test]
+    fn test_global_readonly_pool_uses_custom_arbiter_builder() {
+        let scope = StaticLifetimeScope::new();
+        let global = scope.adopt(
+            GlobalReadonlyBufferPool::with_capacity_and_arbiter_builder_static(
+                frame_page_bytes(16),
+                EvictionArbiterBuilder::new()
+                    .target_free(4)
+                    .hysteresis(2)
+                    .failure_rate_threshold(0.01)
+                    .failure_window(7)
+                    .dynamic_batch_bounds(5, 5),
+            )
+            .unwrap(),
+        );
+        let global = global.as_static();
+        let arbiter = global.eviction_arbiter;
+
+        assert_eq!(arbiter.target_free(), 4);
+        assert_eq!(arbiter.hysteresis(), 2);
+        assert_eq!(arbiter.failure_window(), 7);
+
+        // Verify failure-window wiring through readonly residency tracker.
+        for _ in 0..7 {
+            global.residency.record_alloc_failure();
+        }
+        for _ in 0..3 {
+            global.residency.record_alloc_success();
+        }
+        let failure_rate = global.residency.alloc_failure_rate();
+        assert!((failure_rate - (4.0 / 7.0)).abs() < 1e-9);
+
+        // Verify batch bounds/threshold from builder influence decision output.
+        let decision = arbiter.decide(8, global.capacity(), 0, 0.02, 1).unwrap();
+        assert_eq!(decision.batch_size, 5);
     }
 }

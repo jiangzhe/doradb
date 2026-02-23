@@ -39,7 +39,6 @@ dashmap = "6.1"
 [features]
 default = ["libaio"]
 libaio = []
-mlock = []
 
 [dev-dependencies]
 rand = "0.9"

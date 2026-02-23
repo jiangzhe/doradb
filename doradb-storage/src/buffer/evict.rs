@@ -1,11 +1,15 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
+use crate::buffer::evictor::{
+    ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
+    FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
+};
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{
-    ClockHand, clock_collect, clock_sweep_candidate, deallocate_frame_and_page_arrays,
-    frame_total_bytes, initialize_frame_and_page_arrays, madvise_dontneed,
+    deallocate_frame_and_page_arrays, frame_total_bytes, initialize_frame_and_page_arrays,
+    madvise_dontneed,
 };
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
@@ -16,9 +20,9 @@ use crate::io::{
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::lifetime::StaticLifetime;
-use crate::thread;
+use crate::notify::EventNotifyOnDrop;
 use byte_unit::Byte;
-use event_listener::{Event, Listener, listener};
+use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
@@ -28,9 +32,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
-
-const EVICT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 // min buffer pool size is 64KB * 128 = 8MB.
 const MIN_IN_MEM_PAGES: usize = 128;
 
@@ -74,14 +75,16 @@ impl EvictableBufferPool {
     }
 
     #[inline]
-    pub fn new_evictor(&self) -> BufferPoolEvictor {
-        BufferPoolEvictor {
+    fn new_evictor(&self) -> Evictor<EvictableRuntime> {
+        let runtime = EvictableRuntime {
             frames: BufferFrames(self.frames.0),
             in_mem: Arc::clone(&self.in_mem),
             io_client: self.io_client.clone(),
             inflight_io: Arc::clone(&self.inflight_io),
-            shutdown_flag: Arc::clone(&self.shutdown_flag),
-        }
+        };
+        let policy =
+            PressureDeltaClockPolicy::new(self.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
+        Evictor::new(runtime, policy, Arc::clone(&self.shutdown_flag))
     }
 
     /// Returns AIO statistics.
@@ -99,76 +102,132 @@ impl EvictableBufferPool {
 
     /// Try to dispatch read IO on given page.
     /// This method may not succeed, and client should retry.
-    #[allow(clippy::await_holding_lock)]
     #[inline]
     async fn try_dispatch_io_read(&self, page_id: PageID) {
-        // Use sync lock because the critical section is small.
-        // make sure do not await when holding the guard.
-        let mut g = self.inflight_io.map.lock();
-        match g.entry(page_id) {
-            Entry::Vacant(vac) => {
-                // First thread to initialize IO read.
-                // Try lock page for IO.
-                match self.frames.try_lock_page_exclusive(page_id) {
-                    // If page lock can not be acquired, we just retry.
-                    None => (),
-                    Some(page_guard) => {
-                        // Page is locked, so we dispatch read request to IO thread.
-                        if !self.in_mem.try_inc() {
-                            // we do not have memory budget to load the page.
-                            listener!(self.in_mem.load_ev => listener);
-                            // re-check
+        enum DispatchAction {
+            RetryYield,
+            Wait(EventListener),
+            WaitForLoad(EventListener),
+            SendRead {
+                page_guard: PageExclusiveGuard<Page>,
+                done_listener: EventListener,
+            },
+        }
+
+        // Prepare state under lock, then perform async operations after lock release.
+        let action = {
+            let mut g = self.inflight_io.map.lock();
+            match g.entry(page_id) {
+                Entry::Vacant(vac) => {
+                    // First thread to initialize IO read.
+                    match self.frames.try_lock_page_exclusive(page_id) {
+                        // Retry path. Yield after lock release to avoid tight spin.
+                        None => DispatchAction::RetryYield,
+                        Some(page_guard) => {
+                            // Reserve one in-memory slot for this load.
                             if !self.in_mem.try_inc() {
-                                // still no budget.
-                                // we can only wait for signal and retry.
-                                // before waiting, notify evict thread to work.
-                                // this event may be ignored if evict thread is busy.
-                                self.in_mem.evict_ev.notify(1);
-                                // explicitly drop guards before await
-                                drop(page_guard);
-                                drop(g);
-                                listener.await;
-                                self.in_mem.load_ev.notify(1); // notify next reader to retry.
-                                return; // now retry.
+                                let listener = self.in_mem.load_ev.listen();
+                                if !self.in_mem.try_inc() {
+                                    self.in_mem.record_alloc_failure();
+                                    // Still no budget. Ask evictor to work and wait for progress.
+                                    self.in_mem.evict_ev.notify(1);
+                                    drop(page_guard);
+                                    DispatchAction::WaitForLoad(listener)
+                                } else {
+                                    self.in_mem.record_alloc_success();
+                                    let done = Event::new();
+                                    let done_listener = done.listen();
+                                    vac.insert(IOStatus {
+                                        kind: IOKind::Read,
+                                        done: Some(done),
+                                        page_guard: None,
+                                        uio: None,
+                                        batch_done: None,
+                                    });
+                                    self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
+                                    DispatchAction::SendRead {
+                                        page_guard,
+                                        done_listener,
+                                    }
+                                }
+                            } else {
+                                self.in_mem.record_alloc_success();
+                                let done = Event::new();
+                                let done_listener = done.listen();
+                                vac.insert(IOStatus {
+                                    kind: IOKind::Read,
+                                    done: Some(done),
+                                    page_guard: None,
+                                    uio: None,
+                                    batch_done: None,
+                                });
+                                self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
+                                DispatchAction::SendRead {
+                                    page_guard,
+                                    done_listener,
+                                }
                             }
                         }
-                        // we have memory budget now.
-                        let event = Event::new();
-                        let listener = event.listen();
-                        vac.insert(IOStatus {
-                            kind: IOKind::Read,
-                            event: Some(event),
-                            page_guard: None, // will update later
-                            uio: None,
-                        });
-                        self.inflight_io.reads.fetch_add(1, Ordering::AcqRel);
-                        let _ = self
-                            .io_client
-                            .send_async(PoolRequest::Read(page_guard))
-                            .await;
-                        drop(g); // explicitly drop guard before await
-                        listener.await;
                     }
+                }
+                Entry::Occupied(mut occ) => {
+                    let status = occ.get_mut();
+                    let done = status.done.get_or_insert_default();
+                    DispatchAction::Wait(done.listen())
                 }
             }
-            Entry::Occupied(mut occ) => {
-                let status = occ.get_mut();
-                match status.kind {
-                    IOKind::Read | IOKind::ReadWaitForWrite => {
-                        // Wait for existing signal.
-                        let listener = status.event.as_ref().unwrap().listen();
-                        drop(g); // explicitly drop guard before await
-                        listener.await;
+        };
+
+        match action {
+            DispatchAction::RetryYield => {
+                smol::future::yield_now().await;
+            }
+            DispatchAction::Wait(listener) => {
+                listener.await;
+            }
+            DispatchAction::WaitForLoad(listener) => {
+                listener.await;
+                self.in_mem.load_ev.notify(1);
+            }
+            DispatchAction::SendRead {
+                page_guard,
+                done_listener,
+            } => {
+                if let Err(send_err) = self
+                    .io_client
+                    .send_async(PoolRequest::Read(page_guard))
+                    .await
+                {
+                    let failed_req = send_err.0;
+                    let PoolRequest::Read(failed_page_guard) = failed_req else {
+                        unreachable!("unexpected request kind on read-dispatch failure");
+                    };
+                    drop(failed_page_guard);
+
+                    let done = {
+                        let mut g = self.inflight_io.map.lock();
+                        let mut status = g.remove(&page_id).unwrap_or_else(|| {
+                            panic!(
+                                "inflight read entry missing during send rollback: page_id={}",
+                                page_id
+                            )
+                        });
+                        debug_assert!(status.kind == IOKind::Read);
+                        self.inflight_io.reads.fetch_sub(1, Ordering::AcqRel);
+                        // Release memory reservation taken before dispatch.
+                        self.in_mem.dec();
+                        status.done.take()
+                    };
+                    if let Some(done) = done {
+                        done.notify(usize::MAX);
                     }
-                    IOKind::Write => {
-                        // Write IO in progress
-                        let event = Event::new();
-                        let listener = event.listen();
-                        status.event = Some(event);
-                        drop(g); // explicitly drop guard before await
-                        listener.await;
-                    }
+                    self.in_mem.load_ev.notify(1);
+                    unreachable!(
+                        "failed to enqueue read IO request after inflight install; shutdown ordering is violated (page_id={})",
+                        page_id
+                    );
                 }
+                done_listener.await;
             }
         }
     }
@@ -183,7 +242,9 @@ impl EvictableBufferPool {
 
     #[inline]
     fn start_evict_thread(&self) {
-        let handle = self.new_evictor().start_thread();
+        let handle = self
+            .new_evictor()
+            .start_thread("EvictableBufferPoolEvictor");
         let mut g = self.in_mem.evict_thread.lock();
         *g = Some(handle);
     }
@@ -194,15 +255,18 @@ impl EvictableBufferPool {
     #[inline]
     async fn reserve_page(&self) {
         if self.in_mem.try_inc() {
+            self.in_mem.record_alloc_success();
             return;
         }
         // Slow path. Wait for other to release memory.
         loop {
             listener!(self.in_mem.load_ev => listener);
             if self.in_mem.try_inc() {
+                self.in_mem.record_alloc_success();
                 self.in_mem.load_ev.notify(1);
                 return;
             }
+            self.in_mem.record_alloc_failure();
             // Notify evictor thread to work.
             self.in_mem.evict_ev.notify(1);
             listener.await;
@@ -470,6 +534,10 @@ unsafe impl Sync for EvictableBufferPool {}
 
 unsafe impl StaticLifetime for EvictableBufferPool {}
 
+/// IO event-loop adapter for [`EvictableBufferPool`].
+///
+/// It translates high-level pool requests into concrete page IO submissions and
+/// reconciles frame/inflight state on completion.
 pub struct EvictableBufferPoolListener {
     inflight_io: Arc<InflightIO>,
     in_mem: Arc<InMemPageSet>,
@@ -496,10 +564,12 @@ impl AIOEventListener for EvictableBufferPoolListener {
                     page_guard,
                     kind: IOKind::Read,
                     uio,
+                    batch_done: None,
                 };
                 queue.push(iocb, sub);
             }
-            PoolRequest::BatchWrite(page_guards) => {
+            PoolRequest::BatchWrite(page_guards, done_ev) => {
+                let done_ev = Arc::new(done_ev);
                 for mut page_guard in page_guards {
                     let page_id = page_guard.page_id();
                     debug_assert!(self.inflight_io.contains(page_id));
@@ -510,6 +580,7 @@ impl AIOEventListener for EvictableBufferPoolListener {
                         page_guard,
                         kind: IOKind::Write,
                         uio,
+                        batch_done: Some(Arc::clone(&done_ev)),
                     };
                     queue.push(iocb, req);
                 }
@@ -537,31 +608,34 @@ impl AIOEventListener for EvictableBufferPoolListener {
                 let mut status = g.remove(&page_id).unwrap();
                 let _uio = status.uio.take().unwrap();
                 let page_guard = status.page_guard.take().unwrap();
+                let batch_done = status.batch_done.take();
                 let bf = page_guard.bf();
                 match status.kind {
                     IOKind::Read => {
+                        debug_assert!(batch_done.is_none());
                         debug_assert!(bf.kind() == FrameKind::Evicted);
                         bf.set_dirty(false);
                         bf.compare_exchange_kind(FrameKind::Evicted, FrameKind::Hot);
-                        let event = status.event.take();
+                        let done = status.done.take();
                         self.inflight_io.reads.fetch_sub(1, Ordering::Relaxed);
                         self.in_mem.pin(page_id);
                         drop(page_guard);
-                        if let Some(event) = event {
-                            event.notify(usize::MAX);
+                        if let Some(done) = done {
+                            done.notify(usize::MAX);
                         }
                         drop(g);
                         AIOKind::Read
                     }
                     IOKind::Write => {
                         debug_assert!(bf.kind() == FrameKind::Evicting);
-                        let event = status.event.take();
+                        let done = status.done.take();
                         self.inflight_io.writes.fetch_sub(1, Ordering::Relaxed);
                         self.in_mem.evict_page(page_guard);
-                        if let Some(event) = event {
-                            event.notify(usize::MAX);
+                        if let Some(done) = done {
+                            done.notify(usize::MAX);
                         }
                         drop(g);
+                        drop(batch_done);
                         AIOKind::Write
                     }
                     IOKind::ReadWaitForWrite => {
@@ -573,14 +647,6 @@ impl AIOEventListener for EvictableBufferPoolListener {
             Err(err) => {
                 unimplemented!("AIO error: page_id={}, {}", key, err)
             }
-        }
-    }
-
-    #[inline]
-    fn on_batch_complete(&mut self, _read_count: usize, write_count: usize) {
-        if write_count > 0 {
-            // notify readers which wait for any inflight write.
-            self.inflight_io.writes_finish_ev.notify(1);
         }
     }
 
@@ -628,179 +694,131 @@ impl AIOEventListener for EvictableBufferPoolListener {
     }
 }
 
-pub struct BufferPoolEvictor {
+struct EvictableRuntime {
     frames: BufferFrames,
     in_mem: Arc<InMemPageSet>,
     inflight_io: Arc<InflightIO>,
     io_client: AIOClient<PoolRequest>,
-    shutdown_flag: Arc<AtomicBool>,
 }
 
-impl BufferPoolEvictor {
+impl EvictableRuntime {
     #[inline]
-    pub fn start_thread(self) -> JoinHandle<()> {
-        thread::spawn_named("BufferPoolEvictor", move || self.run())
+    fn dispatch_io_writes(&self, page_guards: Vec<PageExclusiveGuard<Page>>) -> EventListener {
+        self.inflight_io.batch_writes(&page_guards);
+        let done_ev = EventNotifyOnDrop::new();
+        let listener = done_ev.listen();
+        let _ = self
+            .io_client
+            .send(PoolRequest::BatchWrite(page_guards, done_ev));
+        listener
+    }
+}
+
+impl EvictionRuntime for EvictableRuntime {
+    #[inline]
+    fn resident_count(&self) -> usize {
+        self.in_mem.count.load(Ordering::Acquire)
     }
 
     #[inline]
-    fn run(self) {
-        const EVICT_BATCH: usize = 64;
-        const SMALL_BATCH: usize = 8;
-        // Used to store temporary page ids to avoid lock in-mem page set too long.
-        let mut tmp_page_ids = vec![];
-        let mut evict_candidates = vec![];
-        let mut clock_hand = ClockHand::default();
-        loop {
-            if self.shutdown_flag.load(Ordering::Acquire) {
-                return;
-            }
+    fn capacity(&self) -> usize {
+        self.in_mem.max_count
+    }
 
-            let mut batch_size = match self.in_mem.pages_to_evict() {
-                Some(n) => n.min(EVICT_BATCH),
-                None => {
-                    listener!(self.in_mem.evict_ev => listener);
-                    // re-check
-                    match self.in_mem.pages_to_evict() {
-                        Some(n) => n.min(EVICT_BATCH),
-                        None => {
-                            // Because we don't specify wait timeout,
-                            // we need to check shutdown flag in case
-                            // the event is missed.
-                            if self.shutdown_flag.load(Ordering::Acquire) {
-                                return;
-                            }
-                            // Before waiting, check if there are any free space
-                            // for page loading. And let readers to continue.
-                            let in_mem_count = self.in_mem.count.load(Ordering::Acquire);
-                            if in_mem_count < self.in_mem.max_count {
-                                self.in_mem.load_ev.notify(1);
-                            }
-                            listener.wait();
-                            continue;
-                        }
-                    }
-                }
-            };
+    #[inline]
+    fn inflight_evicts(&self) -> usize {
+        self.inflight_io.writes.load(Ordering::Relaxed)
+    }
 
-            // There might be IO writes in-progress and queued,
-            // we should ignore these numbers.
-            batch_size = batch_size.saturating_sub(self.inflight_io.writes.load(Ordering::Relaxed));
-            if batch_size == 0 {
-                // Unnecessary to evict more pages because many page evictions are in progress.
-                listener!(self.in_mem.evict_ev => listener);
-                // Always wait a moment and re-check if eviction is required.
-                listener.wait_timeout(EVICT_CHECK_INTERVAL);
-                continue;
-            }
+    #[inline]
+    fn allocation_failure_rate(&self) -> f64 {
+        self.in_mem.alloc_failure_rate()
+    }
 
-            // Start eviction.
-            let mut next_ch = None;
-            // Iterate over all pages twice.
-            'SWEEP: for _ in 0..2 {
-                next_ch = Some(clock_hand.clone());
-                while let Some(ch) = next_ch.take() {
-                    if batch_size <= SMALL_BATCH {
-                        next_ch = self.in_mem.clock_collect(ch, |page_id| {
-                            if let Some(page_guard) = self.clock_sweep(page_id) {
-                                evict_candidates.push(page_guard);
-                                batch_size -= 1;
-                                batch_size == 0
-                            } else {
-                                false
-                            }
-                        });
-                    } else {
-                        tmp_page_ids.clear();
-                        next_ch = self.in_mem.clock_collect(ch, |page_id| {
-                            tmp_page_ids.push(page_id);
-                            tmp_page_ids.len() == batch_size
-                        });
-                        for page_id in tmp_page_ids.drain(..) {
-                            if let Some(page_guard) = self.clock_sweep(page_id) {
-                                evict_candidates.push(page_guard);
-                                batch_size -= 1;
-                            }
-                        }
-                    }
-                    if batch_size == 0 {
-                        break 'SWEEP;
-                    }
-                }
-            }
+    #[inline]
+    fn work_listener(&self) -> EventListener {
+        self.in_mem.evict_ev.listen()
+    }
 
-            // Send all evict candidates to IO thread
-            if evict_candidates.is_empty() {
-                // Because we don't find any evict candidate, we can wait sometime
-                // to avoid busy loop
-                listener!(self.in_mem.evict_ev => listener);
-                listener.wait_timeout(EVICT_CHECK_INTERVAL);
-                continue;
-            }
-            // If the page is not dirty, we can directly drop it.
-            // This will largely reduce IO pressure.
-            let mut page_guards = vec![];
-            for page_guard in mem::take(&mut evict_candidates) {
-                if page_guard.is_dirty() {
-                    page_guards.push(page_guard);
-                } else {
-                    // Page is not dirty means it's a read-only copy of the data on disk.
-                    // So we can directly remove it from memory without IO write.
-                    // But concurrent readers may rely on the status updated in inflight
-                    // IO map. So we lock the map when updating frame kind.
-                    let g = self.inflight_io.map.lock();
-                    debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
-                    self.in_mem.evict_page(page_guard);
-                    drop(g);
-                }
-            }
-
-            if page_guards.is_empty() {
-                continue;
-            }
-
-            listener!(self.inflight_io.writes_finish_ev => writes_finish);
-            self.dispatch_io_writes(page_guards);
-
-            // To void busy we always wait for at least one write finish.
-            // Because we don't specify wait timeout,
-            // we need to check shutdown flag in case
-            // the event is missed.
-            if self.shutdown_flag.load(Ordering::Acquire) {
-                return;
-            }
-            writes_finish.wait();
-
-            // update clock hand.
-            if let Some(mut ch) = next_ch {
-                ch.reset();
-                clock_hand = ch;
-            } else {
-                clock_hand.reset();
-            }
+    #[inline]
+    fn notify_progress(&self) {
+        let in_mem_count = self.in_mem.count.load(Ordering::Acquire);
+        if in_mem_count < self.in_mem.max_count {
+            self.in_mem.load_ev.notify(1);
         }
     }
 
     #[inline]
-    fn dispatch_io_writes(&self, page_guards: Vec<PageExclusiveGuard<Page>>) {
-        self.inflight_io.batch_writes(&page_guards);
-        let _ = self.io_client.send(PoolRequest::BatchWrite(page_guards));
+    fn collect_batch_ids(
+        &self,
+        hand: ClockHand,
+        limit: usize,
+        out: &mut Vec<PageID>,
+    ) -> Option<ClockHand> {
+        self.in_mem.collect_batch_ids(hand, limit, out)
     }
 
     #[inline]
-    fn clock_sweep(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
+    fn try_mark_evicting(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
         clock_sweep_candidate(&self.frames, page_id)
+    }
+
+    #[inline]
+    fn execute(&self, pages: Vec<PageExclusiveGuard<Page>>) -> Option<EventListener> {
+        let mut dirty_pages = vec![];
+        for page_guard in pages {
+            if page_guard.is_dirty() {
+                dirty_pages.push(page_guard);
+            } else {
+                // Page is a read-only copy of disk content.
+                // Keep inflight map ordering consistent with write path.
+                let page_id = page_guard.page_id();
+                let waiter_done = {
+                    let mut g = self.inflight_io.map.lock();
+                    let waiter_done = if matches!(
+                        g.get(&page_id).map(|status| status.kind),
+                        Some(IOKind::ReadWaitForWrite)
+                    ) {
+                        let mut status = g.remove(&page_id).unwrap();
+                        debug_assert!(status.page_guard.is_none());
+                        debug_assert!(status.uio.is_none());
+                        debug_assert!(status.batch_done.is_none());
+                        status.done.take()
+                    } else {
+                        if let Some(status) = g.get(&page_id) {
+                            debug_assert!(status.kind != IOKind::Write);
+                        }
+                        None
+                    };
+                    debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                    self.in_mem.evict_page(page_guard);
+                    waiter_done
+                };
+                if let Some(done) = waiter_done {
+                    done.notify(usize::MAX);
+                }
+            }
+        }
+
+        if dirty_pages.is_empty() {
+            return None;
+        }
+
+        Some(self.dispatch_io_writes(dirty_pages))
     }
 }
 
-unsafe impl Send for BufferPoolEvictor {}
+unsafe impl Send for EvictableRuntime {}
 
 struct InMemPageSet {
     // Current page number held in memory.
     count: AtomicUsize,
     // Maximum page number held in memory.
     max_count: usize,
-    // Evict threshold.
-    evict_threshold: usize,
+    // Shared pressure-delta eviction arbiter.
+    eviction_arbiter: EvictionArbiter,
+    // Sliding-window allocation failure tracker.
+    alloc_failures: FailureRateTracker,
     // Ordered page id set, used for evict thread.
     set: Mutex<BTreeSet<PageID>>,
     // Event to notify thread that loading a page is available.
@@ -813,13 +831,12 @@ struct InMemPageSet {
 
 impl InMemPageSet {
     #[inline]
-    fn new(max_count: usize) -> Self {
-        const EVICT_THRESHOLD: f64 = 0.9;
-        let evict_threshold = (max_count as f64 * EVICT_THRESHOLD) as usize;
+    fn new(max_count: usize, eviction_arbiter: EvictionArbiter) -> Self {
         InMemPageSet {
             count: AtomicUsize::new(0),
             max_count,
-            evict_threshold,
+            alloc_failures: FailureRateTracker::new(eviction_arbiter.failure_window()),
+            eviction_arbiter,
             set: Mutex::new(BTreeSet::new()),
             load_ev: Event::new(),
             evict_ev: Event::new(),
@@ -857,31 +874,31 @@ impl InMemPageSet {
         }
     }
 
-    /// Returns number of pages which would be evicted.
+    /// Returns current failure rate in allocation attempts.
     #[inline]
-    fn pages_to_evict(&self) -> Option<usize> {
-        let curr_count = self.count.load(Ordering::Acquire);
-        if curr_count < MIN_IN_MEM_PAGES / 2 {
-            // do not evict if page count is too small.
-            return None;
-        } else if curr_count > self.evict_threshold {
-            return Some(curr_count - self.evict_threshold);
-        }
-        None
+    fn alloc_failure_rate(&self) -> f64 {
+        self.alloc_failures.failure_rate()
+    }
+
+    #[inline]
+    fn record_alloc_success(&self) {
+        self.alloc_failures.record_success();
+    }
+
+    #[inline]
+    fn record_alloc_failure(&self) {
+        self.alloc_failures.record_failure();
     }
 
     /// Pin given page in memory.
-    /// Use mlock() to prevent page to swap out to disk.
     #[inline]
     fn pin(&self, page_id: PageID) {
-        // assert!(mlock(ptr as *mut u8, PAGE_SIZE));
         let mut g = self.set.lock();
         g.insert(page_id);
     }
 
     #[inline]
     fn unpin(&self, page_id: PageID) {
-        // assert!(munlock(ptr as *mut u8, PAGE_SIZE));
         let mut g = self.set.lock();
         g.remove(&page_id);
     }
@@ -913,13 +930,14 @@ impl InMemPageSet {
     }
 
     #[inline]
-    fn clock_collect<F: FnMut(PageID) -> bool>(
+    fn collect_batch_ids(
         &self,
         clock_hand: ClockHand,
-        mut callback: F,
+        limit: usize,
+        out: &mut Vec<PageID>,
     ) -> Option<ClockHand> {
         let g = self.set.lock();
-        clock_collect(&g, clock_hand, &mut callback)
+        clock_collect_batch(&g, clock_hand, limit, out)
     }
 
     #[inline]
@@ -935,6 +953,7 @@ impl InMemPageSet {
     }
 }
 
+/// Thin wrapper for sparse-file page IO used by the evictable pool.
 pub struct SingleFileIO {
     file: SparseFile,
 }
@@ -975,12 +994,17 @@ const DEFAULT_MAX_FILE_SIZE: Byte = Byte::from_u64(2 * 1024 * 1024 * 1024); // b
 const DEFAULT_MAX_MEM_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // by default 1GB
 const DEFAULT_MAX_IO_DEPTH: usize = 64;
 
+/// Builder-style configuration for [`EvictableBufferPool`].
+///
+/// Besides file and memory sizing, this type carries eviction-arbiter tuning
+/// used to build the background evictor policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvictableBufferPoolConfig {
     file_path: String,
     max_file_size: Byte,
     max_mem_size: Byte,
     max_io_depth: usize,
+    eviction_arbiter_builder: EvictionArbiterBuilder,
 }
 
 impl Default for EvictableBufferPoolConfig {
@@ -991,6 +1015,7 @@ impl Default for EvictableBufferPoolConfig {
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             max_mem_size: DEFAULT_MAX_MEM_SIZE,
             max_io_depth: DEFAULT_MAX_IO_DEPTH,
+            eviction_arbiter_builder: EvictionArbiter::builder(),
         }
     }
 }
@@ -1034,6 +1059,49 @@ impl EvictableBufferPoolConfig {
     }
 
     #[inline]
+    pub fn eviction_arbiter_builder(
+        mut self,
+        eviction_arbiter_builder: EvictionArbiterBuilder,
+    ) -> Self {
+        self.eviction_arbiter_builder = eviction_arbiter_builder;
+        self
+    }
+
+    #[inline]
+    pub fn target_free(mut self, target_free: usize) -> Self {
+        self.eviction_arbiter_builder = self.eviction_arbiter_builder.target_free(target_free);
+        self
+    }
+
+    #[inline]
+    pub fn hysteresis(mut self, hysteresis: usize) -> Self {
+        self.eviction_arbiter_builder = self.eviction_arbiter_builder.hysteresis(hysteresis);
+        self
+    }
+
+    #[inline]
+    pub fn failure_rate_threshold(mut self, threshold: f64) -> Self {
+        self.eviction_arbiter_builder = self
+            .eviction_arbiter_builder
+            .failure_rate_threshold(threshold);
+        self
+    }
+
+    #[inline]
+    pub fn failure_window(mut self, window: usize) -> Self {
+        self.eviction_arbiter_builder = self.eviction_arbiter_builder.failure_window(window);
+        self
+    }
+
+    #[inline]
+    pub fn dynamic_batch_bounds(mut self, min_batch: usize, max_batch: usize) -> Self {
+        self.eviction_arbiter_builder = self
+            .eviction_arbiter_builder
+            .dynamic_batch_bounds(min_batch, max_batch);
+        self
+    }
+
+    #[inline]
     pub fn build(self) -> Result<EvictableBufferPool> {
         // 1. Calculate memory usage.
         let max_file_size = self.max_file_size.as_u64() as usize;
@@ -1054,6 +1122,7 @@ impl EvictableBufferPoolConfig {
         if max_nbr_in_mem < MIN_IN_MEM_PAGES {
             return Err(Error::BufferPoolSizeTooSmall);
         }
+        let eviction_arbiter = self.eviction_arbiter_builder.build(max_nbr_in_mem);
 
         // 2. Initialize memory of frames and pages.
         let (frames, pages) = unsafe { initialize_frame_and_page_arrays(max_nbr)? };
@@ -1073,7 +1142,7 @@ impl EvictableBufferPoolConfig {
             io_client,
             io_thread: Mutex::new(None),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
-            in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem)),
+            in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             inflight_io: Arc::new(InflightIO::default()),
             stats: Arc::new(EvictableBufferPoolStats::default()),
         };
@@ -1096,16 +1165,16 @@ impl EvictableBufferPoolConfig {
 
 struct IOStatus {
     kind: IOKind,
-    event: Option<Event>,
+    // Per-page completion event for readers waiting on this specific page IO.
+    done: Option<Event>,
     page_guard: Option<PageExclusiveGuard<Page>>,
     uio: Option<UnsafeAIO>,
+    // Shared batch-level completion token for writeback selected in one eviction pass.
+    batch_done: Option<Arc<EventNotifyOnDrop>>,
 }
 
 struct InflightIO {
     map: Mutex<HashMap<PageID, IOStatus>>,
-    // Signal to notify map change on IO writes.
-    // writes_submit_signal: Signal,
-    writes_finish_ev: Event,
     reads: AtomicUsize,
     writes: AtomicUsize,
 }
@@ -1115,8 +1184,6 @@ impl Default for InflightIO {
     fn default() -> Self {
         InflightIO {
             map: Mutex::new(HashMap::new()),
-            // writes_submit_signal: Signal::default(),
-            writes_finish_ev: Event::new(),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
         }
@@ -1141,9 +1208,10 @@ impl InflightIO {
                         let listener = event.listen();
                         vac.insert(IOStatus {
                             kind: IOKind::ReadWaitForWrite,
-                            event: Some(event),
+                            done: Some(event),
                             page_guard: None, // will update later.
                             uio: None,
+                            batch_done: None,
                         });
                         drop(g); // explicit drop guard before await.
                         listener.await;
@@ -1163,8 +1231,8 @@ impl InflightIO {
                     let kind = occ.get().kind;
                     kind == IOKind::ReadWaitForWrite || kind == IOKind::Write
                 });
-                let event = occ.get_mut().event.get_or_insert_default();
-                let listener = event.listen();
+                let done = occ.get_mut().done.get_or_insert_default();
+                let listener = done.listen();
                 drop(g); // explicitly drop guard before await.
                 listener.await;
             }
@@ -1181,9 +1249,10 @@ impl InflightIO {
                 Entry::Vacant(vac) => {
                     vac.insert(IOStatus {
                         kind: IOKind::Write,
-                        event: None,
+                        done: None,
                         page_guard: None, // will update later.
                         uio: None,
+                        batch_done: None,
                     });
                 }
                 Entry::Occupied(mut occ) => {
@@ -1203,6 +1272,7 @@ impl InflightIO {
             page_guard,
             uio,
             kind: _,
+            batch_done,
         } = page_io;
         let page_id = page_guard.page_id();
         let mut g = self.map.lock();
@@ -1211,6 +1281,12 @@ impl InflightIO {
             debug_assert!(res.is_none());
             let res = status.uio.replace(uio);
             debug_assert!(res.is_none());
+            if let Some(batch_done) = batch_done {
+                let res = status.batch_done.replace(batch_done);
+                debug_assert!(res.is_none());
+            } else {
+                debug_assert!(status.batch_done.is_none());
+            }
             return true;
         }
         false
@@ -1223,6 +1299,7 @@ impl InflightIO {
     }
 }
 
+/// Runtime counters for evictable-pool IO scheduling and completion.
 #[derive(Default)]
 pub struct EvictableBufferPoolStats {
     running: AtomicUsize,
@@ -1235,9 +1312,13 @@ pub struct EvictableBufferPoolStats {
     io_wait_nanos: AtomicUsize,
 }
 
+/// Internal request channel payload consumed by the IO event loop.
+///
+/// `Read` schedules a single-page load; `BatchWrite` schedules writeback for a
+/// batch of dirty pages selected by eviction.
 pub enum PoolRequest {
     Read(PageExclusiveGuard<Page>),
-    BatchWrite(Vec<PageExclusiveGuard<Page>>),
+    BatchWrite(Vec<PageExclusiveGuard<Page>>, EventNotifyOnDrop),
 }
 
 #[cfg(test)]
@@ -1465,12 +1546,12 @@ mod tests {
                         let g = pool.allocate_page::<RowPage>().await;
                         pages.push(g.page_id());
                         println!(
-                            "thread {} alloc page end page_id {}, allocated {}, in-mem {}, threshold {}, reads {}, writes {}",
+                            "thread {} alloc page end page_id {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
                             thread_id,
                             g.page_id(),
                             pool.allocated(),
                             pool.in_mem.count.load(Ordering::Relaxed),
-                            pool.in_mem.evict_threshold,
+                            pool.in_mem.eviction_arbiter.target_free(),
                             pool.inflight_io.reads.load(Ordering::Relaxed),
                             pool.inflight_io.writes.load(Ordering::Relaxed),
                         );
@@ -1480,12 +1561,12 @@ mod tests {
                             // choose one page and try to lock it.
                             let page_id = pages.choose(&mut rng).cloned().unwrap();
                             println!(
-                                "thread {} read page {}, allocated {}, in-mem {}, threshold {}, reads {}, writes {}",
+                                "thread {} read page {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
                                 thread_id,
                                 page_id,
                                 pool.allocated(),
                                 pool.in_mem.count.load(Ordering::Relaxed),
-                                pool.in_mem.evict_threshold,
+                                pool.in_mem.eviction_arbiter.target_free(),
                                 pool.inflight_io.reads.load(Ordering::Relaxed),
                                 pool.inflight_io.writes.load(Ordering::Relaxed),
                             );
@@ -1504,5 +1585,49 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_evict_buffer_pool_uses_custom_arbiter_builder() {
+        let temp_dir = TempDir::new().unwrap();
+        let scope = StaticLifetimeScope::new();
+        let pool = scope.adopt(
+            EvictableBufferPoolConfig::default()
+                .with_main_dir(temp_dir.path())
+                .max_mem_size(1024u64 * 1024 * 10)
+                .max_file_size(1024u64 * 1024 * 16)
+                .eviction_arbiter_builder(
+                    EvictionArbiterBuilder::new()
+                        .target_free(2)
+                        .hysteresis(1)
+                        .failure_rate_threshold(0.05)
+                        .failure_window(5)
+                        .dynamic_batch_bounds(3, 3),
+                )
+                .build_static()
+                .unwrap(),
+        );
+        let pool = pool.as_static();
+        let arbiter = pool.in_mem.eviction_arbiter;
+
+        assert_eq!(arbiter.target_free(), 2);
+        assert_eq!(arbiter.hysteresis(), 1);
+        assert_eq!(arbiter.failure_window(), 5);
+
+        // Verify failure-window wiring through the in-mem tracker.
+        for _ in 0..5 {
+            pool.in_mem.record_alloc_failure();
+        }
+        for _ in 0..2 {
+            pool.in_mem.record_alloc_success();
+        }
+        let failure_rate = pool.in_mem.alloc_failure_rate();
+        assert!((failure_rate - (3.0 / 5.0)).abs() < 1e-9);
+
+        // Verify batch bounds/threshold from builder influence decision output.
+        let decision = arbiter
+            .decide(pool.in_mem.max_count / 2, pool.in_mem.max_count, 0, 0.10, 1)
+            .unwrap();
+        assert_eq!(decision.batch_size, 3);
     }
 }

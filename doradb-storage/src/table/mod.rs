@@ -455,7 +455,7 @@ impl Table {
         row_id: RowID,
         read_set: &[usize],
     ) -> Result<Option<Vec<Val>>> {
-        let page_guard = self.disk_pool.get_page_shared::<Page>(page_id).await;
+        let page_guard = self.disk_pool.try_get_page_shared::<Page>(page_id).await?;
         let page = LwcPage::try_from_bytes(page_guard.page())?;
         let Some(row_idx) = page.row_idx(row_id) else {
             return Ok(None);

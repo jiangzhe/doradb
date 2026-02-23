@@ -603,9 +603,6 @@ pub trait AIOEventListener {
     /// In such way, the caller always keeps the buffer in valid state.
     fn on_complete(&mut self, key: AIOKey, res: std::io::Result<usize>) -> AIOKind;
 
-    /// Called when multiple IOs completed.
-    fn on_batch_complete(&mut self, read_count: usize, write_count: usize);
-
     /// Called when stats is collected.
     fn on_stats(&mut self, stats: &AIOStats);
 
@@ -784,7 +781,6 @@ impl<T> AIOEventLoop<T> {
                 let (read_count, write_count) =
                     self.ctx
                         .wait_at_least(&mut results, 1, |key, res| listener.on_complete(key, res));
-                listener.on_batch_complete(read_count, write_count);
                 self.submitted -= read_count + write_count;
                 (
                     1,
@@ -883,7 +879,6 @@ impl<T> AIOEventLoop<T> {
                     while let Ok(completion) = completion_rx.try_recv() {
                         handle_completion(completion);
                     }
-                    listener.on_batch_complete(read_count, write_count);
                     self.submitted -= read_count + write_count;
                     (
                         1,
@@ -913,52 +908,6 @@ impl<T> AIOEventLoop<T> {
         }
         listener.end_loop(&self.ctx);
     }
-}
-
-/// mlock.
-///
-/// # Safety
-///
-/// Wrapper of mlock.
-#[cfg(feature = "mlock")]
-#[inline]
-pub unsafe fn mlock(ptr: *mut u8, len: usize) -> bool {
-    let res = libc::mlock(ptr as *const libc::c_void, len);
-    res == 0
-}
-
-/// mlock.
-///
-/// # Safety
-///
-/// Wrapper of mlock.
-#[cfg(not(feature = "mlock"))]
-#[inline]
-pub unsafe fn mlock(_ptr: *mut u8, _len: usize) -> bool {
-    true
-}
-
-/// munlock.
-///
-/// # Safety
-///
-/// Wrapper of munlock.
-#[cfg(feature = "mlock")]
-#[inline]
-pub unsafe fn munlock(ptr: *mut u8, len: usize) -> bool {
-    let res = libc::munlock(ptr as *const libc::c_void, len);
-    res == 0
-}
-
-/// munlock.
-///
-/// # Safety
-///
-/// Wrapper of munlock.
-#[cfg(not(feature = "mlock"))]
-#[inline]
-pub unsafe fn munlock(_ptr: *mut u8, _len: usize) -> bool {
-    true
 }
 
 #[inline]
@@ -1165,10 +1114,6 @@ mod tests {
                     panic!("{:?}", err);
                 }
             }
-        }
-
-        fn on_batch_complete(&mut self, read_count: usize, write_count: usize) {
-            println!("reads {}, writes {}", read_count, write_count);
         }
 
         fn on_stats(&mut self, stats: &AIOStats) {
