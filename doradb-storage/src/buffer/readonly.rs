@@ -1328,4 +1328,41 @@ mod tests {
             let _ = pool.as_static().allocate_page::<Page>().await;
         });
     }
+
+    #[test]
+    fn test_global_readonly_pool_uses_custom_arbiter_builder() {
+        let scope = StaticLifetimeScope::new();
+        let global = scope.adopt(
+            GlobalReadonlyBufferPool::with_capacity_and_arbiter_builder_static(
+                frame_page_bytes(16),
+                EvictionArbiterBuilder::new()
+                    .target_free(4)
+                    .hysteresis(2)
+                    .failure_rate_threshold(0.01)
+                    .failure_window(7)
+                    .dynamic_batch_bounds(5, 5),
+            )
+            .unwrap(),
+        );
+        let global = global.as_static();
+        let arbiter = global.eviction_arbiter;
+
+        assert_eq!(arbiter.target_free(), 4);
+        assert_eq!(arbiter.hysteresis(), 2);
+        assert_eq!(arbiter.failure_window(), 7);
+
+        // Verify failure-window wiring through readonly residency tracker.
+        for _ in 0..7 {
+            global.residency.record_alloc_failure();
+        }
+        for _ in 0..3 {
+            global.residency.record_alloc_success();
+        }
+        let failure_rate = global.residency.alloc_failure_rate();
+        assert!((failure_rate - (4.0 / 7.0)).abs() < 1e-9);
+
+        // Verify batch bounds/threshold from builder influence decision output.
+        let decision = arbiter.decide(8, global.capacity(), 0, 0.02, 1).unwrap();
+        assert_eq!(decision.batch_size, 5);
+    }
 }

@@ -1537,4 +1537,48 @@ mod tests {
             h.join().unwrap();
         }
     }
+
+    #[test]
+    fn test_evict_buffer_pool_uses_custom_arbiter_builder() {
+        let temp_dir = TempDir::new().unwrap();
+        let scope = StaticLifetimeScope::new();
+        let pool = scope.adopt(
+            EvictableBufferPoolConfig::default()
+                .with_main_dir(temp_dir.path())
+                .max_mem_size(1024u64 * 1024 * 10)
+                .max_file_size(1024u64 * 1024 * 16)
+                .eviction_arbiter_builder(
+                    EvictionArbiterBuilder::new()
+                        .target_free(2)
+                        .hysteresis(1)
+                        .failure_rate_threshold(0.05)
+                        .failure_window(5)
+                        .dynamic_batch_bounds(3, 3),
+                )
+                .build_static()
+                .unwrap(),
+        );
+        let pool = pool.as_static();
+        let arbiter = pool.in_mem.eviction_arbiter;
+
+        assert_eq!(arbiter.target_free(), 2);
+        assert_eq!(arbiter.hysteresis(), 1);
+        assert_eq!(arbiter.failure_window(), 5);
+
+        // Verify failure-window wiring through the in-mem tracker.
+        for _ in 0..5 {
+            pool.in_mem.record_alloc_failure();
+        }
+        for _ in 0..2 {
+            pool.in_mem.record_alloc_success();
+        }
+        let failure_rate = pool.in_mem.alloc_failure_rate();
+        assert!((failure_rate - (3.0 / 5.0)).abs() < 1e-9);
+
+        // Verify batch bounds/threshold from builder influence decision output.
+        let decision = arbiter
+            .decide(pool.in_mem.max_count / 2, pool.in_mem.max_count, 0, 0.10, 1)
+            .unwrap();
+        assert_eq!(decision.batch_size, 3);
+    }
 }

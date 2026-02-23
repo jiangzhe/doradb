@@ -760,4 +760,46 @@ mod tests {
         let decision = arbiter.decide(50, 100, 8, 0.9, 1).unwrap();
         assert!(decision.batch_size < 40);
     }
+
+    #[test]
+    fn test_arbiter_builder_normalizes_invalid_inputs() {
+        let arbiter = EvictionArbiterBuilder::new()
+            .target_free_ratio(f64::NAN)
+            .hysteresis_ratio(f64::INFINITY)
+            .failure_rate_threshold(2.0)
+            .failure_window(0)
+            .dynamic_batch_bounds(0, 0)
+            .build(10);
+
+        // target_free_ratio falls back to default (0.10), then min-clamped to 1.
+        assert_eq!(arbiter.target_free, 1);
+        // hysteresis_ratio is clamped to 1.0, so hysteresis becomes target_free.
+        assert_eq!(arbiter.hysteresis, 1);
+        assert_eq!(arbiter.failure_rate_threshold, 1.0);
+        assert_eq!(arbiter.failure_window, 1);
+        assert_eq!(arbiter.min_batch, 1);
+        assert_eq!(arbiter.max_batch, 1);
+    }
+
+    #[test]
+    fn test_arbiter_builder_respects_explicit_values() {
+        let arbiter = EvictionArbiterBuilder::new()
+            .target_free(7)
+            .target_free_ratio(0.95)
+            .hysteresis(5)
+            .hysteresis_ratio(0.8)
+            .failure_rate_threshold(0.42)
+            .failure_window(17)
+            .dynamic_batch_bounds(9, 4)
+            .build(100);
+
+        // Absolute fields override ratio-derived defaults.
+        assert_eq!(arbiter.target_free, 7);
+        assert_eq!(arbiter.hysteresis, 5);
+        assert_eq!(arbiter.failure_rate_threshold, 0.42);
+        assert_eq!(arbiter.failure_window, 17);
+        // max_batch is normalized to be at least min_batch.
+        assert_eq!(arbiter.min_batch, 9);
+        assert_eq!(arbiter.max_batch, 9);
+    }
 }
