@@ -23,7 +23,7 @@ All pool implementations share these core ideas:
 
 ## FixedBufferPool
 
-`FixedBufferPool` is a non-evicting metadata/index pool.
+`FixedBufferPool` is a non-evicting metadata pool.
 
 Characteristics:
 
@@ -34,7 +34,6 @@ Characteristics:
 Typical usage:
 
 1. metadata pages
-2. index structure pages
 
 ## EvictableBufferPool
 
@@ -62,11 +61,19 @@ Eviction behavior is controlled by shared `EvictionArbiter`:
 4. `failure_window`
 5. `min_batch` / `max_batch`
 
+`EvictableBufferPool` and readonly pools use the same eviction policy and tuning
+fields, but have different runtime eviction behaviors. `EvictableBufferPool` may
+need writeback before dropping dirty pages.
+
 Decision rule:
 
 1. Trigger when `free_frames < target_free` OR allocation-failure rate reaches threshold.
 2. Stop when `free_frames >= target_free + hysteresis` AND failure-rate drops below threshold.
 3. Dynamic batch size scales with pressure and stays inside configured bounds.
+
+Primary usage:
+
+1. in-memory row store pages
 
 ## GlobalReadonlyBufferPool + ReadonlyBufferPool
 
@@ -97,6 +104,14 @@ This preserves cache hits across root swaps when physical blocks are unchanged.
 Readonly-specific accessors return `Result` for recoverable miss/load errors.  
 The generic `BufferPool` trait boundary still has deferred error policy and uses explicit `todo!()` for unresolved mapping decisions.
 
+### Read Latching and Optimization Opportunity
+
+Readonly page access currently acquires shared lock on each page.
+
+Because all pages in readonly pool are immutable, this can be optimized in future
+to a lock-free read path, as long as frame generation/lifetime validation remains
+correct.
+
 ### Readonly Eviction
 
 Readonly eviction is drop-only:
@@ -109,6 +124,10 @@ Readonly eviction is drop-only:
 
 It uses the same shared pressure-delta decision logic and tuning fields as `EvictableBufferPool`.
 
+Primary usage:
+
+1. on-disk column store (LWC) pages
+
 ## Shared vs Different Responsibilities
 
 Shared:
@@ -116,10 +135,30 @@ Shared:
 1. frame/page memory model
 2. latch/guard semantics
 3. clock-sweep primitives
-4. pressure-aware eviction policy/tuning
+4. pressure-aware eviction policy/tuning (`EvictionArbiter`)
 
 Different:
 
-1. mutable pool has writeback + allocation lifecycle
-2. readonly pool has physical-key mapping + drop-only eviction
+1. mutable pool has writeback-capable allocation/eviction lifecycle
+2. readonly pool has physical-key mapping + drop-only eviction runtime
 3. fixed pool has no eviction/IO path
+
+## Pool Usage Mapping
+
+1. `FixedBufferPool`: metadata pages
+2. `EvictableBufferPool`: row store pages
+3. `ReadonlyBufferPool`: column store (LWC) pages
+
+## Data and Index Notes
+
+Both row store and column store contain data and index concerns.
+
+Data status:
+
+1. row store data is implemented as row pages
+2. column store data is implemented as LWC pages
+
+Index status:
+
+1. in-memory B+Tree is implemented
+2. on-disk CoW B+Tree is the target design but is not fully implemented yet
