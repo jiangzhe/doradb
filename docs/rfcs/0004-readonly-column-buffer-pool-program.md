@@ -1,7 +1,7 @@
 ---
 id: 0004
 title: Readonly Column-Store Buffer Pool Program
-status: proposal
+status: implemented
 github_issue: 340
 tags: [storage-engine, buffer-pool, io, cow, performance]
 created: 2026-02-21
@@ -174,6 +174,10 @@ Validation includes:
 
 - **Phase 1: Interfaces and Correctness Contracts**
 
+Implemented task tracking:
+- Task doc: `docs/tasks/000031-readonly-column-buffer-pool-phase-1.md`
+- Task issue: [#341](https://github.com/jiangzhe/doradb/issues/341)
+
 Scope:
 - Define new readonly pool types and ownership boundaries.
 - Define physical cache key structure and page-id reuse invalidation protocol.
@@ -189,6 +193,10 @@ Non-goals:
 
 - **Phase 2: Global Readonly Pool Core**
 
+Implemented task tracking:
+- Task doc: `docs/tasks/000032-readonly-column-buffer-pool-phase-2-core.md`
+- Task issue: [#343](https://github.com/jiangzhe/doradb/issues/343)
+
 Scope:
 - Implement `GlobalReadonlyBufferPool` core: frame arena, forward key mapping + inline frame key metadata, inflight dedup, direct pread miss load, drop-only eviction.
 - Implement explicit invalidation API for reused physical page ids.
@@ -201,6 +209,10 @@ Non-goals:
 - No table/index integration yet.
 
 - **Phase 3: Per-Table Wrapper and LWC Read Integration**
+
+Implemented task tracking:
+- Task doc: `docs/tasks/000033-readonly-column-buffer-pool-phase-3-per-table-integration.md`
+- Task issue: [#345](https://github.com/jiangzhe/doradb/issues/345)
 
 Scope:
 - Implement per-table `ReadonlyBufferPool` wrapper.
@@ -216,6 +228,10 @@ Non-goals:
 
 - **Phase 4: Column-Block-Index Integration and Lookup Boundary Validation**
 
+Implemented task tracking:
+- Task doc: `docs/tasks/000034-readonly-column-buffer-pool-phase-4-block-index-integration-refactor.md`
+- Task issue: [#347](https://github.com/jiangzhe/doradb/issues/347)
+
 Scope:
 - Integrate readonly pool into `column_block_index` file traversal.
 - Validate block-index lookup stage and readonly read stage boundary: resolved block ids remain snapshot-correct while reads use physical-key cache.
@@ -230,6 +246,10 @@ Non-goals:
 - No broad performance tuning/cleanup yet.
 
 - **Phase 5: Hardening, Performance, and Cleanup**
+
+Implemented task tracking:
+- Task doc: `docs/tasks/000035-readonly-buffer-pool-harden-perf-cleanup.md`
+- Task issue: [#349](https://github.com/jiangzhe/doradb/issues/349)
 
 Scope:
 - Stress/race tests, targeted benchmarks, and low-risk utility extraction for shared buffer helpers.
