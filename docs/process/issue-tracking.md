@@ -68,7 +68,7 @@ Since GitHub does not have strict fields for type/priority, use **Labels**:
 - `priority:medium` (P2) - Default, nice-to-have
 - `priority:low` (P3) - Polish, optimization
 
-When using `.codex/skills/issue/scripts/create_issue_from_doc.py`, omitting `priority:*` defaults to `priority:medium`.
+When using `tools/issue.rs create-issue-from-doc`, omitting `priority:*` defaults to `priority:medium`.
 
 ## Epic & Subtask Management
 

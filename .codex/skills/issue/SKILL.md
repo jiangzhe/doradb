@@ -6,13 +6,14 @@ description: Automate GitHub Issues lifecycle workflows with deterministic scrip
 # GitHub Issue Automation
 
 Use these scripts for all issue operations. Avoid interactive `gh` prompts.
+Scripts are executable; invoke them directly (no `cargo +nightly -Zscript` prefix).
 
 ## Enforce Document-First Creation
 
 Before creating an issue, validate the planning document path:
 
 ```bash
-python3 .codex/skills/issue/scripts/validate_doc_path.py --path docs/tasks/000001-example.md
+tools/issue.rs validate-doc-path --path docs/tasks/000001-example.md
 ```
 
 Accepted paths:
@@ -24,7 +25,7 @@ Create operations must fail if no valid planning document is provided.
 ## Create Issue From Planning Doc
 
 ```bash
-python3 .codex/skills/issue/scripts/create_issue_from_doc.py \
+tools/issue.rs create-issue-from-doc \
   --doc docs/tasks/000001-example.md \
   --labels "type:task,priority:high" \
   --assignee "@me"
@@ -33,7 +34,7 @@ python3 .codex/skills/issue/scripts/create_issue_from_doc.py \
 For child issues linked to an epic:
 
 ```bash
-python3 .codex/skills/issue/scripts/create_issue_from_doc.py \
+tools/issue.rs create-issue-from-doc \
   --doc docs/tasks/000002-subtask.md \
   --labels "type:task" \
   --parent 42
@@ -45,19 +46,19 @@ If `priority:*` is omitted, it automatically adds `priority:medium`.
 ## List Issues
 
 ```bash
-python3 .codex/skills/issue/scripts/list_issues.py --state open --assignee "@me" --limit 50
+tools/issue.rs list-issues --state open --assignee "@me" --limit 50
 ```
 
 Use `--label` repeatedly for multiple labels:
 
 ```bash
-python3 .codex/skills/issue/scripts/list_issues.py --label type:task --label priority:high
+tools/issue.rs list-issues --label type:task --label priority:high
 ```
 
 ## Update Issue
 
 ```bash
-python3 .codex/skills/issue/scripts/update_issue.py \
+tools/issue.rs update-issue \
   --issue 123 \
   --add-label "priority:high" \
   --comment "Refined acceptance criteria."
@@ -72,7 +73,7 @@ Supported update operations:
 ## Close Issue
 
 ```bash
-python3 .codex/skills/issue/scripts/close_issue.py \
+tools/issue.rs close-issue \
   --issue 123 \
   --comment "Completed in PR #456."
 ```
@@ -82,7 +83,7 @@ python3 .codex/skills/issue/scripts/close_issue.py \
 Generate a canonical close-link snippet:
 
 ```bash
-python3 .codex/skills/issue/scripts/link_pr_guidance.py --issue 123
+tools/issue.rs link-pr-guidance --issue 123
 ```
 
 Use the snippet in PR body (for example: `Fixes #123`).

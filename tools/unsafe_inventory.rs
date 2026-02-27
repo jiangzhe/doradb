@@ -1,4 +1,4 @@
-#!/usr/bin/env -S cargo +nightly -Zscript
+#!/usr/bin/env -S cargo +nightly -q -Zscript
 ---
 [package]
 edition = "2024"
@@ -35,7 +35,7 @@ struct ModuleMetrics {
 }
 
 fn usage() -> &'static str {
-    "Usage: cargo +nightly -Zscript tools/unsafe_inventory.rs [--write <path>] [--top <n>]"
+    "Usage: tools/unsafe_inventory.rs [--write <path>] [--top <n>]"
 }
 
 fn main() {
@@ -214,7 +214,7 @@ fn render_markdown(module_rows: &[ModuleMetrics], file_rows: &[FileMetrics], top
     let mut out = String::new();
     out.push_str("# Unsafe Usage Baseline\n\n");
     out.push_str(&format!("- Generated on: `{}`\n", generated_at()));
-    out.push_str("- Command: `cargo +nightly -Zscript tools/unsafe_inventory.rs`\n");
+    out.push_str("- Command: `tools/unsafe_inventory.rs`\n");
     out.push_str("- Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`\n\n");
 
     out.push_str("## Module Summary\n\n");
