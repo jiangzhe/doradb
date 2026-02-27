@@ -5,10 +5,15 @@ use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::file::table_file::TableFile;
 use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE};
+use crate::index::column_deletion_blob::{
+    COLUMN_DELETION_BLOB_PAGE_BODY_SIZE, ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
+};
 use crate::io::DirectBuf;
 use crate::row::RowID;
 use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
+use std::future::Future;
 use std::mem;
+use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -71,6 +76,71 @@ impl ColumnPagePayload {
     pub fn deletion_list(&mut self) -> DeletionList<'_> {
         DeletionList::new(&mut self.deletion_field)
     }
+
+    /// Returns decoded offloaded bitmap reference if this payload is offloaded.
+    #[inline]
+    pub fn offloaded_ref(&self) -> Option<BlobRef> {
+        self.try_offloaded_ref().ok().flatten()
+    }
+
+    /// Sets offloaded bitmap reference.
+    #[inline]
+    pub fn set_offloaded_ref(&mut self, blob_ref: BlobRef) {
+        self.deletion_field[0] &= !DELETION_FLAG_U32;
+        self.deletion_field[0] |= DELETION_FLAG_OFFLOADED;
+        self.deletion_field[1] = 0;
+        self.deletion_field[DELETION_OFFLOAD_REF_OFFSET..DELETION_OFFLOAD_REF_OFFSET + 8]
+            .copy_from_slice(&blob_ref.start_page_id.to_le_bytes());
+        self.deletion_field[DELETION_OFFLOAD_REF_OFFSET + 8..DELETION_OFFLOAD_REF_OFFSET + 10]
+            .copy_from_slice(&blob_ref.start_offset.to_le_bytes());
+        self.deletion_field[DELETION_OFFLOAD_REF_OFFSET + 10..DELETION_OFFLOAD_REF_OFFSET + 14]
+            .copy_from_slice(&blob_ref.byte_len.to_le_bytes());
+    }
+
+    /// Clears inline deletion bytes and stores only offloaded bitmap reference.
+    #[inline]
+    pub fn clear_inline_and_set_offloaded(&mut self, blob_ref: BlobRef) {
+        self.deletion_field.fill(0);
+        self.set_offloaded_ref(blob_ref);
+    }
+
+    #[inline]
+    fn try_offloaded_ref(&self) -> Result<Option<BlobRef>> {
+        if (self.deletion_field[0] & DELETION_FLAG_OFFLOADED) == 0 {
+            return Ok(None);
+        }
+        let start_page_id = u64::from_le_bytes(
+            self.deletion_field[DELETION_OFFLOAD_REF_OFFSET..DELETION_OFFLOAD_REF_OFFSET + 8]
+                .try_into()?,
+        );
+        let start_offset = u16::from_le_bytes(
+            self.deletion_field[DELETION_OFFLOAD_REF_OFFSET + 8..DELETION_OFFLOAD_REF_OFFSET + 10]
+                .try_into()?,
+        );
+        let byte_len = u32::from_le_bytes(
+            self.deletion_field[DELETION_OFFLOAD_REF_OFFSET + 10..DELETION_OFFLOAD_REF_OFFSET + 14]
+                .try_into()?,
+        );
+        if start_page_id == 0
+            || byte_len == 0
+            || (start_offset as usize) >= COLUMN_DELETION_BLOB_PAGE_BODY_SIZE
+        {
+            return Err(Error::InvalidFormat);
+        }
+        Ok(Some(BlobRef {
+            start_page_id,
+            start_offset,
+            byte_len,
+        }))
+    }
+}
+
+/// Reference to one offloaded bitmap byte range in linked immutable blob pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobRef {
+    pub start_page_id: PageID,
+    pub start_offset: u16,
+    pub byte_len: u32,
 }
 
 #[repr(C)]
@@ -234,6 +304,7 @@ impl BufferPage for ColumnBlockNode {}
 
 const DELETION_FIELD_SIZE: usize = 120;
 const DELETION_HEADER_SIZE: usize = 2;
+const DELETION_OFFLOAD_REF_OFFSET: usize = DELETION_HEADER_SIZE;
 const DELETION_U16_OFFSET: usize = DELETION_HEADER_SIZE;
 const DELETION_U32_OFFSET: usize = 4;
 const DELETION_U16_CAPACITY: usize = (DELETION_FIELD_SIZE - DELETION_U16_OFFSET) / 2;
@@ -460,6 +531,25 @@ pub struct ColumnBlockIndex<'a> {
     end_row_id: RowID,
 }
 
+/// One bitmap update patch keyed by leaf `start_row_id`.
+#[derive(Clone, Copy, Debug)]
+pub struct OffloadedBitmapPatch<'a> {
+    pub start_row_id: RowID,
+    pub bitmap_bytes: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OffloadedBitmapRefPatch {
+    start_row_id: RowID,
+    blob_ref: BlobRef,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NodeUpdateResult {
+    new_page_id: PageID,
+    touched: bool,
+}
+
 impl<'a> ColumnBlockIndex<'a> {
     /// Creates a column block-index view for one root page snapshot.
     #[inline]
@@ -514,6 +604,61 @@ impl<'a> ColumnBlockIndex<'a> {
         }
     }
 
+    /// Reads offloaded bitmap bytes referenced by payload.
+    ///
+    /// Returns `Ok(None)` when payload is inline-only.
+    pub async fn read_offloaded_bitmap_bytes(
+        &self,
+        payload: &ColumnPagePayload,
+    ) -> Result<Option<Vec<u8>>> {
+        let blob_ref = match payload.try_offloaded_ref()? {
+            Some(blob_ref) => blob_ref,
+            None => return Ok(None),
+        };
+        let reader = ColumnDeletionBlobReader::new(self.disk_pool);
+        let bytes = reader.read(blob_ref).await?;
+        Ok(Some(bytes))
+    }
+
+    /// Applies sorted start-row-id bitmap patches with copy-on-write updates.
+    ///
+    /// This API is sticky offload: updated payloads always store offloaded refs.
+    pub async fn batch_update_offloaded_bitmaps(
+        &self,
+        mutable_file: &mut MutableTableFile,
+        patches: &[OffloadedBitmapPatch<'_>],
+        create_ts: u64,
+    ) -> Result<PageID> {
+        if patches.is_empty() {
+            return Ok(self.root_page_id);
+        }
+        if self.root_page_id == 0 {
+            return Err(Error::InvalidState);
+        }
+        if !patches_sorted_unique(patches) {
+            return Err(Error::InvalidArgument);
+        }
+
+        let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
+        let mut resolved = Vec::with_capacity(patches.len());
+        for patch in patches {
+            let blob_ref = writer.append(patch.bitmap_bytes).await?;
+            resolved.push(OffloadedBitmapRefPatch {
+                start_row_id: patch.start_row_id,
+                blob_ref,
+            });
+        }
+        writer.finish().await?;
+
+        let res = self
+            .update_subtree_with_patches(mutable_file, self.root_page_id, &resolved, create_ts)
+            .await?;
+        if !res.touched {
+            return Err(Error::InvalidState);
+        }
+        Ok(res.new_page_id)
+    }
+
     /// Appends sorted `(start_row_id, block_id)` entries and returns new root page id.
     ///
     /// The update follows copy-on-write semantics on the right-most path.
@@ -565,6 +710,141 @@ impl<'a> ColumnBlockIndex<'a> {
             .build_branch_levels(mutable_file, root_entries, root_height + 1, create_ts)
             .await?;
         Ok(new_root_page_id)
+    }
+
+    fn update_subtree_with_patches<'b>(
+        &'b self,
+        mutable_file: &'b mut MutableTableFile,
+        page_id: PageID,
+        patches: &'b [OffloadedBitmapRefPatch],
+        create_ts: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<NodeUpdateResult>> + 'b>> {
+        Box::pin(async move {
+            if patches.is_empty() {
+                return Ok(NodeUpdateResult {
+                    new_page_id: page_id,
+                    touched: false,
+                });
+            }
+            let g = self
+                .disk_pool
+                .try_get_page_shared::<ColumnBlockNode>(page_id)
+                .await?;
+            let node = g.page();
+            if node.is_leaf() {
+                return self
+                    .update_leaf_with_patches(mutable_file, page_id, node, patches, create_ts)
+                    .await;
+            }
+            self.update_branch_with_patches(mutable_file, page_id, node, patches, create_ts)
+                .await
+        })
+    }
+
+    async fn update_leaf_with_patches(
+        &self,
+        mutable_file: &mut MutableTableFile,
+        page_id: PageID,
+        node: &ColumnBlockNode,
+        patches: &[OffloadedBitmapRefPatch],
+        create_ts: u64,
+    ) -> Result<NodeUpdateResult> {
+        let row_ids = node.leaf_start_row_ids();
+        let mut update_slots = Vec::with_capacity(patches.len());
+        for patch in patches {
+            match row_ids.binary_search(&patch.start_row_id) {
+                Ok(slot_idx) => update_slots.push((slot_idx, patch.blob_ref)),
+                Err(_) => return Err(Error::InvalidArgument),
+            }
+        }
+
+        let (new_page_id, mut new_node) =
+            self.allocate_node(mutable_file, 0, node.header.start_row_id, create_ts)?;
+        new_node.header.count = node.header.count;
+        {
+            let (new_row_ids, new_payloads) = new_node.leaf_arrays_mut();
+            new_row_ids.copy_from_slice(row_ids);
+            new_payloads.copy_from_slice(node.leaf_payloads());
+            for (slot_idx, blob_ref) in update_slots {
+                new_payloads[slot_idx].clear_inline_and_set_offloaded(blob_ref);
+            }
+        }
+        self.write_node(mutable_file, new_page_id, &new_node)
+            .await?;
+        self.record_obsolete_node(mutable_file, page_id)?;
+        Ok(NodeUpdateResult {
+            new_page_id,
+            touched: true,
+        })
+    }
+
+    async fn update_branch_with_patches(
+        &self,
+        mutable_file: &mut MutableTableFile,
+        page_id: PageID,
+        node: &ColumnBlockNode,
+        patches: &[OffloadedBitmapRefPatch],
+        create_ts: u64,
+    ) -> Result<NodeUpdateResult> {
+        let old_entries = node.branch_entries();
+        if old_entries.is_empty() {
+            return Err(Error::InvalidState);
+        }
+
+        let mut patch_idx = 0usize;
+        let mut child_updates = Vec::new();
+        for (child_idx, entry) in old_entries.iter().enumerate() {
+            let next_start_row_id = old_entries
+                .get(child_idx + 1)
+                .map(|next| next.start_row_id)
+                .unwrap_or(RowID::MAX);
+            let range_start = patch_idx;
+            while patch_idx < patches.len() && patches[patch_idx].start_row_id < next_start_row_id {
+                patch_idx += 1;
+            }
+            if patch_idx == range_start {
+                continue;
+            }
+            let child_res = self
+                .update_subtree_with_patches(
+                    mutable_file,
+                    entry.page_id,
+                    &patches[range_start..patch_idx],
+                    create_ts,
+                )
+                .await?;
+            if child_res.touched {
+                child_updates.push((child_idx, child_res.new_page_id));
+            }
+        }
+        if patch_idx != patches.len() {
+            return Err(Error::InvalidArgument);
+        }
+        if child_updates.is_empty() {
+            return Ok(NodeUpdateResult {
+                new_page_id: page_id,
+                touched: false,
+            });
+        }
+
+        let (new_page_id, mut new_node) = self.allocate_node(
+            mutable_file,
+            node.header.height,
+            node.header.start_row_id,
+            create_ts,
+        )?;
+        new_node.header.count = node.header.count;
+        new_node.branch_entries_mut().copy_from_slice(old_entries);
+        for (child_idx, child_page_id) in child_updates {
+            new_node.branch_entries_mut()[child_idx].page_id = child_page_id;
+        }
+        self.write_node(mutable_file, new_page_id, &new_node)
+            .await?;
+        self.record_obsolete_node(mutable_file, page_id)?;
+        Ok(NodeUpdateResult {
+            new_page_id,
+            touched: true,
+        })
     }
 
     /// Allocate a new node page for copy-on-write updates.
@@ -905,6 +1185,13 @@ fn entries_sorted(entries: &[(RowID, u64)]) -> bool {
     entries.windows(2).all(|pair| pair[0].0 <= pair[1].0)
 }
 
+fn patches_sorted_unique(patches: &[OffloadedBitmapPatch<'_>]) -> bool {
+    patches
+        .windows(2)
+        .all(|pair| pair[0].start_row_id < pair[1].start_row_id)
+        && patches.iter().all(|patch| !patch.bitmap_bytes.is_empty())
+}
+
 fn search_start_row_id(start_row_ids: &[RowID], row_id: RowID) -> Option<usize> {
     match start_row_ids.binary_search(&row_id) {
         Ok(idx) => Some(idx),
@@ -1061,6 +1348,39 @@ mod tests {
         assert!(list.add(5).unwrap());
         let row_ids = list.iter_row_ids(100).collect::<Vec<_>>();
         assert_eq!(row_ids, vec![102, 105]);
+    }
+
+    #[test]
+    fn test_blob_ref_encode_decode_roundtrip() {
+        let mut payload = build_deletion_payload();
+        let blob_ref = BlobRef {
+            start_page_id: 77,
+            start_offset: 9,
+            byte_len: 2048,
+        };
+        payload.clear_inline_and_set_offloaded(blob_ref);
+        assert_eq!(payload.offloaded_ref(), Some(blob_ref));
+        assert_eq!(payload.try_offloaded_ref().unwrap(), Some(blob_ref));
+        let list = payload.deletion_list();
+        assert!(list.is_offloaded());
+        assert_eq!(list.len(), 0);
+    }
+
+    #[test]
+    fn test_blob_ref_invalid_decode() {
+        let mut payload = build_deletion_payload();
+        payload.clear_inline_and_set_offloaded(BlobRef {
+            start_page_id: 1,
+            start_offset: 0,
+            byte_len: 12,
+        });
+        payload.deletion_field[DELETION_OFFLOAD_REF_OFFSET..DELETION_OFFLOAD_REF_OFFSET + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(payload.offloaded_ref(), None);
+        assert!(matches!(
+            payload.try_offloaded_ref(),
+            Err(Error::InvalidFormat)
+        ));
     }
 
     fn build_test_metadata() -> Arc<TableMetadata> {
@@ -1409,6 +1729,288 @@ mod tests {
                 drop(table_file);
                 drop(fs);
                 let _ = std::fs::remove_file("205.tbl");
+            })
+        });
+    }
+
+    #[test]
+    fn test_batch_update_offloaded_bitmaps_cow_snapshot() {
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let _ = std::fs::remove_file("207.tbl");
+                let table_file = fs
+                    .create_table_file(207, build_test_metadata(), false)
+                    .unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
+                let disk_pool = readonly_pool(207, &table_file);
+
+                let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
+                let entries = build_entries(0, initial_count, 7000);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+                drop(old_root);
+
+                let index_v1 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool);
+                let patch_bytes = vec![3u8; 1024];
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v2 = index_v1
+                    .batch_update_offloaded_bitmaps(
+                        &mut mutable,
+                        &[OffloadedBitmapPatch {
+                            start_row_id: 0,
+                            bitmap_bytes: &patch_bytes,
+                        }],
+                        3,
+                    )
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
+                drop(old_root);
+
+                let old_root_node = read_node_from_file(&table_file, root_v1).await.unwrap();
+                let new_root_node = read_node_from_file(&table_file, root_v2).await.unwrap();
+                assert!(old_root_node.is_branch());
+                assert!(new_root_node.is_branch());
+                assert_eq!(
+                    old_root_node.branch_entries().len(),
+                    new_root_node.branch_entries().len()
+                );
+                assert_ne!(
+                    old_root_node.branch_entries()[0].page_id,
+                    new_root_node.branch_entries()[0].page_id
+                );
+                assert_eq!(
+                    old_root_node.branch_entries()[1].page_id,
+                    new_root_node.branch_entries()[1].page_id
+                );
+
+                let old_payload =
+                    ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool)
+                        .find(0)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(old_payload.offloaded_ref(), None);
+
+                let index_v2 = ColumnBlockIndex::new(root_v2, initial_count as RowID, &disk_pool);
+                let new_payload = index_v2.find(0).await.unwrap().unwrap();
+                assert!(new_payload.offloaded_ref().is_some());
+                assert_eq!(
+                    index_v2
+                        .read_offloaded_bitmap_bytes(&new_payload)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    patch_bytes
+                );
+                let untouched = index_v2
+                    .find(COLUMN_BLOCK_MAX_ENTRIES as RowID)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(untouched.offloaded_ref(), None);
+
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("207.tbl");
+            })
+        });
+    }
+
+    #[test]
+    fn test_batch_update_offloaded_bitmaps_multi_leaf() {
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let _ = std::fs::remove_file("208.tbl");
+                let table_file = fs
+                    .create_table_file(208, build_test_metadata(), false)
+                    .unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
+                let disk_pool = readonly_pool(208, &table_file);
+
+                let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
+                let entries = build_entries(0, initial_count, 8000);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+                drop(old_root);
+
+                let left_bytes = vec![1u8; 321];
+                let right_bytes = vec![2u8; 777];
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v2 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool)
+                    .batch_update_offloaded_bitmaps(
+                        &mut mutable,
+                        &[
+                            OffloadedBitmapPatch {
+                                start_row_id: 0,
+                                bitmap_bytes: &left_bytes,
+                            },
+                            OffloadedBitmapPatch {
+                                start_row_id: COLUMN_BLOCK_MAX_ENTRIES as RowID,
+                                bitmap_bytes: &right_bytes,
+                            },
+                        ],
+                        3,
+                    )
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
+                drop(old_root);
+
+                let index_v2 = ColumnBlockIndex::new(root_v2, initial_count as RowID, &disk_pool);
+                let left_payload = index_v2.find(0).await.unwrap().unwrap();
+                let right_payload = index_v2
+                    .find(COLUMN_BLOCK_MAX_ENTRIES as RowID)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    index_v2
+                        .read_offloaded_bitmap_bytes(&left_payload)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    left_bytes
+                );
+                assert_eq!(
+                    index_v2
+                        .read_offloaded_bitmap_bytes(&right_payload)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    right_bytes
+                );
+
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("208.tbl");
+            })
+        });
+    }
+
+    #[test]
+    fn test_batch_update_offloaded_bitmaps_sticky() {
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let _ = std::fs::remove_file("209.tbl");
+                let table_file = fs
+                    .create_table_file(209, build_test_metadata(), false)
+                    .unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
+                let disk_pool = readonly_pool(209, &table_file);
+
+                let entries = build_entries(0, 4, 9000);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+                    .batch_insert(&mut mutable, &entries, 4, 2)
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+                drop(old_root);
+
+                let first = vec![11u8; 100];
+                let second = vec![22u8; 333];
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v2 = ColumnBlockIndex::new(root_v1, 4, &disk_pool)
+                    .batch_update_offloaded_bitmaps(
+                        &mut mutable,
+                        &[OffloadedBitmapPatch {
+                            start_row_id: 0,
+                            bitmap_bytes: &first,
+                        }],
+                        3,
+                    )
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
+                drop(old_root);
+
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v3 = ColumnBlockIndex::new(root_v2, 4, &disk_pool)
+                    .batch_update_offloaded_bitmaps(
+                        &mut mutable,
+                        &[OffloadedBitmapPatch {
+                            start_row_id: 0,
+                            bitmap_bytes: &second,
+                        }],
+                        4,
+                    )
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(4, false).await.unwrap();
+                drop(old_root);
+
+                let index_v2 = ColumnBlockIndex::new(root_v2, 4, &disk_pool);
+                let payload_v2 = index_v2.find(0).await.unwrap().unwrap();
+                assert!(payload_v2.offloaded_ref().is_some());
+                assert_eq!(
+                    index_v2
+                        .read_offloaded_bitmap_bytes(&payload_v2)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    first
+                );
+
+                let index_v3 = ColumnBlockIndex::new(root_v3, 4, &disk_pool);
+                let payload_v3 = index_v3.find(0).await.unwrap().unwrap();
+                assert!(payload_v3.offloaded_ref().is_some());
+                assert_eq!(
+                    index_v3
+                        .read_offloaded_bitmap_bytes(&payload_v3)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    second
+                );
+
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("209.tbl");
+            })
+        });
+    }
+
+    #[test]
+    fn test_read_offloaded_bitmap_invalid_ref() {
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let _ = std::fs::remove_file("210.tbl");
+                let table_file = fs
+                    .create_table_file(210, build_test_metadata(), false)
+                    .unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
+                let disk_pool = readonly_pool(210, &table_file);
+
+                let mut payload = build_deletion_payload();
+                payload.set_offloaded_ref(BlobRef {
+                    start_page_id: 0,
+                    start_offset: 0,
+                    byte_len: 1,
+                });
+                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
+                let res = index.read_offloaded_bitmap_bytes(&payload).await;
+                assert!(matches!(res, Err(Error::InvalidFormat)));
+
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("210.tbl");
             })
         });
     }
