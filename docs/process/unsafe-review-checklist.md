@@ -22,7 +22,7 @@ Hook behavior (`.githooks/pre-commit`):
   `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`,
   `tools/unsafe_inventory.rs`, or `docs/unsafe-usage-baseline.md`.
 - Action: run
-  `cargo +nightly -Zscript tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`.
+  `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`.
 - Enforcement: commit is blocked if the baseline file changes and is not staged.
 
 ## Required Checks
@@ -42,7 +42,7 @@ Hook behavior (`.githooks/pre-commit`):
 4. Regression control
    - [ ] Net-new unsafe usage is justified in PR description.
    - [ ] If target modules are affected, baseline inventory is re-run:
-         `cargo +nightly -Zscript tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+         `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
    - [ ] Any unexpected metric increase is explained.
    - [ ] If an existing `unsafe fn` can be converted to a safe API with internal checks, it is refactored.
 

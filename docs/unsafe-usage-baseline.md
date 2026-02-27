@@ -1,7 +1,7 @@
 # Unsafe Usage Baseline
 
 - Generated on: `2026-02-23`
-- Command: `cargo +nightly -Zscript tools/unsafe_inventory.rs`
+- Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
 
 ## Module Summary

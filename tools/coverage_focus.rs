@@ -1,4 +1,4 @@
-#!/usr/bin/env -S cargo +nightly -Zscript
+#!/usr/bin/env -S cargo +nightly -q -Zscript
 ---
 [package]
 edition = "2024"
@@ -57,7 +57,7 @@ struct MatchResult {
 }
 
 fn usage() -> &'static str {
-    "Usage: cargo +nightly -Zscript tools/coverage_focus.rs --path <repo-path> [--write <markdown-path>] [--top-uncovered <n>] [--verbose]\n\
+    "Usage: tools/coverage_focus.rs --path <repo-path> [--write <markdown-path>] [--top-uncovered <n>] [--verbose]\n\
 \n\
 Prerequisites:\n\
 - `grcov` available in PATH (`cargo install grcov`)\n\

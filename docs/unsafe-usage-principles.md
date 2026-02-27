@@ -38,7 +38,7 @@ If a public `unsafe fn` can be made safe by validating preconditions internally,
 For unsafe-touching changes:
 1. justify any net-new unsafe in PR/task context,
 2. refresh baseline inventory:
-   - `cargo +nightly -Zscript tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+   - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
 3. run behavior-preserving tests:
    - `cargo test -p doradb-storage`
    - `cargo test -p doradb-storage --no-default-features` (when relevant)

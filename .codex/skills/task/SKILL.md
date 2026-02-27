@@ -6,6 +6,7 @@ description: Design a task document for a feature or bug fix through deep resear
 # Task Design Workflow
 
 Use this skill to design a high-quality task document before coding.
+Scripts are executable; invoke them directly (no `cargo +nightly -Zscript` prefix).
 
 ## Required Flow
 
@@ -73,11 +74,11 @@ Do not create draft files before approval.
 After explicit approval:
 1. Determine next task id:
 ```bash
-python3 .codex/skills/task/scripts/next_task_id.py
+tools/task.rs next-task-id
 ```
 2. Create the task file from template:
 ```bash
-python3 .codex/skills/task/scripts/create_task_doc.py \
+tools/task.rs create-task-doc \
   --title "Task title" \
   --slug "task-title" \
   --auto-id

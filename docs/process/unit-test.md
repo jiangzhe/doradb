@@ -36,7 +36,7 @@ Use the local coverage focus script when you need fast feedback for one file or 
 
 ### Prerequisites
 
--   Nightly toolchain with cargo script support.
+-   Nightly toolchain installed (scripts are directly executable via shebang).
 -   `grcov` installed in `PATH`:
 
     ```bash
@@ -54,13 +54,13 @@ Use the local coverage focus script when you need fast feedback for one file or 
 Run focused coverage for one file or directory path inside this repository:
 
 ```bash
-cargo +nightly -Zscript tools/coverage_focus.rs --path doradb-storage/src/table/tests.rs
+tools/coverage_focus.rs --path doradb-storage/src/table/tests.rs
 ```
 
 Directory example with markdown export:
 
 ```bash
-cargo +nightly -Zscript tools/coverage_focus.rs \
+tools/coverage_focus.rs \
   --path doradb-storage/src/table \
   --top-uncovered 15 \
   --write target/coverage/table-focus.md
