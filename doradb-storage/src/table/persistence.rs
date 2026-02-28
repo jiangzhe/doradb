@@ -35,11 +35,14 @@ impl Table {
         include_new_data: bool,
         include_deletion: bool,
     ) -> Result<()> {
+        // Step 1: snapshot current table root and initialize checkpoint boundaries.
         let trx_sys = session.engine().trx_sys;
         let active_root = self.file.active_root();
         let pivot_row_id = active_root.pivot_row_id;
         let mut next_heap_redo_start_ts = None;
 
+        // Step 2: for new-data checkpoint, collect frozen pages and move them into
+        // transition state under a refreshed cutoff timestamp.
         let mut cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
         let mut frozen_pages = Vec::new();
         if include_new_data {
@@ -56,6 +59,7 @@ impl Table {
             next_heap_redo_start_ts = candidate_heap_redo_start_ts;
         }
 
+        // Step 3: open a checkpoint transaction and prepare per-phase state.
         let mut trx = session
             .begin_trx()
             .ok_or(Error::NotSupported("checkpoint requires idle session"))?;
@@ -64,6 +68,7 @@ impl Table {
         let mut lwc_pages = Vec::new();
         let mut heap_redo_start_ts = active_root.heap_redo_start_ts;
         if include_new_data {
+            // Step 4: build LWC pages from transition pages using the cutoff snapshot.
             new_pivot_row_id = frozen_pages
                 .last()
                 .map(|page| page.end_row_id)
@@ -89,12 +94,14 @@ impl Table {
             let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
             trx.extend_gc_row_pages(gc_pages);
         }
+        // Step 5: emit one checkpoint redo marker for recovery.
         trx.redo.ddl = Some(Box::new(DDLRedo::DataCheckpoint {
             table_id: self.table_id(),
             pivor_row_id: new_pivot_row_id,
             sts: checkpoint_ts,
         }));
 
+        // Step 6: fork mutable table-file state and apply selected phases.
         let mut mutable_file = MutableTableFile::fork(&self.file);
         let mut table_file_changed = false;
         if include_new_data {
@@ -113,18 +120,28 @@ impl Table {
             }
         }
 
+        // Step 7: merge committed cold-row deletions into column index payloads.
         if include_deletion {
-            let changed = self
+            let changed = match self
                 .apply_deletion_checkpoint(&mut mutable_file, cutoff_ts, checkpoint_ts)
-                .await?;
+                .await
+            {
+                Ok(changed) => changed,
+                Err(err) => {
+                    trx_sys.rollback(trx).await;
+                    return Err(err);
+                }
+            };
             table_file_changed |= changed;
         }
 
+        // Step 8: rollback no-op checkpoint transactions to avoid empty commits.
         if !table_file_changed {
             trx_sys.rollback(trx).await;
             return Ok(());
         }
 
+        // Step 9: publish new table-file root and then commit checkpoint transaction.
         let (table_file, old_root) = mutable_file.commit(checkpoint_ts, false).await?;
         let active_root = table_file.active_root();
         self.blk_idx
@@ -145,11 +162,17 @@ impl Table {
         cutoff_ts: TrxID,
         checkpoint_ts: TrxID,
     ) -> Result<bool> {
+        // Step 1: ensure there is a persisted column index to patch.
         let mutable_root = mutable_file.root();
         if mutable_root.column_block_index_root == 0 || mutable_root.pivot_row_id == 0 {
             return Ok(false);
         }
 
+        // Step 2: pick committed deletion markers that are visible at cutoff.
+        // This is currently a simple scan + in-place filter + sort/dedup path.
+        // For very large deletion buffers, we can optimize this step later by
+        // introducing parallel marker selection and parallel sort/merge while
+        // preserving deterministic ordering before patch application.
         let mut selected_row_ids = self.deletion_buffer.collect_committed_before(cutoff_ts);
         selected_row_ids.retain(|row_id| *row_id < mutable_root.pivot_row_id);
         if selected_row_ids.is_empty() {
@@ -158,6 +181,11 @@ impl Table {
         selected_row_ids.sort_unstable();
         selected_row_ids.dedup();
 
+        // Step 3: resolve each row-id to its persisted block payload.
+        // Future improvement:
+        // 1) resolve disjoint row-id ranges in parallel for higher throughput;
+        // 2) when roaring bitmap encoding is introduced, also fetch the target LWC page
+        //    row-id array to map each input row-id to the correct offset-based bit index.
         let column_index = ColumnBlockIndex::new(
             mutable_root.column_block_index_root,
             mutable_root.pivot_row_id,
@@ -185,6 +213,7 @@ impl Table {
             return Ok(false);
         }
 
+        // Step 4: load persisted deltas, merge pending deltas, and build patch bytes.
         let mut patch_storage: Vec<(u64, Vec<u8>)> = Vec::new();
         for (start_row_id, (seed, pending)) in grouped {
             let mut base = self
@@ -201,6 +230,7 @@ impl Table {
             return Ok(false);
         }
 
+        // Step 5: apply offloaded bitmap patches and advance index root in mutable file.
         let patches: Vec<OffloadedBitmapPatch<'_>> = patch_storage
             .iter()
             .map(|(start_row_id, bytes)| OffloadedBitmapPatch {
@@ -222,11 +252,7 @@ impl Table {
         mut payload: crate::index::ColumnPagePayload,
     ) -> Result<BTreeSet<u32>> {
         let mut res = BTreeSet::new();
-        if payload.offloaded_ref().is_some() {
-            let bytes = column_index
-                .read_offloaded_bitmap_bytes(&payload)
-                .await?
-                .ok_or(Error::InvalidFormat)?;
+        if let Some(bytes) = column_index.read_offloaded_bitmap_bytes(&payload).await? {
             for delta in decode_deltas_from_bytes(&bytes)? {
                 res.insert(delta);
             }
@@ -256,19 +282,24 @@ impl TablePersistence for Table {
     }
 
     async fn checkpoint_for_new_data(&self, session: &mut Session) -> Result<()> {
+        // Run only the new-data phase.
         self.run_checkpoint(session, true, false).await
     }
 
     async fn checkpoint_for_deletion(&self, session: &mut Session) -> Result<()> {
+        // Run only the deletion phase.
         self.run_checkpoint(session, false, true).await
     }
 
     async fn data_checkpoint(&self, session: &mut Session) -> Result<()> {
+        // Run both new-data and deletion phases in one combined checkpoint.
         self.run_checkpoint(session, true, true).await
     }
 }
 
 fn encode_deltas_to_bytes(deltas: &BTreeSet<u32>) -> Vec<u8> {
+    // Current on-disk blob encoding is a sorted little-endian u32 delta array.
+    // Future improvement: switch to roaring bitmap encoding for better space and merge efficiency.
     let mut out = Vec::with_capacity(deltas.len() * std::mem::size_of::<u32>());
     for delta in deltas {
         out.extend_from_slice(&delta.to_le_bytes());
@@ -277,6 +308,7 @@ fn encode_deltas_to_bytes(deltas: &BTreeSet<u32>) -> Vec<u8> {
 }
 
 fn decode_deltas_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
+    // Must match `encode_deltas_to_bytes` format until roaring bitmap encoding is introduced.
     if bytes.is_empty() || !bytes.len().is_multiple_of(std::mem::size_of::<u32>()) {
         return Err(Error::InvalidFormat);
     }

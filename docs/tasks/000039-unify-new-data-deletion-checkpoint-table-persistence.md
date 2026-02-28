@@ -8,9 +8,15 @@ As part of this task, split persistence-related APIs out of `TableAccess` into a
 
 Deletion selection correctness is in scope: deletion markers persisted by checkpoint must satisfy a strict cutoff boundary.
 
+Current implementation also includes:
+
+1. Explicit rollback on deletion-phase errors before returning `Err`.
+2. Strict offloaded-ref decode behavior (invalid offloaded refs fail with `InvalidFormat` instead of silently falling back to inline parsing).
+3. Parallel async IO for deletion blob page flush in `ColumnDeletionBlobWriter::finish` (allocation/linking remains sequential).
+
 ## Context
 
-Current implementation only persists new data from frozen row pages to LWC pages and updates table-file metadata/root. Deletions on persisted rows are maintained in `ColumnDeletionBuffer` for MVCC visibility but are not yet checkpointed into the on-disk column index bitmap payload path.
+Before this task, checkpointing only persisted new data from frozen row pages to LWC pages and updated table-file metadata/root. Deletions on persisted rows were maintained in `ColumnDeletionBuffer` for MVCC visibility but were not checkpointed into the on-disk column index bitmap payload path.
 
 The codebase already has building blocks for deletion persistence:
 
@@ -20,7 +26,7 @@ The codebase already has building blocks for deletion persistence:
 
 However, current checkpoint API and trait layout couple unrelated concerns in `TableAccess`, and real workloads often mix insert/update/delete. Running separate checkpoints increases overhead and root-switch cost.
 
-This task introduces a clean persistence API boundary and a combined checkpoint flow that persists both new data and qualifying deletions in one run.
+This task adds a clean persistence API boundary and a combined checkpoint flow that persists both new data and qualifying deletions in one run.
 
 ## Goals
 
@@ -46,7 +52,7 @@ No new `unsafe` blocks are planned.
 
 Changes are limited to checkpoint orchestration, trait/module split, and selection/merge logic built on existing safe APIs.
 
-## Plan
+## Implemented Plan
 
 1. Add new persistence trait and module split.
    - Create `doradb-storage/src/table/persistence.rs`.
@@ -97,6 +103,39 @@ Changes are limited to checkpoint orchestration, trait/module split, and selecti
    - Update tests currently invoking `data_checkpoint` where needed.
    - Add focused tests for cutoff-based deletion selection and deletion-only checkpoint behavior.
 
+9. Deletion blob write performance optimization.
+   - Keep blob page allocation and next-page linking sequential for correctness.
+   - Stage sealed blob pages and flush them with parallel async writes in `finish`.
+
+## Implementation Notes
+
+1. Checkpoint transaction and rollback semantics.
+   - `run_checkpoint` opens one transaction and one mutable table-file fork for selected phases.
+   - Build-LWC errors and deletion-phase errors both rollback the open transaction before returning `Err`.
+   - No-op checkpoint runs rollback instead of committing empty work.
+
+2. Cutoff boundary and visibility contract.
+   - Deletion eligibility is `cts < cutoff_ts`.
+   - For new-data flow, cutoff is refreshed after frozen-page stabilization before transition/persist.
+   - Deletion flow additionally filters to cold rows (`row_id < pivot_row_id`) so only persisted rows are patched.
+
+3. Deletion payload decoding behavior.
+   - Offloaded payload reads use checked decode path via `read_offloaded_bitmap_bytes`.
+   - Invalid offloaded references now surface `InvalidFormat` instead of silently treating payload as inline.
+
+4. Current blob encoding.
+   - Deletion blob payload bytes are currently encoded as sorted little-endian `u32` row-id deltas.
+   - Blob pages are generic byte containers; format semantics are defined by checkpoint encode/decode logic.
+
+5. Blob write parallelism scope.
+   - `ColumnDeletionBlobWriter` now batches sealed blob pages and writes them with `try_join_all`.
+   - This improves IO parallelism for blob-page flush.
+   - Page-id allocation and page-link construction remain sequential.
+
+6. Tree patching remains sequential.
+   - Subtree patch update (`update_subtree_with_patches`) is still sequential because one shared `MutableTableFile` is mutated (allocation + obsolete-page recording).
+   - Code includes comments documenting future parallelization direction and required staging/allocator design.
+
 ## Impacts
 
 Primary files/modules:
@@ -116,13 +155,16 @@ Primary files/modules:
 5. `doradb-storage/src/index/column_block_index.rs`
    - checkpoint integration use of existing bitmap patch/update APIs.
 
-6. `doradb-storage/src/file/table_file.rs`
+6. `doradb-storage/src/index/column_deletion_blob.rs`
+   - blob write path changed to staged + parallel async flush in `finish`.
+
+7. `doradb-storage/src/file/table_file.rs`
    - potential helper adjustments for phase-wise mutation + single commit.
 
-7. `doradb-storage/src/table/tests.rs`
+8. `doradb-storage/src/table/tests.rs`
    - adapt existing checkpoint tests and add new deletion-checkpoint coverage.
 
-8. `doradb-storage/src/trx/redo.rs` and `doradb-storage/src/trx/recover.rs` (if needed)
+9. `doradb-storage/src/trx/redo.rs` and `doradb-storage/src/trx/recover.rs` (if needed)
    - minimal updates if checkpoint naming or checkpoint DDL semantics require explicit alignment.
 
 ## Test Cases
@@ -152,8 +194,15 @@ Primary files/modules:
 8. Existing heartbeat-like no-new-data behavior:
    - checkpoint without eligible data changes remains valid and deterministic.
 
+9. Cutoff-timing robustness in tests:
+   - deletion persistence tests wait until marker timestamp is eligible under current cutoff semantics to avoid async GC timing flakes.
+
 ## Open Questions
 
 1. When to remove already persisted deletion markers from `ColumnDeletionBuffer` (future task).
 2. Whether deletion watermark fields in meta/redo should be expanded in a dedicated follow-up for log truncation policy.
-3. Future optimization: avoid repeated row-id-to-block resolution cost for large deletion batches.
+3. Future optimization: parallelize committed-marker selection and sort/dedup for very large deletion buffers.
+4. Future optimization: parallelize row-id-to-block resolution for disjoint ranges in deletion checkpoint.
+5. Future optimization: parallel subtree rewrite in block-index patching; requires staged mutable-root mutations or allocator partitioning.
+6. Blob encoding upgrade plan: migrate from plain `u32` delta array to roaring bitmap encoding with compatibility/versioning strategy.
+7. Roaring mapping requirement: once roaring is used, checkpoint must fetch target LWC row-id arrays and map input row ids to offset-based bitmap bits.

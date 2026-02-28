@@ -446,6 +446,28 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
         reader.commit().await.unwrap();
 
         sys.new_trx_delete(&mut session, &key).await;
+        let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+        let marker_ts = match marker {
+            DeleteMarker::Committed(ts) => ts,
+            DeleteMarker::Ref(status) => status.ts(),
+        };
+        let trx_sys = session.engine().trx_sys;
+        // `checkpoint_for_deletion` selects markers with `cts < cutoff_ts`.
+        // `cutoff_ts` comes from GC-visible min-active STS and can lag right after delete commit,
+        // so we wait until this marker becomes eligible to avoid timing flakes.
+        let mut ready = false;
+        for _ in 0..50 {
+            if trx_sys.calc_min_active_sts_for_gc() > marker_ts {
+                ready = true;
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(20)).await;
+        }
+        assert!(
+            ready,
+            "deletion marker ts {} not yet below checkpoint cutoff",
+            marker_ts
+        );
         sys.table
             .checkpoint_for_deletion(&mut session)
             .await

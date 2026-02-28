@@ -831,6 +831,10 @@ impl<'a> ColumnBlockIndex<'a> {
 
         let mut patch_idx = 0usize;
         let mut child_updates = Vec::new();
+        // Future improvement: disjoint child ranges can be processed in parallel.
+        // We keep this loop sequential today because subtree updates mutate one shared
+        // `MutableTableFile` (page-id allocation + obsolete-page recording), so safe
+        // parallel writes require an additional staging or allocator-partition design.
         for (child_idx, entry) in old_entries.iter().enumerate() {
             let next_start_row_id = old_entries
                 .get(child_idx + 1)
