@@ -604,6 +604,37 @@ impl<'a> ColumnBlockIndex<'a> {
         }
     }
 
+    /// Finds leaf entry `(start_row_id, payload)` containing `row_id`.
+    ///
+    /// Returns `Ok(None)` when `row_id` is not persisted in this column range.
+    pub async fn find_entry(&self, row_id: RowID) -> Result<Option<(RowID, ColumnPagePayload)>> {
+        if self.root_page_id == 0 || row_id >= self.end_row_id {
+            return Ok(None);
+        }
+        let mut page_id = self.root_page_id;
+        loop {
+            let g = self
+                .disk_pool
+                .try_get_page_shared::<ColumnBlockNode>(page_id)
+                .await?;
+            let node = g.page();
+            if node.is_leaf() {
+                let start_row_ids = node.leaf_start_row_ids();
+                let idx = match search_start_row_id(start_row_ids, row_id) {
+                    Some(idx) => idx,
+                    None => return Ok(None),
+                };
+                return Ok(Some((start_row_ids[idx], node.leaf_payloads()[idx])));
+            }
+            let entries = node.branch_entries();
+            let idx = match search_branch_entry(entries, row_id) {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+            page_id = entries[idx].page_id;
+        }
+    }
+
     /// Reads offloaded bitmap bytes referenced by payload.
     ///
     /// Returns `Ok(None)` when payload is inline-only.
@@ -800,6 +831,10 @@ impl<'a> ColumnBlockIndex<'a> {
 
         let mut patch_idx = 0usize;
         let mut child_updates = Vec::new();
+        // Future improvement: disjoint child ranges can be processed in parallel.
+        // We keep this loop sequential today because subtree updates mutate one shared
+        // `MutableTableFile` (page-id allocation + obsolete-page recording), so safe
+        // parallel writes require an additional staging or allocator-partition design.
         for (child_idx, entry) in old_entries.iter().enumerate() {
             let next_start_row_id = old_entries
                 .get(child_idx + 1)

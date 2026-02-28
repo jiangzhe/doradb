@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE};
 use crate::index::column_block_index::BlobRef;
 use crate::io::DirectBuf;
+use futures::future::try_join_all;
 
 const COLUMN_DELETION_BLOB_MAGIC: [u8; 4] = *b"CDBP";
 const COLUMN_DELETION_BLOB_VERSION: u8 = 1;
@@ -91,10 +92,16 @@ impl PendingBlobPage {
     }
 }
 
+struct SealedBlobPage {
+    page: PendingBlobPage,
+    next_page_id: PageID,
+}
+
 /// Append-only writer for immutable shared bitmap-blob pages.
 pub struct ColumnDeletionBlobWriter<'a> {
     mutable_file: &'a mut MutableTableFile,
     current_page: Option<PendingBlobPage>,
+    sealed_pages: Vec<SealedBlobPage>,
 }
 
 impl<'a> ColumnDeletionBlobWriter<'a> {
@@ -103,6 +110,7 @@ impl<'a> ColumnDeletionBlobWriter<'a> {
         ColumnDeletionBlobWriter {
             mutable_file,
             current_page: None,
+            sealed_pages: Vec::new(),
         }
     }
 
@@ -124,7 +132,7 @@ impl<'a> ColumnDeletionBlobWriter<'a> {
                 .ok_or(Error::InvalidState)?
                 .free_space();
             if free_space == 0 {
-                self.roll_to_next_page().await?;
+                self.roll_to_next_page()?;
                 continue;
             }
             let take = remaining.len().min(free_space);
@@ -143,11 +151,28 @@ impl<'a> ColumnDeletionBlobWriter<'a> {
 
     /// Flushes the tail page that still has pending blob bytes.
     pub async fn finish(&mut self) -> Result<()> {
-        if let Some(page) = self.current_page.take() {
-            if page.used_size > 0 {
-                self.flush_page(page, 0).await?;
-            }
+        if let Some(page) = self.current_page.take()
+            && page.used_size > 0
+        {
+            self.sealed_pages.push(SealedBlobPage {
+                page,
+                next_page_id: 0,
+            });
         }
+        let sealed_pages = std::mem::take(&mut self.sealed_pages);
+        let mut writes = Vec::with_capacity(sealed_pages.len());
+        for mut sealed in sealed_pages {
+            encode_blob_page_header(
+                sealed.page.buf.data_mut(),
+                sealed.next_page_id,
+                sealed.page.used_size,
+            )?;
+            writes.push(
+                self.mutable_file
+                    .write_page(sealed.page.page_id, sealed.page.buf),
+            );
+        }
+        try_join_all(writes).await?;
         Ok(())
     }
 
@@ -160,17 +185,13 @@ impl<'a> ColumnDeletionBlobWriter<'a> {
         Ok(())
     }
 
-    async fn roll_to_next_page(&mut self) -> Result<()> {
+    fn roll_to_next_page(&mut self) -> Result<()> {
         let next_page_id = self.mutable_file.allocate_page_id()?;
         let page = self.current_page.take().ok_or(Error::InvalidState)?;
-        self.flush_page(page, next_page_id).await?;
+        self.sealed_pages
+            .push(SealedBlobPage { page, next_page_id });
         self.current_page = Some(PendingBlobPage::new(next_page_id));
         Ok(())
-    }
-
-    async fn flush_page(&self, mut page: PendingBlobPage, next_page_id: PageID) -> Result<()> {
-        encode_blob_page_header(page.buf.data_mut(), next_page_id, page.used_size)?;
-        self.mutable_file.write_page(page.page_id, page.buf).await
     }
 }
 
