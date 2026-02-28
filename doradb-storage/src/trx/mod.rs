@@ -557,20 +557,3 @@ impl CommittedTrx {
         self.payload.as_ref().map(|p| &p.gc_row_pages[..])
     }
 }
-
-#[cfg(test)]
-pub(crate) mod tests {
-    pub(crate) fn remove_files(file_pattern: &str) {
-        let files = glob::glob(file_pattern);
-        if files.is_err() {
-            return;
-        }
-        for f in files.unwrap() {
-            if f.is_err() {
-                continue;
-            }
-            let fp = f.unwrap();
-            let _ = std::fs::remove_file(&fp);
-        }
-    }
-}

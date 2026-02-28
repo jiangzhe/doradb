@@ -1984,7 +1984,7 @@ mod tests {
                         Ok(idx) => idx,
                         _ => panic!("wrong search result"),
                     };
-                    let new_key = BTreeKey::from(format!("long-key-75").as_bytes());
+                    let new_key = BTreeKey::from("long-key-75".as_bytes());
                     assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
                     node.update_key::<BTreeU64>(idx, &new_key);
                     assert_eq!(node.key(idx), new_key);
@@ -2086,7 +2086,7 @@ mod tests {
                     let res = node.search_key(&k);
                     assert!(res.is_ok());
                     let v = node.value::<BTreeU64>(res.unwrap());
-                    if v.to_u64() == value as u64 {
+                    if v.to_u64() == value {
                         println!("debug-only match");
                     } else {
                         panic!("debug-only mismatch");

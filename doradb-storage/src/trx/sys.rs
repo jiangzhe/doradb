@@ -615,7 +615,7 @@ mod tests {
                     TrxSysConfig::default()
                         .log_partitions(1)
                         .log_file_prefix("redo_rotate")
-                        .log_file_max_size(1024u64 * 1024 * 1)
+                        .log_file_max_size(1024u64 * 1024)
                         .skip_recovery(true),
                 )
                 .build()
@@ -625,7 +625,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
             let mut session = engine.new_session();
-            let s = vec![1u8; 196];
+            let s = [1u8; 196];
             for i in 0..COUNT {
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();

@@ -483,6 +483,7 @@ fn encode_key_prefix<V: Borrow<Val>>(
 mod tests {
     use super::*;
     use crate::memcmp::NULL_FLAG;
+    use std::f64::consts::PI;
 
     #[test]
     fn test_single_key_encoder_basic() {
@@ -682,7 +683,7 @@ mod tests {
 
         for (ty, val, expected) in test_cases {
             let encoder = BTreeKeyEncoder::new(vec![ty]);
-            let key = encoder.encode(&[val.clone()]);
+            let key = encoder.encode(std::slice::from_ref(&val));
             assert_eq!(key.as_bytes(), expected);
         }
 
@@ -716,7 +717,7 @@ mod tests {
             ValType::new(ValKind::VarByte, false),
             ValType::new(ValKind::F64, false),
         ]);
-        let keys = vec![Val::from(42i32), Val::from(b"multi"), Val::from(3.14f64)];
+        let keys = vec![Val::from(42i32), Val::from(b"multi"), Val::from(PI)];
         let key = encoder.encode(&keys);
         assert!(!key.is_empty());
 

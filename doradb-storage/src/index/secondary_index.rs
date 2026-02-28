@@ -236,7 +236,7 @@ impl VarLenEncoder {
     }
 }
 
-impl VarLenEncoder {
+impl EncodeMultiKeys for VarLenEncoder {
     #[inline]
     fn encode(&self, key: &[Val]) -> Val {
         debug_assert!(key.len() == self.types.len());

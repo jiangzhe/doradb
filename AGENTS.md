@@ -46,3 +46,7 @@ Read `docs/process/issue-tracking.md` for details.
 ## Pull Request Guidelines
 
 Read `docs/process/pull-request.md` for details.
+
+## Lint Guidelines
+
+Read `docs/process/lint.md` for details.

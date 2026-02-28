@@ -27,7 +27,15 @@ const COL_NO_INDEXES_INDEX_ATTRIBUTES: usize = 3;
 const COL_NAME_INDEXES_INDEX_ATTRIBUTES: &str = "index_attributes";
 const INDEX_NO_INDEXES_INDEX_ID: usize = 0;
 const INDEX_NAME_INDEXES_INDEX_ID: &str = "idx_indexes_index_id";
+#[expect(
+    dead_code,
+    reason = "reserved for planned non-unique index on indexes.table_id"
+)]
 const INDEX_NO_INDEXES_TABLE_ID: usize = 1;
+#[expect(
+    dead_code,
+    reason = "reserved for planned non-unique index on indexes.table_id"
+)]
 const INDEX_NAME_INDEXES_TABLE_ID: &str = "idx_indexes_table_id";
 
 pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
@@ -155,6 +163,10 @@ const COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO: &str = "index_column_no";
 
 const COL_NO_INDEX_COLUMNS_INDEX_ORDER: usize = 4;
 const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &str = "index_order";
+#[expect(
+    dead_code,
+    reason = "reserved for future index-columns lookups by index_id"
+)]
 const INDEX_NO_INDEX_COLUMNS_INDEX_ID: usize = 0;
 const INDEX_NAME_INDEX_COLUMNS_INDEX_ID: &str = "idx_index_columns_index_id";
 

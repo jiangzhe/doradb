@@ -1,3 +1,5 @@
+#![warn(clippy::all)]
+
 pub mod bitmap;
 pub mod io;
 #[macro_use]

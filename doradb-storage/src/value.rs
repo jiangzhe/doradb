@@ -1268,6 +1268,7 @@ impl Clone for MemVarOutline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI as PI_F64;
 
     #[test]
     fn test_var_len() {
@@ -1390,24 +1391,24 @@ mod tests {
         assert!(val == Val::from(-0x1234567890abcdefi64));
 
         // serialize and deserialize f32
-        let val = Val::from(3.14f32);
+        let val = Val::from(f32::from_bits(0x4048_f5c3));
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
         // f32 code is 7, value 3.14f32 bits: 0x4048f5c3
         assert!(buf == b"\x07\xc3\xf5\x48\x40");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
-        assert!(val == Val::from(3.14f32));
+        assert!(val == Val::from(f32::from_bits(0x4048_f5c3)));
 
         // serialize and deserialize f64
-        let val = Val::from(3.141592653589793f64);
+        let val = Val::from(PI_F64);
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
         // f64 code is 10, value 3.141592653589793 bits: 0x400921fb54442d18
         assert!(buf == b"\x0a\x18\x2d\x44\x54\xfb\x21\x09\x40");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
-        assert!(val == Val::from(3.141592653589793f64));
+        assert!(val == Val::from(PI_F64));
 
         // serialize and deserialize bytes
         let val = Val::from(&b"hello"[..]);
@@ -1437,7 +1438,7 @@ mod tests {
         // 验证反序列化结果
         let (_, deserialized) = ValType::deser(&buf[..], 0).unwrap();
         assert_eq!(deserialized.kind, ValKind::I32);
-        assert_eq!(deserialized.nullable, false);
+        assert!(!deserialized.nullable);
 
         // 测试用例2：可空的变长类型
         let val_type = ValType {
@@ -1455,7 +1456,7 @@ mod tests {
         // 验证反序列化结果
         let (_, deserialized) = ValType::deser(&buf[..], 0).unwrap();
         assert_eq!(deserialized.kind, ValKind::VarByte);
-        assert_eq!(deserialized.nullable, true);
+        assert!(deserialized.nullable);
 
         // 测试用例3：测试所有ValKind类型
         let kinds = vec![
@@ -1482,7 +1483,7 @@ mod tests {
 
             let (_, deserialized) = ValType::deser(&buf[..], 0).unwrap();
             assert_eq!(deserialized.kind, kind);
-            assert_eq!(deserialized.nullable, true);
+            assert!(deserialized.nullable);
         }
 
         // 测试用例4：测试序列化位置偏移
@@ -1501,7 +1502,7 @@ mod tests {
         let (next_pos, deserialized) = ValType::deser(&buf[..], 4).unwrap();
         assert_eq!(next_pos, 6); // 应该前进2个字节
         assert_eq!(deserialized.kind, ValKind::I64);
-        assert_eq!(deserialized.nullable, true);
+        assert!(deserialized.nullable);
     }
 
     #[test]
@@ -1561,7 +1562,7 @@ mod tests {
     #[test]
     fn test_page_var_outline() {
         let data = b"a long string that needs outline storage";
-        let mut page_data = vec![0u8; 100];
+        let mut page_data = [0u8; 100];
         let offset = 10;
         let prefix = &data[..PAGE_VAR_LEN_PREFIX];
 

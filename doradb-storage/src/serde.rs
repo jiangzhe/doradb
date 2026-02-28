@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_vec_serde() {
-        let vec = vec![TestStruct {
+        let vec = [TestStruct {
             a: 1,
             b: 2,
             c: 3,
@@ -1143,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_for_bitpacking_serde() {
-        for input in vec![
+        for input in [
             vec![1u64],
             vec![1, 1 << 1],
             vec![1, 1 << 1, 1 << 2],

@@ -21,6 +21,8 @@ jobs:
         components: llvm-tools      
     - name: Install grcov
       run: cargo install grcov
+    - name: Clippy (all features / all targets)
+      run: cargo clippy --all-features --all-targets -- -D warnings
     - name: Build and Test (default features)
       env:
         RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"

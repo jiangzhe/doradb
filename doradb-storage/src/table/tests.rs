@@ -40,9 +40,9 @@ fn test_mvcc_insert_normal() {
                 trx = sys
                     .trx_select(trx, &key, |vals| {
                         assert!(vals.len() == 2);
-                        assert!(&vals[0] == &Val::from(i));
+                        assert!(vals[0] == Val::from(i));
                         let s = format!("{}", i);
-                        assert!(&vals[1] == &Val::from(&s[..]));
+                        assert!(vals[1] == Val::from(&s[..]));
                     })
                     .await;
             }
@@ -217,7 +217,7 @@ fn test_column_delete_basic() {
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(1i32);
-        let mut trx = session.begin_trx().unwrap();
+        let trx = session.begin_trx().unwrap();
         let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
         trx.commit().await.unwrap();
 
@@ -247,7 +247,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(1i32);
-        let mut trx = session.begin_trx().unwrap();
+        let trx = session.begin_trx().unwrap();
         let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
         trx.commit().await.unwrap();
 
@@ -284,7 +284,7 @@ fn test_column_delete_rollback() {
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(2i32);
-        let mut trx = session.begin_trx().unwrap();
+        let trx = session.begin_trx().unwrap();
         let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
         trx.commit().await.unwrap();
 
@@ -329,7 +329,7 @@ fn test_column_delete_rollback_after_checkpoint() {
             .await
             .unwrap();
 
-        let mut trx = session.begin_trx().unwrap();
+        let trx = session.begin_trx().unwrap();
         let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
         trx.commit().await.unwrap();
 
@@ -363,7 +363,7 @@ fn test_column_delete_write_conflict() {
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(4i32);
-        let mut trx = session.begin_trx().unwrap();
+        let trx = session.begin_trx().unwrap();
         let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
         trx.commit().await.unwrap();
 
@@ -399,7 +399,7 @@ fn test_column_delete_mvcc_visibility() {
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(5i32);
-        let mut trx = session.begin_trx().unwrap();
+        let trx = session.begin_trx().unwrap();
         let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
         trx.commit().await.unwrap();
 

@@ -17,7 +17,7 @@ git config core.hooksPath .githooks
 Hook behavior (`.githooks/pre-commit`):
 - Always run:
   - `cargo fmt` (commit blocked if it changes files)
-  - `cargo clippy -- -D warnings -A dead_code` (commit blocked on any warning except `dead_code`)
+  - `cargo clippy --all-features --all-targets -- -D warnings` (commit blocked on any warning)
 - Precondition: staged files include any path in
   `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`,
   `tools/unsafe_inventory.rs`, or `docs/unsafe-usage-baseline.md`.

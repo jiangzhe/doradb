@@ -403,6 +403,7 @@ impl LogPartition {
     }
 
     #[inline]
+    #[cfg(test)]
     pub fn logs(&self, desc: bool) -> Result<Vec<PathBuf>> {
         list_log_files(&self.file_prefix, self.log_no, desc)
     }

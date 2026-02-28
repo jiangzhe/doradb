@@ -166,7 +166,7 @@ mod tests {
         let buf = DirectBuf::uninit(1024);
         assert_eq!(buf.len(), 1024);
         assert!(buf.capacity() >= 1024);
-        assert!(buf.capacity() % STORAGE_SECTOR_SIZE == 0);
+        assert!(buf.capacity().is_multiple_of(STORAGE_SECTOR_SIZE));
 
         let buf = DirectBuf::uninit(0);
         assert_eq!(buf.len(), 0);
@@ -183,7 +183,7 @@ mod tests {
 
         let buf = DirectBuf::zeroed(STORAGE_SECTOR_SIZE + 1);
         assert_eq!(buf.len(), STORAGE_SECTOR_SIZE + 1);
-        assert!(buf.capacity() >= STORAGE_SECTOR_SIZE + 1);
+        assert!(buf.capacity() > STORAGE_SECTOR_SIZE);
         assert_eq!(buf.capacity() % STORAGE_SECTOR_SIZE, 0);
         assert_eq!(buf.remaining_capacity(), buf.capacity() - buf.len());
     }

@@ -1323,7 +1323,7 @@ mod tests {
         let mut payload = build_deletion_payload();
         let mut list = payload.deletion_list();
         for delta in 0..DELETION_U16_CAPACITY as u32 {
-            assert_eq!(list.add(delta).unwrap(), true);
+            assert!(list.add(delta).unwrap());
         }
         assert_eq!(list.len(), DELETION_U16_CAPACITY);
         assert_eq!(
@@ -1336,9 +1336,9 @@ mod tests {
     fn test_deletion_list_promotion_to_u32() {
         let mut payload = build_deletion_payload();
         let mut list = payload.deletion_list();
-        assert_eq!(list.add(10).unwrap(), true);
-        assert_eq!(list.add(5).unwrap(), true);
-        assert_eq!(list.add(u16::MAX as u32 + 4).unwrap(), true);
+        assert!(list.add(10).unwrap());
+        assert!(list.add(5).unwrap());
+        assert!(list.add(u16::MAX as u32 + 4).unwrap());
         assert!(list.contains(u16::MAX as u32 + 4));
         assert_eq!(list.len(), 3);
         assert_eq!(
@@ -1352,7 +1352,7 @@ mod tests {
         let mut payload = build_deletion_payload();
         let mut list = payload.deletion_list();
         for delta in 0..(DELETION_U32_CAPACITY as u32 + 1) {
-            assert_eq!(list.add(delta).unwrap(), true);
+            assert!(list.add(delta).unwrap());
         }
         assert_eq!(
             list.add(u16::MAX as u32 + 1).unwrap_err(),
@@ -1364,10 +1364,10 @@ mod tests {
     fn test_deletion_list_sorted_and_duplicates() {
         let mut payload = build_deletion_payload();
         let mut list = payload.deletion_list();
-        assert_eq!(list.add(10).unwrap(), true);
-        assert_eq!(list.add(3).unwrap(), true);
-        assert_eq!(list.add(8).unwrap(), true);
-        assert_eq!(list.add(8).unwrap(), false);
+        assert!(list.add(10).unwrap());
+        assert!(list.add(3).unwrap());
+        assert!(list.add(8).unwrap());
+        assert!(!list.add(8).unwrap());
         assert_eq!(list.iter().collect::<Vec<_>>(), vec![3, 8, 10]);
     }
 
@@ -1459,7 +1459,7 @@ mod tests {
 
     fn global_readonly_pool() -> &'static GlobalReadonlyBufferPool {
         static GLOBAL: OnceLock<&'static GlobalReadonlyBufferPool> = OnceLock::new();
-        *GLOBAL.get_or_init(|| {
+        GLOBAL.get_or_init(|| {
             GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap()
         })
     }

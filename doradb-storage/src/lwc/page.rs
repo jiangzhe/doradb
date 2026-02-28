@@ -14,6 +14,10 @@ use crate::value::ValKind;
 use bytemuck::{Pod, Zeroable};
 use std::mem;
 
+#[expect(
+    dead_code,
+    reason = "reserved for future LWC page checksum/footer implementation"
+)]
 const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>() - 32;
 
 /// LwcPage stores compressioned data on disk.

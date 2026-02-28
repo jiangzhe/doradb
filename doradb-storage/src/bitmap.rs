@@ -974,43 +974,43 @@ mod tests {
         );
         let g1 = alloc_map.inner.lock();
         let g2 = alloc_map2.inner.lock();
-        assert!(&*g1 == &*g2);
+        assert!(*g1 == *g2);
     }
 
     #[test]
     fn test_bitmap_extend() {
         let mut bm1 = vec![1u64];
-        let bm2 = vec![1u64];
+        let bm2 = [1u64];
         bm1.bitmap_extend(1, &bm2[..], 1);
         assert_eq!(bm1, vec![3u64]);
 
         let mut bm1 = vec![1u64];
-        let bm2 = vec![1u64];
+        let bm2 = [1u64];
         bm1.bitmap_extend(64, &bm2[..], 1);
         assert_eq!(bm1, vec![1u64, 1u64]);
 
         let mut bm1 = vec![1u64];
-        let bm2 = vec![1u64];
+        let bm2 = [1u64];
         bm1.bitmap_extend(60, &bm2[..], 4);
         assert_eq!(bm1, vec![1u64 | (1u64 << 60)]);
 
         let mut bm1 = vec![1u64];
-        let bm2 = vec![1u64];
+        let bm2 = [1u64];
         bm1.bitmap_extend(60, &bm2[..], 5);
         assert_eq!(bm1, vec![1u64 | (1u64 << 60), 0u64]);
 
         let mut bm1 = vec![1u64];
-        let bm2 = vec![1u64 | 16];
+        let bm2 = [1u64 | 16];
         bm1.bitmap_extend(60, &bm2[..], 5);
         assert_eq!(bm1, vec![1u64 | (1u64 << 60), 1u64]);
 
         let mut bm1 = vec![1u64];
-        let bm2 = vec![1u64, 1u64];
+        let bm2 = [1u64, 1u64];
         bm1.bitmap_extend(64, &bm2[..], 65);
         assert_eq!(bm1, vec![1u64, 1, 1]);
 
         let mut bm1 = vec![1u64, 0];
-        let bm2 = vec![1u64, 1u64];
+        let bm2 = [1u64, 1u64];
         bm1.bitmap_extend(65, &bm2[..], 65);
         assert_eq!(bm1, vec![1u64, 2, 2]);
     }
