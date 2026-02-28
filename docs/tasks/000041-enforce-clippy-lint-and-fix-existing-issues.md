@@ -72,6 +72,36 @@ Reference:
 
 ## Implementation Notes
 
+1. Enforced crate-level clippy baseline in `doradb-storage` by adding:
+   `#![warn(clippy::all)]` in `doradb-storage/src/lib.rs`.
+
+2. Enforced strict clippy command in CI:
+   - Updated `.github/workflows/build.yml` to run:
+     `cargo clippy --all-features --all-targets -- -D warnings`.
+
+3. Enforced the same command in local pre-commit:
+   - Updated `.githooks/pre-commit` to run:
+     `cargo clippy --all-features --all-targets -- -D warnings`.
+
+4. Added lint process documentation:
+   - Created `docs/process/lint.md` with local, pre-commit, and CI lint policy.
+   - Kept process docs aligned by updating clippy command references in
+     `docs/process/unsafe-review-checklist.md`.
+   - Added agent guidance reference to lint process in `AGENTS.md`.
+
+5. Completed strict-clippy warning cleanup required for enforcement:
+   - Resolved warning failures across active `doradb-storage` targets.
+   - Refined no-`libaio` coverage by feature-gating libaio ABI exports and
+     adding explicit fallback test behavior, while preserving test count parity
+     between default and `--no-default-features`.
+   - For intentionally deferred implementation areas, documented deferral
+     comments in code and kept behavior stable.
+
+6. Verification results:
+   - `cargo clippy -p doradb-storage --all-features --all-targets -- -D warnings` passes.
+   - `cargo clippy -p doradb-storage --no-default-features --all-targets -- -D warnings` passes.
+   - `cargo test -p doradb-storage` passes (`290` tests).
+   - `cargo test -p doradb-storage --no-default-features` passes (`290` tests).
 
 ## Impacts
 
@@ -92,4 +122,9 @@ Reference:
 
 ## Open Questions
 
-1. Future follow-up: evaluate enabling `clippy::pedantic` enforcement with a curated allow-list/deny-list policy for this repository. This requires classifying current pedantic warning categories and handling them case by case in a dedicated task.
+1. Future follow-up: evaluate enabling `clippy::pedantic` enforcement with a curated allow-list/deny-list policy for this repository. This requires classifying warning categories and handling them case by case in a dedicated task.
+   Backlog: `docs/backlogs/000001-pedantic-clippy-adoption-policy.todo.md`.
+2. Future follow-up: implement reserved non-unique indexes for catalog tables (`columns.table_id`, `indexes.table_id`) that are currently deferred.
+   Backlog: `docs/backlogs/000002-non-unique-index-for-catalog-tables.todo.md`.
+3. Future follow-up: improve no-`libaio` ABI stubs so `iocb`/related stub structs can be simplified (potentially empty) after decoupling fallback request metadata from ABI layout.
+   Backlog: `docs/backlogs/000003-improve-libaio-stub-struct-design.todo.md`.
