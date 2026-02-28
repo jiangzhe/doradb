@@ -1,4 +1,4 @@
 interface:
   display_name: "Task Design"
   short_description: "Deep-research, multi-round task design with approval gates"
-  default_prompt: "Use $task to research docs/code, compare proposals, run two review rounds, and only write docs/tasks after explicit approval."
+  default_prompt: "Use $task create for deep-research design rounds with explicit approval gating (backlog input uses one or more docs/backlogs/<6digits>-<topic>.{todo|done}.md files), and use $task resolve to sync implementation notes/open questions and rename source backlog todo->done after verification."

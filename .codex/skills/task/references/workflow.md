@@ -1,6 +1,12 @@
 # Task Skill Workflow Reference
 
-## Formal Round Definition
+## Command Model
+
+`task` has two prompt workflows:
+1. `task create`: design-phase analysis and task doc creation.
+2. `task resolve`: post-implementation sync and follow-up tracking.
+
+## `task create` Formal Round Definition
 
 Use exactly two mandatory rounds before writing any file in `docs/tasks/`:
 
@@ -9,7 +15,7 @@ Use exactly two mandatory rounds before writing any file in `docs/tasks/`:
 
 Require explicit user approval after Round 2 before creating a task doc file.
 
-## Round 1 Checklist
+## `task create` Round 1 Checklist
 
 Complete all items:
 
@@ -21,7 +27,7 @@ Complete all items:
 6. Recommend one proposal and explain why.
 7. Ask for user feedback on the recommendation.
 
-## Round 2 Checklist
+## `task create` Round 2 Checklist
 
 Complete all items:
 
@@ -62,3 +68,38 @@ Follow `docs/tasks/000000-template.md` and fill:
 8. Open Questions
 
 Ensure content is decision-complete and ready for implementation.
+
+`Implementation Notes` must stay blank during design phase, and is filled during `task resolve`.
+
+## `task resolve` Checklist
+
+Complete all items:
+
+1. Ensure implementation and tests are complete before running resolve updates.
+2. Edit the task doc directly and keep section structure consistent with `docs/tasks/000000-template.md`.
+3. Fill `Implementation Notes` with concrete implementation/test/review results.
+4. Append unresolved future improvements to `Open Questions` if they remain out of scope.
+5. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
+6. Link related backlog todos from task doc resolve updates.
+7. If task doc has `Source Backlogs:` entries with `docs/backlogs/...todo.md`, rename those backlog files to `.done.md` when resolve is completed.
+   - Helper command:
+```bash
+tools/task.rs rename-backlog-doc \
+  --path docs/backlogs/000010-example-a.todo.md \
+  --path docs/backlogs/000011-example-b.todo.md \
+  --status done
+```
+
+## Backlog Integration
+
+1. Backlog docs live in `docs/backlogs/<6digits>-<follow-up-topic>.{todo|done}.md`.
+2. Use `docs/backlogs/000000-template.md` for brief todo docs.
+3. `.todo.md` means pending, `.done.md` means completed status.
+4. A backlog doc is input context for `task create`, not a shortcut for design quality gates.
+5. If one or more backlog sources are `.done.md`, prompt user before continuing task creation from completed item(s).
+6. If task creation proceeds from backlog, record `Source Backlogs:` list in task doc to enable resolve-time rename.
+7. Even when backlog exists, still run deep research, proposals, and two formal rounds before writing `docs/tasks/`.
+8. To allocate a new backlog id, use:
+```bash
+tools/task.rs next-backlog-id
+```

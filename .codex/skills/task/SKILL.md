@@ -8,7 +8,11 @@ description: Design a task document for a feature or bug fix through deep resear
 Use this skill to design a high-quality task document before coding.
 Scripts are executable; invoke them directly (no `cargo +nightly -Zscript` prefix).
 
-## Required Flow
+This skill has two prompt workflows:
+1. `task create`: design-phase planning and task doc creation.
+2. `task resolve`: post-implementation synchronization after code/tests/review are complete.
+
+## `task create` Required Flow
 
 1. Perform deep research first.
 2. Present multiple proposals and tradeoffs.
@@ -76,14 +80,43 @@ After explicit approval:
 ```bash
 tools/task.rs next-task-id
 ```
-2. Create the task file from template:
+2. Create the task file from template (standard path):
 ```bash
 tools/task.rs create-task-doc \
   --title "Task title" \
   --slug "task-title" \
   --auto-id
 ```
-3. Fill the file according to `docs/tasks/000000-template.md`.
+3. If the request starts from `docs/backlogs/`, treat that backlog doc as context input only.
+   - Still run full deep research and proposal rounds.
+   - Do not skip quality gates because backlog is brief.
+   - Backlog filename must match `docs/backlogs/<6digits>-<follow-up-topic>.{todo|done}.md`.
+   - For creating a new backlog todo, get next id with:
+```bash
+tools/task.rs next-backlog-id
+```
+   - Multiple source backlog docs are allowed when they are small/closely related.
+   - If any source backlog file is `.done.md`, ask the user whether to continue task creation from completed backlog item(s).
+   - If task creation proceeds from backlog, include a `Source Backlogs:` list in task doc context for resolve traceability.
+4. Fill the file according to `docs/tasks/000000-template.md`.
+
+## `task resolve` Required Flow
+
+Use `task resolve` only after implementation and tests are done, and behavior is reviewed/verified.
+
+1. Synchronize the task doc implementation outcome by editing the task doc directly.
+2. Fill `Implementation Notes` with concrete implementation/test/review outcomes.
+3. Append unresolved future improvements to `Open Questions` when needed.
+4. Create/link follow-up backlog todos in `docs/backlogs/` for actionable deferred work.
+5. Keep `Implementation Notes` blank during design phase and fill it only in resolve phase.
+6. If the task is sourced from backlog todo docs (tracked via `Source Backlogs:` in task doc), rename each corresponding `.todo.md` backlog file to the matching `.done.md` path during resolve.
+   - Use helper command when appropriate:
+```bash
+tools/task.rs rename-backlog-doc \
+  --path docs/backlogs/000010-example-a.todo.md \
+  --path docs/backlogs/000011-example-b.todo.md \
+  --status done
+```
 
 ## Output Quality Bar
 

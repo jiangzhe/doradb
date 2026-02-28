@@ -7,6 +7,7 @@
 ## Planning: Tasks & RFCs
 
 Before writing code, you must create a planning document in the repository.
+`docs/backlogs/` is used for brief follow-up todos and does not replace task/RFC planning documents for implementation. Backlog filename format is `docs/backlogs/<6digits>-<topic>.{todo|done}.md`.
 
 ### 1. Tasks (Small/Simple)
 - **Scope**: Narrow, well-defined changes (e.g., bug fixes, small features, refactoring).
