@@ -7,6 +7,9 @@ Summarize the issue/feature and solution.
 ## Context
 
 Describe background and context of this problem.
+If sourced from backlog, add:
+`Source Backlogs:`
+`- docs/backlogs/<6digits>-<follow-up-topic>.todo.md`
 
 ## Goals
 
@@ -31,6 +34,10 @@ Reference:
 
 Describe implementation plan, including important changes on files, structs, traits, functions, etc.
 
+## Implementation Notes
+
+Keep this section blank in design phase. Fill this section during `task resolve` after implementation, tests, review, and verification are completed.
+
 ## Impacts
 
 Related modules, files, structs, traits and functions.
@@ -42,3 +49,4 @@ Summarize test scenarios that should be covered to verify code correctness.
 ## Open Questions
 
 Issues that can not be solved in this task scope, and possible follow-ups.
+During `task resolve`, future improvements can be added here and summarized as backlog todos under `docs/backlogs/`.
