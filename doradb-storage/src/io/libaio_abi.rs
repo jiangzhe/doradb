@@ -15,221 +15,326 @@ pub enum io_iocb_cmd {
 
 #[repr(C)]
 #[allow(non_camel_case_types)]
-pub struct iocb {
-    pub data: u64,
-    pub key: u32,
-    _aio_rw_flags: u32, // not used.
-    pub aio_lio_opcode: u16,
-    pub aio_reqprio: u16,
-    pub aio_fildes: u32,
-    // PREAD/PWRITE -> void*
-    // PREADV/PWRITEV -> iovec
-    pub buf: *mut u8,
-    pub count: u64,
-    pub offset: u64,
-    _padding: u64, // not used.
-    pub flags: u32,
-    pub resfd: u32,
-}
-
-impl iocb {
-    /// Creates an owned iocb allocated on heap.
-    #[inline]
-    pub fn boxed() -> Box<Self> {
-        let mut this = Box::new(iocb {
-            data: 0,
-            key: 0,
-            _aio_rw_flags: 0,
-            aio_lio_opcode: io_iocb_cmd::IO_CMD_NOOP as u16,
-            aio_reqprio: 0,
-            aio_fildes: !0,
-            buf: std::ptr::null_mut(),
-            count: 0,
-            offset: 0,
-            _padding: 0,
-            flags: 0,
-            resfd: 0,
-        });
-        this.init();
-        this
-    }
-
-    #[inline]
-    fn init(&mut self) {
-        self.data = 0;
-        self.key = 0;
-        self._aio_rw_flags = 0;
-        self.aio_lio_opcode = io_iocb_cmd::IO_CMD_NOOP as u16;
-        self.aio_reqprio = 0;
-        self.aio_fildes = !0;
-        self.buf = std::ptr::null_mut();
-        self.count = 0;
-        self.offset = 0;
-        self._padding = 0;
-        self.flags = 0;
-        self.resfd = 0;
-    }
-
-    #[inline]
-    pub fn as_mut_ptr(&self) -> *mut iocb {
-        self as *const _ as *mut _
-    }
-}
-
-unsafe impl Send for iocb {}
-
-#[derive(Clone)]
-#[repr(C)]
-#[allow(non_camel_case_types)]
-pub struct io_event {
-    pub data: u64,
-    pub obj: *mut iocb,
-    pub res: i64,
-    pub res2: i64,
-}
-
-impl Default for io_event {
-    #[inline]
-    fn default() -> Self {
-        io_event {
-            data: 0,
-            obj: std::ptr::null_mut(),
-            res: 0,
-            res2: 0,
-        }
-    }
-}
-
-#[allow(non_camel_case_types)]
-pub enum io_context {}
-
-#[allow(non_camel_case_types)]
-pub type io_context_t = *mut io_context;
-
-#[repr(C)]
-#[allow(non_camel_case_types)]
 pub struct iovec {
     pub iov_base: *mut u8,
     pub iov_len: usize,
 }
 
 #[cfg(feature = "libaio")]
-#[link(name = "aio")]
-unsafe extern "C" {
-    pub fn io_queue_init(maxevents: c_int, ctxp: *mut io_context_t) -> c_int;
+mod linux {
+    use super::*;
 
-    pub fn io_queue_release(ctx: io_context_t) -> c_int;
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    pub struct iocb {
+        pub data: u64,
+        pub key: u32,
+        _aio_rw_flags: u32, // not used.
+        pub aio_lio_opcode: u16,
+        pub aio_reqprio: u16,
+        pub aio_fildes: u32,
+        // PREAD/PWRITE -> void*
+        // PREADV/PWRITEV -> iovec
+        pub buf: *mut u8,
+        pub count: u64,
+        pub offset: u64,
+        _padding: u64, // not used.
+        pub flags: u32,
+        pub resfd: u32,
+    }
 
-    pub fn io_queue_run(ctx: io_context_t) -> c_int;
+    impl iocb {
+        /// Creates an owned iocb allocated on heap.
+        #[inline]
+        pub fn boxed() -> Box<Self> {
+            let mut this = Box::new(iocb {
+                data: 0,
+                key: 0,
+                _aio_rw_flags: 0,
+                aio_lio_opcode: io_iocb_cmd::IO_CMD_NOOP as u16,
+                aio_reqprio: 0,
+                aio_fildes: !0,
+                buf: std::ptr::null_mut(),
+                count: 0,
+                offset: 0,
+                _padding: 0,
+                flags: 0,
+                resfd: 0,
+            });
+            this.init();
+            this
+        }
 
-    pub fn io_setup(maxevents: c_int, ctxp: *mut io_context_t) -> c_int;
+        #[inline]
+        fn init(&mut self) {
+            self.data = 0;
+            self.key = 0;
+            self._aio_rw_flags = 0;
+            self.aio_lio_opcode = io_iocb_cmd::IO_CMD_NOOP as u16;
+            self.aio_reqprio = 0;
+            self.aio_fildes = !0;
+            self.buf = std::ptr::null_mut();
+            self.count = 0;
+            self.offset = 0;
+            self._padding = 0;
+            self.flags = 0;
+            self.resfd = 0;
+        }
 
-    pub fn io_destroy(ctx: io_context_t) -> c_int;
+        #[inline]
+        pub fn as_mut_ptr(&self) -> *mut iocb {
+            self as *const _ as *mut _
+        }
+    }
 
-    pub fn io_submit(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> c_int;
+    // SAFETY: iocb is plain old data carried across threads for async I/O submission.
+    unsafe impl Send for iocb {}
 
-    pub fn io_cancel(ctx: io_context_t, iocb: *mut iocb, evt: *mut io_event) -> c_int;
+    #[derive(Clone)]
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    pub struct io_event {
+        pub data: u64,
+        pub obj: *mut iocb,
+        pub res: i64,
+        pub res2: i64,
+    }
 
-    pub fn io_getevents(
-        ctx_id: io_context_t,
-        min_nr: c_long,
-        nr: c_long,
-        events: *mut io_event,
-        timeout: *mut timespec,
-    ) -> c_int;
+    impl Default for io_event {
+        #[inline]
+        fn default() -> Self {
+            io_event {
+                data: 0,
+                obj: std::ptr::null_mut(),
+                res: 0,
+                res2: 0,
+            }
+        }
+    }
+
+    #[allow(non_camel_case_types)]
+    pub enum io_context {}
+
+    #[allow(non_camel_case_types)]
+    pub type io_context_t = *mut io_context;
+
+    #[link(name = "aio")]
+    unsafe extern "C" {
+        pub fn io_queue_init(maxevents: c_int, ctxp: *mut io_context_t) -> c_int;
+
+        pub fn io_queue_release(ctx: io_context_t) -> c_int;
+
+        pub fn io_queue_run(ctx: io_context_t) -> c_int;
+
+        pub fn io_setup(maxevents: c_int, ctxp: *mut io_context_t) -> c_int;
+
+        pub fn io_destroy(ctx: io_context_t) -> c_int;
+
+        pub fn io_submit(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> c_int;
+
+        pub fn io_cancel(ctx: io_context_t, iocb: *mut iocb, evt: *mut io_event) -> c_int;
+
+        pub fn io_getevents(
+            ctx_id: io_context_t,
+            min_nr: c_long,
+            nr: c_long,
+            events: *mut io_event,
+            timeout: *mut timespec,
+        ) -> c_int;
+    }
 }
 
 #[cfg(not(feature = "libaio"))]
-#[inline]
-fn libaio_stub_error() -> c_int {
-    -(libc::ENOSYS as c_int)
+mod stub {
+    use super::*;
+
+    // Keep the stub iocb layout fieldful for now.
+    //
+    // The no-libaio fallback still uses iocb as an in-memory transport object
+    // (see io::no_libaio::blocking_iocb), so empty stubs would break runtime behavior.
+    // A future task can decouple fallback metadata from iocb and then shrink stubs.
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    pub struct iocb {
+        pub data: u64,
+        pub key: u32,
+        _aio_rw_flags: u32, // not used.
+        pub aio_lio_opcode: u16,
+        pub aio_reqprio: u16,
+        pub aio_fildes: u32,
+        // PREAD/PWRITE -> void*
+        // PREADV/PWRITEV -> iovec
+        pub buf: *mut u8,
+        pub count: u64,
+        pub offset: u64,
+        _padding: u64, // not used.
+        pub flags: u32,
+        pub resfd: u32,
+    }
+
+    impl iocb {
+        /// Creates an owned iocb allocated on heap.
+        #[inline]
+        pub fn boxed() -> Box<Self> {
+            let mut this = Box::new(iocb {
+                data: 0,
+                key: 0,
+                _aio_rw_flags: 0,
+                aio_lio_opcode: io_iocb_cmd::IO_CMD_NOOP as u16,
+                aio_reqprio: 0,
+                aio_fildes: !0,
+                buf: std::ptr::null_mut(),
+                count: 0,
+                offset: 0,
+                _padding: 0,
+                flags: 0,
+                resfd: 0,
+            });
+            this.init();
+            this
+        }
+
+        #[inline]
+        fn init(&mut self) {
+            self.data = 0;
+            self.key = 0;
+            self._aio_rw_flags = 0;
+            self.aio_lio_opcode = io_iocb_cmd::IO_CMD_NOOP as u16;
+            self.aio_reqprio = 0;
+            self.aio_fildes = !0;
+            self.buf = std::ptr::null_mut();
+            self.count = 0;
+            self.offset = 0;
+            self._padding = 0;
+            self.flags = 0;
+            self.resfd = 0;
+        }
+
+        #[inline]
+        pub fn as_mut_ptr(&self) -> *mut iocb {
+            self as *const _ as *mut _
+        }
+    }
+
+    // SAFETY: iocb is plain old data carried across threads for async I/O submission.
+    unsafe impl Send for iocb {}
+
+    #[derive(Clone)]
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    pub struct io_event {
+        pub data: u64,
+        pub obj: *mut iocb,
+        pub res: i64,
+        pub res2: i64,
+    }
+
+    impl Default for io_event {
+        #[inline]
+        fn default() -> Self {
+            io_event {
+                data: 0,
+                obj: std::ptr::null_mut(),
+                res: 0,
+                res2: 0,
+            }
+        }
+    }
+
+    #[allow(non_camel_case_types)]
+    pub enum io_context {}
+
+    #[allow(non_camel_case_types)]
+    pub type io_context_t = *mut io_context;
+
+    #[inline]
+    fn libaio_stub_error() -> c_int {
+        -(libc::ENOSYS as c_int)
+    }
+
+    /// Stubbed `io_queue_init` when `libaio` is disabled.
+    ///
+    /// # Safety
+    /// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
+    /// validity requirements as the real libaio entrypoint.
+    pub unsafe fn io_queue_init(_maxevents: c_int, _ctxp: *mut io_context_t) -> c_int {
+        libaio_stub_error()
+    }
+
+    /// Stubbed `io_queue_release` when `libaio` is disabled.
+    ///
+    /// # Safety
+    /// This FFI-shaped API mirrors libaio. Callers must pass a context handle that
+    /// would be valid for the real libaio entrypoint.
+    pub unsafe fn io_queue_release(_ctx: io_context_t) -> c_int {
+        libaio_stub_error()
+    }
+
+    /// Stubbed `io_queue_run` when `libaio` is disabled.
+    ///
+    /// # Safety
+    /// This FFI-shaped API mirrors libaio. Callers must pass a context handle that
+    /// would be valid for the real libaio entrypoint.
+    pub unsafe fn io_queue_run(_ctx: io_context_t) -> c_int {
+        libaio_stub_error()
+    }
+
+    /// Stubbed `io_setup` when `libaio` is disabled.
+    ///
+    /// # Safety
+    /// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
+    /// validity requirements as the real libaio entrypoint.
+    pub unsafe fn io_setup(_maxevents: c_int, _ctxp: *mut io_context_t) -> c_int {
+        libaio_stub_error()
+    }
+
+    /// Stubbed `io_destroy` when `libaio` is disabled.
+    ///
+    /// # Safety
+    /// This FFI-shaped API mirrors libaio. Callers must pass a context handle that
+    /// would be valid for the real libaio entrypoint.
+    pub unsafe fn io_destroy(_ctx: io_context_t) -> c_int {
+        libaio_stub_error()
+    }
+
+    /// Stubbed `io_submit` when `libaio` is disabled.
+    ///
+    /// # Safety
+    /// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
+    /// validity requirements as the real libaio entrypoint.
+    pub unsafe fn io_submit(_ctx: io_context_t, _nr: c_long, _ios: *mut *mut iocb) -> c_int {
+        libaio_stub_error()
+    }
+
+    /// Stubbed `io_cancel` when `libaio` is disabled.
+    ///
+    /// # Safety
+    /// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
+    /// validity requirements as the real libaio entrypoint.
+    pub unsafe fn io_cancel(_ctx: io_context_t, _iocb: *mut iocb, _evt: *mut io_event) -> c_int {
+        libaio_stub_error()
+    }
+
+    /// Stubbed `io_getevents` when `libaio` is disabled.
+    ///
+    /// # Safety
+    /// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
+    /// validity requirements as the real libaio entrypoint.
+    pub unsafe fn io_getevents(
+        _ctx_id: io_context_t,
+        _min_nr: c_long,
+        _nr: c_long,
+        _events: *mut io_event,
+        _timeout: *mut timespec,
+    ) -> c_int {
+        libaio_stub_error()
+    }
 }
 
+#[cfg(feature = "libaio")]
+pub use linux::*;
 #[cfg(not(feature = "libaio"))]
-/// Stubbed `io_queue_init` when `libaio` is disabled.
-///
-/// # Safety
-/// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
-/// validity requirements as the real libaio entrypoint.
-pub unsafe fn io_queue_init(_maxevents: c_int, _ctxp: *mut io_context_t) -> c_int {
-    libaio_stub_error()
-}
-
-#[cfg(not(feature = "libaio"))]
-/// Stubbed `io_queue_release` when `libaio` is disabled.
-///
-/// # Safety
-/// This FFI-shaped API mirrors libaio. Callers must pass a context handle that
-/// would be valid for the real libaio entrypoint.
-pub unsafe fn io_queue_release(_ctx: io_context_t) -> c_int {
-    libaio_stub_error()
-}
-
-#[cfg(not(feature = "libaio"))]
-/// Stubbed `io_queue_run` when `libaio` is disabled.
-///
-/// # Safety
-/// This FFI-shaped API mirrors libaio. Callers must pass a context handle that
-/// would be valid for the real libaio entrypoint.
-pub unsafe fn io_queue_run(_ctx: io_context_t) -> c_int {
-    libaio_stub_error()
-}
-
-#[cfg(not(feature = "libaio"))]
-/// Stubbed `io_setup` when `libaio` is disabled.
-///
-/// # Safety
-/// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
-/// validity requirements as the real libaio entrypoint.
-pub unsafe fn io_setup(_maxevents: c_int, _ctxp: *mut io_context_t) -> c_int {
-    libaio_stub_error()
-}
-
-#[cfg(not(feature = "libaio"))]
-/// Stubbed `io_destroy` when `libaio` is disabled.
-///
-/// # Safety
-/// This FFI-shaped API mirrors libaio. Callers must pass a context handle that
-/// would be valid for the real libaio entrypoint.
-pub unsafe fn io_destroy(_ctx: io_context_t) -> c_int {
-    libaio_stub_error()
-}
-
-#[cfg(not(feature = "libaio"))]
-/// Stubbed `io_submit` when `libaio` is disabled.
-///
-/// # Safety
-/// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
-/// validity requirements as the real libaio entrypoint.
-pub unsafe fn io_submit(_ctx: io_context_t, _nr: c_long, _ios: *mut *mut iocb) -> c_int {
-    libaio_stub_error()
-}
-
-#[cfg(not(feature = "libaio"))]
-/// Stubbed `io_cancel` when `libaio` is disabled.
-///
-/// # Safety
-/// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
-/// validity requirements as the real libaio entrypoint.
-pub unsafe fn io_cancel(_ctx: io_context_t, _iocb: *mut iocb, _evt: *mut io_event) -> c_int {
-    libaio_stub_error()
-}
-
-#[cfg(not(feature = "libaio"))]
-/// Stubbed `io_getevents` when `libaio` is disabled.
-///
-/// # Safety
-/// This FFI-shaped API mirrors libaio. Callers must uphold the same pointer
-/// validity requirements as the real libaio entrypoint.
-pub unsafe fn io_getevents(
-    _ctx_id: io_context_t,
-    _min_nr: c_long,
-    _nr: c_long,
-    _events: *mut io_event,
-    _timeout: *mut timespec,
-) -> c_int {
-    libaio_stub_error()
-}
+pub use stub::*;
 
 #[cfg(test)]
 mod tests {

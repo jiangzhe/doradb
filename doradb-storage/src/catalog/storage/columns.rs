@@ -28,7 +28,15 @@ const COL_NO_COLUMNS_COLUMN_ATTRIBUTES: usize = 5;
 const COL_NAME_COLUMNS_COLUMN_ATTRIBUTES: &str = "column_attributes";
 const INDEX_NO_COLUMNS_COLUMN_ID: usize = 0;
 const INDEX_NAME_COLUMNS_COLUMN_ID: &str = "idx_columns_column_id";
+#[expect(
+    dead_code,
+    reason = "reserved for planned non-unique index on columns.table_id"
+)]
 const INDEX_NO_COLUMNS_TABLE_ID: usize = 1;
+#[expect(
+    dead_code,
+    reason = "reserved for planned non-unique index on columns.table_id"
+)]
 const INDEX_NAME_COLUMNS_TABLE_ID: &str = "idx_columns_table_id";
 
 pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {

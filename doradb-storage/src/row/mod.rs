@@ -721,11 +721,6 @@ impl RowPage {
     }
 
     #[inline]
-    pub(crate) fn update_var_exclusive(&mut self, row_idx: usize, col_idx: usize, var: PageVar) {
-        self.update_val_exclusive::<u64>(row_idx, col_idx, var.into_u64());
-    }
-
-    #[inline]
     pub(crate) fn add_var(&self, input: &[u8], var_offset: usize) -> (PageVar, usize) {
         let len = input.len();
         if len <= PAGE_VAR_LEN_INLINE {
@@ -736,15 +731,6 @@ impl RowPage {
             PageVar::outline(len as u16, var_offset as u16, &input[..PAGE_VAR_LEN_PREFIX]),
             var_offset + len,
         )
-    }
-
-    #[inline]
-    pub(crate) fn add_var_exclusive(
-        &mut self,
-        input: &[u8],
-        var_offset: usize,
-    ) -> (PageVar, usize) {
-        self.add_var(input, var_offset)
     }
 
     #[inline]
@@ -1633,11 +1619,11 @@ mod tests {
         assert!(page.header.max_row_count == 105);
         assert!(page.header.row_count() == 0);
         assert!(page.header.del_bitmap_offset == 0);
-        assert!(page.header.null_bitmap_list_offset % 8 == 0);
-        assert!(page.header.col_offset_list_offset % 8 == 0);
-        assert!(page.header.fix_field_offset % 8 == 0);
-        assert!(page.header.fix_field_end % 8 == 0);
-        assert!(page.header.var_field_offset() % 8 == 0);
+        assert!(page.header.null_bitmap_list_offset.is_multiple_of(8));
+        assert!(page.header.col_offset_list_offset.is_multiple_of(8));
+        assert!(page.header.fix_field_offset.is_multiple_of(8));
+        assert!(page.header.fix_field_end.is_multiple_of(8));
+        assert!(page.header.var_field_offset().is_multiple_of(8));
     }
 
     #[test]

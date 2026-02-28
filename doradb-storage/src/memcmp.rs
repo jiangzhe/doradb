@@ -1245,7 +1245,7 @@ mod tests {
     where
         T: MemCmpFormat + Ord,
     {
-        in1.sort_by(|a, b| a.cmp(b));
+        in1.sort();
         in2.sort();
 
         for (e, a) in in1.iter().zip(in2.iter()) {
@@ -1256,7 +1256,7 @@ mod tests {
     }
 
     fn sort_and_check_varlen_mcf(in1: &mut [Vec<u8>], in2: &mut [Vec<u8>]) {
-        in1.sort_by(|a, b| a.cmp(b));
+        in1.sort();
         in2.sort();
 
         for (e, a) in in1.iter().zip(in2.iter()) {
@@ -1270,7 +1270,7 @@ mod tests {
     where
         T: NullableMemCmpFormat + Ord,
     {
-        in1.sort_by(|a, b| a.cmp(b));
+        in1.sort();
         in2.sort();
 
         for (e, a) in in1.iter().zip(in2.iter()) {
@@ -1281,7 +1281,7 @@ mod tests {
     }
 
     fn sort_and_check_varlen_nmcf(in1: &mut [SegmentedBytes], in2: &mut [Vec<u8>]) {
-        in1.sort_by(|a, b| a.cmp(b));
+        in1.sort();
         in2.sort();
 
         for (e, a) in in1.iter().zip(in2.iter()) {
@@ -1373,7 +1373,7 @@ mod tests {
         k17.update_last_byte(0x02);
         assert!(!k17.is_empty());
         assert!(k17.len() == 4);
-        assert!(k17.as_bytes() == &[0x00, 0x01, 0x01, 0x02]);
+        assert!(k17.as_bytes() == [0x00, 0x01, 0x01, 0x02]);
 
         let mut k17 = MemCmpKey::empty();
         for _ in 0..64 {
@@ -1405,8 +1405,8 @@ mod tests {
 
     #[test]
     fn test_mem_cmp_normal_bytes() {
-        assert!(NormalBytes::est_mcf_len() == None);
-        assert!(NormalBytes::est_nmcf_len() == None);
+        assert!(NormalBytes::est_mcf_len().is_none());
+        assert!(NormalBytes::est_nmcf_len().is_none());
         let mut buf = vec![];
         NormalBytes(b"hello").extend_mcf_to(&mut buf);
         assert!(&buf[..] == b"hello");

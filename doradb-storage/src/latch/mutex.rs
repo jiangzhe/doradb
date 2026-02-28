@@ -123,6 +123,7 @@ impl RawMutex {
 
     /// Lock this mutex in async way.
     #[inline]
+    #[cfg(test)]
     pub async fn lock_async(&self) {
         if self.try_lock() {
             return;
@@ -307,7 +308,7 @@ mod tests {
             .map_err(|_| ())
             .and_then(|s| s.parse::<usize>().map_err(|_| ()))
             .unwrap_or(1usize);
-        assert!(threads % sys_threads == 0);
+        assert!(threads.is_multiple_of(sys_threads));
 
         // sync lock
         let start = Instant::now();

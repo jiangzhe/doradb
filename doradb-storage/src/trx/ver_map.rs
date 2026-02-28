@@ -154,7 +154,7 @@ impl RowVersionMap {
     #[inline]
     pub fn read_latch(&self, row_idx: usize) -> RowVersionReadGuard<'_> {
         let g = self.entries[row_idx].read();
-        RowVersionReadGuard { m: self, g }
+        RowVersionReadGuard { g }
     }
 
     /// Acquire a write latch on given row.
@@ -188,7 +188,6 @@ impl RowVersionMap {
 }
 
 pub struct RowVersionReadGuard<'a> {
-    m: &'a RowVersionMap,
     g: RwLockReadGuard<'a, Option<Box<RowUndoHead>>>,
 }
 

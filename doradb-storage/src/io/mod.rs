@@ -27,6 +27,11 @@ mod no_libaio {
         pub(super) res: std::io::Result<usize>,
     }
 
+    // NOTE:
+    // In no-libaio mode we currently execute blocking pread/pwrite by decoding
+    // fields from iocb directly. Because of this, stub iocb cannot be an empty
+    // struct yet. Migrating to empty stubs is deferred to a future task that
+    // introduces a dedicated fallback request metadata type.
     pub(super) unsafe fn blocking_iocb(iocb: IocbRawPtr) -> Completion {
         let iocb = unsafe { &*iocb };
         let fd = iocb.aio_fildes as RawFd;
@@ -119,7 +124,10 @@ pub enum AIOError {
 pub type AIOResult<T> = StdResult<T, AIOError>;
 
 pub struct AIOContext {
+    #[cfg(feature = "libaio")]
     ctx: io_context_t,
+    #[cfg(not(feature = "libaio"))]
+    _ctx: io_context_t,
     max_events: usize,
     #[cfg(not(feature = "libaio"))]
     completion_tx: Sender<Completion>,
@@ -148,7 +156,7 @@ impl AIOContext {
         {
             let (completion_tx, completion_rx) = flume::unbounded();
             Ok(AIOContext {
-                ctx: std::ptr::null_mut(),
+                _ctx: std::ptr::null_mut(),
                 max_events,
                 completion_tx,
                 completion_rx,
@@ -953,9 +961,9 @@ mod tests {
         let buf = DirectBuf::with_data(b"hello, world");
         let (offset, _) = file.alloc(buf.capacity()).unwrap();
         let aio = file.pwrite_direct(100, offset, buf);
-        let mut reqs = vec![aio.iocb_raw()];
+        let reqs = vec![aio.iocb_raw()];
         let limit = reqs.len();
-        let submit_count = ctx.submit_limit(&mut reqs, limit);
+        let submit_count = ctx.submit_limit(&reqs, limit);
         println!("submit_count={}", submit_count);
         let mut events = ctx.events();
         ctx.wait_at_least(&mut events, 1, |key, res| {
@@ -1003,7 +1011,7 @@ mod tests {
         buf.reset();
         buf.extend_from_slice(b"hello, world");
 
-        let _ = client
+        client
             .send(Request {
                 kind: AIOKind::Write,
                 offset: 0,
@@ -1029,15 +1037,24 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "libaio")]
     fn test_submit_limit_eagain_no_panic() {
         let ctx = AIOContext::try_default().unwrap();
-        let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
-        let iocb = iocb::boxed();
-        let reqs = vec![iocb.as_mut_ptr()];
-        let submit_count = ctx.submit_limit(&reqs, 1);
-        set_io_submit_hook(previous);
-        assert_eq!(submit_count, 0);
+        #[cfg(feature = "libaio")]
+        {
+            let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
+            let iocb = iocb::boxed();
+            let reqs = vec![iocb.as_mut_ptr()];
+            let submit_count = ctx.submit_limit(&reqs, 1);
+            set_io_submit_hook(previous);
+            assert_eq!(submit_count, 0);
+        }
+        #[cfg(not(feature = "libaio"))]
+        {
+            // In fallback mode, empty submission should succeed and return 0.
+            let reqs: Vec<*mut iocb> = vec![];
+            let submit_count = ctx.submit_limit(&reqs, 1);
+            assert_eq!(submit_count, 0);
+        }
     }
 
     struct Request {

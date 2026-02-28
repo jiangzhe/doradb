@@ -283,7 +283,7 @@ mod tests {
 
     fn global_readonly_pool() -> &'static GlobalReadonlyBufferPool {
         static GLOBAL: OnceLock<&'static GlobalReadonlyBufferPool> = OnceLock::new();
-        *GLOBAL.get_or_init(|| {
+        GLOBAL.get_or_init(|| {
             GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap()
         })
     }
