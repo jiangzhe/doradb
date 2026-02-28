@@ -622,7 +622,14 @@ impl<'a> ColumnBlockIndex<'a> {
 
     /// Applies sorted start-row-id bitmap patches with copy-on-write updates.
     ///
-    /// This API is sticky offload: updated payloads always store offloaded refs.
+    /// Constraints:
+    /// - `patches` must be sorted and unique by `start_row_id`.
+    /// - every `start_row_id` must already exist in the current index snapshot.
+    ///
+    /// Behavior:
+    /// - this API is sticky offload: updated payloads always store offloaded refs.
+    /// - it mutates the provided `MutableTableFile` as part of CoW writes.
+    /// - callers should discard the mutable file after `Err` and fork a new one for retries.
     pub async fn batch_update_offloaded_bitmaps(
         &self,
         mutable_file: &mut MutableTableFile,
