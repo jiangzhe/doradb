@@ -1,11 +1,13 @@
 mod access;
 mod deletion_buffer;
+mod persistence;
 mod recover;
 #[cfg(test)]
 mod tests;
 
 pub use access::*;
 pub use deletion_buffer::*;
+pub use persistence::*;
 pub use recover::*;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};

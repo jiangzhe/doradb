@@ -2,12 +2,12 @@ use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
 use crate::file::table_fs::TableFileSystemConfig;
-use crate::index::{RowLocation, UniqueIndex};
+use crate::index::{ColumnBlockIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage};
 use crate::session::Session;
-use crate::table::{DeleteMarker, Table, TableAccess};
+use crate::table::{DeleteMarker, Table, TableAccess, TablePersistence};
 use crate::trx::row::LockRowForWrite;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::undo::RowUndoKind;
@@ -423,6 +423,114 @@ fn test_column_delete_mvcc_visibility() {
         trx_new = sys.trx_select_not_found(trx_new, &key).await;
         trx_new.commit().await.unwrap();
 
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_for_deletion_persists_committed_markers() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table
+            .checkpoint_for_new_data(&mut session)
+            .await
+            .unwrap();
+
+        let key = single_key(6i32);
+        let reader = session.begin_trx().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, &key, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        sys.new_trx_delete(&mut session, &key).await;
+        sys.table
+            .checkpoint_for_deletion(&mut session)
+            .await
+            .unwrap();
+
+        let active_root = sys.table.file.active_root();
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            &sys.table.disk_pool,
+        );
+        let (start_row_id, payload) = index
+            .find_entry(row_id)
+            .await
+            .unwrap()
+            .expect("payload should exist");
+        assert!(payload.offloaded_ref().is_some());
+        let bytes = index
+            .read_offloaded_bitmap_bytes(&payload)
+            .await
+            .unwrap()
+            .expect("offloaded bytes should exist");
+        let deltas = decode_offloaded_deltas(&bytes);
+        let expected_delta = (row_id - start_row_id) as u32;
+        assert!(deltas.binary_search(&expected_delta).is_ok());
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table
+            .checkpoint_for_new_data(&mut session)
+            .await
+            .unwrap();
+
+        let key = single_key(7i32);
+        let reader = session.begin_trx().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, &key, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        let mut hold_session = sys.new_session();
+        let hold_trx = hold_session.begin_trx().unwrap();
+        let hold_sts = hold_trx.sts;
+
+        let mut writer_session = sys.new_session();
+        sys.new_trx_delete(&mut writer_session, &key).await;
+
+        let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+        let delete_cts = match marker {
+            DeleteMarker::Committed(ts) => ts,
+            DeleteMarker::Ref(status) => status.ts(),
+        };
+        assert!(delete_cts >= hold_sts);
+
+        let mut checkpoint_session = sys.new_session();
+        sys.table
+            .checkpoint_for_deletion(&mut checkpoint_session)
+            .await
+            .unwrap();
+
+        let active_root = sys.table.file.active_root();
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            &sys.table.disk_pool,
+        );
+        let (_start_row_id, payload) = index
+            .find_entry(row_id)
+            .await
+            .unwrap()
+            .expect("payload should exist");
+        assert!(payload.offloaded_ref().is_none());
+
+        hold_trx.rollback().await;
+        drop(checkpoint_session);
+        drop(writer_session);
+        drop(hold_session);
         drop(session);
         sys.clean_all();
     });
@@ -1577,6 +1685,17 @@ async fn assert_row_in_lwc(table: &Table, key: &SelectKey, sts: TrxID) -> RowID 
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),
     }
+}
+
+fn decode_offloaded_deltas(bytes: &[u8]) -> Vec<u32> {
+    assert!(!bytes.is_empty());
+    assert!(bytes.len().is_multiple_of(std::mem::size_of::<u32>()));
+    let mut deltas = bytes
+        .chunks_exact(std::mem::size_of::<u32>())
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    deltas.sort_unstable();
+    deltas
 }
 
 async fn insert_rows(sys: &TestSys, session: &mut Session, start: i32, count: i32, name: &str) {

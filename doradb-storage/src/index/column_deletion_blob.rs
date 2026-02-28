@@ -143,10 +143,10 @@ impl<'a> ColumnDeletionBlobWriter<'a> {
 
     /// Flushes the tail page that still has pending blob bytes.
     pub async fn finish(&mut self) -> Result<()> {
-        if let Some(page) = self.current_page.take() {
-            if page.used_size > 0 {
-                self.flush_page(page, 0).await?;
-            }
+        if let Some(page) = self.current_page.take()
+            && page.used_size > 0
+        {
+            self.flush_page(page, 0).await?;
         }
         Ok(())
     }

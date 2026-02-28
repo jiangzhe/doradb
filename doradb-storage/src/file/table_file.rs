@@ -368,6 +368,33 @@ impl MutableTableFile {
         }
     }
 
+    /// Returns the mutable root snapshot being built by this COW transaction.
+    #[inline]
+    pub fn root(&self) -> &ActiveRoot {
+        &self.new_root
+    }
+
+    /// Updates mutable root column-index pointer.
+    #[inline]
+    pub fn set_column_block_index_root(&mut self, root_page_id: PageID) {
+        self.new_root.column_block_index_root = root_page_id;
+    }
+
+    /// Updates mutable root checkpoint metadata.
+    #[inline]
+    pub fn apply_checkpoint_metadata(
+        &mut self,
+        pivot_row_id: RowID,
+        heap_redo_start_ts: TrxID,
+    ) -> Result<()> {
+        if pivot_row_id < self.new_root.pivot_row_id {
+            return Err(Error::InvalidArgument);
+        }
+        self.new_root.pivot_row_id = pivot_row_id;
+        self.new_root.heap_redo_start_ts = heap_redo_start_ts;
+        Ok(())
+    }
+
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
     pub fn allocate_page_id(&mut self) -> Result<PageID> {
@@ -477,13 +504,13 @@ impl MutableTableFile {
         Ok((table_file, old_root))
     }
 
-    pub async fn persist_lwc_pages(
-        mut self,
+    pub async fn apply_lwc_pages(
+        &mut self,
         lwc_pages: Vec<LwcPagePersist>,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
         disk_pool: &ReadonlyBufferPool,
-    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+    ) -> Result<()> {
         let mut max_row_id = self.new_root.pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_pages.len());
         let mut new_entries = Vec::with_capacity(lwc_pages.len());
@@ -515,12 +542,23 @@ impl MutableTableFile {
             disk_pool,
         );
         let new_root = column_index
-            .batch_insert(&mut self, &new_entries, max_row_id, ts)
+            .batch_insert(self, &new_entries, max_row_id, ts)
             .await?;
         self.new_root.column_block_index_root = new_root;
         self.new_root.pivot_row_id = max_row_id;
         self.new_root.heap_redo_start_ts = heap_redo_start_ts;
+        Ok(())
+    }
 
+    pub async fn persist_lwc_pages(
+        mut self,
+        lwc_pages: Vec<LwcPagePersist>,
+        heap_redo_start_ts: TrxID,
+        ts: TrxID,
+        disk_pool: &ReadonlyBufferPool,
+    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+        self.apply_lwc_pages(lwc_pages, heap_redo_start_ts, ts, disk_pool)
+            .await?;
         self.commit(ts, false).await
     }
 
@@ -534,11 +572,7 @@ impl MutableTableFile {
         heap_redo_start_ts: TrxID,
         ts: TrxID,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        if pivot_row_id < self.new_root.pivot_row_id {
-            return Err(Error::InvalidArgument);
-        }
-        self.new_root.pivot_row_id = pivot_row_id;
-        self.new_root.heap_redo_start_ts = heap_redo_start_ts;
+        self.apply_checkpoint_metadata(pivot_row_id, heap_redo_start_ts)?;
         self.commit(ts, false).await
     }
 
