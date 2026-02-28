@@ -12,7 +12,7 @@ In Doradb's HTAP architecture, data blocks (LWC Blocks) are immutable. Modificat
 2.  **Pessimistic Disk Persistence**: The on-disk Bitmap represents a **superset** of all committed deletions.
     *   **Disk State**: "Physically Deleted".
     *   **Memory State**: "Logically Visible" (Undo information).
-3.  **Hybrid Storage Layout**: Small bitmaps are inlined in the Block Index; large bitmaps are offloaded to a dedicated CoW B+Tree.
+3.  **Hybrid Storage Layout**: Small bitmaps are inlined in the Block Index; large bitmaps are offloaded to immutable shared slotted blob pages.
 4.  **Decoupled GC**: Persistence (I/O) is decoupled from Memory Garbage Collection (Visibility). Data remains in memory after flushing to serve as an Undo Log for active long-running transactions.
 
 ## 2. Data Structures
@@ -41,30 +41,25 @@ struct DeletionEntry {
 
 ### 2.2 On-Disk: Hybrid Bitmap Storage
 
-We utilize a **Hybrid / Adaptive** strategy to manage `RoaringBitmap` persistence, leveraging the `Block Index` for navigation and the `Bitmap Tree` for bulk storage.
+We utilize a **Hybrid / Adaptive** strategy to manage `RoaringBitmap` persistence, leveraging the `Block Index` for navigation and immutable blob pages for bulk storage.
 
 #### A. Block Index (Primary)
-The Block Index Leaf Entry contains a `BitmapValue` enum:
+The Block Index Leaf Entry keeps either an inline deletion-delta list or an offloaded blob reference:
 
 ```rust
-enum BitmapValue {
-    // 1. Inline Mode
-    // Used when serialized size < Threshold (e.g., 128 Bytes).
-    // Zero extra I/O to fetch bitmap during Index Scan.
-    Inline(Vec<u8>), 
-    
-    // 2. Offload Mode
-    // Used when serialized size >= Threshold.
-    // Points to a key in the Bitmap Tree.
-    Offload(RowID),  // Key is the Start_RowID of the LWC Block
+struct BlobRef {
+    start_page_id: u64,
+    start_offset: u16,
+    byte_len: u32,
 }
 ```
 
-#### B. Bitmap Tree (Overflow)
-*   **Implementation**: Reuses the existing **DiskTree** (CoW B+Tree).
-*   **Key**: `Start_RowID` (u64).
-*   **Value**: Serialized `RoaringBitmap`.
-*   **Page Size**: 64KB (Consistent with the rest of the system).
+#### B. Deletion Blob Pages (Overflow)
+*   **Implementation**: Immutable shared slotted blob pages in table file.
+*   **Layout**: 64KB page with `(magic/version, next_page_id, used_size)` header + packed byte body.
+*   **Reference**: `BlobRef` points to start page+offset and total byte length.
+*   **Spill**: Large bitmaps can continue through linked pages (`next_page_id`).
+*   **Reclaim**: Sweep/compaction is deferred to a dedicated follow-up task.
 
 ## 3. Transaction & Visibility Model
 
@@ -74,7 +69,7 @@ The visibility check logic determines whether a row is "alive" for a reader tran
 
 ### The Read Path
 1.  **Check Disk (Fast Path)**:
-    *   Query Block Index. Get Bitmap (Inline or fetch from Bitmap Tree).
+    *   Query Block Index. Get Bitmap (Inline or fetch via `BlobRef` from blob pages).
     *   If `Bitmap.contains(RowID) == false`: **Row is Visible**. (Return data).
 2.  **Check Memory (Slow Path / Undo Path)**:
     *   *Condition*: Triggered only if `Bitmap.contains(RowID) == true`.
@@ -106,25 +101,25 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
 ### Phase 2: Merge & Encode (Pure Computation)
 *   **Condition**: If the list from Phase 1 is empty, skip to **Phase 4 (Heartbeat Path)**.
 *   **Action**: For each affected LWC Block:
-    1.  **Load Old Bitmap**: Fetch from Block Index (Inline) or Bitmap Tree (Offload).
+    1.  **Load Old Bitmap**: Fetch from Block Index (Inline) or blob pages (Offload).
     2.  **Merge**: `New_Bitmap = Old_Bitmap | New_Deletes`.
     3.  **Optimize**: Serialize `New_Bitmap`.
         *   If `Size < Threshold`: Mark as `Inline`.
         *   If `Size >= Threshold`: Mark as `Offload`.
 
 ### Phase 3: CoW Persistence (I/O)
-*   **Update Bitmap Tree** (Only for Offload blocks):
-    *   Insert/Update `(Start_RowID, Blob)` in the Bitmap B+Tree using Copy-on-Write.
-    *   Generate new Bitmap Tree Root.
+*   **Write Blob Pages** (Only for Offload blocks):
+    *   Append serialized bytes into immutable shared slotted blob pages.
+    *   Capture `BlobRef` for each updated block.
 *   **Update Block Index**:
     *   Perform a **Batch Put** on the Block Index.
-    *   Update values to `Inline(Blob)` or `Offload(Start_RowID)`.
-    *   Generate new Block Index Root.
+    *   Update values to inline deletion list or offloaded `BlobRef`.
+    *   Generate new Block Index Root via CoW.
 
 ### Phase 4: Commit & Watermark Advancement
 *   **Lock**: Acquire `SuperPage Lock`.
 *   **New MetaPage**: Create a new `MetaPage`.
-    *   Update `BlockIndexRoot` and `BitmapTreeRoot` (if changed).
+    *   Update `BlockIndexRoot` (if changed).
     *   **Crucial Update**: Set `Table.watermarks.deletion_rec_ts = Checkpoint_STS`.
     *   *Note*: This is set to the system timestamp acquired in Phase 1, regardless of the actual data timestamps.
 *   **Persist**: Write MetaPage to disk.
@@ -192,11 +187,11 @@ sequenceDiagram
 
     %% Phase 2 & 3
     loop For Each Affected Block
-        CP->>IDX: Get Old Bitmap (Inline/Offload)
+        CP->>IDX: Get Old Bitmap (Inline/Offload Ref)
         CP->>CP: Merge & Serialize
         alt Size >= Threshold
-            CP->>IO: Update BitmapTree (CoW)
-            Note right of CP: Prepare IndexVal = Offload(Key)
+            CP->>IO: Append immutable blob pages
+            Note right of CP: Prepare IndexVal = Offload(BlobRef)
         else Size < Threshold
             Note right of CP: Prepare IndexVal = Inline(Blob)
         end

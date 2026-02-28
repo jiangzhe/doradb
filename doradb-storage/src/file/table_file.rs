@@ -340,7 +340,7 @@ impl Drop for TableFile {
 /// is persisted to disk.
 pub struct MutableTableFile {
     table_file: Arc<TableFile>,
-    active_root: ActiveRoot,
+    new_root: ActiveRoot,
 }
 
 pub struct LwcPagePersist {
@@ -352,10 +352,10 @@ pub struct LwcPagePersist {
 impl MutableTableFile {
     /// Create new mutable table file.
     #[inline]
-    pub fn new(table_file: Arc<TableFile>, active_root: ActiveRoot) -> Self {
+    pub fn new(table_file: Arc<TableFile>, new_root: ActiveRoot) -> Self {
         MutableTableFile {
             table_file,
-            active_root,
+            new_root,
         }
     }
 
@@ -364,14 +364,14 @@ impl MutableTableFile {
     pub fn fork(table_file: &Arc<TableFile>) -> Self {
         MutableTableFile {
             table_file: Arc::clone(table_file),
-            active_root: table_file.active_root().flip(),
+            new_root: table_file.active_root().flip(),
         }
     }
 
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
     pub fn allocate_page_id(&mut self) -> Result<PageID> {
-        self.active_root
+        self.new_root
             .alloc_map
             .try_allocate()
             .map(|page_id| page_id as PageID)
@@ -381,7 +381,7 @@ impl MutableTableFile {
     /// Record an obsolete page id to be reclaimed on commit.
     #[inline]
     pub fn record_gc_page(&mut self, page_id: PageID) {
-        self.active_root.gc_page_list.push(page_id);
+        self.new_root.gc_page_list.push(page_id);
     }
 
     /// Write one page into the underlying table file.
@@ -401,22 +401,22 @@ impl MutableTableFile {
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         let MutableTableFile {
             table_file,
-            mut active_root,
+            mut new_root,
         } = self;
-        debug_assert!(active_root.trx_id == 0 || active_root.trx_id < trx_id);
-        active_root.trx_id = trx_id;
+        debug_assert!(new_root.trx_id == 0 || new_root.trx_id < trx_id);
+        new_root.trx_id = trx_id;
 
-        if active_root.meta_page_id != 0 {
-            active_root.gc_page_list.push(active_root.meta_page_id);
+        if new_root.meta_page_id != 0 {
+            new_root.gc_page_list.push(new_root.meta_page_id);
         }
-        let new_meta_page_id = active_root
+        let new_meta_page_id = new_root
             .alloc_map
             .try_allocate()
             .ok_or(Error::InvalidState)? as PageID;
-        active_root.meta_page_id = new_meta_page_id;
+        new_root.meta_page_id = new_meta_page_id;
 
         // serialize meta page.
-        let meta_page = active_root.meta_page_ser_view();
+        let meta_page = new_root.meta_page_ser_view();
         let mut meta_buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
         let meta_len = meta_page.ser_len();
         if meta_len > TABLE_FILE_PAGE_SIZE {
@@ -437,7 +437,7 @@ impl MutableTableFile {
         }
 
         // serialize header and body of super page.
-        let super_page = active_root.ser_view();
+        let super_page = new_root.ser_view();
         let mut buf = DirectBuf::zeroed(TABLE_FILE_SUPER_PAGE_SIZE);
         let ser_len = super_page.ser_len();
         if ser_len > TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET {
@@ -472,7 +472,7 @@ impl MutableTableFile {
         table_file.fsync();
 
         // swap active root at the end.
-        let old_root = table_file.swap_active_root(active_root);
+        let old_root = table_file.swap_active_root(new_root);
 
         Ok((table_file, old_root))
     }
@@ -484,17 +484,17 @@ impl MutableTableFile {
         ts: TrxID,
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        let mut max_row_id = self.active_root.pivot_row_id;
+        let mut max_row_id = self.new_root.pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_pages.len());
         let mut new_entries = Vec::with_capacity(lwc_pages.len());
-        let mut last_end = self.active_root.pivot_row_id;
+        let mut last_end = self.new_root.pivot_row_id;
 
         for page in lwc_pages {
             if page.start_row_id >= page.end_row_id {
                 return Err(Error::InvalidArgument);
             }
             let page_id = self
-                .active_root
+                .new_root
                 .alloc_map
                 .try_allocate()
                 .ok_or(Error::InvalidState)? as PageID;
@@ -510,31 +510,35 @@ impl MutableTableFile {
         try_join_all(writes).await?;
 
         let column_index = crate::index::ColumnBlockIndex::new(
-            self.active_root.column_block_index_root,
-            self.active_root.pivot_row_id,
+            self.new_root.column_block_index_root,
+            self.new_root.pivot_row_id,
             disk_pool,
         );
         let new_root = column_index
             .batch_insert(&mut self, &new_entries, max_row_id, ts)
             .await?;
-        self.active_root.column_block_index_root = new_root;
-        self.active_root.pivot_row_id = max_row_id;
-        self.active_root.heap_redo_start_ts = heap_redo_start_ts;
+        self.new_root.column_block_index_root = new_root;
+        self.new_root.pivot_row_id = max_row_id;
+        self.new_root.heap_redo_start_ts = heap_redo_start_ts;
 
         self.commit(ts, false).await
     }
 
+    /// Updates checkpoint metadata in the mutable root and commits it as a new table-file root.
+    ///
+    /// This method consumes `self`; on `Err`, the caller must treat the failed mutable instance
+    /// as discarded and start from `MutableTableFile::fork` again.
     pub async fn update_checkpoint(
         mut self,
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        if pivot_row_id < self.active_root.pivot_row_id {
+        if pivot_row_id < self.new_root.pivot_row_id {
             return Err(Error::InvalidArgument);
         }
-        self.active_root.pivot_row_id = pivot_row_id;
-        self.active_root.heap_redo_start_ts = heap_redo_start_ts;
+        self.new_root.pivot_row_id = pivot_row_id;
+        self.new_root.heap_redo_start_ts = heap_redo_start_ts;
         self.commit(ts, false).await
     }
 
