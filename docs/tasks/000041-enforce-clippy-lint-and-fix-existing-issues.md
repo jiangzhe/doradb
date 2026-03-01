@@ -123,8 +123,8 @@ Reference:
 ## Open Questions
 
 1. Future follow-up: evaluate enabling `clippy::pedantic` enforcement with a curated allow-list/deny-list policy for this repository. This requires classifying warning categories and handling them case by case in a dedicated task.
-   Backlog: `docs/backlogs/000001-pedantic-clippy-adoption-policy.todo.md`.
+   Backlog: `docs/backlogs/000001-pedantic-clippy-adoption-policy.md`.
 2. Future follow-up: implement reserved non-unique indexes for catalog tables (`columns.table_id`, `indexes.table_id`) that are currently deferred.
-   Backlog: `docs/backlogs/000002-non-unique-index-for-catalog-tables.todo.md`.
+   Backlog: `docs/backlogs/000002-non-unique-index-for-catalog-tables.md`.
 3. Future follow-up: improve no-`libaio` ABI stubs so `iocb`/related stub structs can be simplified (potentially empty) after decoupling fallback request metadata from ABI layout.
-   Backlog: `docs/backlogs/000003-improve-libaio-stub-struct-design.todo.md`.
+   Backlog: `docs/backlogs/000003-improve-libaio-stub-struct-design.md`.

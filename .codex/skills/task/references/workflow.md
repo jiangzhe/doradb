@@ -2,9 +2,10 @@
 
 ## Command Model
 
-`task` has two prompt workflows:
+`task` has three prompt workflows:
 1. `task create`: design-phase analysis and task doc creation.
 2. `task resolve`: post-implementation sync and follow-up tracking.
+3. `task close`: user-intention backlog closure and archive.
 
 ## `task create` Formal Round Definition
 
@@ -81,25 +82,35 @@ Complete all items:
 4. Append unresolved future improvements to `Open Questions` if they remain out of scope.
 5. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
 6. Link related backlog todos from task doc resolve updates.
-7. If task doc has `Source Backlogs:` entries with `docs/backlogs/...todo.md`, rename those backlog files to `.done.md` when resolve is completed.
+7. If task doc has `Source Backlogs:` entries in `docs/backlogs/`, close/archive those backlog files during resolve.
    - Helper command:
 ```bash
-tools/task.rs rename-backlog-doc \
-  --path docs/backlogs/000010-example-a.todo.md \
-  --path docs/backlogs/000011-example-b.todo.md \
-  --status done
+tools/task.rs resolve-task-backlogs \
+  --task docs/tasks/000042-example.md
 ```
 
 ## Backlog Integration
 
-1. Backlog docs live in `docs/backlogs/<6digits>-<follow-up-topic>.{todo|done}.md`.
-2. Use `docs/backlogs/000000-template.md` for brief todo docs.
-3. `.todo.md` means pending, `.done.md` means completed status.
-4. A backlog doc is input context for `task create`, not a shortcut for design quality gates.
-5. If one or more backlog sources are `.done.md`, prompt user before continuing task creation from completed item(s).
-6. If task creation proceeds from backlog, record `Source Backlogs:` list in task doc to enable resolve-time rename.
-7. Even when backlog exists, still run deep research, proposals, and two formal rounds before writing `docs/tasks/`.
-8. To allocate a new backlog id, use:
+1. Open backlog docs live in `docs/backlogs/<6digits>-<follow-up-topic>.md`.
+2. Closed backlog docs live in `docs/backlogs/closed/<6digits>-<follow-up-topic>.md`.
+3. Use `docs/backlogs/000000-template.md` for brief todo docs.
+4. `docs/backlogs/next-id` stores next backlog id as single 6-digit line.
+5. A backlog doc is input context for `task create`, not a shortcut for design quality gates.
+6. If one or more source backlog docs are already under `docs/backlogs/closed/`, prompt user before continuing task creation from closed item(s).
+7. If task creation proceeds from backlog, record `Source Backlogs:` list in task doc to enable resolve-time closure tracking.
+8. Even when backlog exists, still run deep research, proposals, and two formal rounds before writing `docs/tasks/`.
+9. To allocate a new backlog id, use:
 ```bash
-tools/task.rs next-backlog-id
+tools/task.rs alloc-backlog-id
 ```
+
+## `task close` Checklist
+
+1. Validate target is an open backlog item under `docs/backlogs/`.
+2. Collect explicit close reason detail from user intent.
+3. Choose close type (`stale`, `replaced`, `duplicate`, `wontfix`, `already-implemented`, `other`) or infer from explicit user wording.
+4. Run:
+```bash
+tools/task.rs close-backlog-doc --id 000123 --type stale --detail \"Superseded by new implementation\"
+```
+5. Confirm file moved to `docs/backlogs/closed/` and `## Close Reason` section exists.
