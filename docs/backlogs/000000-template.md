@@ -5,10 +5,11 @@ Filename rule:
 - Closed/archived backlog item: `docs/backlogs/closed/<6digits>-<follow-up-topic>.md`.
 - Next id storage: `docs/backlogs/next-id` (single 6-digit line).
 - Next id helpers:
-  - `tools/task.rs init-backlog-next-id`
-  - `tools/task.rs alloc-backlog-id`
+  - `tools/backlog.rs init-next-id`
+  - `tools/backlog.rs alloc-id`
 - Close helpers:
-  - `tools/task.rs close-backlog-doc --id <6digits> --type <type> --detail <text>`
+  - `tools/backlog.rs close-doc --id <6digits> --type <type> --detail <text>`
+  - `tools/task.rs resolve-task-backlogs --task docs/tasks/<6digits>-<slug>.md`
   - `tools/task.rs complete-backlog-doc --id <6digits> --task docs/tasks/<6digits>-<slug>.md`
 
 ## Summary
@@ -42,7 +43,7 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 
 - Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
 - Detail: <reason detail>
-- Closed By: <task close|task resolve>
+- Closed By: <backlog close|task resolve>
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```

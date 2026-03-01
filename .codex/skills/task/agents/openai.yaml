@@ -1,4 +1,4 @@
 interface:
   display_name: "Task Design"
   short_description: "Deep-research, multi-round task design with approval gates"
-  default_prompt: "Use $task create for deep-research design rounds with explicit approval gating (backlog input uses one or more docs/backlogs/<6digits>-<topic>.md files). Use $task resolve to sync implementation notes/open questions and auto-close source backlogs into docs/backlogs/closed via resolve-task-backlogs. Use $task close to close a specific open backlog item by id/path with explicit close reason."
+  default_prompt: "Use $task create for deep-research design rounds with explicit approval gating (backlog input uses one or more docs/backlogs/<6digits>-<topic>.md files). Use $task resolve to sync implementation notes/open questions and auto-close source backlogs into docs/backlogs/closed via resolve-task-backlogs. Use $backlog for manual backlog create/close workflows."
