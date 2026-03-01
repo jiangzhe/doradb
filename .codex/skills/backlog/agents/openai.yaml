@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backlog Workflow"
+  short_description: "Create and close backlog docs with duplicate checks"
+  default_prompt: "Use $backlog create to confirm intent, scan open backlog duplicates, allocate id, and create a backlog doc. Use $backlog close to archive an open backlog doc with explicit close reason."

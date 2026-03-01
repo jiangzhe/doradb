@@ -2,10 +2,9 @@
 
 ## Command Model
 
-`task` has three prompt workflows:
+`task` has two prompt workflows:
 1. `task create`: design-phase analysis and task doc creation.
 2. `task resolve`: post-implementation sync and follow-up tracking.
-3. `task close`: user-intention backlog closure and archive.
 
 ## `task create` Formal Round Definition
 
@@ -99,18 +98,8 @@ tools/task.rs resolve-task-backlogs \
 6. If one or more source backlog docs are already under `docs/backlogs/closed/`, prompt user before continuing task creation from closed item(s).
 7. If task creation proceeds from backlog, record `Source Backlogs:` list in task doc to enable resolve-time closure tracking.
 8. Even when backlog exists, still run deep research, proposals, and two formal rounds before writing `docs/tasks/`.
-9. To allocate a new backlog id, use:
+9. Manual backlog create/close workflow is owned by `$backlog` skill:
 ```bash
-tools/task.rs alloc-backlog-id
+tools/backlog.rs create-doc ...
+tools/backlog.rs close-doc ...
 ```
-
-## `task close` Checklist
-
-1. Validate target is an open backlog item under `docs/backlogs/`.
-2. Collect explicit close reason detail from user intent.
-3. Choose close type (`stale`, `replaced`, `duplicate`, `wontfix`, `already-implemented`, `other`) or infer from explicit user wording.
-4. Run:
-```bash
-tools/task.rs close-backlog-doc --id 000123 --type stale --detail \"Superseded by new implementation\"
-```
-5. Confirm file moved to `docs/backlogs/closed/` and `## Close Reason` section exists.
