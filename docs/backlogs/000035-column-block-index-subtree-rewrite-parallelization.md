@@ -18,3 +18,4 @@ Explore and implement parallel subtree rewrite for block-index patching, includi
 ## Acceptance Hint
 
 Parallel subtree rewrite design is validated and implemented with no CoW correctness regressions.
+

@@ -18,3 +18,4 @@ Implement and validate how cold-data updates (delete+insert path) integrate with
 ## Acceptance Hint
 
 Cold updates against persisted data are fully specified and tested with no MVCC/regression gaps.
+

@@ -18,3 +18,4 @@ Implement row-id to offset mapping requirement for roaring-based deletion bitmap
 ## Acceptance Hint
 
 Roaring checkpoint patching correctly maps row IDs to bitmap offsets with regression coverage.
+

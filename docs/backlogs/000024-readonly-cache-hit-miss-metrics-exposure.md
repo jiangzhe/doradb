@@ -18,3 +18,4 @@ Expose readonly cache hit/miss metrics for operational tuning and observability.
 ## Acceptance Hint
 
 Readonly hit/miss metrics are available with validated correctness and documented usage.
+

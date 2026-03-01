@@ -18,3 +18,4 @@ Define trigger policy and service-level expectations for deletion-blob page recl
 ## Acceptance Hint
 
 Reclamation trigger/SLA policy is documented and enforced by implementation behavior.
+

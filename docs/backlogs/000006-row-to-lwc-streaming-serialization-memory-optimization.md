@@ -18,3 +18,4 @@ Reduce temporary memory overhead in row-to-LWC conversion by introducing streami
 ## Acceptance Hint
 
 Conversion memory peak is reduced with equivalent output correctness and regression tests covering large-row-page conversion scenarios.
+

@@ -18,3 +18,4 @@ Extend unsafe baseline inventory and review scope to additional modules (`value`
 ## Acceptance Hint
 
 Baseline/reporting includes additional modules with documented impacts and next-step prioritization.
+

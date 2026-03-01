@@ -18,3 +18,4 @@ Add helper API to obtain current `VersionedPageID` directly from page guards to 
 ## Acceptance Hint
 
 Call sites use shared helper API and pass existing tests without identity-regression issues.
+

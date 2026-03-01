@@ -68,6 +68,7 @@ Reference:
 ## Implementation Notes
 
 Resolved by completing a one-time manual triage pass over `docs/tasks/000001` through `docs/tasks/000040` and creating fine-grained backlog todo docs for actionable deferred work.
+Resolve-time source backlog closure check executed with `tools/task.rs resolve-task-backlogs --task docs/tasks/000042-collect-backlog-from-implemented-tasks-000001-000040.md`; no `Source Backlogs:` entries were present, so no backlog items were closed during resolve.
 
 Triage disposition by task id:
 1. `000001`: actionable -> `000005`, `000006`.

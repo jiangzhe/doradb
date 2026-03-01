@@ -18,3 +18,4 @@ Finalize invalidation trigger placement for reused page IDs in readonly cache wo
 ## Acceptance Hint
 
 Trigger placement is chosen and validated with race/regression tests.
+

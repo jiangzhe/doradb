@@ -18,3 +18,4 @@ Evaluate optional compression policy for offloaded deletion blob payloads after 
 ## Acceptance Hint
 
 Compression policy decision is documented with benchmark evidence and implementation plan if adopted.
+

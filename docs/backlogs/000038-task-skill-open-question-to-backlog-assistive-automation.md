@@ -18,3 +18,4 @@ Evaluate optional assistive (non-blocking) automation for extracting backlog tod
 ## Acceptance Hint
 
 Assistive extraction capability exists with clear non-blocking semantics and documented review requirements.
+

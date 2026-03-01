@@ -18,3 +18,4 @@ Enhance issue creation workflow to optionally derive labels from task/RFC docume
 ## Acceptance Hint
 
 `create-issue-from-doc` supports optional metadata-derived labels with tests and deterministic conflict behavior.
+

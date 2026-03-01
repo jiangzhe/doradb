@@ -18,3 +18,4 @@ Define CI policy for blocking unsafe-usage count regressions in covered modules 
 ## Acceptance Hint
 
 Unsafe regression gate policy is implemented or explicitly deferred with clear rationale and process.
+

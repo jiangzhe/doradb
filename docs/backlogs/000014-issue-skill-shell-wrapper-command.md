@@ -18,3 +18,4 @@ Evaluate adding developer-facing shell helper wrappers (for example `make issue-
 ## Acceptance Hint
 
 Wrapper strategy is either implemented and documented, or explicitly rejected with rationale.
+

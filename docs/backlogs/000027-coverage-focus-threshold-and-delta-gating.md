@@ -18,3 +18,4 @@ Extend `tools/coverage_focus.rs` with optional threshold/delta gating to support
 ## Acceptance Hint
 
 Coverage focus tool supports optional gating with clear CLI semantics and tests.
+

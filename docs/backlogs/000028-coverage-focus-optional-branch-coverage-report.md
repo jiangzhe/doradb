@@ -18,3 +18,4 @@ Add optional branch-coverage output to `tools/coverage_focus.rs` after line-focu
 ## Acceptance Hint
 
 Tool can produce branch-coverage report on demand with validated parser/report behavior.
+

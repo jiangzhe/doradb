@@ -18,3 +18,4 @@ Validate architecture and performance implications of specializing table row-pag
 ## Acceptance Hint
 
 Follow-up decision is documented with evidence; either specialization is confirmed stable or specific compatibility/perf fixes are defined.
+

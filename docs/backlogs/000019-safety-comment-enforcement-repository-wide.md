@@ -18,3 +18,4 @@ Evaluate and implement repository-wide policy requiring `// SAFETY:` contracts a
 ## Acceptance Hint
 
 Repository-wide policy is documented and enforced with a migration strategy for existing code.
+

@@ -18,3 +18,4 @@ Plan and implement migration from plain `u32` delta array encoding to roaring bi
 ## Acceptance Hint
 
 Roaring encoding upgrade is specified and implemented with compatibility guarantees and tests.
+

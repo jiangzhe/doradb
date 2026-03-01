@@ -18,3 +18,4 @@ Define unified IO error handling policy across storage modules to replace ad-hoc
 ## Acceptance Hint
 
 A documented cross-module policy exists and core paths align with it in code/tests.
+

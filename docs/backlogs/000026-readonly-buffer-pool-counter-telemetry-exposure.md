@@ -18,3 +18,4 @@ Add broader readonly buffer-pool telemetry exposure (beyond basic hit/miss) to s
 ## Acceptance Hint
 
 Readonly telemetry API/reporting is implemented with stable semantics and tests.
+

@@ -18,3 +18,4 @@ Evaluate and implement expanded deletion watermark fields in metadata/redo paths
 ## Acceptance Hint
 
 Watermark model supports intended log-truncation policy with recovery-safe implementation.
+

@@ -18,3 +18,4 @@ Add optional machine-readable artifact output for `task` workflow state (for exa
 ## Acceptance Hint
 
 Task workflow can emit a clear machine-readable state artifact with deterministic semantics.
+

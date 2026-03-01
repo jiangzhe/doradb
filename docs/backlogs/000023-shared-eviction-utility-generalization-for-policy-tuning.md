@@ -18,3 +18,4 @@ Generalize shared eviction utilities to better support future policy tuning (for
 ## Acceptance Hint
 
 Eviction utility interfaces support policy extensions with preserved correctness and existing test coverage.
+

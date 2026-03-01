@@ -18,3 +18,4 @@ Parallelize committed-marker selection and sort/dedup stages for very large dele
 ## Acceptance Hint
 
 Deletion marker selection path is parallelized with correctness guarantees and performance evidence.
+

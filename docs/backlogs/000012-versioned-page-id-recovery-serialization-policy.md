@@ -18,3 +18,4 @@ Decide whether `VersionedPageID` generation must be persisted in redo/undo seria
 ## Acceptance Hint
 
 Policy is finalized and documented with code/tests aligned to chosen recovery model.
+

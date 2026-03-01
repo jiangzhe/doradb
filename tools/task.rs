@@ -804,27 +804,37 @@ fn render_close_reason(reason: &CloseReason) -> String {
 
 fn extract_source_backlog_paths(task_text: &str) -> Vec<String> {
     let mut refs = Vec::new();
+    let mut in_source_backlogs = false;
+
     for line in task_text.lines() {
-        let mut cursor = line;
-        while let Some(pos) = cursor.find("docs/backlogs/") {
-            let tail = &cursor[pos..];
-            let mut end = tail.len();
-            for (idx, ch) in tail.char_indices() {
-                if ch.is_whitespace() || matches!(ch, '`' | ')' | ']' | '>' | ',' | ';') {
-                    end = idx;
-                    break;
-                }
+        let trimmed = line.trim();
+
+        if trimmed == "Source Backlogs:" || trimmed == "`Source Backlogs:`" {
+            in_source_backlogs = true;
+            continue;
+        }
+
+        if in_source_backlogs {
+            if trimmed.is_empty() {
+                continue;
             }
-            let mut cand = tail[..end].trim_matches('`').to_string();
-            while cand.ends_with('.') {
-                cand.pop();
+            // Accept markdown list markers and code ticks.
+            let cand = trimmed
+                .trim_start_matches('-')
+                .trim_start_matches('*')
+                .trim()
+                .trim_matches('`');
+            if cand.starts_with("docs/backlogs/") && cand.ends_with(".md") {
+                refs.push(cand.to_string());
+                continue;
             }
-            if cand.ends_with(".md") {
-                refs.push(cand);
+            // Leave source backlog section when first non-list/non-path line appears.
+            if trimmed.starts_with("## ") {
+                in_source_backlogs = false;
             }
-            cursor = &tail[end..];
         }
     }
+
     refs.sort();
     refs.dedup();
     refs

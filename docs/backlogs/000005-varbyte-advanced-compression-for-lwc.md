@@ -22,3 +22,4 @@ A follow-up task lands with selected VarByte compression strategy, format detail
 ## Notes (Optional)
 
 Coordinate with deletion/checkpoint bitmap and scan-path performance characteristics.
+

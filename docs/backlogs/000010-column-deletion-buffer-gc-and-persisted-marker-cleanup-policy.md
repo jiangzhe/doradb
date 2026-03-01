@@ -18,3 +18,4 @@ Define and implement cleanup policy for `ColumnDeletionBuffer`, including when p
 ## Acceptance Hint
 
 Persisted and globally invisible markers are reclaimed safely with deterministic policy and regression coverage.
+

@@ -18,3 +18,4 @@ Define and implement deterministic behavior when a single source row-page payloa
 ## Acceptance Hint
 
 Oversized source cases are handled explicitly and tested; checkpoint conversion no longer relies on undocumented assumptions.
+
