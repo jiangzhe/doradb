@@ -1,10 +1,15 @@
 # Backlog: Follow-up Title
 
 Filename rule:
-- `docs/backlogs/<6digits>-<follow-up-topic>.todo.md` for pending items.
-- `docs/backlogs/<6digits>-<follow-up-topic>.done.md` for completed items.
-- Next id helper: `tools/task.rs next-backlog-id`.
-- Rename helper: `tools/task.rs rename-backlog-doc --path <path> --status done`.
+- Open backlog item: `docs/backlogs/<6digits>-<follow-up-topic>.md`.
+- Closed/archived backlog item: `docs/backlogs/closed/<6digits>-<follow-up-topic>.md`.
+- Next id storage: `docs/backlogs/next-id` (single 6-digit line).
+- Next id helpers:
+  - `tools/task.rs init-backlog-next-id`
+  - `tools/task.rs alloc-backlog-id`
+- Close helpers:
+  - `tools/task.rs close-backlog-doc --id <6digits> --type <type> --detail <text>`
+  - `tools/task.rs complete-backlog-doc --id <6digits> --task docs/tasks/<6digits>-<slug>.md`
 
 ## Summary
 
@@ -27,3 +32,17 @@ Briefly describe what outcome would indicate this item is done.
 ## Notes (Optional)
 
 Extra context that helps future task creation.
+
+## Close Reason (Added When Closed)
+
+When a backlog item is moved to `docs/backlogs/closed/`, append:
+
+```md
+## Close Reason
+
+- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
+- Detail: <reason detail>
+- Closed By: <task close|task resolve>
+- Reference: <task/issue/pr reference>
+- Closed At: <YYYY-MM-DD>
+```

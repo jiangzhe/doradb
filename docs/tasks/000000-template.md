@@ -9,7 +9,7 @@ Summarize the issue/feature and solution.
 Describe background and context of this problem.
 If sourced from backlog, add:
 `Source Backlogs:`
-`- docs/backlogs/<6digits>-<follow-up-topic>.todo.md`
+`- docs/backlogs/<6digits>-<follow-up-topic>.md`
 
 ## Goals
 
