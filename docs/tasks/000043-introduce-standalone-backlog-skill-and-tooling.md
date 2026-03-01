@@ -73,7 +73,38 @@ Reference:
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve` after implementation, tests, review, and verification are completed.
+Implemented and validated.
+
+Implemented changes:
+1. Added standalone backlog helper script:
+   - `tools/backlog.rs`
+   - Commands: `init-next-id`, `alloc-id`, `create-doc`, `find-duplicates`, `close-doc`.
+2. Added standalone backlog skill:
+   - `.codex/skills/backlog/SKILL.md`
+   - `.codex/skills/backlog/references/workflow.md`
+   - `.codex/skills/backlog/agents/openai.yaml`
+3. Refactored task skill scope:
+   - removed `task close` workflow ownership from `.codex/skills/task/SKILL.md`.
+   - updated `.codex/skills/task/references/workflow.md` to keep `task create` and `task resolve` scope only.
+   - updated `.codex/skills/task/agents/openai.yaml` default prompt to point manual backlog lifecycle operations to `$backlog`.
+4. Updated backlog template helper references:
+   - `docs/backlogs/000000-template.md` now points new backlog lifecycle operations to `tools/backlog.rs`.
+5. Fixed close-reason insertion behavior in `tools/backlog.rs`:
+   - `close-doc` now detects existing `## Close Reason` only at real section level and ignores fenced example blocks in templates.
+
+Validation and smoke tests executed:
+1. `CARGO_TARGET_DIR=target/cargo-script tools/backlog.rs --help`
+2. `CARGO_TARGET_DIR=target/cargo-script tools/backlog.rs create-doc --help`
+3. `CARGO_TARGET_DIR=target/cargo-script tools/backlog.rs close-doc --help`
+4. `CARGO_TARGET_DIR=target/cargo-script tools/backlog.rs find-duplicates --title \"Task Tool Source-Backlog Auto-Rename Command\" --slug \"task-tool-source-backlog-auto-rename-command\"`
+   - expected duplicate candidate `docs/backlogs/000039-task-tool-source-backlog-auto-rename-command.md` was returned.
+5. `create-doc` smoke test using temporary output directory and temporary next-id file under `/tmp`:
+   - verified output file creation and next-id increment.
+6. End-to-end local test on temporary backlog id:
+   - created test backlog doc with fixed id, then closed it with `close-doc`, verified `## Close Reason` append, then cleaned up test artifact.
+7. Resolve-time source backlog closure check:
+   - `CARGO_TARGET_DIR=target/cargo-script tools/task.rs resolve-task-backlogs --task docs/tasks/000043-introduce-standalone-backlog-skill-and-tooling.md`
+   - result: `closed=[]`, `already_closed=[]`, `missing=[]`.
 
 ## Impacts
 
@@ -103,5 +134,4 @@ Keep this section blank in design phase. Fill this section during `task resolve`
 
 ## Open Questions
 
-1. Should overlapping backlog subcommands in `tools/task.rs` be removed immediately or kept temporarily with deprecation guidance?
-2. Should `find-duplicates` expose a strict mode (`exact slug/title only`) and a fuzzy mode (`summary token overlap`) in the first version, or start with one deterministic mode only?
+1. None.
