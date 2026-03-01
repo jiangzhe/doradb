@@ -19,3 +19,10 @@ Evaluate adding developer-facing shell helper wrappers (for example `make issue-
 
 Wrapper strategy is either implemented and documented, or explicitly rejected with rationale.
 
+## Close Reason
+
+- Type: wontfix
+- Detail: Scripts and workflows are primarily designed for code agents instead of direct developer actions.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-01

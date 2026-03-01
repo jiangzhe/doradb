@@ -19,3 +19,10 @@ Add optional machine-readable artifact output for `task` workflow state (for exa
 
 Task workflow can emit a clear machine-readable state artifact with deterministic semantics.
 
+## Close Reason
+
+- Type: wontfix
+- Detail: Task skill is intended to help code agents produce better plans; a single task-document output is sufficient.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-01
