@@ -19,3 +19,10 @@ Define CI policy for blocking unsafe-usage count regressions in covered modules 
 
 Unsafe regression gate policy is implemented or explicitly deferred with clear rationale and process.
 
+## Close Reason
+
+- Type: wontfix
+- Detail: CI policy is too restrictive for this project.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-01
