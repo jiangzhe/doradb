@@ -6,8 +6,7 @@ use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
 use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig};
 use doradb_storage::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableID,
-    TableSpec,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableSpec,
 };
 use doradb_storage::engine::{Engine, EngineConfig, EngineRef};
 use doradb_storage::trx::log::LogSync;
@@ -246,27 +245,14 @@ fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
     Byte::parse_str(input, true).map(|b| b.as_u64() as usize)
 }
 
-#[inline]
-pub(crate) async fn db1(engine: &Engine) -> SchemaID {
-    let mut session = engine.new_session();
-    let schema_id = session.create_schema("db1", true).await.unwrap();
-
-    drop(session);
-    schema_id
-}
-
 /// Sbtest is target table of sysbench.
 #[inline]
 pub async fn sbtest(engine: &Engine) -> TableID {
-    let schema_id = db1(engine).await;
-
     let mut session = engine.new_session();
 
     let table_id = session
         .create_table(
-            schema_id,
             TableSpec {
-                table_name: SemiStr::new("sbtest"),
                 columns: vec![
                     ColumnSpec {
                         column_name: SemiStr::new("id"),

@@ -1,20 +1,10 @@
-use crate::catalog::{
-    ColumnAttributes, ColumnID, IndexAttributes, IndexID, IndexOrder, SchemaID, TableID,
-};
+use crate::catalog::{ColumnAttributes, ColumnID, IndexAttributes, IndexID, IndexOrder, TableID};
 use crate::value::ValKind;
 use semistr::SemiStr;
 
 #[derive(Debug)]
-pub struct SchemaObject {
-    pub schema_id: SchemaID,
-    pub schema_name: SemiStr,
-}
-
-#[derive(Debug)]
 pub struct TableObject {
     pub table_id: TableID,
-    pub schema_id: SchemaID,
-    pub table_name: SemiStr,
 }
 
 #[derive(Debug)]

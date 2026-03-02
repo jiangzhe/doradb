@@ -2,32 +2,15 @@ use crate::value::ValKind;
 use bitflags::bitflags;
 use semistr::SemiStr;
 
-#[derive(Debug, Clone)]
-pub struct SchemaSpec {
-    pub schema_name: SemiStr,
-}
-
-impl SchemaSpec {
-    #[inline]
-    pub fn new(schema_name: &str) -> Self {
-        Self {
-            schema_name: SemiStr::new(schema_name),
-        }
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSpec {
-    pub table_name: SemiStr,
     pub columns: Vec<ColumnSpec>,
 }
 
 impl TableSpec {
     #[inline]
-    pub fn new(table_name: &str, columns: Vec<ColumnSpec>) -> Self {
-        Self {
-            table_name: SemiStr::new(table_name),
-            columns,
-        }
+    pub fn new(columns: Vec<ColumnSpec>) -> Self {
+        Self { columns }
     }
 }
 

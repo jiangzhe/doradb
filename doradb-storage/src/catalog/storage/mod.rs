@@ -1,7 +1,6 @@
 mod columns;
 mod indexes;
 mod object;
-mod schemas;
 mod tables;
 
 use crate::buffer::{EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
@@ -9,7 +8,6 @@ use crate::catalog::TableID;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 pub use crate::catalog::storage::object::*;
-use crate::catalog::storage::schemas::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::error::Result;
@@ -36,7 +34,6 @@ impl CatalogStorage {
     ) -> Result<Self> {
         let mut cat: Vec<Table> = vec![];
         for CatalogDefinition { table_id, metadata } in [
-            catalog_definition_of_schemas(),
             catalog_definition_of_tables(),
             catalog_definition_of_columns(),
             catalog_definition_of_indexes(),
@@ -68,13 +65,6 @@ impl CatalogStorage {
             mem_pool,
             tables: cat.into_boxed_slice(),
         })
-    }
-
-    #[inline]
-    pub fn schemas(&self) -> Schemas<'_> {
-        Schemas {
-            table: &self.tables[TABLE_ID_SCHEMAS as usize],
-        }
     }
 
     #[inline]
