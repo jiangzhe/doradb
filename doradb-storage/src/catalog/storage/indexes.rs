@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 
 /* Indexes table */
 
-pub const TABLE_ID_INDEXES: TableID = 3;
+pub const TABLE_ID_INDEXES: TableID = 2;
 const COL_NO_INDEXES_INDEX_ID: usize = 0;
 const COL_NAME_INDEXES_INDEX_ID: &str = "index_id";
 const COL_NO_INDEXES_TABLE_ID: usize = 1;
@@ -151,7 +151,7 @@ impl Indexes<'_> {
 
 /* Index columns table */
 
-pub const TABLE_ID_INDEX_COLUMNS: TableID = 4;
+pub const TABLE_ID_INDEX_COLUMNS: TableID = 3;
 const COL_NO_INDEX_COLUMNS_COLUMN_ID: usize = 0;
 const COL_NAME_INDEX_COLUMNS_COLUMN_ID: &str = "column_id";
 const COL_NO_INDEX_COLUMNS_INDEX_ID: usize = 1;

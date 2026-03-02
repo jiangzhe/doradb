@@ -24,7 +24,6 @@ pub const ROW_ID_COL_NAME: &str = "__row_id";
 
 pub type ObjID = u64;
 pub type TableID = ObjID;
-pub type SchemaID = ObjID;
 pub type ColumnID = ObjID;
 pub type IndexID = ObjID;
 
@@ -57,10 +56,7 @@ impl Catalog {
 
     #[inline]
     fn try_update_obj_id(&self, next_obj_id: u64) {
-        let obj_id = self.obj_id.load(Ordering::Relaxed);
-        if next_obj_id > obj_id {
-            self.obj_id.fetch_max(obj_id, Ordering::SeqCst);
-        }
+        self.obj_id.fetch_max(next_obj_id, Ordering::SeqCst);
     }
 
     /// Returns whether a table is user table.
@@ -81,33 +77,6 @@ impl Catalog {
         }
     }
 
-    /// Reload schema cache for given schema id.
-    /// If exists flag is set to true, schema should exist.
-    /// Otherwise, schema should not exist.
-    pub async fn reload_schema(&self, schema_id: SchemaID, exists: bool) -> Result<()> {
-        let res = self
-            .storage
-            .schemas()
-            .find_uncommitted_by_id(schema_id)
-            .await;
-        match (exists, res) {
-            (true, Some(schema)) => {
-                let schema_id = schema.schema_id;
-                self.try_update_obj_id(schema_id);
-                let mut g = self.cache.schemas.write().await;
-                let _ = g.insert(schema_id, schema);
-                Ok(())
-            }
-            (false, None) => {
-                let mut g = self.cache.schemas.write().await;
-                let _ = g.remove(&schema_id);
-                Ok(())
-            }
-            (true, None) => Err(Error::SchemaNotFound),
-            (false, Some(_)) => Err(Error::SchemaNotDeleted),
-        }
-    }
-
     pub async fn reload_create_table(
         &self,
         index_pool: &'static FixedBufferPool,
@@ -120,8 +89,8 @@ impl Catalog {
         match res {
             Some(table) => {
                 // A table creation involves table, column and index.
-                // Try to find the maximum object id and update the global one.
-                let mut next_obj_id = table.table_id;
+                // Find the maximum existing object id and then move allocator to next id.
+                let mut max_obj_id = table.table_id;
 
                 // todo: use secondary index to improve performance
                 let columns = self
@@ -131,7 +100,7 @@ impl Catalog {
                     .await;
                 debug_assert!(!columns.is_empty());
                 if let Some(column_id) = columns.iter().map(|c| c.column_id).max() {
-                    next_obj_id = next_obj_id.max(column_id);
+                    max_obj_id = max_obj_id.max(column_id);
                 }
 
                 let column_specs = columns
@@ -145,9 +114,9 @@ impl Catalog {
                     .list_uncommitted_by_table_id(table_id)
                     .await;
                 if let Some(index_id) = indexes.iter().map(|i| i.index_id).max() {
-                    next_obj_id = next_obj_id.max(index_id);
+                    max_obj_id = max_obj_id.max(index_id);
                 }
-                self.try_update_obj_id(next_obj_id);
+                self.try_update_obj_id(max_obj_id.saturating_add(1));
 
                 let mut index_specs = vec![];
                 for index in indexes {
@@ -223,7 +192,6 @@ unsafe impl Sync for Catalog {}
 unsafe impl StaticLifetime for Catalog {}
 
 pub struct CatalogCache {
-    pub schemas: RwLock<HashMap<SchemaID, SchemaObject>>,
     pub tables: RwLock<HashMap<TableID, Table>>,
 }
 
@@ -232,7 +200,6 @@ impl CatalogCache {
     #[inline]
     pub fn new() -> Self {
         CatalogCache {
-            schemas: RwLock::new(HashMap::new()),
             tables: RwLock::new(HashMap::new()),
         }
     }
@@ -304,25 +271,13 @@ pub mod tests {
     use crate::value::ValKind;
     use semistr::SemiStr;
 
-    #[inline]
-    pub(crate) async fn db1(engine: &Engine) -> SchemaID {
-        let mut session = engine.new_session();
-        let schema_id = session.create_schema("db1", true).await.unwrap();
-        drop(session);
-        schema_id
-    }
-
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
     pub(crate) async fn table1(engine: &Engine) -> TableID {
-        let schema_id = db1(engine).await;
-
         let mut session = engine.new_session();
         let table_id = session
             .create_table(
-                schema_id,
                 TableSpec {
-                    table_name: SemiStr::new("table1"),
                     columns: vec![ColumnSpec {
                         column_name: SemiStr::new("id"),
                         column_type: ValKind::I32,
@@ -345,14 +300,10 @@ pub mod tests {
     /// Table2 has i32(unique key) and string column.
     #[inline]
     pub(crate) async fn table2(engine: &Engine) -> TableID {
-        let schema_id = db1(engine).await;
-
         let mut session = engine.new_session();
         let table_id = session
             .create_table(
-                schema_id,
                 TableSpec {
-                    table_name: SemiStr::new("table2"),
                     columns: vec![
                         ColumnSpec {
                             column_name: SemiStr::new("id"),
@@ -382,15 +333,11 @@ pub mod tests {
     /// Table3 has single string key column.
     #[inline]
     pub(crate) async fn table3(engine: &Engine) -> TableID {
-        let schema_id = db1(engine).await;
-
         let mut session = engine.new_session();
 
         let table_id = session
             .create_table(
-                schema_id,
                 TableSpec {
-                    table_name: SemiStr::new("table3"),
                     columns: vec![ColumnSpec {
                         column_name: SemiStr::new("name"),
                         column_type: ValKind::VarByte,
@@ -415,15 +362,11 @@ pub mod tests {
     /// Second is non-unique index.
     #[inline]
     pub(crate) async fn table4(engine: &Engine) -> TableID {
-        let schema_id = db1(engine).await;
-
         let mut session = engine.new_session();
 
         let table_id = session
             .create_table(
-                schema_id,
                 TableSpec {
-                    table_name: SemiStr::new("table4"),
                     columns: vec![
                         ColumnSpec {
                             column_name: SemiStr::new("id"),

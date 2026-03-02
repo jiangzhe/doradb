@@ -1,6 +1,6 @@
 use crate::buffer::page::PageID;
 
-use crate::catalog::{SchemaID, TableCache, TableID, TableSpec};
+use crate::catalog::{TableCache, TableID, TableSpec};
 use crate::row::RowID;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::table::{Table, TableAccess};
@@ -8,12 +8,10 @@ use crate::trx::ActiveTrx;
 use crate::trx::redo::RedoLogs;
 use crate::trx::undo::{IndexUndo, IndexUndoKind, IndexUndoLogs, RowUndoKind, RowUndoLogs};
 use crate::value::Val;
-use semistr::SemiStr;
 use std::mem;
 
 pub enum StmtKind {
-    CreateSchema(SemiStr),
-    CreateTable(SchemaID, TableSpec),
+    CreateTable(TableSpec),
 }
 
 pub struct Statement {

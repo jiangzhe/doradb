@@ -1,9 +1,7 @@
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::TableMetadata;
-use crate::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, SchemaID, TableID,
-};
+use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
@@ -13,17 +11,11 @@ use crate::value::ValKind;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
-pub const TABLE_ID_TABLES: TableID = 1;
+pub const TABLE_ID_TABLES: TableID = 0;
 const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
-const COL_NO_TABLES_SCHEMA_ID: usize = 1;
-const COL_NAME_TABLES_SCHEMA_ID: &str = "schema_id";
-const COL_NO_TABLES_TABLE_NAME: usize = 2;
-const COL_NAME_TABLES_TABLE_NAME: &str = "table_name";
 const INDEX_NO_TABLES_TABLE_ID: usize = 0;
 const INDEX_NAME_TABLES_TABLE_ID: &str = "idx_tables_table_id";
-const INDEX_NO_TABLES_TABLE_NAME: usize = 1;
-const INDEX_NAME_TABLES_TABLE_NAME: &str = "idx_tables_table_name";
 
 pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
@@ -38,18 +30,6 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                         column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
-                    // schema_id unsigned bigint not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_TABLES_SCHEMA_ID),
-                        column_type: ValKind::U64,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
-                    // table_name string not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_TABLES_TABLE_NAME),
-                        column_type: ValKind::VarByte,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
                 ],
                 vec![
                     // primary key idx_tables_table_id (table_id)
@@ -57,12 +37,6 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                         INDEX_NAME_TABLES_TABLE_ID,
                         vec![IndexKey::new(0)],
                         IndexAttributes::PK,
-                    ),
-                    // unique key idx_tables_table_name (schema_id, table_name)
-                    IndexSpec::new(
-                        INDEX_NAME_TABLES_TABLE_NAME,
-                        vec![IndexKey::new(1), IndexKey::new(2)],
-                        IndexAttributes::UK,
                     ),
                 ],
             ),
@@ -73,13 +47,7 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
 #[inline]
 fn row_to_table_object(metadata: &TableMetadata, row: Row<'_>) -> TableObject {
     let table_id = row.val(metadata, COL_NO_TABLES_TABLE_ID).as_u64().unwrap();
-    let schema_id = row.val(metadata, COL_NO_TABLES_SCHEMA_ID).as_u64().unwrap();
-    let table_name = row.str(COL_NO_TABLES_TABLE_NAME).unwrap();
-    TableObject {
-        table_id,
-        schema_id,
-        table_name: SemiStr::new(table_name),
-    }
+    TableObject { table_id }
 }
 
 pub struct Tables<'a> {
@@ -96,29 +64,9 @@ impl Tables<'_> {
             .await
     }
 
-    /// Find a table by name.
-    #[inline]
-    pub async fn find_uncommitted_by_name(
-        &self,
-        schema_id: SchemaID,
-        name: &str,
-    ) -> Option<TableObject> {
-        let key = SelectKey::new(
-            INDEX_NO_TABLES_TABLE_NAME,
-            vec![Val::from(schema_id), Val::from(name)],
-        );
-        self.table
-            .index_lookup_unique_uncommitted(&key, row_to_table_object)
-            .await
-    }
-
     /// Insert a table.
     pub async fn insert(&self, stmt: &mut Statement, obj: &TableObject) -> bool {
-        let cols = vec![
-            Val::from(obj.table_id),
-            Val::from(obj.schema_id),
-            Val::from(obj.table_name.as_str()),
-        ];
+        let cols = vec![Val::from(obj.table_id)];
         self.table.insert_mvcc(stmt, cols).await.is_ok()
     }
 

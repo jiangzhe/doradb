@@ -261,14 +261,6 @@ impl<'a> LogRecovery<'a> {
         cts: TrxID,
     ) -> Result<()> {
         match &*ddl {
-            DDLRedo::CreateSchema(schema_id) => {
-                self.replay_catalog_modifications(dml).await?;
-                self.catalog.reload_schema(*schema_id, true).await?;
-            }
-            DDLRedo::DropSchema(schema_id) => {
-                self.replay_catalog_modifications(dml).await?;
-                self.catalog.reload_schema(*schema_id, false).await?;
-            }
             DDLRedo::CreateTable(table_id) => {
                 self.replay_catalog_modifications(dml).await?;
                 self.catalog
@@ -490,19 +482,13 @@ mod tests {
                 .unwrap();
 
             let mut session = engine.new_session();
-            let schema_id = session.create_schema("db1", false).await.unwrap();
-
-            let table_spec = TableSpec::new(
-                "t1",
-                vec![
-                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
-                ],
-            );
+            let table_spec = TableSpec::new(vec![
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+            ]);
 
             let table_id = session
                 .create_table(
-                    schema_id,
                     table_spec,
                     vec![IndexSpec::new(
                         "idx_t1_pk",
@@ -566,19 +552,13 @@ mod tests {
                 .unwrap();
 
             let mut session = engine.new_session();
-            let schema_id = session.create_schema("db1", false).await.unwrap();
-
-            let table_spec = TableSpec::new(
-                "t1",
-                vec![
-                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", ValKind::VarByte, ColumnAttributes::empty()),
-                ],
-            );
+            let table_spec = TableSpec::new(vec![
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::VarByte, ColumnAttributes::empty()),
+            ]);
 
             let table_id = session
                 .create_table(
-                    schema_id,
                     table_spec,
                     vec![IndexSpec::new(
                         "idx_t1_pk",

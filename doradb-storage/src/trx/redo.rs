@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::catalog::{IndexID, SchemaID, TableID};
+use crate::catalog::{IndexID, TableID};
 use crate::error::{Error, Result};
 use crate::row::RowID;
 use crate::row::ops::{SelectKey, UpdateCol};
@@ -155,14 +155,12 @@ impl Deser for RowRedo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum DDLRedoCode {
-    CreateSchema = 129,
-    DropSchema = 130,
-    CreateTable = 131,
-    DropTable = 132,
-    CreateIndex = 133,
-    DropIndex = 134,
-    CreateRowPage = 135,
-    DataCheckpoint = 136,
+    CreateTable = 129,
+    DropTable = 130,
+    CreateIndex = 131,
+    DropIndex = 132,
+    CreateRowPage = 133,
+    DataCheckpoint = 134,
 }
 
 impl TryFrom<u8> for DDLRedoCode {
@@ -171,14 +169,12 @@ impl TryFrom<u8> for DDLRedoCode {
     #[inline]
     fn try_from(code: u8) -> std::result::Result<Self, Self::Error> {
         match code {
-            129 => Ok(DDLRedoCode::CreateSchema),
-            130 => Ok(DDLRedoCode::DropSchema),
-            131 => Ok(DDLRedoCode::CreateTable),
-            132 => Ok(DDLRedoCode::DropTable),
-            133 => Ok(DDLRedoCode::CreateIndex),
-            134 => Ok(DDLRedoCode::DropIndex),
-            135 => Ok(DDLRedoCode::CreateRowPage),
-            136 => Ok(DDLRedoCode::DataCheckpoint),
+            129 => Ok(DDLRedoCode::CreateTable),
+            130 => Ok(DDLRedoCode::DropTable),
+            131 => Ok(DDLRedoCode::CreateIndex),
+            132 => Ok(DDLRedoCode::DropIndex),
+            133 => Ok(DDLRedoCode::CreateRowPage),
+            134 => Ok(DDLRedoCode::DataCheckpoint),
             _ => Err(()),
         }
     }
@@ -187,8 +183,6 @@ impl TryFrom<u8> for DDLRedoCode {
 /// Represents a redo record of any DDL operation.
 #[derive(Debug)]
 pub enum DDLRedo {
-    CreateSchema(SchemaID),
-    DropSchema(SchemaID),
     // Create a new table with given table id.
     // Actual metadata change is recorded in DML logs.
     CreateTable(TableID),
@@ -213,12 +207,10 @@ impl DDLRedo {
     #[inline]
     pub fn code(&self) -> DDLRedoCode {
         match self {
-            DDLRedo::CreateSchema { .. } => DDLRedoCode::CreateSchema,
-            DDLRedo::DropSchema { .. } => DDLRedoCode::DropSchema,
-            DDLRedo::CreateTable { .. } => DDLRedoCode::CreateTable,
-            DDLRedo::DropTable { .. } => DDLRedoCode::DropTable,
-            DDLRedo::CreateIndex { .. } => DDLRedoCode::CreateIndex,
-            DDLRedo::DropIndex { .. } => DDLRedoCode::DropIndex,
+            DDLRedo::CreateTable(..) => DDLRedoCode::CreateTable,
+            DDLRedo::DropTable(..) => DDLRedoCode::DropTable,
+            DDLRedo::CreateIndex(..) => DDLRedoCode::CreateIndex,
+            DDLRedo::DropIndex(..) => DDLRedoCode::DropIndex,
             DDLRedo::CreateRowPage { .. } => DDLRedoCode::CreateRowPage,
             DDLRedo::DataCheckpoint { .. } => DDLRedoCode::DataCheckpoint,
         }
@@ -230,8 +222,6 @@ impl Ser<'_> for DDLRedo {
     fn ser_len(&self) -> usize {
         mem::size_of::<u8>()
             + match self {
-                DDLRedo::CreateSchema(_) => mem::size_of::<SchemaID>(),
-                DDLRedo::DropSchema(_) => mem::size_of::<SchemaID>(),
                 DDLRedo::CreateTable(_) => mem::size_of::<TableID>(),
                 DDLRedo::DropTable(_) => mem::size_of::<TableID>(),
                 DDLRedo::CreateIndex(_) => mem::size_of::<IndexID>(),
@@ -252,12 +242,6 @@ impl Ser<'_> for DDLRedo {
         let mut idx = start_idx;
         idx = out.ser_u8(idx, self.code() as u8);
         match self {
-            DDLRedo::CreateSchema(schema_id) => {
-                idx = out.ser_u64(idx, *schema_id);
-            }
-            DDLRedo::DropSchema(schema_id) => {
-                idx = out.ser_u64(idx, *schema_id);
-            }
             DDLRedo::CreateTable(table_id) => {
                 idx = out.ser_u64(idx, *table_id);
             }
@@ -301,14 +285,6 @@ impl Deser for DDLRedo {
         let (idx, code) = input.deser_u8(start_idx)?;
         let code = DDLRedoCode::try_from(code).map_err(|_| Error::InvalidFormat)?;
         match code {
-            DDLRedoCode::CreateSchema => {
-                let (idx, schema_id) = input.deser_u64(idx)?;
-                Ok((idx, DDLRedo::CreateSchema(schema_id)))
-            }
-            DDLRedoCode::DropSchema => {
-                let (idx, schema_id) = input.deser_u64(idx)?;
-                Ok((idx, DDLRedo::DropSchema(schema_id)))
-            }
             DDLRedoCode::CreateTable => {
                 let (idx, table_id) = input.deser_u64(idx)?;
                 Ok((idx, DDLRedo::CreateTable(table_id)))

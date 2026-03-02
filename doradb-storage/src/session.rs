@@ -1,8 +1,6 @@
 use crate::buffer::page::PageID;
-use crate::catalog::{
-    ColumnObject, IndexColumnObject, IndexObject, SchemaObject, TableMetadata, TableObject,
-};
-use crate::catalog::{IndexSpec, SchemaID, TableID, TableSpec};
+use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
+use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
 use crate::error::{Error, Result};
 use crate::index::BlockIndex;
@@ -11,7 +9,6 @@ use crate::table::Table;
 use crate::trx::redo::DDLRedo;
 use crate::trx::{ActiveTrx, TrxID};
 use parking_lot::Mutex;
-use semistr::SemiStr;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -62,79 +59,10 @@ impl Session {
         Some(trx)
     }
 
-    /// Create a new schema.
-    /// This is a session level method, because
-    /// we automatically start a new transaction and
-    /// commit once the creation is done.
-    #[inline]
-    pub async fn create_schema(
-        &mut self,
-        schema_name: &str,
-        if_not_exists: bool,
-    ) -> Result<SchemaID> {
-        if self.in_trx() {
-            return Err(Error::NotSupported("implicit commit due to DDL"));
-        }
-        let engine = self.engine().clone();
-        // 1. Check if schema exists
-        if let Some(schema) = engine
-            .catalog()
-            .storage
-            .schemas()
-            .find_uncommitted_by_name(schema_name)
-            .await
-        {
-            if if_not_exists {
-                return Ok(schema.schema_id);
-            }
-            return Err(Error::SchemaAlreadyExists);
-        }
-
-        // 2. Prepare schema object
-        let schema_id = engine.catalog().next_obj_id();
-        let schema_object = SchemaObject {
-            schema_id,
-            schema_name: SemiStr::new(schema_name),
-        };
-
-        // 3. Start transaction.
-        let mut stmt = self.begin_trx().unwrap().start_stmt();
-
-        // 4. lock and insert catalog
-        let mut schema_cache_g = engine.catalog().cache.schemas.write().await;
-
-        let inserted = engine
-            .catalog()
-            .storage
-            .schemas()
-            .insert(&mut stmt, &schema_object)
-            .await;
-        if !inserted {
-            stmt.fail().await.rollback().await;
-            return Err(Error::SchemaAlreadyExists);
-        }
-
-        schema_cache_g.insert(schema_id, schema_object);
-
-        drop(schema_cache_g);
-
-        // 5. Finally add DDL redo log to redo log buffer
-        let res = stmt
-            .redo
-            .ddl
-            .replace(Box::new(DDLRedo::CreateSchema(schema_id)));
-        debug_assert!(res.is_none());
-
-        // 6. Auto commit the transaction.
-        stmt.succeed().commit().await?;
-        Ok(schema_id)
-    }
-
     /// Create a new table.
     #[inline]
     pub async fn create_table(
         &mut self,
-        schema_id: SchemaID,
         table_spec: TableSpec,
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
@@ -143,31 +71,7 @@ impl Session {
         }
 
         let engine = self.state.engine().clone();
-        // 1. Check if schema exists
-        if engine
-            .catalog()
-            .storage
-            .schemas()
-            .find_uncommitted_by_id(schema_id)
-            .await
-            .is_none()
-        {
-            return Err(Error::SchemaNotFound);
-        }
-
-        // 2. Check if table exists
-        if engine
-            .catalog()
-            .storage
-            .tables()
-            .find_uncommitted_by_name(schema_id, &table_spec.table_name)
-            .await
-            .is_some()
-        {
-            return Err(Error::TableAlreadyExists);
-        }
-
-        // 3. Prepare a new table file.
+        // 1. Prepare a new table file.
         //    Use <table-id>.tbl as table name
         let table_id = engine.catalog().next_obj_id();
 
@@ -179,12 +83,8 @@ impl Session {
             .table_fs
             .create_table_file(table_id, metadata, false)?;
 
-        // 4. Prepare catalog related object
-        let table_object = TableObject {
-            table_id,
-            table_name: table_spec.table_name.clone(),
-            schema_id,
-        };
+        // 2. Prepare catalog related object
+        let table_object = TableObject { table_id };
 
         let column_objects: Vec<_> = table_spec
             .columns
@@ -223,13 +123,13 @@ impl Session {
             }
         }
 
-        // 5. begin transaction
+        // 3. begin transaction
         let mut stmt = self.begin_trx().unwrap().start_stmt();
 
-        // 6. lock metadata.
+        // 4. lock metadata.
         let mut table_cache_g = engine.catalog().cache.tables.write().await;
 
-        // 7. insert catalog related objects.
+        // 5. insert catalog related objects.
         let inserted = engine
             .catalog()
             .storage
@@ -270,14 +170,14 @@ impl Session {
             debug_assert!(inserted);
         }
 
-        // 7. add DDL redo log to redo log buffer
+        // 6. add DDL redo log to redo log buffer
         let res = stmt
             .redo
             .ddl
             .replace(Box::new(DDLRedo::CreateTable(table_id)));
         debug_assert!(res.is_none());
 
-        // 8. commit current transaction implicitly.
+        // 7. commit current transaction implicitly.
         let cts = match stmt.succeed().commit().await {
             Ok(cts) => cts,
             Err(e) => {
@@ -286,11 +186,11 @@ impl Session {
             }
         };
 
-        // 9. commit file with cts.
+        // 8. commit file with cts.
         let (table_file, old_root) = uninit_table_file.commit(cts, true).await?;
         debug_assert!(old_root.is_none());
 
-        // 10. Prepare in-memory representation of new table
+        // 9. Prepare in-memory representation of new table
         let blk_idx = BlockIndex::new(
             engine.meta_pool,
             table_id,

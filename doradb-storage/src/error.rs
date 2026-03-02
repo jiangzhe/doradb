@@ -47,12 +47,6 @@ pub enum Error {
     TransactionSystemShutdown,
     #[error("{0}")]
     AIOError(#[from] AIOError),
-    #[error("schema not found")]
-    SchemaNotFound,
-    #[error("schema not deleted")]
-    SchemaNotDeleted,
-    #[error("schema already exists")]
-    SchemaAlreadyExists,
     #[error("table not found")]
     TableNotFound,
     #[error("table not deleted")]
