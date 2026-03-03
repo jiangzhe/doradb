@@ -11,6 +11,10 @@ Use GitHub Issues via `gh` CLI as the source of truth for task tracking.
   - `docs/tasks/<6 digits>-<slug>.md` for small scoped work.
   - `docs/rfcs/<4 digits>-<slug>.md` for large architectural work.
 - Create issues from those docs, not from free-form text.
+- For id-only shorthand requests, resolve doc first:
+```bash
+tools/doc-id.rs search-by-id --kind task --id 000047 --scope open
+```
 
 ## Label Taxonomy
 
@@ -59,6 +63,10 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 
 - Close with a clear status comment.
 - For PR linkage, include `Fixes #<issue>` or `Closes #<issue>` in PR body.
+- Optional helper for PR creation from current branch:
+```bash
+tools/issue.rs create-pr-from-branch --issue <id> --push
+```
 
 ## RFC Resolve Precheck Gate
 

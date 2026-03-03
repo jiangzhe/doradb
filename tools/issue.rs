@@ -60,6 +60,7 @@ fn usage() -> &'static str {
 Subcommands:\n\
   validate-doc-path\n\
   create-issue-from-doc\n\
+  create-pr-from-branch\n\
   list-issues\n\
   update-issue\n\
   close-issue\n\
@@ -91,6 +92,7 @@ fn run() -> Result<(), i32> {
         }
         "validate-doc-path" => cmd_validate_doc_path(args),
         "create-issue-from-doc" => cmd_create_issue_from_doc(args),
+        "create-pr-from-branch" => cmd_create_pr_from_branch(args),
         "list-issues" => cmd_list_issues(args),
         "update-issue" => cmd_update_issue(args),
         "close-issue" => cmd_close_issue(args),
@@ -342,6 +344,186 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         "labels": labels,
         "assignee": assignee,
         "parent": parent,
+    }));
+    Ok(())
+}
+
+fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
+    let mut issue: Option<i64> = None;
+    let mut base = "main".to_string();
+    let mut head: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut push = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--issue" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --issue");
+                    return Err(1);
+                };
+                let parsed = match v.parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!("invalid --issue value: {v}");
+                        return Err(1);
+                    }
+                };
+                issue = Some(parsed);
+            }
+            "--base" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --base");
+                    return Err(1);
+                };
+                base = v;
+            }
+            "--head" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --head");
+                    return Err(1);
+                };
+                head = Some(v);
+            }
+            "--title" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --title");
+                    return Err(1);
+                };
+                title = Some(v);
+            }
+            "--body" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --body");
+                    return Err(1);
+                };
+                body = Some(v);
+            }
+            "--push" => {
+                push = true;
+            }
+            "-h" | "--help" => {
+                println!("Usage: ... issue.rs create-pr-from-branch --issue <n> [--base <branch>] [--head <branch>] [--title <title>] [--body <text>] [--push]");
+                return Ok(());
+            }
+            _ => {
+                eprintln!("unknown arg: {arg}");
+                return Err(1);
+            }
+        }
+    }
+
+    let Some(issue_no) = issue else {
+        eprintln!("missing required arg: --issue");
+        return Err(1);
+    };
+
+    let head_branch = if let Some(h) = head {
+        h
+    } else {
+        let branch_cmd = vec![
+            "git".to_string(),
+            "rev-parse".to_string(),
+            "--abbrev-ref".to_string(),
+            "HEAD".to_string(),
+        ];
+        let branch_res = run_command(&branch_cmd);
+        if branch_res.returncode != 0 {
+            print_json(&json!({
+                "ok": false,
+                "created": false,
+                "error": "failed to determine current git branch",
+                "command": branch_cmd,
+                "stdout": branch_res.stdout.trim(),
+                "stderr": branch_res.stderr.trim(),
+            }));
+            return Err(if branch_res.returncode == 0 { 1 } else { branch_res.returncode });
+        }
+        let branch = branch_res.stdout.trim().to_string();
+        if branch.is_empty() {
+            print_json(&json!({
+                "ok": false,
+                "created": false,
+                "error": "current git branch is empty",
+            }));
+            return Err(1);
+        }
+        branch
+    };
+
+    if push {
+        let push_cmd = vec![
+            "git".to_string(),
+            "push".to_string(),
+            "-u".to_string(),
+            "origin".to_string(),
+            head_branch.clone(),
+        ];
+        let push_res = run_command(&push_cmd);
+        if push_res.returncode != 0 {
+            print_json(&json!({
+                "ok": false,
+                "created": false,
+                "error": "failed to push branch",
+                "command": push_cmd,
+                "stdout": push_res.stdout.trim(),
+                "stderr": push_res.stderr.trim(),
+            }));
+            return Err(if push_res.returncode == 0 { 1 } else { push_res.returncode });
+        }
+    }
+
+    let pr_title = title.unwrap_or_else(|| format!("chore: {}", head_branch.replace('_', "-")));
+    let close_line = format!("Closes #{issue_no}");
+    let pr_body = match body {
+        Some(text) => format!("{}\n\n{}", text.trim(), close_line),
+        None => close_line.clone(),
+    };
+
+    let create_cmd = vec![
+        "gh".to_string(),
+        "pr".to_string(),
+        "create".to_string(),
+        "--base".to_string(),
+        base.clone(),
+        "--head".to_string(),
+        head_branch.clone(),
+        "--title".to_string(),
+        pr_title.clone(),
+        "--body".to_string(),
+        pr_body.clone(),
+    ];
+    let create_res = run_command(&create_cmd);
+    if create_res.returncode != 0 {
+        print_json(&json!({
+            "ok": false,
+            "created": false,
+            "command": create_cmd,
+            "stdout": create_res.stdout.trim(),
+            "stderr": create_res.stderr.trim(),
+        }));
+        return Err(if create_res.returncode == 0 { 1 } else { create_res.returncode });
+    }
+
+    let pr_url = create_res
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .last()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    print_json(&json!({
+        "ok": true,
+        "created": true,
+        "issue_number": issue_no,
+        "base": base,
+        "head": head_branch,
+        "title": pr_title,
+        "close_line": close_line,
+        "pr_url": pr_url,
     }));
     Ok(())
 }
@@ -936,65 +1118,75 @@ fn cmd_link_pr_guidance(mut args: impl Iterator<Item = String>) -> Result<(), i3
 }
 
 fn validate_doc_path(path: &Path) -> serde_json::Value {
-    let rel = normalize_for_doc_rule(path);
+    let cmd = vec![
+        "tools/doc-id.rs".to_string(),
+        "validate-path".to_string(),
+        "--path".to_string(),
+        normalize_path(path),
+    ];
+    let res = run_command(&cmd);
+    let payload = if res.stdout.trim().is_empty() {
+        json!({
+            "valid": false,
+            "path": normalize_for_doc_rule(path),
+            "error": "doc-id tool returned empty output",
+        })
+    } else {
+        match serde_json::from_str::<serde_json::Value>(res.stdout.trim()) {
+            Ok(v) => v,
+            Err(e) => json!({
+                "valid": false,
+                "path": normalize_for_doc_rule(path),
+                "error": format!("failed to parse doc-id output: {e}"),
+                "stdout": res.stdout.trim(),
+                "stderr": res.stderr.trim(),
+            }),
+        }
+    };
 
-    if !path.exists() {
-        return json!({"valid": false, "error": format!("path not found: {rel}")});
-    }
-    if !path.is_file() {
-        return json!({"valid": false, "error": format!("path is not a file: {rel}")});
+    let valid = payload
+        .get("valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !valid {
+        return payload;
     }
 
-    if let Some(id) = parse_task_doc_id(&rel) {
+    let kind = payload
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if kind != "task" && kind != "rfc" {
+        let fallback_path = normalize_for_doc_rule(path);
+        let err_path = payload
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback_path.as_str());
         return json!({
-            "valid": true,
-            "path": rel,
-            "doc_type": "task",
-            "doc_id": id,
-            "title_hint": title_hint(path),
+            "valid": false,
+            "path": err_path,
+            "error": "invalid path pattern; expected docs/tasks/<6 digits>-<slug>.md or docs/rfcs/<4 digits>-<slug>.md",
         });
     }
-    if let Some(id) = parse_rfc_doc_id(&rel) {
-        return json!({
-            "valid": true,
-            "path": rel,
-            "doc_type": "rfc",
-            "doc_id": id,
-            "title_hint": title_hint(path),
-        });
-    }
+
+    let doc_id = payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let rel_path = payload
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| normalize_for_doc_rule(path));
 
     json!({
-        "valid": false,
-        "path": rel,
-        "error": "invalid path pattern; expected docs/tasks/<6 digits>-<slug>.md or docs/rfcs/<4 digits>-<slug>.md",
+        "valid": true,
+        "path": rel_path,
+        "doc_type": kind,
+        "doc_id": doc_id,
+        "title_hint": title_hint(path),
     })
-}
-
-fn parse_task_doc_id(rel: &str) -> Option<String> {
-    parse_doc_id(rel, "docs/tasks/", 6)
-}
-
-fn parse_rfc_doc_id(rel: &str) -> Option<String> {
-    parse_doc_id(rel, "docs/rfcs/", 4)
-}
-
-fn parse_doc_id(rel: &str, prefix: &str, width: usize) -> Option<String> {
-    if !rel.starts_with(prefix) || !rel.ends_with(".md") {
-        return None;
-    }
-    let tail = &rel[prefix.len()..rel.len() - 3];
-    if tail.contains('/') {
-        return None;
-    }
-    let (id, slug) = tail.split_once('-')?;
-    if id.len() != width || !id.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if slug.is_empty() {
-        return None;
-    }
-    Some(id.to_string())
 }
 
 fn title_hint(path: &Path) -> Option<String> {

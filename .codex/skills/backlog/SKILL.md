@@ -48,12 +48,16 @@ tools/backlog.rs init-next-id
 
 ## `backlog close` Required Flow
 
-1. Confirm the target is an open backlog doc in `docs/backlogs/`.
+1. Resolve and confirm the target is an open backlog doc in `docs/backlogs/`.
+   - If user input is id-only shorthand (for example `backlog close 000123 ...`), resolve first:
+```bash
+tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
+```
 2. Require explicit close reason type and detail.
 3. Close/archive with:
 ```bash
 tools/backlog.rs close-doc \
-  --id 000123 \
+  --path docs/backlogs/000123-example.md \
   --type stale \
   --detail "Superseded by later design"
 ```

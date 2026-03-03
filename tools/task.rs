@@ -4,6 +4,8 @@
 edition = "2024"
 ---
 
+#![allow(dead_code)]
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,22 +15,18 @@ const BACKLOG_DIR: &str = "docs/backlogs";
 const BACKLOG_CLOSED_DIR: &str = "docs/backlogs/closed";
 const BACKLOG_NEXT_ID_FILE: &str = "docs/backlogs/next-id";
 const RFC_DIR: &str = "docs/rfcs";
+const DOC_ID_TOOL: &str = "tools/doc-id.rs";
 
 fn usage() -> &'static str {
     "Usage: tools/task.rs <subcommand> [options]\n\n\
 Subcommands:\n\
-  next-task-id          Print the next task id based on docs/tasks/<id>-<slug>.md files\n\
+  next-task-id          Print the next task id from docs/tasks/next-id\n\
   create-task-doc       Create a docs/tasks task document from template with validated id and slug\n\
-  init-backlog-next-id  Initialize docs/backlogs/next-id (single 6-digit id)\n\
-  alloc-backlog-id      Allocate and consume the next backlog id from docs/backlogs/next-id\n\
-  close-backlog-doc     Move an open backlog doc to docs/backlogs/closed with Close Reason\n\
-  complete-backlog-doc  Archive an open backlog doc as implemented by a task\n\
-  resolve-task-backlogs Close Source Backlogs and sync parent RFC phase during task resolve\n\
   resolve-task-rfc      Sync task resolve outcome into parent RFC Implementation Phases\n"
 }
 
 fn next_task_id_usage() -> &'static str {
-    "Usage: tools/task.rs next-task-id [--dir <path>] [--width <n>]"
+    "Usage: tools/task.rs next-task-id"
 }
 
 fn create_task_doc_usage() -> &'static str {
@@ -106,47 +104,21 @@ fn run() -> Result<(), String> {
         }
         "next-task-id" => run_next_task_id(args),
         "create-task-doc" => run_create_task_doc(args),
-        "init-backlog-next-id" => run_init_backlog_next_id(args),
-        "alloc-backlog-id" => run_alloc_backlog_id(args),
-        "close-backlog-doc" => run_close_backlog_doc(args),
-        "complete-backlog-doc" => run_complete_backlog_doc(args),
-        "resolve-task-backlogs" => run_resolve_task_backlogs(args),
         "resolve-task-rfc" => run_resolve_task_rfc(args),
         _ => Err(format!("unknown subcommand: {subcommand}\n{}", usage())),
     }
 }
 
 fn run_next_task_id(mut args: impl Iterator<Item = String>) -> Result<(), String> {
-    let mut task_dir = PathBuf::from("docs/tasks");
-    let mut width_raw = "6".to_string();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--dir" => {
-                let Some(v) = args.next() else {
-                    return Err(format!("missing value for --dir\n{}", next_task_id_usage()));
-                };
-                task_dir = PathBuf::from(v);
-            }
-            "--width" => {
-                let Some(v) = args.next() else {
-                    return Err(format!(
-                        "missing value for --width\n{}",
-                        next_task_id_usage()
-                    ));
-                };
-                width_raw = v;
-            }
-            "-h" | "--help" => {
-                println!("{}", next_task_id_usage());
-                return Ok(());
-            }
-            _ => return Err(format!("unknown arg: {arg}\n{}", next_task_id_usage())),
+    if let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            println!("{}", next_task_id_usage());
+            return Ok(());
         }
+        return Err(format!("unknown arg: {arg}\n{}", next_task_id_usage()));
     }
 
-    let width = parse_positive_width(&width_raw)?;
-    let id = detect_next_task_id(&task_dir, width)?;
+    let id = run_doc_id_and_capture(["peek-next-id", "--kind", "task"])?;
     println!("{id}");
     Ok(())
 }
@@ -238,7 +210,7 @@ fn run_create_task_doc(mut args: impl Iterator<Item = String>) -> Result<(), Str
     }
 
     let task_id = if auto_id {
-        detect_next_id_from_output_dir(&output_dir)?
+        run_doc_id_and_capture(["alloc-id", "--kind", "task"])?
     } else {
         validate_fixed_id(&task_id.expect("checked is_some"))?
     };
@@ -1719,6 +1691,29 @@ fn ensure_parent_dir_exists(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn run_doc_id_and_capture<const N: usize>(args: [&str; N]) -> Result<String, String> {
+    let out = Command::new(DOC_ID_TOOL)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute {DOC_ID_TOOL}: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+        if !stdout.is_empty() {
+            return Err(stdout);
+        }
+        return Err(format!("{DOC_ID_TOOL} returned non-zero exit code"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err(format!("{DOC_ID_TOOL} returned empty output"));
+    }
+    Ok(text)
 }
 
 fn today_yyyy_mm_dd() -> String {

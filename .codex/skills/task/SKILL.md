@@ -107,14 +107,19 @@ Use `task resolve` only after implementation and tests are done, and behavior is
 4. Create/link follow-up backlog todos in `docs/backlogs/` for actionable deferred work (use `$backlog create` when creating new backlog docs manually).
 5. Keep `Implementation Notes` blank during design phase and fill it only in resolve phase.
 6. If the task is sourced from open backlog docs (tracked via `Source Backlogs:` in task doc), close/archive each source backlog during resolve.
-   - Use helper command:
+   - Resolve id/path deterministically first when only id is available:
 ```bash
-tools/task.rs resolve-task-backlogs \
-  --task docs/tasks/000042-example.md
+tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
+```
+   - Close with backlog tool:
+```bash
+tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
 7. `task resolve` must always check RFC parent linkage.
-   - If task is a sub-task of an RFC, update corresponding RFC `Implementation Phases` during resolve.
-   - `tools/task.rs resolve-task-backlogs --task ...` now enforces this RFC-sync check.
+   - If task is a sub-task of an RFC, update corresponding RFC `Implementation Phases` during resolve:
+```bash
+tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
+```
 
 ## Output Quality Bar
 

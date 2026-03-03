@@ -22,6 +22,12 @@ Accepted paths:
 
 Create operations must fail if no valid planning document is provided.
 
+If user input is id-only shorthand (for example `$issue create task 000047`), resolve id to exactly one document first:
+
+```bash
+tools/doc-id.rs search-by-id --kind task --id 000047 --scope open
+```
+
 ## Create Issue From Planning Doc
 
 ```bash
@@ -134,6 +140,14 @@ tools/issue.rs link-pr-guidance --issue 123
 ```
 
 Use the snippet in PR body (for example: `Fixes #123`).
+
+Or create PR directly from current branch with default close-link body:
+
+```bash
+tools/issue.rs create-pr-from-branch --issue 123 --push
+```
+
+Default body includes `Closes #123`.
 
 ## Reference
 
