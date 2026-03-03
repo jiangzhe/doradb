@@ -1,0 +1,4 @@
+interface:
+  display_name: "RFC Design"
+  short_description: "Evidence-gated RFC create/resolve with draft and sync checks"
+  default_prompt: "Use $rfc create for deep-research RFC proposals with draft-to-formal gates, and $rfc resolve to sync phase outcomes/backlogs before explicit issue closure via $issue resolve-rfc."

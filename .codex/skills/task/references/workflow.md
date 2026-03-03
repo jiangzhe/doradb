@@ -87,6 +87,9 @@ Complete all items:
 tools/task.rs resolve-task-backlogs \
   --task docs/tasks/000042-example.md
 ```
+8. Always check whether resolved task is an RFC sub-task.
+9. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
+   - Enforced by `tools/task.rs resolve-task-backlogs --task ...` (built-in RFC sync).
 
 ## Backlog Integration
 

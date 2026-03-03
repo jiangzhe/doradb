@@ -99,6 +99,32 @@ tools/issue.rs close-issue \
   --comment "Completed in PR #456."
 ```
 
+## Resolve RFC Issue (Precheck + Explicit Close)
+
+Use RFC-specific resolve flow instead of direct close when closing RFC issues:
+
+```bash
+tools/issue.rs resolve-rfc \
+  --doc docs/rfcs/0006-example.md
+```
+
+This runs RFC resolve precheck only (no closure).
+
+To close explicitly after precheck passes:
+
+```bash
+tools/issue.rs resolve-rfc \
+  --doc docs/rfcs/0006-example.md \
+  --issue 456 \
+  --close \
+  --comment "RFC implemented and synchronized."
+```
+
+Rules:
+- `resolve-rfc` must validate all sub-task/docs/backlog prechecks before closure.
+- No automatic issue closure from `rfc resolve`; closure requires explicit `--close`.
+- For legacy RFC docs without parseable phase tracking, use `--allow-legacy`.
+
 ## Optional PR Bridge
 
 Generate a canonical close-link snippet:

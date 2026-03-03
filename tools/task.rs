@@ -12,6 +12,7 @@ use std::process::Command;
 const BACKLOG_DIR: &str = "docs/backlogs";
 const BACKLOG_CLOSED_DIR: &str = "docs/backlogs/closed";
 const BACKLOG_NEXT_ID_FILE: &str = "docs/backlogs/next-id";
+const RFC_DIR: &str = "docs/rfcs";
 
 fn usage() -> &'static str {
     "Usage: tools/task.rs <subcommand> [options]\n\n\
@@ -22,7 +23,8 @@ Subcommands:\n\
   alloc-backlog-id      Allocate and consume the next backlog id from docs/backlogs/next-id\n\
   close-backlog-doc     Move an open backlog doc to docs/backlogs/closed with Close Reason\n\
   complete-backlog-doc  Archive an open backlog doc as implemented by a task\n\
-  resolve-task-backlogs Close all Source Backlogs referenced by a task doc as implemented\n"
+  resolve-task-backlogs Close Source Backlogs and sync parent RFC phase during task resolve\n\
+  resolve-task-rfc      Sync task resolve outcome into parent RFC Implementation Phases\n"
 }
 
 fn next_task_id_usage() -> &'static str {
@@ -53,6 +55,10 @@ fn resolve_task_backlogs_usage() -> &'static str {
     "Usage: tools/task.rs resolve-task-backlogs --task <docs/tasks/<id>-<slug>.md> [--date <YYYY-MM-DD>] [--allow-missing]"
 }
 
+fn resolve_task_rfc_usage() -> &'static str {
+    "Usage: tools/task.rs resolve-task-rfc --task <docs/tasks/<id>-<slug>.md> [--date <YYYY-MM-DD>] [--summary <text>] [--rfc <docs/rfcs/<id>-<slug>.md>]"
+}
+
 #[derive(Clone)]
 struct CloseReason {
     reason_type: String,
@@ -67,6 +73,17 @@ struct ResolveSummary {
     closed: Vec<String>,
     already_closed: Vec<String>,
     missing: Vec<String>,
+    rfc_sync: RfcSyncSummary,
+}
+
+#[derive(Clone)]
+struct RfcSyncSummary {
+    checked: bool,
+    has_parent_rfc: bool,
+    rfc_doc: Option<String>,
+    updated: bool,
+    phase: Option<String>,
+    detail: Option<String>,
 }
 
 fn main() {
@@ -94,6 +111,7 @@ fn run() -> Result<(), String> {
         "close-backlog-doc" => run_close_backlog_doc(args),
         "complete-backlog-doc" => run_complete_backlog_doc(args),
         "resolve-task-backlogs" => run_resolve_task_backlogs(args),
+        "resolve-task-rfc" => run_resolve_task_rfc(args),
         _ => Err(format!("unknown subcommand: {subcommand}\n{}", usage())),
     }
 }
@@ -566,6 +584,14 @@ fn run_resolve_task_backlogs(mut args: impl Iterator<Item = String>) -> Result<(
         closed: Vec::new(),
         already_closed: Vec::new(),
         missing: Vec::new(),
+        rfc_sync: RfcSyncSummary {
+            checked: false,
+            has_parent_rfc: false,
+            rfc_doc: None,
+            updated: false,
+            phase: None,
+            detail: None,
+        },
     };
 
     for raw_ref in refs {
@@ -591,12 +617,75 @@ fn run_resolve_task_backlogs(mut args: impl Iterator<Item = String>) -> Result<(
         }
     }
 
+    summary.rfc_sync = sync_task_into_parent_rfc(&task_path, None, Some(closed_at.clone()), None)?;
+
     println!("{}", resolve_summary_json(&summary));
 
     if !allow_missing && !summary.missing.is_empty() {
         return Err("one or more referenced source backlogs are missing".to_string());
     }
 
+    Ok(())
+}
+
+fn run_resolve_task_rfc(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut task_path: Option<PathBuf> = None;
+    let mut date: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut rfc_override: Option<PathBuf> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--task" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --task\n{}",
+                        resolve_task_rfc_usage()
+                    ));
+                };
+                task_path = Some(PathBuf::from(v));
+            }
+            "--date" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --date\n{}",
+                        resolve_task_rfc_usage()
+                    ));
+                };
+                date = Some(v);
+            }
+            "--summary" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --summary\n{}",
+                        resolve_task_rfc_usage()
+                    ));
+                };
+                summary = Some(v);
+            }
+            "--rfc" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --rfc\n{}",
+                        resolve_task_rfc_usage()
+                    ));
+                };
+                rfc_override = Some(PathBuf::from(v));
+            }
+            "-h" | "--help" => {
+                println!("{}", resolve_task_rfc_usage());
+                return Ok(());
+            }
+            _ => return Err(format!("unknown arg: {arg}\n{}", resolve_task_rfc_usage())),
+        }
+    }
+
+    let task_path = task_path
+        .ok_or_else(|| format!("missing required arg: --task\n{}", resolve_task_rfc_usage()))?;
+    validate_task_doc_path(&task_path)?;
+
+    let sync = sync_task_into_parent_rfc(&task_path, summary, date, rfc_override)?;
+    println!("{}", rfc_sync_summary_json(&sync));
     Ok(())
 }
 
@@ -891,6 +980,314 @@ fn resolve_backlog_ref(raw_ref: &str) -> Result<BacklogRefResolution, String> {
     Ok(BacklogRefResolution::Missing(normalized_text))
 }
 
+fn sync_task_into_parent_rfc(
+    task_path: &Path,
+    summary_override: Option<String>,
+    date: Option<String>,
+    rfc_override: Option<PathBuf>,
+) -> Result<RfcSyncSummary, String> {
+    let task_path = normalize_reference_path(task_path);
+    validate_task_doc_path(&task_path)?;
+    let task_text = fs::read_to_string(&task_path)
+        .map_err(|e| format!("failed to read {}: {e}", normalize_path(&task_path)))?;
+    let task_ref = normalize_path(&task_path);
+
+    let parent_rfc = if let Some(override_path) = rfc_override {
+        let normalized = normalize_reference_path(&override_path);
+        validate_rfc_doc_path(&normalized)?;
+        normalized
+    } else {
+        let refs = extract_doc_refs_by_prefix(&task_text, "docs/rfcs/")
+            .into_iter()
+            .filter(|ref_path| {
+                let name = Path::new(ref_path)
+                    .file_name()
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match parse_strict_four_digit_rfc_name(&name) {
+                    Some(id) => id != 0,
+                    None => false,
+                }
+            })
+            .collect::<Vec<_>>();
+        if refs.is_empty() {
+            return Ok(RfcSyncSummary {
+                checked: true,
+                has_parent_rfc: false,
+                rfc_doc: None,
+                updated: false,
+                phase: None,
+                detail: Some("no parent RFC reference found in task doc".to_string()),
+            });
+        }
+        if refs.len() > 1 {
+            return Err(format!(
+                "multiple RFC references found in task doc: {} (use --rfc to disambiguate)",
+                refs.join(", ")
+            ));
+        }
+        let p = PathBuf::from(&refs[0]);
+        validate_rfc_doc_path(&p)?;
+        p
+    };
+
+    let notes = extract_markdown_section(&task_text, "Implementation Notes").unwrap_or_default();
+    if is_blank_implementation_notes(&notes) {
+        return Err(format!(
+            "task resolve requires non-empty `Implementation Notes` before RFC sync: {}",
+            task_ref
+        ));
+    }
+
+    let summary = match summary_override {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => first_meaningful_line(&notes)
+            .unwrap_or_else(|| "Implementation completed; see task implementation notes".to_string()),
+    };
+    let sync_date = date.unwrap_or_else(today_yyyy_mm_dd);
+
+    let (updated, phase, detail) =
+        apply_task_sync_into_rfc(&parent_rfc, &task_ref, &summary, &sync_date)?;
+
+    Ok(RfcSyncSummary {
+        checked: true,
+        has_parent_rfc: true,
+        rfc_doc: Some(normalize_path(&parent_rfc)),
+        updated,
+        phase: Some(phase),
+        detail: Some(detail),
+    })
+}
+
+fn apply_task_sync_into_rfc(
+    rfc_path: &Path,
+    task_ref: &str,
+    summary: &str,
+    date: &str,
+) -> Result<(bool, String, String), String> {
+    let original = fs::read_to_string(rfc_path)
+        .map_err(|e| format!("failed to read {}: {e}", normalize_path(rfc_path)))?;
+    let mut lines: Vec<String> = original.lines().map(|x| x.to_string()).collect();
+
+    let section_start = lines
+        .iter()
+        .position(|line| line.trim() == "## Implementation Phases")
+        .ok_or_else(|| {
+            format!(
+                "missing `## Implementation Phases` in parent RFC: {}",
+                normalize_path(rfc_path)
+            )
+        })?;
+    let section_end = lines
+        .iter()
+        .enumerate()
+        .skip(section_start + 1)
+        .find(|(_, line)| line.starts_with("## "))
+        .map(|(idx, _)| idx)
+        .unwrap_or(lines.len());
+
+    let task_line_idx = lines
+        .iter()
+        .enumerate()
+        .skip(section_start + 1)
+        .take(section_end.saturating_sub(section_start + 1))
+        .find(|(_, line)| line.contains(task_ref))
+        .map(|(idx, _)| idx)
+        .ok_or_else(|| {
+            format!(
+                "cannot find task reference `{}` inside RFC Implementation Phases: {}",
+                task_ref,
+                normalize_path(rfc_path)
+            )
+        })?;
+
+    let phase_start = (section_start + 1..=task_line_idx)
+        .rev()
+        .find(|idx| {
+            let trimmed = lines[*idx].trim_start();
+            trimmed.starts_with("- **Phase ") || trimmed.starts_with("### Phase ")
+        })
+        .ok_or_else(|| {
+            format!(
+                "cannot locate parent phase heading for task `{task_ref}` in {}",
+                normalize_path(rfc_path)
+            )
+        })?;
+
+    let phase_end = (task_line_idx + 1..section_end)
+        .find(|idx| {
+            let trimmed = lines[*idx].trim_start();
+            trimmed.starts_with("- **Phase ") || trimmed.starts_with("### Phase ")
+        })
+        .unwrap_or(section_end);
+
+    let phase_title = lines[phase_start].trim().to_string();
+    let status_line = "  - Phase Status: done".to_string();
+    let impl_line = format!(
+        "  - Implementation Summary: {} [Task Resolve Sync: {} @ {}]",
+        collapse_inline(summary),
+        task_ref,
+        date
+    );
+
+    let mut status_idx = None;
+    let mut impl_idx = None;
+    for idx in phase_start + 1..phase_end {
+        let trimmed = lines[idx].trim_start();
+        if trimmed.starts_with("- Phase Status:") {
+            status_idx = Some(idx);
+        } else if trimmed.starts_with("- Implementation Summary:") {
+            impl_idx = Some(idx);
+        }
+    }
+
+    if let Some(idx) = status_idx {
+        lines[idx] = status_line;
+    } else {
+        let insert_at = task_line_idx + 1;
+        lines.insert(insert_at, status_line);
+    }
+
+    let phase_end_adjusted = phase_end + if status_idx.is_none() { 1 } else { 0 };
+    if let Some(idx) = impl_idx {
+        lines[idx + if status_idx.is_none() && idx >= task_line_idx + 1 { 1 } else { 0 }] =
+            impl_line;
+    } else {
+        let status_pos = (phase_start + 1..phase_end_adjusted)
+            .find(|idx| lines[*idx].trim_start().starts_with("- Phase Status:"))
+            .unwrap_or(task_line_idx + 1);
+        lines.insert(status_pos + 1, impl_line);
+    }
+
+    let mut rebuilt = lines.join("\n");
+    if original.ends_with('\n') {
+        rebuilt.push('\n');
+    }
+
+    let changed = rebuilt != original;
+    if changed {
+        fs::write(rfc_path, rebuilt)
+            .map_err(|e| format!("failed to write {}: {e}", normalize_path(rfc_path)))?;
+    }
+
+    let detail = if changed {
+        "updated RFC phase status and implementation summary from task resolve".to_string()
+    } else {
+        "RFC phase already up to date".to_string()
+    };
+
+    Ok((changed, phase_title, detail))
+}
+
+fn validate_rfc_doc_path(path: &Path) -> Result<(), String> {
+    let path = normalize_reference_path(path);
+    if !path.exists() {
+        return Err(format!("RFC doc not found: {}", normalize_path(&path)));
+    }
+    if !path.is_file() {
+        return Err(format!("RFC doc is not a file: {}", normalize_path(&path)));
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("invalid RFC doc path: {}", normalize_path(&path)))?;
+    if normalize_path(parent) != RFC_DIR {
+        return Err(format!(
+            "RFC doc must be under {}: {}",
+            RFC_DIR,
+            normalize_path(&path)
+        ));
+    }
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid RFC doc path: {}", normalize_path(&path)))?
+        .to_string_lossy()
+        .to_string();
+    if parse_strict_four_digit_rfc_name(&name).is_none() {
+        return Err(format!(
+            "invalid RFC doc name: {} (expected <4digits>-<slug>.md)",
+            normalize_path(&path)
+        ));
+    }
+    Ok(())
+}
+
+fn extract_doc_refs_by_prefix(text: &str, prefix: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut pos = 0;
+    while let Some(found) = text[pos..].find(prefix) {
+        let start = pos + found;
+        let mut end = text.len();
+        for (idx, ch) in text[start..].char_indices() {
+            if ch.is_whitespace() || matches!(ch, ')' | ']' | '>' | '"' | '\'' | ',') {
+                end = start + idx;
+                break;
+            }
+        }
+        let mut cand = text[start..end].trim().trim_matches('`').to_string();
+        while cand.ends_with('.') || cand.ends_with(':') || cand.ends_with(';') {
+            cand.pop();
+        }
+        if cand.starts_with(prefix) && cand.ends_with(".md") {
+            refs.push(cand);
+        }
+        pos = start + prefix.len();
+        if pos >= text.len() {
+            break;
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn extract_markdown_section(content: &str, section: &str) -> Option<String> {
+    let header = format!("## {section}");
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.iter().position(|line| line.trim() == header)?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| line.starts_with("## "))
+        .map(|(idx, _)| idx)
+        .unwrap_or(lines.len());
+    Some(lines[start + 1..end].join("\n"))
+}
+
+fn is_blank_implementation_notes(notes: &str) -> bool {
+    let trimmed = notes.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed
+        .to_ascii_lowercase()
+        .contains("keep this section blank in design phase")
+}
+
+fn first_meaningful_line(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line
+            .trim()
+            .trim_start_matches('-')
+            .trim_start_matches('*')
+            .trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with('#') {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn collapse_inline(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 struct BacklogRefCandidates {
     id: Option<String>,
     open_candidates: Vec<String>,
@@ -942,11 +1339,24 @@ fn extract_id_from_backlog_path(path: &str) -> Option<String> {
 
 fn resolve_summary_json(summary: &ResolveSummary) -> String {
     format!(
-        "{{\"task\":\"{}\",\"closed\":{},\"already_closed\":{},\"missing\":{}}}",
+        "{{\"task\":\"{}\",\"closed\":{},\"already_closed\":{},\"missing\":{},\"rfc_sync\":{}}}",
         json_escape(&summary.task),
         json_array(&summary.closed),
         json_array(&summary.already_closed),
-        json_array(&summary.missing)
+        json_array(&summary.missing),
+        rfc_sync_summary_json(&summary.rfc_sync)
+    )
+}
+
+fn rfc_sync_summary_json(summary: &RfcSyncSummary) -> String {
+    format!(
+        "{{\"checked\":{},\"has_parent_rfc\":{},\"rfc_doc\":{},\"updated\":{},\"phase\":{},\"detail\":{}}}",
+        if summary.checked { "true" } else { "false" },
+        if summary.has_parent_rfc { "true" } else { "false" },
+        json_nullable(&summary.rfc_doc),
+        if summary.updated { "true" } else { "false" },
+        json_nullable(&summary.phase),
+        json_nullable(&summary.detail),
     )
 }
 
@@ -957,6 +1367,13 @@ fn json_array(items: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{body}]")
+}
+
+fn json_nullable(value: &Option<String>) -> String {
+    match value {
+        Some(v) => format!("\"{}\"", json_escape(v)),
+        None => "null".to_string(),
+    }
 }
 
 fn json_escape(text: &str) -> String {
@@ -1194,6 +1611,21 @@ fn parse_strict_six_digit_task_name(name: &str) -> Option<u32> {
     let body = &name[..name.len() - 3];
     let (id, slug) = body.split_once('-')?;
     if id.len() != 6 || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !is_valid_slug(slug) {
+        return None;
+    }
+    id.parse::<u32>().ok()
+}
+
+fn parse_strict_four_digit_rfc_name(name: &str) -> Option<u32> {
+    if !name.ends_with(".md") {
+        return None;
+    }
+    let body = &name[..name.len() - 3];
+    let (id, slug) = body.split_once('-')?;
+    if id.len() != 4 || !id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     if !is_valid_slug(slug) {

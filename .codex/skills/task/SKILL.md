@@ -112,6 +112,9 @@ Use `task resolve` only after implementation and tests are done, and behavior is
 tools/task.rs resolve-task-backlogs \
   --task docs/tasks/000042-example.md
 ```
+7. `task resolve` must always check RFC parent linkage.
+   - If task is a sub-task of an RFC, update corresponding RFC `Implementation Phases` during resolve.
+   - `tools/task.rs resolve-task-backlogs --task ...` now enforces this RFC-sync check.
 
 ## Output Quality Bar
 

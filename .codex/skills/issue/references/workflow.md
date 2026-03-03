@@ -59,3 +59,27 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 
 - Close with a clear status comment.
 - For PR linkage, include `Fixes #<issue>` or `Closes #<issue>` in PR body.
+
+## RFC Resolve Precheck Gate
+
+When closing RFC issues, use:
+
+```bash
+tools/issue.rs resolve-rfc --doc docs/rfcs/0006-example.md [--allow-legacy]
+```
+
+Then explicitly close only after successful precheck:
+
+```bash
+tools/issue.rs resolve-rfc \
+  --doc docs/rfcs/0006-example.md \
+  --issue <issue> \
+  --close \
+  --comment "RFC implemented and synchronized."
+```
+
+Precheck must verify:
+1. RFC resolve readiness checks pass (`tools/rfc.rs precheck-rfc-resolve`).
+2. All tracked sub-task issues are closed (strict mode).
+3. Related task docs are synchronized (implementation notes present).
+4. Related backlog documents are resolved.

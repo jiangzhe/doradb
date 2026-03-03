@@ -1,7 +1,7 @@
 ---
 id: 0000
 title: RFC Title
-status: proposal  # proposal | accepted | implemented | superseded
+status: draft  # draft | proposal | accepted | implemented | superseded
 tags: []
 created: YYYY-MM-DD
 ---
@@ -10,12 +10,12 @@ created: YYYY-MM-DD
 
 ## Summary
 
-One paragraph explaining the decision.
+One paragraph explaining the decision and expected outcomes.
 
 ## Context
 
 What problem does it solve?
-Why is this decision needed?
+Why is this decision needed now?
 
 Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `Issue Labels:`
@@ -23,10 +23,44 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `- priority:medium`
 `- codex`
 
+## Design Inputs
+
+### Documents
+
+- [D1] `docs/architecture.md` - relevance to this RFC.
+
+### Code References
+
+- [C1] `doradb-storage/src/...` - current-state behavior and impact surface.
+
+### Conversation References
+
+- [U1] User-provided requirement/constraint summary from discussion.
+
+### Source Backlogs (Optional)
+
+- [B1] `docs/backlogs/<6digits>-<follow-up-topic>.md`
+
 ## Decision
 
-What we're going to do. Technical details, process flow, data structure, etc.
-Design rationales. Goals, scope, trade-offs, technical difficulties, comparison with alternatives.
+State the selected direction clearly.
+For each major decision point, include at least one input reference token (`[D#]`, `[C#]`, `[U#]`, `[B#]`).
+
+## Alternatives Considered
+
+### Alternative A: Name
+
+- Summary: ...
+- Analysis: ...
+- Why Not Chosen: ...
+- References: [D1], [C1]
+
+### Alternative B: Name
+
+- Summary: ...
+- Analysis: ...
+- Why Not Chosen: ...
+- References: [D1], [U1]
 
 ## Unsafe Considerations (If Applicable)
 
@@ -43,30 +77,43 @@ Reference:
 ## Implementation Phases
 
 - **Phase 1: Name**
-
-Description of this phase, should be equivalent to a simple task.
-Focus on the scope of this task: context, goals, non-goals.
+  - Scope: ...
+  - Goals: ...
+  - Non-goals: ...
+  - Task Doc: `docs/tasks/<6digits>-<task-topic>.md`
+  - Task Issue: `#123`
+  - Phase Status: `pending`
+  - Implementation Summary: `pending`
+  - Related Backlogs:
+    - `docs/backlogs/<6digits>-<follow-up-topic>.md`
 
 - **Phase 2: Name**
-
-...
+  - Scope: ...
+  - Goals: ...
+  - Non-goals: ...
+  - Task Doc: `docs/tasks/<6digits>-<task-topic>.md`
+  - Task Issue: `#124`
+  - Phase Status: `pending`
+  - Implementation Summary: `pending`
 
 ## Consequences
 
 ### Positive
+
 - ...
 
 ### Negative
+
 - ...
 
 ## Open Questions
 
-List open questions which may not be solved easily.
+List open questions that remain unresolved.
 
 ## Future Work
 
-Things explicitly out of scope, for future RFCs.
+Things explicitly out of scope, for future RFCs/tasks.
 
 ## References
 
-- Related RFCs, discussions, external resources
+- Related RFCs, docs, discussions, external resources.

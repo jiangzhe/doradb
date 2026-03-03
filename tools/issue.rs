@@ -63,6 +63,7 @@ Subcommands:\n\
   list-issues\n\
   update-issue\n\
   close-issue\n\
+  resolve-rfc\n\
   link-pr-guidance\n"
 }
 
@@ -93,6 +94,7 @@ fn run() -> Result<(), i32> {
         "list-issues" => cmd_list_issues(args),
         "update-issue" => cmd_update_issue(args),
         "close-issue" => cmd_close_issue(args),
+        "resolve-rfc" => cmd_resolve_rfc(args),
         "link-pr-guidance" => cmd_link_pr_guidance(args),
         _ => {
             eprintln!("unknown subcommand: {subcommand}\n{}", usage());
@@ -714,6 +716,176 @@ fn cmd_close_issue(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
     Ok(())
 }
 
+fn cmd_resolve_rfc(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
+    let mut doc: Option<String> = None;
+    let mut issue: Option<i64> = None;
+    let mut close = false;
+    let mut comment: Option<String> = None;
+    let mut allow_legacy = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--doc" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --doc");
+                    return Err(1);
+                };
+                doc = Some(v);
+            }
+            "--issue" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --issue");
+                    return Err(1);
+                };
+                let parsed = match v.parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!("invalid --issue value: {v}");
+                        return Err(1);
+                    }
+                };
+                issue = Some(parsed);
+            }
+            "--close" => {
+                close = true;
+            }
+            "--comment" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --comment");
+                    return Err(1);
+                };
+                comment = Some(v);
+            }
+            "--allow-legacy" => {
+                allow_legacy = true;
+            }
+            "-h" | "--help" => {
+                println!("Usage: ... issue.rs resolve-rfc --doc <docs/rfcs/<id>-<slug>.md> [--issue <n>] [--allow-legacy] [--close] [--comment <text>]");
+                return Ok(());
+            }
+            _ => {
+                eprintln!("unknown arg: {arg}");
+                return Err(1);
+            }
+        }
+    }
+
+    let Some(doc) = doc else {
+        eprintln!("missing required arg: --doc");
+        return Err(1);
+    };
+
+    let doc_path = Path::new(&doc);
+    let validated_value = validate_doc_path(doc_path);
+    let Some(valid) = validated_value.get("valid").and_then(|v| v.as_bool()) else {
+        print_json(&validated_value);
+        return Err(1);
+    };
+    if !valid {
+        print_json(&validated_value);
+        return Err(1);
+    }
+    let doc_type = validated_value
+        .get("doc_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if doc_type != "rfc" {
+        print_json(&json!({
+            "ok": false,
+            "error": "resolve-rfc only accepts docs/rfcs documents",
+            "doc": normalize_path(doc_path),
+        }));
+        return Err(1);
+    }
+
+    let mut precheck_cmd = vec![
+        "tools/rfc.rs".to_string(),
+        "precheck-rfc-resolve".to_string(),
+        "--doc".to_string(),
+        normalize_path(doc_path),
+    ];
+    if allow_legacy {
+        precheck_cmd.push("--allow-legacy".to_string());
+    }
+    let precheck_res = run_command(&precheck_cmd);
+    if precheck_res.returncode != 0 {
+        print_json(&json!({
+            "ok": false,
+            "precheck_ok": false,
+            "closed": false,
+            "doc": normalize_path(doc_path),
+            "precheck_command": precheck_cmd,
+            "precheck_stdout": precheck_res.stdout.trim(),
+            "precheck_stderr": precheck_res.stderr.trim(),
+        }));
+        return Err(if precheck_res.returncode == 0 { 1 } else { precheck_res.returncode });
+    }
+
+    if !close {
+        print_json(&json!({
+            "ok": true,
+            "precheck_ok": true,
+            "closed": false,
+            "doc": normalize_path(doc_path),
+            "message": "RFC resolve precheck passed. No issue closure performed (use --close for explicit closure).",
+            "precheck_stdout": precheck_res.stdout.trim(),
+        }));
+        return Ok(());
+    }
+
+    let issue = issue.or_else(|| parse_rfc_issue_hint(doc_path));
+    let Some(issue_no) = issue else {
+        print_json(&json!({
+            "ok": false,
+            "precheck_ok": true,
+            "closed": false,
+            "doc": normalize_path(doc_path),
+            "error": "issue number is required for closure (pass --issue or add github_issue in RFC frontmatter)",
+        }));
+        return Err(1);
+    };
+
+    let close_comment = comment.unwrap_or_else(|| {
+        format!(
+            "RFC resolve precheck passed for `{}`. Closing RFC issue.",
+            normalize_path(doc_path)
+        )
+    });
+    let close_cmd = vec![
+        "gh".to_string(),
+        "issue".to_string(),
+        "close".to_string(),
+        issue_no.to_string(),
+        "--comment".to_string(),
+        close_comment,
+    ];
+    let close_res = run_command(&close_cmd);
+    if close_res.returncode != 0 {
+        print_json(&json!({
+            "ok": false,
+            "precheck_ok": true,
+            "closed": false,
+            "doc": normalize_path(doc_path),
+            "issue_number": issue_no,
+            "close_command": close_cmd,
+            "close_stdout": close_res.stdout.trim(),
+            "close_stderr": close_res.stderr.trim(),
+        }));
+        return Err(if close_res.returncode == 0 { 1 } else { close_res.returncode });
+    }
+
+    print_json(&json!({
+        "ok": true,
+        "precheck_ok": true,
+        "closed": true,
+        "doc": normalize_path(doc_path),
+        "issue_number": issue_no,
+        "precheck_stdout": precheck_res.stdout.trim(),
+        "close_stdout": close_res.stdout.trim(),
+    }));
+    Ok(())
+}
+
 fn cmd_link_pr_guidance(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
     let mut issue: Option<i64> = None;
 
@@ -834,6 +1006,37 @@ fn title_hint(path: &Path) -> Option<String> {
                 return None;
             }
             return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn parse_rfc_issue_hint(path: &Path) -> Option<i64> {
+    let text = fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.first().map(|v| v.trim()) != Some("---") {
+        return None;
+    }
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, v)| v.trim() == "---")
+        .map(|(idx, _)| idx)?;
+
+    for line in &lines[1..end] {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("github_issue:") {
+            continue;
+        }
+        let value = trimmed
+            .split_once(':')
+            .map(|(_, right)| right.trim())
+            .unwrap_or("");
+        if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(parsed) = value.parse::<i64>() {
+                return Some(parsed);
+            }
         }
     }
     None
