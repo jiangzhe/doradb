@@ -37,6 +37,8 @@ tools/issue.rs create-issue-from-doc \
   --assignee "@me"
 ```
 
+`create-issue-from-doc` must use assignee `@me`.
+
 `--labels` is optional. If omitted, labels can be derived from planning-doc metadata:
 
 ```md
@@ -61,6 +63,7 @@ For child issues linked to an epic:
 tools/issue.rs create-issue-from-doc \
   --doc docs/tasks/000002-subtask.md \
   --labels "type:task" \
+  --assignee "@me" \
   --parent 42
 ```
 
@@ -144,10 +147,18 @@ Use the snippet in PR body (for example: `Fixes #123`).
 Or create PR directly from current branch with default close-link body:
 
 ```bash
-tools/issue.rs create-pr-from-branch --issue 123 --push
+tools/issue.rs create-pr-from-branch --issue 123 --push --assignee "@me"
 ```
 
 Default body includes `Closes #123`.
+Assignee must be `@me`.
+Before creating PR, workflow must check for uncommitted changes.
+If dirty changes exist, developer must explicitly decide to:
+1. manually commit selected changes, or
+2. ignore and proceed with explicit override:
+```bash
+tools/issue.rs create-pr-from-branch --issue 123 --push --assignee "@me" --allow-dirty
+```
 
 ## Reference
 

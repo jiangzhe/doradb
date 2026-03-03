@@ -109,7 +109,71 @@ Reference:
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve` after implementation, tests, review, and verification are completed.
+Implemented and verified.
+
+1. Added shared doc-id tooling:
+   - `tools/doc-id.rs` with:
+     - `init-next-id`
+     - `peek-next-id`
+     - `alloc-id`
+     - `validate-path`
+     - `inspect-path`
+     - `search-by-id`
+   - `search-by-id` now provides deterministic unique-match resolution and explicit error responses (including closed-only backlog detection when scope is `open`).
+
+2. Migrated id allocation and validation to doc-id tool:
+   - `tools/task.rs next-task-id` reads from `docs/tasks/next-id` through `tools/doc-id.rs`.
+   - `tools/task.rs create-task-doc --auto-id` allocates id through `tools/doc-id.rs alloc-id --kind task`.
+   - `tools/rfc.rs next-rfc-id` reads from `docs/rfcs/next-id` through `tools/doc-id.rs`.
+   - `tools/rfc.rs create-rfc-doc --auto-id` allocates id through `tools/doc-id.rs alloc-id --kind rfc`.
+   - `tools/issue.rs validate-doc-path` delegates planning-doc path validation to `tools/doc-id.rs validate-path`.
+   - `tools/backlog.rs close-doc --id ...` resolves open backlog path through `tools/doc-id.rs search-by-id --kind backlog --scope open`.
+
+3. Removed backlog lifecycle ownership from task tool command surface:
+   - `tools/task.rs` command surface is now task-focused:
+     - `next-task-id`
+     - `create-task-doc`
+     - `resolve-task-rfc`
+   - Legacy task backlog subcommands were removed from dispatch/help (no compatibility wrappers).
+
+4. Added PR creation helper to issue tool:
+   - `tools/issue.rs create-pr-from-branch` with default PR close line `Closes #<issue-id>`.
+   - Enforced assignee policy: issue create / PR create flows require `assignee="@me"`.
+   - Added dirty worktree gate for PR creation:
+     - command blocks if uncommitted changes exist,
+     - developer must explicitly decide to commit selected changes or rerun with `--allow-dirty`.
+
+5. Added next-id files for all three doc families:
+   - `docs/tasks/next-id`
+   - `docs/backlogs/next-id` (pre-existing, retained)
+   - `docs/rfcs/next-id`
+
+6. Updated skill/process/template docs to reflect separation and multi-tool workflows:
+   - issue/backlog/task/rfc skill docs and workflow references now document:
+     - shorthand id resolution through `tools/doc-id.rs search-by-id`,
+     - issue/PR assignee `@me` requirement,
+     - PR dirty-worktree explicit decision requirement.
+   - backlog template helper references were updated to remove removed `tools/task.rs` backlog commands.
+
+7. Verification commands executed:
+   - `tools/doc-id.rs --help`
+   - `tools/doc-id.rs peek-next-id --kind task`
+   - `tools/doc-id.rs peek-next-id --kind backlog`
+   - `tools/doc-id.rs peek-next-id --kind rfc`
+   - `tools/doc-id.rs validate-path --path docs/tasks/000047-refactor-codex-skill-tools-strict-separation-shared-doc-id-next-id.md`
+   - `tools/doc-id.rs search-by-id --kind task --id 000047 --scope open`
+   - `tools/doc-id.rs search-by-id --kind backlog --id 000039 --scope open` (expected fail: closed-only backlog)
+   - `tools/task.rs --help`
+   - `tools/task.rs next-task-id`
+   - `tools/rfc.rs --help`
+   - `tools/rfc.rs next-rfc-id`
+   - `tools/backlog.rs --help`
+   - `tools/issue.rs --help`
+   - `tools/issue.rs validate-doc-path --path docs/tasks/000047-refactor-codex-skill-tools-strict-separation-shared-doc-id-next-id.md`
+   - `tools/issue.rs create-pr-from-branch --help`
+   - `tools/issue.rs create-pr-from-branch --issue 380 --assignee someone` (expected fail: assignee policy)
+   - `tools/issue.rs create-pr-from-branch --issue 380 --assignee "@me"` (expected fail on dirty worktree, requiring commit or `--allow-dirty`)
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000047-refactor-codex-skill-tools-strict-separation-shared-doc-id-next-id.md` (result: no parent RFC reference found)
 
 ## Impacts
 
@@ -130,10 +194,13 @@ Keep this section blank in design phase. Fill this section during `task resolve`
 4. Process docs:
    - `docs/process/issue-tracking.md`
    - `docs/process/pull-request.md`
-5. Potential template references:
+5. Template/docs references:
    - `docs/backlogs/000000-template.md`
    - `docs/tasks/000000-template.md`
    - `docs/rfcs/0000-template.md`
+6. Next-id files:
+   - `docs/tasks/next-id`
+   - `docs/rfcs/next-id`
 
 ## Test Cases
 
@@ -154,7 +221,8 @@ Keep this section blank in design phase. Fill this section during `task resolve`
 12. `tools/backlog.rs` backlog create/close/duplicate flows still pass.
 13. `tools/issue.rs validate-doc-path` still passes for valid task/rfc docs after shared refactor.
 14. `tools/issue.rs create-pr-from-branch` creates PR from current branch with default body line `Closes #<issue-id>`.
-15. Skill workflow smoke checks confirm multi-tool sequencing works without cross-tool convenience commands.
+15. `tools/issue.rs create-pr-from-branch` enforces `assignee="@me"` and blocks on dirty worktree unless explicit `--allow-dirty` is provided.
+16. Skill workflow smoke checks confirm multi-tool sequencing works without cross-tool convenience commands.
 
 ## Open Questions
 

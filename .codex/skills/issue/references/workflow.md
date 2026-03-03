@@ -57,7 +57,8 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 - Use non-interactive commands.
 - Use `--json` for list/read operations.
 - Use `--body-file` when body can be long.
-- Add assignee explicitly (`@me` default for active work).
+- Always use assignee `@me` when creating issues and PRs.
+- For PR creation, check working tree cleanliness first and force explicit decision on dirty changes.
 
 ## Completion
 
@@ -65,7 +66,11 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 - For PR linkage, include `Fixes #<issue>` or `Closes #<issue>` in PR body.
 - Optional helper for PR creation from current branch:
 ```bash
-tools/issue.rs create-pr-from-branch --issue <id> --push
+tools/issue.rs create-pr-from-branch --issue <id> --push --assignee "@me"
+```
+- If helper reports uncommitted changes, developer must either commit selected changes manually or rerun with explicit override:
+```bash
+tools/issue.rs create-pr-from-branch --issue <id> --push --assignee "@me" --allow-dirty
 ```
 
 ## RFC Resolve Precheck Gate

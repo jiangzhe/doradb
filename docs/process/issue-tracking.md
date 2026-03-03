@@ -174,7 +174,13 @@ gh issue edit 42 --body "High-level goal.
     *   Link to the related issue using `Fixes #<issue id>` or `Closes #<issue id>` in PR body.
     *   Optional helper:
 ```bash
-tools/issue.rs create-pr-from-branch --issue <issue-id> --push
+tools/issue.rs create-pr-from-branch --issue <issue-id> --push --assignee "@me"
+```
+    *   If uncommitted changes are present, decide explicitly:
+        1. commit selected changes manually, or
+        2. rerun with `--allow-dirty` to ignore:
+```bash
+tools/issue.rs create-pr-from-branch --issue <issue-id> --push --assignee "@me" --allow-dirty
 ```
     *   Ensure CI succeeds and code review is passed.
 

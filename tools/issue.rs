@@ -208,6 +208,13 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         eprintln!("missing required arg: --doc");
         return Err(1);
     };
+    if assignee != "@me" {
+        print_json(&json!({
+            "created": false,
+            "error": "create-issue-from-doc requires --assignee @me (or omit to use default)",
+        }));
+        return Err(1);
+    }
 
     let doc_path = Path::new(&doc);
     let validated_value = validate_doc_path(doc_path);
@@ -355,6 +362,8 @@ fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(
     let mut title: Option<String> = None;
     let mut body: Option<String> = None;
     let mut push = false;
+    let mut assignee = "@me".to_string();
+    let mut allow_dirty = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -403,8 +412,18 @@ fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(
             "--push" => {
                 push = true;
             }
+            "--assignee" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --assignee");
+                    return Err(1);
+                };
+                assignee = v;
+            }
+            "--allow-dirty" => {
+                allow_dirty = true;
+            }
             "-h" | "--help" => {
-                println!("Usage: ... issue.rs create-pr-from-branch --issue <n> [--base <branch>] [--head <branch>] [--title <title>] [--body <text>] [--push]");
+                println!("Usage: ... issue.rs create-pr-from-branch --issue <n> [--base <branch>] [--head <branch>] [--title <title>] [--body <text>] [--push] [--assignee @me] [--allow-dirty]");
                 return Ok(());
             }
             _ => {
@@ -418,6 +437,48 @@ fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(
         eprintln!("missing required arg: --issue");
         return Err(1);
     };
+    if assignee != "@me" {
+        print_json(&json!({
+            "ok": false,
+            "created": false,
+            "error": "create-pr-from-branch requires --assignee @me (or omit to use default)",
+        }));
+        return Err(1);
+    }
+
+    let dirty_cmd = vec![
+        "git".to_string(),
+        "status".to_string(),
+        "--porcelain".to_string(),
+    ];
+    let dirty_res = run_command(&dirty_cmd);
+    if dirty_res.returncode != 0 {
+        print_json(&json!({
+            "ok": false,
+            "created": false,
+            "error": "failed to inspect git working tree status",
+            "command": dirty_cmd,
+            "stdout": dirty_res.stdout.trim(),
+            "stderr": dirty_res.stderr.trim(),
+        }));
+        return Err(if dirty_res.returncode == 0 { 1 } else { dirty_res.returncode });
+    }
+    let dirty_entries: Vec<String> = dirty_res
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if !allow_dirty && !dirty_entries.is_empty() {
+        print_json(&json!({
+            "ok": false,
+            "created": false,
+            "error": "working tree has uncommitted changes; manually commit desired changes, or rerun with --allow-dirty to ignore",
+            "dirty_entries": dirty_entries,
+        }));
+        return Err(1);
+    }
 
     let head_branch = if let Some(h) = head {
         h
@@ -493,6 +554,8 @@ fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(
         pr_title.clone(),
         "--body".to_string(),
         pr_body.clone(),
+        "--assignee".to_string(),
+        assignee.clone(),
     ];
     let create_res = run_command(&create_cmd);
     if create_res.returncode != 0 {
@@ -523,6 +586,8 @@ fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(
         "head": head_branch,
         "title": pr_title,
         "close_line": close_line,
+        "assignee": assignee,
+        "dirty_ignored": allow_dirty && !dirty_entries.is_empty(),
         "pr_url": pr_url,
     }));
     Ok(())
