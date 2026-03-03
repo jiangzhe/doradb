@@ -8,6 +8,8 @@ The change introduces a shared `tools/doc-id.rs` for doc id inspection/allocatio
 
 It also adds a shared ID lookup command to support shorthand prompts (for example `$issue create task 000047`, `$backlog close 000123 ...`) by resolving exactly one target doc before tool-specific actions run.
 
+For issue-to-PR flow, `tools/issue.rs create-pr-from-branch` now supports document-aware default title derivation: when planning docs are included in the PR diff, task/RFC title is used with a suitable type prefix, and RFC is preferred when both task and RFC docs are present.
+
 ## Context
 
 Current skill tooling has overlap and mixed responsibilities:
@@ -46,6 +48,10 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 6. Add `tools/issue.rs create-pr-from-branch` with default close-link body behavior (`Closes #<issue-id>`).
 7. Update skill/process docs so workflows compose multiple tools explicitly.
 8. Add `tools/doc-id.rs search-by-id --kind ... --id ...` as the required first step for shorthand-id workflows.
+9. Enhance `create-pr-from-branch` default title derivation:
+   - derive title from changed task/RFC doc heading when `--title` is omitted,
+   - prefer RFC title when both task and RFC docs are present,
+   - keep explicit `--title` as hard override.
 
 ## Non-Goals
 
@@ -100,7 +106,11 @@ Reference:
    - add `create-pr-from-branch`,
    - infer current branch,
    - default PR body includes `Closes #<issue-id>`,
-   - keep CLI non-interactive.
+   - keep CLI non-interactive,
+   - if `--title` is omitted, derive title from changed planning docs in `base...head`:
+     - prefer RFC docs when task and RFC docs coexist,
+     - use doc heading text as core title and choose suitable prefix (`feat:`/`fix:`/`docs:`/`perf:`/`chore:`),
+     - fallback to branch-based `chore:` title when no planning doc is found.
 10. Update skills/process docs:
    - `task` skill references backlog lifecycle via `backlog` tool commands only,
    - `issue`/`backlog` skills require `search-by-id` when user input is id-only shorthand,
@@ -142,6 +152,14 @@ Implemented and verified.
    - Added dirty worktree gate for PR creation:
      - command blocks if uncommitted changes exist,
      - developer must explicitly decide to commit selected changes or rerun with `--allow-dirty`.
+   - Added default PR title derivation when `--title` is omitted:
+     - inspect changed files via `git diff --name-only <base>...<head>`,
+     - detect planning docs in `docs/tasks/*.md` and `docs/rfcs/*.md` (exclude templates),
+     - if both task and RFC docs exist, choose RFC,
+     - if multiple docs exist in selected kind, choose highest doc id,
+     - parse heading (`# Task: ...`, `# RFC-xxxx: ...`) and normalize to title text,
+     - choose title prefix from `Issue Labels` `type:*` when available; otherwise fallback by doc type (`rfc -> feat`, `task -> chore`),
+     - keep explicit `--title` as hard override.
 
 5. Added next-id files for all three doc families:
    - `docs/tasks/next-id`
@@ -173,6 +191,8 @@ Implemented and verified.
    - `tools/issue.rs create-pr-from-branch --help`
    - `tools/issue.rs create-pr-from-branch --issue 380 --assignee someone` (expected fail: assignee policy)
    - `tools/issue.rs create-pr-from-branch --issue 380 --assignee "@me"` (expected fail on dirty worktree, requiring commit or `--allow-dirty`)
+   - `tools/issue.rs create-pr-from-branch --issue 380 --assignee "@me" --allow-dirty` (expected fail in this repo state due existing PR, but validates auto-derived title payload and RFC-preferred selection)
+   - `tools/issue.rs create-pr-from-branch --issue 380 --assignee "@me" --allow-dirty --title "chore: explicit title test"` (expected fail in this repo state due existing PR, but validates explicit title override)
    - `tools/task.rs resolve-task-rfc --task docs/tasks/000047-refactor-codex-skill-tools-strict-separation-shared-doc-id-next-id.md` (result: no parent RFC reference found)
 
 ## Impacts
@@ -223,6 +243,9 @@ Implemented and verified.
 14. `tools/issue.rs create-pr-from-branch` creates PR from current branch with default body line `Closes #<issue-id>`.
 15. `tools/issue.rs create-pr-from-branch` enforces `assignee="@me"` and blocks on dirty worktree unless explicit `--allow-dirty` is provided.
 16. Skill workflow smoke checks confirm multi-tool sequencing works without cross-tool convenience commands.
+17. `tools/issue.rs create-pr-from-branch` auto-derives PR title from changed planning docs when `--title` is omitted.
+18. When both task and RFC docs are present in PR diff, auto title prefers RFC document title.
+19. Explicit `--title` always overrides auto title derivation.
 
 ## Open Questions
 

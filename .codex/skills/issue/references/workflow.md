@@ -68,6 +68,10 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 ```bash
 tools/issue.rs create-pr-from-branch --issue <id> --push --assignee "@me"
 ```
+- If `--title` is omitted, helper auto-selects title from changed planning docs in `base...head`:
+  - prefer RFC doc title when both task/RFC docs are changed,
+  - otherwise use the changed task/RFC title with suitable type prefix,
+  - explicit `--title` overrides auto-selection.
 - If helper reports uncommitted changes, developer must either commit selected changes manually or rerun with explicit override:
 ```bash
 tools/issue.rs create-pr-from-branch --issue <id> --push --assignee "@me" --allow-dirty

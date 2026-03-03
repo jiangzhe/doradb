@@ -176,6 +176,10 @@ gh issue edit 42 --body "High-level goal.
 ```bash
 tools/issue.rs create-pr-from-branch --issue <issue-id> --push --assignee "@me"
 ```
+    *   If `--title` is omitted, helper auto-derives PR title from changed planning docs (`base...head`):
+        1. prefer RFC title when both task and RFC docs are included,
+        2. otherwise use task/RFC title with suitable type prefix (`feat:`/`fix:`/`docs:`/`perf:`/`chore:`).
+        3. explicit `--title` overrides auto title.
     *   If uncommitted changes are present, decide explicitly:
         1. commit selected changes manually, or
         2. rerun with `--allow-dirty` to ignore:

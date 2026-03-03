@@ -152,6 +152,11 @@ tools/issue.rs create-pr-from-branch --issue 123 --push --assignee "@me"
 
 Default body includes `Closes #123`.
 Assignee must be `@me`.
+If `--title` is omitted, title is auto-derived from changed planning docs in `base...head`:
+- if both task and RFC docs are present, RFC is preferred.
+- if only RFC docs are present, use RFC title with a suitable type prefix (default `feat:`).
+- if only task docs are present, use task title with a suitable type prefix (default `chore:`).
+- explicit `--title` always overrides auto title.
 Before creating PR, workflow must check for uncommitted changes.
 If dirty changes exist, developer must explicitly decide to:
 1. manually commit selected changes, or

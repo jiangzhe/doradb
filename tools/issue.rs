@@ -8,6 +8,7 @@ serde_json = "1"
 ---
 
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,28 @@ struct LabelSelection {
     type_label: Option<String>,
     priority_label: Option<String>,
     codex: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PrDocCandidate {
+    path: String,
+    doc_type: String,
+    doc_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct AutoPrTitle {
+    title: String,
+    doc_path: String,
+    doc_type: String,
+    doc_id: String,
+    doc_heading: Option<String>,
+    doc_title: String,
+    prefix: String,
+    type_label: Option<String>,
+    selection_reason: String,
+    changed_doc_paths: Vec<String>,
+    warnings: Vec<String>,
 }
 
 const ALLOWED_TYPE_LABELS: &[&str] = &[
@@ -535,7 +558,31 @@ fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(
         }
     }
 
-    let pr_title = title.unwrap_or_else(|| format!("chore: {}", head_branch.replace('_', "-")));
+    let mut title_source = "explicit".to_string();
+    let mut auto_title: Option<AutoPrTitle> = None;
+    let mut title_warning: Option<String> = None;
+
+    let pr_title = if let Some(explicit) = title {
+        explicit
+    } else {
+        match derive_pr_title_from_docs(&base, &head_branch) {
+            Ok(Some(derived)) => {
+                title_source = "planning-doc".to_string();
+                let title = derived.title.clone();
+                auto_title = Some(derived);
+                title
+            }
+            Ok(None) => {
+                title_source = "branch-default".to_string();
+                format!("chore: {}", head_branch.replace('_', "-"))
+            }
+            Err(e) => {
+                title_source = "branch-default".to_string();
+                title_warning = Some(e);
+                format!("chore: {}", head_branch.replace('_', "-"))
+            }
+        }
+    };
     let close_line = format!("Closes #{issue_no}");
     let pr_body = match body {
         Some(text) => format!("{}\n\n{}", text.trim(), close_line),
@@ -563,6 +610,23 @@ fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(
             "ok": false,
             "created": false,
             "command": create_cmd,
+            "title": pr_title,
+            "title_source": title_source,
+            "auto_title": auto_title.as_ref().map(|v| json!({
+                "doc": {
+                    "path": v.doc_path,
+                    "doc_type": v.doc_type,
+                    "doc_id": v.doc_id,
+                },
+                "doc_heading": v.doc_heading,
+                "doc_title": v.doc_title,
+                "prefix": v.prefix,
+                "type_label": v.type_label,
+                "selection_reason": v.selection_reason,
+                "changed_doc_paths": v.changed_doc_paths,
+                "warnings": v.warnings,
+            })),
+            "title_warning": title_warning,
             "stdout": create_res.stdout.trim(),
             "stderr": create_res.stderr.trim(),
         }));
@@ -585,6 +649,22 @@ fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(
         "base": base,
         "head": head_branch,
         "title": pr_title,
+        "title_source": title_source,
+        "auto_title": auto_title.as_ref().map(|v| json!({
+            "doc": {
+                "path": v.doc_path,
+                "doc_type": v.doc_type,
+                "doc_id": v.doc_id,
+            },
+            "doc_heading": v.doc_heading,
+            "doc_title": v.doc_title,
+            "prefix": v.prefix,
+            "type_label": v.type_label,
+            "selection_reason": v.selection_reason,
+            "changed_doc_paths": v.changed_doc_paths,
+            "warnings": v.warnings,
+        })),
+        "title_warning": title_warning,
         "close_line": close_line,
         "assignee": assignee,
         "dirty_ignored": allow_dirty && !dirty_entries.is_empty(),
@@ -1180,6 +1260,256 @@ fn cmd_link_pr_guidance(mut args: impl Iterator<Item = String>) -> Result<(), i3
         },
     }));
     Ok(())
+}
+
+fn derive_pr_title_from_docs(base: &str, head: &str) -> Result<Option<AutoPrTitle>, String> {
+    let candidates = collect_pr_doc_candidates_from_diff(base, head)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let task_count = candidates.iter().filter(|v| v.doc_type == "task").count();
+    let rfc_count = candidates.iter().filter(|v| v.doc_type == "rfc").count();
+    let has_task = task_count > 0;
+    let has_rfc = rfc_count > 0;
+
+    let mut preferred: Vec<PrDocCandidate> = if has_rfc {
+        candidates
+            .iter()
+            .filter(|v| v.doc_type == "rfc")
+            .cloned()
+            .collect()
+    } else {
+        candidates
+            .iter()
+            .filter(|v| v.doc_type == "task")
+            .cloned()
+            .collect()
+    };
+    preferred.sort_by(|a, b| {
+        let a_id = a.doc_id.parse::<u64>().unwrap_or(0);
+        let b_id = b.doc_id.parse::<u64>().unwrap_or(0);
+        b_id.cmp(&a_id).then_with(|| a.path.cmp(&b.path))
+    });
+    let Some(selected) = preferred.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let selection_reason = if has_rfc && has_task {
+        "rfc_preferred_when_task_and_rfc_present"
+    } else if has_rfc && rfc_count > 1 {
+        "multiple_rfc_docs_highest_id"
+    } else if has_rfc {
+        "single_rfc_doc"
+    } else if task_count > 1 {
+        "multiple_task_docs_highest_id"
+    } else {
+        "single_task_doc"
+    };
+
+    let selected_path = Path::new(&selected.path);
+    let doc_heading = title_hint(selected_path);
+    let mut warnings = Vec::new();
+
+    let doc_title = match doc_heading
+        .as_deref()
+        .and_then(|v| normalize_doc_title_for_pr(v, &selected.doc_type, &selected.doc_id))
+    {
+        Some(v) => v,
+        None => {
+            warnings.push(format!(
+                "missing or invalid markdown heading in {}",
+                selected.path
+            ));
+            default_doc_title_for_pr(&selected.doc_type, &selected.doc_id)
+        }
+    };
+
+    let (type_label, label_warnings) = detect_doc_type_label_for_pr(selected_path);
+    warnings.extend(label_warnings);
+    let prefix = type_label
+        .as_deref()
+        .map(pr_prefix_from_type_label)
+        .unwrap_or_else(|| default_pr_prefix_for_doc_type(&selected.doc_type))
+        .to_string();
+
+    Ok(Some(AutoPrTitle {
+        title: format!("{prefix}: {doc_title}"),
+        doc_path: selected.path.clone(),
+        doc_type: selected.doc_type,
+        doc_id: selected.doc_id,
+        doc_heading,
+        doc_title,
+        prefix,
+        type_label,
+        selection_reason: selection_reason.to_string(),
+        changed_doc_paths: candidates.into_iter().map(|v| v.path).collect(),
+        warnings,
+    }))
+}
+
+fn collect_pr_doc_candidates_from_diff(base: &str, head: &str) -> Result<Vec<PrDocCandidate>, String> {
+    let range = format!("{base}...{head}");
+    let cmd = vec![
+        "git".to_string(),
+        "diff".to_string(),
+        "--name-only".to_string(),
+        range.clone(),
+    ];
+    let res = run_command(&cmd);
+    if res.returncode != 0 {
+        return Err(format!(
+            "failed to inspect changed files for range `{range}` (stdout: {}; stderr: {})",
+            res.stdout.trim(),
+            res.stderr.trim()
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut docs = Vec::new();
+    for line in res.stdout.lines() {
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if !seen.insert(raw.to_string()) {
+            continue;
+        }
+        let Some(candidate) = parse_pr_doc_candidate(raw) else {
+            continue;
+        };
+        if Path::new(&candidate.path).is_file() {
+            docs.push(candidate);
+        }
+    }
+
+    docs.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(docs)
+}
+
+fn parse_pr_doc_candidate(path: &str) -> Option<PrDocCandidate> {
+    let normalized = path
+        .trim()
+        .trim_start_matches("./")
+        .replace('\\', "/");
+
+    if let Some(filename) = normalized.strip_prefix("docs/tasks/") {
+        let (doc_id, _) = parse_doc_filename(filename, 6, "000000-template.md")?;
+        return Some(PrDocCandidate {
+            path: normalized,
+            doc_type: "task".to_string(),
+            doc_id,
+        });
+    }
+
+    if let Some(filename) = normalized.strip_prefix("docs/rfcs/") {
+        let (doc_id, _) = parse_doc_filename(filename, 4, "0000-template.md")?;
+        return Some(PrDocCandidate {
+            path: normalized,
+            doc_type: "rfc".to_string(),
+            doc_id,
+        });
+    }
+
+    None
+}
+
+fn parse_doc_filename(filename: &str, id_width: usize, template_name: &str) -> Option<(String, String)> {
+    if filename == template_name {
+        return None;
+    }
+    if filename.contains('/') {
+        return None;
+    }
+    let stem = filename.strip_suffix(".md")?;
+    let (doc_id, slug) = stem.split_once('-')?;
+    if doc_id.len() != id_width || !doc_id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if slug.is_empty() {
+        return None;
+    }
+    Some((doc_id.to_string(), slug.to_string()))
+}
+
+fn normalize_doc_title_for_pr(heading: &str, doc_type: &str, doc_id: &str) -> Option<String> {
+    let trimmed = heading.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((left, right)) = trimmed.split_once(':') {
+        let prefix = left.trim();
+        let title = right.trim();
+        if !title.is_empty()
+            && ((doc_type == "task" && is_task_heading_prefix(prefix))
+                || (doc_type == "rfc" && is_rfc_heading_prefix(prefix, doc_id)))
+        {
+            return Some(title.to_string());
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn is_task_heading_prefix(prefix: &str) -> bool {
+    prefix.eq_ignore_ascii_case("task") || prefix.to_ascii_lowercase().starts_with("task ")
+}
+
+fn is_rfc_heading_prefix(prefix: &str, doc_id: &str) -> bool {
+    if prefix.eq_ignore_ascii_case("rfc") {
+        return true;
+    }
+    let upper = prefix.to_ascii_uppercase();
+    if upper == format!("RFC-{doc_id}") {
+        return true;
+    }
+    match upper.strip_prefix("RFC-") {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+fn default_doc_title_for_pr(doc_type: &str, doc_id: &str) -> String {
+    match doc_type {
+        "rfc" => format!("RFC-{doc_id}"),
+        _ => format!("Task {doc_id}"),
+    }
+}
+
+fn detect_doc_type_label_for_pr(path: &Path) -> (Option<String>, Vec<String>) {
+    match parse_doc_issue_labels(path) {
+        Ok(labels) => {
+            let mut type_label = None;
+            for raw in labels {
+                let label = normalize_label_token(&raw);
+                if label.starts_with("type:") && is_allowed_type_label(&label) {
+                    type_label = Some(label);
+                    break;
+                }
+            }
+            (type_label, Vec::new())
+        }
+        Err(e) => (None, vec![e]),
+    }
+}
+
+fn pr_prefix_from_type_label(type_label: &str) -> &'static str {
+    match type_label {
+        "type:feature" | "type:epic" => "feat",
+        "type:bug" => "fix",
+        "type:perf" => "perf",
+        "type:doc" => "docs",
+        "type:question" | "type:chore" | "type:task" => "chore",
+        _ => "chore",
+    }
+}
+
+fn default_pr_prefix_for_doc_type(doc_type: &str) -> &'static str {
+    match doc_type {
+        "rfc" => "feat",
+        _ => "chore",
+    }
 }
 
 fn validate_doc_path(path: &Path) -> serde_json::Value {
