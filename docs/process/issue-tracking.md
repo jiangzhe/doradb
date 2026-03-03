@@ -16,13 +16,14 @@ Backlog files use:
 - **Scope**: Narrow, well-defined changes (e.g., bug fixes, small features, refactoring).
 - **Location**: `docs/tasks/<nnnnnn>-<description>.md`
 - **Template**: Use `docs/tasks/000000-template.md`.
-- **Workflow**: Create the task doc -> Link to a `gh` issue -> Implement.
+- **Workflow**: Create the task doc -> Link to a `gh` issue -> Implement -> Resolve doc updates.
+- **Resolve rule**: During `task resolve`, always check whether task belongs to an RFC; if yes, sync corresponding RFC `Implementation Phases`.
 
 ### 2. RFCs (Large/Complex)
 - **Scope**: Large architectural changes, new subsystems, or complex implementations.
 - **Location**: `docs/rfcs/<nnnn>-<description>.md`
 - **Template**: Use `docs/rfcs/0000-template.md`.
-- **Workflow**: Create RFC doc -> Review/Acceptance -> Break into Tasks -> Implement.
+- **Workflow**: Create draft RFC (`status: draft`) -> Formalize (`proposal`/`accepted`) -> Break into Tasks -> Implement -> Resolve (`implemented`/`superseded`).
 
 ## Quick Start (with `gh` CLI)
 
@@ -174,6 +175,18 @@ gh issue edit 42 --body "High-level goal.
 
 7.  **Close**:
     *   Close the issue.
+    *   For RFC issues, run strict precheck first:
+```bash
+tools/issue.rs resolve-rfc --doc docs/rfcs/0006-example.md
+```
+    *   Then close explicitly only when precheck passes:
+```bash
+tools/issue.rs resolve-rfc \
+  --doc docs/rfcs/0006-example.md \
+  --issue <issue-id> \
+  --close \
+  --comment "RFC implemented and synchronized."
+```
 
 ## CLI Rules & Data Format
 
@@ -192,5 +205,6 @@ Run `gh <command> --help` to see all available flags for any command.
 - ✅ Always claim an issue (`--add-assignee "@me"`) before starting code modification.
 - ✅ Use **Labels** strictly to define Type and Priority.
 - ✅ Link related work by mentioning "Ref #<number>" in the issue body.
+- ✅ RFC issue closure must use `tools/issue.rs resolve-rfc` precheck before explicit close.
 - ❌ Do NOT create markdown TODO lists in source code.
 - ❌ Do NOT commit issue state; only commit code. Issue state is handled via API.

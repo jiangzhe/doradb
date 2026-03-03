@@ -12,6 +12,9 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `- type:task`
 `- priority:medium`
 `- codex`
+If this task is a phase/sub-task of an RFC, add:
+`Parent RFC:`
+`- docs/rfcs/<4digits>-<program-topic>.md`
 If sourced from backlog, add:
 `Source Backlogs:`
 `- docs/backlogs/<6digits>-<follow-up-topic>.md`
@@ -55,3 +58,4 @@ Summarize test scenarios that should be covered to verify code correctness.
 
 Issues that can not be solved in this task scope, and possible follow-ups.
 During `task resolve`, future improvements can be added here and summarized as backlog todos under `docs/backlogs/`.
+If this task belongs to an RFC, `task resolve` must also sync related RFC phase updates.
