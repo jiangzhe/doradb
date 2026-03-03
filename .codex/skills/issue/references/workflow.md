@@ -15,11 +15,14 @@ Use GitHub Issues via `gh` CLI as the source of truth for task tracking.
 ## Label Taxonomy
 
 Type labels:
+- `type:doc`
+- `type:perf`
+- `type:question`
 - `type:bug`
 - `type:feature`
+- `type:chore`
 - `type:task`
 - `type:epic`
-- `type:maintenance`
 
 Priority labels:
 - `priority:critical`
@@ -27,8 +30,17 @@ Priority labels:
 - `priority:medium`
 - `priority:low`
 
+Special labels:
+- `codex`
+
 Require at least one `type:*` on new issues.
 If no `priority:*` label is provided, default to `priority:medium`.
+
+For `tools/issue.rs create-issue-from-doc`, labels can come from:
+1. `--labels`
+2. planning-doc `Issue Labels:` metadata block
+
+If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is unioned.
 
 ## Epic and Child Linking
 

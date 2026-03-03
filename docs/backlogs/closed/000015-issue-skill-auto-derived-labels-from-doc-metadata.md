@@ -19,3 +19,10 @@ Enhance issue creation workflow to optionally derive labels from task/RFC docume
 
 `create-issue-from-doc` supports optional metadata-derived labels with tests and deterministic conflict behavior.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000045-support-metadata-derived-labels-in-issue-skill.md
+- Closed By: task resolve
+- Reference: docs/tasks/000045-support-metadata-derived-labels-in-issue-skill.md
+- Closed At: 2026-03-03

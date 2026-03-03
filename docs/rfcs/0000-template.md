@@ -17,6 +17,12 @@ One paragraph explaining the decision.
 What problem does it solve?
 Why is this decision needed?
 
+Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
+`Issue Labels:`
+`- type:epic`
+`- priority:medium`
+`- codex`
+
 ## Decision
 
 What we're going to do. Technical details, process flow, data structure, etc.
