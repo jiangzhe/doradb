@@ -2,8 +2,12 @@
 ---
 [package]
 edition = "2024"
+
+[dependencies]
+serde_json = "1"
 ---
 
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -14,6 +18,7 @@ const BACKLOG_DIR: &str = "docs/backlogs";
 const BACKLOG_CLOSED_DIR: &str = "docs/backlogs/closed";
 const BACKLOG_NEXT_ID_FILE: &str = "docs/backlogs/next-id";
 const BACKLOG_TEMPLATE_FILE: &str = "docs/backlogs/000000-template.md";
+const DOC_ID_TOOL: &str = "tools/doc-id.rs";
 
 fn usage() -> &'static str {
     "Usage: tools/backlog.rs <subcommand> [options]\n\n\
@@ -780,30 +785,49 @@ fn resolve_open_backlog_path(
 }
 
 fn resolve_open_backlog_by_id(id: &str) -> Result<PathBuf, String> {
-    let open_matches = find_backlog_by_id(Path::new(BACKLOG_DIR), id)?;
-    if open_matches.len() == 1 {
-        return Ok(open_matches[0].clone());
-    }
-    if open_matches.len() > 1 {
-        return Err(format!(
-            "multiple open backlogs found for id {id}: {}",
-            open_matches
-                .iter()
-                .map(|p| normalize_path(p))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+    let out = Command::new(DOC_ID_TOOL)
+        .args([
+            "search-by-id",
+            "--kind",
+            "backlog",
+            "--id",
+            id,
+            "--scope",
+            "open",
+        ])
+        .output()
+        .map_err(|e| format!("failed to execute {DOC_ID_TOOL}: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let payload: Value = serde_json::from_str(&stdout).map_err(|e| {
+        format!(
+            "failed to parse {DOC_ID_TOOL} output: {e}; stdout={stdout}; stderr={stderr}"
+        )
+    })?;
+
+    if !out.status.success() {
+        let error = payload
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                if !stderr.is_empty() {
+                    stderr.as_str()
+                } else {
+                    "backlog id lookup failed"
+                }
+            })
+            .to_string();
+        return Err(error);
     }
 
-    let closed_matches = find_backlog_by_id(Path::new(BACKLOG_CLOSED_DIR), id)?;
-    if closed_matches.len() == 1 {
-        return Err(format!(
-            "backlog {id} is already closed: {}",
-            normalize_path(&closed_matches[0])
-        ));
-    }
-
-    Err(format!("no open backlog found for id {id}"))
+    let path = payload
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{DOC_ID_TOOL} output missing path field"))?;
+    let resolved = PathBuf::from(path);
+    ensure_open_backlog_path(&resolved)?;
+    Ok(resolved)
 }
 
 fn ensure_open_backlog_path(path: &Path) -> Result<(), String> {
@@ -983,38 +1007,6 @@ fn detect_max_backlog_id(open_dir: &Path, closed_dir: &Path) -> Result<u32, Stri
         }
     }
     Ok(max_id)
-}
-
-fn find_backlog_by_id(dir: &Path, id: &str) -> Result<Vec<PathBuf>, String> {
-    let mut out = Vec::new();
-    if !dir.exists() {
-        return Ok(out);
-    }
-
-    let prefix = format!("{id}-");
-    let entries =
-        fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", normalize_path(dir)))?;
-    for entry in entries {
-        let entry = match entry {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if !ft.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-        if parse_backlog_name_new(&name).is_some() {
-            out.push(entry.path());
-        }
-    }
-    out.sort();
-    Ok(out)
 }
 
 fn parse_backlog_name_new(name: &str) -> Option<(u32, &str)> {

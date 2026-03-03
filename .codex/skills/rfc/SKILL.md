@@ -129,9 +129,9 @@ tools/rfc.rs precheck-rfc-resolve --doc docs/rfcs/0002-legacy.md --allow-legacy
 If resolved task is a sub-task of an RFC, update related RFC phase section during task resolve.
 Use:
 ```bash
-tools/task.rs resolve-task-backlogs --task docs/tasks/000123-example.md
+tools/task.rs resolve-task-rfc --task docs/tasks/000123-example.md
 ```
-This command now enforces parent-RFC check and phase sync when applicable.
+This command enforces parent-RFC check and phase sync when applicable.
 
 ## Output Quality Bar
 

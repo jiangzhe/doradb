@@ -28,14 +28,19 @@ tools/backlog.rs create-doc ... --auto-id
 
 Complete all items:
 
-1. Validate target is an open backlog item (by `--id` or `--path`).
-2. Require close reason type and detail.
-3. Run close command:
+1. Validate target is an open backlog item.
+2. If target is provided as id-only shorthand, resolve to exactly one open doc first:
 ```bash
-tools/backlog.rs close-doc --id 000123 --type stale --detail "..."
+tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
 ```
-4. Confirm file moved under `docs/backlogs/closed/`.
-5. Confirm `## Close Reason` section exists in archived file.
+3. Use resolved `--path` in close command when available.
+4. Require close reason type and detail.
+5. Run close command:
+```bash
+tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type stale --detail "..."
+```
+6. Confirm file moved under `docs/backlogs/closed/`.
+7. Confirm `## Close Reason` section exists in archived file.
 
 ## Naming and Storage Rules
 

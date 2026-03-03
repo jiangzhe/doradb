@@ -22,6 +22,12 @@ Accepted paths:
 
 Create operations must fail if no valid planning document is provided.
 
+If user input is id-only shorthand (for example `$issue create task 000047`), resolve id to exactly one document first:
+
+```bash
+tools/doc-id.rs search-by-id --kind task --id 000047 --scope open
+```
+
 ## Create Issue From Planning Doc
 
 ```bash
@@ -30,6 +36,8 @@ tools/issue.rs create-issue-from-doc \
   --labels "type:task,priority:high" \
   --assignee "@me"
 ```
+
+`create-issue-from-doc` must use assignee `@me`.
 
 `--labels` is optional. If omitted, labels can be derived from planning-doc metadata:
 
@@ -55,6 +63,7 @@ For child issues linked to an epic:
 tools/issue.rs create-issue-from-doc \
   --doc docs/tasks/000002-subtask.md \
   --labels "type:task" \
+  --assignee "@me" \
   --parent 42
 ```
 
@@ -134,6 +143,27 @@ tools/issue.rs link-pr-guidance --issue 123
 ```
 
 Use the snippet in PR body (for example: `Fixes #123`).
+
+Or create PR directly from current branch with default close-link body:
+
+```bash
+tools/issue.rs create-pr-from-branch --issue 123 --push --assignee "@me"
+```
+
+Default body includes `Closes #123`.
+Assignee must be `@me`.
+If `--title` is omitted, title is auto-derived from changed planning docs in `base...head`:
+- if both task and RFC docs are present, RFC is preferred.
+- if only RFC docs are present, use RFC title with a suitable type prefix (default `feat:`).
+- if only task docs are present, use task title with a suitable type prefix (default `chore:`).
+- explicit `--title` always overrides auto title.
+Before creating PR, workflow must check for uncommitted changes.
+If dirty changes exist, developer must explicitly decide to:
+1. manually commit selected changes, or
+2. ignore and proceed with explicit override:
+```bash
+tools/issue.rs create-pr-from-branch --issue 123 --push --assignee "@me" --allow-dirty
+```
 
 ## Reference
 

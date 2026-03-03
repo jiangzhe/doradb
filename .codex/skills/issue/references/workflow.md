@@ -11,6 +11,10 @@ Use GitHub Issues via `gh` CLI as the source of truth for task tracking.
   - `docs/tasks/<6 digits>-<slug>.md` for small scoped work.
   - `docs/rfcs/<4 digits>-<slug>.md` for large architectural work.
 - Create issues from those docs, not from free-form text.
+- For id-only shorthand requests, resolve doc first:
+```bash
+tools/doc-id.rs search-by-id --kind task --id 000047 --scope open
+```
 
 ## Label Taxonomy
 
@@ -53,12 +57,25 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 - Use non-interactive commands.
 - Use `--json` for list/read operations.
 - Use `--body-file` when body can be long.
-- Add assignee explicitly (`@me` default for active work).
+- Always use assignee `@me` when creating issues and PRs.
+- For PR creation, check working tree cleanliness first and force explicit decision on dirty changes.
 
 ## Completion
 
 - Close with a clear status comment.
 - For PR linkage, include `Fixes #<issue>` or `Closes #<issue>` in PR body.
+- Optional helper for PR creation from current branch:
+```bash
+tools/issue.rs create-pr-from-branch --issue <id> --push --assignee "@me"
+```
+- If `--title` is omitted, helper auto-selects title from changed planning docs in `base...head`:
+  - prefer RFC doc title when both task/RFC docs are changed,
+  - otherwise use the changed task/RFC title with suitable type prefix,
+  - explicit `--title` overrides auto-selection.
+- If helper reports uncommitted changes, developer must either commit selected changes manually or rerun with explicit override:
+```bash
+tools/issue.rs create-pr-from-branch --issue <id> --push --assignee "@me" --allow-dirty
+```
 
 ## RFC Resolve Precheck Gate
 

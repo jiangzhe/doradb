@@ -31,6 +31,11 @@ gh pr merge <number> --squash --delete-branch
 2.  **Create the PR**:
     Run `gh pr create` with explicit flags to avoid interactive prompts.
     *   **Linking Issues**: You MUST include "Fixes #<issue-number>" or "Closes #<issue-number>" in the `--body` to auto-close the issue upon merge.
+    *   Optional helper command:
+        `tools/issue.rs create-pr-from-branch --issue <issue-number> --push --assignee "@me"`
+    *   If `--title` is omitted, helper auto-selects PR title from changed planning docs (`base...head`), preferring RFC title when both task and RFC docs are included.
+    *   If helper reports uncommitted changes, commit selected changes manually or rerun with:
+        `tools/issue.rs create-pr-from-branch --issue <issue-number> --push --assignee "@me" --allow-dirty`
     *   **Example**:
         ```bash
         gh pr create \

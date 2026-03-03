@@ -8,6 +8,7 @@ serde_json = "1"
 ---
 
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,28 @@ struct LabelSelection {
     codex: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PrDocCandidate {
+    path: String,
+    doc_type: String,
+    doc_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct AutoPrTitle {
+    title: String,
+    doc_path: String,
+    doc_type: String,
+    doc_id: String,
+    doc_heading: Option<String>,
+    doc_title: String,
+    prefix: String,
+    type_label: Option<String>,
+    selection_reason: String,
+    changed_doc_paths: Vec<String>,
+    warnings: Vec<String>,
+}
+
 const ALLOWED_TYPE_LABELS: &[&str] = &[
     "type:doc",
     "type:perf",
@@ -60,6 +83,7 @@ fn usage() -> &'static str {
 Subcommands:\n\
   validate-doc-path\n\
   create-issue-from-doc\n\
+  create-pr-from-branch\n\
   list-issues\n\
   update-issue\n\
   close-issue\n\
@@ -91,6 +115,7 @@ fn run() -> Result<(), i32> {
         }
         "validate-doc-path" => cmd_validate_doc_path(args),
         "create-issue-from-doc" => cmd_create_issue_from_doc(args),
+        "create-pr-from-branch" => cmd_create_pr_from_branch(args),
         "list-issues" => cmd_list_issues(args),
         "update-issue" => cmd_update_issue(args),
         "close-issue" => cmd_close_issue(args),
@@ -206,6 +231,13 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         eprintln!("missing required arg: --doc");
         return Err(1);
     };
+    if assignee != "@me" {
+        print_json(&json!({
+            "created": false,
+            "error": "create-issue-from-doc requires --assignee @me (or omit to use default)",
+        }));
+        return Err(1);
+    }
 
     let doc_path = Path::new(&doc);
     let validated_value = validate_doc_path(doc_path);
@@ -342,6 +374,301 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         "labels": labels,
         "assignee": assignee,
         "parent": parent,
+    }));
+    Ok(())
+}
+
+fn cmd_create_pr_from_branch(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
+    let mut issue: Option<i64> = None;
+    let mut base = "main".to_string();
+    let mut head: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut push = false;
+    let mut assignee = "@me".to_string();
+    let mut allow_dirty = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--issue" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --issue");
+                    return Err(1);
+                };
+                let parsed = match v.parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!("invalid --issue value: {v}");
+                        return Err(1);
+                    }
+                };
+                issue = Some(parsed);
+            }
+            "--base" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --base");
+                    return Err(1);
+                };
+                base = v;
+            }
+            "--head" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --head");
+                    return Err(1);
+                };
+                head = Some(v);
+            }
+            "--title" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --title");
+                    return Err(1);
+                };
+                title = Some(v);
+            }
+            "--body" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --body");
+                    return Err(1);
+                };
+                body = Some(v);
+            }
+            "--push" => {
+                push = true;
+            }
+            "--assignee" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --assignee");
+                    return Err(1);
+                };
+                assignee = v;
+            }
+            "--allow-dirty" => {
+                allow_dirty = true;
+            }
+            "-h" | "--help" => {
+                println!("Usage: ... issue.rs create-pr-from-branch --issue <n> [--base <branch>] [--head <branch>] [--title <title>] [--body <text>] [--push] [--assignee @me] [--allow-dirty]");
+                return Ok(());
+            }
+            _ => {
+                eprintln!("unknown arg: {arg}");
+                return Err(1);
+            }
+        }
+    }
+
+    let Some(issue_no) = issue else {
+        eprintln!("missing required arg: --issue");
+        return Err(1);
+    };
+    if assignee != "@me" {
+        print_json(&json!({
+            "ok": false,
+            "created": false,
+            "error": "create-pr-from-branch requires --assignee @me (or omit to use default)",
+        }));
+        return Err(1);
+    }
+
+    let dirty_cmd = vec![
+        "git".to_string(),
+        "status".to_string(),
+        "--porcelain".to_string(),
+    ];
+    let dirty_res = run_command(&dirty_cmd);
+    if dirty_res.returncode != 0 {
+        print_json(&json!({
+            "ok": false,
+            "created": false,
+            "error": "failed to inspect git working tree status",
+            "command": dirty_cmd,
+            "stdout": dirty_res.stdout.trim(),
+            "stderr": dirty_res.stderr.trim(),
+        }));
+        return Err(if dirty_res.returncode == 0 { 1 } else { dirty_res.returncode });
+    }
+    let dirty_entries: Vec<String> = dirty_res
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if !allow_dirty && !dirty_entries.is_empty() {
+        print_json(&json!({
+            "ok": false,
+            "created": false,
+            "error": "working tree has uncommitted changes; manually commit desired changes, or rerun with --allow-dirty to ignore",
+            "dirty_entries": dirty_entries,
+        }));
+        return Err(1);
+    }
+
+    let head_branch = if let Some(h) = head {
+        h
+    } else {
+        let branch_cmd = vec![
+            "git".to_string(),
+            "rev-parse".to_string(),
+            "--abbrev-ref".to_string(),
+            "HEAD".to_string(),
+        ];
+        let branch_res = run_command(&branch_cmd);
+        if branch_res.returncode != 0 {
+            print_json(&json!({
+                "ok": false,
+                "created": false,
+                "error": "failed to determine current git branch",
+                "command": branch_cmd,
+                "stdout": branch_res.stdout.trim(),
+                "stderr": branch_res.stderr.trim(),
+            }));
+            return Err(if branch_res.returncode == 0 { 1 } else { branch_res.returncode });
+        }
+        let branch = branch_res.stdout.trim().to_string();
+        if branch.is_empty() {
+            print_json(&json!({
+                "ok": false,
+                "created": false,
+                "error": "current git branch is empty",
+            }));
+            return Err(1);
+        }
+        branch
+    };
+
+    if push {
+        let push_cmd = vec![
+            "git".to_string(),
+            "push".to_string(),
+            "-u".to_string(),
+            "origin".to_string(),
+            head_branch.clone(),
+        ];
+        let push_res = run_command(&push_cmd);
+        if push_res.returncode != 0 {
+            print_json(&json!({
+                "ok": false,
+                "created": false,
+                "error": "failed to push branch",
+                "command": push_cmd,
+                "stdout": push_res.stdout.trim(),
+                "stderr": push_res.stderr.trim(),
+            }));
+            return Err(if push_res.returncode == 0 { 1 } else { push_res.returncode });
+        }
+    }
+
+    let mut title_source = "explicit".to_string();
+    let mut auto_title: Option<AutoPrTitle> = None;
+    let mut title_warning: Option<String> = None;
+
+    let pr_title = if let Some(explicit) = title {
+        explicit
+    } else {
+        match derive_pr_title_from_docs(&base, &head_branch) {
+            Ok(Some(derived)) => {
+                title_source = "planning-doc".to_string();
+                let title = derived.title.clone();
+                auto_title = Some(derived);
+                title
+            }
+            Ok(None) => {
+                title_source = "branch-default".to_string();
+                format!("chore: {}", head_branch.replace('_', "-"))
+            }
+            Err(e) => {
+                title_source = "branch-default".to_string();
+                title_warning = Some(e);
+                format!("chore: {}", head_branch.replace('_', "-"))
+            }
+        }
+    };
+    let close_line = format!("Closes #{issue_no}");
+    let pr_body = match body {
+        Some(text) => format!("{}\n\n{}", text.trim(), close_line),
+        None => close_line.clone(),
+    };
+
+    let create_cmd = vec![
+        "gh".to_string(),
+        "pr".to_string(),
+        "create".to_string(),
+        "--base".to_string(),
+        base.clone(),
+        "--head".to_string(),
+        head_branch.clone(),
+        "--title".to_string(),
+        pr_title.clone(),
+        "--body".to_string(),
+        pr_body.clone(),
+        "--assignee".to_string(),
+        assignee.clone(),
+    ];
+    let create_res = run_command(&create_cmd);
+    if create_res.returncode != 0 {
+        print_json(&json!({
+            "ok": false,
+            "created": false,
+            "command": create_cmd,
+            "title": pr_title,
+            "title_source": title_source,
+            "auto_title": auto_title.as_ref().map(|v| json!({
+                "doc": {
+                    "path": v.doc_path,
+                    "doc_type": v.doc_type,
+                    "doc_id": v.doc_id,
+                },
+                "doc_heading": v.doc_heading,
+                "doc_title": v.doc_title,
+                "prefix": v.prefix,
+                "type_label": v.type_label,
+                "selection_reason": v.selection_reason,
+                "changed_doc_paths": v.changed_doc_paths,
+                "warnings": v.warnings,
+            })),
+            "title_warning": title_warning,
+            "stdout": create_res.stdout.trim(),
+            "stderr": create_res.stderr.trim(),
+        }));
+        return Err(if create_res.returncode == 0 { 1 } else { create_res.returncode });
+    }
+
+    let pr_url = create_res
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .last()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    print_json(&json!({
+        "ok": true,
+        "created": true,
+        "issue_number": issue_no,
+        "base": base,
+        "head": head_branch,
+        "title": pr_title,
+        "title_source": title_source,
+        "auto_title": auto_title.as_ref().map(|v| json!({
+            "doc": {
+                "path": v.doc_path,
+                "doc_type": v.doc_type,
+                "doc_id": v.doc_id,
+            },
+            "doc_heading": v.doc_heading,
+            "doc_title": v.doc_title,
+            "prefix": v.prefix,
+            "type_label": v.type_label,
+            "selection_reason": v.selection_reason,
+            "changed_doc_paths": v.changed_doc_paths,
+            "warnings": v.warnings,
+        })),
+        "title_warning": title_warning,
+        "close_line": close_line,
+        "assignee": assignee,
+        "dirty_ignored": allow_dirty && !dirty_entries.is_empty(),
+        "pr_url": pr_url,
     }));
     Ok(())
 }
@@ -935,66 +1262,326 @@ fn cmd_link_pr_guidance(mut args: impl Iterator<Item = String>) -> Result<(), i3
     Ok(())
 }
 
-fn validate_doc_path(path: &Path) -> serde_json::Value {
-    let rel = normalize_for_doc_rule(path);
-
-    if !path.exists() {
-        return json!({"valid": false, "error": format!("path not found: {rel}")});
-    }
-    if !path.is_file() {
-        return json!({"valid": false, "error": format!("path is not a file: {rel}")});
+fn derive_pr_title_from_docs(base: &str, head: &str) -> Result<Option<AutoPrTitle>, String> {
+    let candidates = collect_pr_doc_candidates_from_diff(base, head)?;
+    if candidates.is_empty() {
+        return Ok(None);
     }
 
-    if let Some(id) = parse_task_doc_id(&rel) {
-        return json!({
-            "valid": true,
-            "path": rel,
-            "doc_type": "task",
-            "doc_id": id,
-            "title_hint": title_hint(path),
+    let task_count = candidates.iter().filter(|v| v.doc_type == "task").count();
+    let rfc_count = candidates.iter().filter(|v| v.doc_type == "rfc").count();
+    let has_task = task_count > 0;
+    let has_rfc = rfc_count > 0;
+
+    let mut preferred: Vec<PrDocCandidate> = if has_rfc {
+        candidates
+            .iter()
+            .filter(|v| v.doc_type == "rfc")
+            .cloned()
+            .collect()
+    } else {
+        candidates
+            .iter()
+            .filter(|v| v.doc_type == "task")
+            .cloned()
+            .collect()
+    };
+    preferred.sort_by(|a, b| {
+        let a_id = a.doc_id.parse::<u64>().unwrap_or(0);
+        let b_id = b.doc_id.parse::<u64>().unwrap_or(0);
+        b_id.cmp(&a_id).then_with(|| a.path.cmp(&b.path))
+    });
+    let Some(selected) = preferred.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let selection_reason = if has_rfc && has_task {
+        "rfc_preferred_when_task_and_rfc_present"
+    } else if has_rfc && rfc_count > 1 {
+        "multiple_rfc_docs_highest_id"
+    } else if has_rfc {
+        "single_rfc_doc"
+    } else if task_count > 1 {
+        "multiple_task_docs_highest_id"
+    } else {
+        "single_task_doc"
+    };
+
+    let selected_path = Path::new(&selected.path);
+    let doc_heading = title_hint(selected_path);
+    let mut warnings = Vec::new();
+
+    let doc_title = match doc_heading
+        .as_deref()
+        .and_then(|v| normalize_doc_title_for_pr(v, &selected.doc_type, &selected.doc_id))
+    {
+        Some(v) => v,
+        None => {
+            warnings.push(format!(
+                "missing or invalid markdown heading in {}",
+                selected.path
+            ));
+            default_doc_title_for_pr(&selected.doc_type, &selected.doc_id)
+        }
+    };
+
+    let (type_label, label_warnings) = detect_doc_type_label_for_pr(selected_path);
+    warnings.extend(label_warnings);
+    let prefix = type_label
+        .as_deref()
+        .map(pr_prefix_from_type_label)
+        .unwrap_or_else(|| default_pr_prefix_for_doc_type(&selected.doc_type))
+        .to_string();
+
+    Ok(Some(AutoPrTitle {
+        title: format!("{prefix}: {doc_title}"),
+        doc_path: selected.path.clone(),
+        doc_type: selected.doc_type,
+        doc_id: selected.doc_id,
+        doc_heading,
+        doc_title,
+        prefix,
+        type_label,
+        selection_reason: selection_reason.to_string(),
+        changed_doc_paths: candidates.into_iter().map(|v| v.path).collect(),
+        warnings,
+    }))
+}
+
+fn collect_pr_doc_candidates_from_diff(base: &str, head: &str) -> Result<Vec<PrDocCandidate>, String> {
+    let range = format!("{base}...{head}");
+    let cmd = vec![
+        "git".to_string(),
+        "diff".to_string(),
+        "--name-only".to_string(),
+        range.clone(),
+    ];
+    let res = run_command(&cmd);
+    if res.returncode != 0 {
+        return Err(format!(
+            "failed to inspect changed files for range `{range}` (stdout: {}; stderr: {})",
+            res.stdout.trim(),
+            res.stderr.trim()
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut docs = Vec::new();
+    for line in res.stdout.lines() {
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if !seen.insert(raw.to_string()) {
+            continue;
+        }
+        let Some(candidate) = parse_pr_doc_candidate(raw) else {
+            continue;
+        };
+        if Path::new(&candidate.path).is_file() {
+            docs.push(candidate);
+        }
+    }
+
+    docs.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(docs)
+}
+
+fn parse_pr_doc_candidate(path: &str) -> Option<PrDocCandidate> {
+    let normalized = path
+        .trim()
+        .trim_start_matches("./")
+        .replace('\\', "/");
+
+    if let Some(filename) = normalized.strip_prefix("docs/tasks/") {
+        let (doc_id, _) = parse_doc_filename(filename, 6, "000000-template.md")?;
+        return Some(PrDocCandidate {
+            path: normalized,
+            doc_type: "task".to_string(),
+            doc_id,
         });
     }
-    if let Some(id) = parse_rfc_doc_id(&rel) {
-        return json!({
-            "valid": true,
-            "path": rel,
-            "doc_type": "rfc",
-            "doc_id": id,
-            "title_hint": title_hint(path),
+
+    if let Some(filename) = normalized.strip_prefix("docs/rfcs/") {
+        let (doc_id, _) = parse_doc_filename(filename, 4, "0000-template.md")?;
+        return Some(PrDocCandidate {
+            path: normalized,
+            doc_type: "rfc".to_string(),
+            doc_id,
         });
     }
 
-    json!({
-        "valid": false,
-        "path": rel,
-        "error": "invalid path pattern; expected docs/tasks/<6 digits>-<slug>.md or docs/rfcs/<4 digits>-<slug>.md",
-    })
+    None
 }
 
-fn parse_task_doc_id(rel: &str) -> Option<String> {
-    parse_doc_id(rel, "docs/tasks/", 6)
-}
-
-fn parse_rfc_doc_id(rel: &str) -> Option<String> {
-    parse_doc_id(rel, "docs/rfcs/", 4)
-}
-
-fn parse_doc_id(rel: &str, prefix: &str, width: usize) -> Option<String> {
-    if !rel.starts_with(prefix) || !rel.ends_with(".md") {
+fn parse_doc_filename(filename: &str, id_width: usize, template_name: &str) -> Option<(String, String)> {
+    if filename == template_name {
         return None;
     }
-    let tail = &rel[prefix.len()..rel.len() - 3];
-    if tail.contains('/') {
+    if filename.contains('/') {
         return None;
     }
-    let (id, slug) = tail.split_once('-')?;
-    if id.len() != width || !id.bytes().all(|b| b.is_ascii_digit()) {
+    let stem = filename.strip_suffix(".md")?;
+    let (doc_id, slug) = stem.split_once('-')?;
+    if doc_id.len() != id_width || !doc_id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     if slug.is_empty() {
         return None;
     }
-    Some(id.to_string())
+    Some((doc_id.to_string(), slug.to_string()))
+}
+
+fn normalize_doc_title_for_pr(heading: &str, doc_type: &str, doc_id: &str) -> Option<String> {
+    let trimmed = heading.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((left, right)) = trimmed.split_once(':') {
+        let prefix = left.trim();
+        let title = right.trim();
+        if !title.is_empty()
+            && ((doc_type == "task" && is_task_heading_prefix(prefix))
+                || (doc_type == "rfc" && is_rfc_heading_prefix(prefix, doc_id)))
+        {
+            return Some(title.to_string());
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn is_task_heading_prefix(prefix: &str) -> bool {
+    prefix.eq_ignore_ascii_case("task") || prefix.to_ascii_lowercase().starts_with("task ")
+}
+
+fn is_rfc_heading_prefix(prefix: &str, doc_id: &str) -> bool {
+    if prefix.eq_ignore_ascii_case("rfc") {
+        return true;
+    }
+    let upper = prefix.to_ascii_uppercase();
+    if upper == format!("RFC-{doc_id}") {
+        return true;
+    }
+    match upper.strip_prefix("RFC-") {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+fn default_doc_title_for_pr(doc_type: &str, doc_id: &str) -> String {
+    match doc_type {
+        "rfc" => format!("RFC-{doc_id}"),
+        _ => format!("Task {doc_id}"),
+    }
+}
+
+fn detect_doc_type_label_for_pr(path: &Path) -> (Option<String>, Vec<String>) {
+    match parse_doc_issue_labels(path) {
+        Ok(labels) => {
+            let mut type_label = None;
+            for raw in labels {
+                let label = normalize_label_token(&raw);
+                if label.starts_with("type:") && is_allowed_type_label(&label) {
+                    type_label = Some(label);
+                    break;
+                }
+            }
+            (type_label, Vec::new())
+        }
+        Err(e) => (None, vec![e]),
+    }
+}
+
+fn pr_prefix_from_type_label(type_label: &str) -> &'static str {
+    match type_label {
+        "type:feature" | "type:epic" => "feat",
+        "type:bug" => "fix",
+        "type:perf" => "perf",
+        "type:doc" => "docs",
+        "type:question" | "type:chore" | "type:task" => "chore",
+        _ => "chore",
+    }
+}
+
+fn default_pr_prefix_for_doc_type(doc_type: &str) -> &'static str {
+    match doc_type {
+        "rfc" => "feat",
+        _ => "chore",
+    }
+}
+
+fn validate_doc_path(path: &Path) -> serde_json::Value {
+    let cmd = vec![
+        "tools/doc-id.rs".to_string(),
+        "validate-path".to_string(),
+        "--path".to_string(),
+        normalize_path(path),
+    ];
+    let res = run_command(&cmd);
+    let payload = if res.stdout.trim().is_empty() {
+        json!({
+            "valid": false,
+            "path": normalize_for_doc_rule(path),
+            "error": "doc-id tool returned empty output",
+        })
+    } else {
+        match serde_json::from_str::<serde_json::Value>(res.stdout.trim()) {
+            Ok(v) => v,
+            Err(e) => json!({
+                "valid": false,
+                "path": normalize_for_doc_rule(path),
+                "error": format!("failed to parse doc-id output: {e}"),
+                "stdout": res.stdout.trim(),
+                "stderr": res.stderr.trim(),
+            }),
+        }
+    };
+
+    let valid = payload
+        .get("valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !valid {
+        return payload;
+    }
+
+    let kind = payload
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if kind != "task" && kind != "rfc" {
+        let fallback_path = normalize_for_doc_rule(path);
+        let err_path = payload
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback_path.as_str());
+        return json!({
+            "valid": false,
+            "path": err_path,
+            "error": "invalid path pattern; expected docs/tasks/<6 digits>-<slug>.md or docs/rfcs/<4 digits>-<slug>.md",
+        });
+    }
+
+    let doc_id = payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let rel_path = payload
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| normalize_for_doc_rule(path));
+
+    json!({
+        "valid": true,
+        "path": rel_path,
+        "doc_type": kind,
+        "doc_id": doc_id,
+        "title_hint": title_hint(path),
+    })
 }
 
 fn title_hint(path: &Path) -> Option<String> {

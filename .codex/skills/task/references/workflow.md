@@ -82,14 +82,20 @@ Complete all items:
 5. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
 6. Link related backlog todos from task doc resolve updates.
 7. If task doc has `Source Backlogs:` entries in `docs/backlogs/`, close/archive those backlog files during resolve.
-   - Helper command:
+   - Resolve backlog by id/path first when needed:
 ```bash
-tools/task.rs resolve-task-backlogs \
-  --task docs/tasks/000042-example.md
+tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
+```
+   - Close resolved backlog via backlog tool:
+```bash
+tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
 8. Always check whether resolved task is an RFC sub-task.
 9. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
-   - Enforced by `tools/task.rs resolve-task-backlogs --task ...` (built-in RFC sync).
+   - Use:
+```bash
+tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
+```
 
 ## Backlog Integration
 

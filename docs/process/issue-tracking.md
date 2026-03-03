@@ -81,6 +81,11 @@ Since GitHub does not have strict fields for type/priority, use **Labels**:
 
 For `tools/issue.rs create-issue-from-doc`, labels can come from CLI `--labels` and/or planning-doc metadata (`Issue Labels:` block). CLI `type:*`/`priority:*` override metadata values, and `codex` is unioned.
 
+For id-only shorthand inputs, resolve planning doc path first:
+```bash
+tools/doc-id.rs search-by-id --kind task --id 000047 --scope open
+```
+
 When creating from planning docs with no explicit type/priority from either source:
 - task docs default to `type:task`
 - RFC docs default to `type:epic`
@@ -166,7 +171,21 @@ gh issue edit 42 --body "High-level goal.
 
 5.  **PR**:
     *   Fire a Pull Request once code on the new branch is finalized.
-    *   Link to the related issue by commenting `#<issue id>` in the PR description.
+    *   Link to the related issue using `Fixes #<issue id>` or `Closes #<issue id>` in PR body.
+    *   Optional helper:
+```bash
+tools/issue.rs create-pr-from-branch --issue <issue-id> --push --assignee "@me"
+```
+    *   If `--title` is omitted, helper auto-derives PR title from changed planning docs (`base...head`):
+        1. prefer RFC title when both task and RFC docs are included,
+        2. otherwise use task/RFC title with suitable type prefix (`feat:`/`fix:`/`docs:`/`perf:`/`chore:`).
+        3. explicit `--title` overrides auto title.
+    *   If uncommitted changes are present, decide explicitly:
+        1. commit selected changes manually, or
+        2. rerun with `--allow-dirty` to ignore:
+```bash
+tools/issue.rs create-pr-from-branch --issue <issue-id> --push --assignee "@me" --allow-dirty
+```
     *   Ensure CI succeeds and code review is passed.
 
 6.  **Merge**:

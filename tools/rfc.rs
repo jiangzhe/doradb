@@ -19,6 +19,7 @@ const RFC_TEMPLATE: &str = "docs/rfcs/0000-template.md";
 const TASK_DIR: &str = "docs/tasks";
 const BACKLOG_DIR: &str = "docs/backlogs";
 const BACKLOG_CLOSED_DIR: &str = "docs/backlogs/closed";
+const DOC_ID_TOOL: &str = "tools/doc-id.rs";
 
 #[derive(Debug, Clone)]
 struct PhaseTracking {
@@ -108,8 +109,6 @@ fn run() -> Result<(), i32> {
 }
 
 fn cmd_next_rfc_id(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
-    let mut rfc_dir = PathBuf::from(RFC_DIR);
-
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dir" => {
@@ -117,7 +116,10 @@ fn cmd_next_rfc_id(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
                     eprintln!("missing value for --dir\n{}", next_rfc_id_usage());
                     return Err(1);
                 };
-                rfc_dir = PathBuf::from(v);
+                if v != RFC_DIR {
+                    eprintln!("--dir is no longer configurable; use default {RFC_DIR}");
+                    return Err(1);
+                }
             }
             "-h" | "--help" => {
                 println!("{}", next_rfc_id_usage());
@@ -130,7 +132,8 @@ fn cmd_next_rfc_id(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
         }
     }
 
-    let id = detect_next_rfc_id(&rfc_dir).map_err(print_and_exit)?;
+    let id =
+        run_doc_id_and_capture(["peek-next-id", "--kind", "rfc"]).map_err(print_and_exit)?;
     println!("{id}");
     Ok(())
 }
@@ -221,7 +224,7 @@ fn cmd_create_rfc_doc(mut args: impl Iterator<Item = String>) -> Result<(), i32>
     }
 
     let rfc_id = if auto_id {
-        detect_next_rfc_id(&output_dir).map_err(print_and_exit)?
+        run_doc_id_and_capture(["alloc-id", "--kind", "rfc"]).map_err(print_and_exit)?
     } else {
         rfc_id.expect("checked is_some")
     };
@@ -558,6 +561,29 @@ fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn run_doc_id_and_capture<const N: usize>(args: [&str; N]) -> Result<String, String> {
+    let out = Command::new(DOC_ID_TOOL)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute {DOC_ID_TOOL}: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+        if !stdout.is_empty() {
+            return Err(stdout);
+        }
+        return Err(format!("{DOC_ID_TOOL} returned non-zero exit code"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err(format!("{DOC_ID_TOOL} returned empty output"));
+    }
+    Ok(text)
+}
+
 fn normalize_ref_path(path: &Path) -> PathBuf {
     let text = normalize_path(path);
     if let Some(stripped) = text.strip_prefix("./") {
@@ -633,41 +659,6 @@ fn validate_task_doc_path(path: &Path) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn detect_next_rfc_id(dir: &Path) -> Result<String, String> {
-    if !dir.exists() {
-        return Err(format!("directory not found: {}", normalize_path(dir)));
-    }
-    if !dir.is_dir() {
-        return Err(format!("not a directory: {}", normalize_path(dir)));
-    }
-
-    let mut max_id: u32 = 0;
-    let entries = fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", normalize_path(dir)))?;
-    for entry in entries {
-        let entry = match entry {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if !ft.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(id) = parse_rfc_name(&name) {
-            if id > max_id {
-                max_id = id;
-            }
-        }
-    }
-
-    if max_id >= 9999 {
-        return Err("RFC id overflow".to_string());
-    }
-    Ok(format!("{:04}", max_id + 1))
 }
 
 fn parse_rfc_name(name: &str) -> Option<u32> {

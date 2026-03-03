@@ -9,8 +9,7 @@ Filename rule:
   - `tools/backlog.rs alloc-id`
 - Close helpers:
   - `tools/backlog.rs close-doc --id <6digits> --type <type> --detail <text>`
-  - `tools/task.rs resolve-task-backlogs --task docs/tasks/<6digits>-<slug>.md`
-  - `tools/task.rs complete-backlog-doc --id <6digits> --task docs/tasks/<6digits>-<slug>.md`
+  - `tools/doc-id.rs search-by-id --kind backlog --id <6digits> --scope open`
 
 ## Summary
 
@@ -43,7 +42,7 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 
 - Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
 - Detail: <reason detail>
-- Closed By: <backlog close|task resolve>
+- Closed By: <backlog close>
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
