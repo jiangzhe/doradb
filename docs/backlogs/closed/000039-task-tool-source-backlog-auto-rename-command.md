@@ -19,3 +19,10 @@ Evaluate adding optional command support to extract `Source Backlogs:` from task
 
 Optional command is implemented with deterministic parsing, safety guards, and tests.
 
+## Close Reason
+
+- Type: stale
+- Detail: Marked stale per user request on 2026-03-03.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-03
