@@ -28,6 +28,33 @@ struct ValidatedDoc {
     title_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LabelSelection {
+    type_label: Option<String>,
+    priority_label: Option<String>,
+    codex: bool,
+}
+
+const ALLOWED_TYPE_LABELS: &[&str] = &[
+    "type:doc",
+    "type:perf",
+    "type:feature",
+    "type:question",
+    "type:bug",
+    "type:chore",
+    "type:epic",
+    "type:task",
+];
+
+const ALLOWED_PRIORITY_LABELS: &[&str] = &[
+    "priority:low",
+    "priority:medium",
+    "priority:high",
+    "priority:critical",
+];
+
+const SPECIAL_LABEL_CODEX: &str = "codex";
+
 fn usage() -> &'static str {
     "Usage: tools/issue.rs <subcommand> [options]\n\n\
 Subcommands:\n\
@@ -163,7 +190,7 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
                 parent = Some(parsed);
             }
             "-h" | "--help" => {
-                println!("Usage: ... issue.rs create-issue-from-doc --doc <path> --labels <csv> [--title <title>] [--assignee <assignee>] [--parent <issue>]\n");
+                println!("Usage: ... issue.rs create-issue-from-doc --doc <path> [--labels <csv>] [--title <title>] [--assignee <assignee>] [--parent <issue>]\n");
                 return Ok(());
             }
             _ => {
@@ -177,12 +204,9 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         eprintln!("missing required arg: --doc");
         return Err(1);
     };
-    let Some(labels_csv) = labels_csv else {
-        eprintln!("missing required arg: --labels");
-        return Err(1);
-    };
 
-    let validated_value = validate_doc_path(Path::new(&doc));
+    let doc_path = Path::new(&doc);
+    let validated_value = validate_doc_path(doc_path);
     let Some(valid) = validated_value.get("valid").and_then(|v| v.as_bool()) else {
         print_json(&validated_value);
         return Err(1);
@@ -200,10 +224,23 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         }
     };
 
-    let labels = split_labels(&labels_csv);
-    let (labels, ok, err) = normalize_labels(labels);
-    if !ok {
-        print_json(&json!({"created": false, "error": err.unwrap_or("invalid labels")}));
+    let metadata_labels = match parse_doc_issue_labels(doc_path) {
+        Ok(v) => v,
+        Err(e) => {
+            print_json(&json!({"created": false, "error": e}));
+            return Err(1);
+        }
+    };
+    let cli_labels = labels_csv.map(|v| split_labels(&v)).unwrap_or_default();
+    let labels = match finalize_issue_labels(&validated.doc_type, cli_labels, metadata_labels) {
+        Ok(v) => v,
+        Err(e) => {
+            print_json(&json!({"created": false, "error": e}));
+            return Err(1);
+        }
+    };
+    if labels.is_empty() {
+        print_json(&json!({"created": false, "error": "internal error: no labels selected"}));
         return Err(1);
     }
 
@@ -827,20 +864,180 @@ fn split_labels(csv: &str) -> Vec<String> {
         .collect()
 }
 
-fn normalize_labels(mut labels: Vec<String>) -> (Vec<String>, bool, Option<&'static str>) {
-    let has_type = labels.iter().any(|label| label.starts_with("type:"));
-    let has_priority = labels.iter().any(|label| label.starts_with("priority:"));
-    if !has_type {
-        return (
-            labels,
-            false,
-            Some("labels must include at least one type:* label"),
-        );
+fn parse_doc_issue_labels(path: &Path) -> Result<Vec<String>, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", normalize_path(path)))?;
+    let mut labels = Vec::new();
+    let mut in_block = false;
+    let mut found_block = false;
+
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if !in_block {
+            if is_issue_labels_header(trimmed) {
+                if found_block {
+                    return Err(format!(
+                        "multiple `Issue Labels:` sections found in {}",
+                        normalize_path(path)
+                    ));
+                }
+                found_block = true;
+                in_block = true;
+            }
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.starts_with('#') {
+            break;
+        }
+
+        let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            return Err(format!(
+                "invalid `Issue Labels:` entry at {}:{}; expected `- <label>`",
+                normalize_path(path),
+                idx + 1
+            ));
+        };
+        let normalized = normalize_label_token(rest);
+        if normalized.is_empty() {
+            return Err(format!(
+                "empty `Issue Labels:` entry at {}:{}",
+                normalize_path(path),
+                idx + 1
+            ));
+        }
+        labels.push(normalized);
     }
-    if !has_priority {
-        labels.push("priority:medium".to_string());
+
+    Ok(labels)
+}
+
+fn is_issue_labels_header(line: &str) -> bool {
+    line == "Issue Labels:"
+}
+
+fn normalize_label_token(value: &str) -> String {
+    let trimmed = value.trim();
+    let without_backticks = trimmed
+        .strip_prefix('`')
+        .and_then(|v| v.strip_suffix('`'))
+        .unwrap_or(trimmed);
+    without_backticks.trim().to_string()
+}
+
+fn finalize_issue_labels(
+    doc_type: &str,
+    cli_labels: Vec<String>,
+    metadata_labels: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let cli = parse_labels(cli_labels, "cli")?;
+    let metadata = parse_labels(metadata_labels, "metadata")?;
+
+    let type_label = match cli.type_label.or(metadata.type_label) {
+        Some(v) => v,
+        None => default_type_label(doc_type).to_string(),
+    };
+    let priority_label = match cli.priority_label.or(metadata.priority_label) {
+        Some(v) => v,
+        None => "priority:medium".to_string(),
+    };
+    let codex = cli.codex || metadata.codex;
+
+    if !is_allowed_type_label(&type_label) {
+        return Err(format!(
+            "invalid type label: {type_label}; allowed: {}",
+            ALLOWED_TYPE_LABELS.join(", ")
+        ));
     }
-    (labels, true, None)
+    if !is_allowed_priority_label(&priority_label) {
+        return Err(format!(
+            "invalid priority label: {priority_label}; allowed: {}",
+            ALLOWED_PRIORITY_LABELS.join(", ")
+        ));
+    }
+
+    let mut labels = vec![type_label, priority_label];
+    if codex {
+        labels.push(SPECIAL_LABEL_CODEX.to_string());
+    }
+    Ok(labels)
+}
+
+fn parse_labels(labels: Vec<String>, source: &str) -> Result<LabelSelection, String> {
+    let mut selected = LabelSelection::default();
+    for raw in labels {
+        let label = normalize_label_token(&raw);
+        if label.is_empty() {
+            continue;
+        }
+
+        if label.starts_with("type:") {
+            if !is_allowed_type_label(&label) {
+                return Err(format!(
+                    "unsupported label in {source} labels: {label}; allowed type labels: {}",
+                    ALLOWED_TYPE_LABELS.join(", ")
+                ));
+            }
+            if selected.type_label.is_some() {
+                return Err(format!(
+                    "{source} labels must include at most one type:* label"
+                ));
+            }
+            selected.type_label = Some(label);
+            continue;
+        }
+
+        if label.starts_with("priority:") {
+            if !is_allowed_priority_label(&label) {
+                return Err(format!(
+                    "unsupported label in {source} labels: {label}; allowed priority labels: {}",
+                    ALLOWED_PRIORITY_LABELS.join(", ")
+                ));
+            }
+            if selected.priority_label.is_some() {
+                return Err(format!(
+                    "{source} labels must include at most one priority:* label"
+                ));
+            }
+            selected.priority_label = Some(label);
+            continue;
+        }
+
+        if label == SPECIAL_LABEL_CODEX {
+            selected.codex = true;
+            continue;
+        }
+
+        return Err(format!(
+            "unsupported label in {source} labels: {label}; allowed labels: {}, {}, {}",
+            ALLOWED_TYPE_LABELS.join(", "),
+            ALLOWED_PRIORITY_LABELS.join(", "),
+            SPECIAL_LABEL_CODEX,
+        ));
+    }
+    Ok(selected)
+}
+
+fn is_allowed_type_label(label: &str) -> bool {
+    ALLOWED_TYPE_LABELS.contains(&label)
+}
+
+fn is_allowed_priority_label(label: &str) -> bool {
+    ALLOWED_PRIORITY_LABELS.contains(&label)
+}
+
+fn default_type_label(doc_type: &str) -> &'static str {
+    match doc_type {
+        "task" => "type:task",
+        "rfc" => "type:epic",
+        _ => "type:task",
+    }
 }
 
 fn build_body(

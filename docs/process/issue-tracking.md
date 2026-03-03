@@ -60,11 +60,14 @@ Do NOT forget to remove the temporary file once issue is created successfully.
 Since GitHub does not have strict fields for type/priority, use **Labels**:
 
 **Type Labels:**
+- `type:doc` - Documentation work
+- `type:perf` - Performance-focused work
+- `type:question` - Research/question tracking
 - `type:bug` - Something broken
 - `type:feature` - New functionality
+- `type:chore` - Repository/tooling maintenance work
 - `type:task` - Work item (tests, docs, refactoring)
 - `type:epic` - Large feature tracking
-- `type:maintenance` - Maintenance
 
 **Priority Labels:**
 - `priority:critical` (P0) - Security, data loss, broken builds
@@ -72,7 +75,15 @@ Since GitHub does not have strict fields for type/priority, use **Labels**:
 - `priority:medium` (P2) - Default, nice-to-have
 - `priority:low` (P3) - Polish, optimization
 
-When using `tools/issue.rs create-issue-from-doc`, omitting `priority:*` defaults to `priority:medium`.
+**Special Labels:**
+- `codex` - Task intended for Codex implementation flow
+
+For `tools/issue.rs create-issue-from-doc`, labels can come from CLI `--labels` and/or planning-doc metadata (`Issue Labels:` block). CLI `type:*`/`priority:*` override metadata values, and `codex` is unioned.
+
+When creating from planning docs with no explicit type/priority from either source:
+- task docs default to `type:task`
+- RFC docs default to `type:epic`
+- priority defaults to `priority:medium`
 
 ## Epic & Subtask Management
 

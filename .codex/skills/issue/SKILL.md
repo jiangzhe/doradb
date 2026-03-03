@@ -31,6 +31,24 @@ tools/issue.rs create-issue-from-doc \
   --assignee "@me"
 ```
 
+`--labels` is optional. If omitted, labels can be derived from planning-doc metadata:
+
+```md
+Issue Labels:
+- type:task
+- priority:high
+- codex
+```
+
+When both metadata and `--labels` are present:
+- CLI `type:*` and `priority:*` override metadata values.
+- `codex` is unioned from both sources.
+
+Defaults when no source provides a value:
+- task doc -> `type:task`
+- RFC doc -> `type:epic`
+- priority -> `priority:medium`
+
 For child issues linked to an epic:
 
 ```bash
@@ -41,7 +59,10 @@ tools/issue.rs create-issue-from-doc \
 ```
 
 This script always uses `--body-file` to avoid body-length command issues.
-If `priority:*` is omitted, it automatically adds `priority:medium`.
+Allowed labels are strictly validated:
+- type: `type:doc`, `type:perf`, `type:feature`, `type:question`, `type:bug`, `type:chore`, `type:epic`, `type:task`
+- priority: `priority:low`, `priority:medium`, `priority:high`, `priority:critical`
+- special: `codex`
 
 ## List Issues
 

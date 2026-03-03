@@ -7,6 +7,11 @@ Summarize the issue/feature and solution.
 ## Context
 
 Describe background and context of this problem.
+Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
+`Issue Labels:`
+`- type:task`
+`- priority:medium`
+`- codex`
 If sourced from backlog, add:
 `Source Backlogs:`
 `- docs/backlogs/<6digits>-<follow-up-topic>.md`
