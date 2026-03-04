@@ -4,23 +4,29 @@ mod object;
 mod tables;
 
 use crate::buffer::{EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
-use crate::catalog::TableID;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
+use crate::catalog::{ObjID, TableID};
 use crate::error::Result;
+use crate::file::multi_table_file::{
+    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile,
+};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::table::Table;
 use crate::trx::MIN_SNAPSHOT_TS;
+use crate::trx::TrxID;
 use std::sync::Arc;
 
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
     pub(super) mem_pool: &'static EvictableBufferPool,
     tables: Box<[Table]>,
+    next_user_obj_id: ObjID,
+    mtb: Arc<MultiTableFile>,
 }
 
 impl CatalogStorage {
@@ -32,6 +38,9 @@ impl CatalogStorage {
         table_fs: &'static TableFileSystem,
         global_disk_pool: &'static GlobalReadonlyBufferPool,
     ) -> Result<Self> {
+        let mtb = table_fs.open_or_create_multi_table_file().await?;
+        let mtb_snapshot = mtb.load_snapshot()?;
+
         let mut cat: Vec<Table> = vec![];
         for CatalogDefinition { table_id, metadata } in [
             catalog_definition_of_tables(),
@@ -58,12 +67,18 @@ impl CatalogStorage {
             .await;
             let table =
                 Table::new(mem_pool, index_pool, global_disk_pool, blk_idx, table_file).await;
+
+            // Catalog table files are only runtime scratch structures today.
+            // Persistent catalog state is managed by catalog.mtb.
+            let _ = std::fs::remove_file(table_fs.table_file_path(*table_id));
             cat.push(table);
         }
         Ok(CatalogStorage {
             meta_pool,
             mem_pool,
             tables: cat.into_boxed_slice(),
+            next_user_obj_id: mtb_snapshot.meta.next_user_obj_id,
+            mtb,
         })
     }
 
@@ -108,6 +123,45 @@ impl CatalogStorage {
     #[inline]
     pub fn len(&self) -> usize {
         self.tables.len()
+    }
+
+    #[inline]
+    pub fn next_user_obj_id(&self) -> ObjID {
+        self.next_user_obj_id
+    }
+
+    /// Publish one catalog metadata snapshot into `catalog.mtb`.
+    ///
+    /// This method is temporary in RFC 0006 and is expected to change in phase 3,
+    /// where a dedicated catalog checkpointer will replay catalog redo logs and
+    /// merge checkpoint deltas into `catalog.mtb`.
+    #[inline]
+    pub async fn publish_checkpoint(
+        &self,
+        checkpoint_cts: TrxID,
+        next_user_obj_id: ObjID,
+    ) -> Result<()> {
+        self.mtb
+            .publish_checkpoint(checkpoint_cts, next_user_obj_id, self.catalog_table_roots())
+            .await
+    }
+
+    #[inline]
+    fn catalog_table_roots(&self) -> [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT] {
+        let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
+        for table in &self.tables {
+            let table_id = table.table_id() as usize;
+            if table_id >= roots.len() {
+                continue;
+            }
+            let active_root = table.file.active_root();
+            roots[table_id] = CatalogTableRootDesc {
+                table_id: table_id as u64,
+                root_page_id: active_root.column_block_index_root,
+                pivot_row_id: active_root.pivot_row_id,
+            };
+        }
+        roots
     }
 }
 

@@ -1,11 +1,11 @@
 use crate::buffer::page::PageID;
-use crate::error::Result;
-use crate::file::table_file::TABLE_FILE_SUPER_PAGE_FOOTER_SIZE;
+use crate::error::{Error, Result};
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use std::mem;
 
 pub const SUPER_PAGE_VERSION: u64 = 1;
+pub const SUPER_PAGE_FOOTER_SIZE: usize = mem::size_of::<SuperPageFooter>();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperPageHeader {
@@ -103,7 +103,7 @@ impl Deser for SuperPageFooter {
 impl Ser<'_> for SuperPageFooter {
     #[inline]
     fn ser_len(&self) -> usize {
-        TABLE_FILE_SUPER_PAGE_FOOTER_SIZE
+        SUPER_PAGE_FOOTER_SIZE
     }
 
     #[inline]
@@ -135,6 +135,61 @@ impl Ser<'_> for SuperPageSerView {
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = self.header.ser(out, start_idx);
         self.body.ser(out, idx)
+    }
+}
+
+#[inline]
+pub fn parse_super_page(
+    buf: &[u8],
+    expected_magic_word: [u8; 8],
+    expected_version: u64,
+    footer_offset: usize,
+) -> Result<SuperPage> {
+    let (body_start, header) = SuperPageHeader::deser(buf, 0)?;
+    if header.magic_word != expected_magic_word {
+        return Err(Error::InvalidFormat);
+    }
+    if header.version != expected_version {
+        return Err(Error::InvalidFormat);
+    }
+    let (_, footer) = SuperPageFooter::deser(buf, footer_offset)?;
+    if header.checkpoint_cts != footer.checkpoint_cts {
+        return Err(Error::TornWrite);
+    }
+    let b3sum = blake3::hash(&buf[..footer_offset]);
+    if b3sum != footer.b3sum {
+        return Err(Error::ChecksumMismatch);
+    }
+    let (_, body) = SuperPageBody::deser(buf, body_start)?;
+    Ok(SuperPage {
+        header,
+        body,
+        footer,
+    })
+}
+
+#[inline]
+pub fn pick_latest_valid_super_page<F>(
+    buf: &[u8],
+    single_super_page_size: usize,
+    parse: F,
+) -> Result<SuperPage>
+where
+    F: Fn(&[u8]) -> Result<SuperPage>,
+{
+    debug_assert!(buf.len() == single_super_page_size * 2);
+    let first = parse(&buf[..single_super_page_size]);
+    let second = parse(&buf[single_super_page_size..]);
+    match (first, second) {
+        (Err(err), Err(_)) => Err(err),
+        (Ok(root), Err(_)) | (Err(_), Ok(root)) => Ok(root),
+        (Ok(l), Ok(r)) => {
+            if l.header.checkpoint_cts < r.header.checkpoint_cts {
+                Ok(r)
+            } else {
+                Ok(l)
+            }
+        }
     }
 }
 

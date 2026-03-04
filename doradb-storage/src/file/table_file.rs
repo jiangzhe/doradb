@@ -7,7 +7,7 @@ use crate::file::FixedSizeBufferFreeList;
 use crate::file::meta_page::{MetaPage, MetaPageSerView};
 use crate::file::super_page::{
     SUPER_PAGE_VERSION, SuperPage, SuperPageBody, SuperPageFooter, SuperPageHeader,
-    SuperPageSerView,
+    SuperPageSerView, parse_super_page, pick_latest_valid_super_page,
 };
 use crate::file::{FileIO, FileIOResult, SparseFile};
 use crate::io::DirectBuf;
@@ -233,47 +233,19 @@ impl TableFile {
 
     #[inline]
     fn pick_super_page(&self, buf: &[u8]) -> Result<SuperPage> {
-        debug_assert!(buf.len() == TABLE_FILE_SUPER_PAGE_SIZE * 2);
-        let first = self.parse_super_page(&buf[..TABLE_FILE_SUPER_PAGE_SIZE]);
-        let second = self.parse_super_page(&buf[TABLE_FILE_SUPER_PAGE_SIZE..]);
-        match (first, second) {
-            (Err(err), Err(_)) => Err(err),
-            (Ok(root), Err(_)) | (Err(_), Ok(root)) => Ok(root),
-            (Ok(r1), Ok(r2)) => {
-                // pick the one with larger transaction id.
-                if r1.header.checkpoint_cts < r2.header.checkpoint_cts {
-                    Ok(r2)
-                } else {
-                    Ok(r1)
-                }
-            }
-        }
+        pick_latest_valid_super_page(buf, TABLE_FILE_SUPER_PAGE_SIZE, |super_page_buf| {
+            self.parse_super_page(super_page_buf)
+        })
     }
 
     #[inline]
     fn parse_super_page(&self, buf: &[u8]) -> Result<SuperPage> {
-        // first we extract and validate checksum and transaction id.
-        let (idx, header) = SuperPageHeader::deser(buf, 0)?;
-        debug_assert!(idx == TABLE_FILE_SUPER_PAGE_HEADER_SIZE);
-        if header.version != SUPER_PAGE_VERSION {
-            return Err(Error::InvalidFormat);
-        }
-        let (idx, footer) = SuperPageFooter::deser(buf, TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET)?;
-        debug_assert!(idx == TABLE_FILE_SUPER_PAGE_SIZE);
-        if header.checkpoint_cts != footer.checkpoint_cts {
-            // torn write happens
-            return Err(Error::TornWrite);
-        }
-        let b3sum = blake3::hash(&buf[..TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET]);
-        if b3sum != footer.b3sum {
-            return Err(Error::ChecksumMismatch);
-        }
-        let (_, body) = SuperPageBody::deser(buf, TABLE_FILE_SUPER_PAGE_HEADER_SIZE)?;
-        Ok(SuperPage {
-            header,
-            body,
-            footer,
-        })
+        parse_super_page(
+            buf,
+            TABLE_FILE_MAGIC_WORD,
+            SUPER_PAGE_VERSION,
+            TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET,
+        )
     }
 
     #[inline]

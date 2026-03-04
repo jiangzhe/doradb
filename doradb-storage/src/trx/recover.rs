@@ -296,7 +296,7 @@ impl<'a> LogRecovery<'a> {
 
                 // Record recovered pages so we can recover indexes and refresh undo map at end.
                 // Note: we do not need to recover catalog tables because they are specially handled.
-                if *table_id as usize >= self.catalog.storage.len() {
+                if self.catalog.is_user_table(*table_id) {
                     self.recovered_tables
                         .entry(*table_id)
                         .or_default()
