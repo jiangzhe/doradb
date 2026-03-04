@@ -1,9 +1,10 @@
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
 use crate::error::Result;
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
-use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE, TableFile};
+use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
 use crate::io::{AIOClient, AIOContext};
 use crate::lifetime::StaticLifetime;
@@ -28,7 +29,7 @@ impl TableFileSystem {
     #[inline]
     pub fn new(io_depth: usize, base_dir: String, catalog_file_name: String) -> Result<Self> {
         let ctx = AIOContext::new(io_depth)?;
-        let buf_list = FixedSizeBufferFreeList::new(TABLE_FILE_PAGE_SIZE, io_depth, io_depth * 2);
+        let buf_list = FixedSizeBufferFreeList::new(COW_FILE_PAGE_SIZE, io_depth, io_depth * 2);
         let (event_loop, io_client) = ctx.event_loop();
         let listener = FileIOListener::new(buf_list.clone());
         let handle = event_loop.start_thread(listener);
@@ -59,7 +60,7 @@ impl TableFileSystem {
             self.buf_list.clone(),
             trunc,
         )?;
-        let initial_pages = TABLE_FILE_INITIAL_SIZE / TABLE_FILE_PAGE_SIZE;
+        let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
         let active_root = ActiveRoot::new(0, initial_pages, metadata);
         Ok(MutableTableFile::new(Arc::new(table_file), active_root))
     }

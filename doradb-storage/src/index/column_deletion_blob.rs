@@ -2,7 +2,8 @@ use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{Page, PageID};
 use crate::error::{Error, Result};
-use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE};
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::file::table_file::MutableTableFile;
 use crate::index::column_block_index::BlobRef;
 use crate::io::DirectBuf;
 use futures::future::try_join_all;
@@ -13,7 +14,7 @@ const COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET: usize = 8;
 const COLUMN_DELETION_BLOB_USED_SIZE_OFFSET: usize = 16;
 pub const COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE: usize = 20;
 pub const COLUMN_DELETION_BLOB_PAGE_BODY_SIZE: usize =
-    TABLE_FILE_PAGE_SIZE - COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE;
+    COW_FILE_PAGE_SIZE - COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE;
 
 struct BlobPageHeader {
     next_page_id: PageID,
@@ -21,7 +22,7 @@ struct BlobPageHeader {
 }
 
 fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
-    if page.len() != TABLE_FILE_PAGE_SIZE {
+    if page.len() != COW_FILE_PAGE_SIZE {
         return Err(Error::InvalidState);
     }
     if page[..4] != COLUMN_DELETION_BLOB_MAGIC {
@@ -73,7 +74,7 @@ impl PendingBlobPage {
         PendingBlobPage {
             page_id,
             used_size: 0,
-            buf: DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE),
+            buf: DirectBuf::zeroed(COW_FILE_PAGE_SIZE),
         }
     }
 

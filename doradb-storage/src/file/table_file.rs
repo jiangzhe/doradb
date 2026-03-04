@@ -1,39 +1,34 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
-use crate::buffer::page::{PAGE_SIZE, PageID};
+use crate::buffer::page::PageID;
 use crate::catalog::table::TableMetadata;
 use crate::error::{Error, Result};
+use crate::file::FileIO;
 use crate::file::FixedSizeBufferFreeList;
+use crate::file::cow_file::{
+    COW_FILE_PAGE_SIZE, CoWFile, CoWFileOwner, CoWRoot, MutableCoWFile, OldCoWRoot,
+};
 use crate::file::meta_page::{MetaPage, MetaPageSerView};
 use crate::file::super_page::{
     SUPER_PAGE_VERSION, SuperPage, SuperPageBody, SuperPageFooter, SuperPageHeader,
     SuperPageSerView, parse_super_page, pick_latest_valid_super_page,
 };
-use crate::file::{FileIO, FileIOResult, SparseFile};
-use crate::io::DirectBuf;
-use crate::io::{AIOBuf, AIOClient, AIOKind};
+use crate::io::{AIOBuf, AIOClient, DirectBuf};
 use crate::ptr::UnsafePtr;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
 use futures::future::try_join_all;
-use std::fs;
 use std::mem;
-use std::os::fd::{AsRawFd, RawFd};
-use std::ptr::NonNull;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
 
 /// Initial size of new table file.
 pub const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
-/// Page size of table file is 64KB.
-/// This is equivalent to page size of in-memory row store
-/// (row page and secondary index page).
-pub const TABLE_FILE_PAGE_SIZE: usize = PAGE_SIZE;
 /// Super page size of table file is 32KB.
-pub const TABLE_FILE_SUPER_PAGE_SIZE: usize = TABLE_FILE_PAGE_SIZE / 2;
+pub const TABLE_FILE_SUPER_PAGE_SIZE: usize = COW_FILE_PAGE_SIZE / 2;
 /// Super page header size.
 pub const TABLE_FILE_SUPER_PAGE_HEADER_SIZE: usize = mem::size_of::<[u8; 8]>()
     + mem::size_of::<u64>()
@@ -45,19 +40,8 @@ pub const TABLE_FILE_SUPER_PAGE_FOOTER_SIZE: usize = mem::size_of::<SuperPageFoo
 pub const TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET: usize =
     TABLE_FILE_SUPER_PAGE_SIZE - TABLE_FILE_SUPER_PAGE_FOOTER_SIZE;
 
-/// Table file is a wrapper of file, IO channel and cache.
-pub struct TableFile {
-    /// Underlying sparse file storing table metadata and data.
-    file: SparseFile,
-    /// Active root of this table file.
-    /// This root can be switched once a modification of
-    /// the file is committed.
-    active_root: AtomicPtr<ActiveRoot>,
-    /// Client to submit IO reads/writes.
-    io_client: AIOClient<FileIO>,
-    /// Reusable buffer list.
-    buf_list: FixedSizeBufferFreeList,
-}
+/// Table file wrapper over generic copy-on-write file mechanics.
+pub struct TableFile(CoWFile<ActiveRoot>);
 
 impl TableFile {
     /// Create a table file.
@@ -69,18 +53,9 @@ impl TableFile {
         buf_list: FixedSizeBufferFreeList,
         trunc: bool,
     ) -> Result<Self> {
-        debug_assert!(initial_size.is_multiple_of(TABLE_FILE_PAGE_SIZE));
-        let file = if trunc {
-            SparseFile::create_or_trunc(file_path, initial_size)
-        } else {
-            SparseFile::create_or_fail(file_path, initial_size)
-        }?;
-        Ok(TableFile {
-            file,
-            active_root: AtomicPtr::new(std::ptr::null_mut()),
-            io_client,
-            buf_list,
-        })
+        debug_assert!(initial_size.is_multiple_of(COW_FILE_PAGE_SIZE));
+        let cow_file = CoWFile::create(file_path, initial_size, io_client, buf_list, trunc)?;
+        Ok(TableFile(cow_file))
     }
 
     #[inline]
@@ -89,54 +64,13 @@ impl TableFile {
         io_client: AIOClient<FileIO>,
         buf_list: FixedSizeBufferFreeList,
     ) -> Result<Self> {
-        let file = SparseFile::open(file_path)?;
-        Ok(TableFile {
-            file,
-            active_root: AtomicPtr::new(std::ptr::null_mut()),
-            io_client,
-            buf_list,
-        })
-    }
-
-    #[inline]
-    pub fn buf_list(&self) -> &FixedSizeBufferFreeList {
-        &self.buf_list
-    }
-
-    /// Returns active root of the table file.
-    #[inline]
-    pub fn active_root(&self) -> &ActiveRoot {
-        Self::active_root_from_raw(self.load_active_root_raw())
-    }
-
-    /// Returns copy of active root.
-    /// The returned pointer cannot outlive the root object,
-    /// which is guaranteed by GC logic.
-    #[inline]
-    pub fn active_root_ptr(&self) -> AtomicPtr<ActiveRoot> {
-        AtomicPtr::new(self.load_active_root_raw())
+        let cow_file = CoWFile::open(file_path, io_client, buf_list)?;
+        Ok(TableFile(cow_file))
     }
 
     #[inline]
     pub async fn read_page(&self, page_id: PageID) -> Result<DirectBuf> {
-        let buf = self.buf_list.pop_async(true).await;
-        debug_assert!(buf.capacity() == TABLE_FILE_PAGE_SIZE);
-        let offset = page_id as usize * TABLE_FILE_PAGE_SIZE;
-        let (fio, promise) =
-            FileIO::prepare(AIOKind::Read, self.file.as_raw_fd(), offset, buf, true);
-        if let Err(err) = self.io_client.send_async(fio).await {
-            if let Some(buf) = err.into_inner().take_buf() {
-                self.buf_list.recycle(buf);
-            }
-            return Err(Error::SendError);
-        }
-        let res = promise.wait_async().await;
-        match res {
-            FileIOResult::ReadOk(buf) => Ok(buf),
-            FileIOResult::ReadStaticOk => panic!("invalid state"),
-            FileIOResult::WriteOk => panic!("invalid state"),
-            FileIOResult::Err(err) => Err(err.into()),
-        }
+        self.0.read_page(page_id).await
     }
 
     /// Reads one table-file page directly into caller-provided memory.
@@ -144,7 +78,7 @@ impl TableFile {
     /// # Safety
     ///
     /// Caller must ensure `ptr` points to writable, sector-aligned memory
-    /// of at least `TABLE_FILE_PAGE_SIZE` bytes, and remains valid until
+    /// of at least `COW_FILE_PAGE_SIZE` bytes, and remains valid until
     /// async completion.
     #[inline]
     pub async unsafe fn read_page_into_ptr(
@@ -152,156 +86,34 @@ impl TableFile {
         page_id: PageID,
         ptr: UnsafePtr<u8>,
     ) -> Result<()> {
-        let offset = page_id as usize * TABLE_FILE_PAGE_SIZE;
-        // SAFETY: caller upholds pointer validity/alignment until promise resolves.
-        let (fio, promise) = unsafe {
-            FileIO::prepare_static_read(self.file.as_raw_fd(), offset, ptr, TABLE_FILE_PAGE_SIZE)
-        };
-        if self.io_client.send_async(fio).await.is_err() {
-            return Err(Error::SendError);
-        }
-        let res = promise.wait_async().await;
-        match res {
-            FileIOResult::ReadStaticOk => Ok(()),
-            FileIOResult::ReadOk(_) => panic!("invalid state"),
-            FileIOResult::WriteOk => panic!("invalid state"),
-            FileIOResult::Err(err) => Err(err.into()),
-        }
+        // SAFETY: caller upholds pointer validity/alignment until async completion.
+        unsafe { self.0.read_page_into_ptr(page_id, ptr).await }
     }
 
     #[inline]
     pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
-        debug_assert!(buf.capacity() == TABLE_FILE_PAGE_SIZE);
-        let offset = page_id as usize * TABLE_FILE_PAGE_SIZE;
-        self.write(offset, buf, true).await
-    }
-
-    #[inline]
-    async fn write(&self, offset: usize, buf: DirectBuf, recycle: bool) -> Result<()> {
-        let (fio, promise) =
-            FileIO::prepare(AIOKind::Write, self.file.as_raw_fd(), offset, buf, recycle);
-        if let Err(err) = self.io_client.send_async(fio).await {
-            if let Some(buf) = err.into_inner().take_buf()
-                && recycle
-            {
-                self.buf_list.recycle(buf);
-            }
-            return Err(Error::SendError);
-        }
-        let res = promise.wait_async().await;
-        match res {
-            FileIOResult::WriteOk => Ok(()),
-            FileIOResult::ReadStaticOk => panic!("invalid state"),
-            FileIOResult::ReadOk(_) => panic!("invalid state"),
-            FileIOResult::Err(err) => Err(err.into()),
-        }
-    }
-
-    /// Replace active root with new root, and return old root.
-    #[inline]
-    pub fn swap_active_root(&self, active_root: ActiveRoot) -> Option<OldRoot> {
-        let new = Self::allocate_active_root(active_root);
-        let old = self.active_root.swap(new, Ordering::SeqCst);
-        NonNull::new(old).map(OldRoot)
-    }
-
-    /// Load active root from two super pages.
-    /// The page which passes validation and has larger transaction id
-    /// will win.
-    #[inline]
-    pub async fn load_active_root(&self) -> Result<ActiveRoot> {
-        // First page contains two(ping-pong) super pages.
-        let buf = self.read_page(0).await?;
-        let super_page = self.pick_super_page(buf.as_bytes())?;
-        self.buf_list.push(buf);
-        let meta_page_id = super_page.body.meta_page_id;
-        let meta_buf = self.read_page(meta_page_id).await?;
-        let meta_page = self.parse_meta_page(meta_buf.as_bytes())?;
-        self.buf_list.push(meta_buf);
-        Ok(ActiveRoot {
-            page_no: super_page.header.page_no,
-            trx_id: super_page.header.checkpoint_cts,
-            pivot_row_id: meta_page.pivot_row_id,
-            heap_redo_start_ts: meta_page.heap_redo_start_ts,
-            alloc_map: meta_page.space_map,
-            gc_page_list: meta_page.gc_page_list,
-            metadata: Arc::new(meta_page.schema),
-            column_block_index_root: meta_page.column_block_index_root,
-            meta_page_id,
-        })
-    }
-
-    #[inline]
-    fn pick_super_page(&self, buf: &[u8]) -> Result<SuperPage> {
-        pick_latest_valid_super_page(buf, TABLE_FILE_SUPER_PAGE_SIZE, |super_page_buf| {
-            self.parse_super_page(super_page_buf)
-        })
-    }
-
-    #[inline]
-    fn parse_super_page(&self, buf: &[u8]) -> Result<SuperPage> {
-        parse_super_page(
-            buf,
-            TABLE_FILE_MAGIC_WORD,
-            SUPER_PAGE_VERSION,
-            TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET,
-        )
-    }
-
-    #[inline]
-    fn parse_meta_page(&self, buf: &[u8]) -> Result<MetaPage> {
-        let (_, meta_page) = MetaPage::deser(buf, 0)?;
-        Ok(meta_page)
-    }
-
-    /// fsync to make all data written persisted to disk.
-    #[inline]
-    pub fn fsync(&self) {
-        self.file.syncer().fsync();
+        self.0.write_page(page_id, buf).await
     }
 
     #[inline]
     pub fn delete(self) {
-        let _ = remove_file_by_fd(self.file.as_raw_fd());
-    }
-
-    #[inline]
-    fn load_active_root_raw(&self) -> *mut ActiveRoot {
-        self.active_root.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    fn active_root_from_raw<'a>(ptr: *mut ActiveRoot) -> &'a ActiveRoot {
-        match NonNull::new(ptr) {
-            Some(ptr) => {
-                // SAFETY: active root pointers are created from `Box<ActiveRoot>` and remain
-                // valid until reclaimed by swap/drop.
-                unsafe { ptr.as_ref() }
-            }
-            None => panic!("active root is not initialized"),
-        }
-    }
-
-    #[inline]
-    fn allocate_active_root(active_root: ActiveRoot) -> *mut ActiveRoot {
-        Box::into_raw(Box::new(active_root))
-    }
-
-    #[inline]
-    fn reclaim_active_root(ptr: *mut ActiveRoot) {
-        if let Some(ptr) = NonNull::new(ptr) {
-            // SAFETY: pointer was allocated by `allocate_active_root` and must be reclaimed once.
-            unsafe {
-                drop(Box::from_raw(ptr.as_ptr()));
-            }
-        }
+        self.0.delete();
     }
 }
 
-impl Drop for TableFile {
+impl Deref for TableFile {
+    type Target = CoWFile<ActiveRoot>;
+
     #[inline]
-    fn drop(&mut self) {
-        TableFile::reclaim_active_root(self.load_active_root_raw());
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl CoWFileOwner<ActiveRoot> for TableFile {
+    #[inline]
+    fn cow_file(&self) -> &CoWFile<ActiveRoot> {
+        &self.0
     }
 }
 
@@ -311,8 +123,23 @@ impl Drop for TableFile {
 /// All changes will be committed once the new active root
 /// is persisted to disk.
 pub struct MutableTableFile {
-    table_file: Arc<TableFile>,
-    new_root: ActiveRoot,
+    cow_file: MutableCoWFile<TableFile, ActiveRoot>,
+}
+
+impl Deref for MutableTableFile {
+    type Target = MutableCoWFile<TableFile, ActiveRoot>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.cow_file
+    }
+}
+
+impl DerefMut for MutableTableFile {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cow_file
+    }
 }
 
 pub struct LwcPagePersist {
@@ -326,8 +153,7 @@ impl MutableTableFile {
     #[inline]
     pub fn new(table_file: Arc<TableFile>, new_root: ActiveRoot) -> Self {
         MutableTableFile {
-            table_file,
-            new_root,
+            cow_file: MutableCoWFile::new(table_file, new_root),
         }
     }
 
@@ -335,21 +161,14 @@ impl MutableTableFile {
     #[inline]
     pub fn fork(table_file: &Arc<TableFile>) -> Self {
         MutableTableFile {
-            table_file: Arc::clone(table_file),
-            new_root: table_file.active_root().flip(),
+            cow_file: MutableCoWFile::fork(table_file),
         }
-    }
-
-    /// Returns the mutable root snapshot being built by this COW transaction.
-    #[inline]
-    pub fn root(&self) -> &ActiveRoot {
-        &self.new_root
     }
 
     /// Updates mutable root column-index pointer.
     #[inline]
     pub fn set_column_block_index_root(&mut self, root_page_id: PageID) {
-        self.new_root.column_block_index_root = root_page_id;
+        self.cow_file.root_mut().column_block_index_root = root_page_id;
     }
 
     /// Updates mutable root checkpoint metadata.
@@ -359,18 +178,20 @@ impl MutableTableFile {
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
     ) -> Result<()> {
-        if pivot_row_id < self.new_root.pivot_row_id {
+        let root = self.cow_file.root_mut();
+        if pivot_row_id < root.pivot_row_id {
             return Err(Error::InvalidArgument);
         }
-        self.new_root.pivot_row_id = pivot_row_id;
-        self.new_root.heap_redo_start_ts = heap_redo_start_ts;
+        root.pivot_row_id = pivot_row_id;
+        root.heap_redo_start_ts = heap_redo_start_ts;
         Ok(())
     }
 
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
     pub fn allocate_page_id(&mut self) -> Result<PageID> {
-        self.new_root
+        self.cow_file
+            .root_mut()
             .alloc_map
             .try_allocate()
             .map(|page_id| page_id as PageID)
@@ -380,13 +201,13 @@ impl MutableTableFile {
     /// Record an obsolete page id to be reclaimed on commit.
     #[inline]
     pub fn record_gc_page(&mut self, page_id: PageID) {
-        self.new_root.gc_page_list.push(page_id);
+        self.cow_file.root_mut().gc_page_list.push(page_id);
     }
 
     /// Write one page into the underlying table file.
     #[inline]
     pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
-        self.table_file.write_page(page_id, buf).await
+        self.cow_file.file().write_page(page_id, buf).await
     }
 
     /// Commit the modification of table file.
@@ -398,82 +219,22 @@ impl MutableTableFile {
         trx_id: TrxID,
         try_delete_if_fail: bool,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        let MutableTableFile {
-            table_file,
-            mut new_root,
-        } = self;
-        debug_assert!(new_root.trx_id == 0 || new_root.trx_id < trx_id);
-        new_root.trx_id = trx_id;
-
-        if new_root.meta_page_id != 0 {
-            new_root.gc_page_list.push(new_root.meta_page_id);
+        let mut cow_file = self.cow_file;
+        {
+            let new_root = cow_file.root_mut();
+            debug_assert!(new_root.trx_id == 0 || new_root.trx_id < trx_id);
+            new_root.trx_id = trx_id;
         }
-        let new_meta_page_id = new_root
-            .alloc_map
-            .try_allocate()
-            .ok_or(Error::InvalidState)? as PageID;
-        new_root.meta_page_id = new_meta_page_id;
 
-        // serialize meta page.
-        let meta_page = new_root.meta_page_ser_view();
-        let mut meta_buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
-        let meta_len = meta_page.ser_len();
-        if meta_len > TABLE_FILE_PAGE_SIZE {
-            return Err(Error::InvalidState);
-        }
-        let meta_idx = meta_page.ser(meta_buf.as_bytes_mut(), 0);
-        debug_assert!(meta_idx == meta_len);
-
-        // write meta page down.
-        match table_file.write_page(new_meta_page_id, meta_buf).await {
-            Ok(_) => {}
-            Err(e) => {
-                if try_delete_if_fail && let Some(f) = Arc::into_inner(table_file) {
-                    f.delete();
+        match cow_file.commit().await {
+            Ok((table_file, old_root)) => Ok((table_file, old_root)),
+            Err((table_file, err)) => {
+                if try_delete_if_fail && let Some(file) = Arc::into_inner(table_file) {
+                    file.delete();
                 }
-                return Err(e);
+                Err(err)
             }
         }
-
-        // serialize header and body of super page.
-        let super_page = new_root.ser_view();
-        let mut buf = DirectBuf::zeroed(TABLE_FILE_SUPER_PAGE_SIZE);
-        let ser_len = super_page.ser_len();
-        if ser_len > TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET {
-            // single super page cannot hold all data
-            unimplemented!("multiple pages are required to hold super data");
-        }
-        let ser_idx = super_page.ser(buf.as_bytes_mut(), 0);
-        debug_assert!(ser_idx == ser_len);
-
-        // serialize footer of super page.
-        let b3sum = blake3::hash(&buf.as_bytes()[..TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET]);
-        let footer = SuperPageFooter {
-            b3sum: *b3sum.as_bytes(),
-            checkpoint_cts: super_page.header.checkpoint_cts,
-        };
-        let ser_idx = footer.ser(buf.as_bytes_mut(), TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET);
-        debug_assert!(ser_idx == TABLE_FILE_SUPER_PAGE_SIZE);
-
-        // write page down.
-        let offset = super_page.header.page_no as usize * TABLE_FILE_SUPER_PAGE_SIZE;
-        match table_file.write(offset, buf, false).await {
-            Ok(_) => {}
-            Err(e) => {
-                if try_delete_if_fail && let Some(f) = Arc::into_inner(table_file) {
-                    f.delete();
-                }
-                return Err(e);
-            }
-        }
-
-        // fsync for persistence.
-        table_file.fsync();
-
-        // swap active root at the end.
-        let old_root = table_file.swap_active_root(new_root);
-
-        Ok((table_file, old_root))
     }
 
     pub async fn apply_lwc_pages(
@@ -483,17 +244,19 @@ impl MutableTableFile {
         ts: TrxID,
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<()> {
-        let mut max_row_id = self.new_root.pivot_row_id;
+        let table_file = Arc::clone(self.cow_file.file());
+        let mut max_row_id = self.cow_file.root().pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_pages.len());
         let mut new_entries = Vec::with_capacity(lwc_pages.len());
-        let mut last_end = self.new_root.pivot_row_id;
+        let mut last_end = self.cow_file.root().pivot_row_id;
 
         for page in lwc_pages {
             if page.start_row_id >= page.end_row_id {
                 return Err(Error::InvalidArgument);
             }
             let page_id = self
-                .new_root
+                .cow_file
+                .root_mut()
                 .alloc_map
                 .try_allocate()
                 .ok_or(Error::InvalidState)? as PageID;
@@ -503,22 +266,24 @@ impl MutableTableFile {
             }
             last_end = page.end_row_id;
             new_entries.push((page.start_row_id, page_id as u64));
-            writes.push(self.table_file.write_page(page_id, page.buf));
+            writes.push(table_file.write_page(page_id, page.buf));
         }
 
         try_join_all(writes).await?;
 
+        let root = self.cow_file.root();
         let column_index = crate::index::ColumnBlockIndex::new(
-            self.new_root.column_block_index_root,
-            self.new_root.pivot_row_id,
+            root.column_block_index_root,
+            root.pivot_row_id,
             disk_pool,
         );
         let new_root = column_index
             .batch_insert(self, &new_entries, max_row_id, ts)
             .await?;
-        self.new_root.column_block_index_root = new_root;
-        self.new_root.pivot_row_id = max_row_id;
-        self.new_root.heap_redo_start_ts = heap_redo_start_ts;
+        let root = self.cow_file.root_mut();
+        root.column_block_index_root = new_root;
+        root.pivot_row_id = max_row_id;
+        root.heap_redo_start_ts = heap_redo_start_ts;
         Ok(())
     }
 
@@ -550,7 +315,7 @@ impl MutableTableFile {
 
     #[inline]
     pub fn try_delete(self) -> bool {
-        if let Some(table_file) = Arc::into_inner(self.table_file) {
+        if let Some(table_file) = Arc::into_inner(self.cow_file.into_file()) {
             table_file.delete();
             return true;
         }
@@ -655,26 +420,110 @@ impl ActiveRoot {
     }
 }
 
-pub struct OldRoot(NonNull<ActiveRoot>);
+impl CoWRoot for ActiveRoot {
+    type Meta = MetaPage;
 
-impl Drop for OldRoot {
     #[inline]
-    fn drop(&mut self) {
-        // SAFETY: old roots are created from previous active-root pointers and reclaimed once.
-        unsafe {
-            drop(Box::from_raw(self.0.as_ptr()));
+    fn flip(&self) -> Self {
+        ActiveRoot::flip(self)
+    }
+
+    #[inline]
+    fn page_no(&self) -> u64 {
+        self.page_no
+    }
+
+    #[inline]
+    fn meta_page_id(&self) -> u64 {
+        self.meta_page_id
+    }
+
+    #[inline]
+    fn set_meta_page_id(&mut self, page_id: u64) {
+        self.meta_page_id = page_id;
+    }
+
+    #[inline]
+    fn push_gc_meta_page(&mut self, page_id: u64) {
+        self.gc_page_list.push(page_id);
+    }
+
+    #[inline]
+    fn try_allocate_page_id(&mut self) -> Option<u64> {
+        self.alloc_map.try_allocate().map(|page_id| page_id as u64)
+    }
+
+    #[inline]
+    fn pick_super_page(buf: &[u8]) -> Result<SuperPage> {
+        pick_latest_valid_super_page(buf, TABLE_FILE_SUPER_PAGE_SIZE, |super_page_buf| {
+            parse_super_page(
+                super_page_buf,
+                TABLE_FILE_MAGIC_WORD,
+                SUPER_PAGE_VERSION,
+                TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET,
+            )
+        })
+    }
+
+    #[inline]
+    fn parse_meta_page(buf: &[u8]) -> Result<Self::Meta> {
+        let (_, meta_page) = MetaPage::deser(buf, 0)?;
+        Ok(meta_page)
+    }
+
+    #[inline]
+    fn from_loaded(super_page: SuperPage, meta_page: Self::Meta) -> Result<Self> {
+        Ok(ActiveRoot {
+            page_no: super_page.header.page_no,
+            trx_id: super_page.header.checkpoint_cts,
+            pivot_row_id: meta_page.pivot_row_id,
+            heap_redo_start_ts: meta_page.heap_redo_start_ts,
+            alloc_map: meta_page.space_map,
+            gc_page_list: meta_page.gc_page_list,
+            metadata: Arc::new(meta_page.schema),
+            column_block_index_root: meta_page.column_block_index_root,
+            meta_page_id: super_page.body.meta_page_id,
+        })
+    }
+
+    #[inline]
+    fn build_meta_page(&self) -> Result<DirectBuf> {
+        let meta_page = self.meta_page_ser_view();
+        let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let meta_len = meta_page.ser_len();
+        if meta_len > COW_FILE_PAGE_SIZE {
+            return Err(Error::InvalidState);
         }
+        let meta_idx = meta_page.ser(meta_buf.as_bytes_mut(), 0);
+        debug_assert_eq!(meta_idx, meta_len);
+        Ok(meta_buf)
+    }
+
+    #[inline]
+    fn build_super_page(&self) -> Result<DirectBuf> {
+        let super_page = self.ser_view();
+        let mut buf = DirectBuf::zeroed(TABLE_FILE_SUPER_PAGE_SIZE);
+        let ser_len = super_page.ser_len();
+        if ser_len > TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET {
+            // single super page cannot hold all data
+            unimplemented!("multiple pages are required to hold super data");
+        }
+        let ser_idx = super_page.ser(buf.as_bytes_mut(), 0);
+        debug_assert_eq!(ser_idx, ser_len);
+
+        let b3sum = blake3::hash(&buf.as_bytes()[..TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET]);
+        let footer = SuperPageFooter {
+            b3sum: *b3sum.as_bytes(),
+            checkpoint_cts: super_page.header.checkpoint_cts,
+        };
+        let ser_idx = footer.ser(buf.as_bytes_mut(), TABLE_FILE_SUPER_PAGE_FOOTER_OFFSET);
+        debug_assert_eq!(ser_idx, TABLE_FILE_SUPER_PAGE_SIZE);
+        Ok(buf)
     }
 }
 
-unsafe impl Send for OldRoot {}
-
-#[inline]
-fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
-    let proc_path = format!("/proc/self/fd/{}", fd);
-    let real_path = fs::read_link(&proc_path)?;
-    fs::remove_file(real_path)
-}
+/// Guard object of swapped table-file roots.
+pub type OldRoot = OldCoWRoot<ActiveRoot>;
 
 #[cfg(test)]
 mod tests {
@@ -764,7 +613,7 @@ mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let mut page = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+            let mut page = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
             let out_of_range_page_id = 1_000_000;
             let res = unsafe {
                 table_file
@@ -829,7 +678,7 @@ mod tests {
     }
 
     fn page_buf(payload: &[u8]) -> DirectBuf {
-        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.data_mut()[..payload.len()].copy_from_slice(payload);
         buf
     }

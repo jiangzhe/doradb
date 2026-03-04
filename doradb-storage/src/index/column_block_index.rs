@@ -2,9 +2,10 @@ use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{BufferPage, PageID};
 use crate::error::{Error, Result};
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::file::table_file::MutableTableFile;
 #[cfg(test)]
 use crate::file::table_file::TableFile;
-use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE};
 use crate::index::column_deletion_blob::{
     COLUMN_DELETION_BLOB_PAGE_BODY_SIZE, ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
 };
@@ -17,7 +18,7 @@ use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Arc;
 
-pub const COLUMN_BLOCK_PAGE_SIZE: usize = TABLE_FILE_PAGE_SIZE;
+pub const COLUMN_BLOCK_PAGE_SIZE: usize = COW_FILE_PAGE_SIZE;
 pub const COLUMN_BLOCK_HEADER_SIZE: usize = mem::size_of::<ColumnBlockNodeHeader>();
 pub const COLUMN_BLOCK_DATA_SIZE: usize = COLUMN_BLOCK_PAGE_SIZE - COLUMN_BLOCK_HEADER_SIZE;
 pub const COLUMN_PAGE_PAYLOAD_SIZE: usize = mem::size_of::<ColumnPagePayload>();

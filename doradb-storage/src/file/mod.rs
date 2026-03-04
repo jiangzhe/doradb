@@ -1,3 +1,4 @@
+pub mod cow_file;
 pub mod meta_page;
 pub mod multi_table_file;
 pub mod super_page;
@@ -8,11 +9,12 @@ use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::io_iocb_cmd;
 use crate::io::{
-    AIO, AIOBuf, AIOContext, AIOError, AIOEventListener, AIOKey, AIOKind, AIOResult, AIOStats,
-    IOQueue, STORAGE_SECTOR_SIZE, UnsafeAIO, align_to_sector_size,
+    AIO, AIOBuf, AIOClient, AIOContext, AIOError, AIOEventListener, AIOKey, AIOKind, AIOResult,
+    AIOStats, IOQueue, STORAGE_SECTOR_SIZE, UnsafeAIO, align_to_sector_size,
 };
 use crate::notify::EventNotifyOnDrop;
 use crate::ptr::UnsafePtr;
+use crate::{error::Error, error::Result};
 use event_listener::{EventListener, Listener};
 use libc::{
     O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
@@ -368,6 +370,65 @@ impl FileIO {
     pub fn take_buf(self) -> Option<DirectBuf> {
         let mut g = self.state.lock();
         g.take_buf()
+    }
+}
+
+/// Read one full page via async direct IO and return the filled direct buffer.
+///
+/// On request-submit failure, the allocated buffer is recycled back into `buf_list`.
+#[inline]
+pub(crate) async fn read_page_direct(
+    fd: RawFd,
+    page_id: u64,
+    page_size: usize,
+    io_client: &AIOClient<FileIO>,
+    buf_list: &FixedSizeBufferFreeList,
+) -> Result<DirectBuf> {
+    let buf = buf_list.pop_async(true).await;
+    debug_assert!(buf.capacity() == page_size);
+    let offset = page_id as usize * page_size;
+    let (fio, promise) = FileIO::prepare(AIOKind::Read, fd, offset, buf, true);
+    if let Err(err) = io_client.send_async(fio).await {
+        if let Some(buf) = err.into_inner().take_buf() {
+            buf_list.recycle(buf);
+        }
+        return Err(Error::SendError);
+    }
+    match promise.wait_async().await {
+        FileIOResult::ReadOk(buf) => Ok(buf),
+        FileIOResult::ReadStaticOk => panic!("invalid state"),
+        FileIOResult::WriteOk => panic!("invalid state"),
+        FileIOResult::Err(err) => Err(err.into()),
+    }
+}
+
+/// Write one direct buffer via async direct IO.
+///
+/// When `recycle` is true, write buffers are recycled by IO completion path
+/// and also on request-submit failure.
+#[inline]
+pub(crate) async fn write_direct(
+    fd: RawFd,
+    offset: usize,
+    buf: DirectBuf,
+    recycle: bool,
+    io_client: &AIOClient<FileIO>,
+    buf_list: &FixedSizeBufferFreeList,
+) -> Result<()> {
+    let (fio, promise) = FileIO::prepare(AIOKind::Write, fd, offset, buf, recycle);
+    if let Err(err) = io_client.send_async(fio).await {
+        if let Some(buf) = err.into_inner().take_buf()
+            && recycle
+        {
+            buf_list.recycle(buf);
+        }
+        return Err(Error::SendError);
+    }
+    match promise.wait_async().await {
+        FileIOResult::WriteOk => Ok(()),
+        FileIOResult::ReadStaticOk => panic!("invalid state"),
+        FileIOResult::ReadOk(_) => panic!("invalid state"),
+        FileIOResult::Err(err) => Err(err.into()),
     }
 }
 

@@ -3,7 +3,7 @@
 use crate::buffer::page::BufferPage;
 use crate::catalog::TableMetadata;
 use crate::error::{Error, Result};
-use crate::file::table_file::TABLE_FILE_PAGE_SIZE;
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::lwc::{
     FlatU64, ForBitpacking1, ForBitpacking2, ForBitpacking4, ForBitpacking8, ForBitpacking16,
     ForBitpacking32, LwcData, LwcNullBitmap, LwcPrimitive, LwcPrimitiveData, SortedPosition,
@@ -18,7 +18,7 @@ use std::mem;
     dead_code,
     reason = "reserved for future LWC page checksum/footer implementation"
 )]
-const LWC_PAGE_FOOTER_OFFSET: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>() - 32;
+const LWC_PAGE_FOOTER_OFFSET: usize = COW_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>() - 32;
 
 /// LwcPage stores compressioned data on disk.
 /// Its size is same as in-memory row page.
@@ -81,7 +81,7 @@ pub struct LwcPage {
     // The conversion from disk page to mem page is not safe.
     // We should use Ser and Deser for endianess safety.
     pub header: LwcPageHeader,
-    pub body: [u8; TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>()],
+    pub body: [u8; COW_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>()],
 }
 
 // SAFETY: `LwcPage` is `repr(C)` and consists only of byte-array based fields.
@@ -91,7 +91,7 @@ unsafe impl Zeroable for LwcPage {}
 unsafe impl Pod for LwcPage {}
 
 impl LwcPage {
-    pub const BODY_SIZE: usize = TABLE_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>();
+    pub const BODY_SIZE: usize = COW_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>();
 
     #[inline]
     pub fn try_from_bytes(input: &[u8]) -> Result<&Self> {
@@ -259,7 +259,7 @@ impl ColOffsets<'_> {
 
 const LWC_PAGE_HEADER_SIZE: usize = 24;
 const _: () = assert!(mem::size_of::<LwcPageHeader>() == LWC_PAGE_HEADER_SIZE);
-const _: () = assert!(mem::size_of::<LwcPage>() == TABLE_FILE_PAGE_SIZE);
+const _: () = assert!(mem::size_of::<LwcPage>() == COW_FILE_PAGE_SIZE);
 
 /// Header of Lwc Page.
 /// The fields are all defined as byte array
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_lwc_page() {
-        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         page.header = LwcPageHeader::new(100, 200, 50, 2, 312);
         assert!(page.header.first_row_id() == 100);
@@ -540,7 +540,7 @@ mod tests {
         let idx = null_ser.ser(&mut column_bytes[..], 0);
         column_bytes[idx..].copy_from_slice(&values_bytes);
 
-        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         let col_offsets_len = mem::size_of::<u16>();
         let col_start = col_offsets_len + row_id_bytes.len();
@@ -575,7 +575,7 @@ mod tests {
             )],
             vec![],
         );
-        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         let col_offsets_len = mem::size_of::<u16>() * 2;
         let end_offset = col_offsets_len as u16;
@@ -589,14 +589,14 @@ mod tests {
 
     #[test]
     fn test_lwc_page_try_from_bytes_invalid_len() {
-        let bytes = [0u8; TABLE_FILE_PAGE_SIZE - 1];
+        let bytes = [0u8; COW_FILE_PAGE_SIZE - 1];
         let err = LwcPage::try_from_bytes(&bytes);
         assert!(matches!(err, Err(Error::InvalidCompressedData)));
     }
 
     #[test]
     fn test_lwc_page_try_from_bytes_mut_roundtrip() {
-        let mut buf = DirectBuf::zeroed(TABLE_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         {
             let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
             page.header = LwcPageHeader::new(11, 19, 2, 1, 32);
