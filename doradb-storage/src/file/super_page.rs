@@ -1,11 +1,13 @@
-use crate::buffer::page::PageID;
-use crate::error::Result;
-use crate::file::table_file::TABLE_FILE_SUPER_PAGE_FOOTER_SIZE;
+use crate::buffer::page::{PAGE_SIZE, PageID};
+use crate::error::{Error, Result};
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use std::mem;
 
 pub const SUPER_PAGE_VERSION: u64 = 1;
+pub const SUPER_PAGE_SIZE: usize = PAGE_SIZE / 2;
+pub const SUPER_PAGE_FOOTER_SIZE: usize = mem::size_of::<SuperPageFooter>();
+pub const SUPER_PAGE_FOOTER_OFFSET: usize = SUPER_PAGE_SIZE - SUPER_PAGE_FOOTER_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperPageHeader {
@@ -103,7 +105,7 @@ impl Deser for SuperPageFooter {
 impl Ser<'_> for SuperPageFooter {
     #[inline]
     fn ser_len(&self) -> usize {
-        TABLE_FILE_SUPER_PAGE_FOOTER_SIZE
+        SUPER_PAGE_FOOTER_SIZE
     }
 
     #[inline]
@@ -136,6 +138,35 @@ impl Ser<'_> for SuperPageSerView {
         let idx = self.header.ser(out, start_idx);
         self.body.ser(out, idx)
     }
+}
+
+#[inline]
+pub fn parse_super_page(
+    buf: &[u8],
+    expected_magic_word: [u8; 8],
+    expected_version: u64,
+) -> Result<SuperPage> {
+    let (body_start, header) = SuperPageHeader::deser(buf, 0)?;
+    if header.magic_word != expected_magic_word {
+        return Err(Error::InvalidFormat);
+    }
+    if header.version != expected_version {
+        return Err(Error::InvalidFormat);
+    }
+    let (_, footer) = SuperPageFooter::deser(buf, SUPER_PAGE_FOOTER_OFFSET)?;
+    if header.checkpoint_cts != footer.checkpoint_cts {
+        return Err(Error::TornWrite);
+    }
+    let b3sum = blake3::hash(&buf[..SUPER_PAGE_FOOTER_OFFSET]);
+    if b3sum != footer.b3sum {
+        return Err(Error::ChecksumMismatch);
+    }
+    let (_, body) = SuperPageBody::deser(buf, body_start)?;
+    Ok(SuperPage {
+        header,
+        body,
+        footer,
+    })
 }
 
 #[cfg(test)]

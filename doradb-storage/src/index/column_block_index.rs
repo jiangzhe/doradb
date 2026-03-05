@@ -2,9 +2,8 @@ use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{BufferPage, PageID};
 use crate::error::{Error, Result};
-#[cfg(test)]
-use crate::file::table_file::TableFile;
-use crate::file::table_file::{MutableTableFile, TABLE_FILE_PAGE_SIZE};
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::file::table_file::MutableTableFile;
 use crate::index::column_deletion_blob::{
     COLUMN_DELETION_BLOB_PAGE_BODY_SIZE, ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
 };
@@ -14,10 +13,8 @@ use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
-#[cfg(test)]
-use std::sync::Arc;
 
-pub const COLUMN_BLOCK_PAGE_SIZE: usize = TABLE_FILE_PAGE_SIZE;
+pub const COLUMN_BLOCK_PAGE_SIZE: usize = COW_FILE_PAGE_SIZE;
 pub const COLUMN_BLOCK_HEADER_SIZE: usize = mem::size_of::<ColumnBlockNodeHeader>();
 pub const COLUMN_BLOCK_DATA_SIZE: usize = COLUMN_BLOCK_PAGE_SIZE - COLUMN_BLOCK_HEADER_SIZE;
 pub const COLUMN_PAGE_PAYLOAD_SIZE: usize = mem::size_of::<ColumnPagePayload>();
@@ -1200,23 +1197,6 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 }
 
-#[cfg(test)]
-#[inline]
-async fn read_node_from_file(
-    table_file: &TableFile,
-    page_id: PageID,
-) -> Result<Box<ColumnBlockNode>> {
-    let buf = table_file.read_page(page_id).await?;
-    let src = buf.data();
-    let header = cast_slice::<u8, ColumnBlockNodeHeader>(&src[..COLUMN_BLOCK_HEADER_SIZE])[0];
-    let mut node = ColumnBlockNode::new_boxed(header.height, header.start_row_id, header.create_ts);
-    node.header = header;
-    node.data
-        .copy_from_slice(&src[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_PAGE_SIZE]);
-    table_file.buf_list().recycle(buf);
-    Ok(node)
-}
-
 struct NodeAppendResult {
     new_page_id: PageID,
     start_row_id: RowID,
@@ -1257,9 +1237,34 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableMetadata,
     };
+    use crate::file::table_file::TableFile;
     use crate::file::table_fs::TableFileSystemConfig;
+    use crate::io::AIOBuf;
+    use crate::ptr::UnsafePtr;
     use crate::value::ValKind;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
+
+    #[inline]
+    async fn read_node_from_file(
+        table_file: &TableFile,
+        page_id: PageID,
+    ) -> Result<Box<ColumnBlockNode>> {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        // SAFETY: `DirectBuf` is sector-aligned and remains alive until async read completes.
+        unsafe {
+            table_file
+                .read_page_into_ptr(page_id, UnsafePtr(buf.as_bytes_mut().as_mut_ptr()))
+                .await?;
+        }
+        let src = buf.as_bytes();
+        let header = cast_slice::<u8, ColumnBlockNodeHeader>(&src[..COLUMN_BLOCK_HEADER_SIZE])[0];
+        let mut node =
+            ColumnBlockNode::new_boxed(header.height, header.start_row_id, header.create_ts);
+        node.header = header;
+        node.data
+            .copy_from_slice(&src[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_PAGE_SIZE]);
+        Ok(node)
+    }
 
     #[test]
     fn test_column_block_node_size() {

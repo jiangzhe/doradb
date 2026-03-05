@@ -26,10 +26,21 @@ pub type ObjID = u64;
 pub type TableID = ObjID;
 pub type ColumnID = ObjID;
 pub type IndexID = ObjID;
+pub const USER_OBJ_ID_START: ObjID = 0x0001_0000_0000_0000;
+
+#[inline]
+pub const fn is_user_obj_id(obj_id: ObjID) -> bool {
+    obj_id >= USER_OBJ_ID_START
+}
+
+#[inline]
+pub const fn is_catalog_obj_id(obj_id: ObjID) -> bool {
+    !is_user_obj_id(obj_id)
+}
 
 /// Catalog contains metadata of user tables.
 pub struct Catalog {
-    obj_id: AtomicU64,
+    next_user_obj_id: AtomicU64,
     pub cache: CatalogCache,
     pub storage: CatalogStorage,
 }
@@ -38,31 +49,37 @@ impl Catalog {
     #[inline]
     pub fn new(storage: CatalogStorage) -> Self {
         let mut cache = CatalogCache::new();
-        let obj_id = storage.len() as u64;
+        let next_user_obj_id = storage.next_user_obj_id();
         for (table_id, table) in storage.all() {
             cache.tables.get_mut().insert(table_id, table);
         }
         Catalog {
-            obj_id: AtomicU64::new(obj_id),
+            next_user_obj_id: AtomicU64::new(next_user_obj_id),
             cache,
             storage,
         }
     }
 
     #[inline]
-    pub fn next_obj_id(&self) -> u64 {
-        self.obj_id.fetch_add(1, Ordering::SeqCst)
+    pub fn next_user_obj_id(&self) -> ObjID {
+        self.next_user_obj_id.fetch_add(1, Ordering::SeqCst)
     }
 
     #[inline]
-    fn try_update_obj_id(&self, next_obj_id: u64) {
-        self.obj_id.fetch_max(next_obj_id, Ordering::SeqCst);
+    fn try_update_next_user_obj_id(&self, next_user_obj_id: ObjID) {
+        self.next_user_obj_id
+            .fetch_max(next_user_obj_id, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn curr_next_user_obj_id(&self) -> ObjID {
+        self.next_user_obj_id.load(Ordering::Acquire)
     }
 
     /// Returns whether a table is user table.
     #[inline]
     pub fn is_user_table(&self, table_id: TableID) -> bool {
-        table_id as usize >= self.storage.len()
+        is_user_obj_id(table_id)
     }
 
     /// Enable page committer for tables, excluding catalog tables.
@@ -116,7 +133,9 @@ impl Catalog {
                 if let Some(index_id) = indexes.iter().map(|i| i.index_id).max() {
                     max_obj_id = max_obj_id.max(index_id);
                 }
-                self.try_update_obj_id(max_obj_id.saturating_add(1));
+                self.try_update_next_user_obj_id(
+                    max_obj_id.saturating_add(1).max(USER_OBJ_ID_START),
+                );
 
                 let mut index_specs = vec![];
                 for index in indexes {
@@ -267,9 +286,11 @@ impl<'a> TableCache<'a> {
 pub mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
-    use crate::engine::Engine;
+    use crate::engine::{Engine, EngineConfig};
+    use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::ValKind;
     use semistr::SemiStr;
+    use tempfile::TempDir;
 
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
@@ -400,5 +421,71 @@ pub mod tests {
 
         drop(session);
         table_id
+    }
+
+    #[test]
+    fn test_catalog_user_obj_id_boundary_predicates() {
+        assert!(is_catalog_obj_id(USER_OBJ_ID_START - 1));
+        assert!(!is_catalog_obj_id(USER_OBJ_ID_START));
+        assert!(!is_user_obj_id(USER_OBJ_ID_START - 1));
+        assert!(is_user_obj_id(USER_OBJ_ID_START));
+    }
+
+    #[test]
+    fn test_bootstrap_creates_catalog_mtb_without_catalog_tbl_files() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
+                .trx(TrxSysConfig::default().skip_recovery(true))
+                .build()
+                .await
+                .unwrap();
+            drop(engine);
+
+            let data_dir = temp_dir.path();
+            assert!(data_dir.join("catalog.mtb").exists());
+            for table_id in 0..4u64 {
+                assert!(!data_dir.join(format!("{table_id}.tbl")).exists());
+            }
+        });
+    }
+
+    #[test]
+    fn test_next_user_obj_id_monotonic_across_restart() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-allocator")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(engine.catalog().curr_next_user_obj_id(), USER_OBJ_ID_START);
+            let table_id1 = table1(&engine).await;
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-allocator")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+            let table_id2 = table1(&engine).await;
+            assert!(table_id1 >= USER_OBJ_ID_START);
+            assert!(table_id2 > table_id1);
+            drop(engine);
+        });
     }
 }

@@ -72,8 +72,8 @@ impl Session {
 
         let engine = self.state.engine().clone();
         // 1. Prepare a new table file.
-        //    Use <table-id>.tbl as table name
-        let table_id = engine.catalog().next_obj_id();
+        //    User table file name is <table-id:016x>.tbl
+        let table_id = engine.catalog().next_user_obj_id();
 
         let metadata = Arc::new(TableMetadata::new(
             table_spec.columns.clone(),
@@ -91,7 +91,7 @@ impl Session {
             .iter()
             .enumerate()
             .map(|(col_no, col_spec)| ColumnObject {
-                column_id: engine.catalog().next_obj_id(),
+                column_id: engine.catalog().next_user_obj_id(),
                 column_name: col_spec.column_name.clone(),
                 table_id,
                 column_no: col_no as u16,
@@ -104,7 +104,7 @@ impl Session {
         let mut index_column_objects = vec![];
 
         for index_spec in &index_specs {
-            let index_id = engine.catalog().next_obj_id();
+            let index_id = engine.catalog().next_user_obj_id();
             index_objects.push(IndexObject {
                 index_id,
                 table_id,
