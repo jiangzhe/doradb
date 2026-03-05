@@ -74,6 +74,37 @@ Reference:
 
 ## Implementation Notes
 
+Implemented Phase 1 foundations: unified `catalog.mtb` persistence, explicit catalog/user object-id boundary with user-id allocator, and deterministic 16-hex user table file naming.
+
+1. Added explicit id-range boundary and predicates in catalog runtime:
+   - `USER_OBJ_ID_START`, `is_user_obj_id`, `is_catalog_obj_id`
+   - user object allocation via `Catalog::next_user_obj_id()`
+   - startup allocator repair via replayed max object-id to avoid regression before later replay-cutoff phases.
+2. Rewired DDL allocation call sites in session layer to use user allocator for table/column/index ids.
+3. Added table-file naming split in table file system:
+   - user table ids (`>= USER_OBJ_ID_START`) use `<016x>.tbl`
+   - reserved/catalog ids keep compact decimal naming
+   - unified catalog file path API with configurable `.mtb` filename and validation.
+4. Introduced unified catalog file primitives:
+   - `MultiTableFile` over CoW file mechanics
+   - `catalog.mtb` magic/version/superpage+meta-page validation
+   - atomic publish path for allocator watermark and reserved catalog table roots.
+5. Rewired catalog bootstrap to open/create `catalog.mtb`, load snapshot, and persist checkpoint metadata through multi-table publish path.
+6. Stopped persisted dependency on per-catalog-table files in new-cluster flow:
+   - catalog table files are created only as transitional runtime scratch and unlinked immediately
+   - persisted catalog state is `catalog.mtb`.
+7. Added/updated tests covering the phase goals:
+   - `catalog::tests::test_catalog_user_obj_id_boundary_predicates`
+   - `catalog::tests::test_bootstrap_creates_catalog_mtb_without_catalog_tbl_files`
+   - `catalog::tests::test_next_user_obj_id_monotonic_across_restart`
+   - `file::table_fs::tests::test_user_table_file_uses_hex_name`
+   - `file::table_fs::tests::test_catalog_file_name_default_and_custom_path`
+   - `file::table_fs::tests::test_catalog_file_name_validation`
+   - `file::multi_table_file::*` meta/super-page mismatch and CoW publish tests.
+8. Validation executed during implementation:
+   - `cargo fmt --all`
+   - `cargo test -p doradb-storage --no-default-features`
+   - test result: pass.
 
 ## Impacts
 
@@ -96,4 +127,5 @@ Reference:
 
 ## Open Questions
 
-None.
+1. Catalog tables still pass through legacy `Table`/`TableFile` bootstrap path as transitional runtime scratch before unlink.
+   - Follow-up backlog: `docs/backlogs/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md`

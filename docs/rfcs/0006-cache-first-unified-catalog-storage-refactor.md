@@ -170,8 +170,8 @@ Reference:
   - Non-goals: no schema/key refactor yet.
   - Task Doc: `docs/tasks/000048-catalog-file-id-foundation.md`
   - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 1 foundations: unified `catalog.mtb` persistence, explicit catalog/user object-id boundary with user-id allocator, and deterministic 16-hex user table file naming. [Task Resolve Sync: docs/tasks/000048-catalog-file-id-foundation.md @ 2026-03-05]
 
 - **Phase 2: Catalog Logical Schema Refactor**
   - Scope: migrate `columns`/`indexes`/`index_columns` schemas and object structs to table-scoped composite keys; update DDL write paths and reload logic.
