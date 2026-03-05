@@ -107,7 +107,6 @@ impl ActiveRoot {
             &self.gc_page_list,
             self.pivot_row_id,
             self.heap_redo_start_ts,
-            0,
         )
     }
 }

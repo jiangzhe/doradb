@@ -22,8 +22,6 @@ pub struct MetaPage {
     pub pivot_row_id: RowID,
     /// Earliest redo timestamp required to recover in-memory heap.
     pub heap_redo_start_ts: TrxID,
-    /// Reserved delta-recovery timestamp field.
-    pub delta_rec_ts: TrxID,
     /// Table schema metadata.
     pub schema: TableMetadata,
     /// Root page id of column block index.
@@ -39,9 +37,7 @@ impl Deser for MetaPage {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, pivot_row_id) = input.deser_u64(start_idx)?;
         let (idx, heap_redo_start_ts) = input.deser_u64(idx)?;
-        let (idx, delta_rec_ts) = input.deser_u64(idx)?;
-        let (idx, alloc_map) = AllocMap::deser(input, idx)?;
-        let (idx, gc_page_list) = LwcPrimitiveDeser::<PageID>::deser(input, idx)?;
+        let (idx, space) = AllocMapGcList::deser(input, idx)?;
         let (idx, meta) = TableBriefMetadata::deser(input, idx)?;
         let (idx, column_block_index_root) = input.deser_u64(idx)?;
         Ok((
@@ -49,11 +45,10 @@ impl Deser for MetaPage {
             MetaPage {
                 pivot_row_id,
                 heap_redo_start_ts,
-                delta_rec_ts,
                 schema: TableMetadata::from(meta),
                 column_block_index_root,
-                alloc_map,
-                gc_page_list: gc_page_list.0,
+                alloc_map: space.alloc_map,
+                gc_page_list: space.gc_page_list,
             },
         ))
     }
@@ -68,8 +63,6 @@ pub struct MetaPageSerView<'a> {
     pub pivot_row_id: RowID,
     /// Earliest redo timestamp required to recover in-memory heap.
     pub heap_redo_start_ts: TrxID,
-    /// Reserved delta-recovery timestamp field.
-    pub delta_rec_ts: TrxID,
     /// Compact schema serialization view.
     pub schema: TableBriefMetadataSerView<'a>,
     /// Root page id of column block index.
@@ -89,12 +82,10 @@ impl<'a> MetaPageSerView<'a> {
         gc_page_list: &'a [PageID],
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
-        delta_rec_ts: TrxID,
     ) -> Self {
         MetaPageSerView {
             pivot_row_id,
             heap_redo_start_ts,
-            delta_rec_ts,
             schema,
             column_block_index_root,
             space: AllocMapGcListSerView::new(alloc_map, gc_page_list),
@@ -107,7 +98,6 @@ impl<'a> Ser<'a> for MetaPageSerView<'a> {
     fn ser_len(&self) -> usize {
         mem::size_of::<RowID>()
             + mem::size_of::<TrxID>()
-            + mem::size_of::<TrxID>()
             + self.space.ser_len()
             + self.schema.ser_len()
             + mem::size_of::<PageID>()
@@ -117,7 +107,6 @@ impl<'a> Ser<'a> for MetaPageSerView<'a> {
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = out.ser_u64(start_idx, self.pivot_row_id);
         let idx = out.ser_u64(idx, self.heap_redo_start_ts);
-        let idx = out.ser_u64(idx, self.delta_rec_ts);
         let idx = self.space.ser(out, idx);
         let idx = self.schema.ser(out, idx);
         out.ser_u64(idx, self.column_block_index_root)
@@ -355,6 +344,5 @@ mod tests {
         assert_eq!(meta_page.gc_page_list, active_root.gc_page_list);
         assert_eq!(meta_page.pivot_row_id, active_root.pivot_row_id);
         assert_eq!(meta_page.heap_redo_start_ts, active_root.heap_redo_start_ts);
-        assert_eq!(meta_page.delta_rec_ts, 0);
     }
 }
