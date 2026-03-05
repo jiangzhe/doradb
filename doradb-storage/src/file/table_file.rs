@@ -295,18 +295,6 @@ impl MutableTableFile {
         &self.new_root
     }
 
-    /// Returns mutable reference to mutable root snapshot.
-    #[inline]
-    pub fn root_mut(&mut self) -> &mut ActiveRoot {
-        &mut self.new_root
-    }
-
-    /// Returns wrapped table file.
-    #[inline]
-    pub fn file(&self) -> &Arc<TableFile> {
-        &self.file
-    }
-
     /// Consume mutable handle and return wrapped table file.
     #[inline]
     pub fn into_file(self) -> Arc<TableFile> {

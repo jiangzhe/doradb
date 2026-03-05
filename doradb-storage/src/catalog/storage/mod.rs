@@ -70,6 +70,11 @@ impl CatalogStorage {
 
             // Catalog table files are only runtime scratch structures today.
             // Persistent catalog state is managed by catalog.mtb.
+            //
+            // TODO(RFC-0006 phase 3+): remove this unlink path once catalog
+            // tables are fully in-memory. That change likely requires
+            // reshaping `Table` so catalog tables no longer depend on legacy
+            // `TableFile`, and no old-style `*.tbl` files are created.
             let _ = std::fs::remove_file(table_fs.table_file_path(*table_id));
             cat.push(table);
         }
