@@ -25,7 +25,10 @@ pub struct TableFileSystem {
 }
 
 impl TableFileSystem {
-    /// Create a new table file system.
+    /// Create a new table-file subsystem.
+    ///
+    /// This initializes one async IO context, its event loop thread, and a
+    /// shared direct-buffer free list for table and catalog files.
     #[inline]
     pub fn new(io_depth: usize, base_dir: String, catalog_file_name: String) -> Result<Self> {
         let ctx = AIOContext::new(io_depth)?;
@@ -77,6 +80,10 @@ impl TableFileSystem {
         Ok(Arc::new(table_file))
     }
 
+    /// Build file path for a logical table id.
+    ///
+    /// User table ids use fixed-width hex naming (`<016x>.tbl`), while
+    /// reserved/catalog ids keep compact decimal names.
     #[inline]
     pub fn table_file_path(&self, table_id: TableID) -> String {
         if table_id >= USER_OBJ_ID_START {
@@ -86,6 +93,7 @@ impl TableFileSystem {
         }
     }
 
+    /// Build absolute path for the unified catalog file (`*.mtb`).
     #[inline]
     pub fn catalog_mtb_file_path(&self) -> String {
         format!("{}/{}", self.base_dir, self.catalog_file_name)
@@ -131,6 +139,7 @@ pub struct TableFileSystemConfig {
 }
 
 impl TableFileSystemConfig {
+    /// Prefix `base_dir` with a repository/runtime main directory.
     #[inline]
     pub fn with_main_dir(mut self, main_dir: impl AsRef<Path>) -> Self {
         let base_dir = main_dir.as_ref().join(&self.base_dir);
@@ -138,30 +147,35 @@ impl TableFileSystemConfig {
         self
     }
 
+    /// Set async IO queue depth used by table-file subsystem.
     #[inline]
     pub fn io_depth(mut self, io_depth: usize) -> Self {
         self.io_depth = io_depth;
         self
     }
 
+    /// Set data directory used for table and catalog files.
     #[inline]
     pub fn data_dir(mut self, base_dir: impl Into<String>) -> Self {
         self.base_dir = base_dir.into();
         self
     }
 
+    /// Set global readonly-buffer-pool size in bytes.
     #[inline]
     pub fn readonly_buffer_size(mut self, readonly_buffer_size: usize) -> Self {
         self.readonly_buffer_size = readonly_buffer_size;
         self
     }
 
+    /// Set unified catalog file name under `base_dir` (must end with `.mtb`).
     #[inline]
     pub fn catalog_file_name(mut self, catalog_file_name: impl Into<String>) -> Self {
         self.catalog_file_name = catalog_file_name.into();
         self
     }
 
+    /// Validate config and construct a [`TableFileSystem`].
     #[inline]
     pub fn build(self) -> Result<TableFileSystem> {
         if !validate_catalog_file_name(&self.catalog_file_name) {
