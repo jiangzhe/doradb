@@ -127,6 +127,9 @@ impl Indexes<'_> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(0, |metadata, row| {
+                if row.is_deleted() {
+                    return true;
+                }
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = row.val(metadata, COL_NO_INDEXES_TABLE_ID).as_u64().unwrap();
                 if table_id_in_row == table_id {
@@ -273,6 +276,9 @@ impl IndexColumns<'_> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(0, |metadata, row| {
+                if row.is_deleted() {
+                    return true;
+                }
                 let table_id_in_row = row
                     .val(metadata, COL_NO_INDEX_COLUMNS_TABLE_ID)
                     .as_u64()
@@ -285,5 +291,160 @@ impl IndexColumns<'_> {
             })
             .await;
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use crate::trx::sys_conf::TrxSysConfig;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_indexes_delete_by_id() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(TrxSysConfig::default().skip_recovery(true))
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session();
+
+            let idx_42_0 = IndexObject {
+                table_id: 42,
+                index_no: 0,
+                index_name: SemiStr::new("pk"),
+                index_attributes: IndexAttributes::PK,
+            };
+            let idx_42_1 = IndexObject {
+                table_id: 42,
+                index_no: 1,
+                index_name: SemiStr::new("k1"),
+                index_attributes: IndexAttributes::empty(),
+            };
+            let idx_43_0 = IndexObject {
+                table_id: 43,
+                index_no: 0,
+                index_name: SemiStr::new("pk"),
+                index_attributes: IndexAttributes::PK,
+            };
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .insert(&mut stmt, &idx_42_0)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .insert(&mut stmt, &idx_42_1)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .insert(&mut stmt, &idx_43_0)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(&mut stmt, 42, 1)
+                    .await
+            );
+            assert!(
+                !engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(&mut stmt, 42, 9)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            let idx_42 = engine
+                .catalog()
+                .storage
+                .indexes()
+                .list_uncommitted_by_table_id(42)
+                .await;
+            assert_eq!(idx_42.len(), 1);
+            assert_eq!(idx_42[0].index_no, 0);
+
+            let idx_43 = engine
+                .catalog()
+                .storage
+                .indexes()
+                .list_uncommitted_by_table_id(43)
+                .await;
+            assert_eq!(idx_43.len(), 1);
+            assert_eq!(idx_43[0].index_no, 0);
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                !engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(&mut stmt, 42, 1)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(&mut stmt, 42, 0)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(&mut stmt, 43, 0)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .list_uncommitted_by_table_id(42)
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .list_uncommitted_by_table_id(43)
+                    .await
+                    .is_empty()
+            );
+
+            drop(session);
+            drop(engine);
+        });
     }
 }

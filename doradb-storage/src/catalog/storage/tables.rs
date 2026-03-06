@@ -75,3 +75,88 @@ impl Tables<'_> {
             .is_ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use crate::trx::sys_conf::TrxSysConfig;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_tables_delete_by_id() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(TrxSysConfig::default().skip_recovery(true))
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session();
+
+            let table100 = TableObject { table_id: 100 };
+            let table101 = TableObject { table_id: 101 };
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .insert(&mut stmt, &table100)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .insert(&mut stmt, &table101)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .delete_by_id(&mut stmt, table100.table_id)
+                    .await
+            );
+            assert!(
+                !engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .delete_by_id(&mut stmt, 999)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .find_uncommitted_by_id(table100.table_id)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .find_uncommitted_by_id(table101.table_id)
+                    .await
+                    .is_some()
+            );
+
+            drop(session);
+            drop(engine);
+        });
+    }
+}
