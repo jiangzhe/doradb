@@ -91,10 +91,9 @@ impl Session {
             .iter()
             .enumerate()
             .map(|(col_no, col_spec)| ColumnObject {
-                column_id: engine.catalog().next_user_obj_id(),
-                column_name: col_spec.column_name.clone(),
                 table_id,
                 column_no: col_no as u16,
+                column_name: col_spec.column_name.clone(),
                 column_type: col_spec.column_type,
                 column_attributes: col_spec.column_attributes,
             })
@@ -103,21 +102,19 @@ impl Session {
         let mut index_objects = vec![];
         let mut index_column_objects = vec![];
 
-        for index_spec in &index_specs {
-            let index_id = engine.catalog().next_user_obj_id();
+        for (index_no, index_spec) in index_specs.iter().enumerate() {
             index_objects.push(IndexObject {
-                index_id,
                 table_id,
+                index_no: index_no as u16,
                 index_name: index_spec.index_name.clone(),
                 index_attributes: index_spec.index_attributes,
             });
             for (index_column_no, ik) in index_spec.index_cols.iter().enumerate() {
-                let column = &column_objects[ik.col_no as usize];
                 index_column_objects.push(IndexColumnObject {
-                    column_id: column.column_id,
-                    index_id,
-                    column_no: column.column_no,
+                    table_id,
+                    index_no: index_no as u16,
                     index_column_no: index_column_no as u16,
+                    column_no: ik.col_no,
                     index_order: ik.order,
                 });
             }

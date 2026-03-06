@@ -16,7 +16,7 @@ use crate::lifetime::StaticLifetime;
 use crate::table::Table;
 use crate::trx::sys::TransactionSystem;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -105,48 +105,54 @@ impl Catalog {
         let res = self.storage.tables().find_uncommitted_by_id(table_id).await;
         match res {
             Some(table) => {
-                // A table creation involves table, column and index.
-                // Find the maximum existing object id and then move allocator to next id.
-                let mut max_obj_id = table.table_id;
+                // Phase 2 allocator semantics: only table ids consume global user object ids.
+                self.try_update_next_user_obj_id(
+                    table.table_id.saturating_add(1).max(USER_OBJ_ID_START),
+                );
 
                 // todo: use secondary index to improve performance
-                let columns = self
+                let mut columns = self
                     .storage
                     .columns()
                     .list_uncommitted_by_table_id(table_id)
                     .await;
                 debug_assert!(!columns.is_empty());
-                if let Some(column_id) = columns.iter().map(|c| c.column_id).max() {
-                    max_obj_id = max_obj_id.max(column_id);
-                }
+                columns.sort_by_key(|c| c.column_no);
 
                 let column_specs = columns
                     .into_iter()
                     .map(|c| ColumnSpec::new(&c.column_name, c.column_type, c.column_attributes))
                     .collect::<Vec<_>>();
 
-                let indexes = self
+                let mut indexes = self
                     .storage
                     .indexes()
                     .list_uncommitted_by_table_id(table_id)
                     .await;
-                if let Some(index_id) = indexes.iter().map(|i| i.index_id).max() {
-                    max_obj_id = max_obj_id.max(index_id);
+                indexes.sort_by_key(|index| index.index_no);
+
+                let mut index_columns = self
+                    .storage
+                    .index_columns()
+                    .list_uncommitted_by_table_id(table_id)
+                    .await;
+                index_columns.sort_by_key(|ic| (ic.index_no, ic.index_column_no));
+                let mut index_columns_by_index_no: BTreeMap<u16, Vec<IndexColumnObject>> =
+                    BTreeMap::new();
+                for index_column in index_columns {
+                    index_columns_by_index_no
+                        .entry(index_column.index_no)
+                        .or_default()
+                        .push(index_column);
                 }
-                self.try_update_next_user_obj_id(
-                    max_obj_id.saturating_add(1).max(USER_OBJ_ID_START),
-                );
 
                 let mut index_specs = vec![];
                 for index in indexes {
-                    let mut index_columns = self
-                        .storage
-                        .index_columns()
-                        .list_uncommitted_by_index_id(index.index_id)
-                        .await;
-                    index_columns.sort_by_key(|ic| ic.index_column_no);
                     let mut index_cols = vec![];
-                    for index_column in index_columns {
+                    for index_column in index_columns_by_index_no
+                        .remove(&index.index_no)
+                        .unwrap_or_default()
+                    {
                         let ik = IndexKey {
                             col_no: index_column.column_no,
                             order: index_column.index_order,
@@ -469,7 +475,41 @@ pub mod tests {
                 .await
                 .unwrap();
             assert_eq!(engine.catalog().curr_next_user_obj_id(), USER_OBJ_ID_START);
-            let table_id1 = table1(&engine).await;
+            let mut session = engine.new_session();
+            let table_spec = TableSpec {
+                columns: vec![
+                    ColumnSpec {
+                        column_name: SemiStr::new("id"),
+                        column_type: ValKind::I32,
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                    ColumnSpec {
+                        column_name: SemiStr::new("k1"),
+                        column_type: ValKind::I32,
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                    ColumnSpec {
+                        column_name: SemiStr::new("k2"),
+                        column_type: ValKind::I32,
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                ],
+            };
+            let index_specs = vec![
+                IndexSpec::new(
+                    "idx_allocator_pk",
+                    vec![IndexKey::new(0)],
+                    IndexAttributes::PK,
+                ),
+                IndexSpec::new(
+                    "idx_allocator_k12",
+                    vec![IndexKey::new(1), IndexKey::new(2)],
+                    IndexAttributes::empty(),
+                ),
+            ];
+            let table_id1 = session.create_table(table_spec, index_specs).await.unwrap();
+            assert_eq!(engine.catalog().curr_next_user_obj_id(), table_id1 + 1);
+            drop(session);
             drop(engine);
 
             let engine = EngineConfig::default()
@@ -482,9 +522,10 @@ pub mod tests {
                 .build()
                 .await
                 .unwrap();
+            assert_eq!(engine.catalog().curr_next_user_obj_id(), table_id1 + 1);
             let table_id2 = table1(&engine).await;
             assert!(table_id1 >= USER_OBJ_ID_START);
-            assert!(table_id2 > table_id1);
+            assert_eq!(table_id2, table_id1 + 1);
             drop(engine);
         });
     }

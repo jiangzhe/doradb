@@ -14,8 +14,8 @@ use std::sync::OnceLock;
 pub const TABLE_ID_TABLES: TableID = 0;
 const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
-const INDEX_NO_TABLES_TABLE_ID: usize = 0;
-const INDEX_NAME_TABLES_TABLE_ID: &str = "idx_tables_table_id";
+const PK_NO_TABLES: usize = 0;
+const PK_NAME_TABLES: &str = "pk_tables";
 
 pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
@@ -32,12 +32,8 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                     },
                 ],
                 vec![
-                    // primary key idx_tables_table_id (table_id)
-                    IndexSpec::new(
-                        INDEX_NAME_TABLES_TABLE_ID,
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    ),
+                    // primary key pk_tables (table_id)
+                    IndexSpec::new(PK_NAME_TABLES, vec![IndexKey::new(0)], IndexAttributes::PK),
                 ],
             ),
         }
@@ -58,7 +54,7 @@ impl Tables<'_> {
     /// Find a table by id.
     #[inline]
     pub async fn find_uncommitted_by_id(&self, table_id: TableID) -> Option<TableObject> {
-        let key = SelectKey::new(INDEX_NO_TABLES_TABLE_ID, vec![Val::from(table_id)]);
+        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
         self.table
             .index_lookup_unique_uncommitted(&key, row_to_table_object)
             .await
@@ -72,7 +68,7 @@ impl Tables<'_> {
 
     /// Delete a table by id.
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: TableID) -> bool {
-        let key = SelectKey::new(INDEX_NO_TABLES_TABLE_ID, vec![Val::from(id)]);
+        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
         self.table
             .delete_unique_mvcc(stmt, &key, true)
             .await

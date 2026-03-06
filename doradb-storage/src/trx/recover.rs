@@ -424,7 +424,8 @@ impl<'a> LogRecovery<'a> {
 mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
+        TableMetadata, TableSpec,
     };
     use crate::engine::EngineConfig;
     use crate::row::RowRead;
@@ -485,19 +486,26 @@ mod tests {
             let table_spec = TableSpec::new(vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+                ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
             ]);
+            let index_specs = vec![
+                IndexSpec::new("idx_t1_pk", vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(
+                    "idx_t1_c1_c2",
+                    vec![
+                        IndexKey {
+                            col_no: 1,
+                            order: IndexOrder::Desc,
+                        },
+                        IndexKey::new(2),
+                    ],
+                    IndexAttributes::empty(),
+                ),
+            ];
+            let expected_metadata =
+                TableMetadata::new(table_spec.columns.clone(), index_specs.clone());
 
-            let table_id = session
-                .create_table(
-                    table_spec,
-                    vec![IndexSpec::new(
-                        "idx_t1_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
-                )
-                .await
-                .unwrap();
+            let table_id = session.create_table(table_spec, index_specs).await.unwrap();
 
             drop(session);
             drop(engine);
@@ -520,6 +528,8 @@ mod tests {
                 .unwrap();
 
             assert!(engine.catalog().get_table(table_id).await.is_some());
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert_eq!(&*table.file.active_root().metadata, &expected_metadata);
 
             drop(engine);
         })
