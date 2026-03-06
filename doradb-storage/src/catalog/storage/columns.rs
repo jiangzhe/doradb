@@ -1,9 +1,7 @@
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::TableMetadata;
-use crate::catalog::{
-    ColumnAttributes, ColumnID, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID,
-};
+use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
@@ -14,30 +12,18 @@ use semistr::SemiStr;
 use std::sync::OnceLock;
 
 pub const TABLE_ID_COLUMNS: TableID = 1;
-const COL_NO_COLUMNS_COLUMN_ID: usize = 0;
-const COL_NAME_COLUMNS_COLUMN_ID: &str = "column_id";
-const COL_NO_COLUMNS_TABLE_ID: usize = 1;
+const COL_NO_COLUMNS_TABLE_ID: usize = 0;
 const COL_NAME_COLUMNS_TABLE_ID: &str = "table_id";
+const COL_NO_COLUMNS_COLUMN_NO: usize = 1;
+const COL_NAME_COLUMNS_COLUMN_NO: &str = "column_no";
 const COL_NO_COLUMNS_COLUMN_NAME: usize = 2;
 const COL_NAME_COLUMNS_COLUMN_NAME: &str = "column_name";
-const COL_NO_COLUMNS_COLUMN_NO: usize = 3;
-const COL_NAME_COLUMNS_COLUMN_NO: &str = "column_no";
-const COL_NO_COLUMNS_COLUMN_TYPE: usize = 4;
+const COL_NO_COLUMNS_COLUMN_TYPE: usize = 3;
 const COL_NAME_COLUMNS_COLUMN_TYPE: &str = "column_type";
-const COL_NO_COLUMNS_COLUMN_ATTRIBUTES: usize = 5;
+const COL_NO_COLUMNS_COLUMN_ATTRIBUTES: usize = 4;
 const COL_NAME_COLUMNS_COLUMN_ATTRIBUTES: &str = "column_attributes";
-const INDEX_NO_COLUMNS_COLUMN_ID: usize = 0;
-const INDEX_NAME_COLUMNS_COLUMN_ID: &str = "idx_columns_column_id";
-#[expect(
-    dead_code,
-    reason = "reserved for planned non-unique index on columns.table_id"
-)]
-const INDEX_NO_COLUMNS_TABLE_ID: usize = 1;
-#[expect(
-    dead_code,
-    reason = "reserved for planned non-unique index on columns.table_id"
-)]
-const INDEX_NAME_COLUMNS_TABLE_ID: &str = "idx_columns_table_id";
+const PK_NO_COLUMNS: usize = 0;
+const PK_NAME_COLUMNS: &str = "pk_columns";
 
 pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
@@ -46,28 +32,22 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
             table_id: TABLE_ID_COLUMNS,
             metadata: TableMetadata::new(
                 vec![
-                    // column_id unsigned bigint primary key not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_ID),
-                        column_type: ValKind::U64,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
                     // table_id unsigned bigint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_TABLE_ID),
                         column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
-                    // column_name string not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_NAME),
-                        column_type: ValKind::VarByte,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
                     // column_no unsigned smallint not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_NO),
                         column_type: ValKind::U16,
+                        column_attributes: ColumnAttributes::INDEX,
+                    },
+                    // column_name string not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_COLUMNS_COLUMN_NAME),
+                        column_type: ValKind::VarByte,
                         column_attributes: ColumnAttributes::empty(),
                     },
                     // column_type unsgined int not null
@@ -84,18 +64,12 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
                     },
                 ],
                 vec![
-                    // primary key idx_columns_column_id (column_id)
+                    // primary key pk_columns (table_id, column_no)
                     IndexSpec::new(
-                        INDEX_NAME_COLUMNS_COLUMN_ID,
-                        vec![IndexKey::new(0)],
+                        PK_NAME_COLUMNS,
+                        vec![IndexKey::new(0), IndexKey::new(1)],
                         IndexAttributes::PK,
                     ),
-                    // todo: non-unique key idx_columns_table_id (table_id)
-                    // IndexSpec::new(
-                    //     INDEX_NAME_COLUMNS_TABLE_ID,
-                    //     vec![IndexKey::new(1)],
-                    //     IndexAttributes::empty(),
-                    // ),
                 ],
             ),
         }
@@ -104,16 +78,12 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
 
 #[inline]
 fn row_to_column_object(metadata: &TableMetadata, row: Row<'_>) -> ColumnObject {
-    let column_id = row
-        .val(metadata, COL_NO_COLUMNS_COLUMN_ID)
-        .as_u64()
-        .unwrap();
     let table_id = row.val(metadata, COL_NO_COLUMNS_TABLE_ID).as_u64().unwrap();
-    let column_name = row.str(COL_NO_COLUMNS_COLUMN_NAME).unwrap();
     let column_no = row
         .val(metadata, COL_NO_COLUMNS_COLUMN_NO)
         .as_u16()
         .unwrap();
+    let column_name = row.str(COL_NO_COLUMNS_COLUMN_NAME).unwrap();
     let column_type = row
         .val(metadata, COL_NO_COLUMNS_COLUMN_TYPE)
         .as_u32()
@@ -123,10 +93,9 @@ fn row_to_column_object(metadata: &TableMetadata, row: Row<'_>) -> ColumnObject 
         .as_u32()
         .unwrap();
     ColumnObject {
-        column_id,
         table_id,
-        column_name: SemiStr::new(column_name),
         column_no,
+        column_name: SemiStr::new(column_name),
         column_type: ValKind::try_from(column_type as u8).unwrap(),
         column_attributes: ColumnAttributes::from_bits_truncate(column_attributes),
     }
@@ -140,10 +109,9 @@ impl Columns<'_> {
     /// Insert a column.
     pub async fn insert(&self, stmt: &mut Statement, obj: &ColumnObject) -> bool {
         let cols = vec![
-            Val::from(obj.column_id),
             Val::from(obj.table_id),
-            Val::from(obj.column_name.as_str()),
             Val::from(obj.column_no),
+            Val::from(obj.column_name.as_str()),
             Val::from(obj.column_type as u32),
             Val::from(obj.column_attributes.bits()),
         ];
@@ -154,6 +122,9 @@ impl Columns<'_> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(0, |metadata, row| {
+                if row.is_deleted() {
+                    return true;
+                }
                 // filter by table id before deserializing the whole object.
                 let table_id_in_row = row.val(metadata, COL_NO_COLUMNS_TABLE_ID).as_u64().unwrap();
                 if table_id_in_row == table_id {
@@ -166,12 +137,178 @@ impl Columns<'_> {
         res
     }
 
-    /// Delete a column by id.
-    pub async fn delete_by_id(&self, stmt: &mut Statement, id: ColumnID) -> bool {
-        let key = SelectKey::new(INDEX_NO_COLUMNS_COLUMN_ID, vec![Val::from(id)]);
+    /// Delete a column by (table_id, column_no).
+    pub async fn delete_by_id(
+        &self,
+        stmt: &mut Statement,
+        table_id: TableID,
+        column_no: u16,
+    ) -> bool {
+        let key = SelectKey::new(
+            PK_NO_COLUMNS,
+            vec![Val::from(table_id), Val::from(column_no)],
+        );
         self.table
             .delete_unique_mvcc(stmt, &key, true)
             .await
             .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use crate::trx::sys_conf::TrxSysConfig;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_columns_delete_by_id() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(TrxSysConfig::default().skip_recovery(true))
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session();
+
+            let col_42_0 = ColumnObject {
+                table_id: 42,
+                column_no: 0,
+                column_name: SemiStr::new("c0"),
+                column_type: ValKind::U32,
+                column_attributes: ColumnAttributes::empty(),
+            };
+            let col_42_1 = ColumnObject {
+                table_id: 42,
+                column_no: 1,
+                column_name: SemiStr::new("c1"),
+                column_type: ValKind::U64,
+                column_attributes: ColumnAttributes::empty(),
+            };
+            let col_43_0 = ColumnObject {
+                table_id: 43,
+                column_no: 0,
+                column_name: SemiStr::new("c0"),
+                column_type: ValKind::U16,
+                column_attributes: ColumnAttributes::empty(),
+            };
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .insert(&mut stmt, &col_42_0)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .insert(&mut stmt, &col_42_1)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .insert(&mut stmt, &col_43_0)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .delete_by_id(&mut stmt, 42, 1)
+                    .await
+            );
+            assert!(
+                !engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .delete_by_id(&mut stmt, 42, 9)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            let cols_42 = engine
+                .catalog()
+                .storage
+                .columns()
+                .list_uncommitted_by_table_id(42)
+                .await;
+            assert_eq!(cols_42.len(), 1);
+            assert_eq!(cols_42[0].column_no, 0);
+
+            let cols_43 = engine
+                .catalog()
+                .storage
+                .columns()
+                .list_uncommitted_by_table_id(43)
+                .await;
+            assert_eq!(cols_43.len(), 1);
+            assert_eq!(cols_43[0].column_no, 0);
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                !engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .delete_by_id(&mut stmt, 42, 1)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .delete_by_id(&mut stmt, 42, 0)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .delete_by_id(&mut stmt, 43, 0)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .list_uncommitted_by_table_id(42)
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .list_uncommitted_by_table_id(43)
+                    .await
+                    .is_empty()
+            );
+
+            drop(session);
+            drop(engine);
+        });
     }
 }

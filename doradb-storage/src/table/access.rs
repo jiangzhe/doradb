@@ -19,6 +19,10 @@ use std::future::Future;
 
 pub trait TableAccess {
     /// Table scan including uncommitted versions.
+    ///
+    /// This method iterates raw latest row versions and includes rows marked
+    /// as deleted. Callers should explicitly filter `row.is_deleted()` if they
+    /// only need live rows.
     fn table_scan_uncommitted<F>(
         &self,
         start_row_id: RowID,

@@ -14,8 +14,8 @@ use std::sync::OnceLock;
 pub const TABLE_ID_TABLES: TableID = 0;
 const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
-const INDEX_NO_TABLES_TABLE_ID: usize = 0;
-const INDEX_NAME_TABLES_TABLE_ID: &str = "idx_tables_table_id";
+const PK_NO_TABLES: usize = 0;
+const PK_NAME_TABLES: &str = "pk_tables";
 
 pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
@@ -32,12 +32,8 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                     },
                 ],
                 vec![
-                    // primary key idx_tables_table_id (table_id)
-                    IndexSpec::new(
-                        INDEX_NAME_TABLES_TABLE_ID,
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    ),
+                    // primary key pk_tables (table_id)
+                    IndexSpec::new(PK_NAME_TABLES, vec![IndexKey::new(0)], IndexAttributes::PK),
                 ],
             ),
         }
@@ -58,7 +54,7 @@ impl Tables<'_> {
     /// Find a table by id.
     #[inline]
     pub async fn find_uncommitted_by_id(&self, table_id: TableID) -> Option<TableObject> {
-        let key = SelectKey::new(INDEX_NO_TABLES_TABLE_ID, vec![Val::from(table_id)]);
+        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
         self.table
             .index_lookup_unique_uncommitted(&key, row_to_table_object)
             .await
@@ -72,10 +68,95 @@ impl Tables<'_> {
 
     /// Delete a table by id.
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: TableID) -> bool {
-        let key = SelectKey::new(INDEX_NO_TABLES_TABLE_ID, vec![Val::from(id)]);
+        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
         self.table
             .delete_unique_mvcc(stmt, &key, true)
             .await
             .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use crate::trx::sys_conf::TrxSysConfig;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_tables_delete_by_id() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(TrxSysConfig::default().skip_recovery(true))
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session();
+
+            let table100 = TableObject { table_id: 100 };
+            let table101 = TableObject { table_id: 101 };
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .insert(&mut stmt, &table100)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .insert(&mut stmt, &table101)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .delete_by_id(&mut stmt, table100.table_id)
+                    .await
+            );
+            assert!(
+                !engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .delete_by_id(&mut stmt, 999)
+                    .await
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .find_uncommitted_by_id(table100.table_id)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .find_uncommitted_by_id(table101.table_id)
+                    .await
+                    .is_some()
+            );
+
+            drop(session);
+            drop(engine);
+        });
     }
 }

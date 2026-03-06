@@ -179,10 +179,10 @@ Reference:
   - Non-goals: no unified overlay/checkpoint publish yet.
   - Task Doc: `docs/tasks/000049-catalog-composite-key-refactor.md`
   - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 2 catalog schema refactor to table-scoped composite keys, updated DDL/reload paths, and validated catalog delete/list behavior with added regression tests. [Task Resolve Sync: docs/tasks/000049-catalog-composite-key-refactor.md @ 2026-03-06]
   - Related Backlogs:
-    - `docs/backlogs/000002-non-unique-index-for-catalog-tables.md`
+    - `docs/backlogs/000045-composite-index-prefix-scan-support-for-catalog-table-id-lookups.md`
 
 - **Phase 3: Unified Catalog Overlay and Checkpoint Worker**
   - Scope: implement catalog overlay root format over `catalog.tbl`, periodic + dirty-event scheduling, `Catalog::checkpoint_now()`, and replay-based catalog checkpoint build for redo prefix `(last_catalog_checkpoint_cts, W]`.

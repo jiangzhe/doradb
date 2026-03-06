@@ -1349,7 +1349,8 @@ fn derive_pr_title_from_docs(base: &str, head: &str) -> Result<Option<AutoPrTitl
 }
 
 fn collect_pr_doc_candidates_from_diff(base: &str, head: &str) -> Result<Vec<PrDocCandidate>, String> {
-    let range = format!("{base}...{head}");
+    let effective_base = resolve_diff_base_ref(base);
+    let range = format!("{effective_base}...{head}");
     let cmd = vec![
         "git".to_string(),
         "diff".to_string(),
@@ -1385,6 +1386,25 @@ fn collect_pr_doc_candidates_from_diff(base: &str, head: &str) -> Result<Vec<PrD
 
     docs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(docs)
+}
+
+fn resolve_diff_base_ref(base: &str) -> String {
+    if base.trim().is_empty() || base.starts_with("origin/") {
+        return base.to_string();
+    }
+    let candidate = format!("origin/{base}");
+    let cmd = vec![
+        "git".to_string(),
+        "rev-parse".to_string(),
+        "--verify".to_string(),
+        "--quiet".to_string(),
+        candidate.clone(),
+    ];
+    let res = run_command(&cmd);
+    if res.returncode == 0 && !res.stdout.trim().is_empty() {
+        return candidate;
+    }
+    base.to_string()
 }
 
 fn parse_pr_doc_candidate(path: &str) -> Option<PrDocCandidate> {
