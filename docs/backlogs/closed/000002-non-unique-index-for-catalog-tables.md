@@ -25,3 +25,11 @@ Catalog non-unique indexes for `columns.table_id` and `indexes.table_id` are imp
 ## Notes (Optional)
 
 Current code uses `#[expect(dead_code)]` and todo comments for reserved index IDs/handlers pending this follow-up.
+
+## Close Reason
+
+- Type: stale
+- Detail: Superseded by composite-key catalog schema in RFC-0006 Phase 2; non-unique catalog indexes are no longer the selected direction.
+- Closed By: backlog close
+- Reference: Replaced by docs/backlogs/000045-composite-index-prefix-scan-support-for-catalog-table-id-lookups and resolved via docs/tasks/000049-catalog-composite-key-refactor.md
+- Closed At: 2026-03-06

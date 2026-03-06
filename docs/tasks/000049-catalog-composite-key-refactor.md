@@ -102,6 +102,39 @@ Reference:
 
 ## Implementation Notes
 
+Implemented Phase 2 catalog schema refactor to table-scoped composite keys and
+aligned DDL/recovery/test paths:
+
+1. Catalog object/layout changes:
+   - removed global `column_id` and `index_id` dependencies from catalog object
+     model and storage schemas.
+   - `columns` primary key is now `(table_id, column_no)`.
+   - `indexes` primary key is now `(table_id, index_no)`.
+   - `index_columns` primary key is now
+     `(table_id, index_no, index_column_no)` and stores table `column_no`.
+2. DDL and reload path updates:
+   - `Session::create_table` now persists ordinal-based catalog rows and no
+     longer allocates global column/index ids.
+   - `Catalog::reload_create_table` reconstructs metadata by table-scoped
+     ordinals and no longer joins by global ids.
+   - `next_user_obj_id` behavior remains tied to user objects and is not
+     advanced by per-column/per-index allocations.
+3. Catalog constants and naming cleanup:
+   - renamed catalog PK constants to `PK_NAME_<table>` style and corresponding
+     id constants to `PK_NO_<table>`.
+   - updated PK string names to `pk_<table>`.
+4. Catalog scan semantics/tests:
+   - fixed `list_uncommitted_by_table_id` in catalog tables to filter deleted
+     rows for uncommitted list behavior.
+   - added `TableAccess::table_scan_uncommitted` trait documentation clarifying
+     deleted-row return behavior and caller-side filtering requirements.
+   - added delete-path tests for modified catalog tables (`tables`, `columns`,
+     `indexes`) and validated list behavior after delete.
+5. Validation:
+   - `cargo fmt --all`
+   - `cargo test -p doradb-storage --no-default-features`
+   - full crate tests passed (`303 passed, 0 failed`) in local verification.
+
 ## Impacts
 
 1. `doradb-storage/src/catalog/storage/object.rs`
@@ -129,6 +162,7 @@ Reference:
 
 1. Catalog lookup-by-table performance remains scan-based in this task because
    prefix scan on composite keys is not currently available in index module.
-2. During `task resolve`, mark
-   `docs/backlogs/000002-non-unique-index-for-catalog-tables.md` as stale and
-   replace it with a new backlog item for composite-index prefix-scan support.
+2. Follow-up backlog:
+   - `docs/backlogs/000045-composite-index-prefix-scan-support-for-catalog-table-id-lookups.md`
+3. Related CI investigation backlog (separate issue observed after code changes):
+   - `docs/backlogs/000044-investigate-ci-panic-test-log-recover-dml-btree-node-850.md`
