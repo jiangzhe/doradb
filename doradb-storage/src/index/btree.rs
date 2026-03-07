@@ -68,25 +68,29 @@ impl<V: BTreeValue> BTreeUpdate<V> {
     }
 }
 
-pub struct BTree {
+/// Generic B-Tree storage wrapper over a buffer-pool implementation.
+pub struct GenericBTree<P: 'static> {
     root: PageID,
     /// Height of this btree.
     height: AtomicUsize,
     // buffer pool to hold this index structure.
     // todo: switch to ShadowBufferPool, which
     // supports CoW operations.
-    pool: &'static FixedBufferPool,
+    pool: &'static P,
 }
 
-impl BTree {
+/// Compatibility alias for runtime B-Tree backed by `FixedBufferPool`.
+pub type BTree = GenericBTree<FixedBufferPool>;
+
+impl<P: BufferPool> GenericBTree<P> {
     /// Create a new B-Tree index.
     #[inline]
-    pub async fn new(pool: &'static FixedBufferPool, hints_enabled: bool, ts: TrxID) -> Self {
+    pub async fn new(pool: &'static P, hints_enabled: bool, ts: TrxID) -> Self {
         let mut g = pool.allocate_page::<BTreeNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init(0, ts, &[], BTreeU64::INVALID_VALUE, &[], hints_enabled);
-        BTree {
+        GenericBTree {
             root: page_id,
             height: AtomicUsize::new(0),
             pool,
@@ -314,13 +318,13 @@ impl BTree {
     /// Create a cursor to iterator over nodes at given height.
     /// Height equals to 0 means iterating over all leaf nodes.
     #[inline]
-    pub fn cursor(&self, height: usize) -> BTreeNodeCursor<'_> {
+    pub fn cursor(&self, height: usize) -> BTreeNodeCursor<'_, P> {
         BTreeNodeCursor::new(self, height)
     }
 
     /// Create a prefix scanner to scan keys.
     #[inline]
-    pub fn prefix_scanner<C: BTreeSlotCallback>(&self, callback: C) -> BTreePrefixScan<'_, C> {
+    pub fn prefix_scanner<C: BTreeSlotCallback>(&self, callback: C) -> BTreePrefixScan<'_, C, P> {
         BTreePrefixScan::new(self, callback)
     }
 
@@ -361,7 +365,7 @@ impl BTree {
         &self,
         height: usize,
         config: BTreeCompactConfig,
-    ) -> BTreeCompactor<'_, V> {
+    ) -> BTreeCompactor<'_, V, P> {
         BTreeCompactor::new(self, height, config)
     }
 
@@ -1097,7 +1101,12 @@ where
 
     /// Seek given key and lock the node at given height with its parent.
     #[inline]
-    pub async fn seek_and_lock(&mut self, tree: &BTree, height: usize, key: &[u8]) {
+    pub async fn seek_and_lock<P: BufferPool>(
+        &mut self,
+        tree: &GenericBTree<P>,
+        height: usize,
+        key: &[u8],
+    ) {
         loop {
             self.reset();
             let g = tree
@@ -1118,9 +1127,9 @@ where
     }
 
     #[inline]
-    async fn try_seek_and_lock(
+    async fn try_seek_and_lock<P: BufferPool>(
         &mut self,
-        tree: &BTree,
+        tree: &GenericBTree<P>,
         height: usize,
         key: &[u8],
         mut p_guard: FacadePageGuard<BTreeNode>,
@@ -1245,16 +1254,16 @@ pub struct NodePurgeList {
 /// the tree nodes.
 /// But it guarantees if a value(node) does not change during the traverse,
 /// it will be always visited.
-pub struct BTreeNodeCursor<'a> {
-    tree: &'a BTree,
+pub struct BTreeNodeCursor<'a, P: 'static> {
+    tree: &'a GenericBTree<P>,
     height: usize,
     coupling: BTreeCoupling<SharedStrategy>,
 }
 
-impl<'a> BTreeNodeCursor<'a> {
+impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
     /// Create a new cursor.
     #[inline]
-    pub fn new(tree: &'a BTree, height: usize) -> Self {
+    pub fn new(tree: &'a GenericBTree<P>, height: usize) -> Self {
         BTreeNodeCursor {
             tree,
             height,
@@ -1355,8 +1364,8 @@ impl Default for BTreeCompactConfig {
 /// It behaves like a cursor.
 /// It can lock three nodes at the same time(one parent and two children).
 /// It will try to merge right node into left.
-pub struct BTreeCompactor<'a, V: BTreeValue> {
-    tree: &'a BTree,
+pub struct BTreeCompactor<'a, V: BTreeValue, P: 'static> {
+    tree: &'a GenericBTree<P>,
     // height of nodes to be compacted.
     // If height is greater than 0, V should always be PageID.
     height: usize,
@@ -1366,9 +1375,9 @@ pub struct BTreeCompactor<'a, V: BTreeValue> {
     _marker: PhantomData<V>,
 }
 
-impl<'a, V: BTreeValue> BTreeCompactor<'a, V> {
+impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     #[inline]
-    pub fn new(tree: &'a BTree, height: usize, config: BTreeCompactConfig) -> Self {
+    pub fn new(tree: &'a GenericBTree<P>, height: usize, config: BTreeCompactConfig) -> Self {
         let low_space = ((mem::size_of::<BTreeNode>() as f64 * config.low_ratio) as usize)
             .min(mem::size_of::<BTreeNode>());
         let high_space = ((mem::size_of::<BTreeNode>() as f64 * config.high_ratio) as usize)

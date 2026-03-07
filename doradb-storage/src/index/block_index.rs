@@ -1,13 +1,15 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{
-    EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool,
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool,
 };
 use crate::catalog::TableID;
 use crate::file::table_file::TableFile;
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
-use crate::index::row_block_index::{RowBlockIndex, RowBlockIndexMemCursor, RowLocation};
+use crate::index::row_block_index::{
+    GenericRowBlockIndex, GenericRowBlockIndexMemCursor, RowLocation,
+};
 use crate::index::util::Maskable;
 use crate::row::{RowID, RowPage};
 use crate::trx::sys::TransactionSystem;
@@ -20,22 +22,25 @@ use std::sync::Arc;
 /// - the on-disk column-store index (`ColumnBlockIndex`)
 ///
 /// Routing decisions are made by `BlockIndexRoot`.
-pub struct BlockIndex {
+pub struct GenericBlockIndex<P: 'static> {
     /// Owning table id.
     pub table_id: TableID,
     root: BlockIndexRoot,
-    row: RowBlockIndex,
+    row: GenericRowBlockIndex<P>,
     disk_pool: ReadonlyBufferPool,
 }
 
-impl BlockIndex {
+/// Compatibility alias for runtime block index backed by `FixedBufferPool`.
+pub type BlockIndex = GenericBlockIndex<FixedBufferPool>;
+
+impl<P: BufferPool> GenericBlockIndex<P> {
     /// Creates a block-index facade for one table.
     ///
     /// `pivot_row_id` and `column_root_page_id` define the boundary and root of
     /// persisted columnar data at startup.
     #[inline]
     pub async fn new(
-        pool: &'static FixedBufferPool,
+        pool: &'static P,
         table_id: TableID,
         pivot_row_id: RowID,
         column_root_page_id: PageID,
@@ -43,11 +48,11 @@ impl BlockIndex {
         global_disk_pool: &'static GlobalReadonlyBufferPool,
     ) -> Self {
         let metadata = Arc::clone(&table_file.active_root().metadata);
-        let row = RowBlockIndex::new(pool, table_id, metadata).await;
+        let row = GenericRowBlockIndex::new(pool, table_id, metadata).await;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_page_id);
         let disk_pool =
             ReadonlyBufferPool::new(table_id, Arc::clone(&table_file), global_disk_pool);
-        BlockIndex {
+        GenericBlockIndex {
             table_id,
             root,
             row,
@@ -126,7 +131,7 @@ impl BlockIndex {
 
     /// Creates a cursor to scan in-memory block-index leaves.
     #[inline]
-    pub fn mem_cursor(&self) -> RowBlockIndexMemCursor<'_> {
+    pub fn mem_cursor(&self) -> GenericRowBlockIndexMemCursor<'_, P> {
         self.row.mem_cursor()
     }
 
@@ -181,5 +186,5 @@ impl BlockIndex {
     }
 }
 
-unsafe impl Send for BlockIndex {}
-unsafe impl Sync for BlockIndex {}
+unsafe impl<P: BufferPool> Send for GenericBlockIndex<P> {}
+unsafe impl<P: BufferPool> Sync for GenericBlockIndex<P> {}

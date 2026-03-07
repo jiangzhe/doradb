@@ -1,6 +1,7 @@
 use crate::buffer::guard::PageGuard;
+use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::index::IndexCompareExchange;
-use crate::index::btree::{BTree, BTreeDelete, BTreeInsert, BTreeUpdate};
+use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
 use crate::index::btree_key::BTreeKeyEncoder;
 use crate::index::btree_value::BTreeU64;
 use crate::index::secondary_index::{
@@ -75,19 +76,24 @@ pub trait UniqueIndex: Send + Sync + 'static {
     fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> impl Future<Output = ()>;
 }
 
-pub struct UniqueBTreeIndex {
-    tree: BTree,
+/// Generic unique-index implementation backed by a generic B-Tree.
+pub struct GenericUniqueBTreeIndex<P: 'static> {
+    tree: GenericBTree<P>,
     encoder: BTreeKeyEncoder,
 }
 
-impl UniqueBTreeIndex {
+/// Compatibility alias for runtime unique index backed by `FixedBufferPool`.
+pub type UniqueBTreeIndex = GenericUniqueBTreeIndex<FixedBufferPool>;
+
+impl<P: BufferPool> GenericUniqueBTreeIndex<P> {
+    /// Create a unique B-Tree index with key encoder.
     #[inline]
-    pub fn new(tree: BTree, encoder: BTreeKeyEncoder) -> Self {
-        UniqueBTreeIndex { tree, encoder }
+    pub fn new(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
+        GenericUniqueBTreeIndex { tree, encoder }
     }
 }
 
-impl UniqueIndex for UniqueBTreeIndex {
+impl<P: BufferPool> UniqueIndex for GenericUniqueBTreeIndex<P> {
     #[inline]
     async fn lookup(&self, key: &[Val], _ts: TrxID) -> Option<(RowID, bool)> {
         let k = self.encoder.encode(key);
@@ -350,6 +356,7 @@ impl UniqueIndex for PartitionMultiKeyIndex {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
+    use crate::index::btree::BTree;
     use crate::index::secondary_index::multi_key_encoder;
     use crate::lifetime::StaticLifetimeScope;
     use crate::value::{ValKind, ValType};

@@ -1,5 +1,5 @@
-use crate::buffer::BufferPool;
 use crate::buffer::page::INVALID_PAGE_ID;
+use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
@@ -16,6 +16,8 @@ use crate::trx::row::{ReadAllRows, RowReadAccess};
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use crate::value::Val;
 use std::future::Future;
+use std::marker::PhantomData;
+use std::ops::Deref;
 
 pub trait TableAccess {
     /// Table scan including uncommitted versions.
@@ -125,7 +127,38 @@ pub trait TableAccess {
     ) -> impl Future<Output = bool>;
 }
 
-impl TableAccess for Table {
+/// Thin operation wrapper that exposes `TableAccess` over a table reference
+/// with data/index pool type parameters.
+pub struct TableAccessor<'a, D, I> {
+    table: &'a Table,
+    _data_pool: PhantomData<D>,
+    _index_pool: PhantomData<I>,
+}
+
+impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
+    /// Build a cheap accessor for one table operation.
+    #[inline]
+    pub fn new(table: &'a Table) -> Self {
+        TableAccessor {
+            table,
+            _data_pool: PhantomData,
+            _index_pool: PhantomData,
+        }
+    }
+}
+
+impl<D: BufferPool, I: BufferPool> Deref for TableAccessor<'_, D, I> {
+    type Target = Table;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.table
+    }
+}
+
+type RuntimeTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool, FixedBufferPool>;
+
+impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
     async fn table_scan_uncommitted<F>(&self, start_row_id: RowID, mut row_action: F)
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
@@ -596,5 +629,120 @@ impl TableAccess for Table {
             let index = self.sec_idx[key.index_no].non_unique().unwrap();
             self.delete_non_unique_index(index, key, row_id).await
         }
+    }
+}
+
+impl TableAccess for Table {
+    #[inline]
+    async fn table_scan_uncommitted<F>(&self, start_row_id: RowID, row_action: F)
+    where
+        F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
+    {
+        RuntimeTableAccessor::new(self)
+            .table_scan_uncommitted(start_row_id, row_action)
+            .await
+    }
+
+    #[inline]
+    async fn table_scan_mvcc<F>(
+        &self,
+        stmt: &Statement,
+        start_row_id: RowID,
+        read_set: &[usize],
+        row_action: F,
+    ) where
+        F: FnMut(Vec<Val>) -> bool,
+    {
+        RuntimeTableAccessor::new(self)
+            .table_scan_mvcc(stmt, start_row_id, read_set, row_action)
+            .await
+    }
+
+    #[inline]
+    async fn index_lookup_unique_mvcc(
+        &self,
+        stmt: &Statement,
+        key: &SelectKey,
+        user_read_set: &[usize],
+    ) -> SelectMvcc {
+        RuntimeTableAccessor::new(self)
+            .index_lookup_unique_mvcc(stmt, key, user_read_set)
+            .await
+    }
+
+    #[inline]
+    async fn index_lookup_unique_uncommitted<R, F>(
+        &self,
+        key: &SelectKey,
+        row_action: F,
+    ) -> Option<R>
+    where
+        for<'m, 'p> F: FnOnce(&'m TableMetadata, Row<'p>) -> R,
+    {
+        RuntimeTableAccessor::new(self)
+            .index_lookup_unique_uncommitted(key, row_action)
+            .await
+    }
+
+    #[inline]
+    async fn index_scan_mvcc(
+        &self,
+        stmt: &Statement,
+        key: &SelectKey,
+        user_read_set: &[usize],
+    ) -> ScanMvcc {
+        RuntimeTableAccessor::new(self)
+            .index_scan_mvcc(stmt, key, user_read_set)
+            .await
+    }
+
+    #[inline]
+    async fn insert_mvcc(&self, stmt: &mut Statement, cols: Vec<Val>) -> InsertMvcc {
+        RuntimeTableAccessor::new(self)
+            .insert_mvcc(stmt, cols)
+            .await
+    }
+
+    #[inline]
+    async fn insert_no_trx(&self, cols: &[Val]) {
+        RuntimeTableAccessor::new(self).insert_no_trx(cols).await
+    }
+
+    #[inline]
+    async fn update_unique_mvcc(
+        &self,
+        stmt: &mut Statement,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> UpdateMvcc {
+        RuntimeTableAccessor::new(self)
+            .update_unique_mvcc(stmt, key, update)
+            .await
+    }
+
+    #[inline]
+    async fn delete_unique_mvcc(
+        &self,
+        stmt: &mut Statement,
+        key: &SelectKey,
+        log_by_key: bool,
+    ) -> DeleteMvcc {
+        RuntimeTableAccessor::new(self)
+            .delete_unique_mvcc(stmt, key, log_by_key)
+            .await
+    }
+
+    #[inline]
+    async fn delete_unique_no_trx(&self, key: &SelectKey) {
+        RuntimeTableAccessor::new(self)
+            .delete_unique_no_trx(key)
+            .await
+    }
+
+    #[inline]
+    async fn delete_index(&self, key: &SelectKey, row_id: RowID, unique: bool) -> bool {
+        RuntimeTableAccessor::new(self)
+            .delete_index(key, row_id, unique)
+            .await
     }
 }
