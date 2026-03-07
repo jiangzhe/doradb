@@ -1,0 +1,34 @@
+# Backlog: Purge crashes on checkpointed rows in index delete LWC path
+
+## Summary
+
+Purge can panic after checkpoint because both index-delete helpers still leave RowLocation::LwcPage(..) as todo!(). Once old rows move to LWC pages, purge may hit that branch while removing stale index entries and crash.
+
+## Reference
+
+User report: purge on checkpointed rows reaches RowLocation::LwcPage(..) todo!() in index-delete helpers.
+
+## Scope Hint
+
+Handle RowLocation::LwcPage(..) in both purge index-delete helper paths and keep stale-index cleanup semantics consistent for checkpointed rows.
+
+## Acceptance Hint
+
+Purge no longer panics on checkpointed rows in LWC pages, and stale index entries are deleted/validated correctly in affected tests or targeted repro.
+
+## Notes (Optional)
+
+
+## Close Reason (Added When Closed)
+
+When a backlog item is moved to `docs/backlogs/closed/`, append:
+
+```md
+## Close Reason
+
+- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
+- Detail: <reason detail>
+- Closed By: <backlog close>
+- Reference: <task/issue/pr reference>
+- Closed At: <YYYY-MM-DD>
+```

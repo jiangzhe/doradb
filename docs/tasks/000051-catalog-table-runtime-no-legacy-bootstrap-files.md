@@ -93,8 +93,44 @@ Reference:
 
 ## Implementation Notes
 
-
-
+1. Introduced dedicated catalog runtime `CatalogTable` in
+   `doradb-storage/src/catalog/runtime.rs` and switched catalog logical tables
+   (`tables`, `columns`, `indexes`, `index_columns`) to this runtime.
+2. Removed legacy catalog `TableFile` bootstrap scratch-file dependency:
+   - `CatalogStorage::new` now initializes catalog tables via
+     `BlockIndex::new_catalog(...)` + `CatalogTable::new(...)`.
+   - Startup no longer creates/unlinks catalog `0.tbl..3.tbl`; persistent
+     catalog identity remains `catalog.mtb`.
+3. Migrated catalog storage wrappers to `&CatalogTable` and accessor-based
+   operations (`insert_mvcc`, `delete_unique_mvcc`, scan lookups) with behavior
+   parity for catalog CRUD paths.
+4. Removed `CatalogCache` and simplified runtime ownership:
+   - `Catalog` now stores user tables in `DashMap<TableID, Table>`.
+   - Catalog-table runtime ownership is centralized in `CatalogStorage`.
+   - Added/used `TableHandle` path where mixed user/catalog table operations are
+     needed (rollback/purge/recovery call paths).
+5. Kept catalog replay semantics unchanged:
+   - recovery resolves catalog runtimes through `Catalog::get_catalog_table(...)`,
+   - catalog DML replay still ignores physical `page_id`/`row_id` and replays by
+     logical key/value contract.
+6. Added/kept regression coverage for bootstrap and recovery behavior:
+   - `catalog::tests::test_bootstrap_creates_catalog_mtb_without_catalog_tbl_files`
+   - `trx::recover::tests::test_log_recover_ddl`
+7. Additional post-implementation API cleanup:
+   - removed `start_row_id` from `TableAccess::table_scan_uncommitted` and
+     `table_scan_mvcc`,
+   - made `mem_scan` full in-memory scan from row-store start (`seek(0)`),
+   - synchronized call sites/tests accordingly.
+8. Verification executed in this resolve pass:
+   - `cargo fmt --all`
+   - `cargo test -p doradb-storage --no-default-features --no-run`
+   - `cargo test -p doradb-storage --no-default-features test_bootstrap_creates_catalog_mtb_without_catalog_tbl_files -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features test_log_recover_ddl -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features test_table_scan_uncommitted -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features test_table_scan_mvcc -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features test_data_checkpoint_basic_flow -- --nocapture`
+9. Follow-up backlog created for hybrid full-table scan correctness:
+   - `docs/backlogs/000048-table-scan-should-include-column-store-rows-for-user-tables.md`
 ## Impacts
 
 1. `doradb-storage/src/catalog/storage/mod.rs`
@@ -133,3 +169,7 @@ Reference:
    runtime remains Phase 5 work.
 2. If additional naming/typing clarity is needed after introducing
    `CatalogTable`, follow-up cleanup may be tracked as a backlog item.
+3. `TableAccess::table_scan_uncommitted` and `table_scan_mvcc` currently scan
+   in-memory row-store pages only and do not include on-disk column-store rows
+   for normal user tables; follow-up tracked in:
+   `docs/backlogs/000048-table-scan-should-include-column-store-rows-for-user-tables.md`.

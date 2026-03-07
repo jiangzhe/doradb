@@ -173,7 +173,7 @@ Reference:
   - Goals: establish deterministic naming and object-id boundary without changing query behavior.
   - Non-goals: no schema/key refactor yet.
   - Task Doc: `docs/tasks/000048-catalog-file-id-foundation.md`
-  - Task Issue: `#0`
+  - Task Issue: `#383`
   - Phase Status: done
   - Implementation Summary: Implemented Phase 1 foundations: unified `catalog.mtb` persistence, explicit catalog/user object-id boundary with user-id allocator, and deterministic 16-hex user table file naming. [Task Resolve Sync: docs/tasks/000048-catalog-file-id-foundation.md @ 2026-03-05]
 
@@ -182,7 +182,7 @@ Reference:
   - Goals: remove global `column_id`/`index_id` dependencies.
   - Non-goals: no unified overlay/checkpoint publish yet.
   - Task Doc: `docs/tasks/000049-catalog-composite-key-refactor.md`
-  - Task Issue: `#0`
+  - Task Issue: `#385`
   - Phase Status: done
   - Implementation Summary: Implemented Phase 2 catalog schema refactor to table-scoped composite keys, updated DDL/reload paths, and validated catalog delete/list behavior with added regression tests. [Task Resolve Sync: docs/tasks/000049-catalog-composite-key-refactor.md @ 2026-03-06]
   - Related Backlogs:
@@ -193,7 +193,7 @@ Reference:
   - Goals: make table-operation implementation reusable by both user-table runtime and future dedicated catalog-table runtime.
   - Non-goals: no `Statement` API signature changes in this phase; no catalog checkpoint/recovery cutoff changes.
   - Task Doc: `docs/tasks/000050-table-accessor-refactor-for-catalog-runtime.md`
-  - Task Issue: `#0`
+  - Task Issue: `#387`
   - Phase Status: done
   - Implementation Summary: 1. Implemented generic type families with compatibility aliases and preserved runtime behavior: [Task Resolve Sync: docs/tasks/000050-table-accessor-refactor-for-catalog-runtime.md @ 2026-03-07]
 
@@ -202,9 +202,9 @@ Reference:
   - Goals: catalog runtime no longer depends on `TableFile` bootstrap scratch files.
   - Non-goals: no fixed-pool specialization yet; no catalog checkpoint algorithm changes.
   - Task Doc: `docs/tasks/000051-catalog-table-runtime-no-legacy-bootstrap-files.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#389`
+  - Phase Status: done
+  - Implementation Summary: 1. Introduced dedicated catalog runtime `CatalogTable` in [Task Resolve Sync: docs/tasks/000051-catalog-table-runtime-no-legacy-bootstrap-files.md @ 2026-03-07]
   - Related Backlogs:
     - `docs/backlogs/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md`
 
