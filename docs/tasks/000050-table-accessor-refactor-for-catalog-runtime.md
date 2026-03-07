@@ -95,7 +95,33 @@ Reference:
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve` after implementation, tests, review, and verification are completed.
+1. Implemented generic type families with compatibility aliases and preserved runtime behavior:
+   - `GenericBTree<P>` with alias `BTree = GenericBTree<FixedBufferPool>`.
+   - `GenericUniqueBTreeIndex<P>` / `GenericNonUniqueBTreeIndex<P>` with aliases
+     `UniqueBTreeIndex` / `NonUniqueBTreeIndex`.
+   - `GenericSecondaryIndex<P>` and `GenericIndexKind<P>` with aliases
+     `SecondaryIndex` and `IndexKind`.
+   - `GenericRowBlockIndex<P>` / `GenericBlockIndex<P>` with aliases
+     `RowBlockIndex` / `BlockIndex`.
+2. Refactored `TableAccess` to accessor-first design:
+   - Added standalone `TableAccessor<'a, D, I>`.
+   - Moved `TableAccess` implementation to `impl<D, I> TableAccess for TableAccessor<D, I>`.
+   - Kept `impl TableAccess for Table` as a forwarding shim by constructing
+     `RuntimeTableAccessor` on each call.
+3. Kept `Statement` interface unchanged in this phase.
+4. Resolved generic-bound style during implementation:
+   - Removed `BufferPool` bounds from generic struct declarations.
+   - Kept bounds on impl blocks/methods where needed.
+   - Kept minimal `'static` bounds where types store `&'static P`.
+5. Added missing rustdoc comments for modified public generic wrappers/aliases
+   and accessor constructors to keep API docs clear after refactor.
+6. Verification results:
+   - `cargo fmt --all`
+   - `cargo build -p doradb-storage --no-default-features`
+   - `cargo test -p doradb-storage --no-default-features`
+   - Full no-default-feature suite passed (`303 passed, 0 failed`).
+7. Follow-up backlog:
+   - `docs/backlogs/000046-evaluate-explicit-evictable-alias-names-for-generic-index-wrappers.md`
 
 ## Impacts
 
@@ -132,5 +158,7 @@ Keep this section blank in design phase. Fill this section during `task resolve`
 1. Additional disk-read path abstractions remain concrete in this phase.
    Rationale: `ReadonlyBufferPool` is currently the only disk-read buffer pool
    implementation, so genericization here is unnecessary churn for Phase 3.
-2. Whether to add explicit alias names such as `EvictableRowBlockIndex` in
-   addition to preserving original aliases will be determined during implementation.
+2. Explicit extra alias names (for example `EvictableRowBlockIndex`) were not
+   introduced in this phase; only compatibility aliases that preserve existing
+   public names were kept. If multi-runtime readability becomes a pain point in
+   later phases, we should evaluate adding those aliases in a follow-up task.

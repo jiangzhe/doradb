@@ -193,8 +193,8 @@ Reference:
   - Non-goals: no `Statement` API signature changes in this phase; no catalog checkpoint/recovery cutoff changes.
   - Task Doc: `docs/tasks/000050-table-accessor-refactor-for-catalog-runtime.md`
   - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: 1. Implemented generic type families with compatibility aliases and preserved runtime behavior: [Task Resolve Sync: docs/tasks/000050-table-accessor-refactor-for-catalog-runtime.md @ 2026-03-07]
 
 - **Phase 4: Dedicated CatalogTable Runtime (No Legacy Catalog *.tbl Bootstrap)**
   - Scope: introduce `CatalogTable` runtime type, switch catalog storage wrappers to it, and remove transient legacy catalog `0.tbl..3.tbl` bootstrap file creation/unlink path.
