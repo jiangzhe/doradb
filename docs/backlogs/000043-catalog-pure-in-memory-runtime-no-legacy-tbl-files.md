@@ -1,16 +1,5 @@
 # Backlog: Remove Legacy Catalog Table Files via Pure In-Memory Catalog Tables
 
-Filename rule:
-- Open backlog item: `docs/backlogs/<6digits>-<follow-up-topic>.md`.
-- Closed/archived backlog item: `docs/backlogs/closed/<6digits>-<follow-up-topic>.md`.
-- Next id storage: `docs/backlogs/next-id` (single 6-digit line).
-- Next id helpers:
-  - `tools/backlog.rs init-next-id`
-  - `tools/backlog.rs alloc-id`
-- Close helpers:
-  - `tools/backlog.rs close-doc --id <6digits> --type <type> --detail <text>`
-  - `tools/doc-id.rs search-by-id --kind backlog --id <6digits> --scope open`
-
 ## Summary
 
 Catalog bootstrap still creates legacy catalog table files as runtime scratch and unlinks them immediately. Replace this transitional path by making catalog tables purely in-memory without creating old-style catalog *.tbl files.
