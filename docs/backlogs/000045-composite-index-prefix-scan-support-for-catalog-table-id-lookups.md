@@ -1,16 +1,5 @@
 # Backlog: Composite Index Prefix-Scan Support for Catalog Table-ID Lookups
 
-Filename rule:
-- Open backlog item: `docs/backlogs/<6digits>-<follow-up-topic>.md`.
-- Closed/archived backlog item: `docs/backlogs/closed/<6digits>-<follow-up-topic>.md`.
-- Next id storage: `docs/backlogs/next-id` (single 6-digit line).
-- Next id helpers:
-  - `tools/backlog.rs init-next-id`
-  - `tools/backlog.rs alloc-id`
-- Close helpers:
-  - `tools/backlog.rs close-doc --id <6digits> --type <type> --detail <text>`
-  - `tools/doc-id.rs search-by-id --kind backlog --id <6digits> --scope open`
-
 ## Summary
 
 Add prefix-scan support on composite index keys so catalog table-scoped lookups can use index range scans instead of full table scans.

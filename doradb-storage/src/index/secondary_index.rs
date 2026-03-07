@@ -1,9 +1,9 @@
-use crate::buffer::FixedBufferPool;
+use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::IndexSpec;
-use crate::index::btree::BTree;
+use crate::index::btree::GenericBTree;
 use crate::index::btree_key::{BTreeKey, BTreeKeyEncoder};
-use crate::index::non_unique_index::NonUniqueBTreeIndex;
-use crate::index::unique_index::UniqueBTreeIndex;
+use crate::index::non_unique_index::GenericNonUniqueBTreeIndex;
+use crate::index::unique_index::GenericUniqueBTreeIndex;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use crate::value::{Val, ValKind, ValType};
@@ -12,15 +12,22 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-pub struct SecondaryIndex {
+/// Generic secondary-index container for one table index definition.
+pub struct GenericSecondaryIndex<P: 'static> {
     pub index_no: usize,
-    pub kind: IndexKind,
+    pub kind: GenericIndexKind<P>,
 }
 
-impl SecondaryIndex {
+/// Compatibility alias for runtime secondary index backed by `FixedBufferPool`.
+pub type SecondaryIndex = GenericSecondaryIndex<FixedBufferPool>;
+/// Compatibility alias for runtime secondary-index kind.
+pub type IndexKind = GenericIndexKind<FixedBufferPool>;
+
+impl<P: BufferPool> GenericSecondaryIndex<P> {
+    /// Build a secondary index from catalog `IndexSpec`.
     #[inline]
     pub async fn new<F: Fn(usize) -> ValType>(
-        index_pool: &'static FixedBufferPool,
+        index_pool: &'static P,
         index_no: usize,
         index_spec: &IndexSpec,
         ty_infer: F,
@@ -34,45 +41,49 @@ impl SecondaryIndex {
             .collect();
         if index_spec.unique() {
             let encoder = BTreeKeyEncoder::new(types);
-            let tree = BTree::new(index_pool, true, ts).await;
-            let kind = IndexKind::Unique(UniqueBTreeIndex::new(tree, encoder));
-            SecondaryIndex { index_no, kind }
+            let tree = GenericBTree::new(index_pool, true, ts).await;
+            let kind = GenericIndexKind::Unique(GenericUniqueBTreeIndex::new(tree, encoder));
+            GenericSecondaryIndex { index_no, kind }
         } else {
             // non-unique index always encodes RowID as last key to
             // ensure uniqueness(which is required by BTree implementation).
             types.push(ValType::new(ValKind::U64, false));
             let encoder = BTreeKeyEncoder::new(types);
-            let tree = BTree::new(index_pool, true, ts).await;
-            let kind = IndexKind::NonUnique(NonUniqueBTreeIndex::new(tree, encoder));
-            SecondaryIndex { index_no, kind }
+            let tree = GenericBTree::new(index_pool, true, ts).await;
+            let kind = GenericIndexKind::NonUnique(GenericNonUniqueBTreeIndex::new(tree, encoder));
+            GenericSecondaryIndex { index_no, kind }
         }
     }
 
+    /// Returns whether this index is unique.
     #[inline]
     pub fn is_unique(&self) -> bool {
-        matches!(self.kind, IndexKind::Unique(_))
+        matches!(self.kind, GenericIndexKind::Unique(_))
     }
 
+    /// Returns the unique-index view when the index is unique.
     #[inline]
-    pub fn unique(&self) -> Option<&UniqueBTreeIndex> {
+    pub fn unique(&self) -> Option<&GenericUniqueBTreeIndex<P>> {
         match &self.kind {
-            IndexKind::Unique(idx) => Some(idx),
+            GenericIndexKind::Unique(idx) => Some(idx),
             _ => None,
         }
     }
 
+    /// Returns the non-unique-index view when the index is non-unique.
     #[inline]
-    pub fn non_unique(&self) -> Option<&NonUniqueBTreeIndex> {
+    pub fn non_unique(&self) -> Option<&GenericNonUniqueBTreeIndex<P>> {
         match &self.kind {
-            IndexKind::NonUnique(idx) => Some(idx),
+            GenericIndexKind::NonUnique(idx) => Some(idx),
             _ => None,
         }
     }
 }
 
-pub enum IndexKind {
-    Unique(UniqueBTreeIndex),
-    NonUnique(NonUniqueBTreeIndex),
+/// Generic variants of secondary-index backends.
+pub enum GenericIndexKind<P: 'static> {
+    Unique(GenericUniqueBTreeIndex<P>),
+    NonUnique(GenericNonUniqueBTreeIndex<P>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

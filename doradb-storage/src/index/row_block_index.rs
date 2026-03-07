@@ -291,32 +291,31 @@ impl PageEntry {
 /// 2. table scan: traverse all column files and row pages to perform
 ///    full table scan.
 ///
-pub struct RowBlockIndex {
+pub struct GenericRowBlockIndex<P: 'static> {
     pub table_id: TableID,
     root_page_id: PageID,
     metadata: Arc<TableMetadata>,
     height: AtomicUsize,
     insert_free_list: Mutex<Vec<PageID>>,
     // Fixed buffer pool to hold block nodes.
-    pool: &'static FixedBufferPool,
+    pool: &'static P,
     // Reference to storage engine,
     // used for committing new page.
     page_committer: Mutex<Option<RedoLogPageCommitter>>,
 }
 
-impl RowBlockIndex {
+/// Compatibility alias for runtime row-block index backed by `FixedBufferPool`.
+pub type RowBlockIndex = GenericRowBlockIndex<FixedBufferPool>;
+
+impl<P: BufferPool> GenericRowBlockIndex<P> {
     /// Create a new block index backed by buffer pool.
     #[inline]
-    pub async fn new(
-        pool: &'static FixedBufferPool,
-        table_id: TableID,
-        metadata: Arc<TableMetadata>,
-    ) -> Self {
+    pub async fn new(pool: &'static P, table_id: TableID, metadata: Arc<TableMetadata>) -> Self {
         let mut g = pool.allocate_page::<BlockNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init_empty(0, 0);
-        RowBlockIndex {
+        GenericRowBlockIndex {
             table_id,
             root_page_id: page_id,
             metadata,
@@ -461,8 +460,8 @@ impl RowBlockIndex {
 
     /// Returns the cursor for range scan.
     #[inline]
-    pub fn mem_cursor(&self) -> RowBlockIndexMemCursor<'_> {
-        RowBlockIndexMemCursor {
+    pub fn mem_cursor(&self) -> GenericRowBlockIndexMemCursor<'_, P> {
+        GenericRowBlockIndexMemCursor {
             blk_idx: self,
             parent: None,
             child: None,
@@ -813,8 +812,8 @@ impl RowBlockIndex {
     }
 }
 
-unsafe impl Send for RowBlockIndex {}
-unsafe impl Sync for RowBlockIndex {}
+unsafe impl<P: BufferPool> Send for GenericRowBlockIndex<P> {}
+unsafe impl<P: BufferPool> Sync for GenericRowBlockIndex<P> {}
 
 /// Physical lookup target returned by row/column block-index search.
 pub enum RowLocation {
@@ -826,14 +825,17 @@ pub enum RowLocation {
 }
 
 /// A cursor to read all in-mem leaf values.
-pub struct RowBlockIndexMemCursor<'a> {
-    blk_idx: &'a RowBlockIndex,
+pub struct GenericRowBlockIndexMemCursor<'a, P: 'static> {
+    blk_idx: &'a GenericRowBlockIndex<P>,
     // The parent node of current located
     parent: Option<ParentPosition<PageSharedGuard<BlockNode>>>,
     child: Option<PageSharedGuard<BlockNode>>,
 }
 
-impl RowBlockIndexMemCursor<'_> {
+/// Compatibility alias for runtime row-block in-memory cursor.
+pub type RowBlockIndexMemCursor<'a> = GenericRowBlockIndexMemCursor<'a, FixedBufferPool>;
+
+impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
     /// Seeks to the in-memory leaf that can serve `row_id`.
     #[inline]
     pub async fn seek(&mut self, row_id: RowID) {

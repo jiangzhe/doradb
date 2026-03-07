@@ -1,5 +1,6 @@
+use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
-use crate::index::btree::{BTree, BTreeNodeCursor};
+use crate::index::btree::{BTreeNodeCursor, GenericBTree};
 use crate::index::btree_node::{BTreeNode, BTreeSlot};
 use std::ops::{Deref, DerefMut};
 
@@ -30,12 +31,12 @@ where
 }
 
 /// Scan on B-tree with specific prefix.
-pub struct BTreePrefixScan<'a, C> {
-    cursor: BTreeNodeCursor<'a>,
+pub struct BTreePrefixScan<'a, C, P: 'static> {
+    cursor: BTreeNodeCursor<'a, P>,
     callback: C,
 }
 
-impl<C> Deref for BTreePrefixScan<'_, C> {
+impl<C, P: BufferPool> Deref for BTreePrefixScan<'_, C, P> {
     type Target = C;
     #[inline]
     fn deref(&self) -> &C {
@@ -43,23 +44,24 @@ impl<C> Deref for BTreePrefixScan<'_, C> {
     }
 }
 
-impl<C> DerefMut for BTreePrefixScan<'_, C> {
+impl<C, P: BufferPool> DerefMut for BTreePrefixScan<'_, C, P> {
     #[inline]
     fn deref_mut(&mut self) -> &mut C {
         &mut self.callback
     }
 }
 
-impl<C> BTreePrefixScan<'_, C> {
+impl<C, P: BufferPool> BTreePrefixScan<'_, C, P> {
+    /// Consume the scanner and return the callback state.
     #[inline]
     pub fn into_callback(self) -> C {
         self.callback
     }
 }
 
-impl<'a, C: BTreeSlotCallback> BTreePrefixScan<'a, C> {
+impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
     #[inline]
-    pub(super) fn new(tree: &'a BTree, callback: C) -> Self {
+    pub(super) fn new(tree: &'a GenericBTree<P>, callback: C) -> Self {
         BTreePrefixScan {
             cursor: BTreeNodeCursor::new(tree, 0),
             callback,
@@ -142,6 +144,7 @@ impl<'a, C: BTreeSlotCallback> BTreePrefixScan<'a, C> {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
+    use crate::index::btree::BTree;
     use crate::index::btree_value::BTreeU64;
     use crate::lifetime::StaticLifetimeScope;
     use rand::prelude::IndexedRandom;

@@ -7,7 +7,76 @@ on:
     branches: [ main ]
 
 jobs:
+  changes:
+    runs-on: ubuntu-22.04
+    outputs:
+      run_build: ${{ steps.delta.outputs.run_build }}
+      diff_range: ${{ steps.delta.outputs.diff_range }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Detect non-doc changes in current update
+      id: delta
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        event="${{ github.event_name }}"
+        action="${{ github.event.action || '' }}"
+        before="${{ github.event.before || '' }}"
+        after="${{ github.event.after || '' }}"
+        base_sha="${{ github.event.pull_request.base.sha || '' }}"
+        head_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+        before_valid="false"
+        if [[ -n "$before" && ! "$before" =~ ^0+$ ]]; then
+          before_valid="true"
+        fi
+
+        if [[ "$event" == "pull_request" && "$action" == "synchronize" && "$before_valid" == "true" && -n "$after" ]]; then
+          range="${before}...${after}"
+        elif [[ "$event" == "pull_request" && -n "$base_sha" && -n "$head_sha" ]]; then
+          range="${base_sha}...${head_sha}"
+        elif [[ "$event" == "push" && "$before_valid" == "true" && -n "$after" ]]; then
+          range="${before}...${after}"
+        elif [[ "$event" == "push" && -n "$after" ]]; then
+          range="${after}^...${after}"
+        else
+          range="HEAD~1...HEAD"
+        fi
+
+        echo "diff_range=${range}" >> "$GITHUB_OUTPUT"
+
+        diff_failed="false"
+        if files="$(git diff --name-only "$range")"; then
+          :
+        else
+          diff_failed="true"
+          files=""
+        fi
+        echo "changed files in ${range}:"
+        printf '%s\n' "$files"
+
+        run_build="false"
+        if [[ "$diff_failed" == "true" || -z "$files" ]]; then
+          run_build="true"
+        else
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            if [[ "$file" != docs/* && "$file" != *.md ]]; then
+              run_build="true"
+              break
+            fi
+          done <<< "$files"
+        fi
+
+        echo "run_build=${run_build}" >> "$GITHUB_OUTPUT"
+        echo "run_build=${run_build}"
+
   build:
+    needs: changes
+    if: needs.changes.outputs.run_build == 'true'
     runs-on: ubuntu-22.04
     steps:
     - name: Install libaio & lcov
@@ -62,3 +131,13 @@ jobs:
       with:
         file: lcov.info
         token: ${{secrets.CODECOV_TOKEN}}
+
+  docs-only:
+    needs: changes
+    if: needs.changes.outputs.run_build != 'true'
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Skip heavy CI for docs-only delta
+      run: |
+        echo "No non-doc changes detected in update range: ${{ needs.changes.outputs.diff_range }}"
+        echo "Compile/test jobs are intentionally skipped."

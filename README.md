@@ -2,6 +2,7 @@
 
 ![build](https://github.com/jiangzhe/doradb/actions/workflows/build.yml/badge.svg)
 ![codecov](https://codecov.io/gh/jiangzhe/doradb/branch/main/graph/badge.svg?token=T3RMZE2998)
+![pr-review](https://img.shields.io/coderabbit/prs/github/jiangzhe/doradb?utm_source=oss&utm_medium=github&utm_campaign=jiangzhe%2Fdoradb&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
 DoraDB is an attempt to build a fast storage engine in Rust from scratch.
 It is work in progress.
@@ -25,6 +26,7 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 - [Table File](./docs/table-file.md)
 - [Data Checkpoint](./docs/data-checkpoint.md)
 - [Deletion Checkpoint](./docs/deletion-checkpoint.md)
+- [Buffer Pool](./docs/buffer-pool.md)
 
 Some ideas are different from traditional database system.
 I'm glad to have discussions if someone is interested in details.

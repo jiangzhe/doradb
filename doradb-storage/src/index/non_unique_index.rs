@@ -1,5 +1,6 @@
 use crate::buffer::guard::PageGuard;
-use crate::index::btree::{BTree, BTreeDelete, BTreeInsert, BTreeUpdate};
+use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
 use crate::index::btree_key::BTreeKeyEncoder;
 use crate::index::btree_node::{BTreeNode, BTreeSlot};
 use crate::index::btree_scan::BTreeSlotCallback;
@@ -57,19 +58,24 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
     fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> impl Future<Output = ()>;
 }
 
-pub struct NonUniqueBTreeIndex {
-    tree: BTree,
+/// Generic non-unique-index implementation backed by a generic B-Tree.
+pub struct GenericNonUniqueBTreeIndex<P: 'static> {
+    tree: GenericBTree<P>,
     encoder: BTreeKeyEncoder,
 }
 
-impl NonUniqueBTreeIndex {
+/// Compatibility alias for runtime non-unique index backed by `FixedBufferPool`.
+pub type NonUniqueBTreeIndex = GenericNonUniqueBTreeIndex<FixedBufferPool>;
+
+impl<P: BufferPool> GenericNonUniqueBTreeIndex<P> {
+    /// Create a non-unique B-Tree index with key encoder.
     #[inline]
-    pub fn new(tree: BTree, encoder: BTreeKeyEncoder) -> Self {
-        NonUniqueBTreeIndex { tree, encoder }
+    pub fn new(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
+        GenericNonUniqueBTreeIndex { tree, encoder }
     }
 }
 
-impl NonUniqueIndex for NonUniqueBTreeIndex {
+impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {
     #[inline]
     async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, _ts: TrxID) {
         let k = self
@@ -187,6 +193,7 @@ impl BTreeSlotCallback for CollectRowID<'_> {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
+    use crate::index::btree::BTree;
     use crate::lifetime::StaticLifetimeScope;
     use crate::value::{ValKind, ValType};
 

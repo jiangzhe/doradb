@@ -1,17 +1,5 @@
 # Backlog: Graceful Storage Engine Shutdown Lifecycle for Sessions and System Components
 
-Filename rule:
-- Open backlog item: `docs/backlogs/<6digits>-<follow-up-topic>.md`.
-- Closed/archived backlog item: `docs/backlogs/closed/<6digits>-<follow-up-topic>.md`.
-- Next id storage: `docs/backlogs/next-id` (single 6-digit line).
-- Next id helpers:
-  - `tools/backlog.rs init-next-id`
-  - `tools/backlog.rs alloc-id`
-- Close helpers:
-  - `tools/backlog.rs close-doc --id <6digits> --type <type> --detail <text>`
-  - `tools/task.rs resolve-task-backlogs --task docs/tasks/<6digits>-<slug>.md`
-  - `tools/task.rs complete-backlog-doc --id <6digits> --task docs/tasks/<6digits>-<slug>.md`
-
 ## Summary
 
 Define and implement a coordinated graceful-shutdown process for the storage engine that safely handles user sessions and all internal components.
