@@ -3,14 +3,8 @@ name: build
 on:
   push:
     branches: [ main ]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
   pull_request:
     branches: [ main ]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
 
 jobs:
   changes:
@@ -35,13 +29,19 @@ jobs:
         after="${{ github.event.after || '' }}"
         base_sha="${{ github.event.pull_request.base.sha || '' }}"
         head_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+        before_valid="false"
+        if [[ -n "$before" && ! "$before" =~ ^0+$ ]]; then
+          before_valid="true"
+        fi
 
-        if [[ "$event" == "pull_request" && "$action" == "synchronize" && -n "$before" && -n "$after" ]]; then
+        if [[ "$event" == "pull_request" && "$action" == "synchronize" && "$before_valid" == "true" && -n "$after" ]]; then
           range="${before}...${after}"
         elif [[ "$event" == "pull_request" && -n "$base_sha" && -n "$head_sha" ]]; then
           range="${base_sha}...${head_sha}"
-        elif [[ "$event" == "push" && -n "$before" && -n "$after" ]]; then
+        elif [[ "$event" == "push" && "$before_valid" == "true" && -n "$after" ]]; then
           range="${before}...${after}"
+        elif [[ "$event" == "push" && -n "$after" ]]; then
+          range="${after}^...${after}"
         else
           range="HEAD~1...HEAD"
         fi
