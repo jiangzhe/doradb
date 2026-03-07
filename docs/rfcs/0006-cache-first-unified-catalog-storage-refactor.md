@@ -10,7 +10,7 @@ created: 2026-03-03
 
 ## Summary
 
-This RFC proposes a cache-first catalog runtime with unified on-disk persistence in a single `catalog.tbl` file. It refactors catalog logical schemas away from global `column_id`/`index_id`, introduces explicit catalog-vs-user object-id boundaries, and adopts a replay-based catalog checkpoint: checkpointed catalog state is produced by replaying catalog redo logs up to a global recovery watermark `W`. Recovery then replays only logs with `cts > W`. Physical log truncation is intentionally deferred; only logical replay cutoff is required in this RFC. The expected outcomes are simpler catalog persistence topology, lower catalog file overhead, and a stronger correctness model for table lifecycle and future schema-evolution DDL.
+This RFC proposes a cache-first catalog runtime with unified on-disk persistence in a single `catalog.mtb` file. It refactors catalog logical schemas away from global `column_id`/`index_id`, introduces explicit catalog-vs-user object-id boundaries, and adopts a replay-based catalog checkpoint: checkpointed catalog state is produced by replaying catalog redo logs up to a global recovery watermark `W`. Recovery then replays only logs with `cts > W`. Physical log truncation is intentionally deferred; only logical replay cutoff is required in this RFC. The expected outcomes are simpler catalog persistence topology, lower catalog file overhead, and a stronger correctness model for table lifecycle and future schema-evolution DDL.
 
 ## Context
 
@@ -62,10 +62,13 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 - [U3] User requested catalog checkpoint interval support plus an ad-hoc checkpoint API.
 - [U4] User requested removing dependency on temporary partial planning document in RFC references.
 - [U5] User proposed replay-based catalog checkpoint aligned to global recovery watermark with deferred physical log truncation.
+- [U6] User requested explicit follow-up to remove transitional catalog `*.tbl` bootstrap scratch files and keep catalog runtime in-memory.
+- [U7] User requested a dedicated `CatalogTable` type and accessor-first refactor direction (defer `Statement` API genericization).
 
 ### Source Backlogs (Optional)
 
 - [B1] `docs/backlogs/000002-non-unique-index-for-catalog-tables.md` - related deferred catalog index work.
+- [B2] `docs/backlogs/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md` - remove transitional catalog runtime dependency on legacy table files.
 
 ## Decision
 
@@ -83,7 +86,7 @@ Adopt a cache-first unified catalog storage design with one persistent catalog f
 
 ### 3. Unified catalog persistence file
 
-1. Persist all catalog logical tables into one fixed catalog file: `catalog.tbl` ([U1], [U2], [C6]).
+1. Persist all catalog logical tables into one fixed catalog file: `catalog.mtb` ([U1], [U2], [C6]).
 2. Add catalog-specific file open/create paths in table-file subsystem so catalog persistence does not rely on numeric table-id naming ([C6], [D5], [U2]).
 3. Keep user table file naming deterministic and machine-friendly by switching to fixed-width 16-hex format for user table files ([C6], [U1]).
 
@@ -106,7 +109,7 @@ Adopt a cache-first unified catalog storage design with one persistent catalog f
    1. compute global watermark `W`;
    2. scan redo logs in `(last_catalog_checkpoint_cts, W]`;
    3. replay only catalog mutations from that range into a checkpoint image;
-   4. publish one new catalog overlay root atomically in `catalog.tbl` ([D4], [D5], [C8], [U5]).
+   4. publish one new catalog overlay root atomically in `catalog.mtb` ([D4], [D5], [C8], [U5]).
 2. Checkpoint trigger model includes:
    1. configurable periodic interval with a default value;
    2. dirty-event wakeup;
@@ -135,7 +138,7 @@ Adopt a cache-first unified catalog storage design with one persistent catalog f
 
 ### Alternative A: Watermark-aligned replay-based catalog checkpoint (chosen)
 
-- Summary: Unified `catalog.tbl`, schema/key refactor, id boundary, and catalog checkpoint derived from replaying catalog redo prefix up to global watermark `W`.
+- Summary: Unified `catalog.mtb`, schema/key refactor, id boundary, and catalog checkpoint derived from replaying catalog redo prefix up to global watermark `W`.
 - Analysis: Ensures catalog snapshot and user-data replay cutoff are synchronized by the same watermark contract; robust for table lifecycle and future schema DDL ordering.
 - Why Not Chosen: N/A (chosen).
 - References: [D2], [D4], [D5], [C1], [C2], [C8], [U1], [U2], [U3], [U5]
@@ -184,29 +187,58 @@ Reference:
   - Related Backlogs:
     - `docs/backlogs/000045-composite-index-prefix-scan-support-for-catalog-table-id-lookups.md`
 
-- **Phase 3: Unified Catalog Overlay and Checkpoint Worker**
-  - Scope: implement catalog overlay root format over `catalog.tbl`, periodic + dirty-event scheduling, `Catalog::checkpoint_now()`, and replay-based catalog checkpoint build for redo prefix `(last_catalog_checkpoint_cts, W]`.
-  - Goals: atomic multi-table catalog checkpoint publish with cache-first runtime preserved and watermark-aligned replay correctness.
-  - Non-goals: no user-table checkpoint algorithm changes.
-  - Task Doc: `docs/tasks/000050-catalog-overlay-checkpoint-worker.md`
+- **Phase 3: Accessor-First TableAccess Refactor**
+  - Scope: extract standalone thin `TableAccessor` and migrate `TableAccess` implementation internals to accessor-driven shared logic.
+  - Goals: make table-operation implementation reusable by both user-table runtime and future dedicated catalog-table runtime.
+  - Non-goals: no `Statement` API signature changes in this phase; no catalog checkpoint/recovery cutoff changes.
+  - Task Doc: `docs/tasks/000050-table-accessor-refactor-for-catalog-runtime.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 4: Recovery Cutoff and Consistency Checks**
+- **Phase 4: Dedicated CatalogTable Runtime (No Legacy Catalog *.tbl Bootstrap)**
+  - Scope: introduce `CatalogTable` runtime type, switch catalog storage wrappers to it, and remove transient legacy catalog `0.tbl..3.tbl` bootstrap file creation/unlink path.
+  - Goals: catalog runtime no longer depends on `TableFile` bootstrap scratch files.
+  - Non-goals: no fixed-pool specialization yet; no catalog checkpoint algorithm changes.
+  - Task Doc: `docs/tasks/000051-catalog-table-runtime-no-legacy-bootstrap-files.md`
+  - Task Issue: `#0`
+  - Phase Status: `pending`
+  - Implementation Summary: `pending`
+  - Related Backlogs:
+    - `docs/backlogs/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md`
+
+- **Phase 5: Catalog FixedBufferPool Specialization**
+  - Scope: adapt reusable table-access/runtime components to support catalog data/index runtime on fixed pools; reuse existing engine `meta_pool`/`index_pool`.
+  - Goals: remove catalog runtime dependence on evictable data-pool semantics.
+  - Non-goals: no new engine config knobs for dedicated catalog pool sizing in this phase.
+  - Task Doc: `docs/tasks/000052-catalog-fixed-buffer-pool-specialization.md`
+  - Task Issue: `#0`
+  - Phase Status: `pending`
+  - Implementation Summary: `pending`
+
+- **Phase 6: Unified Catalog Overlay and Checkpoint Worker**
+  - Scope: implement catalog overlay root format over `catalog.mtb`, periodic + dirty-event scheduling, `Catalog::checkpoint_now()`, and replay-based catalog checkpoint build for redo prefix `(last_catalog_checkpoint_cts, W]`.
+  - Goals: atomic multi-table catalog checkpoint publish with cache-first runtime preserved and watermark-aligned replay correctness.
+  - Non-goals: no user-table checkpoint algorithm changes.
+  - Task Doc: `docs/tasks/000053-catalog-overlay-checkpoint-worker.md`
+  - Task Issue: `#0`
+  - Phase Status: `pending`
+  - Implementation Summary: `pending`
+
+- **Phase 7: Recovery Cutoff and Consistency Checks**
   - Scope: persist/load `catalog_checkpoint_cts`, compute/load watermark `W`, replay only logs with `cts > W`, and add fail-fast checks for post-cutoff catalog/data inconsistencies.
   - Goals: deterministic startup replay boundary with strong consistency guarantees.
   - Non-goals: no physical log truncation implementation.
-  - Task Doc: `docs/tasks/000051-catalog-recovery-cutoff-consistency.md`
+  - Task Doc: `docs/tasks/000054-catalog-recovery-cutoff-consistency.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 5: Validation and Documentation Sync**
+- **Phase 8: Validation and Documentation Sync**
   - Scope: tests for id ranges, file naming, schema behavior, checkpoint atomicity, replay cutoff correctness, and lifecycle ordering (`create/insert/drop`, DDL around cutoff); doc updates.
   - Goals: verify behavioral contract end-to-end.
   - Non-goals: no legacy migration tooling; no physical truncation.
-  - Task Doc: `docs/tasks/000052-catalog-storage-refactor-validation.md`
+  - Task Doc: `docs/tasks/000055-catalog-storage-refactor-validation.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
@@ -256,3 +288,4 @@ None currently.
 - `doradb-storage/src/table/persistence.rs`
 - `doradb-storage/src/trx/redo.rs`
 - `docs/backlogs/000002-non-unique-index-for-catalog-tables.md`
+- `docs/backlogs/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md`
