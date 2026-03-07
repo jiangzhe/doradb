@@ -48,18 +48,28 @@ jobs:
 
         echo "diff_range=${range}" >> "$GITHUB_OUTPUT"
 
-        files="$(git diff --name-only "$range" || true)"
+        diff_failed="false"
+        if files="$(git diff --name-only "$range")"; then
+          :
+        else
+          diff_failed="true"
+          files=""
+        fi
         echo "changed files in ${range}:"
         printf '%s\n' "$files"
 
         run_build="false"
-        while IFS= read -r file; do
-          [[ -z "$file" ]] && continue
-          if [[ "$file" != docs/* && "$file" != *.md ]]; then
-            run_build="true"
-            break
-          fi
-        done <<< "$files"
+        if [[ "$diff_failed" == "true" || -z "$files" ]]; then
+          run_build="true"
+        else
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            if [[ "$file" != docs/* && "$file" != *.md ]]; then
+              run_build="true"
+              break
+            fi
+          done <<< "$files"
+        fi
 
         echo "run_build=${run_build}" >> "$GITHUB_OUTPUT"
         echo "run_build=${run_build}"
