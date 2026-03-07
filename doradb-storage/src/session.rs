@@ -123,10 +123,7 @@ impl Session {
         // 3. begin transaction
         let mut stmt = self.begin_trx().unwrap().start_stmt();
 
-        // 4. lock metadata.
-        let mut table_cache_g = engine.catalog().cache.tables.write().await;
-
-        // 5. insert catalog related objects.
+        // 4. insert catalog related objects.
         let inserted = engine
             .catalog()
             .storage
@@ -167,14 +164,14 @@ impl Session {
             debug_assert!(inserted);
         }
 
-        // 6. add DDL redo log to redo log buffer
+        // 5. add DDL redo log to redo log buffer
         let res = stmt
             .redo
             .ddl
             .replace(Box::new(DDLRedo::CreateTable(table_id)));
         debug_assert!(res.is_none());
 
-        // 7. commit current transaction implicitly.
+        // 6. commit current transaction implicitly.
         let cts = match stmt.succeed().commit().await {
             Ok(cts) => cts,
             Err(e) => {
@@ -183,11 +180,11 @@ impl Session {
             }
         };
 
-        // 8. commit file with cts.
+        // 7. commit file with cts.
         let (table_file, old_root) = uninit_table_file.commit(cts, true).await?;
         debug_assert!(old_root.is_none());
 
-        // 9. Prepare in-memory representation of new table
+        // 8. Prepare in-memory representation of new table
         let blk_idx = BlockIndex::new(
             engine.meta_pool,
             table_id,
@@ -208,8 +205,7 @@ impl Session {
         // Enable page committer so all row pages can be recovered.
         table.blk_idx.enable_page_committer(engine.trx_sys);
 
-        let res = table_cache_g.insert(table_id, table);
-        debug_assert!(res.is_none());
+        engine.catalog().insert_user_table(table);
 
         Ok(table_id)
     }

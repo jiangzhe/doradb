@@ -15,7 +15,7 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
-use crate::catalog::{Catalog, TableID, TableMetadata};
+use crate::catalog::{Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
@@ -222,10 +222,10 @@ impl<'a> LogRecovery<'a> {
         // Update and Delete require a robust consideration.
         for (table_id, pages) in &self.recovered_tables {
             if let Some(table) = self.catalog.get_table(*table_id).await {
-                let metadata = &table.file.active_root().metadata;
+                let metadata = Arc::new(table.metadata().clone());
                 for page_id in pages {
                     table.populate_index_via_row_page(*page_id).await;
-                    self.refresh_page(Arc::clone(metadata), *page_id).await;
+                    self.refresh_page(Arc::clone(&metadata), *page_id).await;
                 }
             }
         }
@@ -336,6 +336,15 @@ impl<'a> LogRecovery<'a> {
         disable_index: bool,
     ) -> Result<()> {
         for (table_id, table_dml) in dml {
+            if is_catalog_obj_id(table_id) {
+                let table = self
+                    .catalog
+                    .get_catalog_table(table_id)
+                    .ok_or(Error::TableNotFound)?;
+                self.replay_catalog_table_modifications(&table, &table_dml.rows)
+                    .await;
+                continue;
+            }
             let table = self
                 .catalog
                 .get_table(table_id)
@@ -356,8 +365,7 @@ impl<'a> LogRecovery<'a> {
         for (table_id, table_dml) in dml {
             let table = self
                 .catalog
-                .get_table(table_id)
-                .await
+                .get_catalog_table(table_id)
                 .ok_or(Error::TableNotFound)?;
             self.replay_catalog_table_modifications(&table, &table_dml.rows)
                 .await;
@@ -367,16 +375,16 @@ impl<'a> LogRecovery<'a> {
 
     async fn replay_catalog_table_modifications(
         &mut self,
-        table: &Table,
+        table: &CatalogTable,
         rows: &BTreeMap<RowID, RowRedo>,
     ) {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
-                    table.insert_no_trx(vals).await;
+                    table.accessor().insert_no_trx(vals).await;
                 }
                 RowRedoKind::DeleteByUniqueKey(key) => {
-                    table.delete_unique_no_trx(key).await;
+                    table.accessor().delete_unique_no_trx(key).await;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     // updates of catalog are implemented as DeleteByUniqueKey and Insert.
@@ -529,7 +537,7 @@ mod tests {
 
             assert!(engine.catalog().get_table(table_id).await.is_some());
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert_eq!(&*table.file.active_root().metadata, &expected_metadata);
+            assert_eq!(table.metadata(), &expected_metadata);
 
             drop(engine);
         })
@@ -648,6 +656,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut rows = 0usize;
             table
+                .accessor()
                 .table_scan_uncommitted(0, |_metadata, row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
                     rows += if row.is_deleted() { 0 } else { 1 };

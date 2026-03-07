@@ -3,12 +3,14 @@ use crate::serde::{Deser, Ser, SerdeCtx};
 pub use doradb_catalog::IndexID;
 use std::mem;
 
+/// In-memory schema definition of one secondary index.
 pub struct IndexSchema {
     pub keys: Vec<IndexKey>,
     pub unique: bool,
 }
 
 impl IndexSchema {
+    /// Create an index schema from ordered key columns and uniqueness flag.
     #[inline]
     pub fn new(keys: Vec<IndexKey>, unique: bool) -> Self {
         debug_assert!(!keys.is_empty());
@@ -16,6 +18,7 @@ impl IndexSchema {
     }
 }
 
+/// One key column descriptor used by [`IndexSchema`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexKey {
     pub user_col_idx: u16,
@@ -52,6 +55,7 @@ impl Deser for IndexKey {
 }
 
 impl IndexKey {
+    /// Create an ascending key descriptor on one user column.
     #[inline]
     pub fn new(user_col_idx: u16) -> Self {
         IndexKey {
@@ -61,6 +65,7 @@ impl IndexKey {
     }
 }
 
+/// Sort direction used in index key definitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IndexOrder {

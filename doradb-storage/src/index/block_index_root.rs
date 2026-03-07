@@ -81,12 +81,22 @@ impl BlockIndexRoot {
     }
 
     #[inline]
-    fn snapshot(&self) -> (RowID, PageID) {
+    pub fn snapshot(&self) -> (RowID, PageID) {
         self.latch.optimistic_read(|| {
             // SAFETY: values are read under optimistic latch and validated
             // before being returned from `optimistic_read`.
             unsafe { (*self.pivot_row_id.get(), *self.column_root_page_id.get()) }
         })
+    }
+
+    #[inline]
+    pub fn pivot_row_id(&self) -> RowID {
+        self.snapshot().0
+    }
+
+    #[inline]
+    pub fn column_root_page_id(&self) -> PageID {
+        self.snapshot().1
     }
 }
 

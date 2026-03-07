@@ -1,10 +1,7 @@
-use crate::buffer::BufferPool;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableCache, TableID};
-use crate::latch::LatchFallbackMode;
+use crate::catalog::{TableCache, TableHandle, TableID};
+use crate::row::RowID;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
-use crate::row::{RowID, RowPage};
-use crate::table::Table;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
@@ -115,20 +112,18 @@ impl RowUndoLogs {
     }
 
     #[inline]
-    async fn rollback_entry_in_table(entry: OwnedRowUndo, table: &Table, sts: Option<TrxID>) {
+    async fn rollback_entry_in_table(entry: OwnedRowUndo, table: &TableHandle, sts: Option<TrxID>) {
         let pivot_row_id = table.pivot_row_id();
         if entry.page_id.is_none() || entry.row_id < pivot_row_id {
-            table.deletion_buffer().remove(entry.row_id);
+            if let Some(deletion_buffer) = table.deletion_buffer() {
+                deletion_buffer.remove(entry.row_id);
+            }
             return;
         }
         let Some(page_guard) = table
-            .mem_pool
-            .try_get_page_versioned::<RowPage>(entry.page_id.unwrap(), LatchFallbackMode::Shared)
+            .try_get_row_page_versioned_shared(entry.page_id.unwrap())
             .await
         else {
-            return;
-        };
-        let Some(page_guard) = page_guard.lock_shared_async().await else {
             return;
         };
         let (ctx, page) = page_guard.ctx_and_page();

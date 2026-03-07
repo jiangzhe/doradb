@@ -1,3 +1,4 @@
+use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::TableMetadata;
@@ -5,7 +6,7 @@ use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, In
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
-use crate::table::{Table, TableAccess};
+use crate::table::TableAccess;
 use crate::value::Val;
 use crate::value::ValKind;
 use semistr::SemiStr;
@@ -17,6 +18,7 @@ const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
 const PK_NO_TABLES: usize = 0;
 const PK_NAME_TABLES: &str = "pk_tables";
 
+/// Return static table definition of `catalog.tables`.
 pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
     DEF.get_or_init(|| {
@@ -46,8 +48,9 @@ fn row_to_table_object(metadata: &TableMetadata, row: Row<'_>) -> TableObject {
     TableObject { table_id }
 }
 
+/// Runtime accessor for `catalog.tables`.
 pub struct Tables<'a> {
-    pub(super) table: &'a Table,
+    pub(super) table: &'a CatalogTable,
 }
 
 impl Tables<'_> {
@@ -56,6 +59,7 @@ impl Tables<'_> {
     pub async fn find_uncommitted_by_id(&self, table_id: TableID) -> Option<TableObject> {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
         self.table
+            .accessor()
             .index_lookup_unique_uncommitted(&key, row_to_table_object)
             .await
     }
@@ -63,13 +67,14 @@ impl Tables<'_> {
     /// Insert a table.
     pub async fn insert(&self, stmt: &mut Statement, obj: &TableObject) -> bool {
         let cols = vec![Val::from(obj.table_id)];
-        self.table.insert_mvcc(stmt, cols).await.is_ok()
+        self.table.accessor().insert_mvcc(stmt, cols).await.is_ok()
     }
 
     /// Delete a table by id.
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: TableID) -> bool {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
         self.table
+            .accessor()
             .delete_unique_mvcc(stmt, &key, true)
             .await
             .is_ok()
