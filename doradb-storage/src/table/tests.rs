@@ -1104,7 +1104,7 @@ fn test_table_scan_uncommitted() {
             let mut res_len = 0usize;
             sys.table
                 .accessor()
-                .table_scan_uncommitted(0, |_metadata, _row| {
+                .table_scan_uncommitted(|_metadata, _row| {
                     res_len += 1;
                     true
                 })
@@ -1144,7 +1144,7 @@ fn test_table_scan_mvcc() {
             let mut res_len = 0usize;
             sys.table
                 .accessor()
-                .table_scan_mvcc(&stmt, 0, &[0], |_| {
+                .table_scan_mvcc(&stmt, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -1170,7 +1170,7 @@ fn test_table_scan_mvcc() {
             let mut res_len = 0usize;
             sys.table
                 .accessor()
-                .table_scan_mvcc(&stmt, 0, &[0], |_| {
+                .table_scan_mvcc(&stmt, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -1188,7 +1188,7 @@ fn test_table_scan_mvcc() {
             let mut res_len = 0usize;
             sys.table
                 .accessor()
-                .table_scan_mvcc(&stmt, 0, &[0], |_| {
+                .table_scan_mvcc(&stmt, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -1350,8 +1350,7 @@ fn test_data_checkpoint_basic_flow() {
 
         let old_root = sys.table.file.active_root().clone();
         sys.table.freeze(usize::MAX).await;
-        let pivot_row_id = sys.table.file.active_root().pivot_row_id;
-        let (frozen_pages, _) = sys.table.collect_frozen_pages(pivot_row_id).await;
+        let (frozen_pages, _) = sys.table.collect_frozen_pages().await;
         assert!(!frozen_pages.is_empty());
 
         sys.table.data_checkpoint(&mut session).await.unwrap();

@@ -48,8 +48,7 @@ impl Table {
         let mut cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
         let mut frozen_pages = Vec::new();
         if include_new_data {
-            let (pages, candidate_heap_redo_start_ts) =
-                self.collect_frozen_pages(pivot_row_id).await;
+            let (pages, candidate_heap_redo_start_ts) = self.collect_frozen_pages().await;
             frozen_pages = pages;
             if !frozen_pages.is_empty() {
                 self.wait_for_frozen_pages_stable(trx_sys, &frozen_pages)
@@ -265,7 +264,7 @@ impl Table {
 impl TablePersistence for Table {
     async fn freeze(&self, max_rows: usize) -> usize {
         let mut rows = 0usize;
-        self.mem_scan(0, |page_guard| {
+        self.mem_scan(|page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let vmap = ctx.row_ver().unwrap();
             rows += page.header.approx_non_deleted();

@@ -164,12 +164,21 @@ impl Table {
         &self.deletion_buffer
     }
 
-    async fn collect_frozen_pages(&self, pivot_row_id: RowID) -> (Vec<FrozenPage>, Option<TrxID>) {
+    async fn collect_frozen_pages(&self) -> (Vec<FrozenPage>, Option<TrxID>) {
         let mut frozen_pages = Vec::new();
+        let pivot_row_id = self.pivot_row_id();
         let mut expected_row_id = pivot_row_id;
         let mut heap_redo_start_ts = None;
-        self.mem_scan(pivot_row_id, |page_guard| {
+        let mut seen_first_page = false;
+        self.mem_scan(|page_guard| {
             let page = page_guard.page();
+            if !seen_first_page {
+                seen_first_page = true;
+                debug_assert_eq!(
+                    page.header.start_row_id, pivot_row_id,
+                    "first in-memory row page must start from pivot_row_id"
+                );
+            }
             if page.header.start_row_id != expected_row_id {
                 return false;
             }
@@ -398,14 +407,14 @@ impl Table {
         res
     }
 
-    async fn mem_scan<F>(&self, start_row_id: RowID, mut page_action: F)
+    async fn mem_scan<F>(&self, mut page_action: F)
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
         let mut cursor = self.blk_idx.mem_cursor();
-        cursor.seek(start_row_id).await;
+        cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
             debug_assert!(g.page().is_leaf());

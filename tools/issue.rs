@@ -27,6 +27,7 @@ struct ValidatedDoc {
     doc_type: String,
     doc_id: String,
     title_hint: Option<String>,
+    github_issue: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -372,7 +373,7 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         }
     }
 
-    let doc_sync = match upsert_doc_github_issue(doc_path, issue_no) {
+    let doc_sync = match upsert_doc_github_issue(doc_path, issue_no, validated.github_issue) {
         Ok(v) => v,
         Err(e) => {
             print_json(&json!({
@@ -386,7 +387,7 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
                 "doc_synced": false,
                 "doc_sync_error": e,
             }));
-            return Err(2);
+            return Ok(());
         }
     };
 
@@ -1631,6 +1632,7 @@ fn validate_doc_path(path: &Path) -> serde_json::Value {
         "doc_type": kind,
         "doc_id": doc_id,
         "title_hint": title_hint(path),
+        "github_issue": parse_doc_github_issue_hint(path),
     })
 }
 
@@ -1648,9 +1650,13 @@ fn title_hint(path: &Path) -> Option<String> {
     None
 }
 
-fn parse_rfc_issue_hint(path: &Path) -> Option<i64> {
+fn parse_doc_github_issue_hint(path: &Path) -> Option<i64> {
     let text = fs::read_to_string(path).ok()?;
     let lines: Vec<&str> = text.lines().collect();
+    parse_github_issue_from_frontmatter_lines(&lines)
+}
+
+fn parse_github_issue_from_frontmatter_lines(lines: &[&str]) -> Option<i64> {
     if lines.first().map(|v| v.trim()) != Some("---") {
         return None;
     }
@@ -1670,8 +1676,9 @@ fn parse_rfc_issue_hint(path: &Path) -> Option<i64> {
             .split_once(':')
             .map(|(_, right)| right.trim())
             .unwrap_or("");
-        if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-            if let Ok(parsed) = value.parse::<i64>() {
+        let token = value.split_whitespace().next().unwrap_or("");
+        if !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(parsed) = token.parse::<i64>() {
                 return Some(parsed);
             }
         }
@@ -1679,14 +1686,37 @@ fn parse_rfc_issue_hint(path: &Path) -> Option<i64> {
     None
 }
 
-fn upsert_doc_github_issue(path: &Path, issue_no: i64) -> Result<DocSyncResult, String> {
+fn parse_rfc_issue_hint(path: &Path) -> Option<i64> {
+    parse_doc_github_issue_hint(path)
+}
+
+fn upsert_doc_github_issue(
+    path: &Path,
+    issue_no: i64,
+    validated_issue: Option<i64>,
+) -> Result<DocSyncResult, String> {
     if issue_no <= 0 {
         return Err("issue number must be positive".to_string());
+    }
+    if let Some(existing) = validated_issue
+        && existing != issue_no
+    {
+        return Err(format!(
+            "conflict: validated github_issue is {existing}, refusing to overwrite with {issue_no}"
+        ));
     }
 
     let content = fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", normalize_path(path)))?;
-    let (updated, changed, mode) = upsert_frontmatter_github_issue(&content, issue_no);
+    let lines: Vec<&str> = content.lines().collect();
+    if let Some(existing) = parse_github_issue_from_frontmatter_lines(&lines)
+        && existing != issue_no
+    {
+        return Err(format!(
+            "conflict: stored github_issue is {existing}, refusing to overwrite with {issue_no}"
+        ));
+    }
+    let (updated, changed, mode) = upsert_frontmatter_github_issue(&content, issue_no)?;
 
     if changed {
         fs::write(path, updated)
@@ -1696,47 +1726,51 @@ fn upsert_doc_github_issue(path: &Path, issue_no: i64) -> Result<DocSyncResult, 
     Ok(DocSyncResult { changed, mode })
 }
 
-fn upsert_frontmatter_github_issue(content: &str, issue_no: i64) -> (String, bool, &'static str) {
+fn upsert_frontmatter_github_issue(
+    content: &str,
+    issue_no: i64,
+) -> Result<(String, bool, &'static str), String> {
     let lines: Vec<&str> = content.lines().collect();
     let issue_line = format!("github_issue: {issue_no}");
 
     if lines.first().map(|v| v.trim()) == Some("---") {
-        if let Some(end_idx) = lines
+        let Some(end_idx) = lines
             .iter()
             .enumerate()
             .skip(1)
             .find(|(_, v)| v.trim() == "---")
-            .map(|(idx, _)| idx)
-        {
-            let mut out: Vec<String> = lines.iter().map(|v| (*v).to_string()).collect();
-            let mut found_idx = None;
-            for (idx, line) in out.iter().enumerate().take(end_idx).skip(1) {
-                if line.trim().starts_with("github_issue:") {
-                    found_idx = Some(idx);
-                    break;
-                }
-            }
+            .map(|(idx, _)| idx) else {
+            return Err("unterminated frontmatter: missing closing `---`".to_string());
+        };
 
-            if let Some(idx) = found_idx {
-                let old = out[idx].trim().to_string();
-                if old == issue_line {
-                    return (content.to_string(), false, "already_set");
-                }
-                out[idx] = issue_line;
-                let mut rebuilt = out.join("\n");
-                if content.ends_with('\n') {
-                    rebuilt.push('\n');
-                }
-                return (rebuilt, true, "updated");
+        let mut out: Vec<String> = lines.iter().map(|v| (*v).to_string()).collect();
+        let mut found_idx = None;
+        for (idx, line) in out.iter().enumerate().take(end_idx).skip(1) {
+            if line.trim().starts_with("github_issue:") {
+                found_idx = Some(idx);
+                break;
             }
+        }
 
-            out.insert(end_idx, issue_line);
+        if let Some(idx) = found_idx {
+            let old = out[idx].trim().to_string();
+            if old == issue_line {
+                return Ok((content.to_string(), false, "already_set"));
+            }
+            out[idx] = issue_line;
             let mut rebuilt = out.join("\n");
             if content.ends_with('\n') {
                 rebuilt.push('\n');
             }
-            return (rebuilt, true, "inserted");
+            return Ok((rebuilt, true, "updated"));
         }
+
+        out.insert(end_idx, issue_line);
+        let mut rebuilt = out.join("\n");
+        if content.ends_with('\n') {
+            rebuilt.push('\n');
+        }
+        return Ok((rebuilt, true, "inserted"));
     }
 
     // No YAML frontmatter found. Prepend a minimal frontmatter block so both
@@ -1749,7 +1783,7 @@ fn upsert_frontmatter_github_issue(content: &str, issue_no: i64) -> (String, boo
     if content.ends_with('\n') && !rebuilt.ends_with('\n') {
         rebuilt.push('\n');
     }
-    (rebuilt, true, "prepended")
+    Ok((rebuilt, true, "prepended"))
 }
 
 fn normalize_for_doc_rule(path: &Path) -> String {
@@ -1766,6 +1800,7 @@ fn validated_from_json(value: &serde_json::Value) -> Option<ValidatedDoc> {
         title_hint: value
             .get("title_hint")
             .and_then(|v| v.as_str().map(ToString::to_string)),
+        github_issue: value.get("github_issue").and_then(|v| v.as_i64()),
     })
 }
 
@@ -2054,4 +2089,99 @@ fn print_json(value: &serde_json::Value) {
 
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn test_upsert_frontmatter_github_issue_already_set() {
+        let input = "---\nowner: alice\ngithub_issue: 123\n---\n\n# Title\n";
+        let (updated, changed, mode) = upsert_frontmatter_github_issue(input, 123).unwrap();
+        assert_eq!(updated, input);
+        assert!(!changed);
+        assert_eq!(mode, "already_set");
+    }
+
+    #[test]
+    fn test_upsert_frontmatter_github_issue_updated() {
+        let input = "---\nowner: alice\ngithub_issue: 99\n---\n\n# Title\n";
+        let expected = "---\nowner: alice\ngithub_issue: 123\n---\n\n# Title\n";
+        let (updated, changed, mode) = upsert_frontmatter_github_issue(input, 123).unwrap();
+        assert_eq!(updated, expected);
+        assert!(changed);
+        assert_eq!(mode, "updated");
+    }
+
+    #[test]
+    fn test_upsert_frontmatter_github_issue_inserted() {
+        let input = "---\nowner: alice\nstatus: open\n---\n\n# Title\n";
+        let expected = "---\nowner: alice\nstatus: open\ngithub_issue: 123\n---\n\n# Title\n";
+        let (updated, changed, mode) = upsert_frontmatter_github_issue(input, 123).unwrap();
+        assert_eq!(updated, expected);
+        assert!(changed);
+        assert_eq!(mode, "inserted");
+    }
+
+    #[test]
+    fn test_upsert_frontmatter_github_issue_prepended_no_frontmatter() {
+        let input = "# Task: Example\n\nBody\n";
+        let expected = "---\ngithub_issue: 123\n---\n\n# Task: Example\n\nBody\n";
+        let (updated, changed, mode) = upsert_frontmatter_github_issue(input, 123).unwrap();
+        assert_eq!(updated, expected);
+        assert!(changed);
+        assert_eq!(mode, "prepended");
+    }
+
+    #[test]
+    fn test_upsert_frontmatter_github_issue_unterminated_frontmatter_error() {
+        let input = "---\nowner: alice\ngithub_issue: 9\n# Missing closing fence\n";
+        let err = upsert_frontmatter_github_issue(input, 123).unwrap_err();
+        assert!(err.contains("unterminated frontmatter"));
+    }
+
+    #[test]
+    fn test_upsert_doc_github_issue_conflict_does_not_overwrite() {
+        let path = unique_temp_path("issue-script-upsert-conflict");
+        let input = "---\ngithub_issue: 7\n---\n\n# Doc\n";
+        fs::write(&path, input).unwrap();
+
+        let err = upsert_doc_github_issue(&path, 9, Some(7)).unwrap_err();
+        assert!(err.contains("conflict"));
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, input);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_upsert_doc_github_issue_unterminated_frontmatter_does_not_overwrite() {
+        let path = unique_temp_path("issue-script-upsert-unterminated");
+        let input = "---\ngithub_issue: 7\n# Missing closing fence\n";
+        fs::write(&path, input).unwrap();
+
+        let err = upsert_doc_github_issue(&path, 9, None).unwrap_err();
+        assert!(err.contains("unterminated frontmatter"));
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, input);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        for attempt in 0..100u32 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let filename = format!("{prefix}-{}-{nanos}-{attempt}.md", std::process::id());
+            let path = env::temp_dir().join(filename);
+            if !path.exists() {
+                return path;
+            }
+        }
+        panic!("failed to allocate unique temp path");
+    }
 }

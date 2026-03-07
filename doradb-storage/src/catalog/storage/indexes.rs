@@ -131,7 +131,7 @@ impl Indexes<'_> {
         let mut res = vec![];
         self.table
             .accessor()
-            .table_scan_uncommitted(0, |metadata, row| {
+            .table_scan_uncommitted(|metadata, row| {
                 if row.is_deleted() {
                     return true;
                 }
@@ -288,7 +288,7 @@ impl IndexColumns<'_> {
         let mut res = vec![];
         self.table
             .accessor()
-            .table_scan_uncommitted(0, |metadata, row| {
+            .table_scan_uncommitted(|metadata, row| {
                 if row.is_deleted() {
                     return true;
                 }

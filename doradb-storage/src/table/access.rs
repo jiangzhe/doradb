@@ -41,19 +41,20 @@ pub trait TableAccess {
     /// This method iterates raw latest row versions and includes rows marked
     /// as deleted. Callers should explicitly filter `row.is_deleted()` if they
     /// only need live rows.
-    fn table_scan_uncommitted<F>(
-        &self,
-        start_row_id: RowID,
-        row_action: F,
-    ) -> impl Future<Output = ()>
+    ///
+    /// Note: this scans only in-memory row-store pages and does not include
+    /// persisted column-store rows on disk.
+    fn table_scan_uncommitted<F>(&self, row_action: F) -> impl Future<Output = ()>
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool;
 
     /// Table scan with MVCC.
+    ///
+    /// Note: this scans only in-memory row-store pages and does not include
+    /// persisted column-store rows on disk.
     fn table_scan_mvcc<F>(
         &self,
         stmt: &Statement,
-        start_row_id: RowID,
         read_set: &[usize],
         row_action: F,
     ) -> impl Future<Output = ()>
@@ -199,7 +200,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     }
 
     #[inline]
-    async fn mem_scan<F>(&self, start_row_id: RowID, page_action: F)
+    async fn mem_scan<F>(&self, page_action: F)
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
@@ -207,7 +208,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
         let mut cursor = self.blk_idx.mem_cursor();
-        cursor.seek(start_row_id).await;
+        cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
             debug_assert!(g.page().is_leaf());
@@ -1786,11 +1787,11 @@ pub type HybridTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool, FixedB
 pub type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool, FixedBufferPool>;
 
 impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
-    async fn table_scan_uncommitted<F>(&self, start_row_id: RowID, mut row_action: F)
+    async fn table_scan_uncommitted<F>(&self, mut row_action: F)
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
     {
-        self.mem_scan(start_row_id, |page_guard| {
+        self.mem_scan(|page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, ctx) {
@@ -1803,16 +1804,11 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         .await;
     }
 
-    async fn table_scan_mvcc<F>(
-        &self,
-        stmt: &Statement,
-        start_row_id: RowID,
-        read_set: &[usize],
-        mut row_action: F,
-    ) where
+    async fn table_scan_mvcc<F>(&self, stmt: &Statement, read_set: &[usize], mut row_action: F)
+    where
         F: FnMut(Vec<Val>) -> bool,
     {
-        self.mem_scan(start_row_id, |page_guard| {
+        self.mem_scan(|page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, ctx) {

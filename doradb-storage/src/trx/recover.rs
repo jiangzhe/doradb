@@ -657,7 +657,7 @@ mod tests {
             let mut rows = 0usize;
             table
                 .accessor()
-                .table_scan_uncommitted(0, |_metadata, row| {
+                .table_scan_uncommitted(|_metadata, row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
                     rows += if row.is_deleted() { 0 } else { 1 };
                     true
