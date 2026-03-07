@@ -58,6 +58,12 @@ struct AutoPrTitle {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct DocSyncResult {
+    changed: bool,
+    mode: &'static str,
+}
+
 const ALLOWED_TYPE_LABELS: &[&str] = &[
     "type:doc",
     "type:perf",
@@ -366,6 +372,24 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         }
     }
 
+    let doc_sync = match upsert_doc_github_issue(doc_path, issue_no) {
+        Ok(v) => v,
+        Err(e) => {
+            print_json(&json!({
+                "created": true,
+                "issue_number": issue_no,
+                "issue_url": issue_url,
+                "doc": validated.path,
+                "labels": labels,
+                "assignee": assignee,
+                "parent": parent,
+                "doc_synced": false,
+                "doc_sync_error": e,
+            }));
+            return Err(2);
+        }
+    };
+
     print_json(&json!({
         "created": true,
         "issue_number": issue_no,
@@ -374,6 +398,12 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         "labels": labels,
         "assignee": assignee,
         "parent": parent,
+        "doc_synced": true,
+        "doc_sync": {
+            "path": normalize_path(doc_path),
+            "changed": doc_sync.changed,
+            "mode": doc_sync.mode,
+        }
     }));
     Ok(())
 }
@@ -1647,6 +1677,79 @@ fn parse_rfc_issue_hint(path: &Path) -> Option<i64> {
         }
     }
     None
+}
+
+fn upsert_doc_github_issue(path: &Path, issue_no: i64) -> Result<DocSyncResult, String> {
+    if issue_no <= 0 {
+        return Err("issue number must be positive".to_string());
+    }
+
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", normalize_path(path)))?;
+    let (updated, changed, mode) = upsert_frontmatter_github_issue(&content, issue_no);
+
+    if changed {
+        fs::write(path, updated)
+            .map_err(|e| format!("failed to write {}: {e}", normalize_path(path)))?;
+    }
+
+    Ok(DocSyncResult { changed, mode })
+}
+
+fn upsert_frontmatter_github_issue(content: &str, issue_no: i64) -> (String, bool, &'static str) {
+    let lines: Vec<&str> = content.lines().collect();
+    let issue_line = format!("github_issue: {issue_no}");
+
+    if lines.first().map(|v| v.trim()) == Some("---") {
+        if let Some(end_idx) = lines
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, v)| v.trim() == "---")
+            .map(|(idx, _)| idx)
+        {
+            let mut out: Vec<String> = lines.iter().map(|v| (*v).to_string()).collect();
+            let mut found_idx = None;
+            for (idx, line) in out.iter().enumerate().take(end_idx).skip(1) {
+                if line.trim().starts_with("github_issue:") {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+
+            if let Some(idx) = found_idx {
+                let old = out[idx].trim().to_string();
+                if old == issue_line {
+                    return (content.to_string(), false, "already_set");
+                }
+                out[idx] = issue_line;
+                let mut rebuilt = out.join("\n");
+                if content.ends_with('\n') {
+                    rebuilt.push('\n');
+                }
+                return (rebuilt, true, "updated");
+            }
+
+            out.insert(end_idx, issue_line);
+            let mut rebuilt = out.join("\n");
+            if content.ends_with('\n') {
+                rebuilt.push('\n');
+            }
+            return (rebuilt, true, "inserted");
+        }
+    }
+
+    // No YAML frontmatter found. Prepend a minimal frontmatter block so both
+    // task and RFC docs can carry deterministic issue linkage metadata.
+    let mut rebuilt = String::new();
+    rebuilt.push_str("---\n");
+    rebuilt.push_str(&issue_line);
+    rebuilt.push_str("\n---\n\n");
+    rebuilt.push_str(content.trim_start_matches('\n'));
+    if content.ends_with('\n') && !rebuilt.ends_with('\n') {
+        rebuilt.push('\n');
+    }
+    (rebuilt, true, "prepended")
 }
 
 fn normalize_for_doc_rule(path: &Path) -> String {

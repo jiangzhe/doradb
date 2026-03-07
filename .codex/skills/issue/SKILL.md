@@ -38,6 +38,9 @@ tools/issue.rs create-issue-from-doc \
 ```
 
 `create-issue-from-doc` must use assignee `@me`.
+After successful issue creation, the tool also syncs
+`github_issue: <issue-id>` back into the source planning doc immediately
+(task or RFC) so later workflows can read issue linkage directly from doc content.
 
 `--labels` is optional. If omitted, labels can be derived from planning-doc metadata:
 

@@ -1,3 +1,7 @@
+---
+github_issue: 389
+---
+
 # Task: Dedicated CatalogTable Runtime Without Legacy Bootstrap Files
 
 ## Summary

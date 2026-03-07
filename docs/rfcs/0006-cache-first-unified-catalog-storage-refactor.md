@@ -1,6 +1,7 @@
 ---
 id: 0006
 title: Cache-First Unified Catalog Storage Refactor
+github_issue: 382
 status: proposal
 tags: [storage-engine, catalog, checkpoint, recovery, refactor]
 created: 2026-03-03
