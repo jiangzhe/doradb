@@ -601,7 +601,7 @@ fn test_row_page_transition_retries_update_delete() {
             .await
             .unwrap();
         let insert = vec![Val::from(2i32), Val::from("insert")];
-        let insert_res = sys.table.insert_row_to_page(
+        let insert_res = sys.table.accessor().insert_row_to_page(
             &mut stmt,
             insert_page_guard,
             insert,
@@ -619,6 +619,7 @@ fn test_row_page_transition_retries_update_delete() {
         }];
         let res = sys
             .table
+            .accessor()
             .update_row_inplace(&mut stmt, page_guard, &key, row_id, update)
             .await;
         assert!(matches!(res, UpdateRowInplace::RetryInTransition));
@@ -637,6 +638,7 @@ fn test_row_page_transition_retries_update_delete() {
             .unwrap();
         let res = sys
             .table
+            .accessor()
             .delete_row_internal(&mut stmt, page_guard, row_id, &key, false)
             .await;
         assert!(matches!(res, DeleteInternal::RetryInTransition));
@@ -1101,7 +1103,8 @@ fn test_table_scan_uncommitted() {
         {
             let mut res_len = 0usize;
             sys.table
-                .table_scan_uncommitted(0, |_metadata, _row| {
+                .accessor()
+                .table_scan_uncommitted(|_metadata, _row| {
                     res_len += 1;
                     true
                 })
@@ -1140,7 +1143,8 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(&stmt, 0, &[0], |_| {
+                .accessor()
+                .table_scan_mvcc(&stmt, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -1165,7 +1169,8 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(&stmt, 0, &[0], |_| {
+                .accessor()
+                .table_scan_mvcc(&stmt, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -1182,7 +1187,8 @@ fn test_table_scan_mvcc() {
             let stmt = trx.start_stmt();
             let mut res_len = 0usize;
             sys.table
-                .table_scan_mvcc(&stmt, 0, &[0], |_| {
+                .accessor()
+                .table_scan_mvcc(&stmt, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -1296,6 +1302,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let (ctx, page) = page_guard.ctx_and_page();
         let mut lock_row = sys
             .table
+            .accessor()
             .lock_row_for_write(&mut stmt, &page_guard, row_id, Some(&key))
             .await;
         match &mut lock_row {
@@ -1343,8 +1350,7 @@ fn test_data_checkpoint_basic_flow() {
 
         let old_root = sys.table.file.active_root().clone();
         sys.table.freeze(usize::MAX).await;
-        let pivot_row_id = sys.table.file.active_root().pivot_row_id;
-        let (frozen_pages, _) = sys.table.collect_frozen_pages(pivot_row_id).await;
+        let (frozen_pages, _) = sys.table.collect_frozen_pages().await;
         assert!(!frozen_pages.is_empty());
 
         sys.table.data_checkpoint(&mut session).await.unwrap();

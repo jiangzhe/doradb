@@ -94,12 +94,12 @@ impl Statement {
     /// Insert a row into a table.
     #[inline]
     pub async fn insert_row(&mut self, table: &Table, cols: Vec<Val>) -> InsertMvcc {
-        table.insert_mvcc(self, cols).await
+        table.accessor().insert_mvcc(self, cols).await
     }
 
     #[inline]
     pub async fn delete_row(&mut self, table: &Table, key: &SelectKey) -> DeleteMvcc {
-        table.delete_unique_mvcc(self, key, false).await
+        table.accessor().delete_unique_mvcc(self, key, false).await
     }
 
     #[inline]
@@ -110,6 +110,7 @@ impl Statement {
         user_read_set: &[usize],
     ) -> SelectMvcc {
         table
+            .accessor()
             .index_lookup_unique_mvcc(self, key, user_read_set)
             .await
     }
@@ -121,7 +122,7 @@ impl Statement {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
-        table.update_unique_mvcc(self, key, update).await
+        table.accessor().update_unique_mvcc(self, key, update).await
     }
 
     #[inline]

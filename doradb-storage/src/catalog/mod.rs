@@ -1,20 +1,28 @@
 // mod index;
+pub mod runtime;
 pub mod spec;
 pub mod storage;
 pub mod table;
 
+pub use runtime::*;
 pub use spec::*;
 pub use storage::*;
 pub use table::*;
 
-use crate::buffer::{FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::guard::PageSharedGuard;
+use crate::buffer::page::{PageID, VersionedPageID};
+use crate::buffer::{BufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
-use crate::latch::RwLock;
+use crate::index::SecondaryIndex;
+use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
-use crate::table::Table;
+use crate::row::ops::SelectKey;
+use crate::row::{RowID, RowPage};
+use crate::table::{ColumnDeletionBuffer, Table, TableAccess};
 use crate::trx::sys::TransactionSystem;
+use dashmap::DashMap;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -28,11 +36,13 @@ pub type ColumnID = ObjID;
 pub type IndexID = ObjID;
 pub const USER_OBJ_ID_START: ObjID = 0x0001_0000_0000_0000;
 
+/// Return whether an object id belongs to user-managed catalog space.
 #[inline]
 pub const fn is_user_obj_id(obj_id: ObjID) -> bool {
     obj_id >= USER_OBJ_ID_START
 }
 
+/// Return whether an object id belongs to built-in catalog table space.
 #[inline]
 pub const fn is_catalog_obj_id(obj_id: ObjID) -> bool {
     !is_user_obj_id(obj_id)
@@ -41,25 +51,23 @@ pub const fn is_catalog_obj_id(obj_id: ObjID) -> bool {
 /// Catalog contains metadata of user tables.
 pub struct Catalog {
     next_user_obj_id: AtomicU64,
-    pub cache: CatalogCache,
+    user_tables: DashMap<TableID, Table>,
     pub storage: CatalogStorage,
 }
 
 impl Catalog {
+    /// Create a catalog runtime from persisted catalog storage.
     #[inline]
     pub fn new(storage: CatalogStorage) -> Self {
-        let mut cache = CatalogCache::new();
         let next_user_obj_id = storage.next_user_obj_id();
-        for (table_id, table) in storage.all() {
-            cache.tables.get_mut().insert(table_id, table);
-        }
         Catalog {
             next_user_obj_id: AtomicU64::new(next_user_obj_id),
-            cache,
+            user_tables: DashMap::new(),
             storage,
         }
     }
 
+    /// Allocate and return the next user object id.
     #[inline]
     pub fn next_user_obj_id(&self) -> ObjID {
         self.next_user_obj_id.fetch_add(1, Ordering::SeqCst)
@@ -71,6 +79,7 @@ impl Catalog {
             .fetch_max(next_user_obj_id, Ordering::SeqCst);
     }
 
+    /// Return the current next user object id without allocating one.
     #[inline]
     pub fn curr_next_user_obj_id(&self) -> ObjID {
         self.next_user_obj_id.load(Ordering::Acquire)
@@ -86,14 +95,12 @@ impl Catalog {
     /// No page creation should be persisted in redo log for catalog tables.
     #[inline]
     pub async fn enable_page_committer_for_tables(&self, trx_sys: &'static TransactionSystem) {
-        let tables_g = self.cache.tables.read().await;
-        for table in tables_g.values() {
-            if self.is_user_table(table.table_id()) {
-                table.blk_idx.enable_page_committer(trx_sys);
-            }
+        for entry in &self.user_tables {
+            entry.value().blk_idx.enable_page_committer(trx_sys);
         }
     }
 
+    /// Reload one user table runtime from catalog metadata and table file.
     pub async fn reload_create_table(
         &self,
         index_pool: &'static FixedBufferPool,
@@ -191,21 +198,40 @@ impl Catalog {
                 )
                 .await;
                 // Update table into cache
-                let mut table_cache_g = self.cache.tables.write().await;
-                let res = table_cache_g.insert(table_id, table);
-                assert!(res.is_none());
+                let old = self.user_tables.insert(table_id, table);
+                debug_assert!(old.is_none());
                 Ok(())
             }
             None => Err(Error::TableNotFound),
         }
     }
 
+    /// Get a user-table runtime handle by table id.
     #[inline]
     pub async fn get_table(&self, table_id: TableID) -> Option<Table> {
-        let g = self.cache.tables.read().await;
-        g.get(&table_id).cloned()
+        if is_catalog_obj_id(table_id) {
+            return None;
+        }
+        self.user_tables
+            .get(&table_id)
+            .map(|table| table.value().clone())
     }
 
+    /// Get a catalog-table runtime handle by table id.
+    #[inline]
+    pub fn get_catalog_table(&self, table_id: TableID) -> Option<CatalogTable> {
+        self.storage.get_catalog_table(table_id)
+    }
+
+    /// Insert a user table runtime into the in-memory cache.
+    #[inline]
+    pub fn insert_user_table(&self, table: Table) {
+        let table_id = table.table_id();
+        let old = self.user_tables.insert(table_id, table);
+        debug_assert!(old.is_none());
+    }
+
+    /// Return the metadata buffer pool used by catalog/index metadata pages.
     #[inline]
     pub fn meta_pool(&self) -> &'static FixedBufferPool {
         self.storage.meta_pool
@@ -216,27 +242,105 @@ unsafe impl Send for Catalog {}
 unsafe impl Sync for Catalog {}
 unsafe impl StaticLifetime for Catalog {}
 
-pub struct CatalogCache {
-    pub tables: RwLock<HashMap<TableID, Table>>,
+/// Unified runtime handle for either user table or catalog table.
+pub enum TableHandle {
+    User(Table),
+    Catalog(CatalogTable),
 }
 
-impl CatalogCache {
-    #[allow(clippy::new_without_default)]
+impl TableHandle {
     #[inline]
-    pub fn new() -> Self {
-        CatalogCache {
-            tables: RwLock::new(HashMap::new()),
+    pub fn blk_idx(&self) -> &BlockIndex {
+        match self {
+            TableHandle::User(table) => &table.blk_idx,
+            TableHandle::Catalog(table) => &table.blk_idx,
+        }
+    }
+
+    #[inline]
+    pub fn sec_idx(&self) -> &[SecondaryIndex] {
+        match self {
+            TableHandle::User(table) => &table.sec_idx,
+            TableHandle::Catalog(table) => &table.sec_idx,
+        }
+    }
+
+    #[inline]
+    pub fn pivot_row_id(&self) -> RowID {
+        self.blk_idx().pivot_row_id()
+    }
+
+    #[inline]
+    pub fn deletion_buffer(&self) -> Option<&ColumnDeletionBuffer> {
+        match self {
+            TableHandle::User(table) => Some(table.deletion_buffer()),
+            TableHandle::Catalog(_) => None,
+        }
+    }
+
+    #[inline]
+    pub async fn try_get_row_page_versioned_shared(
+        &self,
+        page_id: VersionedPageID,
+    ) -> Option<PageSharedGuard<RowPage>> {
+        match self {
+            TableHandle::User(table) => {
+                let page_guard = table
+                    .mem_pool
+                    .try_get_page_versioned::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await?;
+                page_guard.lock_shared_async().await
+            }
+            TableHandle::Catalog(table) => {
+                let page_guard = table
+                    .mem_pool
+                    .try_get_page_versioned::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await?;
+                page_guard.lock_shared_async().await
+            }
+        }
+    }
+
+    #[inline]
+    pub async fn get_row_page_shared(&self, page_id: PageID) -> Option<PageSharedGuard<RowPage>> {
+        match self {
+            TableHandle::User(table) => {
+                table
+                    .mem_pool
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await
+                    .lock_shared_async()
+                    .await
+            }
+            TableHandle::Catalog(table) => {
+                table
+                    .mem_pool
+                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .await
+                    .lock_shared_async()
+                    .await
+            }
+        }
+    }
+
+    #[inline]
+    pub async fn delete_index(&self, key: &SelectKey, row_id: RowID, unique: bool) -> bool {
+        match self {
+            TableHandle::User(table) => table.accessor().delete_index(key, row_id, unique).await,
+            TableHandle::Catalog(table) => table.accessor().delete_index(key, row_id, unique).await,
         }
     }
 }
 
+/// Per-operation table handle cache used by rollback/recovery paths.
 pub struct TableCache<'a> {
     catalog: &'a Catalog,
-    tables: HashMap<TableID, Table>,
+    tables: HashMap<TableID, TableHandle>,
     missing: HashSet<TableID>,
 }
 
 impl<'a> TableCache<'a> {
+    /// Create an empty table cache bound to one catalog instance.
     #[inline]
     pub fn new(catalog: &'a Catalog) -> Self {
         TableCache {
@@ -251,13 +355,23 @@ impl<'a> TableCache<'a> {
     /// If table is not cached, this method loads it from catalog and caches
     /// positive/negative lookup result.
     #[inline]
-    pub async fn get_table_ref(&mut self, table_id: TableID) -> Option<&Table> {
+    pub async fn get_table_ref(&mut self, table_id: TableID) -> Option<&TableHandle> {
         match self.tables.entry(table_id) {
             Entry::Vacant(vac) => {
                 if self.missing.contains(&table_id) {
                     return None;
                 }
-                match self.catalog.get_table(table_id).await {
+                let loaded = if is_catalog_obj_id(table_id) {
+                    self.catalog
+                        .get_catalog_table(table_id)
+                        .map(TableHandle::Catalog)
+                } else {
+                    self.catalog
+                        .get_table(table_id)
+                        .await
+                        .map(TableHandle::User)
+                };
+                match loaded {
                     Some(table) => {
                         let res = vac.insert(table);
                         Some(&*res)
@@ -280,7 +394,7 @@ impl<'a> TableCache<'a> {
     /// This method is intended for rollback paths where table id in undo log
     /// must always map to an existing table.
     #[inline]
-    pub async fn must_get_table(&mut self, table_id: TableID) -> &Table {
+    pub async fn must_get_table(&mut self, table_id: TableID) -> &TableHandle {
         match self.get_table_ref(table_id).await {
             Some(table) => table,
             None => panic!("table {table_id} not found in catalog"),

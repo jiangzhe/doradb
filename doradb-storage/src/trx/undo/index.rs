@@ -1,11 +1,8 @@
-use crate::buffer::BufferPool;
-use crate::catalog::{TableCache, TableID};
+use crate::catalog::{TableCache, TableHandle, TableID};
 use crate::index::util::Maskable;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
-use crate::latch::LatchFallbackMode;
 use crate::row::ops::SelectKey;
-use crate::row::{RowID, RowPage, RowRead};
-use crate::table::Table;
+use crate::row::{RowID, RowRead};
 use crate::trx::TrxID;
 use crate::trx::row::RowReadAccess;
 
@@ -51,10 +48,10 @@ impl IndexUndoLogs {
     }
 
     #[inline]
-    async fn rollback_entry_in_table(entry: IndexUndo, table: &Table, ts: TrxID) {
+    async fn rollback_entry_in_table(entry: IndexUndo, table: &TableHandle, ts: TrxID) {
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
-                let index = table.sec_idx[key.index_no].unique().unwrap();
+                let index = table.sec_idx()[key.index_no].unique().unwrap();
                 if merge_old_deleted {
                     // this is actually a update from deleted to non-deleted.
                     // so we just mask it back to deleted.
@@ -68,7 +65,7 @@ impl IndexUndoLogs {
                 }
             }
             IndexUndoKind::InsertNonUnique(key, merge_old_deleted) => {
-                let index = table.sec_idx[key.index_no].non_unique().unwrap();
+                let index = table.sec_idx()[key.index_no].non_unique().unwrap();
                 if merge_old_deleted {
                     let res = index.mask_as_deleted(&key.vals, entry.row_id, ts).await;
                     assert!(res);
@@ -85,7 +82,7 @@ impl IndexUndoLogs {
                     // must own the lock of old row.
                     // So directly rollback index should be fine.
                     let new_row_id = entry.row_id;
-                    let index = table.sec_idx[key.index_no].unique().unwrap();
+                    let index = table.sec_idx()[key.index_no].unique().unwrap();
                     let res = index
                         .compare_exchange(&key.vals, new_row_id, old_row_id, ts)
                         .await;
@@ -104,17 +101,11 @@ impl IndexUndoLogs {
                     //
                     // To solve this, we need to re-check original row with row latch and delete
                     // index entry if it is deleted and does not have any old version (already GCed).
-                    match table.blk_idx.find_row(old_row_id).await {
+                    match table.blk_idx().find_row(old_row_id).await {
                         RowLocation::NotFound => unreachable!(),
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let Some(page_guard) = table
-                                .mem_pool
-                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                                .await
-                                .lock_shared_async()
-                                .await
-                            else {
+                            let Some(page_guard) = table.get_row_page_shared(page_id).await else {
                                 return;
                             };
                             // acquire row latch to avoid race condition.
@@ -123,7 +114,7 @@ impl IndexUndoLogs {
                             if access.row().is_deleted() && !access.any_old_version_exists() {
                                 // old row is invisible to all transactions.
                                 let new_row_id = entry.row_id;
-                                let index = table.sec_idx[key.index_no].unique().unwrap();
+                                let index = table.sec_idx()[key.index_no].unique().unwrap();
                                 let res =
                                     index.compare_delete(&key.vals, new_row_id, true, ts).await;
                                 assert!(res);
@@ -132,7 +123,7 @@ impl IndexUndoLogs {
                                 // rollback the index change and let other take care of
                                 // following GC.
                                 let new_row_id = entry.row_id;
-                                let index = table.sec_idx[key.index_no].unique().unwrap();
+                                let index = table.sec_idx()[key.index_no].unique().unwrap();
                                 let res = index
                                     .compare_exchange(
                                         &key.vals,
@@ -151,13 +142,13 @@ impl IndexUndoLogs {
                 // Because we always mask index entry as deleted for each defer delete undo log.
                 // We need to unmask it.
                 if unique {
-                    let index = table.sec_idx[key.index_no].unique().unwrap();
+                    let index = table.sec_idx()[key.index_no].unique().unwrap();
                     let res = index
                         .compare_exchange(&key.vals, entry.row_id.deleted(), entry.row_id, ts)
                         .await;
                     assert!(res.is_ok());
                 } else {
-                    let index = table.sec_idx[key.index_no].non_unique().unwrap();
+                    let index = table.sec_idx()[key.index_no].non_unique().unwrap();
                     let res = index.mask_as_active(&key.vals, entry.row_id, ts).await;
                     assert!(res);
                 }

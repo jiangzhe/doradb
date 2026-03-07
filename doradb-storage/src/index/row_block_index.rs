@@ -2,7 +2,7 @@ use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
 };
 use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
-use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::{TableID, TableMetadata};
 use crate::error::{
     Error, Result, Validation,
@@ -354,9 +354,9 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     /// Get row page for insertion.
     /// Caller should cache insert page id to avoid invoking this method frequently.
     #[inline]
-    pub async fn get_insert_page(
+    pub async fn get_insert_page<B: BufferPool>(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &'static B,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
         if let Ok(free_page) = self.get_insert_page_from_free_list(mem_pool).await {
@@ -370,9 +370,9 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
 
     /// Get exclusive row page for insertion.
     #[inline]
-    pub async fn get_insert_page_exclusive(
+    pub async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &'static B,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
         if let Ok(free_page) = self
@@ -390,9 +390,9 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     /// Allocate a row page with given page id.
     /// This method is used for data recovery, which replay all commit logs including row page creation.
     #[inline]
-    pub async fn allocate_row_page_at(
+    pub async fn allocate_row_page_at<B: BufferPool>(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &'static B,
         count: usize,
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
@@ -469,9 +469,9 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     }
 
     #[inline]
-    async fn get_insert_page_from_free_list(
+    async fn get_insert_page_from_free_list<B: BufferPool>(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &'static B,
     ) -> Result<PageSharedGuard<RowPage>> {
         let page_id = {
             let mut g = self.insert_free_list.lock();
@@ -490,9 +490,9 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     }
 
     #[inline]
-    async fn get_insert_page_exclusive_from_free_list(
+    async fn get_insert_page_exclusive_from_free_list<B: BufferPool>(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &'static B,
     ) -> Result<PageExclusiveGuard<RowPage>> {
         let page_id = {
             let mut g = self.insert_free_list.lock();

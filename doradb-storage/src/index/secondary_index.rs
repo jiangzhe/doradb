@@ -355,6 +355,7 @@ mod tests {
                 let mut stmt = trx.start_stmt();
                 for i in 0i32..5i32 {
                     let res = table
+                        .accessor()
                         .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
                         .await;
                     assert!(res.is_ok());
@@ -365,6 +366,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let res = table
+                    .accessor()
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
@@ -373,7 +375,10 @@ mod tests {
                 let trx = session.begin_trx().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(1i32)]);
-                let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
+                let res = table
+                    .accessor()
+                    .index_scan_mvcc(&stmt, &key, user_read_set)
+                    .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.unwrap().len() == 1);
                 // update val = 0 where id = 1
@@ -384,28 +389,40 @@ mod tests {
                     idx: 1,
                     val: Val::from(0i32),
                 }];
-                let res = table.update_unique_mvcc(&mut stmt, &key, update).await;
+                let res = table
+                    .accessor()
+                    .update_unique_mvcc(&mut stmt, &key, update)
+                    .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
                 // select ... where val = 0
                 let trx = session.begin_trx().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
-                let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
+                let res = table
+                    .accessor()
+                    .index_scan_mvcc(&stmt, &key, user_read_set)
+                    .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.unwrap().len() == 2);
                 // delete where id = 0
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
-                let res = table.delete_unique_mvcc(&mut stmt, &key, false).await;
+                let res = table
+                    .accessor()
+                    .delete_unique_mvcc(&mut stmt, &key, false)
+                    .await;
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
                 // select ... where val = 0
                 let trx = session.begin_trx().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
-                let res = table.index_scan_mvcc(&stmt, &key, user_read_set).await;
+                let res = table
+                    .accessor()
+                    .index_scan_mvcc(&stmt, &key, user_read_set)
+                    .await;
                 _ = stmt.succeed().commit().await.unwrap();
                 assert!(res.unwrap().len() == 1);
             }
@@ -441,6 +458,7 @@ mod tests {
                 let mut stmt = trx.start_stmt();
                 for i in 0i32..5i32 {
                     let res = table
+                        .accessor()
                         .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
                         .await;
                     assert!(res.is_ok());
@@ -450,6 +468,7 @@ mod tests {
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let res = table
+                    .accessor()
                     .insert_mvcc(&mut stmt, vec![Val::from(5i32), Val::from(5i32)])
                     .await;
                 assert!(res.is_ok());
@@ -459,6 +478,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(5i32)]);
                 let res = table
+                    .accessor()
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
@@ -471,7 +491,10 @@ mod tests {
                     idx: 1,
                     val: Val::from(0i32),
                 }];
-                let res = table.update_unique_mvcc(&mut stmt, &key, update).await;
+                let res = table
+                    .accessor()
+                    .update_unique_mvcc(&mut stmt, &key, update)
+                    .await;
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;
                 // select ... where id = 1
@@ -479,6 +502,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let res = table
+                    .accessor()
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
@@ -489,7 +513,10 @@ mod tests {
                 let trx = session.begin_trx().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
-                let res = table.delete_unique_mvcc(&mut stmt, &key, false).await;
+                let res = table
+                    .accessor()
+                    .delete_unique_mvcc(&mut stmt, &key, false)
+                    .await;
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;
                 // select ... where val = 0
@@ -497,6 +524,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
                 let res = table
+                    .accessor()
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
@@ -508,11 +536,15 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(3i32)]);
                 let mut stmt = trx.start_stmt();
-                let res = table.delete_unique_mvcc(&mut stmt, &key, false).await;
+                let res = table
+                    .accessor()
+                    .delete_unique_mvcc(&mut stmt, &key, false)
+                    .await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
                 stmt = trx.start_stmt();
                 let res = table
+                    .accessor()
                     .insert_mvcc(&mut stmt, vec![Val::from(3), Val::from(3)])
                     .await;
                 assert!(res.is_ok());
@@ -524,6 +556,7 @@ mod tests {
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(3i32)]);
                 let res = table
+                    .accessor()
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 _ = stmt.succeed().commit().await.unwrap();

@@ -20,6 +20,7 @@
 ## Coding Style & Naming Conventions
 - Standard Rust formatting (rustfmt)
 - Rust edition 2024
+- Follow the [Coding Guidance](docs/process/coding-guidance.md) for detailed patterns and rules.
 
 ## Testing Guidelines
 - Tests live alongside code (`mod tests { ... }`) and in files like `doradb-storage/src/table/tests.rs`.
@@ -50,3 +51,7 @@ Read `docs/process/pull-request.md` for details.
 ## Lint Guidelines
 
 Read `docs/process/lint.md` for details.
+
+## Coding Guidance
+
+Read `docs/process/coding-guidance.md` for details.

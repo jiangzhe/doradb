@@ -1,9 +1,7 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool,
-};
-use crate::catalog::TableID;
+use crate::buffer::{BufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool};
+use crate::catalog::{TableID, TableMetadata};
 use crate::file::table_file::TableFile;
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
@@ -27,7 +25,7 @@ pub struct GenericBlockIndex<P: 'static> {
     pub table_id: TableID,
     root: BlockIndexRoot,
     row: GenericRowBlockIndex<P>,
-    disk_pool: ReadonlyBufferPool,
+    disk_pool: Option<ReadonlyBufferPool>,
 }
 
 /// Compatibility alias for runtime block index backed by `FixedBufferPool`.
@@ -56,7 +54,24 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             table_id,
             root,
             row,
-            disk_pool,
+            disk_pool: Some(disk_pool),
+        }
+    }
+
+    /// Creates block index for catalog-table runtime without table-file backing.
+    #[inline]
+    pub async fn new_catalog(
+        pool: &'static P,
+        table_id: TableID,
+        metadata: Arc<TableMetadata>,
+    ) -> Self {
+        let row = GenericRowBlockIndex::new(pool, table_id, metadata).await;
+        let root = BlockIndexRoot::new(0, 0);
+        GenericBlockIndex {
+            table_id,
+            root,
+            row,
+            disk_pool: None,
         }
     }
 
@@ -88,11 +103,29 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             .await;
     }
 
+    /// Returns current row/column route boundary metadata.
+    #[inline]
+    pub fn root_snapshot(&self) -> (RowID, PageID) {
+        self.root.snapshot()
+    }
+
+    /// Returns current pivot row id.
+    #[inline]
+    pub fn pivot_row_id(&self) -> RowID {
+        self.root.pivot_row_id()
+    }
+
+    /// Returns current column-root page id.
+    #[inline]
+    pub fn column_root_page_id(&self) -> PageID {
+        self.root.column_root_page_id()
+    }
+
     /// Returns a shared row page suitable for insert operations.
     #[inline]
-    pub async fn get_insert_page(
+    pub async fn get_insert_page<B: BufferPool>(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &'static B,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
         self.row.get_insert_page(mem_pool, count).await
@@ -100,9 +133,9 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
     /// Returns an exclusive row page suitable for insert operations.
     #[inline]
-    pub async fn get_insert_page_exclusive(
+    pub async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &'static B,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
         self.row.get_insert_page_exclusive(mem_pool, count).await
@@ -112,9 +145,9 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     ///
     /// This is primarily used by recovery replay.
     #[inline]
-    pub async fn allocate_row_page_at(
+    pub async fn allocate_row_page_at<B: BufferPool>(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &'static B,
         count: usize,
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
@@ -173,7 +206,10 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         pivot_row_id: RowID,
         root_page_id: PageID,
     ) -> RowLocation {
-        let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, &self.disk_pool);
+        let Some(disk_pool) = &self.disk_pool else {
+            return RowLocation::NotFound;
+        };
+        let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, disk_pool);
         match index.find(row_id).await {
             Ok(Some(payload)) => RowLocation::LwcPage(payload.block_id as PageID),
             Ok(None) => RowLocation::NotFound,

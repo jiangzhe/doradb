@@ -65,6 +65,7 @@ Run these commands from the project root:
 *   **Formatting**: Standard `rustfmt`.
 *   **Edition**: Rust 2024.
 *   **Conventions**: Idiomatic Rust. Async/Await is used extensively.
+*   **Detailed Guidelines**: See [Coding Guidance](docs/process/coding-guidance.md).
 
 ### Issue Tracking & Contribution
 *   **Tooling**: Use the GitHub CLI (`gh`) for all issue and PR management.
@@ -94,5 +95,6 @@ Run these commands from the project root:
 ## Key Files
 *   `doradb-storage/Cargo.toml`: Active dependency manifest.
 *   `docs/architecture.md`: The definitive guide to the storage engine's design.
+*   `docs/process/coding-guidance.md`: Coding standards and conventions.
 *   `AGENTS.md`: Guidelines for AI agents working in this repo.
 *   `docs/process/unit-test.md`: Guidelines for unit testing.

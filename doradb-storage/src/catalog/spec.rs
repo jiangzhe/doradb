@@ -2,18 +2,21 @@ use crate::value::ValKind;
 use bitflags::bitflags;
 use semistr::SemiStr;
 
+/// User-facing table definition used by DDL/create-table paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSpec {
     pub columns: Vec<ColumnSpec>,
 }
 
 impl TableSpec {
+    /// Create a table spec from ordered column definitions.
     #[inline]
     pub fn new(columns: Vec<ColumnSpec>) -> Self {
         Self { columns }
     }
 }
 
+/// Logical column definition in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSpec {
     pub column_name: SemiStr,
@@ -22,6 +25,7 @@ pub struct ColumnSpec {
 }
 
 impl ColumnSpec {
+    /// Create one column specification.
     #[inline]
     pub fn new(
         column_name: &str,
@@ -36,6 +40,7 @@ impl ColumnSpec {
     }
 }
 
+/// Logical index definition in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSpec {
     pub index_name: SemiStr,
@@ -44,6 +49,7 @@ pub struct IndexSpec {
 }
 
 impl IndexSpec {
+    /// Create one index specification.
     #[inline]
     pub fn new(name: &str, index_cols: Vec<IndexKey>, index_attributes: IndexAttributes) -> Self {
         let index_name = SemiStr::new(name);
@@ -54,6 +60,7 @@ impl IndexSpec {
         }
     }
 
+    /// Return whether this index enforces uniqueness.
     #[inline]
     pub fn unique(&self) -> bool {
         self.index_attributes.contains(IndexAttributes::PK)
@@ -62,6 +69,7 @@ impl IndexSpec {
 }
 
 bitflags! {
+    /// Column-level attributes for schema definition.
     pub struct ColumnAttributes: u32 {
         // whether value can be null.
         const NULLABLE = 0x01;
@@ -71,12 +79,14 @@ bitflags! {
 }
 
 bitflags! {
+    /// Index-level attributes for schema definition.
     pub struct IndexAttributes: u32 {
         const PK = 0x01;
         const UK = 0x02;
     }
 }
 
+/// One indexed column descriptor inside an index definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexKey {
     // This is user_col_idx. RowID is not included.
@@ -85,6 +95,7 @@ pub struct IndexKey {
 }
 
 impl IndexKey {
+    /// Create an index key on one user column with ascending order.
     #[inline]
     pub fn new(col_no: u16) -> Self {
         IndexKey {
@@ -94,6 +105,7 @@ impl IndexKey {
     }
 }
 
+/// Sort direction of one column in an index key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IndexOrder {

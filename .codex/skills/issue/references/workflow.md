@@ -58,6 +58,8 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 - Use `--json` for list/read operations.
 - Use `--body-file` when body can be long.
 - Always use assignee `@me` when creating issues and PRs.
+- `tools/issue.rs create-issue-from-doc` must sync `github_issue: <issue-id>`
+  into the source planning doc immediately after issue creation.
 - For PR creation, check working tree cleanliness first and force explicit decision on dirty changes.
 
 ## Completion

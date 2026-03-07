@@ -1,3 +1,4 @@
+use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::{IndexColumnObject, IndexObject};
 use crate::catalog::table::TableMetadata;
@@ -7,7 +8,7 @@ use crate::catalog::{
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
-use crate::table::{Table, TableAccess};
+use crate::table::TableAccess;
 use crate::value::Val;
 use crate::value::ValKind;
 use semistr::SemiStr;
@@ -27,6 +28,7 @@ const COL_NAME_INDEXES_INDEX_ATTRIBUTES: &str = "index_attributes";
 const PK_NO_INDEXES: usize = 0;
 const PK_NAME_INDEXES: &str = "pk_indexes";
 
+/// Return static table definition of `catalog.indexes`.
 pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
     DEF.get_or_init(|| {
@@ -89,8 +91,9 @@ fn row_to_index_object(metadata: &TableMetadata, row: Row<'_>) -> IndexObject {
     }
 }
 
+/// Runtime accessor for `catalog.indexes`.
 pub struct Indexes<'a> {
-    pub(super) table: &'a Table,
+    pub(super) table: &'a CatalogTable,
 }
 
 impl Indexes<'_> {
@@ -102,7 +105,7 @@ impl Indexes<'_> {
             Val::from(obj.index_name.as_str()),
             Val::from(obj.index_attributes.bits()),
         ];
-        self.table.insert_mvcc(stmt, cols).await.is_ok()
+        self.table.accessor().insert_mvcc(stmt, cols).await.is_ok()
     }
 
     /// Delete an index by (table_id, index_no).
@@ -117,6 +120,7 @@ impl Indexes<'_> {
             vec![Val::from(table_id), Val::from(index_no)],
         );
         self.table
+            .accessor()
             .delete_unique_mvcc(stmt, &key, true)
             .await
             .is_ok()
@@ -126,7 +130,8 @@ impl Indexes<'_> {
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<IndexObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(0, |metadata, row| {
+            .accessor()
+            .table_scan_uncommitted(|metadata, row| {
                 if row.is_deleted() {
                     return true;
                 }
@@ -164,6 +169,7 @@ const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &str = "index_order";
 const PK_NO_INDEX_COLUMNS: usize = 0;
 const PK_NAME_INDEX_COLUMNS: &str = "pk_index_columns";
 
+/// Return static table definition of `catalog.index_columns`.
 pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
     DEF.get_or_init(|| {
@@ -247,11 +253,13 @@ fn row_to_index_column_object(metadata: &TableMetadata, row: Row<'_>) -> IndexCo
     }
 }
 
+/// Runtime accessor for `catalog.index_columns`.
 pub struct IndexColumns<'a> {
-    pub(super) table: &'a Table,
+    pub(super) table: &'a CatalogTable,
 }
 
 impl IndexColumns<'_> {
+    /// Insert one index-column mapping row.
     pub async fn insert(&self, stmt: &mut Statement, obj: &IndexColumnObject) -> bool {
         let cols = vec![
             Val::from(obj.table_id),
@@ -260,9 +268,12 @@ impl IndexColumns<'_> {
             Val::from(obj.column_no),
             Val::from(obj.index_order as u8),
         ];
-        self.table.insert_mvcc(stmt, cols).await.is_ok()
+        self.table.accessor().insert_mvcc(stmt, cols).await.is_ok()
     }
 
+    /// Delete all index-column rows by `(table_id, index_no)`.
+    ///
+    /// This is not implemented yet and currently always panics.
     pub async fn delete_by_index(
         &self,
         _stmt: &mut Statement,
@@ -272,10 +283,12 @@ impl IndexColumns<'_> {
         todo!()
     }
 
+    /// List all index-column rows of one table from uncommitted-visible rows.
     pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<IndexColumnObject> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(0, |metadata, row| {
+            .accessor()
+            .table_scan_uncommitted(|metadata, row| {
                 if row.is_deleted() {
                     return true;
                 }

@@ -35,9 +35,11 @@ impl Table {
         include_new_data: bool,
         include_deletion: bool,
     ) -> Result<()> {
+        let table_file = &self.file;
+        let disk_pool = &self.disk_pool;
         // Step 1: snapshot current table root and initialize checkpoint boundaries.
         let trx_sys = session.engine().trx_sys;
-        let active_root = self.file.active_root();
+        let active_root = table_file.active_root();
         let pivot_row_id = active_root.pivot_row_id;
         let mut next_heap_redo_start_ts = None;
 
@@ -46,8 +48,7 @@ impl Table {
         let mut cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
         let mut frozen_pages = Vec::new();
         if include_new_data {
-            let (pages, candidate_heap_redo_start_ts) =
-                self.collect_frozen_pages(pivot_row_id).await;
+            let (pages, candidate_heap_redo_start_ts) = self.collect_frozen_pages().await;
             frozen_pages = pages;
             if !frozen_pages.is_empty() {
                 self.wait_for_frozen_pages_stable(trx_sys, &frozen_pages)
@@ -102,18 +103,13 @@ impl Table {
         }));
 
         // Step 6: fork mutable table-file state and apply selected phases.
-        let mut mutable_file = MutableTableFile::fork(&self.file);
+        let mut mutable_file = MutableTableFile::fork(table_file);
         let mut table_file_changed = false;
         if include_new_data {
             table_file_changed = true;
             if !lwc_pages.is_empty() {
                 mutable_file
-                    .apply_lwc_pages(
-                        lwc_pages,
-                        heap_redo_start_ts,
-                        checkpoint_ts,
-                        &self.disk_pool,
-                    )
+                    .apply_lwc_pages(lwc_pages, heap_redo_start_ts, checkpoint_ts, disk_pool)
                     .await?;
             } else {
                 mutable_file.apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts)?;
@@ -162,6 +158,7 @@ impl Table {
         cutoff_ts: TrxID,
         checkpoint_ts: TrxID,
     ) -> Result<bool> {
+        let disk_pool = &self.disk_pool;
         // Step 1: ensure there is a persisted column index to patch.
         let mutable_root = mutable_file.root();
         if mutable_root.column_block_index_root == 0 || mutable_root.pivot_row_id == 0 {
@@ -189,7 +186,7 @@ impl Table {
         let column_index = ColumnBlockIndex::new(
             mutable_root.column_block_index_root,
             mutable_root.pivot_row_id,
-            &self.disk_pool,
+            disk_pool,
         );
 
         let mut grouped: BTreeMap<u64, (BlockPatchSeed, BTreeSet<u32>)> = BTreeMap::new();
@@ -267,7 +264,7 @@ impl Table {
 impl TablePersistence for Table {
     async fn freeze(&self, max_rows: usize) -> usize {
         let mut rows = 0usize;
-        self.mem_scan(0, |page_guard| {
+        self.mem_scan(|page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let vmap = ctx.row_ver().unwrap();
             rows += page.header.approx_non_deleted();
