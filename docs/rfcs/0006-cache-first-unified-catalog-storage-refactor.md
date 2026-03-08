@@ -213,9 +213,9 @@ Reference:
   - Goals: remove catalog runtime dependence on evictable data-pool semantics.
   - Non-goals: no new engine config knobs for dedicated catalog pool sizing in this phase.
   - Task Doc: `docs/tasks/000052-catalog-fixed-buffer-pool-specialization.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#391`
+  - Phase Status: done
+  - Implementation Summary: 1. Removed user-table evictable-pool ownership from `CatalogStorage`: [Task Resolve Sync: docs/tasks/000052-catalog-fixed-buffer-pool-specialization.md @ 2026-03-08]
 
 - **Phase 6: Unified Catalog Overlay and Checkpoint Worker**
   - Scope: implement catalog overlay root format over `catalog.mtb`, periodic + dirty-event scheduling, `Catalog::checkpoint_now()`, and replay-based catalog checkpoint build for redo prefix `(last_catalog_checkpoint_cts, W]`.
