@@ -11,7 +11,7 @@ pub use table::*;
 
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::{PageID, VersionedPageID};
-use crate::buffer::{BufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
@@ -103,6 +103,7 @@ impl Catalog {
     /// Reload one user table runtime from catalog metadata and table file.
     pub async fn reload_create_table(
         &self,
+        mem_pool: &'static EvictableBufferPool,
         index_pool: &'static FixedBufferPool,
         table_fs: &'static TableFileSystem,
         global_disk_pool: &'static GlobalReadonlyBufferPool,
@@ -189,14 +190,8 @@ impl Catalog {
                     global_disk_pool,
                 )
                 .await;
-                let table = Table::new(
-                    self.storage.mem_pool,
-                    index_pool,
-                    global_disk_pool,
-                    blk_idx,
-                    table_file,
-                )
-                .await;
+                let table =
+                    Table::new(mem_pool, index_pool, global_disk_pool, blk_idx, table_file).await;
                 // Update table into cache
                 let old = self.user_tables.insert(table_id, table);
                 debug_assert!(old.is_none());

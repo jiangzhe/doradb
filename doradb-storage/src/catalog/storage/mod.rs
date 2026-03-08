@@ -3,7 +3,7 @@ mod indexes;
 mod object;
 mod tables;
 
-use crate::buffer::{EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::{FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::catalog::runtime::CatalogTable;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
@@ -23,7 +23,6 @@ use std::sync::Arc;
 /// Runtime storage container for all catalog logical tables.
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
-    pub(super) mem_pool: &'static EvictableBufferPool,
     tables: Box<[CatalogTable]>,
     next_user_obj_id: ObjID,
     mtb: Arc<MultiTableFile>,
@@ -35,7 +34,6 @@ impl CatalogStorage {
     pub async fn new(
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
-        mem_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
         _global_disk_pool: &'static GlobalReadonlyBufferPool,
     ) -> Result<Self> {
@@ -59,7 +57,6 @@ impl CatalogStorage {
         }
         Ok(CatalogStorage {
             meta_pool,
-            mem_pool,
             tables: cat.into_boxed_slice(),
             next_user_obj_id: mtb_snapshot.meta.next_user_obj_id,
             mtb,

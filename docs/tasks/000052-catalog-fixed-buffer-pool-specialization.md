@@ -1,7 +1,7 @@
 ---
 id: 000052
 title: Catalog FixedBufferPool Specialization
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-08
 github_issue: 391
 ---
@@ -85,6 +85,29 @@ Reference:
 
 ## Implementation Notes
 
+1. Removed user-table evictable-pool ownership from `CatalogStorage`:
+   - dropped `mem_pool` field from `CatalogStorage`;
+   - removed `mem_pool` parameter from `CatalogStorage::new(...)`.
+2. Kept catalog runtime bootstrap behavior unchanged:
+   - catalog table initialization still uses
+     `BlockIndex::new_catalog(meta_pool, ...)` and
+     `CatalogTable::new(meta_pool, index_pool, ...)`.
+3. Moved user-table `mem_pool` dependency to reload boundary:
+   - `Catalog::reload_create_table(...)` now accepts
+     `mem_pool: &'static EvictableBufferPool`;
+   - user-table runtime reconstruction passes this explicit dependency into
+     `Table::new(...)`.
+4. Updated wiring call sites:
+   - `TrxSysConfig::build_static(...)` now calls
+     `CatalogStorage::new(meta_pool, index_pool, table_fs, global_disk_pool)`;
+   - recovery DDL replay now passes `self.mem_pool` when calling
+     `Catalog::reload_create_table(...)`.
+5. Verification executed:
+   - `cargo fmt --all`
+   - `cargo test -p doradb-storage --no-default-features test_bootstrap_creates_catalog_mtb_without_catalog_tbl_files -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features catalog::storage:: -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features test_log_recover_ddl -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features`
 
 ## Impacts
 

@@ -265,6 +265,7 @@ impl<'a> LogRecovery<'a> {
                 self.replay_catalog_modifications(dml).await?;
                 self.catalog
                     .reload_create_table(
+                        self.mem_pool,
                         self.index_pool,
                         self.table_fs,
                         self.global_disk_pool,
