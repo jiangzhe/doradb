@@ -4,7 +4,8 @@ use crate::buffer::page::PageID;
 use crate::catalog::table::TableMetadata;
 use crate::error::{Error, Result};
 use crate::file::cow_file::{
-    ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, OldCowRoot, ParsedMeta,
+    ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
+    OldCowRoot, ParsedMeta,
 };
 use crate::file::meta_page::{MetaPage, MetaPageSerView};
 use crate::file::super_page::{
@@ -453,6 +454,27 @@ impl MutableTableFile {
             return true;
         }
         false
+    }
+}
+
+impl MutableCowFile for MutableTableFile {
+    #[inline]
+    fn allocate_page_id(&mut self) -> Result<PageID> {
+        MutableTableFile::allocate_page_id(self)
+    }
+
+    #[inline]
+    fn record_gc_page(&mut self, page_id: PageID) {
+        MutableTableFile::record_gc_page(self, page_id)
+    }
+
+    #[inline]
+    fn write_page(
+        &self,
+        page_id: PageID,
+        buf: DirectBuf,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        MutableTableFile::write_page(self, page_id, buf)
     }
 }
 

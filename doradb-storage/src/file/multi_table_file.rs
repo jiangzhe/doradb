@@ -3,7 +3,8 @@ use crate::buffer::page::PageID;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{Error, Result};
 use crate::file::cow_file::{
-    ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, OldCowRoot, ParsedMeta,
+    ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
+    OldCowRoot, ParsedMeta,
 };
 use crate::file::meta_page::{MultiTableMetaPageData, MultiTableMetaPageSerView};
 use crate::file::super_page::{
@@ -300,6 +301,26 @@ impl MutableMultiTableFile {
         &mut self.new_root
     }
 
+    /// Allocate a new page id for copy-on-write updates.
+    #[inline]
+    pub fn allocate_page_id(&mut self) -> Result<PageID> {
+        self.new_root
+            .try_allocate_page_id()
+            .ok_or(Error::InvalidState)
+    }
+
+    /// Record an obsolete page id to be reclaimed after commit.
+    #[inline]
+    pub fn record_gc_page(&mut self, page_id: PageID) {
+        self.new_root.gc_page_list.push(page_id);
+    }
+
+    /// Write one page into the underlying multi-table file.
+    #[inline]
+    pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
+        self.file.write_page(page_id, buf).await
+    }
+
     /// Apply checkpoint metadata to mutable root.
     #[inline]
     pub fn apply_checkpoint_metadata(
@@ -328,6 +349,27 @@ impl MutableMultiTableFile {
         let MutableMultiTableFile { file, new_root } = self;
         let old_root = file.publish_root(new_root).await?;
         Ok((file, old_root))
+    }
+}
+
+impl MutableCowFile for MutableMultiTableFile {
+    #[inline]
+    fn allocate_page_id(&mut self) -> Result<PageID> {
+        MutableMultiTableFile::allocate_page_id(self)
+    }
+
+    #[inline]
+    fn record_gc_page(&mut self, page_id: PageID) {
+        MutableMultiTableFile::record_gc_page(self, page_id)
+    }
+
+    #[inline]
+    fn write_page(
+        &self,
+        page_id: PageID,
+        buf: DirectBuf,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        MutableMultiTableFile::write_page(self, page_id, buf)
     }
 }
 

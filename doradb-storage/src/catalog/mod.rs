@@ -21,7 +21,7 @@ use crate::lifetime::StaticLifetime;
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage};
 use crate::table::{ColumnDeletionBuffer, Table, TableAccess};
-use crate::trx::sys::TransactionSystem;
+use crate::trx::sys::{CatalogCheckpointBatch, TransactionSystem};
 use dashmap::DashMap;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -83,6 +83,34 @@ impl Catalog {
     #[inline]
     pub fn curr_next_user_obj_id(&self) -> ObjID {
         self.next_user_obj_id.load(Ordering::Acquire)
+    }
+
+    /// Trigger one ad-hoc catalog checkpoint publish.
+    #[inline]
+    pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
+        let batch = self.scan_checkpoint_batch(trx_sys)?;
+        self.apply_checkpoint_batch(batch).await
+    }
+
+    /// Scan persisted redo logs and collect one safe catalog checkpoint batch.
+    pub fn scan_checkpoint_batch(
+        &self,
+        trx_sys: &TransactionSystem,
+    ) -> Result<CatalogCheckpointBatch> {
+        let snapshot = self.storage.checkpoint_snapshot()?;
+        let from_exclusive = snapshot.checkpoint_cts;
+        let durable_upper_cts = trx_sys.persisted_watermark_cts();
+        trx_sys.scan_catalog_checkpoint_batch(from_exclusive, durable_upper_cts, |table_id| {
+            self.loaded_table_checkpoint_ts(table_id)
+        })
+    }
+
+    /// Apply one scanned catalog checkpoint batch into `catalog.mtb`.
+    #[inline]
+    pub async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
+        self.storage
+            .apply_checkpoint_batch(batch, self.curr_next_user_obj_id())
+            .await
     }
 
     /// Returns whether a table is user table.
@@ -230,6 +258,13 @@ impl Catalog {
     #[inline]
     pub fn meta_pool(&self) -> &'static FixedBufferPool {
         self.storage.meta_pool
+    }
+
+    #[inline]
+    fn loaded_table_checkpoint_ts(&self, table_id: TableID) -> Option<u64> {
+        self.user_tables
+            .get(&table_id)
+            .map(|table| table.file.active_root().heap_redo_start_ts)
     }
 }
 
@@ -402,8 +437,9 @@ pub mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::engine::{Engine, EngineConfig};
+    use crate::trx::sys::CatalogCheckpointScanStopReason;
     use crate::trx::sys_conf::TrxSysConfig;
-    use crate::value::ValKind;
+    use crate::value::{Val, ValKind};
     use semistr::SemiStr;
     use tempfile::TempDir;
 
@@ -636,6 +672,171 @@ pub mod tests {
             assert!(table_id1 >= USER_OBJ_ID_START);
             assert_eq!(table_id2, table_id1 + 1);
             drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_now_publish_and_noop() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-checkpoint-now")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let snap0 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert_eq!(snap0.checkpoint_cts, 0);
+            assert!(
+                snap0
+                    .meta
+                    .table_roots
+                    .iter()
+                    .all(|root| root.root_page_id == 0 && root.pivot_row_id == 0)
+            );
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert!(snap1.checkpoint_cts > 0);
+            assert_eq!(
+                snap1.meta.next_user_obj_id,
+                engine.catalog().curr_next_user_obj_id()
+            );
+            assert!(
+                snap1
+                    .meta
+                    .table_roots
+                    .iter()
+                    .any(|root| root.root_page_id > 0)
+            );
+            assert!(
+                snap1
+                    .meta
+                    .table_roots
+                    .iter()
+                    .any(|root| root.pivot_row_id > 0)
+            );
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert_eq!(snap2.checkpoint_cts, snap1.checkpoint_cts);
+            assert_eq!(snap2.meta.table_roots, snap1.meta.table_roots);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_now_heartbeat_without_catalog_ops() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-checkpoint-heartbeat")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let table_id = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert!(snap1.checkpoint_cts > 0);
+            let roots_before = snap1.meta.table_roots;
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut session = engine.new_session();
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let res = stmt.insert_row(&table, vec![Val::I32(7)]).await;
+            assert!(res.is_ok());
+            stmt.succeed().commit().await.unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert!(snap2.checkpoint_cts > snap1.checkpoint_cts);
+            assert_eq!(snap2.meta.table_roots, roots_before);
+            assert_eq!(snap2.meta.next_user_obj_id, snap1.meta.next_user_obj_id);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_scan_apply_full_range() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-checkpoint-batch-full-range")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            let _ = table2(&engine).await;
+
+            let batch1 = engine
+                .catalog()
+                .scan_checkpoint_batch(engine.trx_sys)
+                .unwrap();
+            assert_eq!(batch1.catalog_ddl_txn_count, 2);
+            assert_eq!(
+                batch1.stop_reason,
+                CatalogCheckpointScanStopReason::ReachedDurableUpper
+            );
+            let safe_cts_1 = batch1.safe_cts;
+            engine
+                .catalog()
+                .apply_checkpoint_batch(batch1)
+                .await
+                .unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert_eq!(snap1.checkpoint_cts, safe_cts_1);
+
+            let batch2 = engine
+                .catalog()
+                .scan_checkpoint_batch(engine.trx_sys)
+                .unwrap();
+            assert_eq!(batch2.catalog_ddl_txn_count, 0);
+            assert_eq!(batch2.safe_cts, safe_cts_1);
+            engine
+                .catalog()
+                .apply_checkpoint_batch(batch2)
+                .await
+                .unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert_eq!(snap2.checkpoint_cts, snap1.checkpoint_cts);
         });
     }
 }

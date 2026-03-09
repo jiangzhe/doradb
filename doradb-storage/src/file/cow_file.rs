@@ -17,6 +17,17 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 /// Shared page size of CoW table files and multi-table files.
 pub const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
 
+/// Minimal mutable operations required by CoW index/checkpoint writers.
+pub trait MutableCowFile {
+    fn allocate_page_id(&mut self) -> Result<PageID>;
+    fn record_gc_page(&mut self, page_id: PageID);
+    fn write_page(
+        &self,
+        page_id: PageID,
+        buf: DirectBuf,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
 /// Shared in-memory active root for copy-on-write files.
 ///
 /// `ActiveRoot<M>` stores generic CoW bookkeeping (`page_no`, `meta_page_id`,
