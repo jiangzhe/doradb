@@ -365,6 +365,41 @@ impl<'a> ColumnBlockIndex<'a> {
         Ok(Some(bytes))
     }
 
+    /// Collects all leaf entries in ascending `start_row_id` order.
+    pub async fn collect_leaf_entries(&self) -> Result<Vec<(RowID, ColumnPagePayload)>> {
+        if self.root_page_id == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stack = vec![self.root_page_id];
+        let mut entries = Vec::new();
+        while let Some(page_id) = stack.pop() {
+            let node = self.read_node(page_id).await?;
+            let count = node.header.count as usize;
+            if node.is_leaf() {
+                if count > COLUMN_BLOCK_MAX_ENTRIES {
+                    return Err(Error::InvalidFormat);
+                }
+                entries.extend(
+                    node.leaf_start_row_ids()
+                        .iter()
+                        .copied()
+                        .zip(node.leaf_payloads().iter().copied()),
+                );
+                continue;
+            }
+            if count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
+                return Err(Error::InvalidFormat);
+            }
+            for entry in node.branch_entries().iter().rev() {
+                if entry.page_id == 0 {
+                    return Err(Error::InvalidFormat);
+                }
+                stack.push(entry.page_id);
+            }
+        }
+        Ok(entries)
+    }
+
     /// Applies sorted start-row-id bitmap patches with copy-on-write updates.
     ///
     /// Constraints:

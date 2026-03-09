@@ -15,17 +15,19 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
-use crate::catalog::{Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id};
+use crate::catalog::{
+    Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
+};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::row::{RowID, RowPage};
 use crate::table::{Table, TableAccess, TableRecover};
-use crate::trx::TrxID;
 use crate::trx::log::{LogPartition, LogPartitionInitializer};
 use crate::trx::log_replay::{LogMerger, LogPartitionStream, TrxLog};
 use crate::trx::purge::GC;
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
+use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use crossbeam_utils::CachePadded;
 use flume::Receiver;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -162,7 +164,16 @@ pub struct LogRecovery<'a> {
     global_disk_pool: &'static GlobalReadonlyBufferPool,
     catalog: &'a mut Catalog,
     log_merger: LogMerger,
+    catalog_replay_start_ts: TrxID,
+    replay_floor: TrxID,
+    table_states: HashMap<TableID, RecoveryTableState>,
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecoveryTableState {
+    heap_redo_start_ts: TrxID,
+    preloaded_from_checkpoint: bool,
 }
 
 impl<'a> LogRecovery<'a> {
@@ -182,25 +193,96 @@ impl<'a> LogRecovery<'a> {
             global_disk_pool,
             catalog,
             log_merger,
+            catalog_replay_start_ts: MIN_SNAPSHOT_TS,
+            replay_floor: MIN_SNAPSHOT_TS,
+            table_states: HashMap::new(),
             recovered_tables: HashMap::new(),
         }
     }
 
     #[inline]
     pub async fn recover_all(mut self) -> Result<Vec<LogPartitionStream>> {
+        self.bootstrap_checkpointed_user_tables().await?;
         // 1. replay all DDLs and DMLs.
         while let Some(log) = self.log_merger.try_next()? {
             self.replay_log(log).await?;
         }
         // 2. Rebuild all indexes and refresh pages to enable undo map.
-        self.recover_indexes_and_refresh_pages().await;
+        self.recover_indexes_and_refresh_pages().await?;
 
         Ok(self.log_merger.finished_streams())
+    }
+
+    async fn bootstrap_checkpointed_user_tables(&mut self) -> Result<()> {
+        let snapshot = self.catalog.storage.checkpoint_snapshot()?;
+        self.catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
+        self.replay_floor = snapshot.catalog_replay_start_ts;
+
+        for table in self.catalog.storage.tables().list_uncommitted().await {
+            if !is_user_obj_id(table.table_id) {
+                continue;
+            }
+            self.catalog
+                .reload_create_table(
+                    self.mem_pool,
+                    self.index_pool,
+                    self.table_fs,
+                    self.global_disk_pool,
+                    table.table_id,
+                )
+                .await?;
+            self.track_loaded_table(table.table_id, true).await?;
+            let state = self
+                .table_states
+                .get(&table.table_id)
+                .ok_or(Error::TableNotFound)?;
+            self.replay_floor = self.replay_floor.min(state.heap_redo_start_ts);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn should_replay_catalog(&self, cts: TrxID) -> bool {
+        cts >= self.catalog_replay_start_ts
+    }
+
+    async fn track_loaded_table(
+        &mut self,
+        table_id: TableID,
+        preloaded_from_checkpoint: bool,
+    ) -> Result<()> {
+        let table = self
+            .catalog
+            .get_table(table_id)
+            .await
+            .ok_or(Error::TableNotFound)?;
+        let old = self.table_states.insert(
+            table_id,
+            RecoveryTableState {
+                heap_redo_start_ts: table.file.active_root().heap_redo_start_ts,
+                preloaded_from_checkpoint,
+            },
+        );
+        if old.is_some() {
+            return Err(Error::TableAlreadyExists);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn table_heap_redo_start_ts(&self, table_id: TableID) -> Result<TrxID> {
+        self.table_states
+            .get(&table_id)
+            .map(|state| state.heap_redo_start_ts)
+            .ok_or(Error::TableNotFound)
     }
 
     async fn replay_log(&mut self, log: TrxLog) -> Result<()> {
         // sequentially replay redo log.
         let (header, RedoLogs { ddl, dml }) = log.into_inner();
+        if header.cts < self.replay_floor {
+            return Ok(());
+        }
 
         if let Some(ddl) = ddl {
             // Execute DDL after all previous DML is done.
@@ -215,11 +297,19 @@ impl<'a> LogRecovery<'a> {
         Ok(())
     }
 
-    async fn recover_indexes_and_refresh_pages(&mut self) {
+    async fn recover_indexes_and_refresh_pages(&mut self) -> Result<()> {
+        for (&table_id, state) in &self.table_states {
+            if !state.preloaded_from_checkpoint {
+                continue;
+            }
+            let table = self
+                .catalog
+                .get_table(table_id)
+                .await
+                .ok_or(Error::TableNotFound)?;
+            table.populate_index_via_persisted_data().await?;
+        }
         // recover index with all data.
-        // todo: integrate with checkpoint in future.
-        // Insert part is simple.
-        // Update and Delete require a robust consideration.
         for (table_id, pages) in &self.recovered_tables {
             if let Some(table) = self.catalog.get_table(*table_id).await {
                 let metadata = Arc::new(table.metadata().clone());
@@ -229,6 +319,7 @@ impl<'a> LogRecovery<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     async fn refresh_page(&self, metadata: Arc<TableMetadata>, page_id: PageID) {
@@ -262,6 +353,9 @@ impl<'a> LogRecovery<'a> {
     ) -> Result<()> {
         match &*ddl {
             DDLRedo::CreateTable(table_id) => {
+                if !self.should_replay_catalog(cts) {
+                    return Ok(());
+                }
                 self.replay_catalog_modifications(dml).await?;
                 self.catalog
                     .reload_create_table(
@@ -272,6 +366,18 @@ impl<'a> LogRecovery<'a> {
                         *table_id,
                     )
                     .await?;
+                self.track_loaded_table(*table_id, false).await?;
+            }
+            DDLRedo::DropTable(table_id) => {
+                if !self.should_replay_catalog(cts) {
+                    return Ok(());
+                }
+                self.replay_catalog_modifications(dml).await?;
+                if self.catalog.remove_user_table(*table_id).is_none() {
+                    return Err(Error::TableNotFound);
+                }
+                self.table_states.remove(table_id);
+                self.recovered_tables.remove(table_id);
             }
             DDLRedo::CreateRowPage {
                 table_id,
@@ -280,6 +386,9 @@ impl<'a> LogRecovery<'a> {
                 end_row_id,
             } => {
                 debug_assert!(dml.is_empty());
+                if cts < self.table_heap_redo_start_ts(*table_id)? {
+                    return Ok(());
+                }
                 // Row page creation is guaranteed to be ordered in the redo log,
                 // so its safe to recreate it and the row id range must be identical.
                 let table = self
@@ -311,8 +420,16 @@ impl<'a> LogRecovery<'a> {
                             == *end_row_id
                 });
             }
-            DDLRedo::DataCheckpoint { .. } => {
+            DDLRedo::DataCheckpoint { table_id, .. } => {
                 debug_assert!(dml.is_empty());
+                if cts < self.table_heap_redo_start_ts(*table_id)? {
+                    return Ok(());
+                }
+                let _ = self
+                    .catalog
+                    .get_table(*table_id)
+                    .await
+                    .ok_or(Error::TableNotFound)?;
             }
             _ => todo!(),
         }
@@ -338,12 +455,18 @@ impl<'a> LogRecovery<'a> {
     ) -> Result<()> {
         for (table_id, table_dml) in dml {
             if is_catalog_obj_id(table_id) {
+                if !self.should_replay_catalog(cts) {
+                    continue;
+                }
                 let table = self
                     .catalog
                     .get_catalog_table(table_id)
                     .ok_or(Error::TableNotFound)?;
                 self.replay_catalog_table_modifications(&table, &table_dml.rows)
                     .await;
+                continue;
+            }
+            if cts < self.table_heap_redo_start_ts(table_id)? {
                 continue;
             }
             let table = self
@@ -439,7 +562,8 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::row::RowRead;
     use crate::row::ops::{SelectKey, UpdateCol};
-    use crate::table::TableAccess;
+    use crate::table::{TableAccess, TablePersistence};
+    use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::Val;
     use crate::value::ValKind;
@@ -666,6 +790,181 @@ mod tests {
                 .await;
             assert_eq!(rows, DML_SIZE - (DML_SIZE / DEL_STEP + 1));
 
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_log_recover_bootstraps_catalog_from_checkpoint() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover4")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.new_session();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![ColumnSpec::new(
+                        "id",
+                        ValKind::U32,
+                        ColumnAttributes::empty(),
+                    )]),
+                    vec![IndexSpec::new(
+                        "idx_t4_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert!(snap.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
+
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover4")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            assert!(engine.catalog().get_table(table_id).await.is_some());
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_log_recover_skips_pre_checkpoint_table_redo_and_rebuilds_persisted_index() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover5")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.new_session();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![IndexSpec::new(
+                        "idx_t5_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let catalog_replay_start_ts = engine
+                .catalog()
+                .storage
+                .checkpoint_snapshot()
+                .unwrap()
+                .catalog_replay_start_ts;
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt
+                .insert_row(&table, vec![Val::from(7u32), Val::from("cold-row")])
+                .await;
+            assert!(insert.is_ok());
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            table.freeze(usize::MAX).await;
+            let mut checkpoint_session = engine.new_session();
+            table
+                .data_checkpoint(&mut checkpoint_session)
+                .await
+                .unwrap();
+            let root_after_checkpoint = table.file.active_root();
+            assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
+
+            drop(table);
+            drop(checkpoint_session);
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover5")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert_eq!(table.total_row_pages().await, 0);
+
+            let mut session = engine.new_session();
+            let trx = session.begin_trx().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let row = stmt.select_row_mvcc(&table, &key, &[0, 1]).await;
+            assert_eq!(row.unwrap(), vec![Val::from(7u32), Val::from("cold-row")]);
+            stmt.succeed().commit().await.unwrap();
+
+            drop(table);
+            drop(session);
             drop(engine);
         })
     }

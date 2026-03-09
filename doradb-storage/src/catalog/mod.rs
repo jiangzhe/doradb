@@ -111,11 +111,13 @@ impl Catalog {
         trx_sys: &TransactionSystem,
     ) -> Result<CatalogCheckpointBatch> {
         let snapshot = self.storage.checkpoint_snapshot()?;
-        let from_exclusive = snapshot.checkpoint_cts;
+        let catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
         let durable_upper_cts = trx_sys.persisted_watermark_cts();
-        trx_sys.scan_catalog_checkpoint_batch(from_exclusive, durable_upper_cts, |table_id| {
-            self.loaded_table_checkpoint_ts(table_id)
-        })
+        trx_sys.scan_catalog_checkpoint_batch(
+            catalog_replay_start_ts,
+            durable_upper_cts,
+            |table_id| self.loaded_table_heap_redo_start_ts(table_id),
+        )
     }
 
     /// Apply one scanned catalog checkpoint batch into `catalog.mtb`.
@@ -157,7 +159,9 @@ impl Catalog {
         global_disk_pool: &'static GlobalReadonlyBufferPool,
         table_id: TableID,
     ) -> Result<()> {
-        // todo
+        if self.user_tables.contains_key(&table_id) {
+            return Err(Error::TableAlreadyExists);
+        }
         let res = self.storage.tables().find_uncommitted_by_id(table_id).await;
         match res {
             Some(table) => {
@@ -223,26 +227,28 @@ impl Catalog {
                 }
                 let table_file = table_fs.open_table_file(table.table_id).await?;
                 let active_root = table_file.active_root();
-                // todo: refine recovery of corrupted file.
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
                 let metadata_in_file = &*active_root.metadata;
-                debug_assert_eq!(&metadata_in_catalog, metadata_in_file);
+                if &metadata_in_catalog != metadata_in_file {
+                    return Err(Error::InvalidState);
+                }
                 let row_id_bound = active_root.pivot_row_id;
 
                 let blk_idx = BlockIndex::new(
                     self.storage.meta_pool,
                     table.table_id,
                     row_id_bound,
-                    table_file.active_root().column_block_index_root,
+                    active_root.column_block_index_root,
                     Arc::clone(&table_file),
                     global_disk_pool,
                 )
                 .await;
                 let table =
                     Table::new(mem_pool, index_pool, global_disk_pool, blk_idx, table_file).await;
-                // Update table into cache
                 let old = self.user_tables.insert(table_id, table);
-                debug_assert!(old.is_none());
+                if old.is_some() {
+                    return Err(Error::TableAlreadyExists);
+                }
                 Ok(())
             }
             None => Err(Error::TableNotFound),
@@ -274,6 +280,12 @@ impl Catalog {
         debug_assert!(old.is_none());
     }
 
+    /// Remove a user table runtime from the in-memory cache.
+    #[inline]
+    pub fn remove_user_table(&self, table_id: TableID) -> Option<Table> {
+        self.user_tables.remove(&table_id).map(|(_, table)| table)
+    }
+
     /// Return the metadata buffer pool used by catalog/index metadata pages.
     #[inline]
     pub fn meta_pool(&self) -> &'static FixedBufferPool {
@@ -281,7 +293,7 @@ impl Catalog {
     }
 
     #[inline]
-    fn loaded_table_checkpoint_ts(&self, table_id: TableID) -> Option<u64> {
+    fn loaded_table_heap_redo_start_ts(&self, table_id: TableID) -> Option<u64> {
         self.user_tables
             .get(&table_id)
             .map(|table| table.file.active_root().heap_redo_start_ts)
@@ -457,6 +469,7 @@ pub mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::engine::{Engine, EngineConfig};
+    use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::{Val, ValKind};
@@ -713,7 +726,7 @@ pub mod tests {
                 .unwrap();
 
             let snap0 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert_eq!(snap0.checkpoint_cts, 0);
+            assert_eq!(snap0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert!(
                 snap0
                     .meta
@@ -729,7 +742,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert!(snap1.checkpoint_cts > 0);
+            assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             assert_eq!(
                 snap1.meta.next_user_obj_id,
                 engine.catalog().curr_next_user_obj_id()
@@ -755,7 +768,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert_eq!(snap2.checkpoint_cts, snap1.checkpoint_cts);
+            assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, snap1.meta.table_roots);
         });
     }
@@ -784,7 +797,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert!(snap1.checkpoint_cts > 0);
+            assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             let roots_before = snap1.meta.table_roots;
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -800,7 +813,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert!(snap2.checkpoint_cts > snap1.checkpoint_cts);
+            assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
             assert_eq!(snap2.meta.next_user_obj_id, snap1.meta.next_user_obj_id);
         });
@@ -842,7 +855,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert_eq!(snap1.checkpoint_cts, safe_cts_1);
+            assert_eq!(snap1.catalog_replay_start_ts, safe_cts_1 + 1);
 
             let batch2 = engine
                 .catalog()
@@ -856,7 +869,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert_eq!(snap2.checkpoint_cts, snap1.checkpoint_cts);
+            assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
         });
     }
 }

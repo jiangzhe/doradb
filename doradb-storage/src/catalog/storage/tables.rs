@@ -54,6 +54,22 @@ pub struct Tables<'a> {
 }
 
 impl Tables<'_> {
+    /// List all table rows from uncommitted-visible catalog state.
+    pub async fn list_uncommitted(&self) -> Vec<TableObject> {
+        let mut res = vec![];
+        self.table
+            .accessor()
+            .table_scan_uncommitted(|metadata, row| {
+                if row.is_deleted() {
+                    return true;
+                }
+                res.push(row_to_table_object(metadata, row));
+                true
+            })
+            .await;
+        res
+    }
+
     /// Find a table by id.
     #[inline]
     pub async fn find_uncommitted_by_id(&self, table_id: TableID) -> Option<TableObject> {

@@ -3,6 +3,7 @@ id: 000056
 title: Recovery Cutoff and Consistency Checks
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-09
+github_issue: 400
 ---
 
 # Task: Recovery Cutoff and Consistency Checks
