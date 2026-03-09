@@ -155,6 +155,46 @@ Reference:
 
 ## Implementation Notes
 
+1. Generalized readonly cache identity and source binding to physical files:
+   - introduced `ReadonlyFileID` and file-oriented `ReadonlyCacheKey`;
+   - added `ReadonlyPageSource` so both `TableFile` and `MultiTableFile`
+     can load pages through the shared readonly pool;
+   - kept existing user-table behavior by continuing to use table id as the
+     readonly file id for user table files.
+2. Updated readonly buffer-pool internals without changing cache semantics:
+   - `GlobalReadonlyBufferPool` mappings, inflight dedup, invalidation, and
+     reverse lookup now operate on `(file_id, block_id)`;
+   - `ReadonlyBufferPool` now binds one file id plus a page source instead of
+     assuming `Arc<TableFile>`;
+   - cache-hit behavior across unchanged physical pages remains unchanged.
+3. Reused the shared readonly path for `catalog.mtb` checkpoint reads:
+   - `CatalogStorage` now owns a dedicated readonly wrapper for `catalog.mtb`
+     using reserved readonly file id `USER_OBJ_ID_START - 1`;
+   - catalog checkpoint index-page, LWC-page, and offloaded deletion-blob reads
+     now go through `ReadonlyBufferPool`;
+   - removed direct `catalog.mtb` page-read duplication from checkpoint code.
+4. Simplified checkpoint read helpers to one canonical path:
+   - removed `CatalogMtbIndexPageReader`, `read_catalog_mtb_page()`, and the
+     `ColumnBlockIndex::new_with_page_reader(...)` path;
+   - `ColumnBlockIndex` now reads through readonly-pool access only.
+5. Post-implementation cleanup completed during review:
+   - documented `BufferFrame` as an intentionally fixed `128B` layout and added
+     exact const asserts for size/alignment;
+   - renamed `BufferFrame` readonly accessors back to concise
+     `{readonly,set_readonly,clear_readonly}_key`;
+   - renamed `CatalogStorage.catalog_disk_pool` to `disk_pool`.
+6. Verification executed:
+   - `cargo test -p doradb-storage --no-default-features buffer::readonly::tests::`
+   - `cargo test -p doradb-storage --no-default-features test_catalog_checkpoint_`
+   - `cargo test -p doradb-storage --no-default-features test_lwc_read_uses_readonly_buffer_pool`
+   - `cargo test -p doradb-storage --no-default-features column_block_index`
+   - `cargo test -p doradb-storage --no-default-features`
+7. Review/traceability outcome:
+   - task issue: `#395`
+   - implementation PR: `#396`
+   - inline readonly reverse metadata remains in `BufferFrame` for now because
+     the current layout still fits the exact `128B` frame-size contract.
+
 ## Impacts
 
 1. `doradb-storage/src/buffer/frame.rs`
@@ -192,3 +232,6 @@ Reference:
    readonly cache invalidation or a stronger physical-page identity will be
    required. This task intentionally relies on the current no-reuse behavior and
    does not solve future page-id reuse.
+2. If readonly reverse metadata ownership becomes a maintenance burden in
+   future work, should it move from `BufferFrame` into pool-owned side metadata
+   while preserving the exact `128B` `BufferFrame` layout contract?
