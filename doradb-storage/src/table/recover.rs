@@ -51,7 +51,7 @@ pub trait TableRecover {
     ) -> impl Future<Output = ()>;
 
     /// Populate index using data on row page.
-    fn populate_index_via_row_page(&self, page_id: PageID) -> impl Future<Output = ()>;
+    fn populate_index_via_row_page(&self, page_id: PageID) -> impl Future<Output = Result<()>>;
 
     /// Populate indexes using persisted LWC pages below the current pivot boundary.
     fn populate_index_via_persisted_data(&self) -> impl Future<Output = Result<()>>;
@@ -207,7 +207,7 @@ impl TableRecover for Table {
         }
     }
 
-    async fn populate_index_via_row_page(&self, page_id: PageID) {
+    async fn populate_index_via_row_page(&self, page_id: PageID) -> Result<()> {
         let page_guard = self
             .mem_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -232,13 +232,13 @@ impl TableRecover for Table {
                             let res = index
                                 .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
-                            debug_assert!(matches!(res, IndexInsert::Ok(_)));
+                            ensure_recovery_index_insert(sec_idx.index_no, res)?;
                         } else {
                             let index = sec_idx.non_unique().unwrap();
                             let res = index
                                 .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
-                            debug_assert!(matches!(res, IndexInsert::Ok(_)));
+                            ensure_recovery_index_insert(sec_idx.index_no, res)?;
                         }
                     }
                     ReadRow::NotFound => (),
@@ -246,6 +246,7 @@ impl TableRecover for Table {
                 }
             }
         }
+        Ok(())
     }
 
     async fn populate_index_via_persisted_data(&self) -> Result<()> {
@@ -304,19 +305,31 @@ impl TableRecover for Table {
                             .unwrap()
                             .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                             .await;
-                        debug_assert!(matches!(res, IndexInsert::Ok(_)));
+                        ensure_recovery_index_insert(key.index_no, res)?;
                     } else {
                         let res = self.sec_idx[key.index_no]
                             .non_unique()
                             .unwrap()
                             .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                             .await;
-                        debug_assert!(matches!(res, IndexInsert::Ok(_)));
+                        ensure_recovery_index_insert(key.index_no, res)?;
                     }
                 }
             }
         }
         Ok(())
+    }
+}
+
+#[inline]
+fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
+    match res {
+        IndexInsert::Ok(_) => Ok(()),
+        IndexInsert::DuplicateKey(row_id, deleted) => Err(Error::UnexpectedRecoveryDuplicateKey {
+            index_no,
+            row_id,
+            deleted,
+        }),
     }
 }
 
@@ -338,4 +351,35 @@ fn decode_lwc_row_ids(page: &LwcPage) -> Result<Vec<RowID>> {
         row_ids.push(row_id);
     }
     Ok(row_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_recovery_index_insert;
+    use crate::error::Error;
+    use crate::index::IndexInsert;
+
+    #[test]
+    fn test_ensure_recovery_index_insert_accepts_ok_variants() {
+        assert!(ensure_recovery_index_insert(1, IndexInsert::Ok(false)).is_ok());
+        assert!(ensure_recovery_index_insert(1, IndexInsert::Ok(true)).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_recovery_index_insert_rejects_duplicate_key() {
+        let err =
+            ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(42, false)).unwrap_err();
+        match err {
+            Error::UnexpectedRecoveryDuplicateKey {
+                index_no,
+                row_id,
+                deleted,
+            } => {
+                assert_eq!(index_no, 3);
+                assert_eq!(row_id, 42);
+                assert!(!deleted);
+            }
+            _ => panic!("unexpected error: {err:?}"),
+        }
+    }
 }

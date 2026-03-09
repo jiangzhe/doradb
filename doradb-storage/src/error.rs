@@ -1,4 +1,5 @@
 use crate::io::AIOError;
+use crate::row::RowID;
 use std::array::TryFromSliceError;
 use std::ops::ControlFlow;
 use thiserror::Error;
@@ -69,6 +70,14 @@ pub enum Error {
     ColumnNeverNull,
     #[error("invalid column scan")]
     InvalidColumnScan,
+    #[error(
+        "unexpected duplicate key during recovery index rebuild for index {index_no}: row_id={row_id}, deleted={deleted}"
+    )]
+    UnexpectedRecoveryDuplicateKey {
+        index_no: usize,
+        row_id: RowID,
+        deleted: bool,
+    },
 }
 
 impl From<TryFromSliceError> for Error {

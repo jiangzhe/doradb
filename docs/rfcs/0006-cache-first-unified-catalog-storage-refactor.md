@@ -251,9 +251,9 @@ Reference:
   - Goals: deterministic startup replay boundary with strong consistency guarantees.
   - Non-goals: no physical log truncation implementation.
   - Task Doc: `docs/tasks/000056-recovery-cutoff-and-consistency-checks.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#400`
+  - Phase Status: done
+  - Implementation Summary: 1. Aligned catalog checkpoint persistence and recovery around replay-start [Task Resolve Sync: docs/tasks/000056-recovery-cutoff-and-consistency-checks.md @ 2026-03-09]
 
 - **Phase 10: Validation and Documentation Sync**
   - Scope: tests for id ranges, file naming, schema behavior, checkpoint atomicity, replay cutoff correctness, and lifecycle ordering (`create/insert/drop`, DDL around cutoff); doc updates.

@@ -314,7 +314,7 @@ impl<'a> LogRecovery<'a> {
             if let Some(table) = self.catalog.get_table(*table_id).await {
                 let metadata = Arc::new(table.metadata().clone());
                 for page_id in pages {
-                    table.populate_index_via_row_page(*page_id).await;
+                    table.populate_index_via_row_page(*page_id).await?;
                     self.refresh_page(Arc::clone(&metadata), *page_id).await;
                 }
             }

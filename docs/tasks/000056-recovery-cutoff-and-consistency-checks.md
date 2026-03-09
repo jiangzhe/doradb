@@ -1,7 +1,7 @@
 ---
 id: 000056
 title: Recovery Cutoff and Consistency Checks
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-09
 github_issue: 400
 ---
@@ -177,6 +177,62 @@ Reference:
    `catalog_replay_start_ts` plus `>=` replay semantics.
 
 ## Implementation Notes
+
+1. Aligned catalog checkpoint persistence and recovery around replay-start
+   timestamps:
+   - renamed the persisted catalog boundary to `catalog_replay_start_ts` in
+     `doradb-storage/src/file/multi_table_file.rs`;
+   - updated catalog checkpoint scan/publish flow in
+     `doradb-storage/src/trx/sys.rs`,
+     `doradb-storage/src/catalog/mod.rs`, and
+     `doradb-storage/src/catalog/storage/checkpoint.rs` so catalog replay uses
+     inclusive lower-bound semantics (`cts >= replay_start_ts`);
+   - checkpoint publish now advances the stored replay-start timestamp to
+     `safe_cts + 1` after a successful batch.
+2. Added checkpoint-aware startup bootstrap before redo replay:
+   - `CatalogStorage::new(...)` now loads checkpointed catalog rows from
+     `catalog.mtb` into the in-memory catalog-table runtimes;
+   - startup recovery preloads checkpointed user tables via
+     `Catalog::reload_create_table(...)` before replaying later redo;
+   - preload validates user-table file existence and metadata consistency
+     instead of relying on debug-only assertions.
+3. Refactored recovery replay routing to use coarse and fine replay filters:
+   - `doradb-storage/src/trx/recover.rs` now computes a global coarse replay
+     floor `W` from `catalog_replay_start_ts` plus loaded
+     `table.heap_redo_start_ts` values;
+   - redo with `cts < W` is skipped globally;
+   - catalog DDL/DML replays only when
+     `cts >= catalog_replay_start_ts`;
+   - user-table heap redo replays only when
+     `cts >= table.heap_redo_start_ts`, with unknown or inconsistent
+     post-cutoff table references returning errors.
+4. Implemented persisted-data secondary-index rebuild for preloaded tables:
+   - recovery now scans checkpointed LWC data below `pivot_row_id`,
+     interprets checkpointed deletion bitmaps, and rebuilds in-memory
+     secondary indexes from persisted visible rows;
+   - existing row-page-based index population remains in place for post-cutoff
+     hot rows recovered from redo;
+   - `doradb-storage/src/index/column_block_index.rs` now exposes a shared leaf
+     entry traversal helper used by both checkpoint reads and persisted-data
+     recovery rebuild.
+5. Added post-implementation recovery hardening for secondary-index rebuild:
+   - row-page and persisted-data rebuild loops in
+     `doradb-storage/src/table/recover.rs` now fail with
+     `Error::UnexpectedRecoveryDuplicateKey` instead of relying on
+     `debug_assert!` in release builds;
+   - recovery now aborts if a duplicate secondary-index entry appears during
+     rebuild, preventing silent partial index reconstruction.
+6. Verification completed:
+   - `cargo fmt --all`
+   - `cargo test -p doradb-storage --no-default-features test_ensure_recovery_index_insert`
+   - `cargo test -p doradb-storage --no-default-features test_log_recover_`
+   - `cargo test -p doradb-storage --no-default-features`
+7. Delivery tracking:
+   - task issue: `#400`
+   - implementation PR: `#401`
+   - source backlog `docs/backlogs/000052-catalog-checkpoint-recovery-bootstrap.md`
+     is closed during resolve as implemented by this task
+   - no additional follow-up backlog doc was created during resolve
 
 ## Impacts
 
