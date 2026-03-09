@@ -53,6 +53,10 @@ Formal RFC must satisfy all draft requirements plus:
    - `Phase Status`
    - `Implementation Summary`
    - optional `Related Backlogs`
+4. For newly created RFC docs, initialize phase task linkage with placeholders until task planning is complete:
+   - `Task Doc: docs/tasks/TBD.md`
+   - `Task Issue: #0`
+   Replace these placeholders with concrete values when corresponding tasks/issues are created.
 
 ## `rfc resolve` Checklist
 

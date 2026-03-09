@@ -2,8 +2,7 @@ use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{Page, PageID};
 use crate::error::{Error, Result};
-use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::table_file::MutableTableFile;
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
 use crate::index::column_block_index::BlobRef;
 use crate::io::DirectBuf;
 use futures::future::try_join_all;
@@ -45,6 +44,40 @@ fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
     Ok(BlobPageHeader {
         next_page_id,
         used_size,
+    })
+}
+
+pub(crate) struct BlobPageChunk<'a> {
+    pub bytes: &'a [u8],
+    pub next_page_id: PageID,
+}
+
+/// Decodes one blob page and returns the readable chunk for current state.
+///
+/// `remaining` is the number of bytes still expected for the target blob.
+pub(crate) fn read_blob_page_chunk(
+    page: &[u8],
+    offset: usize,
+    remaining: usize,
+) -> Result<BlobPageChunk<'_>> {
+    if remaining == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let header = decode_blob_page_header(page)?;
+    let used_size = header.used_size as usize;
+    if offset >= used_size {
+        return Err(Error::InvalidFormat);
+    }
+    let available = used_size - offset;
+    let take = available.min(remaining);
+    if take < remaining && header.next_page_id == 0 {
+        return Err(Error::InvalidFormat);
+    }
+    let body_start = COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + offset;
+    let body_end = body_start + take;
+    Ok(BlobPageChunk {
+        bytes: &page[body_start..body_end],
+        next_page_id: header.next_page_id,
     })
 }
 
@@ -99,15 +132,15 @@ struct SealedBlobPage {
 }
 
 /// Append-only writer for immutable shared bitmap-blob pages.
-pub struct ColumnDeletionBlobWriter<'a> {
-    mutable_file: &'a mut MutableTableFile,
+pub struct ColumnDeletionBlobWriter<'a, M: MutableCowFile> {
+    mutable_file: &'a mut M,
     current_page: Option<PendingBlobPage>,
     sealed_pages: Vec<SealedBlobPage>,
 }
 
-impl<'a> ColumnDeletionBlobWriter<'a> {
+impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
     #[inline]
-    pub fn new(mutable_file: &'a mut MutableTableFile) -> Self {
+    pub fn new(mutable_file: &'a mut M) -> Self {
         ColumnDeletionBlobWriter {
             mutable_file,
             current_page: None,
@@ -219,24 +252,13 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         while remaining > 0 {
             let g = self.disk_pool.try_get_page_shared::<Page>(page_id).await?;
             let page = g.page();
-            let header = decode_blob_page_header(page)?;
-            let used_size = header.used_size as usize;
-            if offset >= used_size {
-                return Err(Error::InvalidFormat);
-            }
-            let available = used_size - offset;
-            let take = available.min(remaining);
-            let body_start = COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + offset;
-            let body_end = body_start + take;
-            out.extend_from_slice(&page[body_start..body_end]);
-            remaining -= take;
+            let chunk = read_blob_page_chunk(page, offset, remaining)?;
+            out.extend_from_slice(chunk.bytes);
+            remaining -= chunk.bytes.len();
             if remaining == 0 {
                 break;
             }
-            if header.next_page_id == 0 {
-                return Err(Error::InvalidFormat);
-            }
-            page_id = header.next_page_id;
+            page_id = chunk.next_page_id;
             offset = 0;
         }
         Ok(out)
@@ -250,7 +272,7 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableMetadata,
     };
-    use crate::file::table_file::TableFile;
+    use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::index::column_block_index::BlobRef;
     use crate::value::ValKind;

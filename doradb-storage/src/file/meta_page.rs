@@ -11,6 +11,7 @@ use crate::row::RowID;
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use std::mem;
+use std::num::NonZeroU64;
 
 /// Parsed on-disk payload of one table meta page.
 ///
@@ -226,8 +227,12 @@ impl Deser for MultiTableMetaPageData {
         let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
         for root in &mut table_roots {
             let (next_idx, table_id) = input.deser_u64(idx)?;
-            let (next_idx, root_page_id) = input.deser_u64(next_idx)?;
+            let (next_idx, root_page_id_raw) = input.deser_u64(next_idx)?;
             let (next_idx, pivot_row_id) = input.deser_u64(next_idx)?;
+            let root_page_id = NonZeroU64::new(root_page_id_raw);
+            if root_page_id.is_none() && pivot_row_id != 0 {
+                return Err(crate::error::Error::InvalidFormat);
+            }
             *root = CatalogTableRootDesc {
                 table_id,
                 root_page_id,
@@ -285,7 +290,8 @@ impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
             + mem::size_of::<u64>() // next_user_obj_id
             + mem::size_of::<u32>() // table_root_count
             + mem::size_of::<u32>() // reserved
-            + CATALOG_TABLE_ROOT_DESC_COUNT * mem::size_of::<CatalogTableRootDesc>()
+            + CATALOG_TABLE_ROOT_DESC_COUNT
+                * (mem::size_of::<u64>() + mem::size_of::<u64>() + mem::size_of::<u64>())
             + self.space.ser_len()
     }
 
@@ -299,7 +305,7 @@ impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
         idx = out.ser_u32(idx, 0); // reserved
         for root in self.table_roots {
             idx = out.ser_u64(idx, root.table_id);
-            idx = out.ser_u64(idx, root.root_page_id);
+            idx = out.ser_u64(idx, root.root_page_id.map_or(0, NonZeroU64::get));
             idx = out.ser_u64(idx, root.pivot_row_id);
         }
         self.space.ser(out, idx)

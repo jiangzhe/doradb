@@ -1,3 +1,4 @@
+mod checkpoint;
 mod columns;
 mod indexes;
 mod object;
@@ -13,11 +14,12 @@ use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID};
 use crate::error::Result;
 use crate::file::multi_table_file::{
-    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile,
+    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
 };
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::trx::TrxID;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// Runtime storage container for all catalog logical tables.
@@ -114,6 +116,12 @@ impl CatalogStorage {
         self.next_user_obj_id
     }
 
+    /// Returns current persisted catalog checkpoint snapshot from `catalog.mtb`.
+    #[inline]
+    pub fn checkpoint_snapshot(&self) -> Result<MultiTableFileSnapshot> {
+        self.mtb.load_snapshot()
+    }
+
     /// Publish one catalog metadata snapshot into `catalog.mtb`.
     ///
     /// This method is temporary in RFC 0006 and is expected to change in phase 3,
@@ -141,7 +149,7 @@ impl CatalogStorage {
             let (pivot_row_id, root_page_id) = table.blk_idx.root_snapshot();
             roots[table_id] = CatalogTableRootDesc {
                 table_id: table_id as u64,
-                root_page_id,
+                root_page_id: NonZeroU64::new(root_page_id),
                 pivot_row_id,
             };
         }

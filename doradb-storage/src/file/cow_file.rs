@@ -12,10 +12,21 @@ use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Shared page size of CoW table files and multi-table files.
 pub const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
+
+/// Minimal mutable operations required by CoW index/checkpoint writers.
+pub trait MutableCowFile {
+    fn allocate_page_id(&mut self) -> Result<PageID>;
+    fn record_gc_page(&mut self, page_id: PageID);
+    fn write_page(
+        &self,
+        page_id: PageID,
+        buf: DirectBuf,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+}
 
 /// Shared in-memory active root for copy-on-write files.
 ///
@@ -142,6 +153,7 @@ pub struct CowCodec<M> {
 pub struct CowFile<M> {
     file: SparseFile,
     active_root: AtomicPtr<ActiveRoot<M>>,
+    mutable_inflight: AtomicBool,
     io_client: AIOClient<FileIO>,
     buf_list: FixedSizeBufferFreeList,
     codec: CowCodec<M>,
@@ -169,6 +181,7 @@ impl<M> CowFile<M> {
         Ok(CowFile {
             file,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
+            mutable_inflight: AtomicBool::new(false),
             io_client,
             buf_list,
             codec,
@@ -190,6 +203,7 @@ impl<M> CowFile<M> {
         Ok(CowFile {
             file,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
+            mutable_inflight: AtomicBool::new(false),
             io_client,
             buf_list,
             codec,
@@ -214,6 +228,34 @@ impl<M> CowFile<M> {
     #[inline]
     pub fn active_root_ptr(&self) -> AtomicPtr<ActiveRoot<M>> {
         AtomicPtr::new(self.load_active_root_raw())
+    }
+
+    /// Claim exclusive mutable access for one CoW writer.
+    ///
+    /// Panics if another mutable writer already exists for this file handle.
+    #[inline]
+    pub(crate) fn claim_mutable_writer(&self) {
+        let acquired = self
+            .mutable_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        assert!(
+            acquired,
+            "concurrent mutable CoW file modification is not allowed"
+        );
+    }
+
+    /// Release exclusive mutable access claimed by `claim_mutable_writer`.
+    #[inline]
+    pub(crate) fn release_mutable_writer(&self) {
+        let released = self
+            .mutable_inflight
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        assert!(
+            released,
+            "mutable CoW file writer release without active claim"
+        );
     }
 
     /// Read one page using async direct IO.

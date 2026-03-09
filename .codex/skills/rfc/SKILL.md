@@ -75,6 +75,10 @@ tools/rfc.rs create-rfc-doc \
   --auto-id
 ```
 3. Keep frontmatter as `status: draft` during draft discussion.
+4. In `## Implementation Phases`, initialize each phase tracking pair as placeholders:
+   - `Task Doc: docs/tasks/TBD.md`
+   - `Task Issue: #0`
+   These placeholders must be replaced later when concrete task docs/issues are created.
 
 If backlog docs are provided as source context, include them under `Design Inputs` -> `Source Backlogs`.
 

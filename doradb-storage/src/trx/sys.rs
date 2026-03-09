@@ -1,13 +1,17 @@
-use crate::catalog::{Catalog, TableCache};
+use crate::catalog::{Catalog, TableCache, TableID, is_catalog_obj_id, is_user_obj_id};
 use crate::error::Result;
+use crate::io::AIOContext;
 use crate::lifetime::StaticLifetime;
 use crate::session::SessionState;
 use crate::thread;
 use crate::trx::group::Commit;
-use crate::trx::log::{LOG_HEADER_PAGES, LogPartition};
+use crate::trx::log::{
+    LOG_HEADER_PAGES, LogPartition, LogPartitionInitializer, LogPartitionMode, list_log_files,
+};
+use crate::trx::log_replay::LogMerger;
 use crate::trx::log_replay::MmapLogReader;
 use crate::trx::purge::{GC, Purge};
-use crate::trx::redo::RedoLogs;
+use crate::trx::redo::{DDLRedo, RedoLogs, RowRedoKind};
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
@@ -16,6 +20,7 @@ use crate::trx::{
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::mem;
 use std::path::Path;
 use std::sync::Arc;
@@ -83,6 +88,38 @@ pub struct TransactionSystem {
     purge_chan: Sender<Purge>,
     /// Purge threads purge unused undo logs, row pages and index entries.
     pub(super) purge_threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// One catalog-row redo operation extracted from persisted logs.
+pub struct CatalogRedoEntry {
+    pub table_id: TableID,
+    pub kind: RowRedoKind,
+}
+
+/// Table DDL kinds that can block catalog checkpoint scan on ordering safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogCheckpointBlockingDDL {
+    DropTable,
+}
+
+/// Stop reason for one catalog checkpoint scan batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogCheckpointScanStopReason {
+    ReachedDurableUpper,
+    BlockedByTableDDL {
+        table_id: TableID,
+        ddl: CatalogCheckpointBlockingDDL,
+    },
+}
+
+/// Catalog checkpoint scan result consumed by apply phase.
+pub struct CatalogCheckpointBatch {
+    pub from_exclusive: TrxID,
+    pub durable_upper_cts: TrxID,
+    pub safe_cts: TrxID,
+    pub catalog_ops: Vec<CatalogRedoEntry>,
+    pub catalog_ddl_txn_count: usize,
+    pub stop_reason: CatalogCheckpointScanStopReason,
 }
 
 impl TransactionSystem {
@@ -304,6 +341,139 @@ impl TransactionSystem {
             self.config.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
         )
     }
+
+    /// Returns globally durable log watermark `W` from all partitions.
+    #[inline]
+    pub fn persisted_watermark_cts(&self) -> TrxID {
+        self.log_partitions
+            .iter()
+            .map(|partition| partition.persisted_cts.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(MIN_SNAPSHOT_TS)
+    }
+
+    /// Scans persisted redo logs and returns one catalog checkpoint batch.
+    ///
+    /// Caller must pass a `durable_upper_cts` that does not exceed
+    /// `self.persisted_watermark_cts()`. This scan assumes the supplied upper
+    /// bound is already clamped to the slowest partition's persisted watermark.
+    ///
+    /// The scan range is `(from_exclusive, durable_upper_cts]`.
+    /// It stops early when reaching a blocking table DDL whose table checkpoint ts
+    /// is behind DDL cts.
+    ///
+    /// For each scanned log that is accepted into the batch, `safe_cts` advances to
+    /// that log's cts even if it does not contain catalog row-redo changes.
+    pub(crate) fn scan_catalog_checkpoint_batch<F>(
+        &self,
+        from_exclusive: TrxID,
+        durable_upper_cts: TrxID,
+        mut table_checkpoint_ts_lookup: F,
+    ) -> Result<CatalogCheckpointBatch>
+    where
+        F: FnMut(TableID) -> Option<TrxID>,
+    {
+        debug_assert!(
+            durable_upper_cts <= self.persisted_watermark_cts(),
+            "catalog checkpoint scan upper bound must not exceed persisted watermark"
+        );
+        let mut batch = CatalogCheckpointBatch {
+            from_exclusive,
+            durable_upper_cts,
+            safe_cts: from_exclusive,
+            catalog_ops: vec![],
+            catalog_ddl_txn_count: 0,
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+        };
+        if durable_upper_cts <= from_exclusive {
+            return Ok(batch);
+        }
+
+        let mut log_merger = LogMerger::default();
+        for log_no in 0..self.config.log_partitions {
+            let logs = list_log_files(&self.config.log_file_prefix, log_no, false)?;
+            if logs.is_empty() {
+                continue;
+            }
+            let stream = LogPartitionInitializer {
+                ctx: AIOContext::new(self.config.io_depth_per_log)?,
+                mode: LogPartitionMode::Recovery(VecDeque::from(logs)),
+                file_prefix: self.config.log_file_prefix.clone(),
+                file_max_size: self.config.log_file_max_size.as_u64() as usize,
+                file_header_size: self.config.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
+                page_size: self.config.max_io_size.as_u64() as usize,
+                io_depth_per_log: self.config.io_depth_per_log,
+                log_no,
+                file_seq: None,
+            }
+            .stream();
+            log_merger.add_stream(stream)?;
+        }
+
+        while let Some(log) = log_merger.try_next()? {
+            let (header, redo) = log.into_inner();
+            if header.cts <= from_exclusive {
+                continue;
+            }
+            if header.cts > durable_upper_cts {
+                break;
+            }
+
+            if let Some(ddl) = redo.ddl.as_deref()
+                && let Some((table_id, ddl_kind)) = blocking_table_ddl(ddl)
+                && is_user_obj_id(table_id)
+            {
+                let Some(table_checkpoint_ts) = table_checkpoint_ts_lookup(table_id) else {
+                    batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
+                        table_id,
+                        ddl: ddl_kind,
+                    };
+                    break;
+                };
+                if table_checkpoint_ts < header.cts {
+                    batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
+                        table_id,
+                        ddl: ddl_kind,
+                    };
+                    break;
+                }
+            }
+
+            batch.safe_cts = header.cts;
+
+            if let Some(ddl) = redo.ddl.as_deref()
+                && is_catalog_ddl(ddl)
+            {
+                batch.catalog_ddl_txn_count = batch.catalog_ddl_txn_count.saturating_add(1);
+            }
+
+            for (table_id, table_dml) in redo.dml {
+                if !is_catalog_obj_id(table_id) {
+                    continue;
+                }
+                for row_redo in table_dml.rows.into_values() {
+                    batch.catalog_ops.push(CatalogRedoEntry {
+                        table_id,
+                        kind: row_redo.kind,
+                    });
+                }
+            }
+        }
+        Ok(batch)
+    }
+}
+
+#[inline]
+fn blocking_table_ddl(ddl: &DDLRedo) -> Option<(TableID, CatalogCheckpointBlockingDDL)> {
+    match ddl {
+        DDLRedo::DropTable(table_id) => Some((*table_id, CatalogCheckpointBlockingDDL::DropTable)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn is_catalog_ddl(ddl: &DDLRedo) -> bool {
+    matches!(ddl, DDLRedo::CreateTable(_) | DDLRedo::DropTable(_))
 }
 
 unsafe impl StaticLifetime for TransactionSystem {}

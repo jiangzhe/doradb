@@ -80,8 +80,8 @@ Reference:
   - Scope: ...
   - Goals: ...
   - Non-goals: ...
-  - Task Doc: `docs/tasks/<6digits>-<task-topic>.md`
-  - Task Issue: `#123`
+  - Task Doc: `docs/tasks/TBD.md`
+  - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
@@ -91,8 +91,8 @@ Reference:
   - Scope: ...
   - Goals: ...
   - Non-goals: ...
-  - Task Doc: `docs/tasks/<6digits>-<task-topic>.md`
-  - Task Issue: `#124`
+  - Task Doc: `docs/tasks/TBD.md`
+  - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
