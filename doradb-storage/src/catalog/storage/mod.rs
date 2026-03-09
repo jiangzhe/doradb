@@ -19,6 +19,7 @@ use crate::file::multi_table_file::{
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::trx::TrxID;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// Runtime storage container for all catalog logical tables.
@@ -148,7 +149,7 @@ impl CatalogStorage {
             let (pivot_row_id, root_page_id) = table.blk_idx.root_snapshot();
             roots[table_id] = CatalogTableRootDesc {
                 table_id: table_id as u64,
-                root_page_id,
+                root_page_id: NonZeroU64::new(root_page_id),
                 pivot_row_id,
             };
         }

@@ -12,7 +12,7 @@ use crate::file::multi_table_file::{
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_MAX_BRANCH_ENTRIES, COLUMN_BLOCK_MAX_ENTRIES,
     COLUMN_BRANCH_ENTRY_SIZE, COLUMN_PAGE_PAYLOAD_SIZE, ColumnBlockIndex, ColumnBlockNodeHeader,
-    ColumnBlockPageReader, ColumnPagePayload, OffloadedBitmapPatch,
+    ColumnBlockPageReader, ColumnPagePayload, ColumnPagePayloadPatch, OffloadedBitmapPatch,
 };
 use crate::io::{AIOBuf, DirectBuf};
 use crate::lwc::{LwcBuilder, LwcData, LwcPage};
@@ -26,6 +26,7 @@ use bytemuck::pod_read_unaligned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::mem;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 
 struct PendingLwcPage {
@@ -174,12 +175,22 @@ impl CatalogStorage {
         table_ops: &[RowRedoKind],
         checkpoint_cts: u64,
     ) -> Result<CatalogTableRootDesc> {
-        let entries = self.collect_index_entries(root.root_page_id).await?;
+        // Step 1: Validate root invariants and construct a base index snapshot for reads.
+        if root.root_page_id.is_none() && root.pivot_row_id != 0 {
+            return Err(Error::InvalidState);
+        }
+        let root_page_id = root.root_page_id.map_or(0, NonZeroU64::get);
+        let entries = if root_page_id == 0 {
+            Vec::new()
+        } else {
+            self.collect_index_entries(root_page_id).await?
+        };
         let reader = CatalogMtbIndexPageReader::new(&self.mtb);
         let base_index =
-            ColumnBlockIndex::new_with_page_reader(root.root_page_id, root.pivot_row_id, &reader);
+            ColumnBlockIndex::new_with_page_reader(root_page_id, root.pivot_row_id, &reader);
         let mut next_row_id = root.pivot_row_id;
 
+        // Step 2: Preload existing visible rows only when delete-by-key appears.
         let need_delete_lookup = table_ops
             .iter()
             .any(|kind| matches!(kind, RowRedoKind::DeleteByUniqueKey(_)));
@@ -192,6 +203,7 @@ impl CatalogStorage {
         let mut pending_rows = Vec::new();
         let mut delete_deltas: BTreeMap<RowID, BTreeSet<u32>> = BTreeMap::new();
 
+        // Step 3: Replay table ops into in-memory pending rows and deletion deltas.
         for kind in table_ops {
             match kind {
                 RowRedoKind::Insert(vals) => {
@@ -238,7 +250,8 @@ impl CatalogStorage {
             }
         }
 
-        let mut current_root_page_id = root.root_page_id;
+        // Step 4: Build the live-insert batch after canceling same-batch insert+delete rows.
+        let mut current_root_page_id = root_page_id;
         let mut current_end_row_id = root.pivot_row_id;
         let mut entries_changed = false;
         let mut live_inserts = Vec::new();
@@ -251,6 +264,46 @@ impl CatalogStorage {
             }
         }
 
+        // Step 5: Try CoW-merging inserts into the right-most existing LWC page first.
+        if !live_inserts.is_empty()
+            && let Some(last_entry) = entries.last().copied()
+        {
+            let existing_tail_rows = self
+                .decode_lwc_page_rows(last_entry.payload.block_id, metadata)
+                .await?;
+            if !existing_tail_rows.is_empty()
+                && let Some((merged_tail_buf, consumed)) = self
+                    .build_merged_tail_lwc_page(metadata, &existing_tail_rows, &live_inserts)
+                    .await?
+            {
+                let new_tail_page_id = mutable.allocate_page_id()?;
+                mutable
+                    .write_page(new_tail_page_id, merged_tail_buf)
+                    .await?;
+                mutable.record_gc_page(last_entry.payload.block_id);
+                let mut updated_payload = last_entry.payload;
+                updated_payload.block_id = new_tail_page_id;
+                let patches = [ColumnPagePayloadPatch {
+                    start_row_id: last_entry.start_row_id,
+                    payload: updated_payload,
+                }];
+                let column_index = ColumnBlockIndex::new_with_page_reader(
+                    current_root_page_id,
+                    current_end_row_id,
+                    &reader,
+                );
+                current_root_page_id = column_index
+                    .batch_replace_payloads(mutable, &patches, checkpoint_cts)
+                    .await?;
+                entries_changed = true;
+                live_inserts.drain(0..consumed);
+                if live_inserts.is_empty() {
+                    current_end_row_id = next_row_id.max(root.pivot_row_id);
+                }
+            }
+        }
+
+        // Step 6: Persist any remaining inserts as new LWC pages and append index entries.
         if !live_inserts.is_empty() {
             let new_pages = self
                 .build_lwc_pages_from_row_records(self.meta_pool, metadata, &live_inserts)
@@ -276,6 +329,7 @@ impl CatalogStorage {
             }
         }
 
+        // Step 7: Materialize deletion bitmap patches keyed by leaf start-row-id.
         let mut patch_storage: Vec<(RowID, Vec<u8>)> = Vec::new();
         for (start_row_id, pending) in &delete_deltas {
             let idx = entries
@@ -293,6 +347,7 @@ impl CatalogStorage {
             patch_storage.push((*start_row_id, encode_deltas_to_bytes(&base)));
         }
 
+        // Step 8: Apply deletion patches with CoW payload updates on the current root.
         if !patch_storage.is_empty() {
             let patches: Vec<OffloadedBitmapPatch<'_>> = patch_storage
                 .iter()
@@ -312,21 +367,21 @@ impl CatalogStorage {
             entries_changed = true;
         }
 
+        // Step 9: Publish final per-table root descriptor for this checkpoint batch.
+        let root_page_id = if entries_changed {
+            Some(NonZeroU64::new(current_root_page_id).ok_or(Error::InvalidState)?)
+        } else {
+            root.root_page_id
+        };
         Ok(CatalogTableRootDesc {
             table_id,
-            root_page_id: if entries_changed {
-                current_root_page_id
-            } else {
-                root.root_page_id
-            },
+            root_page_id,
             pivot_row_id: next_row_id.max(root.pivot_row_id),
         })
     }
 
-    async fn collect_index_entries(&self, root_page_id: u64) -> Result<Vec<CatalogIndexEntry>> {
-        if root_page_id == 0 {
-            return Ok(Vec::new());
-        }
+    async fn collect_index_entries(&self, root_page_id: PageID) -> Result<Vec<CatalogIndexEntry>> {
+        assert_ne!(root_page_id, 0, "root_page_id must be non-zero");
         let mut stack = vec![root_page_id];
         let mut entries = Vec::new();
         while let Some(page_id) = stack.pop() {
@@ -508,6 +563,53 @@ impl CatalogStorage {
         Ok(lwc_pages)
     }
 
+    async fn build_merged_tail_lwc_page(
+        &self,
+        metadata: &TableMetadata,
+        existing_tail_rows: &[RowRecord],
+        inserts: &[RowRecord],
+    ) -> Result<Option<(DirectBuf, usize)>> {
+        if existing_tail_rows.is_empty() || inserts.is_empty() {
+            return Ok(None);
+        }
+        for row in existing_tail_rows {
+            if row.vals.len() != metadata.col_count() {
+                return Err(Error::InvalidFormat);
+            }
+        }
+        for row in inserts {
+            if row.vals.len() != metadata.col_count() {
+                return Err(Error::InvalidFormat);
+            }
+        }
+
+        let mut builder = LwcBuilder::new(metadata);
+        let mut temp_page = self.meta_pool.allocate_page::<RowPage>().await;
+
+        for row in existing_tail_rows {
+            if !append_single_row_to_builder(metadata, &mut temp_page, &mut builder, row)? {
+                self.meta_pool.deallocate_page(temp_page);
+                return Err(Error::InvalidState);
+            }
+        }
+
+        let mut consumed = 0usize;
+        for row in inserts {
+            if !append_single_row_to_builder(metadata, &mut temp_page, &mut builder, row)? {
+                break;
+            }
+            consumed += 1;
+        }
+
+        self.meta_pool.deallocate_page(temp_page);
+
+        if consumed == 0 {
+            return Ok(None);
+        }
+        let buf = builder.build()?;
+        Ok(Some((buf, consumed)))
+    }
+
     async fn load_payload_deletion_deltas(
         &self,
         column_index: &ColumnBlockIndex<'_>,
@@ -628,4 +730,78 @@ fn decode_deltas_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
     res.sort_unstable();
     res.dedup();
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::catalog::tests::{table1, table2};
+    use crate::engine::EngineConfig;
+    use crate::trx::sys_conf::TrxSysConfig;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_catalog_checkpoint_tail_merge_rewrites_last_payload_without_new_entry() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-checkpoint-tail-merge")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+
+            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let tables_root1 = snap1.meta.table_roots[0];
+            assert!(tables_root1.root_page_id.is_some());
+            let entries1 = engine
+                .catalog()
+                .storage
+                .collect_index_entries(tables_root1.root_page_id.unwrap().get())
+                .await
+                .unwrap();
+            assert!(!entries1.is_empty());
+
+            let _ = table2(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+
+            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let tables_root2 = snap2.meta.table_roots[0];
+            let entries2 = engine
+                .catalog()
+                .storage
+                .collect_index_entries(tables_root2.root_page_id.unwrap().get())
+                .await
+                .unwrap();
+
+            assert!(tables_root2.pivot_row_id > tables_root1.pivot_row_id);
+            assert!(tables_root2.root_page_id != tables_root1.root_page_id);
+            assert_eq!(
+                entries2.len(),
+                entries1.len(),
+                "tail-page merge should reuse the existing last index entry when capacity allows"
+            );
+
+            let last1 = entries1.last().copied().unwrap();
+            let last2 = entries2.last().copied().unwrap();
+            assert_eq!(last2.start_row_id, last1.start_row_id);
+            assert_ne!(last2.payload.block_id, last1.payload.block_id);
+            assert_eq!(last2.payload.deletion_field, last1.payload.deletion_field);
+        });
+    }
 }

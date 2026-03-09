@@ -17,6 +17,7 @@ use crate::io::{AIOBuf, AIOClient, DirectBuf};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
+use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
@@ -36,7 +37,7 @@ pub struct CatalogTableRootDesc {
     /// Catalog table id.
     pub table_id: TableID,
     /// Reserved on-disk root page id for future catalog table persistence.
-    pub root_page_id: u64,
+    pub root_page_id: Option<NonZeroU64>,
     /// Reserved pivot row id paired with `root_page_id`.
     pub pivot_row_id: RowID,
 }
@@ -266,45 +267,86 @@ impl Deref for MultiTableFile {
 ///
 /// This mirrors `MutableTableFile` semantics for catalog file updates.
 pub struct MutableMultiTableFile {
-    file: Arc<MultiTableFile>,
-    new_root: MultiTableActiveRoot,
+    file: Option<Arc<MultiTableFile>>,
+    new_root: Option<MultiTableActiveRoot>,
+    mutable_writer_claimed: bool,
 }
 
 impl MutableMultiTableFile {
+    #[inline]
+    fn file_ref(&self) -> &Arc<MultiTableFile> {
+        self.file
+            .as_ref()
+            .expect("mutable multi-table file has been consumed")
+    }
+
+    #[inline]
+    fn new_root_mut(&mut self) -> &mut MultiTableActiveRoot {
+        self.new_root
+            .as_mut()
+            .expect("mutable multi-table file has been consumed")
+    }
+
+    #[inline]
+    fn release_mutable_claim_with_file(&mut self, file: &Arc<MultiTableFile>) {
+        if self.mutable_writer_claimed {
+            file.release_mutable_writer();
+            self.mutable_writer_claimed = false;
+        }
+    }
+
+    #[inline]
+    fn release_mutable_claim(&mut self) {
+        if self.mutable_writer_claimed {
+            let file = self
+                .file
+                .as_ref()
+                .expect("mutable multi-table file has been consumed");
+            file.release_mutable_writer();
+            self.mutable_writer_claimed = false;
+        }
+    }
+
     /// Create mutable handle with caller-provided root.
     #[inline]
     pub fn new(table_file: Arc<MultiTableFile>, new_root: MultiTableActiveRoot) -> Self {
+        table_file.claim_mutable_writer();
         MutableMultiTableFile {
-            file: table_file,
-            new_root,
+            file: Some(table_file),
+            new_root: Some(new_root),
+            mutable_writer_claimed: true,
         }
     }
 
     /// Fork mutable handle from current active root.
     #[inline]
     pub fn fork(table_file: &Arc<MultiTableFile>) -> Self {
+        table_file.claim_mutable_writer();
         MutableMultiTableFile {
-            file: Arc::clone(table_file),
-            new_root: table_file.active_root().flip(),
+            file: Some(Arc::clone(table_file)),
+            new_root: Some(table_file.active_root().flip()),
+            mutable_writer_claimed: true,
         }
     }
 
     /// Returns immutable reference to mutable root snapshot.
     #[inline]
     pub fn root(&self) -> &MultiTableActiveRoot {
-        &self.new_root
+        self.new_root
+            .as_ref()
+            .expect("mutable multi-table file has been consumed")
     }
 
     /// Returns mutable reference to mutable root snapshot.
     #[inline]
     pub fn root_mut(&mut self) -> &mut MultiTableActiveRoot {
-        &mut self.new_root
+        self.new_root_mut()
     }
 
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
     pub fn allocate_page_id(&mut self) -> Result<PageID> {
-        self.new_root
+        self.new_root_mut()
             .try_allocate_page_id()
             .ok_or(Error::InvalidState)
     }
@@ -312,13 +354,13 @@ impl MutableMultiTableFile {
     /// Record an obsolete page id to be reclaimed after commit.
     #[inline]
     pub fn record_gc_page(&mut self, page_id: PageID) {
-        self.new_root.gc_page_list.push(page_id);
+        self.new_root_mut().gc_page_list.push(page_id);
     }
 
     /// Write one page into the underlying multi-table file.
     #[inline]
     pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
-        self.file.write_page(page_id, buf).await
+        self.file_ref().write_page(page_id, buf).await
     }
 
     /// Apply checkpoint metadata to mutable root.
@@ -329,12 +371,17 @@ impl MutableMultiTableFile {
         next_user_obj_id: ObjID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) -> Result<()> {
-        let root = &mut self.new_root;
+        let root = self.new_root_mut();
         if checkpoint_cts < root.trx_id {
             return Err(Error::InvalidArgument);
         }
         if next_user_obj_id < USER_OBJ_ID_START {
             return Err(Error::InvalidArgument);
+        }
+        for root in &table_roots {
+            if root.root_page_id.is_none() && root.pivot_row_id != 0 {
+                return Err(Error::InvalidArgument);
+            }
         }
 
         root.trx_id = checkpoint_cts;
@@ -345,10 +392,26 @@ impl MutableMultiTableFile {
 
     /// Commit mutable root by writing meta page then ping-pong super page.
     #[inline]
-    pub async fn commit(self) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
-        let MutableMultiTableFile { file, new_root } = self;
-        let old_root = file.publish_root(new_root).await?;
+    pub async fn commit(mut self) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
+        let new_root = self
+            .new_root
+            .take()
+            .expect("mutable multi-table file has been consumed");
+        let publish_res = self.file_ref().publish_root(new_root).await;
+        let file = self
+            .file
+            .take()
+            .expect("mutable multi-table file has been consumed");
+        self.release_mutable_claim_with_file(&file);
+        let old_root = publish_res?;
         Ok((file, old_root))
+    }
+}
+
+impl Drop for MutableMultiTableFile {
+    #[inline]
+    fn drop(&mut self) {
+        self.release_mutable_claim();
     }
 }
 
@@ -409,6 +472,7 @@ mod tests {
     use crate::file::table_fs::TableFileSystemConfig;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
+    use std::num::NonZeroU64;
     use tempfile::TempDir;
 
     #[test]
@@ -431,7 +495,7 @@ mod tests {
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
                 root.table_id = idx as u64;
-                root.root_page_id = (idx + 10) as u64;
+                root.root_page_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = (idx * 100) as u64;
             }
             mtb.publish_checkpoint(7, USER_OBJ_ID_START + 16, roots)
@@ -558,6 +622,39 @@ mod tests {
                 .unwrap();
             let res = fs.open_or_create_multi_table_file().await;
             assert!(res.is_err());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "concurrent mutable CoW file modification is not allowed")]
+    fn test_multi_table_file_rejects_concurrent_fork() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(dir.path())
+                .build()
+                .unwrap();
+            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+
+            let _first = MutableMultiTableFile::fork(&mtb);
+            let _second = MutableMultiTableFile::fork(&mtb);
+        });
+    }
+
+    #[test]
+    fn test_multi_table_file_allows_fork_after_drop() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(dir.path())
+                .build()
+                .unwrap();
+            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+
+            let first = MutableMultiTableFile::fork(&mtb);
+            drop(first);
+
+            let _second = MutableMultiTableFile::fork(&mtb);
         });
     }
 }

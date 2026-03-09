@@ -699,7 +699,7 @@ pub mod tests {
                     .meta
                     .table_roots
                     .iter()
-                    .all(|root| root.root_page_id == 0 && root.pivot_row_id == 0)
+                    .all(|root| root.root_page_id.is_none() && root.pivot_row_id == 0)
             );
 
             let _ = table1(&engine).await;
@@ -719,7 +719,7 @@ pub mod tests {
                     .meta
                     .table_roots
                     .iter()
-                    .any(|root| root.root_page_id > 0)
+                    .any(|root| root.root_page_id.is_some())
             );
             assert!(
                 snap1

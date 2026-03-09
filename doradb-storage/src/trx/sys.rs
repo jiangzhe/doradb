@@ -453,19 +453,6 @@ impl TransactionSystem {
         }
         Ok(batch)
     }
-
-    /// Collects catalog row-redo entries from persisted logs in `(from, to]`.
-    ///
-    /// This method keeps legacy semantics and ignores table-DDL safety barriers.
-    pub fn collect_catalog_redo_entries(
-        &self,
-        from_exclusive: TrxID,
-        to_inclusive: TrxID,
-    ) -> Result<Vec<CatalogRedoEntry>> {
-        let batch = self
-            .scan_catalog_checkpoint_batch(from_exclusive, to_inclusive, |_| Some(to_inclusive))?;
-        Ok(batch.catalog_ops)
-    }
 }
 
 #[inline]
