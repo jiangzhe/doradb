@@ -354,13 +354,17 @@ impl TransactionSystem {
 
     /// Scans persisted redo logs and returns one catalog checkpoint batch.
     ///
+    /// Caller must pass a `durable_upper_cts` that does not exceed
+    /// `self.persisted_watermark_cts()`. This scan assumes the supplied upper
+    /// bound is already clamped to the slowest partition's persisted watermark.
+    ///
     /// The scan range is `(from_exclusive, durable_upper_cts]`.
     /// It stops early when reaching a blocking table DDL whose table checkpoint ts
     /// is behind DDL cts.
     ///
     /// For each scanned log that is accepted into the batch, `safe_cts` advances to
     /// that log's cts even if it does not contain catalog row-redo changes.
-    pub fn scan_catalog_checkpoint_batch<F>(
+    pub(crate) fn scan_catalog_checkpoint_batch<F>(
         &self,
         from_exclusive: TrxID,
         durable_upper_cts: TrxID,
@@ -369,6 +373,10 @@ impl TransactionSystem {
     where
         F: FnMut(TableID) -> Option<TrxID>,
     {
+        debug_assert!(
+            durable_upper_cts <= self.persisted_watermark_cts(),
+            "catalog checkpoint scan upper bound must not exceed persisted watermark"
+        );
         let mut batch = CatalogCheckpointBatch {
             from_exclusive,
             durable_upper_cts,

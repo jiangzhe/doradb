@@ -93,6 +93,9 @@ impl Catalog {
     }
 
     /// Scan persisted redo logs and collect one safe catalog checkpoint batch.
+    ///
+    /// This call satisfies `scan_catalog_checkpoint_batch`'s precondition by
+    /// using the global persisted watermark across all log partitions.
     pub fn scan_checkpoint_batch(
         &self,
         trx_sys: &TransactionSystem,
