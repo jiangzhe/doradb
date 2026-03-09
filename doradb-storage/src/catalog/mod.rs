@@ -86,6 +86,10 @@ impl Catalog {
     }
 
     /// Trigger one ad-hoc catalog checkpoint publish.
+    ///
+    /// This API is single-caller by contract: callers must not overlap
+    /// `checkpoint_now` or `apply_checkpoint_batch` on the same `Catalog`.
+    /// Underlying CoW file writers already reject concurrent mutable publishes.
     #[inline]
     pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let batch = self.scan_checkpoint_batch(trx_sys)?;
@@ -96,6 +100,9 @@ impl Catalog {
     ///
     /// This call satisfies `scan_catalog_checkpoint_batch`'s precondition by
     /// using the global persisted watermark across all log partitions.
+    ///
+    /// Scanned batches are intended for single-flight publish flow and must not
+    /// be raced with other catalog checkpoint publishes on the same `Catalog`.
     pub fn scan_checkpoint_batch(
         &self,
         trx_sys: &TransactionSystem,
@@ -109,6 +116,10 @@ impl Catalog {
     }
 
     /// Apply one scanned catalog checkpoint batch into `catalog.mtb`.
+    ///
+    /// This API is single-caller by contract: callers must not overlap
+    /// `apply_checkpoint_batch` or `checkpoint_now` on the same `Catalog`.
+    /// Concurrent mutable publishes are rejected by the underlying CoW file.
     #[inline]
     pub async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
         self.storage

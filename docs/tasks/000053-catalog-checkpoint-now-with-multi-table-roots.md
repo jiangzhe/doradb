@@ -1,7 +1,7 @@
 ---
 id: 000053
 title: Catalog Checkpoint Now with MultiTable Roots
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-08
 github_issue: 393
 ---
@@ -89,6 +89,50 @@ Reference:
 
 ## Implementation Notes
 
+1. Added scoped catalog checkpoint API surface in
+   `doradb-storage/src/catalog/mod.rs`:
+   - `Catalog::checkpoint_now(...)` now sequences scan + apply for one ad-hoc
+     publish;
+   - `Catalog::scan_checkpoint_batch(...)` derives checkpoint range from the
+     persisted `catalog.mtb` snapshot plus global redo durability watermark;
+   - `Catalog::apply_checkpoint_batch(...)` forwards one scanned batch into
+     storage publish.
+2. Implemented catalog redo scan result plumbing in
+   `doradb-storage/src/trx/sys.rs`:
+   - added `CatalogCheckpointBatch`, stop-reason enum, and
+     `scan_catalog_checkpoint_batch(...)`;
+   - scan advances only across persisted redo range and stops on blocking
+     user-table DDL whose table checkpoint watermark lags the DDL CTS.
+3. Implemented catalog checkpoint publish/apply path in
+   `doradb-storage/src/catalog/storage/checkpoint.rs`:
+   - loads current `catalog.mtb` snapshot and replays catalog row/DDL effects
+     into catalog logical-table checkpoint state;
+   - updates `MultiTableMetaPage.table_roots` and publishes active-root
+     `trx_id = safe_cts`;
+   - supports no-op heartbeat publish when no catalog row pages need rewriting;
+   - reuses existing tail entry during append-focused updates when LWC merge
+     capacity allows.
+4. Extended reusable CoW/file primitives needed for multi-table catalog publish:
+   - `doradb-storage/src/file/multi_table_file.rs` now exposes snapshot/load and
+     checkpoint metadata publish helpers for `catalog.mtb`;
+   - `doradb-storage/src/index/column_block_index.rs` now supports generic
+     `MutableCowFile` / page-reader based payload replacement so catalog
+     checkpoint can reuse the same index structures as table checkpoint.
+5. Kept phase boundaries intact:
+   - checkpoint state is persisted directly in `catalog.mtb` multi-table roots;
+   - catalog secondary indexes are still rebuilt from checkpoint rows + replay,
+     not checkpointed directly;
+   - background scheduling, dirty-event wakeup, redo-maintenance worker, and
+     recovery cutoff `cts > W` remain deferred follow-up work.
+6. Post-implementation review outcome:
+   - overlapping catalog checkpoints remain unsupported by contract;
+   - no catalog async mutex was added because concurrent mutable `catalog.mtb`
+     publishes already panic at the underlying CoW file writer boundary;
+   - the single-caller contract is now documented on catalog checkpoint
+     entrypoints.
+7. Verification executed in this resolve pass:
+   - `cargo test -p doradb-storage --no-default-features catalog_checkpoint`
+   - `cargo test -p doradb-storage --no-default-features test_multi_table_file_`
 
 ## Impacts
 
@@ -124,3 +168,6 @@ Reference:
    - periodic scheduling,
    - dirty-event coalescing,
    - checkpoint + truncation coordination.
+4. This task intentionally keeps catalog checkpoint entrypoints single-caller by
+   contract. If future background or multi-caller checkpoint orchestration is
+   introduced, add an explicit single-flight guard at the catalog boundary.

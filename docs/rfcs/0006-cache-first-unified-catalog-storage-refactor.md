@@ -221,10 +221,10 @@ Reference:
   - Scope: implement catalog overlay root format over `catalog.mtb`, periodic + dirty-event scheduling, `Catalog::checkpoint_now()`, and replay-based catalog checkpoint build for redo prefix `(last_catalog_checkpoint_cts, W]`.
   - Goals: atomic multi-table catalog checkpoint publish with cache-first runtime preserved and watermark-aligned replay correctness.
   - Non-goals: no user-table checkpoint algorithm changes.
-  - Task Doc: `docs/tasks/000053-catalog-overlay-checkpoint-worker.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000053-catalog-checkpoint-now-with-multi-table-roots.md`
+  - Task Issue: `#393`
+  - Phase Status: done
+  - Implementation Summary: 1. Added scoped catalog checkpoint API surface in [Task Resolve Sync: docs/tasks/000053-catalog-checkpoint-now-with-multi-table-roots.md @ 2026-03-09]
 
 - **Phase 7: Catalog Checkpoint Readonly Buffer Pool Reuse**
   - Scope: generalize readonly buffer-pool file binding so `catalog.mtb` pages can be read through the same readonly cache machinery; wire catalog checkpoint page reads to this path.
