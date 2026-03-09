@@ -235,25 +235,16 @@ Reference:
   - Phase Status: done
   - Implementation Summary: 1. Generalized readonly cache identity and source binding to physical files: [Task Resolve Sync: docs/tasks/000054-catalog-checkpoint-readonly-buffer-pool-reuse.md @ 2026-03-09]
 
-- **Phase 8: Shared Checkpoint Primitives and Table Migration**
-  - Scope: extract shared checkpoint primitives (deletion-delta codec, deletion-blob helpers, and column-index checkpoint edit helpers) and migrate table checkpoint call sites to them.
-  - Goals: establish one reusable checkpoint primitive layer while preserving current table checkpoint behavior.
-  - Non-goals: no catalog checkpoint call-site migration in this phase; no recovery-cutoff policy changes.
-  - Task Doc: `docs/tasks/TBD.md`
+- **Phase 8: Shared Checkpoint Primitives and Duplication Cleanup**
+  - Scope: extract shared checkpoint primitives for column-page deletion persistence, migrate both table and catalog checkpoint call sites to them, and remove duplicated helper logic while preserving current semantics.
+  - Goals: establish one reusable checkpoint primitive layer, centralize payload/deletion-format invariants, and reduce maintenance cost without changing checkpoint behavior.
+  - Non-goals: no recovery-cutoff policy changes; no catalog runtime in-memory access model changes; no user-visible API changes.
+  - Task Doc: `docs/tasks/000055-shared-checkpoint-primitives-and-duplication-cleanup.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 9: Catalog Checkpoint Migration and Duplication Cleanup**
-  - Scope: migrate catalog checkpoint implementation to shared primitives and remove duplicated helper logic in catalog checkpoint module.
-  - Goals: reduce maintenance cost and keep catalog checkpoint semantics unchanged.
-  - Non-goals: no catalog runtime in-memory access model changes; no user-visible API changes.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
-
-- **Phase 10: Recovery Cutoff and Consistency Checks**
+- **Phase 9: Recovery Cutoff and Consistency Checks**
   - Scope: persist/load `catalog_checkpoint_cts`, compute/load watermark `W`, replay only logs with `cts > W`, and add fail-fast checks for post-cutoff catalog/data inconsistencies.
   - Goals: deterministic startup replay boundary with strong consistency guarantees.
   - Non-goals: no physical log truncation implementation.
@@ -262,7 +253,7 @@ Reference:
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 11: Validation and Documentation Sync**
+- **Phase 10: Validation and Documentation Sync**
   - Scope: tests for id ranges, file naming, schema behavior, checkpoint atomicity, replay cutoff correctness, and lifecycle ordering (`create/insert/drop`, DDL around cutoff); doc updates.
   - Goals: verify behavioral contract end-to-end.
   - Non-goals: no legacy migration tooling; no physical truncation.
