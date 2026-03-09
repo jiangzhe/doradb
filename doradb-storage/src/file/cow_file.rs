@@ -230,10 +230,15 @@ impl<M> CowFile<M> {
         AtomicPtr::new(self.load_active_root_raw())
     }
 
-    /// Claim exclusive mutable access for one CoW writer.
+    /// Claim exclusive mutable access to this CoW file.
+    ///
+    /// This is called by [`MutableTableFile`] and [`MutableMultiTableFile`]
+    /// constructors (including catalog checkpoint application). At most one
+    /// mutable writer may be active at any time.
+    ///
+    /// # Panics
     ///
     /// Panics if another mutable writer already exists for this file handle.
-    #[inline]
     pub(crate) fn claim_mutable_writer(&self) {
         let acquired = self
             .mutable_inflight

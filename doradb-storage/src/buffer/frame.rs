@@ -1,7 +1,7 @@
-use crate::buffer::BufferPage;
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID, VersionedPageID};
-use crate::catalog::{TableID, TableMetadata};
+use crate::buffer::{BufferPage, ReadonlyFileID};
+use crate::catalog::TableMetadata;
 use crate::latch::HybridLatch;
 use crate::ptr::UnsafePtr;
 use crate::trx::TrxID;
@@ -10,30 +10,38 @@ use crate::trx::ver_map::RowVersionMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
+const BUFFER_FRAME_SIZE_BYTES: usize = 128;
+
 const _: () = assert!(
-    { std::mem::size_of::<BufferFrame>().is_multiple_of(64) },
-    "Size of BufferFrame must be multiply of 64"
+    { std::mem::size_of::<BufferFrame>() == BUFFER_FRAME_SIZE_BYTES },
+    "Size of BufferFrame must be exactly 128 bytes"
 );
 
 const _: () = assert!(
-    { std::mem::align_of::<BufferFrame>().is_multiple_of(64) },
-    "Align of BufferFrame must be multiply of 64"
+    { std::mem::align_of::<BufferFrame>() == BUFFER_FRAME_SIZE_BYTES },
+    "Align of BufferFrame must be exactly 128 bytes"
 );
 
 /// BufferFrame is the header of a page. It contains some
 /// metadata of the page and anything that is not suitable
 /// storing in the page, e.g. undo map of row page.
+///
+/// Layout contract:
+/// - `BufferFrame` is intentionally kept at exactly 128 bytes.
+/// - field order is part of that contract; adding or reordering fields may
+///   change the size and reduce effective buffer-pool capacity.
+/// - update the layout deliberately and keep the const asserts below green.
 #[repr(C, align(128))]
 pub struct BufferFrame {
     /* header part */
     pub latch: HybridLatch, // lock proctects free list and page.
     pub page_id: PageID,
-    frame_kind: AtomicU8,
     generation: AtomicU64,
+    frame_kind: AtomicU8,
     dirty: AtomicBool,
-    readonly_table_id: AtomicU64,
-    readonly_block_id: AtomicU64,
     has_readonly_key: AtomicBool,
+    readonly_file_id: AtomicU64,
+    readonly_block_id: AtomicU64,
     /// Context of this buffer frame. It can store additinal contextual information
     /// about the page, e.g. undo map of row page.
     pub ctx: Option<Box<FrameContext>>,
@@ -95,19 +103,19 @@ impl BufferFrame {
 
     /// Returns readonly cache key stored in this frame, if present.
     #[inline]
-    pub fn readonly_key(&self) -> Option<(TableID, PageID)> {
+    pub fn readonly_key(&self) -> Option<(ReadonlyFileID, PageID)> {
         if !self.has_readonly_key.load(Ordering::Acquire) {
             return None;
         }
-        let table_id = self.readonly_table_id.load(Ordering::Acquire);
+        let file_id = self.readonly_file_id.load(Ordering::Acquire);
         let block_id = self.readonly_block_id.load(Ordering::Acquire);
-        Some((table_id, block_id))
+        Some((file_id, block_id))
     }
 
     /// Updates readonly cache key metadata for this frame.
     #[inline]
-    pub fn set_readonly_key(&self, table_id: TableID, block_id: PageID) {
-        self.readonly_table_id.store(table_id, Ordering::Release);
+    pub fn set_readonly_key(&self, file_id: ReadonlyFileID, block_id: PageID) {
+        self.readonly_file_id.store(file_id, Ordering::Release);
         self.readonly_block_id.store(block_id, Ordering::Release);
         self.has_readonly_key.store(true, Ordering::Release);
     }
@@ -116,7 +124,7 @@ impl BufferFrame {
     #[inline]
     pub fn clear_readonly_key(&self) {
         self.has_readonly_key.store(false, Ordering::Release);
-        self.readonly_table_id.store(0, Ordering::Release);
+        self.readonly_file_id.store(0, Ordering::Release);
         self.readonly_block_id
             .store(INVALID_PAGE_ID, Ordering::Release);
     }
@@ -146,7 +154,7 @@ impl Default for BufferFrame {
             generation: AtomicU64::new(0),
             // by default the page is dirty because no copy on disk.
             dirty: AtomicBool::new(true),
-            readonly_table_id: AtomicU64::new(0),
+            readonly_file_id: AtomicU64::new(0),
             readonly_block_id: AtomicU64::new(INVALID_PAGE_ID),
             has_readonly_key: AtomicBool::new(false),
             ctx: None,

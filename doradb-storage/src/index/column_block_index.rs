@@ -5,11 +5,10 @@ use crate::error::{Error, Result};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
 use crate::index::column_deletion_blob::{
     COLUMN_DELETION_BLOB_PAGE_BODY_SIZE, ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
-    read_blob_page_chunk,
 };
-use crate::io::{AIOBuf, DirectBuf};
+use crate::io::DirectBuf;
 use crate::row::RowID;
-use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut, pod_read_unaligned};
+use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
@@ -519,23 +518,8 @@ impl<'a> Iterator for DeletionListIter<'a> {
     }
 }
 
-/// Thin wrapper over column block-index root and readonly pool.
-///
-/// It is cheap to instantiate per lookup/checkpoint operation.
-pub trait ColumnBlockPageReader: Sync {
-    fn read_page<'a>(
-        &'a self,
-        page_id: PageID,
-    ) -> Pin<Box<dyn Future<Output = Result<DirectBuf>> + Send + 'a>>;
-}
-
-enum ColumnBlockReadView<'a> {
-    ReadonlyPool(&'a ReadonlyBufferPool),
-    PageReader(&'a dyn ColumnBlockPageReader),
-}
-
 pub struct ColumnBlockIndex<'a> {
-    read_view: ColumnBlockReadView<'a>,
+    disk_pool: &'a ReadonlyBufferPool,
     root_page_id: PageID,
     end_row_id: RowID,
 }
@@ -600,21 +584,7 @@ impl<'a> ColumnBlockIndex<'a> {
     #[inline]
     pub fn new(root_page_id: PageID, end_row_id: RowID, disk_pool: &'a ReadonlyBufferPool) -> Self {
         ColumnBlockIndex {
-            read_view: ColumnBlockReadView::ReadonlyPool(disk_pool),
-            root_page_id,
-            end_row_id,
-        }
-    }
-
-    /// Creates a column block-index view backed by a direct page reader.
-    #[inline]
-    pub fn new_with_page_reader(
-        root_page_id: PageID,
-        end_row_id: RowID,
-        reader: &'a dyn ColumnBlockPageReader,
-    ) -> Self {
-        ColumnBlockIndex {
-            read_view: ColumnBlockReadView::PageReader(reader),
+            disk_pool,
             root_page_id,
             end_row_id,
         }
@@ -634,40 +604,19 @@ impl<'a> ColumnBlockIndex<'a> {
 
     #[inline]
     async fn read_node(&self, page_id: PageID) -> Result<Box<ColumnBlockNode>> {
-        match self.read_view {
-            ColumnBlockReadView::ReadonlyPool(disk_pool) => {
-                let g = disk_pool
-                    .try_get_page_shared::<ColumnBlockNode>(page_id)
-                    .await?;
-                let node = g.page();
-                let mut copy = ColumnBlockNode::new_boxed(
-                    node.header.height,
-                    node.header.start_row_id,
-                    node.header.create_ts,
-                );
-                copy.header = node.header;
-                copy.data.copy_from_slice(&node.data);
-                Ok(copy)
-            }
-            ColumnBlockReadView::PageReader(reader) => {
-                let buf = reader.read_page(page_id).await?;
-                Self::decode_node_page(buf.as_bytes())
-            }
-        }
-    }
-
-    #[inline]
-    fn decode_node_page(page: &[u8]) -> Result<Box<ColumnBlockNode>> {
-        if page.len() != COLUMN_BLOCK_PAGE_SIZE {
-            return Err(Error::InvalidFormat);
-        }
-        let header = pod_read_unaligned::<ColumnBlockNodeHeader>(&page[..COLUMN_BLOCK_HEADER_SIZE]);
-        let mut node =
-            ColumnBlockNode::new_boxed(header.height, header.start_row_id, header.create_ts);
-        node.header = header;
-        node.data
-            .copy_from_slice(&page[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_PAGE_SIZE]);
-        Ok(node)
+        let g = self
+            .disk_pool
+            .try_get_page_shared::<ColumnBlockNode>(page_id)
+            .await?;
+        let node = g.page();
+        let mut copy = ColumnBlockNode::new_boxed(
+            node.header.height,
+            node.header.start_row_id,
+            node.header.create_ts,
+        );
+        copy.header = node.header;
+        copy.data.copy_from_slice(&node.data);
+        Ok(copy)
     }
 
     /// Finds the column page payload containing `row_id`.
@@ -684,50 +633,27 @@ impl<'a> ColumnBlockIndex<'a> {
         if self.root_page_id == 0 || row_id >= self.end_row_id {
             return Ok(None);
         }
-        match self.read_view {
-            ColumnBlockReadView::ReadonlyPool(disk_pool) => {
-                let mut page_id = self.root_page_id;
-                loop {
-                    let g = disk_pool
-                        .try_get_page_shared::<ColumnBlockNode>(page_id)
-                        .await?;
-                    let node = g.page();
-                    if node.is_leaf() {
-                        let start_row_ids = node.leaf_start_row_ids();
-                        let idx = match search_start_row_id(start_row_ids, row_id) {
-                            Some(idx) => idx,
-                            None => return Ok(None),
-                        };
-                        return Ok(Some((start_row_ids[idx], node.leaf_payloads()[idx])));
-                    }
-                    let entries = node.branch_entries();
-                    let idx = match search_branch_entry(entries, row_id) {
-                        Some(idx) => idx,
-                        None => return Ok(None),
-                    };
-                    page_id = entries[idx].page_id;
-                }
+        let mut page_id = self.root_page_id;
+        loop {
+            let g = self
+                .disk_pool
+                .try_get_page_shared::<ColumnBlockNode>(page_id)
+                .await?;
+            let node = g.page();
+            if node.is_leaf() {
+                let start_row_ids = node.leaf_start_row_ids();
+                let idx = match search_start_row_id(start_row_ids, row_id) {
+                    Some(idx) => idx,
+                    None => return Ok(None),
+                };
+                return Ok(Some((start_row_ids[idx], node.leaf_payloads()[idx])));
             }
-            ColumnBlockReadView::PageReader(_) => {
-                let mut page_id = self.root_page_id;
-                loop {
-                    let node = self.read_node(page_id).await?;
-                    if node.is_leaf() {
-                        let start_row_ids = node.leaf_start_row_ids();
-                        let idx = match search_start_row_id(start_row_ids, row_id) {
-                            Some(idx) => idx,
-                            None => return Ok(None),
-                        };
-                        return Ok(Some((start_row_ids[idx], node.leaf_payloads()[idx])));
-                    }
-                    let entries = node.branch_entries();
-                    let idx = match search_branch_entry(entries, row_id) {
-                        Some(idx) => idx,
-                        None => return Ok(None),
-                    };
-                    page_id = entries[idx].page_id;
-                }
-            }
+            let entries = node.branch_entries();
+            let idx = match search_branch_entry(entries, row_id) {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+            page_id = entries[idx].page_id;
         }
     }
 
@@ -742,32 +668,9 @@ impl<'a> ColumnBlockIndex<'a> {
             Some(blob_ref) => blob_ref,
             None => return Ok(None),
         };
-        match self.read_view {
-            ColumnBlockReadView::ReadonlyPool(disk_pool) => {
-                let reader = ColumnDeletionBlobReader::new(disk_pool);
-                let bytes = reader.read(blob_ref).await?;
-                Ok(Some(bytes))
-            }
-            ColumnBlockReadView::PageReader(reader) => {
-                let mut out = Vec::with_capacity(blob_ref.byte_len as usize);
-                let mut remaining = blob_ref.byte_len as usize;
-                let mut page_id = blob_ref.start_page_id;
-                let mut offset = blob_ref.start_offset as usize;
-                while remaining > 0 {
-                    let page_buf = reader.read_page(page_id).await?;
-                    let page = page_buf.as_bytes();
-                    let chunk = read_blob_page_chunk(page, offset, remaining)?;
-                    out.extend_from_slice(chunk.bytes);
-                    remaining -= chunk.bytes.len();
-                    if remaining == 0 {
-                        break;
-                    }
-                    page_id = chunk.next_page_id;
-                    offset = 0;
-                }
-                Ok(Some(out))
-            }
-        }
+        let reader = ColumnDeletionBlobReader::new(self.disk_pool);
+        let bytes = reader.read(blob_ref).await?;
+        Ok(Some(bytes))
     }
 
     /// Applies sorted start-row-id bitmap patches with copy-on-write updates.

@@ -10,7 +10,12 @@ mod util;
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
-pub use readonly::{GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey};
+pub use readonly::{
+    GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey, ReadonlyPageSource,
+};
+
+/// Physical file identity used by the shared readonly cache.
+pub type ReadonlyFileID = u64;
 
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, PageID, VersionedPageID};

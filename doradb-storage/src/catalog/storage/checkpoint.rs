@@ -5,29 +5,23 @@ use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{Error, Result};
-use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
-    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MutableMultiTableFile,
+    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MutableMultiTableFile,
 };
 use crate::index::{
-    COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_MAX_BRANCH_ENTRIES, COLUMN_BLOCK_MAX_ENTRIES,
-    COLUMN_BRANCH_ENTRY_SIZE, COLUMN_PAGE_PAYLOAD_SIZE, ColumnBlockIndex, ColumnBlockNodeHeader,
-    ColumnBlockPageReader, ColumnPagePayload, ColumnPagePayloadPatch, OffloadedBitmapPatch,
+    COLUMN_BLOCK_MAX_BRANCH_ENTRIES, COLUMN_BLOCK_MAX_ENTRIES, ColumnBlockIndex, ColumnBlockNode,
+    ColumnPagePayload, ColumnPagePayloadPatch, OffloadedBitmapPatch,
 };
-use crate::io::{AIOBuf, DirectBuf};
+use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, LwcData, LwcPage};
-use crate::ptr::UnsafePtr;
 use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowID, RowPage};
 use crate::trx::redo::RowRedoKind;
 use crate::trx::sys::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::value::{Val, ValKind};
-use bytemuck::pod_read_unaligned;
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::mem;
 use std::num::NonZeroU64;
-use std::pin::Pin;
 
 struct PendingLwcPage {
     start_row_id: RowID,
@@ -56,35 +50,6 @@ struct PendingInsertRow {
     row_id: RowID,
     vals: Vec<Val>,
     deleted: bool,
-}
-
-struct CatalogMtbIndexPageReader<'a> {
-    mtb: &'a MultiTableFile,
-}
-
-impl<'a> CatalogMtbIndexPageReader<'a> {
-    #[inline]
-    fn new(mtb: &'a MultiTableFile) -> Self {
-        CatalogMtbIndexPageReader { mtb }
-    }
-}
-
-impl ColumnBlockPageReader for CatalogMtbIndexPageReader<'_> {
-    fn read_page<'a>(
-        &'a self,
-        page_id: PageID,
-    ) -> Pin<Box<dyn Future<Output = Result<DirectBuf>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-            // SAFETY: `DirectBuf` memory is sector-aligned and valid until async read completes.
-            unsafe {
-                self.mtb
-                    .read_page_into_ptr(page_id, UnsafePtr(buf.as_bytes_mut().as_mut_ptr()))
-                    .await?;
-            }
-            Ok(buf)
-        })
-    }
 }
 
 impl CatalogStorage {
@@ -185,9 +150,7 @@ impl CatalogStorage {
         } else {
             self.collect_index_entries(root_page_id).await?
         };
-        let reader = CatalogMtbIndexPageReader::new(&self.mtb);
-        let base_index =
-            ColumnBlockIndex::new_with_page_reader(root_page_id, root.pivot_row_id, &reader);
+        let base_index = ColumnBlockIndex::new(root_page_id, root.pivot_row_id, &self.disk_pool);
         let mut next_row_id = root.pivot_row_id;
 
         // Step 2: Preload existing visible rows only when delete-by-key appears.
@@ -287,10 +250,10 @@ impl CatalogStorage {
                     start_row_id: last_entry.start_row_id,
                     payload: updated_payload,
                 }];
-                let column_index = ColumnBlockIndex::new_with_page_reader(
+                let column_index = ColumnBlockIndex::new(
                     current_root_page_id,
                     current_end_row_id,
-                    &reader,
+                    &self.disk_pool,
                 );
                 current_root_page_id = column_index
                     .batch_replace_payloads(mutable, &patches, checkpoint_cts)
@@ -316,10 +279,10 @@ impl CatalogStorage {
             }
             if !new_entries.is_empty() {
                 let new_end_row_id = next_row_id.max(root.pivot_row_id);
-                let column_index = ColumnBlockIndex::new_with_page_reader(
+                let column_index = ColumnBlockIndex::new(
                     current_root_page_id,
                     current_end_row_id,
-                    &reader,
+                    &self.disk_pool,
                 );
                 current_root_page_id = column_index
                     .batch_insert(mutable, &new_entries, new_end_row_id, checkpoint_cts)
@@ -356,11 +319,8 @@ impl CatalogStorage {
                     bitmap_bytes: bytes,
                 })
                 .collect();
-            let column_index = ColumnBlockIndex::new_with_page_reader(
-                current_root_page_id,
-                current_end_row_id,
-                &reader,
-            );
+            let column_index =
+                ColumnBlockIndex::new(current_root_page_id, current_end_row_id, &self.disk_pool);
             current_root_page_id = column_index
                 .batch_update_offloaded_bitmaps(mutable, &patches, checkpoint_cts)
                 .await?;
@@ -385,54 +345,36 @@ impl CatalogStorage {
         let mut stack = vec![root_page_id];
         let mut entries = Vec::new();
         while let Some(page_id) = stack.pop() {
-            let page_buf = self.read_catalog_mtb_page(page_id).await?;
-            let page = page_buf.as_bytes();
-            let header = parse_column_block_header(page)?;
-            let count = header.count as usize;
-            if header.height == 0 {
+            let page_guard = self
+                .disk_pool
+                .try_get_page_shared::<ColumnBlockNode>(page_id)
+                .await?;
+            let node = page_guard.page();
+            let count = node.header.count as usize;
+            if node.is_leaf() {
                 if count > COLUMN_BLOCK_MAX_ENTRIES {
                     return Err(Error::InvalidFormat);
                 }
-                let row_ids_start = COLUMN_BLOCK_HEADER_SIZE;
-                let row_ids_end = row_ids_start + count * mem::size_of::<RowID>();
-                let payloads_end = row_ids_end + count * COLUMN_PAGE_PAYLOAD_SIZE;
-                if payloads_end > COW_FILE_PAGE_SIZE {
-                    return Err(Error::InvalidFormat);
-                }
-                let mut row_idx = row_ids_start;
-                let mut payload_idx = row_ids_end;
-                for _ in 0..count {
-                    let start_row_id = read_u64(page, row_idx)?;
-                    let payload_bytes = page
-                        .get(payload_idx..payload_idx + COLUMN_PAGE_PAYLOAD_SIZE)
-                        .ok_or(Error::InvalidFormat)?;
-                    let payload = pod_read_unaligned::<ColumnPagePayload>(payload_bytes);
+                for (&start_row_id, &payload) in node
+                    .leaf_start_row_ids()
+                    .iter()
+                    .zip(node.leaf_payloads().iter())
+                {
                     entries.push(CatalogIndexEntry {
                         start_row_id,
                         payload,
                     });
-                    row_idx += mem::size_of::<u64>();
-                    payload_idx += COLUMN_PAGE_PAYLOAD_SIZE;
                 }
             } else {
                 if count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
                     return Err(Error::InvalidFormat);
                 }
-                let entries_start = COLUMN_BLOCK_HEADER_SIZE;
-                let entries_end = entries_start + count * COLUMN_BRANCH_ENTRY_SIZE;
-                if entries_end > COW_FILE_PAGE_SIZE {
-                    return Err(Error::InvalidFormat);
-                }
                 let mut children = Vec::with_capacity(count);
-                let mut idx = entries_start;
-                for _ in 0..count {
-                    let _start_row_id = read_u64(page, idx)?;
-                    let child_page_id = read_u64(page, idx + mem::size_of::<u64>())?;
-                    if child_page_id == 0 {
+                for entry in node.branch_entries() {
+                    if entry.page_id == 0 {
                         return Err(Error::InvalidFormat);
                     }
-                    children.push(child_page_id);
-                    idx += COLUMN_BRANCH_ENTRY_SIZE;
+                    children.push(entry.page_id);
                 }
                 for child_page_id in children.into_iter().rev() {
                     stack.push(child_page_id);
@@ -483,8 +425,11 @@ impl CatalogStorage {
         page_id: u64,
         metadata: &TableMetadata,
     ) -> Result<Vec<RowRecord>> {
-        let page_buf = self.read_catalog_mtb_page(page_id).await?;
-        let lwc_page = LwcPage::try_from_bytes(page_buf.as_bytes())?;
+        let page_guard = self
+            .disk_pool
+            .try_get_page_shared::<LwcPage>(page_id)
+            .await?;
+        let lwc_page = page_guard.page();
         let row_count = lwc_page.header.row_count() as usize;
         let row_ids = decode_lwc_row_ids(lwc_page)?;
         if row_ids.len() != row_count {
@@ -626,17 +571,6 @@ impl CatalogStorage {
         res.extend(list.iter());
         Ok(res)
     }
-
-    async fn read_catalog_mtb_page(&self, page_id: u64) -> Result<DirectBuf> {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        // SAFETY: `DirectBuf` memory is sector-aligned and valid until async read completes.
-        unsafe {
-            self.mtb
-                .read_page_into_ptr(page_id, UnsafePtr(buf.as_bytes_mut().as_mut_ptr()))
-                .await?;
-        }
-        Ok(buf)
-    }
 }
 
 fn append_single_row_to_builder(
@@ -675,24 +609,6 @@ fn decode_lwc_row_ids(page: &LwcPage) -> Result<Vec<RowID>> {
         row_ids.push(row_id);
     }
     Ok(row_ids)
-}
-
-fn parse_column_block_header(page: &[u8]) -> Result<ColumnBlockNodeHeader> {
-    if page.len() != COW_FILE_PAGE_SIZE {
-        return Err(Error::InvalidFormat);
-    }
-    let header_slice = page
-        .get(..COLUMN_BLOCK_HEADER_SIZE)
-        .ok_or(Error::InvalidFormat)?;
-    let header = pod_read_unaligned::<ColumnBlockNodeHeader>(header_slice);
-    Ok(header)
-}
-
-fn read_u64(input: &[u8], idx: usize) -> Result<u64> {
-    let end = idx + mem::size_of::<u64>();
-    let bytes = input.get(idx..end).ok_or(Error::InvalidFormat)?;
-    let arr: [u8; 8] = bytes.try_into()?;
-    Ok(u64::from_le_bytes(arr))
 }
 
 fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bool {
@@ -734,10 +650,65 @@ fn decode_deltas_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::buffer::ReadonlyCacheKey;
+    use crate::catalog::storage::CATALOG_MTB_READONLY_FILE_ID;
     use crate::catalog::tests::{table1, table2};
     use crate::engine::EngineConfig;
     use crate::trx::sys_conf::TrxSysConfig;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_catalog_checkpoint_collect_index_entries_uses_readonly_cache() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-checkpoint-readonly-cache")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+
+            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let tables_root = snap.meta.table_roots[0];
+            let root_page_id = tables_root.root_page_id.unwrap().get();
+
+            assert_eq!(engine.disk_pool.allocated(), 0);
+
+            let entries1 = engine
+                .catalog()
+                .storage
+                .collect_index_entries(root_page_id)
+                .await
+                .unwrap();
+            assert!(!entries1.is_empty());
+
+            let cached_after_first = engine.disk_pool.allocated();
+            assert!(cached_after_first >= 1);
+            let root_key = ReadonlyCacheKey::new(CATALOG_MTB_READONLY_FILE_ID, root_page_id);
+            assert!(engine.disk_pool.try_get_frame_id(&root_key).is_some());
+
+            let entries2 = engine
+                .catalog()
+                .storage
+                .collect_index_entries(root_page_id)
+                .await
+                .unwrap();
+            assert_eq!(entries2.len(), entries1.len());
+            assert_eq!(engine.disk_pool.allocated(), cached_after_first);
+        });
+    }
 
     #[test]
     fn test_catalog_checkpoint_tail_merge_rewrites_last_payload_without_new_entry() {
