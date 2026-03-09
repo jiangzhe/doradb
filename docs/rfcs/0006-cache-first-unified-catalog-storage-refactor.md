@@ -11,7 +11,7 @@ created: 2026-03-03
 
 ## Summary
 
-This RFC proposes a cache-first catalog runtime with unified on-disk persistence in a single `catalog.mtb` file. It refactors catalog logical schemas away from global `column_id`/`index_id`, introduces explicit catalog-vs-user object-id boundaries, and adopts a replay-based catalog checkpoint: checkpointed catalog state is produced by replaying catalog redo logs up to a global recovery watermark `W`. Recovery then replays only logs with `cts > W`. Physical log truncation is intentionally deferred; only logical replay cutoff is required in this RFC. The expected outcomes are simpler catalog persistence topology, lower catalog file overhead, and a stronger correctness model for table lifecycle and future schema-evolution DDL.
+This RFC proposes a cache-first catalog runtime with unified on-disk persistence in a single `catalog.mtb` file. It refactors catalog logical schemas away from global `column_id`/`index_id`, introduces explicit catalog-vs-user object-id boundaries, and adopts a replay-based catalog checkpoint: checkpointed catalog state is produced by replaying catalog redo logs from a persisted `catalog_replay_start_ts` through a durable upper bound. Recovery then replays only logs with `cts >= W`, with finer per-component replay-start filters applied afterward. Physical log truncation is intentionally deferred; only logical replay cutoff is required in this RFC. The expected outcomes are simpler catalog persistence topology, lower catalog file overhead, and a stronger correctness model for table lifecycle and future schema-evolution DDL.
 
 ## Context
 
@@ -107,10 +107,10 @@ Adopt a cache-first unified catalog storage design with one persistent catalog f
 ### 6. Catalog checkpoint model and control
 
 1. Introduce a catalog checkpoint worker that builds checkpointed catalog state from redo-log replay, not from ad-hoc scan of current catalog tables:
-   1. compute global watermark `W`;
-   2. scan redo logs in `(last_catalog_checkpoint_cts, W]`;
+   1. compute durable upper bound `W`;
+   2. scan redo logs in `[catalog_replay_start_ts, W]`;
    3. replay only catalog mutations from that range into a checkpoint image;
-   4. publish one new catalog overlay root atomically in `catalog.mtb` ([D4], [D5], [C8], [U5]).
+   4. publish one new catalog overlay root atomically in `catalog.mtb`, advancing `catalog_replay_start_ts` to `safe_cts + 1` ([D4], [D5], [C8], [U5]).
 2. Checkpoint trigger model includes:
    1. configurable periodic interval with a default value;
    2. dirty-event wakeup;
@@ -119,16 +119,18 @@ Adopt a cache-first unified catalog storage design with one persistent catalog f
 
 ### 7. Recovery integration
 
-1. Persist `catalog_checkpoint_cts` in catalog overlay root and load it during startup ([D4], [C8], [U1]).
+1. Persist `catalog_replay_start_ts` in catalog overlay root and load it during startup ([D4], [C8], [U1]).
 2. Recovery replay start is bounded by watermark `W`:
-   1. load catalog snapshot at `catalog_checkpoint_cts`;
-   2. replay only logs with `cts > W`;
-   3. rely on redo ordering so catalog DDL and user-data logs after `W` remain consistent ([D2], [D4], [C8], [U5]).
-3. Recovery must fail fast on post-cutoff inconsistencies (for example, user DML at `cts > W` referencing unknown table id) rather than silently skipping ([C8], [U2]).
+   1. load catalog snapshot at `catalog_replay_start_ts`;
+   2. compute `W = min(catalog_replay_start_ts, all loaded table.heap_redo_start_ts)`;
+   3. replay only logs with `cts >= W`;
+   4. apply finer per-component filters so catalog changes require `cts >= catalog_replay_start_ts` and user-table heap recovery requires `cts >= table.heap_redo_start_ts`;
+   5. rely on redo ordering so catalog DDL and user-data logs after `W` remain consistent ([D2], [D4], [C8], [U5]).
+3. Recovery must fail fast on post-cutoff inconsistencies (for example, user DML at `cts >= W` referencing unknown table id) rather than silently skipping ([C8], [U2]).
 
 ### 8. Watermark semantics and truncation staging
 
-1. In this RFC stage, `W` is derived conservatively from currently persisted user-table recovery watermarks; at minimum this includes `heap_redo_start_ts` from all user tables ([C9], [C7], [U2]).
+1. In this RFC stage, `W` is derived conservatively from currently persisted replay-start watermarks; at minimum this includes `catalog_replay_start_ts` plus `heap_redo_start_ts` from all user tables ([C9], [C7], [U2]).
 2. As additional per-table persisted recovery watermarks become available (for example deletion/index), `W` is extended to the minimum across all required components without changing replay contract ([D4], [U5]).
 3. Physical log truncation is deferred:
    1. this RFC requires logical replay cutoff using `W`;
@@ -218,7 +220,7 @@ Reference:
   - Implementation Summary: 1. Removed user-table evictable-pool ownership from `CatalogStorage`: [Task Resolve Sync: docs/tasks/000052-catalog-fixed-buffer-pool-specialization.md @ 2026-03-08]
 
 - **Phase 6: Unified Catalog Overlay and Checkpoint Worker**
-  - Scope: implement catalog overlay root format over `catalog.mtb`, periodic + dirty-event scheduling, `Catalog::checkpoint_now()`, and replay-based catalog checkpoint build for redo prefix `(last_catalog_checkpoint_cts, W]`.
+  - Scope: implement catalog overlay root format over `catalog.mtb`, periodic + dirty-event scheduling, `Catalog::checkpoint_now()`, and replay-based catalog checkpoint build for redo prefix `[catalog_replay_start_ts, W]`.
   - Goals: atomic multi-table catalog checkpoint publish with cache-first runtime preserved and watermark-aligned replay correctness.
   - Non-goals: no user-table checkpoint algorithm changes.
   - Task Doc: `docs/tasks/000053-catalog-checkpoint-now-with-multi-table-roots.md`
@@ -245,13 +247,13 @@ Reference:
   - Implementation Summary: 1. Extracted payload-layout ownership into [Task Resolve Sync: docs/tasks/000055-shared-checkpoint-primitives-and-duplication-cleanup.md @ 2026-03-09]
 
 - **Phase 9: Recovery Cutoff and Consistency Checks**
-  - Scope: persist/load `catalog_checkpoint_cts`, compute/load watermark `W`, replay only logs with `cts > W`, and add fail-fast checks for post-cutoff catalog/data inconsistencies.
+  - Scope: persist/load `catalog_replay_start_ts`, compute/load watermark `W`, replay only logs with `cts >= W` plus per-component replay-start filters, and add fail-fast checks for post-cutoff catalog/data inconsistencies.
   - Goals: deterministic startup replay boundary with strong consistency guarantees.
   - Non-goals: no physical log truncation implementation.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000056-recovery-cutoff-and-consistency-checks.md`
+  - Task Issue: `#400`
+  - Phase Status: done
+  - Implementation Summary: 1. Aligned catalog checkpoint persistence and recovery around replay-start [Task Resolve Sync: docs/tasks/000056-recovery-cutoff-and-consistency-checks.md @ 2026-03-09]
 
 - **Phase 10: Validation and Documentation Sync**
   - Scope: tests for id ranges, file naming, schema behavior, checkpoint atomicity, replay cutoff correctness, and lifecycle ordering (`create/insert/drop`, DDL around cutoff); doc updates.

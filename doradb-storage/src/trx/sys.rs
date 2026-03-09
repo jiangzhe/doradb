@@ -114,7 +114,7 @@ pub enum CatalogCheckpointScanStopReason {
 
 /// Catalog checkpoint scan result consumed by apply phase.
 pub struct CatalogCheckpointBatch {
-    pub from_exclusive: TrxID,
+    pub replay_start_ts: TrxID,
     pub durable_upper_cts: TrxID,
     pub safe_cts: TrxID,
     pub catalog_ops: Vec<CatalogRedoEntry>,
@@ -358,17 +358,17 @@ impl TransactionSystem {
     /// `self.persisted_watermark_cts()`. This scan assumes the supplied upper
     /// bound is already clamped to the slowest partition's persisted watermark.
     ///
-    /// The scan range is `(from_exclusive, durable_upper_cts]`.
-    /// It stops early when reaching a blocking table DDL whose table checkpoint ts
-    /// is behind DDL cts.
+    /// The scan range is `[replay_start_ts, durable_upper_cts]`.
+    /// It stops early when reaching a blocking table DDL whose table replay-start
+    /// timestamp has not advanced past that DDL CTS yet.
     ///
     /// For each scanned log that is accepted into the batch, `safe_cts` advances to
     /// that log's cts even if it does not contain catalog row-redo changes.
     pub(crate) fn scan_catalog_checkpoint_batch<F>(
         &self,
-        from_exclusive: TrxID,
+        replay_start_ts: TrxID,
         durable_upper_cts: TrxID,
-        mut table_checkpoint_ts_lookup: F,
+        mut table_replay_start_ts_lookup: F,
     ) -> Result<CatalogCheckpointBatch>
     where
         F: FnMut(TableID) -> Option<TrxID>,
@@ -378,14 +378,14 @@ impl TransactionSystem {
             "catalog checkpoint scan upper bound must not exceed persisted watermark"
         );
         let mut batch = CatalogCheckpointBatch {
-            from_exclusive,
+            replay_start_ts,
             durable_upper_cts,
-            safe_cts: from_exclusive,
+            safe_cts: replay_start_ts.saturating_sub(1),
             catalog_ops: vec![],
             catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
-        if durable_upper_cts <= from_exclusive {
+        if durable_upper_cts < replay_start_ts {
             return Ok(batch);
         }
 
@@ -412,7 +412,7 @@ impl TransactionSystem {
 
         while let Some(log) = log_merger.try_next()? {
             let (header, redo) = log.into_inner();
-            if header.cts <= from_exclusive {
+            if header.cts < replay_start_ts {
                 continue;
             }
             if header.cts > durable_upper_cts {
@@ -423,14 +423,14 @@ impl TransactionSystem {
                 && let Some((table_id, ddl_kind)) = blocking_table_ddl(ddl)
                 && is_user_obj_id(table_id)
             {
-                let Some(table_checkpoint_ts) = table_checkpoint_ts_lookup(table_id) else {
+                let Some(table_replay_start_ts) = table_replay_start_ts_lookup(table_id) else {
                     batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
                         table_id,
                         ddl: ddl_kind,
                     };
                     break;
                 };
-                if table_checkpoint_ts < header.cts {
+                if table_replay_start_ts <= header.cts {
                     batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
                         table_id,
                         ddl: ddl_kind,

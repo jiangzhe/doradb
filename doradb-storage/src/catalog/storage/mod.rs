@@ -67,13 +67,15 @@ impl CatalogStorage {
             let table = CatalogTable::new(meta_pool, index_pool, blk_idx, metadata).await;
             cat.push(table);
         }
-        Ok(CatalogStorage {
+        let storage = CatalogStorage {
             meta_pool,
             tables: cat.into_boxed_slice(),
             next_user_obj_id: mtb_snapshot.meta.next_user_obj_id,
             mtb,
             disk_pool,
-        })
+        };
+        storage.bootstrap_from_checkpoint(&mtb_snapshot).await?;
+        Ok(storage)
     }
 
     /// Accessor of `catalog.tables`.
@@ -141,11 +143,15 @@ impl CatalogStorage {
     #[inline]
     pub async fn publish_checkpoint(
         &self,
-        checkpoint_cts: TrxID,
+        catalog_replay_start_ts: TrxID,
         next_user_obj_id: ObjID,
     ) -> Result<()> {
         self.mtb
-            .publish_checkpoint(checkpoint_cts, next_user_obj_id, self.catalog_table_roots())
+            .publish_checkpoint(
+                catalog_replay_start_ts,
+                next_user_obj_id,
+                self.catalog_table_roots(),
+            )
             .await
     }
 

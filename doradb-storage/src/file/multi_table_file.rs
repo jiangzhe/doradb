@@ -16,7 +16,7 @@ use crate::file::{FileIO, FixedSizeBufferFreeList};
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
-use crate::trx::TrxID;
+use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::path::Path;
@@ -83,7 +83,7 @@ impl MultiTableActiveRoot {
 
         MultiTableActiveRoot::from_parts(
             0,
-            0,
+            MIN_SNAPSHOT_TS,
             0,
             alloc_map,
             vec![],
@@ -110,8 +110,8 @@ impl Default for MultiTableActiveRoot {
 /// or reading checkpoint metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultiTableFileSnapshot {
-    /// Checkpoint CTS attached to active super page.
-    pub checkpoint_cts: TrxID,
+    /// Inclusive lower replay bound for catalog redo persisted in `catalog.mtb`.
+    pub catalog_replay_start_ts: TrxID,
     /// Active meta-page payload.
     pub meta: MultiTableMetaPage,
 }
@@ -233,7 +233,7 @@ impl MultiTableFile {
     pub fn load_snapshot(&self) -> Result<MultiTableFileSnapshot> {
         let active_root = self.active_root();
         Ok(MultiTableFileSnapshot {
-            checkpoint_cts: active_root.trx_id,
+            catalog_replay_start_ts: active_root.trx_id,
             meta: active_root.meta.clone(),
         })
     }
@@ -242,12 +242,16 @@ impl MultiTableFile {
     #[inline]
     pub async fn publish_checkpoint(
         self: &Arc<Self>,
-        checkpoint_cts: TrxID,
+        catalog_replay_start_ts: TrxID,
         next_user_obj_id: ObjID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) -> Result<()> {
         let mut mutable = MutableMultiTableFile::fork(self);
-        mutable.apply_checkpoint_metadata(checkpoint_cts, next_user_obj_id, table_roots)?;
+        mutable.apply_checkpoint_metadata(
+            catalog_replay_start_ts,
+            next_user_obj_id,
+            table_roots,
+        )?;
         let (_, old_root) = mutable.commit().await?;
         drop(old_root);
         Ok(())
@@ -367,12 +371,12 @@ impl MutableMultiTableFile {
     #[inline]
     pub fn apply_checkpoint_metadata(
         &mut self,
-        checkpoint_cts: TrxID,
+        catalog_replay_start_ts: TrxID,
         next_user_obj_id: ObjID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) -> Result<()> {
         let root = self.new_root_mut();
-        if checkpoint_cts < root.trx_id {
+        if catalog_replay_start_ts < root.trx_id {
             return Err(Error::InvalidArgument);
         }
         if next_user_obj_id < USER_OBJ_ID_START {
@@ -384,7 +388,7 @@ impl MutableMultiTableFile {
             }
         }
 
-        root.trx_id = checkpoint_cts;
+        root.trx_id = catalog_replay_start_ts;
         root.next_user_obj_id = next_user_obj_id;
         root.table_roots = table_roots;
         Ok(())
@@ -487,7 +491,7 @@ mod tests {
 
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
             let s0 = mtb.load_snapshot().unwrap();
-            assert_eq!(s0.checkpoint_cts, 0);
+            assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(s0.meta.next_user_obj_id, USER_OBJ_ID_START);
             let meta_page_id_0 = mtb.active_root().meta_page_id;
             assert!(meta_page_id_0 > 0);
@@ -507,7 +511,7 @@ mod tests {
 
             let mtb2 = fs.open_or_create_multi_table_file().await.unwrap();
             let s1 = mtb2.load_snapshot().unwrap();
-            assert_eq!(s1.checkpoint_cts, 7);
+            assert_eq!(s1.catalog_replay_start_ts, 7);
             assert_eq!(s1.meta.next_user_obj_id, USER_OBJ_ID_START + 16);
             assert_eq!(s1.meta.table_roots, roots);
 

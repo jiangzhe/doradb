@@ -6,17 +6,18 @@ use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{Error, Result};
 use crate::file::multi_table_file::{
-    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MutableMultiTableFile,
+    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
+    MutableMultiTableFile,
 };
 use crate::index::{
-    COLUMN_BLOCK_MAX_BRANCH_ENTRIES, COLUMN_BLOCK_MAX_ENTRIES, ColumnBlockIndex, ColumnBlockNode,
-    ColumnPagePayload, ColumnPagePayloadPatch, OffloadedBitmapPatch,
+    ColumnBlockIndex, ColumnPagePayload, ColumnPagePayloadPatch, OffloadedBitmapPatch,
     encode_deletion_deltas_to_bytes, load_payload_deletion_deltas,
 };
 use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, LwcData, LwcPage};
 use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowID, RowPage};
+use crate::table::TableAccess;
 use crate::trx::redo::RowRedoKind;
 use crate::trx::sys::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::value::{Val, ValKind};
@@ -54,33 +55,61 @@ struct PendingInsertRow {
 }
 
 impl CatalogStorage {
+    pub(super) async fn bootstrap_from_checkpoint(
+        &self,
+        snapshot: &MultiTableFileSnapshot,
+    ) -> Result<()> {
+        for (idx, root) in snapshot.meta.table_roots.iter().copied().enumerate() {
+            if idx >= self.tables.len() {
+                break;
+            }
+            if root.root_page_id.is_none() {
+                if root.pivot_row_id != 0 {
+                    return Err(Error::InvalidState);
+                }
+                continue;
+            }
+            if root.table_id as usize != idx {
+                return Err(Error::InvalidState);
+            }
+            let rows = self
+                .load_visible_rows_from_root(self.tables[idx].metadata(), root)
+                .await?;
+            for row in rows {
+                self.tables[idx].accessor().insert_no_trx(&row.vals).await;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn apply_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
         next_user_obj_id: ObjID,
     ) -> Result<()> {
         let CatalogCheckpointBatch {
-            from_exclusive,
+            replay_start_ts,
             safe_cts,
             catalog_ops,
             ..
         } = batch;
         let snapshot = self.mtb.load_snapshot()?;
-        let last_catalog_checkpoint_cts = snapshot.checkpoint_cts;
-        if last_catalog_checkpoint_cts != from_exclusive {
-            if last_catalog_checkpoint_cts >= safe_cts {
+        let current_catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
+        let next_catalog_replay_start_ts = safe_cts.saturating_add(1).max(replay_start_ts);
+        if current_catalog_replay_start_ts != replay_start_ts {
+            if current_catalog_replay_start_ts >= next_catalog_replay_start_ts {
                 return Ok(());
             }
             return Err(Error::InvalidState);
         }
-        if safe_cts <= last_catalog_checkpoint_cts {
+        if safe_cts < replay_start_ts {
             return Ok(());
         }
 
         if catalog_ops.is_empty() {
             let mut mutable = MutableMultiTableFile::fork(&self.mtb);
             mutable.apply_checkpoint_metadata(
-                safe_cts,
+                next_catalog_replay_start_ts,
                 next_user_obj_id.max(USER_OBJ_ID_START),
                 snapshot.meta.table_roots,
             )?;
@@ -123,7 +152,7 @@ impl CatalogStorage {
         }
 
         mutable.apply_checkpoint_metadata(
-            safe_cts,
+            next_catalog_replay_start_ts,
             next_user_obj_id.max(USER_OBJ_ID_START),
             new_roots,
         )?;
@@ -341,46 +370,53 @@ impl CatalogStorage {
 
     async fn collect_index_entries(&self, root_page_id: PageID) -> Result<Vec<CatalogIndexEntry>> {
         assert_ne!(root_page_id, 0, "root_page_id must be non-zero");
-        let mut stack = vec![root_page_id];
-        let mut entries = Vec::new();
-        while let Some(page_id) = stack.pop() {
-            let page_guard = self
-                .disk_pool
-                .try_get_page_shared::<ColumnBlockNode>(page_id)
+        let index = ColumnBlockIndex::new(root_page_id, RowID::MAX, &self.disk_pool);
+        Ok(index
+            .collect_leaf_entries()
+            .await?
+            .into_iter()
+            .map(|(start_row_id, payload)| CatalogIndexEntry {
+                start_row_id,
+                payload,
+            })
+            .collect())
+    }
+
+    async fn load_visible_rows_from_root(
+        &self,
+        metadata: &TableMetadata,
+        root: CatalogTableRootDesc,
+    ) -> Result<Vec<RowRecord>> {
+        if root.root_page_id.is_none() {
+            if root.pivot_row_id != 0 {
+                return Err(Error::InvalidState);
+            }
+            return Ok(Vec::new());
+        }
+        let root_page_id = root.root_page_id.map(NonZeroU64::get).unwrap_or(0);
+        let entries = self.collect_index_entries(root_page_id).await?;
+        let column_index = ColumnBlockIndex::new(root_page_id, root.pivot_row_id, &self.disk_pool);
+        let mut rows = Vec::new();
+        for entry in entries {
+            let deleted = load_payload_deletion_deltas(&column_index, entry.payload).await?;
+            let page_rows = self
+                .decode_lwc_page_rows(entry.payload.block_id, metadata)
                 .await?;
-            let node = page_guard.page();
-            let count = node.header.count as usize;
-            if node.is_leaf() {
-                if count > COLUMN_BLOCK_MAX_ENTRIES {
-                    return Err(Error::InvalidFormat);
+            for row in page_rows {
+                let delta = row
+                    .row_id
+                    .checked_sub(entry.start_row_id)
+                    .ok_or(Error::InvalidState)?;
+                if delta > u32::MAX as u64 {
+                    return Err(Error::InvalidState);
                 }
-                for (&start_row_id, &payload) in node
-                    .leaf_start_row_ids()
-                    .iter()
-                    .zip(node.leaf_payloads().iter())
-                {
-                    entries.push(CatalogIndexEntry {
-                        start_row_id,
-                        payload,
-                    });
+                if deleted.contains(&(delta as u32)) {
+                    continue;
                 }
-            } else {
-                if count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
-                    return Err(Error::InvalidFormat);
-                }
-                let mut children = Vec::with_capacity(count);
-                for entry in node.branch_entries() {
-                    if entry.page_id == 0 {
-                        return Err(Error::InvalidFormat);
-                    }
-                    children.push(entry.page_id);
-                }
-                for child_page_id in children.into_iter().rev() {
-                    stack.push(child_page_id);
-                }
+                rows.push(row);
             }
         }
-        Ok(entries)
+        Ok(rows)
     }
 
     async fn load_visible_rows_for_delete_lookup(

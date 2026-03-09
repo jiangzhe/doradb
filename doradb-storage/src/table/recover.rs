@@ -1,7 +1,12 @@
 use crate::buffer::BufferPool;
-use crate::buffer::page::PageID;
-use crate::index::{IndexInsert, NonUniqueIndex, UniqueIndex};
+use crate::buffer::guard::PageGuard;
+use crate::buffer::page::{Page, PageID};
+use crate::error::{Error, Result};
+use crate::index::{
+    ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_payload_deletion_deltas,
+};
 use crate::latch::LatchFallbackMode;
+use crate::lwc::{LwcData, LwcPage};
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::table::{
@@ -10,9 +15,10 @@ use crate::table::{
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::TrxID;
 use crate::trx::row::ReadAllRows;
-use crate::value::Val;
+use crate::value::{Val, ValKind};
 use std::collections::HashMap;
 use std::future::Future;
+use std::mem;
 
 pub trait TableRecover {
     /// Recover row insert from redo log.
@@ -45,7 +51,10 @@ pub trait TableRecover {
     ) -> impl Future<Output = ()>;
 
     /// Populate index using data on row page.
-    fn populate_index_via_row_page(&self, page_id: PageID) -> impl Future<Output = ()>;
+    fn populate_index_via_row_page(&self, page_id: PageID) -> impl Future<Output = Result<()>>;
+
+    /// Populate indexes using persisted LWC pages below the current pivot boundary.
+    fn populate_index_via_persisted_data(&self) -> impl Future<Output = Result<()>>;
 }
 
 impl TableRecover for Table {
@@ -198,7 +207,7 @@ impl TableRecover for Table {
         }
     }
 
-    async fn populate_index_via_row_page(&self, page_id: PageID) {
+    async fn populate_index_via_row_page(&self, page_id: PageID) -> Result<()> {
         let page_guard = self
             .mem_pool
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
@@ -223,19 +232,154 @@ impl TableRecover for Table {
                             let res = index
                                 .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
-                            debug_assert!(matches!(res, IndexInsert::Ok(_)));
+                            ensure_recovery_index_insert(sec_idx.index_no, res)?;
                         } else {
                             let index = sec_idx.non_unique().unwrap();
                             let res = index
                                 .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
-                            debug_assert!(matches!(res, IndexInsert::Ok(_)));
+                            ensure_recovery_index_insert(sec_idx.index_no, res)?;
                         }
                     }
                     ReadRow::NotFound => (),
                     ReadRow::InvalidIndex => unreachable!(),
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn populate_index_via_persisted_data(&self) -> Result<()> {
+        if self.sec_idx.is_empty() {
+            return Ok(());
+        }
+        let active_root = self.file.active_root();
+        if active_root.column_block_index_root == 0 || active_root.pivot_row_id == 0 {
+            return Ok(());
+        }
+
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            &self.disk_pool,
+        );
+        for (start_row_id, payload) in index.collect_leaf_entries().await? {
+            let deleted = load_payload_deletion_deltas(&index, payload).await?;
+            let page_guard = self
+                .disk_pool
+                .try_get_page_shared::<Page>(payload.block_id)
+                .await?;
+            let page = LwcPage::try_from_bytes(page_guard.page())?;
+            let row_ids = decode_lwc_row_ids(page)?;
+            if row_ids.len() != page.header.row_count() as usize {
+                return Err(Error::InvalidCompressedData);
+            }
+
+            for (row_idx, row_id) in row_ids.into_iter().enumerate() {
+                let delta = row_id
+                    .checked_sub(start_row_id)
+                    .ok_or(Error::InvalidState)?;
+                if delta > u32::MAX as u64 {
+                    return Err(Error::InvalidState);
+                }
+                if deleted.contains(&(delta as u32)) {
+                    continue;
+                }
+
+                let mut vals = Vec::with_capacity(self.metadata().col_count());
+                for col_idx in 0..self.metadata().col_count() {
+                    let column = page.column(self.metadata(), col_idx)?;
+                    if column.is_null(row_idx) {
+                        vals.push(Val::Null);
+                        continue;
+                    }
+                    let data = column.data()?;
+                    let val = data.value(row_idx).ok_or(Error::InvalidCompressedData)?;
+                    vals.push(val);
+                }
+
+                for key in self.metadata().keys_for_insert(&vals) {
+                    if self.metadata().index_specs[key.index_no].unique() {
+                        let res = self.sec_idx[key.index_no]
+                            .unique()
+                            .unwrap()
+                            .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                            .await;
+                        ensure_recovery_index_insert(key.index_no, res)?;
+                    } else {
+                        let res = self.sec_idx[key.index_no]
+                            .non_unique()
+                            .unwrap()
+                            .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                            .await;
+                        ensure_recovery_index_insert(key.index_no, res)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
+    match res {
+        IndexInsert::Ok(_) => Ok(()),
+        IndexInsert::DuplicateKey(row_id, deleted) => Err(Error::UnexpectedRecoveryDuplicateKey {
+            index_no,
+            row_id,
+            deleted,
+        }),
+    }
+}
+
+fn decode_lwc_row_ids(page: &LwcPage) -> Result<Vec<RowID>> {
+    let row_count = page.header.row_count() as usize;
+    let col_count = page.header.col_count() as usize;
+    let start_idx = col_count * mem::size_of::<u16>();
+    let end_idx = page.header.first_col_offset() as usize;
+    if end_idx > page.body.len() || start_idx > end_idx {
+        return Err(Error::InvalidCompressedData);
+    }
+    let row_id_data = LwcData::from_bytes(ValKind::U64, &page.body[start_idx..end_idx])?;
+    let mut row_ids = Vec::with_capacity(row_count);
+    for row_idx in 0..row_count {
+        let row_id = row_id_data
+            .value(row_idx)
+            .and_then(|v| v.as_u64())
+            .ok_or(Error::InvalidCompressedData)?;
+        row_ids.push(row_id);
+    }
+    Ok(row_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_recovery_index_insert;
+    use crate::error::Error;
+    use crate::index::IndexInsert;
+
+    #[test]
+    fn test_ensure_recovery_index_insert_accepts_ok_variants() {
+        assert!(ensure_recovery_index_insert(1, IndexInsert::Ok(false)).is_ok());
+        assert!(ensure_recovery_index_insert(1, IndexInsert::Ok(true)).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_recovery_index_insert_rejects_duplicate_key() {
+        let err =
+            ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(42, false)).unwrap_err();
+        match err {
+            Error::UnexpectedRecoveryDuplicateKey {
+                index_no,
+                row_id,
+                deleted,
+            } => {
+                assert_eq!(index_no, 3);
+                assert_eq!(row_id, 42);
+                assert!(!deleted);
+            }
+            _ => panic!("unexpected error: {err:?}"),
         }
     }
 }
