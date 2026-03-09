@@ -240,7 +240,7 @@ Reference:
   - Goals: establish one reusable checkpoint primitive layer, centralize payload/deletion-format invariants, and reduce maintenance cost without changing checkpoint behavior.
   - Non-goals: no recovery-cutoff policy changes; no catalog runtime in-memory access model changes; no user-visible API changes.
   - Task Doc: `docs/tasks/000055-shared-checkpoint-primitives-and-duplication-cleanup.md`
-  - Task Issue: `#0`
+  - Task Issue: `#398`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 

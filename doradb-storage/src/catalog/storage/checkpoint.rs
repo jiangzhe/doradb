@@ -11,6 +11,7 @@ use crate::file::multi_table_file::{
 use crate::index::{
     COLUMN_BLOCK_MAX_BRANCH_ENTRIES, COLUMN_BLOCK_MAX_ENTRIES, ColumnBlockIndex, ColumnBlockNode,
     ColumnPagePayload, ColumnPagePayloadPatch, OffloadedBitmapPatch,
+    encode_deletion_deltas_to_bytes, load_payload_deletion_deltas,
 };
 use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, LwcData, LwcPage};
@@ -299,15 +300,13 @@ impl CatalogStorage {
                 .binary_search_by_key(start_row_id, |entry| entry.start_row_id)
                 .map_err(|_| Error::InvalidState)?;
             let entry = entries[idx];
-            let mut base = self
-                .load_payload_deletion_deltas(&base_index, entry.payload)
-                .await?;
+            let mut base = load_payload_deletion_deltas(&base_index, entry.payload).await?;
             let old_len = base.len();
             base.extend(pending);
             if base.len() == old_len {
                 continue;
             }
-            patch_storage.push((*start_row_id, encode_deltas_to_bytes(&base)));
+            patch_storage.push((*start_row_id, encode_deletion_deltas_to_bytes(&base)));
         }
 
         // Step 8: Apply deletion patches with CoW payload updates on the current root.
@@ -392,9 +391,7 @@ impl CatalogStorage {
     ) -> Result<Vec<ExistingVisibleRow>> {
         let mut rows = Vec::new();
         for entry in entries {
-            let deleted = self
-                .load_payload_deletion_deltas(column_index, entry.payload)
-                .await?;
+            let deleted = load_payload_deletion_deltas(column_index, entry.payload).await?;
             let page_rows = self
                 .decode_lwc_page_rows(entry.payload.block_id, metadata)
                 .await?;
@@ -554,23 +551,6 @@ impl CatalogStorage {
         let buf = builder.build()?;
         Ok(Some((buf, consumed)))
     }
-
-    async fn load_payload_deletion_deltas(
-        &self,
-        column_index: &ColumnBlockIndex<'_>,
-        mut payload: ColumnPagePayload,
-    ) -> Result<BTreeSet<u32>> {
-        let mut res = BTreeSet::new();
-        if let Some(bytes) = column_index.read_offloaded_bitmap_bytes(&payload).await? {
-            for delta in decode_deltas_from_bytes(&bytes)? {
-                res.insert(delta);
-            }
-            return Ok(res);
-        }
-        let list = payload.deletion_list();
-        res.extend(list.iter());
-        Ok(res)
-    }
 }
 
 fn append_single_row_to_builder(
@@ -625,27 +605,6 @@ fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bo
         }
     }
     true
-}
-
-fn encode_deltas_to_bytes(deltas: &BTreeSet<u32>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(deltas.len() * mem::size_of::<u32>());
-    for delta in deltas {
-        out.extend_from_slice(&delta.to_le_bytes());
-    }
-    out
-}
-
-fn decode_deltas_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
-    if bytes.is_empty() || !bytes.len().is_multiple_of(mem::size_of::<u32>()) {
-        return Err(Error::InvalidFormat);
-    }
-    let mut res = Vec::with_capacity(bytes.len() / mem::size_of::<u32>());
-    for chunk in bytes.chunks_exact(mem::size_of::<u32>()) {
-        res.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    res.sort_unstable();
-    res.dedup();
-    Ok(res)
 }
 
 #[cfg(test)]

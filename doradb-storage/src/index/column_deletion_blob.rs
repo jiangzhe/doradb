@@ -3,7 +3,7 @@ use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{Page, PageID};
 use crate::error::{Error, Result};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
-use crate::index::column_block_index::BlobRef;
+use crate::index::column_payload::BlobRef;
 use crate::io::DirectBuf;
 use futures::future::try_join_all;
 
@@ -274,7 +274,7 @@ mod tests {
     };
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::file::table_fs::TableFileSystemConfig;
-    use crate::index::column_block_index::BlobRef;
+    use crate::index::column_payload::BlobRef;
     use crate::value::ValKind;
     use std::sync::{Arc, OnceLock};
 

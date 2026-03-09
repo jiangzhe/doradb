@@ -1,7 +1,10 @@
 use crate::buffer::page::PageID;
 use crate::error::{Error, Result};
 use crate::file::table_file::MutableTableFile;
-use crate::index::{ColumnBlockIndex, OffloadedBitmapPatch};
+use crate::index::{
+    ColumnBlockIndex, OffloadedBitmapPatch, encode_deletion_deltas_to_bytes,
+    load_payload_deletion_deltas,
+};
 use crate::session::Session;
 use crate::table::Table;
 use crate::trx::TrxID;
@@ -213,15 +216,13 @@ impl Table {
         // Step 4: load persisted deltas, merge pending deltas, and build patch bytes.
         let mut patch_storage: Vec<(u64, Vec<u8>)> = Vec::new();
         for (start_row_id, (seed, pending)) in grouped {
-            let mut base = self
-                .load_persisted_deletion_deltas(&column_index, start_row_id, seed.payload)
-                .await?;
+            let mut base = load_payload_deletion_deltas(&column_index, seed.payload).await?;
             let old_len = base.len();
             base.extend(pending);
             if base.len() == old_len {
                 continue;
             }
-            patch_storage.push((start_row_id, encode_deltas_to_bytes(&base)));
+            patch_storage.push((start_row_id, encode_deletion_deltas_to_bytes(&base)));
         }
         if patch_storage.is_empty() {
             return Ok(false);
@@ -240,24 +241,6 @@ impl Table {
             .await?;
         mutable_file.set_column_block_index_root(new_root);
         Ok(true)
-    }
-
-    async fn load_persisted_deletion_deltas(
-        &self,
-        column_index: &ColumnBlockIndex<'_>,
-        _start_row_id: u64,
-        mut payload: crate::index::ColumnPagePayload,
-    ) -> Result<BTreeSet<u32>> {
-        let mut res = BTreeSet::new();
-        if let Some(bytes) = column_index.read_offloaded_bitmap_bytes(&payload).await? {
-            for delta in decode_deltas_from_bytes(&bytes)? {
-                res.insert(delta);
-            }
-            return Ok(res);
-        }
-        let list = payload.deletion_list();
-        res.extend(list.iter());
-        Ok(res)
     }
 }
 
@@ -292,28 +275,4 @@ impl TablePersistence for Table {
         // Run both new-data and deletion phases in one combined checkpoint.
         self.run_checkpoint(session, true, true).await
     }
-}
-
-fn encode_deltas_to_bytes(deltas: &BTreeSet<u32>) -> Vec<u8> {
-    // Current on-disk blob encoding is a sorted little-endian u32 delta array.
-    // Future improvement: switch to roaring bitmap encoding for better space and merge efficiency.
-    let mut out = Vec::with_capacity(deltas.len() * std::mem::size_of::<u32>());
-    for delta in deltas {
-        out.extend_from_slice(&delta.to_le_bytes());
-    }
-    out
-}
-
-fn decode_deltas_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
-    // Must match `encode_deltas_to_bytes` format until roaring bitmap encoding is introduced.
-    if bytes.is_empty() || !bytes.len().is_multiple_of(std::mem::size_of::<u32>()) {
-        return Err(Error::InvalidFormat);
-    }
-    let mut res = Vec::with_capacity(bytes.len() / std::mem::size_of::<u32>());
-    for chunk in bytes.chunks_exact(std::mem::size_of::<u32>()) {
-        res.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    res.sort_unstable();
-    res.dedup();
-    Ok(res)
 }

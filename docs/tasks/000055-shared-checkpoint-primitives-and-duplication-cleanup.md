@@ -1,8 +1,9 @@
 ---
 id: 000055
 title: Shared Checkpoint Primitives and Duplication Cleanup
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-09
+github_issue: 398
 ---
 
 # Task: Shared Checkpoint Primitives and Duplication Cleanup
