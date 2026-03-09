@@ -230,10 +230,10 @@ Reference:
   - Scope: generalize readonly buffer-pool file binding so `catalog.mtb` pages can be read through the same readonly cache machinery; wire catalog checkpoint page reads to this path.
   - Goals: reuse readonly cache/inflight-dedup/eviction behavior for catalog checkpoint reads and remove direct page-read duplication.
   - Non-goals: no catalog runtime foreground read-path changes; no catalog checkpoint replay algorithm changes.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000054-catalog-checkpoint-readonly-buffer-pool-reuse.md`
+  - Task Issue: `#395`
+  - Phase Status: done
+  - Implementation Summary: 1. Generalized readonly cache identity and source binding to physical files: [Task Resolve Sync: docs/tasks/000054-catalog-checkpoint-readonly-buffer-pool-reuse.md @ 2026-03-09]
 
 - **Phase 8: Shared Checkpoint Primitives and Table Migration**
   - Scope: extract shared checkpoint primitives (deletion-delta codec, deletion-blob helpers, and column-index checkpoint edit helpers) and migrate table checkpoint call sites to them.
