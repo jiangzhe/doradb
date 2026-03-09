@@ -241,8 +241,8 @@ Reference:
   - Non-goals: no recovery-cutoff policy changes; no catalog runtime in-memory access model changes; no user-visible API changes.
   - Task Doc: `docs/tasks/000055-shared-checkpoint-primitives-and-duplication-cleanup.md`
   - Task Issue: `#398`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: 1. Extracted payload-layout ownership into [Task Resolve Sync: docs/tasks/000055-shared-checkpoint-primitives-and-duplication-cleanup.md @ 2026-03-09]
 
 - **Phase 9: Recovery Cutoff and Consistency Checks**
   - Scope: persist/load `catalog_checkpoint_cts`, compute/load watermark `W`, replay only logs with `cts > W`, and add fail-fast checks for post-cutoff catalog/data inconsistencies.

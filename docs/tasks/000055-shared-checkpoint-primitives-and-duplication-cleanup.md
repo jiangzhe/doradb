@@ -148,6 +148,47 @@ Reference:
 
 ## Implementation Notes
 
+1. Extracted payload-layout ownership into
+   `doradb-storage/src/index/column_payload.rs`:
+   - moved `ColumnPagePayload`, `BlobRef`, `DeletionList`, deletion flag/offset
+     constants, and the payload layout assertion out of
+     `column_block_index.rs`;
+   - preserved the existing `repr(C)` layout plus `bytemuck::Pod` /
+     `Zeroable` safety contract;
+   - moved payload-focused tests alongside the payload module.
+2. Added `doradb-storage/src/index/column_checkpoint.rs` as the shared
+   checkpoint primitive layer:
+   - canonical deletion-delta encode/decode helpers;
+   - canonical payload deletion-state loader that reads either inline payload
+     state or offloaded blob bytes through `ColumnBlockIndex`.
+3. Migrated both checkpoint call sites to the shared helpers without changing
+   checkpoint semantics:
+   - `doradb-storage/src/table/persistence.rs` now uses the shared codec and
+     loader for deletion checkpoint patch construction;
+   - `doradb-storage/src/catalog/storage/checkpoint.rs` now uses the same
+     helpers for deletion replay/apply and visible-row filtering;
+   - removed duplicated local helper implementations from both files.
+4. Kept `ColumnBlockIndex` CoW tree-update APIs local to the tree
+   implementation:
+   - `batch_update_offloaded_bitmaps`;
+   - `batch_replace_payloads`;
+   - `read_offloaded_bitmap_bytes`.
+5. Updated `doradb-storage/src/index/mod.rs` exports and switched
+   `doradb-storage/src/index/column_deletion_blob.rs` to import `BlobRef` from
+   the new payload module.
+6. Verification completed:
+   - `cargo fmt --check --all`
+   - `cargo test -p doradb-storage --no-default-features column_payload`
+   - `cargo test -p doradb-storage --no-default-features column_checkpoint`
+   - `cargo test -p doradb-storage --no-default-features catalog_checkpoint`
+   - `cargo test -p doradb-storage --no-default-features column_block_index`
+   - `cargo test -p doradb-storage --no-default-features checkpoint_for_deletion`
+   - `cargo test -p doradb-storage --no-default-features test_data_checkpoint`
+7. Delivery tracking:
+   - task issue: `#398`
+   - implementation PR: `#399`
+   - no additional follow-up backlog doc was created during resolve.
+
 ## Impacts
 
 1. `doradb-storage/src/index/mod.rs`
