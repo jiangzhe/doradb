@@ -87,9 +87,12 @@ impl Catalog {
 
     /// Trigger one ad-hoc catalog checkpoint publish.
     ///
-    /// This API is single-caller by contract: callers must not overlap
-    /// `checkpoint_now` or `apply_checkpoint_batch` on the same `Catalog`.
-    /// Underlying CoW file writers already reject concurrent mutable publishes.
+    /// # Panics
+    ///
+    /// Panics if another checkpoint is already in progress on the same
+    /// `CatalogStorage`/`MultiTableFile`. Concurrent checkpoint publishes are
+    /// not supported by design; the underlying [`CowFile`] enforces a single
+    /// mutable writer via an atomic claim and will panic on violation.
     #[inline]
     pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let batch = self.scan_checkpoint_batch(trx_sys)?;
@@ -117,9 +120,12 @@ impl Catalog {
 
     /// Apply one scanned catalog checkpoint batch into `catalog.mtb`.
     ///
-    /// This API is single-caller by contract: callers must not overlap
-    /// `apply_checkpoint_batch` or `checkpoint_now` on the same `Catalog`.
-    /// Concurrent mutable publishes are rejected by the underlying CoW file.
+    /// # Panics
+    ///
+    /// Panics if another mutable writer is already active on `catalog.mtb`.
+    /// Only one checkpoint publish may be in flight at a time per `Catalog`
+    /// instance; callers are responsible for ensuring mutual exclusion at a
+    /// higher level (e.g., a single background checkpoint task).
     #[inline]
     pub async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
         self.storage

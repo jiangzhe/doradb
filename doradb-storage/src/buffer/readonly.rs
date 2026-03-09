@@ -1,4 +1,5 @@
 use crate::buffer::BufferPool;
+use crate::buffer::ReadonlyFileID;
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
     FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
@@ -9,9 +10,9 @@ use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::{
     deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays, madvise_dontneed,
 };
-use crate::catalog::TableID;
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
+use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
 use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
@@ -21,7 +22,9 @@ use dashmap::mapref::entry::Entry;
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::mem;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -31,27 +34,65 @@ use std::thread::JoinHandle;
 /// Very small pools provide little practical value and can stall eviction/load flow.
 const MIN_READONLY_POOL_PAGES: usize = 256;
 
-/// Physical cache identity for readonly table-file pages.
+/// Physical cache identity for readonly file pages.
 ///
 /// This intentionally excludes root version to preserve cache hits across
 /// root swaps when physical blocks are unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReadonlyCacheKey {
-    /// Table identity owning the block.
-    pub table_id: TableID,
-    /// Physical page/block id in the table file.
+    /// Readonly file identity owning the block.
+    pub file_id: ReadonlyFileID,
+    /// Physical page/block id in the backing file.
     pub block_id: PageID,
 }
 
 impl ReadonlyCacheKey {
-    /// Builds a key from table id and physical block id.
+    /// Builds a key from file id and physical block id.
     #[inline]
-    pub fn new(table_id: TableID, block_id: PageID) -> Self {
-        ReadonlyCacheKey { table_id, block_id }
+    pub fn new(file_id: ReadonlyFileID, block_id: PageID) -> Self {
+        ReadonlyCacheKey { file_id, block_id }
     }
 }
 
-/// Global readonly cache owner shared across tables.
+/// Async direct-read source usable by the shared readonly cache.
+pub trait ReadonlyPageSource: Send + Sync {
+    fn read_page_into_ptr<'a>(
+        &'a self,
+        page_id: PageID,
+        ptr: UnsafePtr<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
+impl ReadonlyPageSource for TableFile {
+    #[inline]
+    fn read_page_into_ptr<'a>(
+        &'a self,
+        page_id: PageID,
+        ptr: UnsafePtr<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // SAFETY: caller upholds destination pointer validity for the full async read.
+            unsafe { TableFile::read_page_into_ptr(self, page_id, ptr).await }
+        })
+    }
+}
+
+impl ReadonlyPageSource for MultiTableFile {
+    #[inline]
+    fn read_page_into_ptr<'a>(
+        &'a self,
+        page_id: PageID,
+        ptr: UnsafePtr<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let cow_file = std::ops::Deref::deref(self);
+            // SAFETY: caller upholds destination pointer validity for the full async read.
+            unsafe { cow_file.read_page_into_ptr(page_id, ptr).await }
+        })
+    }
+}
+
+/// Global readonly cache owner shared across files.
 ///
 /// This type owns the frame/page arena and maintains a forward mapping
 /// from physical on-disk identity to in-memory frame id.
@@ -150,7 +191,7 @@ impl GlobalReadonlyBufferPool {
         let frame = self.frames.frame(frame_id);
         frame
             .readonly_key()
-            .map(|(table_id, block_id)| ReadonlyCacheKey::new(table_id, block_id))
+            .map(|(file_id, block_id)| ReadonlyCacheKey::new(file_id, block_id))
     }
 
     /// Binds a physical key to an exclusively locked frame.
@@ -179,8 +220,8 @@ impl GlobalReadonlyBufferPool {
                     return Err(Error::InvalidState);
                 }
                 return match frame.readonly_key() {
-                    Some((table_id, block_id))
-                        if table_id == key.table_id && block_id == key.block_id =>
+                    Some((file_id, block_id))
+                        if file_id == key.file_id && block_id == key.block_id =>
                     {
                         Ok(())
                     }
@@ -188,8 +229,8 @@ impl GlobalReadonlyBufferPool {
                 };
             }
             Entry::Vacant(vac) => {
-                if let Some((table_id, block_id)) = frame.readonly_key() {
-                    if table_id != key.table_id || block_id != key.block_id {
+                if let Some((file_id, block_id)) = frame.readonly_key() {
+                    if file_id != key.file_id || block_id != key.block_id {
                         return Err(Error::InvalidState);
                     }
                     return Err(Error::InvalidState);
@@ -199,7 +240,7 @@ impl GlobalReadonlyBufferPool {
             }
         };
         if inserted {
-            frame.set_readonly_key(key.table_id, key.block_id);
+            frame.set_readonly_key(key.file_id, key.block_id);
             frame.set_dirty(false);
             frame.bump_generation();
             frame.set_kind(FrameKind::Hot);
@@ -234,28 +275,36 @@ impl GlobalReadonlyBufferPool {
         Some(frame_id)
     }
 
-    /// Invalidates one physical block from one table.
+    /// Invalidates one physical block from one file.
     #[inline]
-    pub fn invalidate_block(&self, table_id: TableID, block_id: PageID) -> Option<PageID> {
-        self.invalidate_key(&ReadonlyCacheKey::new(table_id, block_id))
+    pub fn invalidate_file_block(
+        &self,
+        file_id: ReadonlyFileID,
+        block_id: PageID,
+    ) -> Option<PageID> {
+        self.invalidate_key(&ReadonlyCacheKey::new(file_id, block_id))
     }
 
-    /// Invalidates one physical block from one table using strict GC ordering.
+    /// Invalidates one physical block from one file using strict GC ordering.
     #[inline]
-    pub fn invalidate_block_strict(&self, table_id: TableID, block_id: PageID) -> Option<PageID> {
-        self.invalidate_key_strict(&ReadonlyCacheKey::new(table_id, block_id))
+    pub fn invalidate_file_block_strict(
+        &self,
+        file_id: ReadonlyFileID,
+        block_id: PageID,
+    ) -> Option<PageID> {
+        self.invalidate_key_strict(&ReadonlyCacheKey::new(file_id, block_id))
     }
 
-    /// Invalidates all cache entries belonging to one table.
+    /// Invalidates all cache entries belonging to one file.
     ///
     /// Returns the number of invalidated mappings.
     #[inline]
-    pub fn invalidate_table(&self, table_id: TableID) -> usize {
+    pub fn invalidate_file(&self, file_id: ReadonlyFileID) -> usize {
         let keys = self
             .mappings
             .iter()
             .filter_map(|entry| {
-                if entry.key().table_id == table_id {
+                if entry.key().file_id == file_id {
                     Some(*entry.key())
                 } else {
                     None
@@ -271,16 +320,16 @@ impl GlobalReadonlyBufferPool {
         count
     }
 
-    /// Invalidates all cache entries of one table using strict GC ordering.
+    /// Invalidates all cache entries of one file using strict GC ordering.
     ///
     /// This method panics if any target frame is still latch-held.
     #[inline]
-    pub fn invalidate_table_strict(&self, table_id: TableID) -> usize {
+    pub fn invalidate_file_strict(&self, file_id: ReadonlyFileID) -> usize {
         let keys = self
             .mappings
             .iter()
             .filter_map(|entry| {
-                if entry.key().table_id == table_id {
+                if entry.key().file_id == file_id {
                     Some(*entry.key())
                 } else {
                     None
@@ -321,9 +370,9 @@ impl GlobalReadonlyBufferPool {
             return;
         }
         if let Some(key) = expected_key
-            && let Some((table_id, block_id)) = frame.readonly_key()
+            && let Some((file_id, block_id)) = frame.readonly_key()
         {
-            debug_assert_eq!(table_id, key.table_id);
+            debug_assert_eq!(file_id, key.file_id);
             debug_assert_eq!(block_id, key.block_id);
         }
         frame.clear_readonly_key();
@@ -388,7 +437,7 @@ impl GlobalReadonlyBufferPool {
     async fn load_cache_miss(
         &'static self,
         key: ReadonlyCacheKey,
-        table_file: &TableFile,
+        page_source: &dyn ReadonlyPageSource,
     ) -> Result<PageID> {
         let frame_id = self.reserve_frame_id().await;
         let mut page_guard = match self.frames.try_lock_page_exclusive(frame_id) {
@@ -405,16 +454,14 @@ impl GlobalReadonlyBufferPool {
             frame.set_kind(FrameKind::Evicting);
         }
 
-        // SAFETY: frame page memory is exclusively held by `page_guard`, aligned to page size,
+        // Destination memory is exclusively held by `page_guard`, aligned to page size,
         // and remains valid until IO completion because the guard is held for the full await.
-        let read_res = unsafe {
-            table_file
-                .read_page_into_ptr(
-                    key.block_id,
-                    UnsafePtr(page_guard.page_mut() as *mut Page as *mut u8),
-                )
-                .await
-        };
+        let read_res = page_source
+            .read_page_into_ptr(
+                key.block_id,
+                UnsafePtr(page_guard.page_mut() as *mut Page as *mut u8),
+            )
+            .await;
 
         if let Err(err) = read_res {
             page_guard.page_mut().zero();
@@ -429,7 +476,7 @@ impl GlobalReadonlyBufferPool {
 
         {
             let frame = page_guard.bf_mut();
-            frame.set_readonly_key(key.table_id, key.block_id);
+            frame.set_readonly_key(key.file_id, key.block_id);
             frame.set_dirty(false);
             frame.bump_generation();
             frame.set_kind(FrameKind::Hot);
@@ -461,7 +508,7 @@ impl GlobalReadonlyBufferPool {
     async fn get_or_load_frame_id(
         &'static self,
         key: ReadonlyCacheKey,
-        table_file: &Arc<TableFile>,
+        page_source: &dyn ReadonlyPageSource,
     ) -> Result<PageID> {
         loop {
             if let Some(frame_id) = self.try_get_frame_id(&key) {
@@ -478,7 +525,7 @@ impl GlobalReadonlyBufferPool {
             };
 
             if is_loader {
-                let load_res = self.load_cache_miss(key, table_file).await;
+                let load_res = self.load_cache_miss(key, page_source).await;
                 if let Some((_, inflight)) = self.inflight_loads.remove(&key) {
                     inflight.ev.notify(usize::MAX);
                 }
@@ -524,7 +571,7 @@ impl GlobalReadonlyBufferPool {
     ) -> bool {
         let frame = guard.bf();
         frame.kind() != FrameKind::Uninitialized
-            && frame.readonly_key() == Some((expected_key.table_id, expected_key.block_id))
+            && frame.readonly_key() == Some((expected_key.file_id, expected_key.block_id))
     }
 
     #[inline]
@@ -702,8 +749,8 @@ impl ReadonlyRuntime {
             return;
         }
 
-        if let Some((table_id, block_id)) = frame.readonly_key() {
-            let key = ReadonlyCacheKey::new(table_id, block_id);
+        if let Some((file_id, block_id)) = frame.readonly_key() {
+            let key = ReadonlyCacheKey::new(file_id, block_id);
             if let Some((_, mapped_frame_id)) = self.mappings.remove(&key) {
                 debug_assert_eq!(mapped_frame_id, frame_id);
             }
@@ -781,35 +828,38 @@ impl EvictionRuntime for ReadonlyRuntime {
 
 unsafe impl Send for ReadonlyRuntime {}
 
-/// Per-table readonly wrapper implementing the `BufferPool` contract.
+/// Per-file readonly wrapper implementing the `BufferPool` contract.
 ///
-/// This wrapper translates table-local `PageID` into global physical cache key
+/// This wrapper translates file-local `PageID` into global physical cache keys
 /// and delegates to `GlobalReadonlyBufferPool`.
 #[derive(Clone)]
 pub struct ReadonlyBufferPool {
-    table_id: TableID,
-    table_file: Arc<TableFile>,
+    file_id: ReadonlyFileID,
+    page_source: Arc<dyn ReadonlyPageSource>,
     global: &'static GlobalReadonlyBufferPool,
 }
 
 impl ReadonlyBufferPool {
-    /// Creates a per-table readonly pool wrapper.
+    /// Creates a per-file readonly pool wrapper.
     #[inline]
-    pub fn new(
-        table_id: TableID,
-        table_file: Arc<TableFile>,
+    pub fn new<S>(
+        file_id: ReadonlyFileID,
+        page_source: Arc<S>,
         global: &'static GlobalReadonlyBufferPool,
-    ) -> Self {
+    ) -> Self
+    where
+        S: ReadonlyPageSource + 'static,
+    {
         ReadonlyBufferPool {
-            table_id,
-            table_file,
+            file_id,
+            page_source,
             global,
         }
     }
 
     #[inline]
     fn cache_key(&self, block_id: PageID) -> ReadonlyCacheKey {
-        ReadonlyCacheKey::new(self.table_id, block_id)
+        ReadonlyCacheKey::new(self.file_id, block_id)
     }
 
     #[inline]
@@ -822,7 +872,7 @@ impl ReadonlyBufferPool {
         loop {
             let frame_id = self
                 .global
-                .get_or_load_frame_id(key, &self.table_file)
+                .get_or_load_frame_id(key, &*self.page_source)
                 .await?;
             let guard = self.global.get_page_internal(frame_id, mode).await?;
             if self.global.validate_guarded_frame_key(&guard, key) {
@@ -852,16 +902,17 @@ impl ReadonlyBufferPool {
         }
     }
 
-    /// Invalidates one block for this table from the global readonly cache.
+    /// Invalidates one block for this file from the global readonly cache.
     #[inline]
     pub fn invalidate_block_id(&self, block_id: PageID) -> Option<PageID> {
-        self.global.invalidate_block(self.table_id, block_id)
+        self.global.invalidate_file_block(self.file_id, block_id)
     }
 
-    /// Invalidates one block for this table with strict GC ordering preconditions.
+    /// Invalidates one block for this file with strict GC ordering preconditions.
     #[inline]
     pub fn invalidate_block_id_strict(&self, block_id: PageID) -> Option<PageID> {
-        self.global.invalidate_block_strict(self.table_id, block_id)
+        self.global
+            .invalidate_file_block_strict(self.file_id, block_id)
     }
 }
 
@@ -944,7 +995,7 @@ mod tests {
     use super::*;
     use crate::buffer::guard::{FacadePageGuard, PageGuard};
     use crate::buffer::page::Page;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
     use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
@@ -1009,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_invalidate_table() {
+    fn test_global_invalidate_file() {
         let scope = StaticLifetimeScope::new();
         let global =
             scope.adopt(GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
@@ -1028,10 +1079,30 @@ mod tests {
         drop(g2);
         drop(g3);
 
-        assert_eq!(global.invalidate_table(1), 2);
+        assert_eq!(global.invalidate_file(1), 2);
         assert_eq!(global.try_get_frame_id(&k1), None);
         assert_eq!(global.try_get_frame_id(&k2), None);
         assert_eq!(global.try_get_frame_id(&k3), Some(3));
+    }
+
+    #[test]
+    fn test_readonly_cache_file_ids_keep_catalog_and_user_pages_isolated() {
+        let scope = StaticLifetimeScope::new();
+        let global =
+            scope.adopt(GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+        let global = global.as_static();
+        let catalog_key = ReadonlyCacheKey::new(USER_OBJ_ID_START - 1, 42);
+        let user_key = ReadonlyCacheKey::new(USER_OBJ_ID_START, 42);
+
+        let mut catalog_frame = global.frames.try_lock_page_exclusive(1).unwrap();
+        let mut user_frame = global.frames.try_lock_page_exclusive(2).unwrap();
+        global.bind_frame(catalog_key, &mut catalog_frame).unwrap();
+        global.bind_frame(user_key, &mut user_frame).unwrap();
+        drop(catalog_frame);
+        drop(user_frame);
+
+        assert_eq!(global.try_get_frame_id(&catalog_key), Some(1));
+        assert_eq!(global.try_get_frame_id(&user_key), Some(2));
     }
 
     #[test]

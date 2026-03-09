@@ -1,8 +1,9 @@
 ---
 id: 000054
 title: Catalog Checkpoint Readonly Buffer Pool Reuse
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-09
+github_issue: 395
 ---
 
 # Task: Catalog Checkpoint Readonly Buffer Pool Reuse

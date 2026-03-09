@@ -4,14 +4,16 @@ mod indexes;
 mod object;
 mod tables;
 
-use crate::buffer::{FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::{
+    FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyFileID,
+};
 use crate::catalog::runtime::CatalogTable;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
-use crate::catalog::{ObjID, TableID};
+use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::Result;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
@@ -22,12 +24,15 @@ use crate::trx::TrxID;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+pub(crate) const CATALOG_MTB_READONLY_FILE_ID: ReadonlyFileID = USER_OBJ_ID_START - 1;
+
 /// Runtime storage container for all catalog logical tables.
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
     tables: Box<[CatalogTable]>,
     next_user_obj_id: ObjID,
     mtb: Arc<MultiTableFile>,
+    pub(super) disk_pool: ReadonlyBufferPool,
 }
 
 impl CatalogStorage {
@@ -37,10 +42,15 @@ impl CatalogStorage {
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
         table_fs: &'static TableFileSystem,
-        _global_disk_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
     ) -> Result<Self> {
         let mtb = table_fs.open_or_create_multi_table_file().await?;
         let mtb_snapshot = mtb.load_snapshot()?;
+        let disk_pool = ReadonlyBufferPool::new(
+            CATALOG_MTB_READONLY_FILE_ID,
+            Arc::clone(&mtb),
+            global_disk_pool,
+        );
 
         let mut cat: Vec<CatalogTable> = vec![];
         for CatalogDefinition { table_id, metadata } in [
@@ -62,6 +72,7 @@ impl CatalogStorage {
             tables: cat.into_boxed_slice(),
             next_user_obj_id: mtb_snapshot.meta.next_user_obj_id,
             mtb,
+            disk_pool,
         })
     }
 
