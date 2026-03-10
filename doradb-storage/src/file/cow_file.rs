@@ -1,6 +1,8 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::{PAGE_SIZE, PageID};
-use crate::error::{Error, Result};
+use crate::error::{
+    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+};
 use crate::file::super_page::{SUPER_PAGE_SIZE, SuperPage};
 use crate::file::{
     FileIO, FileIOResult, FixedSizeBufferFreeList, SparseFile, read_page_direct, write_direct,
@@ -138,7 +140,9 @@ pub struct CowCodec<M> {
     /// Parse one super-page image.
     pub parse_super_page: fn(&[u8]) -> Result<SuperPage>,
     /// Parse one meta-page image.
-    pub parse_meta_page: fn(&[u8]) -> Result<ParsedMeta<M>>,
+    pub parse_meta_page: fn(PageID, &[u8]) -> Result<ParsedMeta<M>>,
+    /// Validate root invariants after parsing one meta page.
+    pub validate_root: fn(PageID, &ParsedMeta<M>) -> Result<()>,
     /// Build one meta-page image from active root.
     pub build_meta_page: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
     /// Build one super-page image from active root.
@@ -340,10 +344,12 @@ impl<M> CowFile<M> {
         NonNull::new(old).map(OldCowRoot)
     }
 
-    /// Load active root from on-disk super/meta pages.
+    /// Load and validate the active root from on-disk super/meta pages.
     ///
-    /// This reads super-page pair from page 0, picks the latest valid one,
-    /// then parses the referenced meta page with the configured codec.
+    /// This reads the ping-pong super-page pair from page 0, picks the newest
+    /// valid slot, validates the referenced meta page through the configured
+    /// codec, and rejects invalid root invariants before returning an
+    /// in-memory [`ActiveRoot`].
     #[inline]
     pub async fn load_active_root(&self) -> Result<ActiveRoot<M>> {
         let super_buf = self.read_page(0).await?;
@@ -358,13 +364,18 @@ impl<M> CowFile<M> {
         self.buf_list.push(super_buf);
 
         let meta_buf = self.read_page(super_page.body.meta_page_id).await?;
-        let parsed_meta = match (self.codec.parse_meta_page)(meta_buf.as_bytes()) {
-            Ok(meta) => meta,
-            Err(err) => {
-                self.buf_list.push(meta_buf);
-                return Err(err);
-            }
-        };
+        let parsed_meta =
+            match (self.codec.parse_meta_page)(super_page.body.meta_page_id, meta_buf.as_bytes()) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    self.buf_list.push(meta_buf);
+                    return Err(err);
+                }
+            };
+        if let Err(err) = (self.codec.validate_root)(super_page.body.meta_page_id, &parsed_meta) {
+            self.buf_list.push(meta_buf);
+            return Err(err);
+        }
         self.buf_list.push(meta_buf);
 
         Ok(ActiveRoot::from_parts(
@@ -472,6 +483,35 @@ impl<M> CowFile<M> {
             }
         }
     }
+}
+
+#[inline]
+pub(crate) fn validate_active_meta_page_id(
+    alloc_map: &AllocMap,
+    meta_page_id: PageID,
+    file_kind: PersistedFileKind,
+    page_kind: PersistedPageKind,
+) -> Result<()> {
+    let meta_page_idx = usize::try_from(meta_page_id).map_err(|_| {
+        Error::persisted_page_corrupted(
+            file_kind,
+            page_kind,
+            meta_page_id,
+            PersistedPageCorruptionCause::InvalidRootInvariant,
+        )
+    })?;
+    if meta_page_idx == 0
+        || meta_page_idx >= alloc_map.len()
+        || !alloc_map.is_allocated(meta_page_idx)
+    {
+        return Err(Error::persisted_page_corrupted(
+            file_kind,
+            page_kind,
+            meta_page_id,
+            PersistedPageCorruptionCause::InvalidRootInvariant,
+        ));
+    }
+    Ok(())
 }
 
 impl<M> Drop for CowFile<M> {

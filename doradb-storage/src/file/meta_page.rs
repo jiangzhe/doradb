@@ -4,7 +4,7 @@ use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, Table
 use crate::catalog::{ObjID, USER_OBJ_ID_START};
 use crate::error::Result;
 use crate::file::multi_table_file::{
-    CATALOG_MTB_VERSION, CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaPage,
+    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaPage,
 };
 use crate::lwc::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::row::RowID;
@@ -13,10 +13,15 @@ use crate::trx::TrxID;
 use std::mem;
 use std::num::NonZeroU64;
 
-/// Parsed on-disk payload of one table meta page.
+/// Magic bytes stored at the beginning of every table meta page envelope.
+pub(crate) const TABLE_META_MAGIC_WORD: [u8; 8] = [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
+/// Table meta-page envelope version.
+pub(crate) const TABLE_META_VERSION: u64 = 1;
+
+/// Parsed payload of one checksummed table meta page.
 ///
-/// This value is loaded from the active meta page selected by a table-file
-/// super page during startup/recovery.
+/// The surrounding magic/version/checksum envelope is validated by the file
+/// layer before this payload is deserialized during startup or recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaPage {
     /// Row-store/column-store boundary row id.
@@ -183,14 +188,14 @@ impl<'a> Ser<'a> for AllocMapGcListSerView<'a> {
     }
 }
 
-/// Magic bytes stored at the beginning of every `catalog.mtb` meta page.
+/// Magic bytes stored at the beginning of every `catalog.mtb` meta page envelope.
 pub(crate) const MULTI_TABLE_META_MAGIC_WORD: [u8; 8] =
     [b'M', b'T', b'B', b'M', b'E', b'T', b'A', 0];
 
-/// Parsed on-disk meta-page payload for `catalog.mtb`.
+/// Parsed payload of one checksummed `catalog.mtb` meta page.
 ///
-/// This includes reserved catalog table roots and shared space-management
-/// metadata for the unified catalog file.
+/// The shared page-integrity envelope is validated before this payload is
+/// deserialized into catalog root state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultiTableMetaPageData {
     /// Global next user object-id allocator watermark.
@@ -206,15 +211,7 @@ pub struct MultiTableMetaPageData {
 impl Deser for MultiTableMetaPageData {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, magic) = input.deser_byte_array::<8>(start_idx)?;
-        if magic != MULTI_TABLE_META_MAGIC_WORD {
-            return Err(crate::error::Error::InvalidFormat);
-        }
-        let (idx, version) = input.deser_u64(idx)?;
-        if version != CATALOG_MTB_VERSION {
-            return Err(crate::error::Error::InvalidFormat);
-        }
-        let (idx, next_user_obj_id) = input.deser_u64(idx)?;
+        let (idx, next_user_obj_id) = input.deser_u64(start_idx)?;
         if next_user_obj_id < USER_OBJ_ID_START {
             return Err(crate::error::Error::InvalidFormat);
         }
@@ -255,7 +252,10 @@ impl Deser for MultiTableMetaPageData {
     }
 }
 
-/// Borrowed serialization view for `catalog.mtb` meta pages.
+/// Borrowed payload serialization view for `catalog.mtb` meta pages.
+///
+/// The file layer wraps this payload with the shared integrity envelope when a
+/// new catalog root is published.
 pub struct MultiTableMetaPageSerView<'a> {
     /// Global next user object-id allocator watermark.
     pub next_user_obj_id: ObjID,
@@ -285,9 +285,7 @@ impl<'a> MultiTableMetaPageSerView<'a> {
 impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
     #[inline]
     fn ser_len(&self) -> usize {
-        mem::size_of::<[u8; 8]>() // magic
-            + mem::size_of::<u64>() // version
-            + mem::size_of::<u64>() // next_user_obj_id
+        mem::size_of::<u64>() // next_user_obj_id
             + mem::size_of::<u32>() // table_root_count
             + mem::size_of::<u32>() // reserved
             + CATALOG_TABLE_ROOT_DESC_COUNT
@@ -298,8 +296,6 @@ impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = out.ser_byte_array(idx, &MULTI_TABLE_META_MAGIC_WORD);
-        idx = out.ser_u64(idx, CATALOG_MTB_VERSION);
         idx = out.ser_u64(idx, self.next_user_obj_id);
         idx = out.ser_u32(idx, CATALOG_TABLE_ROOT_DESC_COUNT as u32);
         idx = out.ser_u32(idx, 0); // reserved
