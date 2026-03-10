@@ -131,17 +131,58 @@ Reference:
 
 ## Implementation Notes
 
+1. Added scan-bound, restart, and mixed-state checkpoint tests:
+   - `doradb-storage/src/trx/sys.rs` now has direct scan-layer coverage for
+     durable upper bound handling and replay-start advancement across repeated
+     catalog checkpoint scans;
+   - `doradb-storage/src/catalog/mod.rs` now covers heartbeat catalog
+     checkpoint behavior when user tables have mixed data-checkpoint states;
+   - `doradb-storage/src/trx/recover.rs` now covers both single-table
+     post-cutoff heap replay and two-table mixed checkpoint/replay restart
+     recovery.
+2. Mixed-state recovery validation exposed and fixed a real bootstrap issue:
+   - preloaded user-table row-block indexes now seed their in-memory start row
+     boundary from the persisted `pivot_row_id` instead of always starting at
+     `0`;
+   - the fix lives in `doradb-storage/src/index/row_block_index.rs` and
+     `doradb-storage/src/index/block_index.rs`, and prevents post-checkpoint
+     row-page replay from allocating the wrong row-id range after restart.
+3. Synced the living docs and RFC to the implemented contract:
+   - `docs/architecture.md` now describes unified catalog persistence in
+     `catalog.mtb`;
+   - `docs/checkpoint-and-recovery.md` now documents
+     `catalog_replay_start_ts`, coarse replay-floor calculation, and
+     checkpoint-aware restart sequencing;
+   - RFC-0006 phase 10 is now linked to this task and narrowed to implemented
+     create/checkpoint/recover validation only.
+4. Verification executed in this resolve pass:
+   - `cargo fmt --all`
+   - `cargo test -p doradb-storage test_catalog_checkpoint_scan_respects_upper_bound_and_replay_start`
+   - `cargo test -p doradb-storage test_log_recover_replays_post_checkpoint_heap_redo_after_bootstrap`
+   - `cargo test -p doradb-storage test_log_recover_skips_pre_checkpoint_table_redo_and_rebuilds_persisted_index`
+   - `cargo test -p doradb-storage test_catalog_checkpoint_now_heartbeat_with_mixed_user_table_checkpoint_states`
+   - `cargo test -p doradb-storage test_log_recover_handles_mixed_user_table_checkpoint_states`
+   - `cargo test -p doradb-storage --no-default-features test_catalog_checkpoint_scan_respects_upper_bound_and_replay_start`
+   - `cargo test -p doradb-storage --no-default-features test_log_recover_replays_post_checkpoint_heap_redo_after_bootstrap`
+   - `cargo test -p doradb-storage --no-default-features test_catalog_checkpoint_now_heartbeat_with_mixed_user_table_checkpoint_states`
+   - `cargo test -p doradb-storage --no-default-features test_log_recover_handles_mixed_user_table_checkpoint_states`
+5. Delivery tracking:
+   - task issue: `#402`
+   - implementation PR: `#403`
+   - no `Source Backlogs:` entries were recorded for this task, so no backlog
+     close action was required during resolve
+   - no additional follow-up backlog doc was created in this resolve pass
+
 ## Impacts
 
 1. `doradb-storage/src/catalog/mod.rs`
-2. `doradb-storage/src/catalog/storage/checkpoint.rs`
+2. `doradb-storage/src/trx/sys.rs`
 3. `doradb-storage/src/trx/recover.rs`
-4. `doradb-storage/src/trx/sys.rs`
-5. `doradb-storage/src/file/table_fs.rs`
-6. `doradb-storage/src/file/multi_table_file.rs`
-7. `docs/architecture.md`
-8. `docs/checkpoint-and-recovery.md`
-9. `docs/rfcs/0006-cache-first-unified-catalog-storage-refactor.md`
+4. `doradb-storage/src/index/block_index.rs`
+5. `doradb-storage/src/index/row_block_index.rs`
+6. `docs/architecture.md`
+7. `docs/checkpoint-and-recovery.md`
+8. `docs/rfcs/0006-cache-first-unified-catalog-storage-refactor.md`
 
 ## Test Cases
 
@@ -161,6 +202,9 @@ Reference:
      work or regress roots;
    - heartbeat checkpoint without catalog-row changes advances replay-start
      metadata while preserving table roots.
+   - heartbeat catalog checkpoint still follows the same replay-start/root
+     invariants when one user table is already data-checkpointed and another
+     remains replay-backed.
 4. Catalog checkpoint read-path regressions:
    - persisted catalog checkpoint reads continue to use the readonly-cache path;
    - append-focused tail merge can rewrite the last payload without creating an
@@ -171,6 +215,9 @@ Reference:
    - restart after catalog checkpoint plus user-table data checkpoint skips
      pre-checkpoint heap redo and still rebuilds visible/indexable state
      correctly from persisted data plus post-cutoff replay;
+   - restart with multiple user tables in mixed checkpoint states restores
+     checkpointed-table data from persisted state and replay-backed-table data
+     from redo in the same recovery run;
    - the coarse replay floor remains bounded by `catalog_replay_start_ts` plus
      loaded user-table `heap_redo_start_ts` values.
 6. Catalog checkpoint scan semantics:
@@ -180,11 +227,10 @@ Reference:
 
 ## Open Questions
 
-1. RFC-0006 phase 10 wording currently overreaches into `drop` lifecycle
-   validation. This task should update the phase text to implemented
-   create/checkpoint/recover validation only; any broader table-drop lifecycle
-   work should start from a future RFC.
-2. Current validation will remain distributed across existing owner modules.
-   If restart/checkpoint helper duplication grows later, consider a small
-   follow-up cleanup task, but do not expand this phase-10 task into a test
-   framework refactor.
+1. Broader lifecycle ordering, especially public `DropTable` behavior across
+   checkpoint/recovery boundaries, remains future RFC scope rather than a
+   follow-up on this resolved validation task.
+2. Validation remains distributed across existing owner modules. If the
+   multi-table scenario matrix grows beyond the current common cases, consider
+   a small cleanup or matrix-expansion follow-up instead of refactoring this
+   resolved task into a shared test harness.

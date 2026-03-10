@@ -262,7 +262,7 @@ Reference:
   - Task Doc: `docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md`
   - Task Issue: `#402`
   - Phase Status: done
-  - Implementation Summary: 1. Added direct scan-layer replay-boundary validation, restart coverage for checkpointed persisted rows plus post-cutoff heap replay, and synced the storage docs to the `catalog.mtb` / `catalog_replay_start_ts` contract. [Task Resolve Sync: docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md @ 2026-03-10]
+  - Implementation Summary: 1. Added scan-bound, restart, and mixed-state checkpoint tests: [Task Resolve Sync: docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md @ 2026-03-10]
 
 ## Consequences
 
