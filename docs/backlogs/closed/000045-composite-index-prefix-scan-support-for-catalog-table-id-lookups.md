@@ -33,3 +33,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: stale
+- Detail: RFC-0006 resolved with scan-based catalog list-by-table lookups retained as the implemented contract; composite-prefix scan integration remained an optional optimization and was not taken as committed RFC follow-up work.
+- Closed By: backlog close
+- Reference: docs/tasks/000049-catalog-composite-key-refactor.md; RFC-0006 resolve
+- Closed At: 2026-03-10
