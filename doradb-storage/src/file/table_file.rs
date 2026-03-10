@@ -2,12 +2,19 @@ use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::page::PageID;
 use crate::catalog::table::TableMetadata;
-use crate::error::{Error, Result};
+use crate::error::{
+    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+};
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
-    OldCowRoot, ParsedMeta,
+    OldCowRoot, ParsedMeta, validate_active_meta_page_id,
 };
-use crate::file::meta_page::{MetaPage, MetaPageSerView};
+use crate::file::meta_page::{
+    MetaPage, MetaPageSerView, TABLE_META_MAGIC_WORD, TABLE_META_VERSION,
+};
+use crate::file::page_integrity::{
+    PageIntegritySpec, max_payload_len, validate_page, write_page_checksum, write_page_header,
+};
 use crate::file::super_page::{
     SUPER_PAGE_FOOTER_OFFSET, SUPER_PAGE_SIZE, SUPER_PAGE_VERSION, SuperPage, SuperPageBody,
     SuperPageFooter, SuperPageHeader, SuperPageSerView, parse_super_page,
@@ -24,6 +31,8 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
+const TABLE_META_PAGE_SPEC: PageIntegritySpec =
+    PageIntegritySpec::new(TABLE_META_MAGIC_WORD, TABLE_META_VERSION);
 
 /// Initial size of new table file.
 pub const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
@@ -118,8 +127,24 @@ fn parse_table_super_page(buf: &[u8]) -> Result<SuperPage> {
 }
 
 #[inline]
-fn parse_table_meta_page(buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
-    let (_, meta_page) = MetaPage::deser(buf, 0)?;
+fn parse_table_meta_page(page_id: PageID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
+    let payload = validate_page(buf, TABLE_META_PAGE_SPEC).map_err(|cause| {
+        Error::persisted_page_corrupted(
+            PersistedFileKind::TableFile,
+            PersistedPageKind::TableMeta,
+            page_id,
+            cause,
+        )
+    })?;
+    let (_, meta_page) = MetaPage::deser(payload, 0).map_err(|err| match err {
+        Error::InvalidFormat => Error::persisted_page_corrupted(
+            PersistedFileKind::TableFile,
+            PersistedPageKind::TableMeta,
+            page_id,
+            PersistedPageCorruptionCause::InvalidPayload,
+        ),
+        other => other,
+    })?;
     Ok(ParsedMeta {
         meta: TableMeta {
             metadata: Arc::new(meta_page.schema),
@@ -133,15 +158,30 @@ fn parse_table_meta_page(buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
 }
 
 #[inline]
+fn validate_table_root(meta_page_id: PageID, parsed_meta: &ParsedMeta<TableMeta>) -> Result<()> {
+    validate_active_meta_page_id(
+        &parsed_meta.alloc_map,
+        meta_page_id,
+        PersistedFileKind::TableFile,
+        PersistedPageKind::TableMeta,
+    )
+}
+
+#[inline]
 fn build_table_meta_page(root: &ActiveRoot) -> Result<DirectBuf> {
     let meta_page = root.meta_page_ser_view();
     let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let meta_len = meta_page.ser_len();
-    if meta_len > COW_FILE_PAGE_SIZE {
+    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
         return Err(Error::InvalidState);
     }
-    let meta_idx = meta_page.ser(meta_buf.as_bytes_mut(), 0);
-    debug_assert_eq!(meta_idx, meta_len);
+    let meta_idx = write_page_header(meta_buf.as_bytes_mut(), TABLE_META_PAGE_SPEC);
+    let meta_idx = meta_page.ser(meta_buf.as_bytes_mut(), meta_idx);
+    debug_assert_eq!(
+        meta_idx,
+        crate::file::page_integrity::PAGE_INTEGRITY_HEADER_SIZE + meta_len
+    );
+    write_page_checksum(meta_buf.as_bytes_mut());
     Ok(meta_buf)
 }
 
@@ -172,6 +212,7 @@ fn table_codec() -> CowCodec<TableMeta> {
     CowCodec {
         parse_super_page: parse_table_super_page,
         parse_meta_page: parse_table_meta_page,
+        validate_root: validate_table_root,
         build_meta_page: build_table_meta_page,
         build_super_page: build_table_super_page,
     }
@@ -212,7 +253,7 @@ impl TableFile {
         Ok(TableFile(cow_file))
     }
 
-    /// Load active root by parsing ping-pong super pages and referenced meta page.
+    /// Load the active root after validating the selected table meta page.
     #[inline]
     pub async fn load_active_root(&self) -> Result<ActiveRoot> {
         self.0.load_active_root().await
@@ -552,10 +593,13 @@ mod tests {
     use super::*;
     use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use crate::error::Error;
+    use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::page_integrity::PAGE_INTEGRITY_TRAILER_SIZE;
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
     use crate::value::ValKind;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::OnceLock;
     use tempfile::TempDir;
 
@@ -714,6 +758,115 @@ mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.data_mut()[..payload.len()].copy_from_slice(payload);
         buf
+    }
+
+    fn overwrite_file_bytes(path: &str, offset: u64, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn assert_table_meta_corruption(
+        err: Error,
+        page_id: PageID,
+        cause: PersistedPageCorruptionCause,
+    ) {
+        assert!(matches!(
+            err,
+            Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::TableMeta,
+                page_id: actual_page_id,
+                cause: actual_cause,
+            } if actual_page_id == page_id && actual_cause == cause
+        ));
+    }
+
+    #[test]
+    fn test_table_file_rejects_meta_checksum_corruption() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let table_id = 146;
+            let path = fs.table_file_path(table_id);
+            let table_file = fs
+                .create_table_file(table_id, build_test_metadata(), false)
+                .unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+            let active_meta_page_id = table_file.active_root().meta_page_id;
+            drop(table_file);
+            drop(fs);
+
+            let checksum_offset = active_meta_page_id * COW_FILE_PAGE_SIZE as u64
+                + (COW_FILE_PAGE_SIZE - PAGE_INTEGRITY_TRAILER_SIZE) as u64;
+            overwrite_file_bytes(&path, checksum_offset, &[0xff]);
+
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let err = match fs.open_table_file(table_id).await {
+                Ok(_) => panic!("expected table meta checksum corruption"),
+                Err(err) => err,
+            };
+            assert_table_meta_corruption(
+                err,
+                active_meta_page_id,
+                PersistedPageCorruptionCause::ChecksumMismatch,
+            );
+        });
+    }
+
+    #[test]
+    fn test_table_file_rejects_meta_version_mismatch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let table_id = 147;
+            let path = fs.table_file_path(table_id);
+            let table_file = fs
+                .create_table_file(table_id, build_test_metadata(), false)
+                .unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+            let active_meta_page_id = table_file.active_root().meta_page_id;
+            drop(table_file);
+            drop(fs);
+
+            let version_offset = active_meta_page_id * COW_FILE_PAGE_SIZE as u64
+                + TABLE_META_MAGIC_WORD.len() as u64;
+            overwrite_file_bytes(
+                &path,
+                version_offset,
+                &(TABLE_META_VERSION + 1).to_le_bytes(),
+            );
+
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let err = match fs.open_table_file(table_id).await {
+                Ok(_) => panic!("expected table meta version corruption"),
+                Err(err) => err,
+            };
+            assert_table_meta_corruption(
+                err,
+                active_meta_page_id,
+                PersistedPageCorruptionCause::InvalidVersion,
+            );
+        });
     }
 
     #[test]

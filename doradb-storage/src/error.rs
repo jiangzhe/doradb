@@ -1,10 +1,69 @@
+use crate::buffer::page::PageID;
 use crate::io::AIOError;
 use crate::row::RowID;
 use std::array::TryFromSliceError;
+use std::fmt;
 use std::ops::ControlFlow;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Identifies which persisted CoW file surfaced a corruption failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedFileKind {
+    TableFile,
+    CatalogMultiTableFile,
+}
+
+impl fmt::Display for PersistedFileKind {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PersistedFileKind::TableFile => "table-file",
+            PersistedFileKind::CatalogMultiTableFile => "catalog.mtb",
+        })
+    }
+}
+
+/// Identifies which persisted page kind failed integrity or root validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedPageKind {
+    TableMeta,
+    MultiTableMeta,
+}
+
+impl fmt::Display for PersistedPageKind {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PersistedPageKind::TableMeta => "table-meta",
+            PersistedPageKind::MultiTableMeta => "multi-table-meta",
+        })
+    }
+}
+
+/// Classifies why a persisted page was rejected during startup or checkpoint reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedPageCorruptionCause {
+    InvalidMagic,
+    InvalidVersion,
+    ChecksumMismatch,
+    InvalidPayload,
+    InvalidRootInvariant,
+}
+
+impl fmt::Display for PersistedPageCorruptionCause {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PersistedPageCorruptionCause::InvalidMagic => "invalid magic",
+            PersistedPageCorruptionCause::InvalidVersion => "invalid version",
+            PersistedPageCorruptionCause::ChecksumMismatch => "checksum mismatch",
+            PersistedPageCorruptionCause::InvalidPayload => "invalid payload",
+            PersistedPageCorruptionCause::InvalidRootInvariant => "invalid root invariant",
+        })
+    }
+}
 
 #[derive(Debug, Clone, Error)]
 pub enum Error {
@@ -71,6 +130,15 @@ pub enum Error {
     #[error("invalid column scan")]
     InvalidColumnScan,
     #[error(
+        "persisted page corrupted: file={file_kind}, page={page_kind}, page_id={page_id}, cause={cause}"
+    )]
+    PersistedPageCorrupted {
+        file_kind: PersistedFileKind,
+        page_kind: PersistedPageKind,
+        page_id: PageID,
+        cause: PersistedPageCorruptionCause,
+    },
+    #[error(
         "unexpected duplicate key during recovery index rebuild for index {index_no}: row_id={row_id}, deleted={deleted}"
     )]
     UnexpectedRecoveryDuplicateKey {
@@ -105,6 +173,24 @@ impl From<std::num::ParseIntError> for Error {
     #[inline]
     fn from(_src: std::num::ParseIntError) -> Error {
         Error::InvalidFormat
+    }
+}
+
+impl Error {
+    /// Constructs a contextual corruption error for one persisted CoW page.
+    #[inline]
+    pub fn persisted_page_corrupted(
+        file_kind: PersistedFileKind,
+        page_kind: PersistedPageKind,
+        page_id: PageID,
+        cause: PersistedPageCorruptionCause,
+    ) -> Self {
+        Error::PersistedPageCorrupted {
+            file_kind,
+            page_kind,
+            page_id,
+            cause,
+        }
     }
 }
 
