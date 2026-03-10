@@ -1,7 +1,7 @@
 ---
 id: 000060
 title: Checksum Rollout for Data Pages
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-10
 github_issue: 408
 ---
@@ -132,6 +132,60 @@ Reference:
     the new fully serialized page bytes and inherited corruption errors.
 
 ## Implementation Notes
+
+1. Implemented the phase-2 page-integrity rollout across all checkpointed
+   data-page kinds in scope:
+   - persisted LWC pages now validate the shared page-integrity envelope
+     before payload decode;
+   - column block-index nodes now validate through the shared envelope and
+     surface contextual `PersistedPageCorrupted` errors;
+   - deletion-blob pages now use the shared envelope instead of a
+     payload-local magic/version wrapper.
+2. Updated builders, writers, and capacity contracts to match the reduced
+   usable payload size:
+   - `doradb-storage/src/lwc/mod.rs` now emits full checksummed LWC page
+     images sized against `max_payload_len(COW_FILE_PAGE_SIZE)`;
+   - `doradb-storage/src/index/column_block_index.rs` recomputes node
+     capacities from the validated payload size and writes wrapped node pages;
+   - `doradb-storage/src/index/column_deletion_blob.rs` and
+     `doradb-storage/src/index/column_payload.rs` now enforce the new
+     deletion-blob body limits and blob-reference bounds.
+3. Normalized persisted read paths onto explicit validated decoding:
+   - table access, recovery, and catalog checkpoint readers all load raw
+     pages, validate the outer envelope, and then decode payload bytes through
+     persisted-aware helpers;
+   - catalog-side column-index reads carry explicit
+     `PersistedFileKind::CatalogMultiTableFile` context so corruption reports
+     remain file-specific.
+4. Review/cleanup outcomes completed during implementation:
+   - removed page-sized memcpy from the production column block-index read path
+     by introducing a borrowed validated-node wrapper over the readonly page
+     guard;
+   - moved test-only node copy helpers into the test module and deduplicated
+     shared read-only node accessors behind a private trait;
+   - classified persisted LWC `Error::NotSupported(_)` decode failures as
+     `PersistedPageCorrupted { cause: InvalidPayload }`;
+   - centralized persisted LWC row-id lookup and row materialization helpers
+     in `doradb-storage/src/lwc/page.rs` so access, recovery, and catalog
+     checkpoint no longer duplicate the same `column()/data()/value()` decode
+     loops.
+5. Added and extended regression coverage for the new contract:
+   - LWC persisted-page tests now cover checksum corruption, unsupported row-id
+     codecs, unsupported value codecs, and valid selected/full-row decode;
+   - column block-index tests now cover version corruption, invalid count
+     rejection, zero-copy traversal behavior, and the borrowed validated-node
+     accessors;
+   - deletion-blob tests now cover shared-envelope corruption plus both
+     single-page and cross-page blob reads.
+6. Verification executed for this task:
+   - `cargo test -p doradb-storage --no-default-features`
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+   - `cargo test -p doradb-storage --no-default-features index::column_block_index::tests:: -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features lwc::page::tests:: -- --nocapture`
+7. Delivery tracking:
+   - task issue: `#408`
+   - implementation PR: `#409`
+   - parent RFC: `docs/rfcs/0007-disk-page-integrity-for-cow-storage-files.md`
 
 ## Impacts
 

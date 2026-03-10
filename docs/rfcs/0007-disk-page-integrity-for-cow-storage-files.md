@@ -334,9 +334,9 @@ Reference:
   - Non-goals: no automatic older-root fallback on corruption; no compatibility
     or migration policy for pre-RFC files.
   - Task Doc: `docs/tasks/000060-checksum-rollout-for-data-pages.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#408`
+  - Phase Status: done
+  - Implementation Summary: 1. Implemented the phase-2 page-integrity rollout across LWC pages, column block-index nodes, and deletion-blob pages, including zero-copy column-block reads and centralized persisted LWC row decoding [Task Resolve Sync: docs/tasks/000060-checksum-rollout-for-data-pages.md @ 2026-03-11]
 
 - **Phase 3: Readonly-Cache Validation, Recovery Hardening, and Corruption Tests**
   - Scope: validate persisted pages before readonly-cache residency, convert raw
