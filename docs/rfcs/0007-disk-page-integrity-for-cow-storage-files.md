@@ -127,7 +127,7 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 
 ### Source Backlogs (Optional)
 
-- [B1] `docs/backlogs/000051-disk-page-checksum-mechanism.md`
+- [B1] `docs/backlogs/closed/000051-disk-page-checksum-mechanism.md`
 
 ## Decision
 
@@ -318,11 +318,11 @@ Reference:
   - Non-goals: no LWC, column block-index, or deletion-blob page migration yet;
     no redo-log format change.
   - Task Doc: `docs/tasks/000059-file-integrity-foundation.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#406`
+  - Phase Status: done
+  - Implementation Summary: 1. Implemented phase-1 CoW meta-page integrity across the table/catalog root [Task Resolve Sync: docs/tasks/000059-file-integrity-foundation.md @ 2026-03-10]
   - Related Backlogs:
-    - `docs/backlogs/000051-disk-page-checksum-mechanism.md`
+    - `docs/backlogs/closed/000051-disk-page-checksum-mechanism.md`
 
 - **Phase 2: Checksummed Rollout for Checkpointed Data Pages**
   - Scope: migrate LWC pages, column block-index nodes, and deletion-blob pages
@@ -399,7 +399,7 @@ preserve the on-disk contract and behavioral decisions defined above.
 
 ## References
 
-- `docs/backlogs/000051-disk-page-checksum-mechanism.md`
+- `docs/backlogs/closed/000051-disk-page-checksum-mechanism.md`
 - `docs/rfcs/0004-readonly-column-buffer-pool-program.md`
 - `docs/rfcs/0006-cache-first-unified-catalog-storage-refactor.md`
 - `docs/architecture.md`

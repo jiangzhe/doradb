@@ -3,16 +3,16 @@ use crate::serde::{Deser, Ser, Serde};
 use std::mem;
 
 /// Size in bytes of the fixed page-integrity header.
-pub const PAGE_INTEGRITY_HEADER_SIZE: usize = mem::size_of::<PageIntegrityHeader>();
+pub(crate) const PAGE_INTEGRITY_HEADER_SIZE: usize = mem::size_of::<PageIntegrityHeader>();
 /// Size in bytes of the fixed BLAKE3 checksum trailer.
-pub const PAGE_INTEGRITY_TRAILER_SIZE: usize = mem::size_of::<PageIntegrityTrailer>();
+pub(crate) const PAGE_INTEGRITY_TRAILER_SIZE: usize = mem::size_of::<PageIntegrityTrailer>();
 
 /// Expected page-envelope markers for one persisted CoW page kind.
 ///
 /// The shared integrity helpers use this to validate that a page belongs to
 /// the intended format before its payload is parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageIntegritySpec {
+pub(crate) struct PageIntegritySpec {
     /// Page-kind-specific magic bytes stored at the start of the page.
     pub magic_word: [u8; 8],
     /// Page-envelope version expected for the payload format.
@@ -22,7 +22,7 @@ pub struct PageIntegritySpec {
 impl PageIntegritySpec {
     /// Build one page-integrity specification for a concrete persisted page kind.
     #[inline]
-    pub const fn new(magic_word: [u8; 8], version: u64) -> Self {
+    pub(crate) const fn new(magic_word: [u8; 8], version: u64) -> Self {
         PageIntegritySpec {
             magic_word,
             version,
@@ -90,20 +90,23 @@ impl Deser for PageIntegrityTrailer {
 }
 
 /// Returns the starting byte offset of the checksum trailer for one page image.
+///
+/// Callers must provide a full persisted page image large enough to hold the
+/// shared header and trailer.
 #[inline]
-pub const fn checksum_offset(page_len: usize) -> usize {
+pub(crate) const fn checksum_offset(page_len: usize) -> usize {
     page_len - PAGE_INTEGRITY_TRAILER_SIZE
 }
 
 /// Returns the largest payload size that fits inside the shared integrity envelope.
 #[inline]
-pub const fn max_payload_len(page_len: usize) -> usize {
+pub(crate) const fn max_payload_len(page_len: usize) -> usize {
     page_len - PAGE_INTEGRITY_HEADER_SIZE - PAGE_INTEGRITY_TRAILER_SIZE
 }
 
 /// Writes the integrity header for one persisted page and returns payload start.
 #[inline]
-pub fn write_page_header(buf: &mut [u8], spec: PageIntegritySpec) -> usize {
+pub(crate) fn write_page_header(buf: &mut [u8], spec: PageIntegritySpec) -> usize {
     let header = PageIntegrityHeader {
         magic_word: spec.magic_word,
         version: spec.version,
@@ -113,7 +116,7 @@ pub fn write_page_header(buf: &mut [u8], spec: PageIntegritySpec) -> usize {
 
 /// Computes and writes the trailing BLAKE3 checksum for one full page image.
 #[inline]
-pub fn write_page_checksum(buf: &mut [u8]) {
+pub(crate) fn write_page_checksum(buf: &mut [u8]) {
     let trailer = PageIntegrityTrailer {
         b3sum: *blake3::hash(&buf[..checksum_offset(buf.len())]).as_bytes(),
     };
@@ -123,12 +126,17 @@ pub fn write_page_checksum(buf: &mut [u8]) {
 
 /// Validates one persisted page envelope and returns the payload slice on success.
 ///
-/// The checksum covers the whole page except the trailing checksum bytes.
+/// This helper expects a full fixed-size persisted page image. The checksum
+/// covers the whole page except the trailing checksum bytes.
 #[inline]
-pub fn validate_page(
+pub(crate) fn validate_page(
     buf: &[u8],
     expected: PageIntegritySpec,
 ) -> std::result::Result<&[u8], PersistedPageCorruptionCause> {
+    debug_assert!(
+        buf.len() >= PAGE_INTEGRITY_HEADER_SIZE + PAGE_INTEGRITY_TRAILER_SIZE,
+        "validate_page expects a full persisted page image"
+    );
     let (payload_start, header) = PageIntegrityHeader::deser(buf, 0)
         .map_err(|_| PersistedPageCorruptionCause::InvalidMagic)?;
     if header.magic_word != expected.magic_word {

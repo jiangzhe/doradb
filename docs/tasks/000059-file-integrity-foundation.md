@@ -1,7 +1,7 @@
 ---
 id: 000059
 title: File Integrity Foundation
-status: proposal
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-10
 github_issue: 406
 ---
@@ -113,6 +113,46 @@ re-opened to document invariant changes before completion.
      reopen paths and fresh checkpoints stay consistent.
 
 ## Implementation Notes
+
+1. Implemented phase-1 CoW meta-page integrity across the table/catalog root
+   open and publish path:
+   - added a shared `page_integrity` helper for the common page
+     header/checksum-trailer contract;
+   - added contextual persisted-page corruption classification in
+     `doradb-storage/src/error.rs`;
+   - extended `CowFile` with post-parse root validation so file open rejects
+     corrupt or invalid referenced meta pages before the root is accepted.
+2. Migrated both persisted meta-page formats to the new contract:
+   - table meta pages now carry explicit magic/version markers plus the shared
+     checksum trailer;
+   - `catalog.mtb` meta pages moved their magic/version validation to the
+     shared outer envelope while keeping payload semantics intact.
+3. Added the targeted corruption and root-load regression matrix called for by
+   this task:
+   - table and `catalog.mtb` reopen tests now cover checksum corruption and
+     magic/version mismatch;
+   - CoW root-open tests now cover super-slot fallback when a super page is
+     invalid and fail-fast behavior when the newest valid super page points to
+     invalid meta/root state.
+4. Review/cleanup outcomes completed during implementation:
+   - the shared page-integrity helpers were narrowed to `pub(crate)`, and
+     `validate_page()` now documents/asserts the current fixed-size persisted
+     page invariant used by production callers;
+   - a proposed `column_block_index_root` open-time validation change was
+     reviewed and intentionally not applied in this phase, because page-id
+     correctness remains a program invariant and real page-kind validation for
+     column-block-index pages belongs with later page-kind rollout work.
+5. Verification executed for this task:
+   - `cargo test -p doradb-storage --no-default-features`
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+   - `cargo test -p doradb-storage --no-default-features file::page_integrity::tests:: -- --nocapture`
+6. Delivery tracking:
+   - task issue: `#406`
+   - implementation PR: `#407`
+   - parent RFC: `docs/rfcs/0007-disk-page-integrity-for-cow-storage-files.md`
+   - source backlog archived to
+     `docs/backlogs/closed/000051-disk-page-checksum-mechanism.md`
+     during this resolve pass
 
 ## Impacts
 
