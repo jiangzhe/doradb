@@ -8,6 +8,8 @@ use crate::bitmap::Bitmap;
 use crate::catalog::TableMetadata;
 use crate::compression::*;
 use crate::error::{Error, Result};
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::file::page_integrity::{LWC_PAGE_SPEC, write_page_checksum, write_page_header};
 use crate::io::DirectBuf;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
 use crate::row::{RowID, RowPage};
@@ -652,9 +654,7 @@ impl<'a> Ser<'a> for LwcPrimitiveSer<'a> {
     }
 }
 
-const LWC_PAGE_SIZE: usize = 64 * 1024;
 const LWC_PAGE_HEADER_SIZE: usize = 24;
-const LWC_PAGE_FOOTER_SIZE: usize = 32;
 
 struct LwcColumnStats {
     min_i64: i64,
@@ -781,7 +781,7 @@ impl<'a> LwcBuilder<'a> {
         self.scan_page_stats(&view, &new_row_ids)?;
         self.buffer.scan(view)?;
         self.row_ids.extend(new_row_ids);
-        if self.estimate_size()? > LWC_PAGE_SIZE {
+        if self.estimate_size()? > LWC_PAGE_PAYLOAD_SIZE {
             self.rollback(snapshot);
             return Ok(false);
         }
@@ -887,16 +887,22 @@ impl<'a> LwcBuilder<'a> {
             first_col_offset,
         );
 
-        let mut buf = DirectBuf::zeroed(LWC_PAGE_SIZE);
-        buf.truncate(0);
-        buf.extend_ser(&header);
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let payload_start = write_page_header(buf.data_mut(), LWC_PAGE_SPEC);
+        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+        let page = LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end])?;
+        page.header = header;
+        let mut body_idx = 0;
         for offset in col_offsets {
-            buf.extend_ser(&offset);
+            body_idx = offset.ser(&mut page.body[..], body_idx);
         }
-        buf.extend_ser(&row_id_ser);
+        body_idx = row_id_ser.ser(&mut page.body[..], body_idx);
         for payload in column_payloads {
-            buf.extend_from_slice(&payload);
+            let end = body_idx + payload.len();
+            page.body[body_idx..end].copy_from_slice(&payload);
+            body_idx = end;
         }
+        write_page_checksum(buf.data_mut());
         Ok(buf)
     }
 
@@ -1003,7 +1009,6 @@ impl<'a> LwcBuilder<'a> {
         total += mem::size_of::<u16>() * self.metadata.col_count();
         total += estimate_row_ids_size(&self.row_ids);
         total += estimate_columns_size(self.metadata, &self.buffer, &self.stats, row_count)?;
-        total += LWC_PAGE_FOOTER_SIZE;
         Ok(total)
     }
 }
@@ -1597,6 +1602,7 @@ fn read_i8(input: &[u8]) -> Result<(i8, &[u8])> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::error::PersistedFileKind;
     use crate::io::AIOBuf;
     use crate::row::{Delete, InsertRow, RowPage};
     use crate::value::{MemVar, Val};
@@ -1940,7 +1946,9 @@ mod tests {
         assert!(appended);
         let buf = builder.build().unwrap();
 
-        let lwc_page = LwcPage::try_from_bytes(buf.as_bytes()).unwrap();
+        let lwc_page =
+            LwcPage::try_from_persisted_bytes(buf.as_bytes(), PersistedFileKind::TableFile, 1)
+                .unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, expected_rows.len());
         assert_eq!(
             lwc_page.header.first_row_id(),
@@ -2110,7 +2118,9 @@ mod tests {
         assert!(builder.append_row_page(&page).unwrap());
         let buf = builder.build().unwrap();
 
-        let lwc_page = LwcPage::try_from_bytes(buf.as_bytes()).unwrap();
+        let lwc_page =
+            LwcPage::try_from_persisted_bytes(buf.as_bytes(), PersistedFileKind::TableFile, 1)
+                .unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, rows.len());
 
         for (col_idx, expected_kind) in [

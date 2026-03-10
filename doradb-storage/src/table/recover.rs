@@ -1,12 +1,12 @@
 use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{Page, PageID};
-use crate::error::{Error, Result};
+use crate::error::{Error, PersistedFileKind, Result};
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_payload_deletion_deltas,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::{LwcData, LwcPage};
+use crate::lwc::{LwcPage, map_persisted_lwc_error};
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::table::{
@@ -15,10 +15,9 @@ use crate::table::{
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::TrxID;
 use crate::trx::row::ReadAllRows;
-use crate::value::{Val, ValKind};
+use crate::value::Val;
 use std::collections::HashMap;
 use std::future::Future;
-use std::mem;
 
 pub trait TableRecover {
     /// Recover row insert from redo log.
@@ -269,10 +268,18 @@ impl TableRecover for Table {
                 .disk_pool
                 .try_get_page_shared::<Page>(payload.block_id)
                 .await?;
-            let page = LwcPage::try_from_bytes(page_guard.page())?;
-            let row_ids = decode_lwc_row_ids(page)?;
+            let page = LwcPage::try_from_persisted_bytes(
+                page_guard.page(),
+                PersistedFileKind::TableFile,
+                payload.block_id,
+            )?;
+            let row_ids = decode_lwc_row_ids(payload.block_id, page)?;
             if row_ids.len() != page.header.row_count() as usize {
-                return Err(Error::InvalidCompressedData);
+                return Err(map_persisted_lwc_error(
+                    PersistedFileKind::TableFile,
+                    payload.block_id,
+                    Error::InvalidCompressedData,
+                ));
             }
 
             for (row_idx, row_id) in row_ids.into_iter().enumerate() {
@@ -288,13 +295,26 @@ impl TableRecover for Table {
 
                 let mut vals = Vec::with_capacity(self.metadata().col_count());
                 for col_idx in 0..self.metadata().col_count() {
-                    let column = page.column(self.metadata(), col_idx)?;
+                    let column = page.column(self.metadata(), col_idx).map_err(|err| {
+                        map_persisted_lwc_error(PersistedFileKind::TableFile, payload.block_id, err)
+                    })?;
                     if column.is_null(row_idx) {
                         vals.push(Val::Null);
                         continue;
                     }
-                    let data = column.data()?;
-                    let val = data.value(row_idx).ok_or(Error::InvalidCompressedData)?;
+                    let data = column.data().map_err(|err| {
+                        map_persisted_lwc_error(PersistedFileKind::TableFile, payload.block_id, err)
+                    })?;
+                    let val = data
+                        .value(row_idx)
+                        .ok_or(Error::InvalidCompressedData)
+                        .map_err(|err| {
+                            map_persisted_lwc_error(
+                                PersistedFileKind::TableFile,
+                                payload.block_id,
+                                err,
+                            )
+                        })?;
                     vals.push(val);
                 }
 
@@ -333,24 +353,9 @@ fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()>
     }
 }
 
-fn decode_lwc_row_ids(page: &LwcPage) -> Result<Vec<RowID>> {
-    let row_count = page.header.row_count() as usize;
-    let col_count = page.header.col_count() as usize;
-    let start_idx = col_count * mem::size_of::<u16>();
-    let end_idx = page.header.first_col_offset() as usize;
-    if end_idx > page.body.len() || start_idx > end_idx {
-        return Err(Error::InvalidCompressedData);
-    }
-    let row_id_data = LwcData::from_bytes(ValKind::U64, &page.body[start_idx..end_idx])?;
-    let mut row_ids = Vec::with_capacity(row_count);
-    for row_idx in 0..row_count {
-        let row_id = row_id_data
-            .value(row_idx)
-            .and_then(|v| v.as_u64())
-            .ok_or(Error::InvalidCompressedData)?;
-        row_ids.push(row_id);
-    }
-    Ok(row_ids)
+fn decode_lwc_row_ids(page_id: PageID, page: &LwcPage) -> Result<Vec<RowID>> {
+    page.decode_row_ids()
+        .map_err(|err| map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err))
 }
 
 #[cfg(test)]

@@ -1,9 +1,12 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
-use crate::buffer::page::BufferPage;
+use crate::buffer::page::PageID;
 use crate::catalog::TableMetadata;
-use crate::error::{Error, Result};
+use crate::error::{
+    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::file::page_integrity::{LWC_PAGE_SPEC, max_payload_len, validate_page};
 use crate::lwc::{
     FlatU64, ForBitpacking1, ForBitpacking2, ForBitpacking4, ForBitpacking8, ForBitpacking16,
     ForBitpacking32, LwcData, LwcNullBitmap, LwcPrimitive, LwcPrimitiveData, SortedPosition,
@@ -14,15 +17,13 @@ use crate::value::ValKind;
 use bytemuck::{Pod, Zeroable};
 use std::mem;
 
-#[expect(
-    dead_code,
-    reason = "reserved for future LWC page checksum/footer implementation"
-)]
-const LWC_PAGE_FOOTER_OFFSET: usize = COW_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>() - 32;
+/// Size in bytes of one validated persisted LWC payload, excluding the shared page envelope.
+pub const LWC_PAGE_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_SIZE);
 
-/// LwcPage stores compressioned data on disk.
-/// Its size is same as in-memory row page.
-/// The differences between LwcPage and row(PAX) page
+/// LwcPage stores the payload of one immutable checksummed LWC page.
+///
+/// The surrounding page-integrity envelope is validated before this payload is
+/// interpreted. The differences between LwcPage and row(PAX) page
 /// are:
 /// 1. Fields in row page are well aligned for typed access.
 ///    Fields in lwc page are not aligned, and often compressed
@@ -66,22 +67,14 @@ const LWC_PAGE_FOOTER_OFFSET: usize = COW_FILE_PAGE_SIZE - mem::size_of::<LwcPag
 /// |------------------|------------------------------------------------|
 /// ```
 ///
-/// Footer:
-///
-/// ```text
-/// |-------------------------|-----------|
-/// | field                   | length(B) |
-/// |-------------------------|-----------|
-/// | b3sum                   | 32        |
-/// |-------------------------|-----------|
-/// ```
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LwcPage {
-    // The conversion from disk page to mem page is not safe.
-    // We should use Ser and Deser for endianess safety.
+    // The conversion from raw bytes to payload view is not endianness-safe for
+    // arbitrary external input. Persisted callers must validate the outer page
+    // envelope first and only then cast the fixed-size payload bytes.
     pub header: LwcPageHeader,
-    pub body: [u8; COW_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>()],
+    pub body: [u8; LWC_PAGE_PAYLOAD_SIZE - mem::size_of::<LwcPageHeader>()],
 }
 
 // SAFETY: `LwcPage` is `repr(C)` and consists only of byte-array based fields.
@@ -91,7 +84,7 @@ unsafe impl Zeroable for LwcPage {}
 unsafe impl Pod for LwcPage {}
 
 impl LwcPage {
-    pub const BODY_SIZE: usize = COW_FILE_PAGE_SIZE - mem::size_of::<LwcPageHeader>();
+    pub const BODY_SIZE: usize = LWC_PAGE_PAYLOAD_SIZE - mem::size_of::<LwcPageHeader>();
 
     #[inline]
     pub fn try_from_bytes(input: &[u8]) -> Result<&Self> {
@@ -101,6 +94,20 @@ impl LwcPage {
     #[inline]
     pub fn try_from_bytes_mut(input: &mut [u8]) -> Result<&mut Self> {
         bytemuck::try_from_bytes_mut::<Self>(input).map_err(|_| Error::InvalidCompressedData)
+    }
+
+    /// Validates a full persisted LWC page image and returns its payload view.
+    #[inline]
+    pub fn try_from_persisted_bytes(
+        input: &[u8],
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<&Self> {
+        let payload = validate_page(input, LWC_PAGE_SPEC).map_err(|cause| {
+            Error::persisted_page_corrupted(file_kind, PersistedPageKind::LwcPage, page_id, cause)
+        })?;
+        Self::try_from_bytes(payload)
+            .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))
     }
 
     /// Read row from this page.
@@ -119,27 +126,21 @@ impl LwcPage {
 
     /// Returns row index for given row id.
     #[inline]
-    pub fn row_idx(&self, row_id: RowID) -> Option<usize> {
+    pub fn row_idx(&self, row_id: RowID) -> Result<Option<usize>> {
         if row_id < self.header.first_row_id() || row_id > self.header.last_row_id() {
-            return None;
+            return Ok(None);
         }
-        let start_idx = self.header.col_count() as usize * mem::size_of::<u16>();
-        let end_idx = self.header.first_col_offset() as usize;
-        debug_assert!(start_idx <= end_idx && end_idx <= self.body.len());
-        let row_id_set = match RowIDSet::from_bytes(&self.body[start_idx..end_idx]) {
-            Ok(set) => set,
-            Err(_) => {
-                debug_assert!(false, "invalid LWC row id set");
-                return None;
-            }
-        };
-        row_id_set.position(row_id)
+        let row_id_set = self.row_id_set()?;
+        Ok(row_id_set.position(row_id))
     }
 
     #[inline]
     fn row_id_set(&self) -> Result<RowIDSet<'_>> {
         let start_idx = self.header.col_count() as usize * mem::size_of::<u16>();
         let end_idx = self.header.first_col_offset() as usize;
+        if end_idx > self.body.len() || start_idx > end_idx {
+            return Err(Error::InvalidCompressedData);
+        }
         let input = &self.body[start_idx..end_idx];
         RowIDSet::from_bytes(input)
     }
@@ -198,9 +199,20 @@ impl LwcPage {
             })
         }
     }
-}
 
-impl BufferPage for LwcPage {}
+    /// Decodes the full sorted row-id list stored in this page payload.
+    #[inline]
+    pub fn decode_row_ids(&self) -> Result<Vec<RowID>> {
+        let row_count = self.header.row_count() as usize;
+        let row_id_set = self.row_id_set()?;
+        if row_id_set.len() != row_count {
+            return Err(Error::InvalidCompressedData);
+        }
+        let mut row_ids = Vec::with_capacity(row_count);
+        row_id_set.extend_to(&mut row_ids);
+        Ok(row_ids)
+    }
+}
 
 #[derive(Debug)]
 pub struct LwcColumn<'a> {
@@ -259,7 +271,7 @@ impl ColOffsets<'_> {
 
 const LWC_PAGE_HEADER_SIZE: usize = 24;
 const _: () = assert!(mem::size_of::<LwcPageHeader>() == LWC_PAGE_HEADER_SIZE);
-const _: () = assert!(mem::size_of::<LwcPage>() == COW_FILE_PAGE_SIZE);
+const _: () = assert!(mem::size_of::<LwcPage>() == LWC_PAGE_PAYLOAD_SIZE);
 
 /// Header of Lwc Page.
 /// The fields are all defined as byte array
@@ -347,6 +359,23 @@ impl Ser<'_> for LwcPageHeader {
     }
 }
 
+#[inline]
+pub(crate) fn map_persisted_lwc_error(
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+    err: Error,
+) -> Error {
+    match err {
+        Error::InvalidCompressedData | Error::InvalidFormat => Error::persisted_page_corrupted(
+            file_kind,
+            PersistedPageKind::LwcPage,
+            page_id,
+            PersistedPageCorruptionCause::InvalidPayload,
+        ),
+        other => other,
+    }
+}
+
 pub enum RowIDSet<'a> {
     B1(ForBitpacking1<'a, RowID>),
     B2(ForBitpacking2<'a, RowID>),
@@ -424,6 +453,8 @@ impl<'a> RowIDSet<'a> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::page_integrity::{write_page_checksum, write_page_header};
     use crate::io::DirectBuf;
     use crate::lwc::LwcPrimitiveSer;
 
@@ -499,9 +530,22 @@ mod tests {
         RowIDSet::from_bytes(buffer).unwrap()
     }
 
+    fn build_persisted_lwc_page() -> DirectBuf {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let payload_start = write_page_header(buf.data_mut(), LWC_PAGE_SPEC);
+        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+        let page =
+            LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]).unwrap();
+        page.header = LwcPageHeader::new(11, 19, 2, 1, 32);
+        page.body[0] = 0xAB;
+        page.body[1] = 0xCD;
+        write_page_checksum(buf.data_mut());
+        buf
+    }
+
     #[test]
     fn test_lwc_page() {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(LWC_PAGE_PAYLOAD_SIZE);
         let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         page.header = LwcPageHeader::new(100, 200, 50, 2, 312);
         assert!(page.header.first_row_id() == 100);
@@ -540,7 +584,7 @@ mod tests {
         let idx = null_ser.ser(&mut column_bytes[..], 0);
         column_bytes[idx..].copy_from_slice(&values_bytes);
 
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(LWC_PAGE_PAYLOAD_SIZE);
         let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         let col_offsets_len = mem::size_of::<u16>();
         let col_start = col_offsets_len + row_id_bytes.len();
@@ -575,7 +619,7 @@ mod tests {
             )],
             vec![],
         );
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(LWC_PAGE_PAYLOAD_SIZE);
         let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
         let col_offsets_len = mem::size_of::<u16>() * 2;
         let end_offset = col_offsets_len as u16;
@@ -589,14 +633,14 @@ mod tests {
 
     #[test]
     fn test_lwc_page_try_from_bytes_invalid_len() {
-        let bytes = [0u8; COW_FILE_PAGE_SIZE - 1];
+        let bytes = [0u8; LWC_PAGE_PAYLOAD_SIZE - 1];
         let err = LwcPage::try_from_bytes(&bytes);
         assert!(matches!(err, Err(Error::InvalidCompressedData)));
     }
 
     #[test]
     fn test_lwc_page_try_from_bytes_mut_roundtrip() {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let mut buf = DirectBuf::zeroed(LWC_PAGE_PAYLOAD_SIZE);
         {
             let page = LwcPage::try_from_bytes_mut(buf.data_mut()).unwrap();
             page.header = LwcPageHeader::new(11, 19, 2, 1, 32);
@@ -611,5 +655,27 @@ mod tests {
         assert_eq!(page.header.first_col_offset(), 32);
         assert_eq!(page.body[0], 0xAB);
         assert_eq!(page.body[1], 0xCD);
+    }
+
+    #[test]
+    fn test_lwc_page_rejects_persisted_checksum_corruption() {
+        let mut buf = build_persisted_lwc_page();
+        let last_idx = buf.data().len() - 1;
+        buf.data_mut()[last_idx] ^= 0xFF;
+
+        let err =
+            match LwcPage::try_from_persisted_bytes(buf.data(), PersistedFileKind::TableFile, 7) {
+                Ok(_) => panic!("expected LWC checksum corruption"),
+                Err(err) => err,
+            };
+        assert!(matches!(
+            err,
+            Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::LwcPage,
+                page_id: 7,
+                cause: PersistedPageCorruptionCause::ChecksumMismatch,
+            }
+        ));
     }
 }

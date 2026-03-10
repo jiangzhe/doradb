@@ -30,6 +30,9 @@ impl fmt::Display for PersistedFileKind {
 pub enum PersistedPageKind {
     TableMeta,
     MultiTableMeta,
+    LwcPage,
+    ColumnBlockIndex,
+    ColumnDeletionBlob,
 }
 
 impl fmt::Display for PersistedPageKind {
@@ -38,6 +41,9 @@ impl fmt::Display for PersistedPageKind {
         f.write_str(match self {
             PersistedPageKind::TableMeta => "table-meta",
             PersistedPageKind::MultiTableMeta => "multi-table-meta",
+            PersistedPageKind::LwcPage => "lwc-page",
+            PersistedPageKind::ColumnBlockIndex => "column-block-index",
+            PersistedPageKind::ColumnDeletionBlob => "column-deletion-blob",
         })
     }
 }

@@ -3,14 +3,14 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
 use crate::catalog::{CatalogTable, TableID, TableMetadata};
-use crate::error::{Error, Result};
+use crate::error::{Error, PersistedFileKind, Result};
 use crate::index::util::Maskable;
 use crate::index::{
     BlockIndex, GenericNonUniqueBTreeIndex, GenericSecondaryIndex, GenericUniqueBTreeIndex,
     IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::LwcPage;
+use crate::lwc::{LwcPage, map_persisted_lwc_error};
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey,
     SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
@@ -300,20 +300,36 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             return Err(Error::InvalidState);
         };
         let page_guard = disk_pool.try_get_page_shared::<Page>(page_id).await?;
-        let page = LwcPage::try_from_bytes(page_guard.page())?;
-        let Some(row_idx) = page.row_idx(row_id) else {
+        let page = LwcPage::try_from_persisted_bytes(
+            page_guard.page(),
+            PersistedFileKind::TableFile,
+            page_id,
+        )?;
+        let Some(row_idx) = page
+            .row_idx(row_id)
+            .map_err(|err| map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err))?
+        else {
             return Ok(None);
         };
         let metadata = self.metadata();
         let mut vals = Vec::with_capacity(read_set.len());
         for &col_idx in read_set {
-            let column = page.column(metadata, col_idx)?;
+            let column = page.column(metadata, col_idx).map_err(|err| {
+                map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err)
+            })?;
             if column.is_null(row_idx) {
                 vals.push(Val::Null);
                 continue;
             }
-            let data = column.data()?;
-            let val = data.value(row_idx).ok_or(Error::InvalidCompressedData)?;
+            let data = column.data().map_err(|err| {
+                map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err)
+            })?;
+            let val = data
+                .value(row_idx)
+                .ok_or(Error::InvalidCompressedData)
+                .map_err(|err| {
+                    map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err)
+                })?;
             vals.push(val);
         }
         Ok(Some(vals))
