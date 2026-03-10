@@ -13,7 +13,7 @@ use crate::lwc::{
 };
 use crate::row::RowID;
 use crate::serde::{Ser, Serde};
-use crate::value::ValKind;
+use crate::value::{Val, ValKind};
 use bytemuck::{Pod, Zeroable};
 use std::mem;
 
@@ -134,6 +134,19 @@ impl LwcPage {
         Ok(row_id_set.position(row_id))
     }
 
+    /// Returns row index for a persisted page row id and maps payload failures
+    /// to contextual persisted-page corruption.
+    #[inline]
+    pub fn find_persisted_row_idx(
+        &self,
+        row_id: RowID,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<Option<usize>> {
+        self.row_idx(row_id)
+            .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))
+    }
+
     #[inline]
     fn row_id_set(&self) -> Result<RowIDSet<'_>> {
         let start_idx = self.header.col_count() as usize * mem::size_of::<u16>();
@@ -211,6 +224,100 @@ impl LwcPage {
         let mut row_ids = Vec::with_capacity(row_count);
         row_id_set.extend_to(&mut row_ids);
         Ok(row_ids)
+    }
+
+    /// Decodes all row ids from a persisted page and maps payload failures to
+    /// contextual persisted-page corruption.
+    #[inline]
+    pub fn decode_persisted_row_ids(
+        &self,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<Vec<RowID>> {
+        self.decode_row_ids()
+            .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))
+    }
+
+    /// Decodes selected values from one persisted page row in the requested
+    /// column order and maps payload failures to contextual persisted-page
+    /// corruption.
+    #[inline]
+    pub fn decode_persisted_row_values(
+        &self,
+        metadata: &TableMetadata,
+        row_idx: usize,
+        read_set: &[usize],
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<Vec<Val>> {
+        self.decode_persisted_row_values_inner(
+            metadata,
+            row_idx,
+            read_set.iter().copied(),
+            read_set.len(),
+            file_kind,
+            page_id,
+        )
+    }
+
+    /// Decodes all values from one persisted page row and maps payload
+    /// failures to contextual persisted-page corruption.
+    #[inline]
+    pub fn decode_persisted_full_row_values(
+        &self,
+        metadata: &TableMetadata,
+        row_idx: usize,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<Vec<Val>> {
+        self.decode_persisted_row_values_inner(
+            metadata,
+            row_idx,
+            0..metadata.col_count(),
+            metadata.col_count(),
+            file_kind,
+            page_id,
+        )
+    }
+
+    #[inline]
+    fn decode_persisted_row_values_inner(
+        &self,
+        metadata: &TableMetadata,
+        row_idx: usize,
+        col_indices: impl Iterator<Item = usize>,
+        capacity: usize,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<Vec<Val>> {
+        let mut vals = Vec::with_capacity(capacity);
+        for col_idx in col_indices {
+            vals.push(self.decode_persisted_value(metadata, row_idx, col_idx, file_kind, page_id)?);
+        }
+        Ok(vals)
+    }
+
+    #[inline]
+    fn decode_persisted_value(
+        &self,
+        metadata: &TableMetadata,
+        row_idx: usize,
+        col_idx: usize,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<Val> {
+        let column = self
+            .column(metadata, col_idx)
+            .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))?;
+        if column.is_null(row_idx) {
+            return Ok(Val::Null);
+        }
+        let data = column
+            .data()
+            .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))?;
+        data.value(row_idx)
+            .ok_or(Error::InvalidCompressedData)
+            .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))
     }
 }
 
@@ -366,12 +473,14 @@ pub(crate) fn map_persisted_lwc_error(
     err: Error,
 ) -> Error {
     match err {
-        Error::InvalidCompressedData | Error::InvalidFormat => Error::persisted_page_corrupted(
-            file_kind,
-            PersistedPageKind::LwcPage,
-            page_id,
-            PersistedPageCorruptionCause::InvalidPayload,
-        ),
+        Error::InvalidCompressedData | Error::InvalidFormat | Error::NotSupported(_) => {
+            Error::persisted_page_corrupted(
+                file_kind,
+                PersistedPageKind::LwcPage,
+                page_id,
+                PersistedPageCorruptionCause::InvalidPayload,
+            )
+        }
         other => other,
     }
 }
@@ -452,11 +561,15 @@ impl<'a> RowIDSet<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
-    use crate::file::page_integrity::{write_page_checksum, write_page_header};
+    use crate::file::page_integrity::{
+        PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum, write_page_header,
+    };
     use crate::io::DirectBuf;
-    use crate::lwc::LwcPrimitiveSer;
+    use crate::lwc::{LwcBuilder, LwcCode, LwcPrimitiveSer};
+    use crate::row::{InsertRow, RowPage};
+    use crate::value::Val;
 
     #[test]
     fn test_row_id_set() {
@@ -541,6 +654,36 @@ mod tests {
         page.body[1] = 0xCD;
         write_page_checksum(buf.data_mut());
         buf
+    }
+
+    fn build_valid_persisted_lwc_page() -> (TableMetadata, DirectBuf) {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::NULLABLE),
+            ],
+            vec![],
+        );
+        let mut page = RowPage::new_test_page();
+        page.init(100, 8, &metadata);
+        assert!(matches!(
+            page.insert(&metadata, &[Val::U8(10), Val::I16(20)]),
+            InsertRow::Ok(_)
+        ));
+        assert!(matches!(
+            page.insert(&metadata, &[Val::U8(11), Val::Null]),
+            InsertRow::Ok(_)
+        ));
+        assert!(matches!(
+            page.insert(&metadata, &[Val::U8(12), Val::I16(22)]),
+            InsertRow::Ok(_)
+        ));
+        let buf = {
+            let mut builder = LwcBuilder::new(&metadata);
+            assert!(builder.append_row_page(&page).unwrap());
+            builder.build().unwrap()
+        };
+        (metadata, buf)
     }
 
     #[test]
@@ -675,6 +818,123 @@ mod tests {
                 page_kind: PersistedPageKind::LwcPage,
                 page_id: 7,
                 cause: PersistedPageCorruptionCause::ChecksumMismatch,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_lwc_page_decode_persisted_row_values() {
+        let (metadata, buf) = build_valid_persisted_lwc_page();
+        let page =
+            LwcPage::try_from_persisted_bytes(buf.data(), PersistedFileKind::TableFile, 8).unwrap();
+        let row_idx = page
+            .find_persisted_row_idx(101, PersistedFileKind::TableFile, 8)
+            .unwrap()
+            .unwrap();
+        let vals = page
+            .decode_persisted_row_values(
+                &metadata,
+                row_idx,
+                &[1, 0],
+                PersistedFileKind::TableFile,
+                8,
+            )
+            .unwrap();
+        assert_eq!(vals, vec![Val::Null, Val::U8(11)]);
+        assert_eq!(
+            page.find_persisted_row_idx(999, PersistedFileKind::TableFile, 8)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_lwc_page_decode_persisted_full_row_values() {
+        let (metadata, buf) = build_valid_persisted_lwc_page();
+        let page =
+            LwcPage::try_from_persisted_bytes(buf.data(), PersistedFileKind::TableFile, 8).unwrap();
+        assert_eq!(
+            page.decode_persisted_row_ids(PersistedFileKind::TableFile, 8)
+                .unwrap(),
+            vec![100, 101, 102]
+        );
+        assert_eq!(
+            page.decode_persisted_full_row_values(&metadata, 0, PersistedFileKind::TableFile, 8,)
+                .unwrap(),
+            vec![Val::U8(10), Val::I16(20)]
+        );
+    }
+
+    #[test]
+    fn test_lwc_page_maps_persisted_row_id_not_supported_to_corruption() {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let payload_start = write_page_header(buf.data_mut(), LWC_PAGE_SPEC);
+        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+        let page =
+            LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]).unwrap();
+
+        let mut row_id_bytes = vec![LwcCode::ForBitpacking as u8, 3];
+        row_id_bytes.extend_from_slice(&1u64.to_le_bytes());
+        row_id_bytes.extend_from_slice(&0u64.to_le_bytes());
+        row_id_bytes.push(0);
+
+        page.header = LwcPageHeader::new(0, 0, 1, 0, row_id_bytes.len() as u16);
+        page.body[..row_id_bytes.len()].copy_from_slice(&row_id_bytes);
+        write_page_checksum(buf.data_mut());
+
+        let page =
+            LwcPage::try_from_persisted_bytes(buf.data(), PersistedFileKind::TableFile, 9).unwrap();
+        let err = match page.find_persisted_row_idx(0, PersistedFileKind::TableFile, 9) {
+            Ok(_) => panic!("expected unsupported persisted row-id codec"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::LwcPage,
+                page_id: 9,
+                cause: PersistedPageCorruptionCause::InvalidPayload,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_lwc_page_maps_persisted_value_decode_error_to_corruption() {
+        let (metadata, mut buf) = build_valid_persisted_lwc_page();
+        let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+        {
+            let page = LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end])
+                .unwrap();
+            let (start_idx, end_idx) = page.col_offsets().get(0).unwrap();
+            let column = &mut page.body[start_idx..end_idx];
+            let data_len = column.len().saturating_sub(11);
+            let len = if data_len == 0 {
+                0
+            } else {
+                (((data_len - 1) * 8) / 3 + 1) as u64
+            };
+            column[0] = LwcCode::ForBitpacking as u8;
+            column[1] = 3;
+            column[2..10].copy_from_slice(&len.to_le_bytes());
+            column[10] = 0;
+            column[11..].fill(0);
+        }
+        write_page_checksum(buf.data_mut());
+
+        let page = LwcPage::try_from_persisted_bytes(buf.data(), PersistedFileKind::TableFile, 10)
+            .unwrap();
+        let err = page
+            .decode_persisted_full_row_values(&metadata, 0, PersistedFileKind::TableFile, 10)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::LwcPage,
+                page_id: 10,
+                cause: PersistedPageCorruptionCause::InvalidPayload,
             }
         ));
     }

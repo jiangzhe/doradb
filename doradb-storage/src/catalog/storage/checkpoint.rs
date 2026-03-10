@@ -14,7 +14,7 @@ use crate::index::{
     encode_deletion_deltas_to_bytes, load_payload_deletion_deltas,
 };
 use crate::io::DirectBuf;
-use crate::lwc::{LwcBuilder, LwcPage, map_persisted_lwc_error};
+use crate::lwc::{LwcBuilder, LwcPage};
 use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowID, RowPage};
 use crate::table::TableAccess;
@@ -485,44 +485,16 @@ impl CatalogStorage {
             page_id,
         )?;
         let row_count = lwc_page.header.row_count() as usize;
-        let row_ids = decode_lwc_row_ids(page_id, lwc_page)?;
-        if row_ids.len() != row_count {
-            return Err(map_persisted_lwc_error(
-                PersistedFileKind::CatalogMultiTableFile,
-                page_id,
-                Error::InvalidCompressedData,
-            ));
-        }
+        let row_ids =
+            lwc_page.decode_persisted_row_ids(PersistedFileKind::CatalogMultiTableFile, page_id)?;
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-            let mut vals = Vec::with_capacity(metadata.col_count());
-            for col_idx in 0..metadata.col_count() {
-                let column = lwc_page.column(metadata, col_idx).map_err(|err| {
-                    map_persisted_lwc_error(PersistedFileKind::CatalogMultiTableFile, page_id, err)
-                })?;
-                if column.is_null(row_idx) {
-                    vals.push(Val::Null);
-                } else {
-                    let data = column.data().map_err(|err| {
-                        map_persisted_lwc_error(
-                            PersistedFileKind::CatalogMultiTableFile,
-                            page_id,
-                            err,
-                        )
-                    })?;
-                    let val = data
-                        .value(row_idx)
-                        .ok_or(Error::InvalidCompressedData)
-                        .map_err(|err| {
-                            map_persisted_lwc_error(
-                                PersistedFileKind::CatalogMultiTableFile,
-                                page_id,
-                                err,
-                            )
-                        })?;
-                    vals.push(val);
-                }
-            }
+            let vals = lwc_page.decode_persisted_full_row_values(
+                metadata,
+                row_idx,
+                PersistedFileKind::CatalogMultiTableFile,
+                page_id,
+            )?;
             rows.push(RowRecord { row_id, vals });
         }
         Ok(rows)
@@ -647,12 +619,6 @@ fn append_single_row_to_builder(
         }
     }
     builder.append_row_page(temp_page.page())
-}
-
-fn decode_lwc_row_ids(page_id: PageID, page: &LwcPage) -> Result<Vec<RowID>> {
-    page.decode_row_ids().map_err(|err| {
-        map_persisted_lwc_error(PersistedFileKind::CatalogMultiTableFile, page_id, err)
-    })
 }
 
 fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bool {

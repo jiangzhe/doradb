@@ -6,7 +6,7 @@ use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_payload_deletion_deltas,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::{LwcPage, map_persisted_lwc_error};
+use crate::lwc::LwcPage;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::table::{
@@ -273,14 +273,8 @@ impl TableRecover for Table {
                 PersistedFileKind::TableFile,
                 payload.block_id,
             )?;
-            let row_ids = decode_lwc_row_ids(payload.block_id, page)?;
-            if row_ids.len() != page.header.row_count() as usize {
-                return Err(map_persisted_lwc_error(
-                    PersistedFileKind::TableFile,
-                    payload.block_id,
-                    Error::InvalidCompressedData,
-                ));
-            }
+            let row_ids =
+                page.decode_persisted_row_ids(PersistedFileKind::TableFile, payload.block_id)?;
 
             for (row_idx, row_id) in row_ids.into_iter().enumerate() {
                 let delta = row_id
@@ -293,30 +287,12 @@ impl TableRecover for Table {
                     continue;
                 }
 
-                let mut vals = Vec::with_capacity(self.metadata().col_count());
-                for col_idx in 0..self.metadata().col_count() {
-                    let column = page.column(self.metadata(), col_idx).map_err(|err| {
-                        map_persisted_lwc_error(PersistedFileKind::TableFile, payload.block_id, err)
-                    })?;
-                    if column.is_null(row_idx) {
-                        vals.push(Val::Null);
-                        continue;
-                    }
-                    let data = column.data().map_err(|err| {
-                        map_persisted_lwc_error(PersistedFileKind::TableFile, payload.block_id, err)
-                    })?;
-                    let val = data
-                        .value(row_idx)
-                        .ok_or(Error::InvalidCompressedData)
-                        .map_err(|err| {
-                            map_persisted_lwc_error(
-                                PersistedFileKind::TableFile,
-                                payload.block_id,
-                                err,
-                            )
-                        })?;
-                    vals.push(val);
-                }
+                let vals = page.decode_persisted_full_row_values(
+                    self.metadata(),
+                    row_idx,
+                    PersistedFileKind::TableFile,
+                    payload.block_id,
+                )?;
 
                 for key in self.metadata().keys_for_insert(&vals) {
                     if self.metadata().index_specs[key.index_no].unique() {
@@ -351,11 +327,6 @@ fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()>
             deleted,
         }),
     }
-}
-
-fn decode_lwc_row_ids(page_id: PageID, page: &LwcPage) -> Result<Vec<RowID>> {
-    page.decode_row_ids()
-        .map_err(|err| map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err))
 }
 
 #[cfg(test)]

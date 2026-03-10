@@ -10,7 +10,7 @@ use crate::index::{
     IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::{LwcPage, map_persisted_lwc_error};
+use crate::lwc::LwcPage;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey,
     SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
@@ -305,34 +305,19 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             PersistedFileKind::TableFile,
             page_id,
         )?;
-        let Some(row_idx) = page
-            .row_idx(row_id)
-            .map_err(|err| map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err))?
+        let Some(row_idx) =
+            page.find_persisted_row_idx(row_id, PersistedFileKind::TableFile, page_id)?
         else {
             return Ok(None);
         };
-        let metadata = self.metadata();
-        let mut vals = Vec::with_capacity(read_set.len());
-        for &col_idx in read_set {
-            let column = page.column(metadata, col_idx).map_err(|err| {
-                map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err)
-            })?;
-            if column.is_null(row_idx) {
-                vals.push(Val::Null);
-                continue;
-            }
-            let data = column.data().map_err(|err| {
-                map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err)
-            })?;
-            let val = data
-                .value(row_idx)
-                .ok_or(Error::InvalidCompressedData)
-                .map_err(|err| {
-                    map_persisted_lwc_error(PersistedFileKind::TableFile, page_id, err)
-                })?;
-            vals.push(val);
-        }
-        Ok(Some(vals))
+        page.decode_persisted_row_values(
+            self.metadata(),
+            row_idx,
+            read_set,
+            PersistedFileKind::TableFile,
+            page_id,
+        )
+        .map(Some)
     }
 
     #[inline]
