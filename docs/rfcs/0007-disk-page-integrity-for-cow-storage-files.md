@@ -333,7 +333,7 @@ Reference:
     persistence is self-identifying and self-validating.
   - Non-goals: no automatic older-root fallback on corruption; no compatibility
     or migration policy for pre-RFC files.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000060-checksum-rollout-for-data-pages.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
