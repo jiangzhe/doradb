@@ -1,19 +1,25 @@
 use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{Page, PageID};
-use crate::error::{Error, Result};
+use crate::error::{
+    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
+use crate::file::page_integrity::{
+    COLUMN_DELETION_BLOB_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
+    write_page_checksum, write_page_header,
+};
 use crate::index::column_payload::BlobRef;
 use crate::io::DirectBuf;
 use futures::future::try_join_all;
+use std::mem;
 
-const COLUMN_DELETION_BLOB_MAGIC: [u8; 4] = *b"CDBP";
-const COLUMN_DELETION_BLOB_VERSION: u8 = 1;
-const COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET: usize = 8;
-const COLUMN_DELETION_BLOB_USED_SIZE_OFFSET: usize = 16;
-pub const COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE: usize = 20;
+const COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET: usize = 0;
+const COLUMN_DELETION_BLOB_USED_SIZE_OFFSET: usize = mem::size_of::<PageID>();
+pub const COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE: usize =
+    mem::size_of::<PageID>() + mem::size_of::<u16>();
 pub const COLUMN_DELETION_BLOB_PAGE_BODY_SIZE: usize =
-    COW_FILE_PAGE_SIZE - COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE;
+    max_payload_len(COW_FILE_PAGE_SIZE) - COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE;
 
 struct BlobPageHeader {
     next_page_id: PageID,
@@ -21,15 +27,6 @@ struct BlobPageHeader {
 }
 
 fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
-    if page.len() != COW_FILE_PAGE_SIZE {
-        return Err(Error::InvalidState);
-    }
-    if page[..4] != COLUMN_DELETION_BLOB_MAGIC {
-        return Err(Error::InvalidFormat);
-    }
-    if page[4] != COLUMN_DELETION_BLOB_VERSION {
-        return Err(Error::InvalidFormat);
-    }
     let next_page_id = u64::from_le_bytes(
         page[COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET..COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET + 8]
             .try_into()?,
@@ -47,6 +44,28 @@ fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
     })
 }
 
+#[inline]
+fn invalid_blob_payload(file_kind: PersistedFileKind, page_id: PageID) -> Error {
+    Error::persisted_page_corrupted(
+        file_kind,
+        PersistedPageKind::ColumnDeletionBlob,
+        page_id,
+        PersistedPageCorruptionCause::InvalidPayload,
+    )
+}
+
+#[inline]
+fn validate_blob_page(page: &[u8], file_kind: PersistedFileKind, page_id: PageID) -> Result<&[u8]> {
+    validate_page(page, COLUMN_DELETION_BLOB_PAGE_SPEC).map_err(|cause| {
+        Error::persisted_page_corrupted(
+            file_kind,
+            PersistedPageKind::ColumnDeletionBlob,
+            page_id,
+            cause,
+        )
+    })
+}
+
 pub(crate) struct BlobPageChunk<'a> {
     pub bytes: &'a [u8],
     pub next_page_id: PageID,
@@ -57,26 +76,32 @@ pub(crate) struct BlobPageChunk<'a> {
 /// `remaining` is the number of bytes still expected for the target blob.
 pub(crate) fn read_blob_page_chunk(
     page: &[u8],
+    file_kind: PersistedFileKind,
+    page_id: PageID,
     offset: usize,
     remaining: usize,
 ) -> Result<BlobPageChunk<'_>> {
     if remaining == 0 {
         return Err(Error::InvalidArgument);
     }
-    let header = decode_blob_page_header(page)?;
+    let payload = validate_blob_page(page, file_kind, page_id)?;
+    let header = decode_blob_page_header(payload).map_err(|err| match err {
+        Error::InvalidFormat => invalid_blob_payload(file_kind, page_id),
+        other => other,
+    })?;
     let used_size = header.used_size as usize;
     if offset >= used_size {
-        return Err(Error::InvalidFormat);
+        return Err(invalid_blob_payload(file_kind, page_id));
     }
     let available = used_size - offset;
     let take = available.min(remaining);
     if take < remaining && header.next_page_id == 0 {
-        return Err(Error::InvalidFormat);
+        return Err(invalid_blob_payload(file_kind, page_id));
     }
     let body_start = COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + offset;
     let body_end = body_start + take;
     Ok(BlobPageChunk {
-        bytes: &page[body_start..body_end],
+        bytes: &payload[body_start..body_end],
         next_page_id: header.next_page_id,
     })
 }
@@ -86,8 +111,6 @@ fn encode_blob_page_header(buf: &mut [u8], next_page_id: PageID, used_size: usiz
         return Err(Error::InvalidArgument);
     }
     buf[..COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE].fill(0);
-    buf[..4].copy_from_slice(&COLUMN_DELETION_BLOB_MAGIC);
-    buf[4] = COLUMN_DELETION_BLOB_VERSION;
     buf[COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET..COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET + 8]
         .copy_from_slice(&next_page_id.to_le_bytes());
     buf[COLUMN_DELETION_BLOB_USED_SIZE_OFFSET..COLUMN_DELETION_BLOB_USED_SIZE_OFFSET + 2]
@@ -104,10 +127,13 @@ struct PendingBlobPage {
 impl PendingBlobPage {
     #[inline]
     fn new(page_id: PageID) -> Self {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let payload_start = write_page_header(buf.data_mut(), COLUMN_DELETION_BLOB_PAGE_SPEC);
+        debug_assert_eq!(payload_start, PAGE_INTEGRITY_HEADER_SIZE);
         PendingBlobPage {
             page_id,
             used_size: 0,
-            buf: DirectBuf::zeroed(COW_FILE_PAGE_SIZE),
+            buf,
         }
     }
 
@@ -119,7 +145,8 @@ impl PendingBlobPage {
     #[inline]
     fn write_bytes(&mut self, src: &[u8]) {
         debug_assert!(src.len() <= self.free_space());
-        let start = COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + self.used_size;
+        let start =
+            PAGE_INTEGRITY_HEADER_SIZE + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + self.used_size;
         let end = start + src.len();
         self.buf.data_mut()[start..end].copy_from_slice(src);
         self.used_size += src.len();
@@ -196,11 +223,13 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         let sealed_pages = std::mem::take(&mut self.sealed_pages);
         let mut writes = Vec::with_capacity(sealed_pages.len());
         for mut sealed in sealed_pages {
+            let payload_end = PAGE_INTEGRITY_HEADER_SIZE + max_payload_len(COW_FILE_PAGE_SIZE);
             encode_blob_page_header(
-                sealed.page.buf.data_mut(),
+                &mut sealed.page.buf.data_mut()[PAGE_INTEGRITY_HEADER_SIZE..payload_end],
                 sealed.next_page_id,
                 sealed.page.used_size,
             )?;
+            write_page_checksum(sealed.page.buf.data_mut());
             writes.push(
                 self.mutable_file
                     .write_page(sealed.page.page_id, sealed.page.buf),
@@ -232,12 +261,16 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
 /// Reader for immutable deletion blobs referenced by `BlobRef`.
 pub struct ColumnDeletionBlobReader<'a> {
     disk_pool: &'a ReadonlyBufferPool,
+    file_kind: PersistedFileKind,
 }
 
 impl<'a> ColumnDeletionBlobReader<'a> {
     #[inline]
-    pub fn new(disk_pool: &'a ReadonlyBufferPool) -> Self {
-        ColumnDeletionBlobReader { disk_pool }
+    pub fn new(file_kind: PersistedFileKind, disk_pool: &'a ReadonlyBufferPool) -> Self {
+        ColumnDeletionBlobReader {
+            disk_pool,
+            file_kind,
+        }
     }
 
     /// Reads one blob by traversing linked immutable blob pages.
@@ -252,7 +285,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         while remaining > 0 {
             let g = self.disk_pool.try_get_page_shared::<Page>(page_id).await?;
             let page = g.page();
-            let chunk = read_blob_page_chunk(page, offset, remaining)?;
+            let chunk = read_blob_page_chunk(page, self.file_kind, page_id, offset, remaining)?;
             out.extend_from_slice(chunk.bytes);
             remaining -= chunk.bytes.len();
             if remaining == 0 {
@@ -272,6 +305,7 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableMetadata,
     };
+    use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::index::column_payload::BlobRef;
@@ -315,6 +349,17 @@ mod tests {
         ReadonlyBufferPool::new(table_id, Arc::clone(table_file), global_readonly_pool())
     }
 
+    fn build_persisted_blob_page() -> DirectBuf {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let payload_start = write_page_header(buf.data_mut(), COLUMN_DELETION_BLOB_PAGE_SPEC);
+        let payload_end = payload_start + max_payload_len(COW_FILE_PAGE_SIZE);
+        encode_blob_page_header(&mut buf.data_mut()[payload_start..payload_end], 0, 4).unwrap();
+        let body_start = payload_start + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE;
+        buf.data_mut()[body_start..body_start + 4].copy_from_slice(b"blob");
+        write_page_checksum(buf.data_mut());
+        buf
+    }
+
     #[test]
     fn test_blob_writer_reader_shared_page() {
         run_with_large_stack(|| {
@@ -343,7 +388,8 @@ mod tests {
                 assert_eq!(ref_a.start_offset, 0);
                 assert_eq!(ref_b.start_offset, blob_a.len() as u16);
 
-                let reader = ColumnDeletionBlobReader::new(&disk_pool);
+                let reader =
+                    ColumnDeletionBlobReader::new(PersistedFileKind::TableFile, &disk_pool);
                 assert_eq!(reader.read(ref_a).await.unwrap(), blob_a);
                 assert_eq!(reader.read(ref_b).await.unwrap(), blob_b);
 
@@ -383,7 +429,8 @@ mod tests {
                         byte_len: blob.len() as u32
                     }
                 );
-                let reader = ColumnDeletionBlobReader::new(&disk_pool);
+                let reader =
+                    ColumnDeletionBlobReader::new(PersistedFileKind::TableFile, &disk_pool);
                 assert_eq!(reader.read(blob_ref).await.unwrap(), blob);
 
                 drop(table_file);
@@ -391,5 +438,31 @@ mod tests {
                 let _ = std::fs::remove_file("252.tbl");
             })
         });
+    }
+
+    #[test]
+    fn test_blob_page_rejects_magic_corruption() {
+        let mut buf = build_persisted_blob_page();
+        buf.data_mut()[0] ^= 0xFF;
+
+        let err = match read_blob_page_chunk(
+            buf.data(),
+            PersistedFileKind::CatalogMultiTableFile,
+            29,
+            0,
+            1,
+        ) {
+            Ok(_) => panic!("expected deletion-blob magic corruption"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::CatalogMultiTableFile,
+                page_kind: PersistedPageKind::ColumnDeletionBlob,
+                page_id: 29,
+                cause: PersistedPageCorruptionCause::InvalidMagic,
+            }
+        ));
     }
 }

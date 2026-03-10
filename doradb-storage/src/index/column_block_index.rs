@@ -1,8 +1,14 @@
 use crate::buffer::ReadonlyBufferPool;
-use crate::buffer::guard::PageGuard;
-use crate::buffer::page::{BufferPage, PageID};
-use crate::error::{Error, Result};
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
+use crate::buffer::page::{Page, PageID};
+use crate::error::{
+    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
+use crate::file::page_integrity::{
+    COLUMN_BLOCK_INDEX_PAGE_SPEC, max_payload_len, validate_page, write_page_checksum,
+    write_page_header,
+};
 use crate::index::column_deletion_blob::{ColumnDeletionBlobReader, ColumnDeletionBlobWriter};
 use crate::index::column_payload::{BlobRef, ColumnPagePayload};
 use crate::io::DirectBuf;
@@ -13,8 +19,9 @@ use std::mem;
 use std::pin::Pin;
 
 pub const COLUMN_BLOCK_PAGE_SIZE: usize = COW_FILE_PAGE_SIZE;
+pub const COLUMN_BLOCK_NODE_PAYLOAD_SIZE: usize = max_payload_len(COLUMN_BLOCK_PAGE_SIZE);
 pub const COLUMN_BLOCK_HEADER_SIZE: usize = mem::size_of::<ColumnBlockNodeHeader>();
-pub const COLUMN_BLOCK_DATA_SIZE: usize = COLUMN_BLOCK_PAGE_SIZE - COLUMN_BLOCK_HEADER_SIZE;
+pub const COLUMN_BLOCK_DATA_SIZE: usize = COLUMN_BLOCK_NODE_PAYLOAD_SIZE - COLUMN_BLOCK_HEADER_SIZE;
 pub const COLUMN_PAGE_PAYLOAD_SIZE: usize = mem::size_of::<ColumnPagePayload>();
 pub const COLUMN_BRANCH_ENTRY_SIZE: usize = mem::size_of::<ColumnBlockBranchEntry>();
 pub const COLUMN_BLOCK_MAX_ENTRIES: usize =
@@ -25,13 +32,13 @@ pub const COLUMN_BLOCK_MAX_BRANCH_ENTRIES: usize =
 const _: () = assert!(
     COLUMN_BLOCK_HEADER_SIZE
         + COLUMN_BLOCK_MAX_ENTRIES * (mem::size_of::<RowID>() + COLUMN_PAGE_PAYLOAD_SIZE)
-        <= COLUMN_BLOCK_PAGE_SIZE,
-    "ColumnBlockNode should fit into 64KB pages"
+        <= COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
+    "ColumnBlockNode should fit into the persisted column-block payload"
 );
 
 const _: () = assert!(
-    mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_PAGE_SIZE,
-    "ColumnBlockNode size must match table file page size"
+    mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
+    "ColumnBlockNode size must match the persisted column-block payload size"
 );
 const _: () = assert!(mem::size_of::<ColumnBlockBranchEntry>() == 16);
 const _: () = assert!(COLUMN_BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<RowID>()));
@@ -81,38 +88,11 @@ impl ColumnBlockNode {
         node
     }
 
-    /// Returns whether this node is a leaf node.
-    #[inline]
-    pub fn is_leaf(&self) -> bool {
-        self.header.height == 0
-    }
-
-    /// Returns whether this node is a branch node.
-    #[inline]
-    pub fn is_branch(&self) -> bool {
-        !self.is_leaf()
-    }
-
-    /// Returns leaf start-row-id array.
-    #[inline]
-    pub fn leaf_start_row_ids(&self) -> &[RowID] {
-        debug_assert!(self.is_leaf());
-        self.leaf_row_ids_with_count(self.header.count as usize)
-    }
-
     /// Returns mutable leaf start-row-id array.
     #[inline]
     pub fn leaf_start_row_ids_mut(&mut self) -> &mut [RowID] {
         debug_assert!(self.is_leaf());
         self.leaf_row_ids_mut_with_count(self.header.count as usize)
-    }
-
-    /// Returns leaf payload array.
-    #[inline]
-    pub fn leaf_payloads(&self) -> &[ColumnPagePayload] {
-        debug_assert!(self.is_leaf());
-        let count = self.header.count as usize;
-        self.leaf_payloads_with_count(count)
     }
 
     /// Returns mutable leaf payload array.
@@ -136,13 +116,6 @@ impl ColumnBlockNode {
         (cast_slice_mut(row_region), cast_slice_mut(payload_region))
     }
 
-    /// Returns branch entries.
-    #[inline]
-    pub fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
-        debug_assert!(self.is_branch());
-        self.branch_entries_with_count(self.header.count as usize)
-    }
-
     /// Returns mutable branch entries.
     #[inline]
     pub fn branch_entries_mut(&mut self) -> &mut [ColumnBlockBranchEntry] {
@@ -164,56 +137,115 @@ impl ColumnBlockNode {
     }
 
     #[inline]
-    fn leaf_row_ids_with_count(&self, count: usize) -> &[RowID] {
-        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-        let row_bytes = count * mem::size_of::<RowID>();
-        cast_slice(&self.data[..row_bytes])
-    }
-
-    #[inline]
     fn leaf_row_ids_mut_with_count(&mut self, count: usize) -> &mut [RowID] {
-        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-        let row_bytes = count * mem::size_of::<RowID>();
-        cast_slice_mut(&mut self.data[..row_bytes])
-    }
-
-    #[inline]
-    fn leaf_payloads_with_count(&self, count: usize) -> &[ColumnPagePayload] {
-        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-        let row_bytes = count * mem::size_of::<RowID>();
-        let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
-        cast_slice(&self.data[row_bytes..row_bytes + payload_bytes])
+        leaf_row_ids_from_bytes_mut(&mut self.data, count)
     }
 
     #[inline]
     fn leaf_payloads_mut_with_count(&mut self, count: usize) -> &mut [ColumnPagePayload] {
-        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-        let row_bytes = count * mem::size_of::<RowID>();
-        let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
-        cast_slice_mut(&mut self.data[row_bytes..row_bytes + payload_bytes])
-    }
-
-    #[inline]
-    fn branch_entries_with_count(&self, count: usize) -> &[ColumnBlockBranchEntry] {
-        debug_assert!(count <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-        let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
-        cast_slice(&self.data[..bytes_len])
+        leaf_payloads_from_bytes_mut(&mut self.data, count)
     }
 
     #[inline]
     fn branch_entries_mut_with_count(&mut self, count: usize) -> &mut [ColumnBlockBranchEntry] {
-        debug_assert!(count <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-        let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
-        cast_slice_mut(&mut self.data[..bytes_len])
+        branch_entries_from_bytes_mut(&mut self.data, count)
     }
 }
 
-impl BufferPage for ColumnBlockNode {}
+#[inline]
+fn leaf_row_ids_from_bytes(data: &[u8], count: usize) -> &[RowID] {
+    debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+    let row_bytes = count * mem::size_of::<RowID>();
+    cast_slice(&data[..row_bytes])
+}
+
+#[inline]
+fn leaf_row_ids_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [RowID] {
+    debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+    let row_bytes = count * mem::size_of::<RowID>();
+    cast_slice_mut(&mut data[..row_bytes])
+}
+
+#[inline]
+fn leaf_payloads_from_bytes(data: &[u8], count: usize) -> &[ColumnPagePayload] {
+    debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+    let row_bytes = count * mem::size_of::<RowID>();
+    let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
+    cast_slice(&data[row_bytes..row_bytes + payload_bytes])
+}
+
+#[inline]
+fn leaf_payloads_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnPagePayload] {
+    debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
+    let row_bytes = count * mem::size_of::<RowID>();
+    let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
+    cast_slice_mut(&mut data[row_bytes..row_bytes + payload_bytes])
+}
+
+#[inline]
+fn branch_entries_from_bytes(data: &[u8], count: usize) -> &[ColumnBlockBranchEntry] {
+    debug_assert!(count <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
+    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
+    cast_slice(&data[..bytes_len])
+}
+
+#[inline]
+fn branch_entries_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnBlockBranchEntry] {
+    debug_assert!(count <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
+    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
+    cast_slice_mut(&mut data[..bytes_len])
+}
+
+trait ColumnBlockNodeRead {
+    fn header_ref(&self) -> &ColumnBlockNodeHeader;
+    fn data_ref(&self) -> &[u8];
+
+    #[inline]
+    fn is_leaf(&self) -> bool {
+        self.header_ref().height == 0
+    }
+
+    #[inline]
+    fn is_branch(&self) -> bool {
+        !self.is_leaf()
+    }
+
+    #[inline]
+    fn leaf_start_row_ids(&self) -> &[RowID] {
+        debug_assert!(self.is_leaf());
+        leaf_row_ids_from_bytes(self.data_ref(), self.header_ref().count as usize)
+    }
+
+    #[inline]
+    fn leaf_payloads(&self) -> &[ColumnPagePayload] {
+        debug_assert!(self.is_leaf());
+        leaf_payloads_from_bytes(self.data_ref(), self.header_ref().count as usize)
+    }
+
+    #[inline]
+    fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
+        debug_assert!(self.is_branch());
+        branch_entries_from_bytes(self.data_ref(), self.header_ref().count as usize)
+    }
+}
+
+impl ColumnBlockNodeRead for ColumnBlockNode {
+    #[inline]
+    fn header_ref(&self) -> &ColumnBlockNodeHeader {
+        &self.header
+    }
+
+    #[inline]
+    fn data_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
 
 pub struct ColumnBlockIndex<'a> {
     disk_pool: &'a ReadonlyBufferPool,
     root_page_id: PageID,
     end_row_id: RowID,
+    file_kind: PersistedFileKind,
 }
 
 /// One bitmap update patch keyed by leaf `start_row_id`.
@@ -271,14 +303,99 @@ struct NodeUpdateResult {
     touched: bool,
 }
 
+#[inline]
+fn invalid_node_payload(file_kind: PersistedFileKind, page_id: PageID) -> Error {
+    Error::persisted_page_corrupted(
+        file_kind,
+        PersistedPageKind::ColumnBlockIndex,
+        page_id,
+        PersistedPageCorruptionCause::InvalidPayload,
+    )
+}
+
+#[inline]
+fn validate_node_payload(
+    page: &[u8],
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<(&[u8], ColumnBlockNodeHeader)> {
+    let payload = validate_page(page, COLUMN_BLOCK_INDEX_PAGE_SPEC).map_err(|cause| {
+        Error::persisted_page_corrupted(
+            file_kind,
+            PersistedPageKind::ColumnBlockIndex,
+            page_id,
+            cause,
+        )
+    })?;
+    let header =
+        bytemuck::try_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    let count = header.count as usize;
+    if (header.height == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
+        || (header.height > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
+    {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    Ok((payload, *header))
+}
+
+struct ValidatedColumnBlockNode {
+    guard: PageSharedGuard<Page>,
+    header: ColumnBlockNodeHeader,
+}
+
+impl ValidatedColumnBlockNode {
+    #[inline]
+    fn try_from_guard(
+        guard: PageSharedGuard<Page>,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<Self> {
+        let (_, header) = validate_node_payload(guard.page(), file_kind, page_id)?;
+        Ok(ValidatedColumnBlockNode { guard, header })
+    }
+}
+
+impl ColumnBlockNodeRead for ValidatedColumnBlockNode {
+    #[inline]
+    fn header_ref(&self) -> &ColumnBlockNodeHeader {
+        &self.header
+    }
+
+    #[inline]
+    fn data_ref(&self) -> &[u8] {
+        let payload_start = crate::file::page_integrity::PAGE_INTEGRITY_HEADER_SIZE;
+        let payload =
+            &self.guard.page()[payload_start..payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE];
+        &payload[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
+    }
+}
+
 impl<'a> ColumnBlockIndex<'a> {
     /// Creates a column block-index view for one root page snapshot.
     #[inline]
     pub fn new(root_page_id: PageID, end_row_id: RowID, disk_pool: &'a ReadonlyBufferPool) -> Self {
+        Self::new_in_file(
+            root_page_id,
+            end_row_id,
+            disk_pool,
+            PersistedFileKind::TableFile,
+        )
+    }
+
+    /// Creates a column block-index view for a specific persisted CoW file kind.
+    #[inline]
+    pub fn new_in_file(
+        root_page_id: PageID,
+        end_row_id: RowID,
+        disk_pool: &'a ReadonlyBufferPool,
+        file_kind: PersistedFileKind,
+    ) -> Self {
         ColumnBlockIndex {
             disk_pool,
             root_page_id,
             end_row_id,
+            file_kind,
         }
     }
 
@@ -295,20 +412,9 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     #[inline]
-    async fn read_node(&self, page_id: PageID) -> Result<Box<ColumnBlockNode>> {
-        let g = self
-            .disk_pool
-            .try_get_page_shared::<ColumnBlockNode>(page_id)
-            .await?;
-        let node = g.page();
-        let mut copy = ColumnBlockNode::new_boxed(
-            node.header.height,
-            node.header.start_row_id,
-            node.header.create_ts,
-        );
-        copy.header = node.header;
-        copy.data.copy_from_slice(&node.data);
-        Ok(copy)
+    async fn read_node(&self, page_id: PageID) -> Result<ValidatedColumnBlockNode> {
+        let g = self.disk_pool.try_get_page_shared::<Page>(page_id).await?;
+        ValidatedColumnBlockNode::try_from_guard(g, self.file_kind, page_id)
     }
 
     /// Finds the column page payload containing `row_id`.
@@ -327,11 +433,7 @@ impl<'a> ColumnBlockIndex<'a> {
         }
         let mut page_id = self.root_page_id;
         loop {
-            let g = self
-                .disk_pool
-                .try_get_page_shared::<ColumnBlockNode>(page_id)
-                .await?;
-            let node = g.page();
+            let node = self.read_node(page_id).await?;
             if node.is_leaf() {
                 let start_row_ids = node.leaf_start_row_ids();
                 let idx = match search_start_row_id(start_row_ids, row_id) {
@@ -360,7 +462,7 @@ impl<'a> ColumnBlockIndex<'a> {
             Some(blob_ref) => blob_ref,
             None => return Ok(None),
         };
-        let reader = ColumnDeletionBlobReader::new(self.disk_pool);
+        let reader = ColumnDeletionBlobReader::new(self.file_kind, self.disk_pool);
         let bytes = reader.read(blob_ref).await?;
         Ok(Some(bytes))
     }
@@ -555,7 +657,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         mutable_file: &mut M,
         page_id: PageID,
-        node: &ColumnBlockNode,
+        node: &ValidatedColumnBlockNode,
         patches: &[P],
         create_ts: u64,
     ) -> Result<NodeUpdateResult> {
@@ -592,7 +694,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         mutable_file: &mut M,
         page_id: PageID,
-        node: &ColumnBlockNode,
+        node: &ValidatedColumnBlockNode,
         patches: &[P],
         create_ts: u64,
     ) -> Result<NodeUpdateResult> {
@@ -697,10 +799,14 @@ impl<'a> ColumnBlockIndex<'a> {
         node: &ColumnBlockNode,
     ) -> Result<()> {
         let mut buf = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
-        let dst = buf.data_mut();
+        let payload_start = write_page_header(buf.data_mut(), COLUMN_BLOCK_INDEX_PAGE_SPEC);
+        let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
+        let dst = &mut buf.data_mut()[payload_start..payload_end];
         let header_bytes = cast_slice(std::slice::from_ref(&node.header));
         dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
-        dst[COLUMN_BLOCK_HEADER_SIZE..].copy_from_slice(&node.data);
+        dst[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
+            .copy_from_slice(&node.data);
+        write_page_checksum(buf.data_mut());
         mutable_file.write_page(page_id, buf).await
     }
 
@@ -1003,12 +1109,28 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableMetadata,
     };
+    use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::io::AIOBuf;
     use crate::ptr::UnsafePtr;
     use crate::value::ValKind;
     use std::sync::{Arc, OnceLock};
+
+    fn copy_persisted_node(
+        page: &[u8],
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<Box<ColumnBlockNode>> {
+        let (payload, header) = validate_node_payload(page, file_kind, page_id)?;
+        let mut node =
+            ColumnBlockNode::new_boxed(header.height, header.start_row_id, header.create_ts);
+        node.header = header;
+        node.data.copy_from_slice(
+            &payload[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE],
+        );
+        Ok(node)
+    }
 
     #[inline]
     async fn read_node_from_file(
@@ -1022,19 +1144,86 @@ mod tests {
                 .read_page_into_ptr(page_id, UnsafePtr(buf.as_bytes_mut().as_mut_ptr()))
                 .await?;
         }
-        let src = buf.as_bytes();
-        let header = cast_slice::<u8, ColumnBlockNodeHeader>(&src[..COLUMN_BLOCK_HEADER_SIZE])[0];
-        let mut node =
-            ColumnBlockNode::new_boxed(header.height, header.start_row_id, header.create_ts);
-        node.header = header;
-        node.data
-            .copy_from_slice(&src[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_PAGE_SIZE]);
-        Ok(node)
+        copy_persisted_node(buf.as_bytes(), PersistedFileKind::TableFile, page_id)
+    }
+
+    fn build_persisted_node() -> DirectBuf {
+        let mut node = ColumnBlockNode::new_boxed(0, 0, 1);
+        node.header.count = 1;
+        node.leaf_start_row_ids_mut()[0] = 0;
+        node.leaf_payloads_mut()[0] = ColumnPagePayload {
+            block_id: 7,
+            deletion_field: [0u8; 120],
+        };
+
+        let mut buf = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
+        let payload_start = write_page_header(buf.data_mut(), COLUMN_BLOCK_INDEX_PAGE_SPEC);
+        let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
+        let dst = &mut buf.data_mut()[payload_start..payload_end];
+        let header_bytes = cast_slice(std::slice::from_ref(&node.header));
+        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
+        dst[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
+            .copy_from_slice(&node.data);
+        write_page_checksum(buf.data_mut());
+        buf
     }
 
     #[test]
     fn test_column_block_node_size() {
-        assert_eq!(mem::size_of::<ColumnBlockNode>(), COLUMN_BLOCK_PAGE_SIZE);
+        assert_eq!(
+            mem::size_of::<ColumnBlockNode>(),
+            COLUMN_BLOCK_NODE_PAYLOAD_SIZE
+        );
+    }
+
+    #[test]
+    fn test_parse_persisted_node_rejects_version_corruption() {
+        let mut buf = build_persisted_node();
+        let version_start = COLUMN_BLOCK_INDEX_PAGE_SPEC.magic_word.len();
+        let version_end = version_start + mem::size_of::<u64>();
+        buf.data_mut()[version_start..version_end].copy_from_slice(&9u64.to_le_bytes());
+
+        let err =
+            match validate_node_payload(buf.data(), PersistedFileKind::CatalogMultiTableFile, 13) {
+                Ok(_) => panic!("expected column-block-index version corruption"),
+                Err(err) => err,
+            };
+        assert!(matches!(
+            err,
+            Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::CatalogMultiTableFile,
+                page_kind: PersistedPageKind::ColumnBlockIndex,
+                page_id: 13,
+                cause: PersistedPageCorruptionCause::InvalidVersion,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_validate_node_payload_rejects_invalid_leaf_count() {
+        let mut buf = build_persisted_node();
+        let payload_start = crate::file::page_integrity::PAGE_INTEGRITY_HEADER_SIZE;
+        let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
+        let mut node = copy_persisted_node(buf.data(), PersistedFileKind::TableFile, 17).unwrap();
+        node.header.count = (COLUMN_BLOCK_MAX_ENTRIES + 1) as u32;
+        let dst = &mut buf.data_mut()[payload_start..payload_end];
+        let header_bytes = cast_slice(std::slice::from_ref(&node.header));
+        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
+        write_page_checksum(buf.data_mut());
+
+        let err = match validate_node_payload(buf.data(), PersistedFileKind::TableFile, 17) {
+            Ok(_) => panic!("expected invalid leaf count corruption"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::ColumnBlockIndex,
+                page_id: 17,
+                cause: PersistedPageCorruptionCause::InvalidPayload,
+            }
+        ));
     }
 
     #[test]
