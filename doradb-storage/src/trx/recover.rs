@@ -968,4 +968,326 @@ mod tests {
             drop(engine);
         })
     }
+
+    #[test]
+    fn test_log_recover_replays_post_checkpoint_heap_redo_after_bootstrap() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover6")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.new_session();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![IndexSpec::new(
+                        "idx_t6_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let catalog_replay_start_ts = engine
+                .catalog()
+                .storage
+                .checkpoint_snapshot()
+                .unwrap()
+                .catalog_replay_start_ts;
+            assert!(catalog_replay_start_ts > MIN_SNAPSHOT_TS);
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt
+                .insert_row(&table, vec![Val::from(7u32), Val::from("cold-row")])
+                .await;
+            assert!(insert.is_ok());
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            table.freeze(usize::MAX).await;
+            let mut checkpoint_session = engine.new_session();
+            table
+                .data_checkpoint(&mut checkpoint_session)
+                .await
+                .unwrap();
+            let root_after_checkpoint = table.file.active_root();
+            assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt
+                .insert_row(&table, vec![Val::from(8u32), Val::from("hot-row")])
+                .await;
+            assert!(insert.is_ok());
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            drop(table);
+            drop(checkpoint_session);
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover6")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert!(table.total_row_pages().await > 0);
+
+            let mut session = engine.new_session();
+            let trx = session.begin_trx().unwrap();
+            let stmt = trx.start_stmt();
+
+            let cold_key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let cold_row = stmt.select_row_mvcc(&table, &cold_key, &[0, 1]).await;
+            assert_eq!(
+                cold_row.unwrap(),
+                vec![Val::from(7u32), Val::from("cold-row")]
+            );
+
+            let hot_key = SelectKey::new(0, vec![Val::from(8u32)]);
+            let hot_row = stmt.select_row_mvcc(&table, &hot_key, &[0, 1]).await;
+            assert_eq!(
+                hot_row.unwrap(),
+                vec![Val::from(8u32), Val::from("hot-row")]
+            );
+
+            stmt.succeed().commit().await.unwrap();
+
+            drop(table);
+            drop(session);
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_log_recover_handles_mixed_user_table_checkpoint_states() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover7")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.new_session();
+            let checkpointed_table_id = session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![IndexSpec::new(
+                        "idx_t7a_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+            let replay_only_table_id = session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![IndexSpec::new(
+                        "idx_t7b_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let baseline_catalog_replay_start_ts = engine
+                .catalog()
+                .storage
+                .checkpoint_snapshot()
+                .unwrap()
+                .catalog_replay_start_ts;
+            assert!(baseline_catalog_replay_start_ts > MIN_SNAPSHOT_TS);
+
+            let checkpointed_table = engine
+                .catalog()
+                .get_table(checkpointed_table_id)
+                .await
+                .unwrap();
+            let replay_only_table = engine
+                .catalog()
+                .get_table(replay_only_table_id)
+                .await
+                .unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt
+                .insert_row(
+                    &checkpointed_table,
+                    vec![Val::from(7u32), Val::from("persisted-row")],
+                )
+                .await;
+            assert!(insert.is_ok());
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            checkpointed_table.freeze(usize::MAX).await;
+            let mut checkpoint_session = engine.new_session();
+            checkpointed_table
+                .data_checkpoint(&mut checkpoint_session)
+                .await
+                .unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt
+                .insert_row(
+                    &replay_only_table,
+                    vec![Val::from(8u32), Val::from("replayed-row")],
+                )
+                .await;
+            assert!(insert.is_ok());
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            assert!(checkpointed_table.file.active_root().pivot_row_id > 0);
+            assert_eq!(replay_only_table.file.active_root().pivot_row_id, 0);
+            assert!(
+                checkpointed_table.file.active_root().heap_redo_start_ts
+                    > baseline_catalog_replay_start_ts
+            );
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let final_catalog_replay_start_ts = engine
+                .catalog()
+                .storage
+                .checkpoint_snapshot()
+                .unwrap()
+                .catalog_replay_start_ts;
+            assert!(final_catalog_replay_start_ts > baseline_catalog_replay_start_ts);
+
+            drop(replay_only_table);
+            drop(checkpointed_table);
+            drop(checkpoint_session);
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover7")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let checkpointed_table = engine
+                .catalog()
+                .get_table(checkpointed_table_id)
+                .await
+                .unwrap();
+            let replay_only_table = engine
+                .catalog()
+                .get_table(replay_only_table_id)
+                .await
+                .unwrap();
+
+            assert_eq!(checkpointed_table.total_row_pages().await, 0);
+            assert!(replay_only_table.total_row_pages().await > 0);
+
+            let mut session = engine.new_session();
+            let trx = session.begin_trx().unwrap();
+            let stmt = trx.start_stmt();
+
+            let checkpointed_key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let checkpointed_row = stmt
+                .select_row_mvcc(&checkpointed_table, &checkpointed_key, &[0, 1])
+                .await;
+            assert_eq!(
+                checkpointed_row.unwrap(),
+                vec![Val::from(7u32), Val::from("persisted-row")]
+            );
+
+            let replay_only_key = SelectKey::new(0, vec![Val::from(8u32)]);
+            let replay_only_row = stmt
+                .select_row_mvcc(&replay_only_table, &replay_only_key, &[0, 1])
+                .await;
+            assert_eq!(
+                replay_only_row.unwrap(),
+                vec![Val::from(8u32), Val::from("replayed-row")]
+            );
+
+            stmt.succeed().commit().await.unwrap();
+
+            drop(replay_only_table);
+            drop(checkpointed_table);
+            drop(session);
+            drop(engine);
+        })
+    }
 }

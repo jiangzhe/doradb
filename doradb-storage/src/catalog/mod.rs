@@ -469,6 +469,7 @@ pub mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::engine::{Engine, EngineConfig};
+    use crate::table::TablePersistence;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
     use crate::trx::sys_conf::TrxSysConfig;
@@ -870,6 +871,91 @@ pub mod tests {
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_now_heartbeat_with_mixed_user_table_checkpoint_states() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-checkpoint-mixed-user-states")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let checkpointed_table_id = table1(&engine).await;
+            let replay_only_table_id = table2(&engine).await;
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
+            let roots_before = snap1.meta.table_roots;
+
+            let checkpointed_table = engine
+                .catalog()
+                .get_table(checkpointed_table_id)
+                .await
+                .unwrap();
+            let replay_only_table = engine
+                .catalog()
+                .get_table(replay_only_table_id)
+                .await
+                .unwrap();
+
+            let mut session = engine.new_session();
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let res = stmt
+                .insert_row(&checkpointed_table, vec![Val::I32(7)])
+                .await;
+            assert!(res.is_ok());
+            stmt.succeed().commit().await.unwrap();
+
+            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let res = stmt
+                .insert_row(
+                    &replay_only_table,
+                    vec![Val::I32(9), Val::from("replay-backed")],
+                )
+                .await;
+            assert!(res.is_ok());
+            stmt.succeed().commit().await.unwrap();
+
+            checkpointed_table.freeze(usize::MAX).await;
+            let mut checkpoint_session = engine.new_session();
+            checkpointed_table
+                .data_checkpoint(&mut checkpoint_session)
+                .await
+                .unwrap();
+
+            assert!(checkpointed_table.file.active_root().pivot_row_id > 0);
+            assert_eq!(replay_only_table.file.active_root().pivot_row_id, 0);
+            assert!(
+                checkpointed_table.file.active_root().heap_redo_start_ts
+                    > snap1.catalog_replay_start_ts
+            );
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
+            assert_eq!(snap2.meta.table_roots, roots_before);
+            assert_eq!(snap2.meta.next_user_obj_id, snap1.meta.next_user_obj_id);
         });
     }
 }

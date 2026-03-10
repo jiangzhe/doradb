@@ -545,6 +545,7 @@ pub struct TrxSysStartContext {
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
+    use crate::catalog::tests::{table1, table2};
     use crate::engine::EngineConfig;
     use crate::value::Val;
     use crossbeam_utils::CachePadded;
@@ -591,6 +592,100 @@ mod tests {
             }
 
             drop(session);
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_scan_respects_upper_bound_and_replay_start() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(128usize * 1024 * 1024)
+                        .max_file_size(256usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-scan-upper-bound")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            let first_upper = engine.trx_sys.persisted_watermark_cts();
+            let _ = table2(&engine).await;
+            let second_upper = engine.trx_sys.persisted_watermark_cts();
+            assert!(second_upper > first_upper);
+
+            let batch1 = engine
+                .trx_sys
+                .scan_catalog_checkpoint_batch(MIN_SNAPSHOT_TS, first_upper, |_| None)
+                .unwrap();
+            assert_eq!(batch1.replay_start_ts, MIN_SNAPSHOT_TS);
+            assert_eq!(batch1.durable_upper_cts, first_upper);
+            assert_eq!(batch1.safe_cts, first_upper);
+            assert_eq!(batch1.catalog_ddl_txn_count, 1);
+            assert!(!batch1.catalog_ops.is_empty());
+            assert_eq!(
+                batch1.stop_reason,
+                CatalogCheckpointScanStopReason::ReachedDurableUpper
+            );
+            engine
+                .catalog()
+                .apply_checkpoint_batch(batch1)
+                .await
+                .unwrap();
+
+            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert_eq!(snap1.catalog_replay_start_ts, first_upper.saturating_add(1));
+
+            let batch2 = engine
+                .trx_sys
+                .scan_catalog_checkpoint_batch(snap1.catalog_replay_start_ts, second_upper, |_| {
+                    None
+                })
+                .unwrap();
+            assert_eq!(batch2.replay_start_ts, snap1.catalog_replay_start_ts);
+            assert_eq!(batch2.durable_upper_cts, second_upper);
+            assert_eq!(batch2.safe_cts, second_upper);
+            assert_eq!(batch2.catalog_ddl_txn_count, 1);
+            assert!(!batch2.catalog_ops.is_empty());
+            assert_eq!(
+                batch2.stop_reason,
+                CatalogCheckpointScanStopReason::ReachedDurableUpper
+            );
+            engine
+                .catalog()
+                .apply_checkpoint_batch(batch2)
+                .await
+                .unwrap();
+
+            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert_eq!(
+                snap2.catalog_replay_start_ts,
+                second_upper.saturating_add(1)
+            );
+
+            let batch3 = engine
+                .trx_sys
+                .scan_catalog_checkpoint_batch(snap2.catalog_replay_start_ts, second_upper, |_| {
+                    None
+                })
+                .unwrap();
+            assert_eq!(batch3.catalog_ddl_txn_count, 0);
+            assert!(batch3.catalog_ops.is_empty());
+            assert_eq!(batch3.safe_cts, second_upper);
+            assert_eq!(
+                batch3.stop_reason,
+                CatalogCheckpointScanStopReason::ReachedDurableUpper
+            );
+
             drop(engine);
         })
     }
@@ -765,7 +860,6 @@ mod tests {
 
     #[test]
     fn test_log_rotate() {
-        use crate::catalog::tests::table2;
         // 2000 rows, 200 bytes each row, 4M log file size.
         // log file is 1MB, so it will rotate at least 4 times.
         // Due to alignment of direct IO, the write amplification might

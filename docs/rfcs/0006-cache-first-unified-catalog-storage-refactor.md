@@ -256,13 +256,13 @@ Reference:
   - Implementation Summary: 1. Aligned catalog checkpoint persistence and recovery around replay-start [Task Resolve Sync: docs/tasks/000056-recovery-cutoff-and-consistency-checks.md @ 2026-03-09]
 
 - **Phase 10: Validation and Documentation Sync**
-  - Scope: tests for id ranges, file naming, schema behavior, checkpoint atomicity, replay cutoff correctness, and lifecycle ordering (`create/insert/drop`, DDL around cutoff); doc updates.
-  - Goals: verify behavioral contract end-to-end.
-  - Non-goals: no legacy migration tooling; no physical truncation.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Scope: targeted validation for implemented phases 1 through 9: id ranges, file naming, schema behavior, catalog checkpoint atomicity, checkpoint-aware restart, and replay cutoff correctness across implemented create/checkpoint/recover paths; plus documentation sync.
+  - Goals: verify the implemented behavioral contract end to end without expanding RFC scope to new catalog DDL behavior.
+  - Non-goals: no `DropTable` or broader lifecycle-ordering design in this phase; no legacy migration tooling; no physical truncation.
+  - Task Doc: `docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md`
+  - Task Issue: `#402`
+  - Phase Status: done
+  - Implementation Summary: 1. Added scan-bound, restart, and mixed-state checkpoint tests: [Task Resolve Sync: docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md @ 2026-03-10]
 
 ## Consequences
 

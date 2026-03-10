@@ -53,6 +53,19 @@ The principal of data modification in **Table File** is to do it in Copy-on-Writ
 
 For more details, see [Table File](./table-file.md).
 
+### Catalog Persistence
+
+Catalog metadata remains cache-first at runtime: foreground lookups and DDL/DML
+operate on the in-memory catalog tables, not on persisted catalog pages.
+Durability is provided by a dedicated multi-table file, `catalog.mtb`, which
+stores checkpointed roots for all logical catalog tables plus overlay metadata
+such as `next_user_obj_id` and `catalog_replay_start_ts`.
+
+User tables still persist to one file per table, but now use deterministic
+fixed-width hex file names. `catalog.mtb` is reserved for the catalog-wide
+checkpoint boundary and is published with the same CoW root-swap pattern used
+by user-table files.
+
 ### Redo Log File
 
 **Redo Log File** contains all committed data of recent transactions.
@@ -82,7 +95,19 @@ See [Transaction System](./transaction-system.md).
 ## Logging, Checkpoint and Recovery
 
 This system adopts logging and recovery strategy of in-memory database system, which uses value logging and redo-only recovery.
-Table-level checkpoint is applied to overcome shortcoming of in-memory database: expensive checkponit and slow recovery time. Basically, a background task converts row pages to LWC blocks periodically with CoW update on table file. The LWC blocks and metadata can be treated as table-level checkpoint. Recovery process respects the watermark of each table and only replay logs behind the point.
+Table-level checkpoint is applied to overcome shortcoming of in-memory database:
+expensive checkponit and slow recovery time. Basically, a background task
+converts row pages to LWC blocks periodically with CoW update on table file.
+The LWC blocks and metadata can be treated as table-level checkpoint.
+
+Catalog checkpointing follows the same replay-boundary idea. A catalog
+checkpoint scans persisted redo from `catalog_replay_start_ts` through the
+durable upper watermark, merges the catalog-row changes into `catalog.mtb`, and
+publishes a new root with `catalog_replay_start_ts = safe_cts + 1`. On restart,
+the engine first loads checkpointed catalog rows from `catalog.mtb`, then
+preloads user tables from their table files, and finally replays only redo at
+or after the coarse replay floor derived from `catalog_replay_start_ts` and the
+loaded tables' `heap_redo_start_ts` values.
 
 For more details, see [Checkpoint and Recovery](./checkpoint-and-recovery.md).
 

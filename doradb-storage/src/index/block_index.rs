@@ -46,7 +46,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         global_disk_pool: &'static GlobalReadonlyBufferPool,
     ) -> Self {
         let metadata = Arc::clone(&table_file.active_root().metadata);
-        let row = GenericRowBlockIndex::new(pool, table_id, metadata).await;
+        let row = GenericRowBlockIndex::new(pool, table_id, pivot_row_id, metadata).await;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_page_id);
         let disk_pool =
             ReadonlyBufferPool::new(table_id, Arc::clone(&table_file), global_disk_pool);
@@ -65,7 +65,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         table_id: TableID,
         metadata: Arc<TableMetadata>,
     ) -> Self {
-        let row = GenericRowBlockIndex::new(pool, table_id, metadata).await;
+        let row = GenericRowBlockIndex::new(pool, table_id, 0, metadata).await;
         let root = BlockIndexRoot::new(0, 0);
         GenericBlockIndex {
             table_id,
