@@ -2,7 +2,7 @@
 id: 0006
 title: Cache-First Unified Catalog Storage Refactor
 github_issue: 382
-status: proposal
+status: implemented
 tags: [storage-engine, catalog, checkpoint, recovery, refactor]
 created: 2026-03-03
 ---
@@ -69,7 +69,7 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 ### Source Backlogs (Optional)
 
 - [B1] `docs/backlogs/000002-non-unique-index-for-catalog-tables.md` - related deferred catalog index work.
-- [B2] `docs/backlogs/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md` - remove transitional catalog runtime dependency on legacy table files.
+- [B2] `docs/backlogs/closed/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md` - remove transitional catalog runtime dependency on legacy table files.
 
 ## Decision
 
@@ -188,7 +188,7 @@ Reference:
   - Phase Status: done
   - Implementation Summary: Implemented Phase 2 catalog schema refactor to table-scoped composite keys, updated DDL/reload paths, and validated catalog delete/list behavior with added regression tests. [Task Resolve Sync: docs/tasks/000049-catalog-composite-key-refactor.md @ 2026-03-06]
   - Related Backlogs:
-    - `docs/backlogs/000045-composite-index-prefix-scan-support-for-catalog-table-id-lookups.md`
+    - `docs/backlogs/closed/000045-composite-index-prefix-scan-support-for-catalog-table-id-lookups.md`
 
 - **Phase 3: Accessor-First TableAccess Refactor**
   - Scope: extract standalone thin `TableAccessor` and migrate `TableAccess` implementation internals to accessor-driven shared logic.
@@ -208,7 +208,7 @@ Reference:
   - Phase Status: done
   - Implementation Summary: 1. Introduced dedicated catalog runtime `CatalogTable` in [Task Resolve Sync: docs/tasks/000051-catalog-table-runtime-no-legacy-bootstrap-files.md @ 2026-03-07]
   - Related Backlogs:
-    - `docs/backlogs/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md`
+    - `docs/backlogs/closed/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md`
 
 - **Phase 5: Catalog FixedBufferPool Specialization**
   - Scope: adapt reusable table-access/runtime components to support catalog data/index runtime on fixed pools; reuse existing engine `meta_pool`/`index_pool`.
@@ -262,7 +262,7 @@ Reference:
   - Task Doc: `docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md`
   - Task Issue: `#402`
   - Phase Status: done
-  - Implementation Summary: 1. Added scan-bound, restart, and mixed-state checkpoint tests: [Task Resolve Sync: docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md @ 2026-03-10]
+  - Implementation Summary: Added scan-bound, restart, and mixed-state checkpoint validation; fixed persisted row-block index bootstrap from `pivot_row_id`; and synced living docs to the `catalog.mtb` / `catalog_replay_start_ts` contract. [Task Resolve Sync: docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md @ 2026-03-10]
 
 ## Consequences
 
@@ -287,7 +287,7 @@ None currently.
 ## Future Work
 
 1. Legacy catalog migration tooling if backward compatibility becomes required.
-2. Additional catalog secondary indexes for high-cardinality metadata lookups.
+2. Optional catalog metadata lookup performance work, including secondary indexes or composite-key prefix-scan access paths if scan-based behavior becomes a bottleneck.
 3. Operational metrics/endpoints for catalog checkpoint observability (including trigger source counters).
 
 ## References
@@ -309,4 +309,4 @@ None currently.
 - `doradb-storage/src/table/persistence.rs`
 - `doradb-storage/src/trx/redo.rs`
 - `docs/backlogs/000002-non-unique-index-for-catalog-tables.md`
-- `docs/backlogs/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md`
+- `docs/backlogs/closed/000043-catalog-pure-in-memory-runtime-no-legacy-tbl-files.md`
