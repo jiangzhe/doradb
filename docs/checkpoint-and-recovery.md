@@ -18,6 +18,15 @@ Each Table object maintains the following structures to coordinate checkpoints:
 2. **Unflushed Transaction Map**: Stores committed transactions not yet fully persisted by all table components. Key: STS (Start Timestamp), Value: CTS (Commit Timestamp).
 3. **Component Watermarks**: Records recovery watermark of heap table, checkpoint watermark of each index.
 
+Catalog metadata uses a related but distinct persistence path. Runtime catalog
+reads remain cache-first in memory, while checkpointed catalog state is
+published into a single CoW file, `catalog.mtb`. Its active root stores table
+roots for the logical catalog tables, `next_user_obj_id`, and
+`catalog_replay_start_ts`. `catalog_replay_start_ts` is the inclusive lower
+bound of catalog redo that still must be replayed after restart; heartbeat/noop
+catalog checkpoints may advance this watermark even when the table roots do not
+change.
+
 ### 2.2 Watermark Definitions
 
 Each table maintains three types of watermarks, corresponding to its three persistence components. The minimum of these defines the table's retention requirement.
@@ -181,31 +190,46 @@ To prevent the `unflushed_map` from growing indefinitely, a cleanup task runs pe
 
 The recovery process restores the in-memory state by replaying the WAL, filtering operations based on the persisted watermarks.
 
-### 6.1 Log Truncation and Recovery Start Point
+### 6.1 Logical Replay Floor
 
-To manage disk space and ensure data durability, the system calculates a global **Recovery Start Point**. This point determines the oldest transaction log record required to fully restore the database state. Any logs preceding this point are obsolete and can be safely truncated.
+Current implementation persists a logical recovery floor but does not yet
+physically truncate redo logs. On startup the engine computes a coarse replay
+start watermark `W` from the persisted catalog checkpoint boundary and the
+loaded user-table heap boundaries:
 
-$$ \text{Table\_Min\_CTS}(T) = \min \left( T.\text{Heap\_Redo\_Start\_CTS}, \ T.\text{Deletion\_Rec\_CTS}, \ \min_{i \in T.\text{Indexes}}(i.\text{Rec\_CTS}) \right) $$
+$$ W = \min \left( \text{catalog\_replay\_start\_ts}, \min_{\forall T \in \text{Loaded User Tables}}(T.\text{Heap\_Redo\_Start\_TS}) \right) $$
 
-$$ \text{Global\_Truncation\_CTS} = \min_{\forall T \in \text{All Tables}} ( \text{Table\_Min\_CTS}(T) ) $$
-
-The Log Manager periodically computes this value and physically deletes log segments where `CTS < Global_Truncation_CTS`.
+This watermark is only a coarse filter. Recovery still applies finer
+per-component replay predicates after `W`. Future physical truncation work can
+reuse the same persisted watermarks, but segment deletion is intentionally
+deferred.
 
 ### 6.2 Recovery Procedure
 
 Upon system restart, the recovery process uses these persistent watermarks to determine where to begin reading the log and how to filter operations.
 
 #### 6.2.1 Metadata Load & Start Point Determination
-1.  The system scans the headers of all Table Files and Index Files.
-2.  It constructs an in-memory view of all watermarks (`Heap_Redo_Start_TS`, `Deletion_Rec_CTS`, `Index.Rec_CTS`).
-3.  It calculates the global **Recovery Start Point**:
-    $$ \text{Replay\_Start\_CTS} = \min(\text{All Loaded Watermarks}) $$
-4.  The Log Reader seeks to the log file/offset corresponding to `Replay_Start_CTS`.
+1.  Load the active root from `catalog.mtb` and construct the in-memory
+    catalog tables from the checkpointed catalog rows.
+2.  Restore catalog metadata persisted in `catalog.mtb`, especially
+    `next_user_obj_id` and `catalog_replay_start_ts`.
+3.  Reload each checkpointed user table listed in the catalog and read its
+    table-file metadata, including `Heap_Redo_Start_TS`.
+4.  Calculate the coarse replay floor:
+    $$ \text{Replay\_Start\_CTS} = \min(\text{catalog\_replay\_start\_ts}, \text{all loaded } \text{Heap\_Redo\_Start\_TS}) $$
+5.  The log reader still scans merged redo streams linearly, but skips any log
+    record with `CTS < Replay_Start_CTS`.
 
 #### 6.2.2 Log Replay
 The recovery thread reads logs sequentially from the `Replay_Start_CTS`. This timestamp acts as a coarse-grained filter to skip log records that are guaranteed to be persisted across all tables and all components.
 
 For each log entry read from the log, a second, finer-grained check is performed against the specific component's watermark to decide whether to replay the operation. This ensures that each part of the system (Heap, Deletion, Index) is restored to its correct state without re-applying changes that are already persisted.
+
+*   **Catalog Operations**:
+    *   **Rule**: Replay if `Entry.CTS >= catalog_replay_start_ts`.
+    *   **Action**: Apply catalog row redo to the in-memory catalog tables. New
+        user tables created after the checkpoint are loaded from their table
+        files before subsequent user-table DML replay touches them.
 
 *   **Heap Operations (Affecting the In-Memory RowStore)**:
     *   **Filter**: An operation on a table `T` is a candidate if its `RowID >= T.Pivot_RowID`.
@@ -224,7 +248,12 @@ For each log entry read from the log, a second, finer-grained check is performed
     *   **Action**: Insert the key change into the corresponding in-memory `MemTree` and mark it as dirty.
 
 #### 6.2.3 Completion
-Once the log end is reached, the in-memory state (RowStore, DeletionBuffer, MemTree) is consistent with the state at the moment of the crash. The system then opens for new transactions.
+Once the log end is reached, the in-memory state (catalog tables, RowStore,
+DeletionBuffer, MemTree) is consistent with the state at the moment of the
+crash. For user tables preloaded from checkpoint, persisted data below
+`Pivot_RowID` is already available from the table file and in-memory secondary
+indexes are rebuilt from that persisted data before the engine opens for new
+transactions.
 
 ## 7. Summary
 

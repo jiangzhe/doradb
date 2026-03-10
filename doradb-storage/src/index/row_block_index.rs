@@ -310,11 +310,16 @@ pub type RowBlockIndex = GenericRowBlockIndex<FixedBufferPool>;
 impl<P: BufferPool> GenericRowBlockIndex<P> {
     /// Create a new block index backed by buffer pool.
     #[inline]
-    pub async fn new(pool: &'static P, table_id: TableID, metadata: Arc<TableMetadata>) -> Self {
+    pub async fn new(
+        pool: &'static P,
+        table_id: TableID,
+        start_row_id: RowID,
+        metadata: Arc<TableMetadata>,
+    ) -> Self {
         let mut g = pool.allocate_page::<BlockNode>().await;
         let page_id = g.page_id();
         let page = g.page_mut();
-        page.init_empty(0, 0);
+        page.init_empty(0, start_row_id);
         GenericRowBlockIndex {
             table_id,
             root_page_id: page_id,
@@ -1000,7 +1005,8 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let blk_idx = RowBlockIndex::new(engine.meta_pool, 101, make_test_metadata()).await;
+                let blk_idx =
+                    RowBlockIndex::new(engine.meta_pool, 101, 0, make_test_metadata()).await;
                 let p1 = blk_idx.get_insert_page(engine.mem_pool, 100).await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
@@ -1035,7 +1041,8 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let blk_idx = RowBlockIndex::new(engine.meta_pool, 102, make_test_metadata()).await;
+                let blk_idx =
+                    RowBlockIndex::new(engine.meta_pool, 102, 0, make_test_metadata()).await;
                 let p1 = blk_idx
                     .get_insert_page_exclusive(engine.mem_pool, 100)
                     .await;
@@ -1075,7 +1082,8 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let blk_idx = RowBlockIndex::new(engine.meta_pool, 103, make_test_metadata()).await;
+                let blk_idx =
+                    RowBlockIndex::new(engine.meta_pool, 103, 0, make_test_metadata()).await;
                 for _ in 0..row_pages {
                     let _ = blk_idx.get_insert_page(engine.mem_pool, 100).await;
                 }
@@ -1101,7 +1109,7 @@ mod tests {
             let pool = scope
                 .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
             let pool = pool.as_static();
-            let blk_idx = RowBlockIndex::new(pool, 1, make_test_metadata()).await;
+            let blk_idx = RowBlockIndex::new(pool, 1, 0, make_test_metadata()).await;
 
             let overflow_entries = 3usize;
             let row_pages = NBR_PAGE_ENTRIES_IN_LEAF + overflow_entries;
@@ -1161,7 +1169,7 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(512usize * 1024 * 1024).unwrap());
             let pool = pool.as_static();
-            let blk_idx = RowBlockIndex::new(pool, 1, make_test_metadata()).await;
+            let blk_idx = RowBlockIndex::new(pool, 1, 0, make_test_metadata()).await;
             let row_pages = 5000usize;
             let rows_per_page = 100usize;
             for i in 0..row_pages {
@@ -1195,7 +1203,7 @@ mod tests {
             let pool = scope
                 .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
             let pool = pool.as_static();
-            let blk_idx = RowBlockIndex::new(pool, 1, make_test_metadata()).await;
+            let blk_idx = RowBlockIndex::new(pool, 1, 0, make_test_metadata()).await;
             assert!(!blk_idx.is_page_committer_enabled());
             assert_eq!(blk_idx.height(), 0);
 
@@ -1257,7 +1265,8 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let blk_idx = RowBlockIndex::new(engine.meta_pool, 104, make_test_metadata()).await;
+                let blk_idx =
+                    RowBlockIndex::new(engine.meta_pool, 104, 0, make_test_metadata()).await;
                 assert!(!blk_idx.is_page_committer_enabled());
                 blk_idx.enable_page_committer(engine.trx_sys);
                 assert!(blk_idx.is_page_committer_enabled());
