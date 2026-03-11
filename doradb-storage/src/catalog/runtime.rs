@@ -1,17 +1,14 @@
 use crate::buffer::FixedBufferPool;
 use crate::catalog::{TableID, TableMetadata};
-use crate::index::{BlockIndex, SecondaryIndex};
-use crate::table::{MemTableAccessor, build_secondary_indexes};
+use crate::index::{BlockIndex, RowLocation};
+use crate::table::{GenericMemTable, MemTableAccessor};
 use crate::trx::MIN_SNAPSHOT_TS;
+use std::ops::Deref;
 use std::sync::Arc;
 
 /// Dedicated runtime wrapper for catalog logical tables.
-#[derive(Clone)]
 pub struct CatalogTable {
-    pub(crate) mem_pool: &'static FixedBufferPool,
-    pub(crate) metadata: Arc<TableMetadata>,
-    pub(crate) blk_idx: Arc<BlockIndex>,
-    pub(crate) sec_idx: Arc<[SecondaryIndex]>,
+    pub(crate) mem: GenericMemTable<FixedBufferPool>,
 }
 
 impl CatalogTable {
@@ -20,22 +17,20 @@ impl CatalogTable {
     pub async fn new(
         mem_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
+        table_id: TableID,
         blk_idx: BlockIndex,
         metadata: Arc<TableMetadata>,
     ) -> Self {
-        let sec_idx = build_secondary_indexes(index_pool, &metadata, MIN_SNAPSHOT_TS).await;
-        CatalogTable {
+        let mem = GenericMemTable::new(
             mem_pool,
+            index_pool,
+            table_id,
             metadata,
-            blk_idx: Arc::new(blk_idx),
-            sec_idx,
-        }
-    }
-
-    /// Return table id of this catalog table.
-    #[inline]
-    pub fn table_id(&self) -> TableID {
-        self.blk_idx.table_id
+            blk_idx,
+            MIN_SNAPSHOT_TS,
+        )
+        .await;
+        CatalogTable { mem }
     }
 
     /// Build a lightweight operation accessor over this catalog table runtime.
@@ -44,9 +39,17 @@ impl CatalogTable {
         MemTableAccessor::from(self)
     }
 
-    /// Return immutable metadata of this catalog table.
     #[inline]
-    pub fn metadata(&self) -> &TableMetadata {
-        &self.metadata
+    pub(crate) async fn find_row(&self, row_id: crate::row::RowID) -> RowLocation {
+        GenericMemTable::find_row(self, row_id, None).await
+    }
+}
+
+impl Deref for CatalogTable {
+    type Target = GenericMemTable<FixedBufferPool>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.mem
     }
 }

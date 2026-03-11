@@ -187,23 +187,23 @@ impl Session {
         // 8. Prepare in-memory representation of new table
         let blk_idx = BlockIndex::new(
             engine.meta_pool,
-            table_id,
             table_file.active_root().pivot_row_id,
             table_file.active_root().column_block_index_root,
-            Arc::clone(&table_file),
-            engine.disk_pool,
         )
         .await;
-        let table = Table::new(
-            engine.mem_pool,
-            engine.index_pool,
-            engine.disk_pool,
-            blk_idx,
-            table_file,
-        )
-        .await;
+        let table = Arc::new(
+            Table::new(
+                engine.mem_pool,
+                engine.index_pool,
+                engine.disk_pool,
+                table_id,
+                blk_idx,
+                table_file,
+            )
+            .await,
+        );
         // Enable page committer so all row pages can be recovered.
-        table.blk_idx.enable_page_committer(engine.trx_sys);
+        table.enable_page_committer(engine.trx_sys);
 
         engine.catalog().insert_user_table(table);
 

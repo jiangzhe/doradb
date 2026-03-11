@@ -101,7 +101,7 @@ impl IndexUndoLogs {
                     //
                     // To solve this, we need to re-check original row with row latch and delete
                     // index entry if it is deleted and does not have any old version (already GCed).
-                    match table.blk_idx().find_row(old_row_id).await {
+                    match table.find_row(old_row_id).await {
                         RowLocation::NotFound => unreachable!(),
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {

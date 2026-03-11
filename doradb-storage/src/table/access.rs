@@ -1,14 +1,10 @@
-use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::{INVALID_PAGE_ID, PageID};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
-use crate::catalog::{CatalogTable, TableID, TableMetadata};
+use crate::catalog::{CatalogTable, TableMetadata};
 use crate::error::{Error, Result};
 use crate::index::util::Maskable;
-use crate::index::{
-    BlockIndex, GenericNonUniqueBTreeIndex, GenericSecondaryIndex, GenericUniqueBTreeIndex,
-    IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex,
-};
+use crate::index::{IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
 use crate::lwc::PersistedLwcPage;
 use crate::row::ops::{
@@ -18,9 +14,9 @@ use crate::row::ops::{
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::stmt::Statement;
 use crate::table::{
-    ColumnDeletionBuffer, DeleteInternal, DeleteMarker, DeletionError, InsertRowIntoPage, Table,
-    UpdateRowInplace, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
-    validate_page_row_range,
+    ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
+    GenericMemTable, InsertRowIntoPage, Table, UpdateRowInplace, index_key_is_changed,
+    index_key_replace, read_latest_index_key, row_len, validate_page_row_range,
 };
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{
@@ -33,6 +29,7 @@ use crate::value::Val;
 use std::collections::HashMap;
 use std::future::Future;
 use std::mem;
+use std::ops::Deref;
 use std::sync::Arc;
 
 pub trait TableAccess {
@@ -147,85 +144,37 @@ pub trait TableAccess {
 /// Thin operation wrapper that exposes `TableAccess` over a table reference.
 ///
 /// `D` is the buffer-pool type for row-page (in-memory) operations.
-/// `I` is the buffer-pool type used by secondary-index trees.
-///
 /// In runtime, this is usually bound via [`HybridTableAccessor`], while tests
 /// or alternative runtimes can bind different pool implementations.
-pub struct TableAccessor<'a, D: 'static, I: 'static> {
-    mem_pool: &'static D,
-    disk_pool: Option<&'a ReadonlyBufferPool>,
-    metadata: &'a TableMetadata,
-    blk_idx: &'a BlockIndex,
-    sec_idx: &'a [GenericSecondaryIndex<I>],
-    deletion_buffer: Option<&'a ColumnDeletionBuffer>,
+pub struct TableAccessor<'a, D: 'static> {
+    mem: &'a GenericMemTable<D>,
+    storage: Option<&'a ColumnStorage>,
 }
 
-impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool, FixedBufferPool> {
+impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool> {
     #[inline]
     fn from(table: &'a Table) -> Self {
         TableAccessor {
-            mem_pool: table.mem_pool,
-            disk_pool: Some(&table.disk_pool),
-            metadata: &table.metadata,
-            blk_idx: &table.blk_idx,
-            sec_idx: &table.sec_idx,
-            deletion_buffer: Some(&table.deletion_buffer),
+            mem: table,
+            storage: Some(&table.storage),
         }
     }
 }
 
-impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool, FixedBufferPool> {
+impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool> {
     #[inline]
     fn from(table: &'a CatalogTable) -> Self {
         TableAccessor {
-            mem_pool: table.mem_pool,
-            disk_pool: None,
-            metadata: &table.metadata,
-            blk_idx: &table.blk_idx,
-            sec_idx: &table.sec_idx,
-            deletion_buffer: None,
+            mem: table,
+            storage: None,
         }
     }
 }
 
-impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
+impl<'a, D: BufferPool> TableAccessor<'a, D> {
     #[inline]
-    fn table_id(&self) -> TableID {
-        self.blk_idx.table_id
-    }
-
-    #[inline]
-    fn metadata(&self) -> &TableMetadata {
-        self.metadata
-    }
-
-    #[inline]
-    async fn mem_scan<F>(&self, page_action: F)
-    where
-        F: FnMut(PageSharedGuard<RowPage>) -> bool,
-    {
-        let mut page_action = page_action;
-        // With cursor, we lock two pages in block index and one row page
-        // when scanning rows.
-        let mut cursor = self.blk_idx.mem_cursor();
-        cursor.seek(0).await;
-        while let Some(leaf) = cursor.next().await {
-            let g = leaf.lock_shared_async().await.unwrap();
-            debug_assert!(g.page().is_leaf());
-            let entries = g.page().leaf_entries();
-            for page_entry in entries {
-                let page_guard: PageSharedGuard<RowPage> = self
-                    .mem_pool
-                    .get_page(page_entry.page_id, LatchFallbackMode::Shared)
-                    .await
-                    .lock_shared_async()
-                    .await
-                    .unwrap();
-                if !page_action(page_guard) {
-                    return;
-                }
-            }
-        }
+    fn deletion_buffer(&self) -> Option<&ColumnDeletionBuffer> {
+        self.storage.map(ColumnStorage::deletion_buffer)
     }
 
     #[inline]
@@ -236,14 +185,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         user_read_set: &[usize],
         row_id: RowID,
     ) -> SelectMvcc {
-        let location = match self.blk_idx.try_find_row(row_id).await {
+        let location = match self.try_find_row(row_id, self.storage).await {
             Ok(location) => location,
             Err(err) => return SelectMvcc::Err(err),
         };
         match location {
             RowLocation::NotFound => SelectMvcc::NotFound,
             RowLocation::LwcPage(page_id) => {
-                let Some(deletion_buffer) = self.deletion_buffer else {
+                let Some(deletion_buffer) = self.deletion_buffer() else {
                     return SelectMvcc::NotFound;
                 };
                 if let Some(marker) = deletion_buffer.get(row_id) {
@@ -273,7 +222,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             }
             RowLocation::RowPage(page_id) => {
                 let page_guard = self
-                    .mem_pool
+                    .mem_pool()
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -300,10 +249,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_id: RowID,
         read_set: &[usize],
     ) -> Result<Option<Vec<Val>>> {
-        let Some(disk_pool) = self.disk_pool else {
+        let Some(storage) = self.storage else {
             return Err(Error::InvalidState);
         };
-        let page = PersistedLwcPage::load(disk_pool, page_id).await?;
+        let page = PersistedLwcPage::load(storage.disk_pool(), page_id).await?;
         let Some(row_idx) = page.find_row_idx(row_id)? else {
             return Ok(None);
         };
@@ -314,14 +263,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
     async fn insert_index_no_trx(&self, key: SelectKey, row_id: RowID) {
         if self.metadata().index_specs[key.index_no].unique() {
-            let res = self.sec_idx[key.index_no]
+            let res = self.sec_idx()[key.index_no]
                 .unique()
                 .unwrap()
                 .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
             assert!(res.is_ok());
         } else {
-            self.sec_idx[key.index_no]
+            self.sec_idx()[key.index_no]
                 .non_unique()
                 .unwrap()
                 .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
@@ -676,7 +625,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index_change_cols: &HashMap<usize, Val>,
     ) -> UpdateIndex {
         let metadata = self.metadata();
-        for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
+        for (index, index_schema) in self.sec_idx().iter().zip(&metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
             if index_key_is_changed(index_schema, index_change_cols) {
                 let new_key = read_latest_index_key(metadata, index.index_no, page_guard, row_id);
@@ -727,7 +676,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
-        for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
+        for (index, index_schema) in self.sec_idx().iter().zip(&metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
             let key = read_latest_index_key(metadata, index.index_no, page_guard, new_row_id);
             if index_schema.unique() {
@@ -768,7 +717,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
-        for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
+        for (index, index_schema) in self.sec_idx().iter().zip(&metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
             let key = read_latest_index_key(metadata, index.index_no, page_guard, new_row_id);
             if index_key_is_changed(index_schema, index_change_cols) {
@@ -894,7 +843,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         page_guard: &PageSharedGuard<RowPage>,
     ) {
         let metadata = self.metadata();
-        for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
+        for (index, index_schema) in self.sec_idx().iter().zip(&metadata.index_specs) {
             debug_assert!(index.is_unique() == index_schema.unique());
             let key = read_latest_index_key(metadata, index.index_no, page_guard, row_id);
             if index_schema.unique() {
@@ -913,12 +862,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn delete_index_directly(&self, key: &SelectKey, row_id: RowID) -> bool {
         let index_schema = &self.metadata().index_specs[key.index_no];
         if index_schema.unique() {
-            let index = self.sec_idx[key.index_no].unique().unwrap();
+            let index = self.sec_idx()[key.index_no].unique().unwrap();
             index
                 .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await
         } else {
-            let index = self.sec_idx[key.index_no].non_unique().unwrap();
+            let index = self.sec_idx()[key.index_no].non_unique().unwrap();
             index
                 .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await
@@ -928,7 +877,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
     async fn delete_unique_index(
         &self,
-        index: &GenericUniqueBTreeIndex<I>,
+        index: &impl UniqueIndex,
         key: &SelectKey,
         row_id: RowID,
     ) -> bool {
@@ -944,7 +893,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         // So we skip to delete it.
                         return false;
                     }
-                    match self.blk_idx.find_row(row_id).await {
+                    match self.find_row(row_id, self.storage).await {
                         RowLocation::NotFound => {
                             return index
                                 .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
@@ -953,7 +902,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let page_guard = self
-                                .mem_pool
+                                .mem_pool()
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .lock_shared_async()
@@ -983,7 +932,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
     async fn delete_non_unique_index(
         &self,
-        index: &GenericNonUniqueBTreeIndex<I>,
+        index: &impl NonUniqueIndex,
         key: &SelectKey,
         row_id: RowID,
     ) -> bool {
@@ -1002,7 +951,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         // So we skip to delete it.
                         return false;
                     }
-                    match self.blk_idx.find_row(row_id).await {
+                    match self.find_row(row_id, self.storage).await {
                         RowLocation::NotFound => {
                             return index
                                 .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
@@ -1011,7 +960,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let page_guard = self
-                                .mem_pool
+                                .mem_pool()
                                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                                 .await
                                 .lock_shared_async()
@@ -1046,7 +995,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> PageSharedGuard<RowPage> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
             let page_guard = self
-                .mem_pool
+                .mem_pool()
                 .get_page(page_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
@@ -1060,7 +1009,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 return page_guard;
             }
         }
-        self.blk_idx.get_insert_page(self.mem_pool, row_count).await
+        GenericMemTable::get_insert_page(self, row_count).await
     }
 
     // lock row will check write conflict on given row and lock it.
@@ -1151,12 +1100,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> LinkForUniqueIndex {
         debug_assert!(old_id != new_id);
         let (old_guard, old_id) = loop {
-            match self.blk_idx.find_row(old_id).await {
+            match self.find_row(old_id, self.storage).await {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let old_guard = self
-                        .mem_pool
+                        .mem_pool()
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .lock_shared_async()
@@ -1197,7 +1146,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> InsertIndex {
-        let index = self.sec_idx[key.index_no].unique().unwrap();
+        let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
             match index
                 .insert_if_not_exists(&key.vals, row_id, false, stmt.trx.sts)
@@ -1308,7 +1257,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
         row_id: RowID,
     ) -> InsertIndex {
-        let index = self.sec_idx[key.index_no].non_unique().unwrap();
+        let index = self.sec_idx()[key.index_no].non_unique().unwrap();
         // For non-unique index, it's guaranteed to be success.
         match index
             .insert_if_not_exists(&key.vals, row_id, false, stmt.trx.sts)
@@ -1327,7 +1276,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn defer_delete_unique_index(
         &self,
         stmt: &mut Statement,
-        index: &GenericUniqueBTreeIndex<I>,
+        index: &impl UniqueIndex,
         row_id: RowID,
         key: SelectKey,
     ) {
@@ -1340,7 +1289,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn defer_delete_non_unique_index(
         &self,
         stmt: &mut Statement,
-        index: &GenericNonUniqueBTreeIndex<I>,
+        index: &impl NonUniqueIndex,
         row_id: RowID,
         key: SelectKey,
     ) {
@@ -1354,7 +1303,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn update_unique_index_key_and_row_id_change(
         &self,
         stmt: &mut Statement,
-        index: &GenericUniqueBTreeIndex<I>,
+        index: &impl UniqueIndex,
         old_key: SelectKey,
         new_key: SelectKey,
         old_row_id: RowID,
@@ -1533,7 +1482,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn update_non_unique_index_key_and_row_id_change(
         &self,
         stmt: &mut Statement,
-        index: &GenericNonUniqueBTreeIndex<I>,
+        index: &impl NonUniqueIndex,
         old_key: SelectKey,
         new_key: SelectKey,
         old_row_id: RowID,
@@ -1562,7 +1511,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn update_unique_index_only_row_id_change(
         &self,
         stmt: &mut Statement,
-        index: &GenericUniqueBTreeIndex<I>,
+        index: &impl UniqueIndex,
         key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
@@ -1592,7 +1541,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn update_non_unique_index_only_row_id_change(
         &self,
         stmt: &mut Statement,
-        index: &GenericNonUniqueBTreeIndex<I>,
+        index: &impl NonUniqueIndex,
         key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
@@ -1618,7 +1567,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn update_unique_index_only_key_change(
         &self,
         stmt: &mut Statement,
-        index: &GenericUniqueBTreeIndex<I>,
+        index: &impl UniqueIndex,
         old_key: SelectKey,
         new_key: SelectKey,
         row_id: RowID,
@@ -1737,7 +1686,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn update_non_unique_index_only_key_change(
         &self,
         stmt: &mut Statement,
-        index: &GenericNonUniqueBTreeIndex<I>,
+        index: &impl NonUniqueIndex,
         old_key: SelectKey,
         new_key: SelectKey,
         row_id: RowID,
@@ -1771,14 +1720,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
 /// Runtime accessor type binding for user tables:
 /// - `D = EvictableBufferPool` for row pages
 /// - `I = FixedBufferPool` for secondary indexes
-pub type HybridTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool, FixedBufferPool>;
+pub type HybridTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool>;
 
 /// Runtime accessor type binding for in-memory catalog tables:
 /// - `D = FixedBufferPool` for row pages
 /// - `I = FixedBufferPool` for secondary indexes
-pub type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool, FixedBufferPool>;
+pub type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool>;
 
-impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
+impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
     async fn table_scan_uncommitted<F>(&self, mut row_action: F)
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
@@ -1825,7 +1774,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> SelectMvcc {
-        debug_assert!(key.index_no < self.sec_idx.len());
+        debug_assert!(key.index_no < self.sec_idx().len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         debug_assert!({
@@ -1835,7 +1784,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     .zip(user_read_set.iter().skip(1))
                     .all(|(l, r)| l < r)
         });
-        match self.sec_idx[key.index_no]
+        match self.sec_idx()[key.index_no]
             .unique()
             .unwrap()
             .lookup(&key.vals, stmt.trx.sts)
@@ -1857,22 +1806,22 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
     where
         for<'m, 'p> F: FnOnce(&'m TableMetadata, Row<'p>) -> R,
     {
-        debug_assert!(key.index_no < self.sec_idx.len());
+        debug_assert!(key.index_no < self.sec_idx().len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
-        let (page_guard, row_id) = match self.sec_idx[key.index_no]
+        let (page_guard, row_id) = match self.sec_idx()[key.index_no]
             .unique()
             .unwrap()
             .lookup(&key.vals, MIN_SNAPSHOT_TS)
             .await
         {
             None => return None,
-            Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
+            Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
                 RowLocation::NotFound => return None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self
-                        .mem_pool
+                        .mem_pool()
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                         .await
                         .lock_shared_async()
@@ -1905,7 +1854,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> ScanMvcc {
-        debug_assert!(key.index_no < self.sec_idx.len());
+        debug_assert!(key.index_no < self.sec_idx().len());
         // Index scan should be applied to non-unique index.
         // todo: support partial key scan on unique index.
         debug_assert!(!self.metadata().index_specs[key.index_no].unique());
@@ -1919,7 +1868,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         });
         // todo: support batching, streaming and sorting.
         let mut row_ids = vec![];
-        self.sec_idx[key.index_no]
+        self.sec_idx()[key.index_no]
             .non_unique()
             .unwrap()
             .lookup(&key.vals, &mut row_ids, stmt.trx.sts)
@@ -1985,10 +1934,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         let row_count = estimate_max_row_count(row_len, metadata.col_count());
         loop {
             // acquire insert page from block index.
-            let mut page_guard = self
-                .blk_idx
-                .get_insert_page_exclusive(self.mem_pool, row_count)
-                .await;
+            let mut page_guard = GenericMemTable::get_insert_page_exclusive(self, row_count).await;
             let page = page_guard.page_mut();
             debug_assert!(metadata.col_count() == page.header.col_count as usize);
             debug_assert!(cols.len() == page.header.col_count as usize);
@@ -2012,7 +1958,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
             }
             row.finish_insert();
             // Cache insert page.
-            self.blk_idx.cache_exclusive_insert_page(page_guard);
+            GenericMemTable::cache_exclusive_insert_page(self, page_guard);
             return;
         }
     }
@@ -2023,19 +1969,19 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
-        debug_assert!(key.index_no < self.sec_idx.len());
+        debug_assert!(key.index_no < self.sec_idx().len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
-        let index = self.sec_idx[key.index_no].unique().unwrap();
+        let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
             let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
                 None => return UpdateMvcc::NotFound,
-                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
+                Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
                     RowLocation::NotFound => return UpdateMvcc::NotFound,
                     RowLocation::LwcPage(..) => todo!("lwc page"),
                     RowLocation::RowPage(page_id) => {
                         let page_guard = self
-                            .mem_pool
+                            .mem_pool()
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
                             .lock_shared_async()
@@ -2126,18 +2072,18 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         key: &SelectKey,
         log_by_key: bool,
     ) -> DeleteMvcc {
-        debug_assert!(key.index_no < self.sec_idx.len());
+        debug_assert!(key.index_no < self.sec_idx().len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
-        let index = self.sec_idx[key.index_no].unique().unwrap();
+        let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
             let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
                 None => return DeleteMvcc::NotFound,
-                Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
+                Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
                     RowLocation::LwcPage(..) => {
                         let deletion_buffer = self
-                            .deletion_buffer
+                            .deletion_buffer()
                             .expect("catalog table should never have lwc page rows");
                         match deletion_buffer.put_ref(row_id, stmt.trx.status()) {
                             Ok(()) => {
@@ -2171,7 +2117,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     }
                     RowLocation::RowPage(page_id) => {
                         let page_guard = self
-                            .mem_pool
+                            .mem_pool()
                             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                             .await
                             .lock_shared_async()
@@ -2202,18 +2148,18 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
     }
 
     async fn delete_unique_no_trx(&self, key: &SelectKey) {
-        debug_assert!(key.index_no < self.sec_idx.len());
+        debug_assert!(key.index_no < self.sec_idx().len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
-        let index = self.sec_idx[key.index_no].unique().unwrap();
+        let index = self.sec_idx()[key.index_no].unique().unwrap();
         let (mut page_guard, row_id) = match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await {
             None => unreachable!(),
-            Some((row_id, _)) => match self.blk_idx.find_row(row_id).await {
+            Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
                 RowLocation::NotFound => unreachable!(),
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self
-                        .mem_pool
+                        .mem_pool()
                         .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
                         .await
                         .lock_exclusive_async()
@@ -2241,11 +2187,20 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         let index_schema = &self.metadata().index_specs[key.index_no];
         debug_assert_eq!(unique, index_schema.unique());
         if unique {
-            let index = self.sec_idx[key.index_no].unique().unwrap();
+            let index = self.sec_idx()[key.index_no].unique().unwrap();
             self.delete_unique_index(index, key, row_id).await
         } else {
-            let index = self.sec_idx[key.index_no].non_unique().unwrap();
+            let index = self.sec_idx()[key.index_no].non_unique().unwrap();
             self.delete_non_unique_index(index, key, row_id).await
         }
+    }
+}
+
+impl<D: BufferPool> Deref for TableAccessor<'_, D> {
+    type Target = GenericMemTable<D>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.mem
     }
 }

@@ -1,9 +1,8 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool};
-use crate::catalog::{TableID, TableMetadata};
-use crate::error::{PersistedFileKind, Result};
-use crate::file::table_file::TableFile;
+use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::catalog::TableMetadata;
+use crate::error::{Error, Result};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
 use crate::index::row_block_index::{
@@ -11,6 +10,7 @@ use crate::index::row_block_index::{
 };
 use crate::index::util::Maskable;
 use crate::row::{RowID, RowPage};
+use crate::table::ColumnStorage;
 use crate::trx::sys::TransactionSystem;
 use std::sync::Arc;
 
@@ -22,11 +22,8 @@ use std::sync::Arc;
 ///
 /// Routing decisions are made by `BlockIndexRoot`.
 pub struct GenericBlockIndex<P: 'static> {
-    /// Owning table id.
-    pub table_id: TableID,
     root: BlockIndexRoot,
     row: GenericRowBlockIndex<P>,
-    disk_pool: Option<ReadonlyBufferPool>,
 }
 
 /// Compatibility alias for runtime block index backed by `FixedBufferPool`.
@@ -38,46 +35,16 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     /// `pivot_row_id` and `column_root_page_id` define the boundary and root of
     /// persisted columnar data at startup.
     #[inline]
-    pub async fn new(
-        pool: &'static P,
-        table_id: TableID,
-        pivot_row_id: RowID,
-        column_root_page_id: PageID,
-        table_file: Arc<TableFile>,
-        global_disk_pool: &'static GlobalReadonlyBufferPool,
-    ) -> Self {
-        let metadata = Arc::clone(&table_file.active_root().metadata);
-        let row = GenericRowBlockIndex::new(pool, table_id, pivot_row_id, metadata).await;
+    pub async fn new(pool: &'static P, pivot_row_id: RowID, column_root_page_id: PageID) -> Self {
+        let row = GenericRowBlockIndex::new(pool, pivot_row_id).await;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_page_id);
-        let disk_pool = ReadonlyBufferPool::new(
-            table_id,
-            PersistedFileKind::TableFile,
-            Arc::clone(&table_file),
-            global_disk_pool,
-        );
-        GenericBlockIndex {
-            table_id,
-            root,
-            row,
-            disk_pool: Some(disk_pool),
-        }
+        GenericBlockIndex { root, row }
     }
 
     /// Creates block index for catalog-table runtime without table-file backing.
     #[inline]
-    pub async fn new_catalog(
-        pool: &'static P,
-        table_id: TableID,
-        metadata: Arc<TableMetadata>,
-    ) -> Self {
-        let row = GenericRowBlockIndex::new(pool, table_id, 0, metadata).await;
-        let root = BlockIndexRoot::new(0, 0);
-        GenericBlockIndex {
-            table_id,
-            root,
-            row,
-            disk_pool: None,
-        }
+    pub async fn new_catalog(pool: &'static P) -> Self {
+        Self::new(pool, 0, 0).await
     }
 
     /// Returns the in-memory row index height.
@@ -88,8 +55,12 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
     /// Enables redo logging for newly allocated row pages.
     #[inline]
-    pub fn enable_page_committer(&self, trx_sys: &'static TransactionSystem) {
-        self.row.enable_page_committer(trx_sys)
+    pub(crate) fn enable_page_committer(
+        &self,
+        table_id: crate::catalog::TableID,
+        trx_sys: &'static TransactionSystem,
+    ) {
+        self.row.enable_page_committer(table_id, trx_sys)
     }
 
     /// Returns whether row-page redo logging is enabled.
@@ -131,9 +102,10 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn get_insert_page<B: BufferPool>(
         &self,
         mem_pool: &'static B,
+        metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
-        self.row.get_insert_page(mem_pool, count).await
+        self.row.get_insert_page(mem_pool, metadata, count).await
     }
 
     /// Returns an exclusive row page suitable for insert operations.
@@ -141,9 +113,12 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
         mem_pool: &'static B,
+        metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
-        self.row.get_insert_page_exclusive(mem_pool, count).await
+        self.row
+            .get_insert_page_exclusive(mem_pool, metadata, count)
+            .await
     }
 
     /// Allocates a row page at a specific page id.
@@ -153,11 +128,12 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn allocate_row_page_at<B: BufferPool>(
         &self,
         mem_pool: &'static B,
+        metadata: &Arc<TableMetadata>,
         count: usize,
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
         self.row
-            .allocate_row_page_at(mem_pool, count, page_id)
+            .allocate_row_page_at(mem_pool, metadata, count, page_id)
             .await
     }
 
@@ -178,8 +154,12 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     /// It first follows the root route decision and may fallback to the column
     /// path when the row lookup misses due to concurrent boundary movement.
     #[inline]
-    pub async fn find_row(&self, row_id: RowID) -> RowLocation {
-        match self.try_find_row(row_id).await {
+    pub(crate) async fn find_row(
+        &self,
+        row_id: RowID,
+        storage: Option<&ColumnStorage>,
+    ) -> RowLocation {
+        match self.try_find_row(row_id, storage).await {
             Ok(location) => location,
             Err(err) => todo!(
                 "block-index column-path error policy is deferred (row_id={}, err={})",
@@ -191,14 +171,18 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
     /// Finds the physical location of one row id with persisted column-path errors surfaced.
     #[inline]
-    pub async fn try_find_row(&self, row_id: RowID) -> Result<RowLocation> {
+    pub(crate) async fn try_find_row(
+        &self,
+        row_id: RowID,
+        storage: Option<&ColumnStorage>,
+    ) -> Result<RowLocation> {
         debug_assert!(!row_id.is_deleted());
         match self.root.guide(row_id) {
             BlockIndexRoute::Column {
                 pivot_row_id,
                 root_page_id,
             } => {
-                self.find_row_in_column(row_id, pivot_row_id, root_page_id)
+                self.find_row_in_column(storage, row_id, pivot_row_id, root_page_id)
                     .await
             }
             BlockIndexRoute::Row => {
@@ -208,7 +192,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                 }
                 match self.root.try_column(row_id) {
                     Some((pivot_row_id, root_page_id)) => {
-                        self.find_row_in_column(row_id, pivot_row_id, root_page_id)
+                        self.find_row_in_column(storage, row_id, pivot_row_id, root_page_id)
                             .await
                     }
                     None => Ok(RowLocation::NotFound),
@@ -220,14 +204,15 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     #[inline]
     async fn find_row_in_column(
         &self,
+        storage: Option<&ColumnStorage>,
         row_id: RowID,
         pivot_row_id: RowID,
         root_page_id: PageID,
     ) -> Result<RowLocation> {
-        let Some(disk_pool) = &self.disk_pool else {
-            return Ok(RowLocation::NotFound);
+        let Some(storage) = storage else {
+            return Err(Error::ColumnStorageMissing);
         };
-        let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, disk_pool);
+        let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, storage.disk_pool());
         match index.find(row_id).await {
             Ok(Some(payload)) => Ok(RowLocation::LwcPage(payload.block_id as PageID)),
             Ok(None) => Ok(RowLocation::NotFound),
@@ -238,3 +223,167 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
 unsafe impl<P: BufferPool> Send for GenericBlockIndex<P> {}
 unsafe impl<P: BufferPool> Sync for GenericBlockIndex<P> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+    use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
+    use crate::buffer::{BufferPool, FixedBufferPool};
+    use crate::error::Validation;
+    use crate::latch::LatchFallbackMode;
+    use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Test helper that lets us pause one row-index page fetch at a precise point.
+    // The fallback test uses this to hold `try_find_row()` after the initial route
+    // decision but before the row-store lookup completes, so we can move the pivot
+    // and force the fallback-to-column path deterministically.
+    struct StallingBufferPool {
+        inner: &'static FixedBufferPool,
+        stall_page_id: AtomicU64,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl StallingBufferPool {
+        #[inline]
+        fn new(
+            inner: &'static FixedBufferPool,
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+        ) -> Self {
+            StallingBufferPool {
+                inner,
+                stall_page_id: AtomicU64::new(INVALID_PAGE_ID),
+                entered,
+                release,
+            }
+        }
+
+        #[inline]
+        fn set_stall_page_id(&self, page_id: PageID) {
+            self.stall_page_id.store(page_id, Ordering::Release);
+        }
+    }
+
+    unsafe impl StaticLifetime for StallingBufferPool {}
+
+    impl BufferPool for StallingBufferPool {
+        #[inline]
+        fn capacity(&self) -> usize {
+            self.inner.capacity()
+        }
+
+        #[inline]
+        fn allocated(&self) -> usize {
+            self.inner.allocated()
+        }
+
+        #[inline]
+        fn allocate_page<T: BufferPage>(
+            &'static self,
+        ) -> impl Future<Output = PageExclusiveGuard<T>> + Send {
+            self.inner.allocate_page()
+        }
+
+        #[inline]
+        fn allocate_page_at<T: BufferPage>(
+            &'static self,
+            page_id: PageID,
+        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+            self.inner.allocate_page_at(page_id)
+        }
+
+        #[inline]
+        async fn get_page<T: BufferPage>(
+            &'static self,
+            page_id: PageID,
+            mode: LatchFallbackMode,
+        ) -> FacadePageGuard<T> {
+            // Only stall the specific spin-mode read we care about; everything
+            // else should behave exactly like the wrapped fixed buffer pool.
+            if mode == LatchFallbackMode::Spin
+                && page_id == self.stall_page_id.load(Ordering::Acquire)
+            {
+                self.entered.wait();
+                self.release.wait();
+            }
+            self.inner.get_page(page_id, mode).await
+        }
+
+        #[inline]
+        fn try_get_page_versioned<T: BufferPage>(
+            &'static self,
+            id: VersionedPageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Option<FacadePageGuard<T>>> + Send {
+            self.inner.try_get_page_versioned(id, mode)
+        }
+
+        #[inline]
+        fn deallocate_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>) {
+            self.inner.deallocate_page(g)
+        }
+
+        #[inline]
+        fn get_child_page<T: BufferPage>(
+            &'static self,
+            p_guard: &FacadePageGuard<T>,
+            page_id: PageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send {
+            self.inner.get_child_page(p_guard, page_id, mode)
+        }
+    }
+
+    #[test]
+    fn test_try_find_row_returns_error_when_column_route_has_no_storage() {
+        let scope = StaticLifetimeScope::new();
+        let pool = scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+        let blk_idx = smol::block_on(BlockIndex::new(pool.as_static(), 10, 77));
+
+        // Row id 9 is below the pivot, so lookup goes straight to the column path.
+        // Without column storage this must surface as an error, not as "not found".
+        let err = match smol::block_on(blk_idx.try_find_row(9, None)) {
+            Ok(_location) => panic!("expected missing-column-storage error, got row location"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::ColumnStorageMissing));
+    }
+
+    #[test]
+    fn test_try_find_row_returns_error_when_column_fallback_has_no_storage() {
+        let scope = StaticLifetimeScope::new();
+        let inner = scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let pool = scope.adopt(<StallingBufferPool as StaticLifetime>::new_static(
+            StallingBufferPool::new(
+                inner.as_static(),
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            ),
+        ));
+        let blk_idx = smol::block_on(GenericBlockIndex::new(pool.as_static(), 10, 77));
+        pool.set_stall_page_id(blk_idx.row.root_page_id());
+
+        std::thread::scope(|s| {
+            // Start with row_id == pivot so the first route decision picks the row path.
+            let handle = s.spawn(|| smol::block_on(async { blk_idx.try_find_row(10, None).await }));
+
+            // Wait until the row-store root fetch is paused, then move the pivot past
+            // row_id so the subsequent `try_column()` fallback becomes eligible.
+            // This avoids relying on timing-sensitive races to exercise the fallback.
+            entered.wait();
+            smol::block_on(blk_idx.update_column_root(11, 88));
+            release.wait();
+
+            let res = handle.join().unwrap();
+            assert!(matches!(res, Err(Error::ColumnStorageMissing)));
+        });
+    }
+}

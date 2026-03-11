@@ -51,7 +51,7 @@ pub const fn is_catalog_obj_id(obj_id: ObjID) -> bool {
 /// Catalog contains metadata of user tables.
 pub struct Catalog {
     next_user_obj_id: AtomicU64,
-    user_tables: DashMap<TableID, Table>,
+    user_tables: DashMap<TableID, Arc<Table>>,
     pub storage: CatalogStorage,
 }
 
@@ -146,7 +146,7 @@ impl Catalog {
     #[inline]
     pub async fn enable_page_committer_for_tables(&self, trx_sys: &'static TransactionSystem) {
         for entry in &self.user_tables {
-            entry.value().blk_idx.enable_page_committer(trx_sys);
+            entry.value().enable_page_committer(trx_sys);
         }
     }
 
@@ -236,15 +236,21 @@ impl Catalog {
 
                 let blk_idx = BlockIndex::new(
                     self.storage.meta_pool,
-                    table.table_id,
                     row_id_bound,
                     active_root.column_block_index_root,
-                    Arc::clone(&table_file),
-                    global_disk_pool,
                 )
                 .await;
-                let table =
-                    Table::new(mem_pool, index_pool, global_disk_pool, blk_idx, table_file).await;
+                let table = Arc::new(
+                    Table::new(
+                        mem_pool,
+                        index_pool,
+                        global_disk_pool,
+                        table.table_id,
+                        blk_idx,
+                        table_file,
+                    )
+                    .await,
+                );
                 let old = self.user_tables.insert(table_id, table);
                 if old.is_some() {
                     return Err(Error::TableAlreadyExists);
@@ -257,24 +263,24 @@ impl Catalog {
 
     /// Get a user-table runtime handle by table id.
     #[inline]
-    pub async fn get_table(&self, table_id: TableID) -> Option<Table> {
+    pub async fn get_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         if is_catalog_obj_id(table_id) {
             return None;
         }
         self.user_tables
             .get(&table_id)
-            .map(|table| table.value().clone())
+            .map(|table| Arc::clone(table.value()))
     }
 
     /// Get a catalog-table runtime handle by table id.
     #[inline]
-    pub fn get_catalog_table(&self, table_id: TableID) -> Option<CatalogTable> {
+    pub fn get_catalog_table(&self, table_id: TableID) -> Option<Arc<CatalogTable>> {
         self.storage.get_catalog_table(table_id)
     }
 
     /// Insert a user table runtime into the in-memory cache.
     #[inline]
-    pub fn insert_user_table(&self, table: Table) {
+    pub fn insert_user_table(&self, table: Arc<Table>) {
         let table_id = table.table_id();
         let old = self.user_tables.insert(table_id, table);
         debug_assert!(old.is_none());
@@ -282,7 +288,7 @@ impl Catalog {
 
     /// Remove a user table runtime from the in-memory cache.
     #[inline]
-    pub fn remove_user_table(&self, table_id: TableID) -> Option<Table> {
+    pub fn remove_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         self.user_tables.remove(&table_id).map(|(_, table)| table)
     }
 
@@ -296,7 +302,7 @@ impl Catalog {
     fn loaded_table_heap_redo_start_ts(&self, table_id: TableID) -> Option<u64> {
         self.user_tables
             .get(&table_id)
-            .map(|table| table.file.active_root().heap_redo_start_ts)
+            .map(|table| table.file().active_root().heap_redo_start_ts)
     }
 }
 
@@ -306,8 +312,8 @@ unsafe impl StaticLifetime for Catalog {}
 
 /// Unified runtime handle for either user table or catalog table.
 pub enum TableHandle {
-    User(Table),
-    Catalog(CatalogTable),
+    User(Arc<Table>),
+    Catalog(Arc<CatalogTable>),
 }
 
 impl TableHandle {
@@ -337,6 +343,14 @@ impl TableHandle {
         match self {
             TableHandle::User(table) => Some(table.deletion_buffer()),
             TableHandle::Catalog(_) => None,
+        }
+    }
+
+    #[inline]
+    pub async fn find_row(&self, row_id: RowID) -> crate::index::RowLocation {
+        match self {
+            TableHandle::User(table) => table.find_row(row_id).await,
+            TableHandle::Catalog(table) => table.find_row(row_id).await,
         }
     }
 
@@ -1035,10 +1049,10 @@ pub mod tests {
                 .await
                 .unwrap();
 
-            assert!(checkpointed_table.file.active_root().pivot_row_id > 0);
-            assert_eq!(replay_only_table.file.active_root().pivot_row_id, 0);
+            assert!(checkpointed_table.file().active_root().pivot_row_id > 0);
+            assert_eq!(replay_only_table.file().active_root().pivot_row_id, 0);
             assert!(
-                checkpointed_table.file.active_root().heap_redo_start_ts
+                checkpointed_table.file().active_root().heap_redo_start_ts
                     > snap1.catalog_replay_start_ts
             );
 

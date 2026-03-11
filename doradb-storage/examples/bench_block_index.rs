@@ -4,7 +4,7 @@ use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
 };
 use doradb_storage::engine::EngineConfig;
-use doradb_storage::index::{BlockIndex, RowLocation};
+use doradb_storage::index::{RowBlockIndex, RowLocation};
 use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::ValKind;
 use parking_lot::RwLock;
@@ -45,27 +45,12 @@ fn main() {
                     IndexAttributes::PK,
                 )],
             ));
-            let table_id = 101;
-            let uninit_table_file = engine
-                .table_fs
-                .create_table_file(table_id, metadata, true)
-                .unwrap();
-            let (table_file, _) = uninit_table_file.commit(1, false).await.unwrap();
-            let blk_idx = BlockIndex::new(
-                engine.meta_pool,
-                table_id,
-                table_file.active_root().pivot_row_id,
-                table_file.active_root().column_block_index_root,
-                Arc::clone(&table_file),
-                engine.disk_pool,
-            )
-            .await;
+            let blk_idx = RowBlockIndex::new(engine.meta_pool, 0).await;
             let blk_idx = Box::leak(Box::new(blk_idx));
-            blk_idx.enable_page_committer(engine.trx_sys);
 
             for _ in 0..args.pages {
                 let _ = blk_idx
-                    .get_insert_page(engine.mem_pool, args.rows_per_page)
+                    .get_insert_page(engine.mem_pool, &metadata, args.rows_per_page)
                     .await;
             }
             let start = Instant::now();
@@ -158,7 +143,11 @@ fn bench_btreemap(args: Args) {
     }
 }
 
-async fn worker(args: Args, blk_idx: &'static BlockIndex, stop: Arc<AtomicBool>) -> (usize, u64) {
+async fn worker(
+    args: Args,
+    blk_idx: &'static RowBlockIndex,
+    stop: Arc<AtomicBool>,
+) -> (usize, u64) {
     let max_row_id = (args.pages * args.rows_per_page) as u64;
     let mut rng = rand::rng();
     // rng.next_u64() as usize % max_row_id;

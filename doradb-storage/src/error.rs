@@ -135,6 +135,8 @@ pub enum Error {
     ColumnNeverNull,
     #[error("invalid column scan")]
     InvalidColumnScan,
+    #[error("column storage is required for column-path row lookup")]
+    ColumnStorageMissing,
     #[error(
         "persisted page corrupted: file={file_kind}, page={page_kind}, page_id={page_id}, cause={cause}"
     )]
