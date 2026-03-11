@@ -179,6 +179,51 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented the shared runtime split described by this task:
+   - `doradb-storage/src/table/mod.rs` now defines
+     `GenericMemTable<P>` as the shared in-memory runtime core containing
+     `table_id`, `Arc<TableMetadata>`, `mem_pool`, `blk_idx`, and `sec_idx`;
+   - `ColumnStorage` now owns user-table-only persisted state
+     (`Arc<TableFile>`, `ReadonlyBufferPool`, and `ColumnDeletionBuffer`);
+   - `Table` and `CatalogTable` are now thin runtime wrappers around those
+     pieces instead of duplicating the same field layout.
+2. Moved runtime ownership and cheap-clone boundaries to outer table handles:
+   - user-table and catalog-table caches now traffic in `Arc<Table>` and
+     `Arc<CatalogTable>`;
+   - `Catalog`, `CatalogStorage`, recovery, purge, and session paths were
+     updated to use the new wrapper layout instead of the old field-by-field
+     cloning pattern.
+3. Removed schema/identity ownership from block-index internals and routed it
+   through the owning mem-table runtime:
+   - `GenericRowBlockIndex` no longer stores metadata;
+   - `GenericBlockIndex` no longer stores `table_id` or a readonly pool;
+   - row-page allocation helpers and page-committer setup now receive metadata
+     and table identity from `GenericMemTable<P>`.
+4. Refactored table access around the mem-table core plus optional persisted
+   column state:
+   - `TableAccessor` now stores `mem: &GenericMemTable<_>` and
+     `storage: Option<&ColumnStorage>`;
+   - `Table`, `CatalogTable`, and `TableAccessor` now implement `Deref` to the
+     mem-table core, which removed wrapper-only getters and simplified call
+     sites to the same runtime boundary used by the accessor refactor.
+5. Completed review-driven cleanup after the main refactor landed:
+   - reversed the block-index `find_row` / `try_find_row` parameter order to
+     `(row_id, storage)` for consistency with call sites;
+   - updated cold-row lookup so missing `ColumnStorage` on the column path now
+     returns `Error::ColumnStorageMissing` instead of being collapsed into
+     `RowLocation::NotFound`;
+   - added block-index tests for both the direct column route and the
+     row-miss fallback route, including comments that explain the barrier-based
+     stalling trick used to make the fallback test deterministic.
+6. Verified behavior remained stable after the ownership split and the
+   follow-up review fixes:
+   - `cargo test -p doradb-storage --no-default-features`
+   - `cargo test -p doradb-storage --no-default-features index::block_index`
+7. Resolve tracking:
+   - task issue: `#415`
+   - parent RFC linkage check: `tools/task.rs resolve-task-rfc --task docs/tasks/000062-generic-mem-table-core-and-column-storage-runtime-refactor.md`
+   - RFC result: no parent RFC reference found in task doc
+
 ## Impacts
 
 1. `doradb-storage/src/table/mod.rs`
@@ -236,3 +281,8 @@ Reference:
    outer-`Arc` handle plus inner `mem`/`storage` split is the right
    steady-state model, or whether a single inner runtime object would still be
    beneficial later.
+3. `GenericBlockIndex::find_row` still has a deferred policy for surfacing
+   column-path lookup errors from its infallible API. A follow-up can decide
+   whether that entry point should return `Result<RowLocation>`, map storage
+   and corruption failures into a stable crate error policy, or be eliminated
+   in favor of `try_find_row`.

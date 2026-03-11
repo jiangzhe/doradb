@@ -2,7 +2,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
 use crate::index::row_block_index::{
@@ -210,7 +210,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         root_page_id: PageID,
     ) -> Result<RowLocation> {
         let Some(storage) = storage else {
-            return Ok(RowLocation::NotFound);
+            return Err(Error::ColumnStorageMissing);
         };
         let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, storage.disk_pool());
         match index.find(row_id).await {
@@ -223,3 +223,167 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
 unsafe impl<P: BufferPool> Send for GenericBlockIndex<P> {}
 unsafe impl<P: BufferPool> Sync for GenericBlockIndex<P> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+    use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
+    use crate::buffer::{BufferPool, FixedBufferPool};
+    use crate::error::Validation;
+    use crate::latch::LatchFallbackMode;
+    use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Test helper that lets us pause one row-index page fetch at a precise point.
+    // The fallback test uses this to hold `try_find_row()` after the initial route
+    // decision but before the row-store lookup completes, so we can move the pivot
+    // and force the fallback-to-column path deterministically.
+    struct StallingBufferPool {
+        inner: &'static FixedBufferPool,
+        stall_page_id: AtomicU64,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl StallingBufferPool {
+        #[inline]
+        fn new(
+            inner: &'static FixedBufferPool,
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+        ) -> Self {
+            StallingBufferPool {
+                inner,
+                stall_page_id: AtomicU64::new(INVALID_PAGE_ID),
+                entered,
+                release,
+            }
+        }
+
+        #[inline]
+        fn set_stall_page_id(&self, page_id: PageID) {
+            self.stall_page_id.store(page_id, Ordering::Release);
+        }
+    }
+
+    unsafe impl StaticLifetime for StallingBufferPool {}
+
+    impl BufferPool for StallingBufferPool {
+        #[inline]
+        fn capacity(&self) -> usize {
+            self.inner.capacity()
+        }
+
+        #[inline]
+        fn allocated(&self) -> usize {
+            self.inner.allocated()
+        }
+
+        #[inline]
+        fn allocate_page<T: BufferPage>(
+            &'static self,
+        ) -> impl Future<Output = PageExclusiveGuard<T>> + Send {
+            self.inner.allocate_page()
+        }
+
+        #[inline]
+        fn allocate_page_at<T: BufferPage>(
+            &'static self,
+            page_id: PageID,
+        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+            self.inner.allocate_page_at(page_id)
+        }
+
+        #[inline]
+        async fn get_page<T: BufferPage>(
+            &'static self,
+            page_id: PageID,
+            mode: LatchFallbackMode,
+        ) -> FacadePageGuard<T> {
+            // Only stall the specific spin-mode read we care about; everything
+            // else should behave exactly like the wrapped fixed buffer pool.
+            if mode == LatchFallbackMode::Spin
+                && page_id == self.stall_page_id.load(Ordering::Acquire)
+            {
+                self.entered.wait();
+                self.release.wait();
+            }
+            self.inner.get_page(page_id, mode).await
+        }
+
+        #[inline]
+        fn try_get_page_versioned<T: BufferPage>(
+            &'static self,
+            id: VersionedPageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Option<FacadePageGuard<T>>> + Send {
+            self.inner.try_get_page_versioned(id, mode)
+        }
+
+        #[inline]
+        fn deallocate_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>) {
+            self.inner.deallocate_page(g)
+        }
+
+        #[inline]
+        fn get_child_page<T: BufferPage>(
+            &'static self,
+            p_guard: &FacadePageGuard<T>,
+            page_id: PageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send {
+            self.inner.get_child_page(p_guard, page_id, mode)
+        }
+    }
+
+    #[test]
+    fn test_try_find_row_returns_error_when_column_route_has_no_storage() {
+        let scope = StaticLifetimeScope::new();
+        let pool = scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+        let blk_idx = smol::block_on(BlockIndex::new(pool.as_static(), 10, 77));
+
+        // Row id 9 is below the pivot, so lookup goes straight to the column path.
+        // Without column storage this must surface as an error, not as "not found".
+        let err = match smol::block_on(blk_idx.try_find_row(9, None)) {
+            Ok(_location) => panic!("expected missing-column-storage error, got row location"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::ColumnStorageMissing));
+    }
+
+    #[test]
+    fn test_try_find_row_returns_error_when_column_fallback_has_no_storage() {
+        let scope = StaticLifetimeScope::new();
+        let inner = scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let pool = scope.adopt(<StallingBufferPool as StaticLifetime>::new_static(
+            StallingBufferPool::new(
+                inner.as_static(),
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            ),
+        ));
+        let blk_idx = smol::block_on(GenericBlockIndex::new(pool.as_static(), 10, 77));
+        pool.set_stall_page_id(blk_idx.row.root_page_id());
+
+        std::thread::scope(|s| {
+            // Start with row_id == pivot so the first route decision picks the row path.
+            let handle = s.spawn(|| smol::block_on(async { blk_idx.try_find_row(10, None).await }));
+
+            // Wait until the row-store root fetch is paused, then move the pivot past
+            // row_id so the subsequent `try_column()` fallback becomes eligible.
+            // This avoids relying on timing-sensitive races to exercise the fallback.
+            entered.wait();
+            smol::block_on(blk_idx.update_column_root(11, 88));
+            release.wait();
+
+            let res = handle.join().unwrap();
+            assert!(matches!(res, Err(Error::ColumnStorageMissing)));
+        });
+    }
+}
