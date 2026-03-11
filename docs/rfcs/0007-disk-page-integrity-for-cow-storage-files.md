@@ -348,9 +348,9 @@ Reference:
   - Non-goals: no redo-log checksums, no repair tooling, and no compatibility
     or migration layer for old files.
   - Task Doc: `docs/tasks/000061-readonly-cache-validation-recovery-hardening-and-corruption-tests.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#412`
+  - Phase Status: done
+  - Implementation Summary: 1. Implemented miss-time persisted-page validation at the shared readonly-cache [Task Resolve Sync: docs/tasks/000061-readonly-cache-validation-recovery-hardening-and-corruption-tests.md @ 2026-03-11]
 
 ## Consequences
 

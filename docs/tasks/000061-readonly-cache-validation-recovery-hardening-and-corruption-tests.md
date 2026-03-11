@@ -1,7 +1,7 @@
 ---
 id: 000061
 title: Readonly-Cache Validation, Recovery Hardening, and Corruption Tests
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-11
 github_issue: 412
 ---
@@ -150,6 +150,55 @@ Reference:
      `doradb-storage/src/trx/recover.rs`
 
 ## Implementation Notes
+
+1. Implemented miss-time persisted-page validation at the shared readonly-cache
+   boundary in `doradb-storage/src/buffer/readonly.rs`:
+   - `ReadonlyBufferPool` now carries `PersistedFileKind`;
+   - cache misses can be validated before readonly-key binding and mapping
+     insertion;
+   - validated cached reads invalidate corrupted resident mappings instead of
+     leaving stale readonly entries behind.
+2. Converted the phase-3 persisted readers to the validated readonly path:
+   - `doradb-storage/src/lwc/page.rs` now loads persisted LWC pages through
+     validated shared-page reads;
+   - `doradb-storage/src/index/column_block_index.rs` reads validated
+     zero-copy node views from readonly frames;
+   - `doradb-storage/src/index/column_deletion_blob.rs` reads validated blob
+     pages through the same readonly boundary.
+3. Hardened corruption propagation through runtime and startup call paths:
+   - `doradb-storage/src/index/block_index.rs` now exposes a fallible
+     column-path lookup used by table access instead of panicking through the
+     old `todo!()` path;
+   - table access, catalog checkpoint/bootstrap, and persisted-data recovery
+     now propagate contextual corruption errors through `Result`-based paths;
+   - invalid offloaded deletion-bitmap refs and blob contents are classified
+     as contextual `PersistedPageCorrupted` errors instead of generic
+     `InvalidFormat`.
+4. Review/cleanup outcomes completed during implementation:
+   - removed compatibility-only raw persisted-page helpers that were no longer
+     used after the validated readonly rollout;
+   - refactored readonly miss loading onto a reserved-frame guard so frame
+     cleanup and publish logic live in one place;
+   - confirmed the remaining meaningful copy in runtime table access is the
+     owned `Vec<Val>` / `MemVar` materialization boundary, which stays in
+     place because `TableAccess` still returns owned row values.
+5. Added the targeted corruption coverage and cache-residency assertions
+   called for by this task:
+   - readonly-cache tests now prove corrupted LWC, column-block-index, and
+     deletion-blob pages fail validation without leaving a resident mapping;
+   - table access over corrupted persisted pages returns errors instead of
+     panicking;
+   - catalog bootstrap and user-table recovery fail fast on corrupted
+     checkpointed persisted pages;
+   - offloaded bitmap corruption tests now assert the expected page-kind
+     classification.
+6. Verification executed for this task:
+   - `cargo test -p doradb-storage --no-default-features`
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+7. Delivery tracking:
+   - task issue: `#412`
+   - implementation PR: `#413`
+   - parent RFC: `docs/rfcs/0007-disk-page-integrity-for-cow-storage-files.md`
 
 ## Impacts
 
