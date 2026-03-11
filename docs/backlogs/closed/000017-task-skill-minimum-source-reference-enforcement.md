@@ -19,3 +19,10 @@ Evaluate and optionally enforce minimum referenced source files/docs in Round 1 
 
 Enforcement policy is finalized and documented, with implementation if approved.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000058-enforce-round-1-source-references-in-task-skill.md
+- Closed By: backlog close
+- Reference: docs/tasks/000058-enforce-round-1-source-references-in-task-skill.md
+- Closed At: 2026-03-11

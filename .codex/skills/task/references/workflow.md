@@ -24,8 +24,16 @@ Complete all items:
 3. Inspect impacted code paths and related modules.
 4. Produce at least three proposals.
 5. Provide tradeoffs and drawbacks for each proposal.
-6. Recommend one proposal and explain why.
-7. Ask for user feedback on the recommendation.
+6. Include a `Source References` block with at least:
+   - 2 concrete repo references total,
+   - 1 docs/backlog/process reference (`[D#]` or `[B#]`),
+   - 1 code/tool/skill reference (`[C#]`),
+   - source backlog reference (`[B#]`) when task creation starts from backlog input,
+   - optional conversation references (`[U#]`) only when user constraints materially affect scope.
+7. Cite at least one relevant reference token in each proposal and in the recommendation.
+8. Avoid low-value citation padding; references must be materially used in analysis or rationale.
+9. Recommend one proposal and explain why.
+10. Ask for user feedback on the recommendation.
 
 ## `task create` Round 2 Checklist
 
