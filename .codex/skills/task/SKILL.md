@@ -54,6 +54,17 @@ Produce an initial design package with:
 4. Clear tradeoffs/drawbacks for each proposal.
 5. Recommended direction with rationale.
 
+Round 1 must include a short `Source References` block for the material used in the analysis.
+Minimum evidence requirements:
+- At least 2 concrete repo references total.
+- At least 1 docs/backlog/process reference (`[D#]` or `[B#]`).
+- At least 1 code/tool/skill reference (`[C#]`).
+- If task creation starts from backlog input, include the source backlog explicitly as `[B#]`.
+- Add conversation references (`[U#]`) only when user-provided constraints materially affect scope or direction.
+
+Every proposal and the recommendation must cite at least one relevant reference token.
+Do not satisfy this gate with low-value citation padding; references must be materially used in current-state analysis, tradeoffs, or recommendation rationale.
+
 Then request user feedback.
 Round 1 is incomplete without explicit user input.
 
