@@ -3,6 +3,7 @@ id: 000062
 title: Generic MemTable Core and Column Storage Runtime Refactor
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-11
+github_issue: 415
 ---
 
 # Task: Generic MemTable Core and Column Storage Runtime Refactor
