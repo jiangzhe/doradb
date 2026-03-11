@@ -3,6 +3,7 @@ use doradb_storage::buffer::guard::PageGuard;
 use doradb_storage::buffer::page::{PAGE_SIZE, Page, PageID};
 use doradb_storage::buffer::{BufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool};
 use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+use doradb_storage::error::PersistedFileKind;
 use doradb_storage::file::table_fs::TableFileSystemConfig;
 use doradb_storage::io::AIOBuf;
 use doradb_storage::latch::LatchFallbackMode;
@@ -67,6 +68,7 @@ fn main() {
             scope.adopt(GlobalReadonlyBufferPool::with_capacity_static(args.cache_bytes).unwrap());
         let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
             901,
+            PersistedFileKind::TableFile,
             Arc::clone(&table_file),
             global.as_static(),
         )));

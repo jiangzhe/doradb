@@ -2,7 +2,7 @@ use crate::buffer::page::PageID;
 use crate::error::{Error, Result};
 use crate::file::table_file::MutableTableFile;
 use crate::index::{
-    ColumnBlockIndex, OffloadedBitmapPatch, encode_deletion_deltas_to_bytes,
+    ColumnBlockIndex, ColumnLeafEntry, OffloadedBitmapPatch, encode_deletion_deltas_to_bytes,
     load_payload_deletion_deltas,
 };
 use crate::session::Session;
@@ -28,7 +28,7 @@ pub trait TablePersistence {
 
 #[derive(Clone, Copy)]
 struct BlockPatchSeed {
-    payload: crate::index::ColumnPagePayload,
+    entry: ColumnLeafEntry,
 }
 
 impl Table {
@@ -194,19 +194,19 @@ impl Table {
 
         let mut grouped: BTreeMap<u64, (BlockPatchSeed, BTreeSet<u32>)> = BTreeMap::new();
         for row_id in selected_row_ids {
-            let Some((start_row_id, payload)) = column_index.find_entry(row_id).await? else {
+            let Some(entry) = column_index.find_entry(row_id).await? else {
                 continue;
             };
             let delta_u64 = row_id
-                .checked_sub(start_row_id)
+                .checked_sub(entry.start_row_id)
                 .ok_or(Error::InvalidState)?;
             if delta_u64 > u32::MAX as u64 {
                 return Err(Error::InvalidState);
             }
             let delta = delta_u64 as u32;
             let entry = grouped
-                .entry(start_row_id)
-                .or_insert((BlockPatchSeed { payload }, BTreeSet::new()));
+                .entry(entry.start_row_id)
+                .or_insert((BlockPatchSeed { entry }, BTreeSet::new()));
             entry.1.insert(delta);
         }
         if grouped.is_empty() {
@@ -216,7 +216,7 @@ impl Table {
         // Step 4: load persisted deltas, merge pending deltas, and build patch bytes.
         let mut patch_storage: Vec<(u64, Vec<u8>)> = Vec::new();
         for (start_row_id, (seed, pending)) in grouped {
-            let mut base = load_payload_deletion_deltas(&column_index, seed.payload).await?;
+            let mut base = load_payload_deletion_deltas(&column_index, seed.entry).await?;
             let old_len = base.len();
             base.extend(pending);
             if base.len() == old_len {

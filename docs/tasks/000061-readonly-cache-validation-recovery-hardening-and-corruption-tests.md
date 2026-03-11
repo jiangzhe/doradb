@@ -3,6 +3,7 @@ id: 000061
 title: Readonly-Cache Validation, Recovery Hardening, and Corruption Tests
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-11
+github_issue: 412
 ---
 
 # Task: Readonly-Cache Validation, Recovery Hardening, and Corruption Tests

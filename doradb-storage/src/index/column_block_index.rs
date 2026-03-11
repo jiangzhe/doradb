@@ -6,8 +6,8 @@ use crate::error::{
 };
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
 use crate::file::page_integrity::{
-    COLUMN_BLOCK_INDEX_PAGE_SPEC, max_payload_len, validate_page, write_page_checksum,
-    write_page_header,
+    COLUMN_BLOCK_INDEX_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
+    write_page_checksum, write_page_header,
 };
 use crate::index::column_deletion_blob::{ColumnDeletionBlobReader, ColumnDeletionBlobWriter};
 use crate::index::column_payload::{BlobRef, ColumnPagePayload};
@@ -245,7 +245,14 @@ pub struct ColumnBlockIndex<'a> {
     disk_pool: &'a ReadonlyBufferPool,
     root_page_id: PageID,
     end_row_id: RowID,
-    file_kind: PersistedFileKind,
+}
+
+/// One resolved leaf entry from the persisted column block-index tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnLeafEntry {
+    pub leaf_page_id: PageID,
+    pub start_row_id: RowID,
+    pub payload: ColumnPagePayload,
 }
 
 /// One bitmap update patch keyed by leaf `start_row_id`.
@@ -339,6 +346,40 @@ fn validate_node_payload(
     Ok((payload, *header))
 }
 
+#[inline]
+pub(crate) fn validate_persisted_column_block_index_page(
+    page: &[u8],
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<()> {
+    validate_node_payload(page, file_kind, page_id).map(|_| ())
+}
+
+#[inline]
+fn validated_node_payload(page: &[u8]) -> &[u8] {
+    let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+    &page[payload_start..payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE]
+}
+
+#[inline]
+fn parse_validated_node_header(
+    page: &[u8],
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<ColumnBlockNodeHeader> {
+    let payload = validated_node_payload(page);
+    let header =
+        bytemuck::try_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    let count = header.count as usize;
+    if (header.height == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
+        || (header.height > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
+    {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    Ok(*header)
+}
+
 struct ValidatedColumnBlockNode {
     guard: PageSharedGuard<Page>,
     header: ColumnBlockNodeHeader,
@@ -351,7 +392,7 @@ impl ValidatedColumnBlockNode {
         file_kind: PersistedFileKind,
         page_id: PageID,
     ) -> Result<Self> {
-        let (_, header) = validate_node_payload(guard.page(), file_kind, page_id)?;
+        let header = parse_validated_node_header(guard.page(), file_kind, page_id)?;
         Ok(ValidatedColumnBlockNode { guard, header })
     }
 }
@@ -364,9 +405,7 @@ impl ColumnBlockNodeRead for ValidatedColumnBlockNode {
 
     #[inline]
     fn data_ref(&self) -> &[u8] {
-        let payload_start = crate::file::page_integrity::PAGE_INTEGRITY_HEADER_SIZE;
-        let payload =
-            &self.guard.page()[payload_start..payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE];
+        let payload = validated_node_payload(self.guard.page());
         &payload[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
     }
 }
@@ -375,27 +414,10 @@ impl<'a> ColumnBlockIndex<'a> {
     /// Creates a column block-index view for one root page snapshot.
     #[inline]
     pub fn new(root_page_id: PageID, end_row_id: RowID, disk_pool: &'a ReadonlyBufferPool) -> Self {
-        Self::new_in_file(
-            root_page_id,
-            end_row_id,
-            disk_pool,
-            PersistedFileKind::TableFile,
-        )
-    }
-
-    /// Creates a column block-index view for a specific persisted CoW file kind.
-    #[inline]
-    pub fn new_in_file(
-        root_page_id: PageID,
-        end_row_id: RowID,
-        disk_pool: &'a ReadonlyBufferPool,
-        file_kind: PersistedFileKind,
-    ) -> Self {
         ColumnBlockIndex {
             disk_pool,
             root_page_id,
             end_row_id,
-            file_kind,
         }
     }
 
@@ -412,22 +434,30 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     #[inline]
+    pub(crate) fn file_kind(&self) -> PersistedFileKind {
+        self.disk_pool.persisted_file_kind()
+    }
+
+    #[inline]
     async fn read_node(&self, page_id: PageID) -> Result<ValidatedColumnBlockNode> {
-        let g = self.disk_pool.try_get_page_shared::<Page>(page_id).await?;
-        ValidatedColumnBlockNode::try_from_guard(g, self.file_kind, page_id)
+        let g = self
+            .disk_pool
+            .try_get_validated_page_shared(page_id, validate_persisted_column_block_index_page)
+            .await?;
+        ValidatedColumnBlockNode::try_from_guard(g, self.file_kind(), page_id)
     }
 
     /// Finds the column page payload containing `row_id`.
     ///
     /// Returns `Ok(None)` when `row_id` is not persisted in this column range.
     pub async fn find(&self, row_id: RowID) -> Result<Option<ColumnPagePayload>> {
-        Ok(self.find_entry(row_id).await?.map(|(_, payload)| payload))
+        Ok(self.find_entry(row_id).await?.map(|entry| entry.payload))
     }
 
-    /// Finds leaf entry `(start_row_id, payload)` containing `row_id`.
+    /// Finds the leaf entry containing `row_id`.
     ///
     /// Returns `Ok(None)` when `row_id` is not persisted in this column range.
-    pub async fn find_entry(&self, row_id: RowID) -> Result<Option<(RowID, ColumnPagePayload)>> {
+    pub async fn find_entry(&self, row_id: RowID) -> Result<Option<ColumnLeafEntry>> {
         if self.root_page_id == 0 || row_id >= self.end_row_id {
             return Ok(None);
         }
@@ -440,7 +470,11 @@ impl<'a> ColumnBlockIndex<'a> {
                     Some(idx) => idx,
                     None => return Ok(None),
                 };
-                return Ok(Some((start_row_ids[idx], node.leaf_payloads()[idx])));
+                return Ok(Some(ColumnLeafEntry {
+                    leaf_page_id: page_id,
+                    start_row_id: start_row_ids[idx],
+                    payload: node.leaf_payloads()[idx],
+                }));
             }
             let entries = node.branch_entries();
             let idx = match search_branch_entry(entries, row_id) {
@@ -456,19 +490,23 @@ impl<'a> ColumnBlockIndex<'a> {
     /// Returns `Ok(None)` when payload is inline-only.
     pub async fn read_offloaded_bitmap_bytes(
         &self,
-        payload: &ColumnPagePayload,
+        entry: &ColumnLeafEntry,
     ) -> Result<Option<Vec<u8>>> {
-        let blob_ref = match payload.try_offloaded_ref()? {
-            Some(blob_ref) => blob_ref,
-            None => return Ok(None),
+        let blob_ref = match entry.payload.try_offloaded_ref() {
+            Ok(Some(blob_ref)) => blob_ref,
+            Ok(None) => return Ok(None),
+            Err(Error::InvalidFormat) => {
+                return Err(invalid_node_payload(self.file_kind(), entry.leaf_page_id));
+            }
+            Err(err) => return Err(err),
         };
-        let reader = ColumnDeletionBlobReader::new(self.file_kind, self.disk_pool);
+        let reader = ColumnDeletionBlobReader::new(self.disk_pool);
         let bytes = reader.read(blob_ref).await?;
         Ok(Some(bytes))
     }
 
     /// Collects all leaf entries in ascending `start_row_id` order.
-    pub async fn collect_leaf_entries(&self) -> Result<Vec<(RowID, ColumnPagePayload)>> {
+    pub async fn collect_leaf_entries(&self) -> Result<Vec<ColumnLeafEntry>> {
         if self.root_page_id == 0 {
             return Ok(Vec::new());
         }
@@ -476,25 +514,23 @@ impl<'a> ColumnBlockIndex<'a> {
         let mut entries = Vec::new();
         while let Some(page_id) = stack.pop() {
             let node = self.read_node(page_id).await?;
-            let count = node.header.count as usize;
             if node.is_leaf() {
-                if count > COLUMN_BLOCK_MAX_ENTRIES {
-                    return Err(Error::InvalidFormat);
-                }
                 entries.extend(
                     node.leaf_start_row_ids()
                         .iter()
                         .copied()
-                        .zip(node.leaf_payloads().iter().copied()),
+                        .zip(node.leaf_payloads().iter().copied())
+                        .map(|(start_row_id, payload)| ColumnLeafEntry {
+                            leaf_page_id: page_id,
+                            start_row_id,
+                            payload,
+                        }),
                 );
                 continue;
             }
-            if count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
-                return Err(Error::InvalidFormat);
-            }
             for entry in node.branch_entries().iter().rev() {
                 if entry.page_id == 0 {
-                    return Err(Error::InvalidFormat);
+                    return Err(invalid_node_payload(self.file_kind(), page_id));
                 }
                 stack.push(entry.page_id);
             }
@@ -1112,6 +1148,7 @@ mod tests {
     use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::file::table_fs::TableFileSystemConfig;
+    use crate::index::load_payload_deletion_deltas;
     use crate::io::AIOBuf;
     use crate::ptr::UnsafePtr;
     use crate::value::ValKind;
@@ -1308,7 +1345,12 @@ mod tests {
     }
 
     fn readonly_pool(table_id: TableID, table_file: &Arc<TableFile>) -> ReadonlyBufferPool {
-        ReadonlyBufferPool::new(table_id, Arc::clone(table_file), global_readonly_pool())
+        ReadonlyBufferPool::new(
+            table_id,
+            PersistedFileKind::TableFile,
+            Arc::clone(table_file),
+            global_readonly_pool(),
+        )
     }
 
     #[test]
@@ -1684,11 +1726,11 @@ mod tests {
                 assert_eq!(old_payload.offloaded_ref(), None);
 
                 let index_v2 = ColumnBlockIndex::new(root_v2, initial_count as RowID, &disk_pool);
-                let new_payload = index_v2.find(0).await.unwrap().unwrap();
-                assert!(new_payload.offloaded_ref().is_some());
+                let new_entry = index_v2.find_entry(0).await.unwrap().unwrap();
+                assert!(new_entry.payload.offloaded_ref().is_some());
                 assert_eq!(
                     index_v2
-                        .read_offloaded_bitmap_bytes(&new_payload)
+                        .read_offloaded_bitmap_bytes(&new_entry)
                         .await
                         .unwrap()
                         .unwrap(),
@@ -1755,15 +1797,15 @@ mod tests {
                 drop(old_root);
 
                 let index_v2 = ColumnBlockIndex::new(root_v2, initial_count as RowID, &disk_pool);
-                let left_payload = index_v2.find(0).await.unwrap().unwrap();
-                let right_payload = index_v2
-                    .find(COLUMN_BLOCK_MAX_ENTRIES as RowID)
+                let left_entry = index_v2.find_entry(0).await.unwrap().unwrap();
+                let right_entry = index_v2
+                    .find_entry(COLUMN_BLOCK_MAX_ENTRIES as RowID)
                     .await
                     .unwrap()
                     .unwrap();
                 assert_eq!(
                     index_v2
-                        .read_offloaded_bitmap_bytes(&left_payload)
+                        .read_offloaded_bitmap_bytes(&left_entry)
                         .await
                         .unwrap()
                         .unwrap(),
@@ -1771,7 +1813,7 @@ mod tests {
                 );
                 assert_eq!(
                     index_v2
-                        .read_offloaded_bitmap_bytes(&right_payload)
+                        .read_offloaded_bitmap_bytes(&right_entry)
                         .await
                         .unwrap()
                         .unwrap(),
@@ -1840,11 +1882,11 @@ mod tests {
                 drop(old_root);
 
                 let index_v2 = ColumnBlockIndex::new(root_v2, 4, &disk_pool);
-                let payload_v2 = index_v2.find(0).await.unwrap().unwrap();
-                assert!(payload_v2.offloaded_ref().is_some());
+                let entry_v2 = index_v2.find_entry(0).await.unwrap().unwrap();
+                assert!(entry_v2.payload.offloaded_ref().is_some());
                 assert_eq!(
                     index_v2
-                        .read_offloaded_bitmap_bytes(&payload_v2)
+                        .read_offloaded_bitmap_bytes(&entry_v2)
                         .await
                         .unwrap()
                         .unwrap(),
@@ -1852,11 +1894,11 @@ mod tests {
                 );
 
                 let index_v3 = ColumnBlockIndex::new(root_v3, 4, &disk_pool);
-                let payload_v3 = index_v3.find(0).await.unwrap().unwrap();
-                assert!(payload_v3.offloaded_ref().is_some());
+                let entry_v3 = index_v3.find_entry(0).await.unwrap().unwrap();
+                assert!(entry_v3.payload.offloaded_ref().is_some());
                 assert_eq!(
                     index_v3
-                        .read_offloaded_bitmap_bytes(&payload_v3)
+                        .read_offloaded_bitmap_bytes(&entry_v3)
                         .await
                         .unwrap()
                         .unwrap(),
@@ -2087,12 +2129,82 @@ mod tests {
                     byte_len: 1,
                 });
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let res = index.read_offloaded_bitmap_bytes(&payload).await;
-                assert!(matches!(res, Err(Error::InvalidFormat)));
+                let entry = ColumnLeafEntry {
+                    leaf_page_id: 77,
+                    start_row_id: 0,
+                    payload,
+                };
+                let res = index.read_offloaded_bitmap_bytes(&entry).await;
+                assert!(matches!(
+                    res,
+                    Err(Error::PersistedPageCorrupted {
+                        file_kind: PersistedFileKind::TableFile,
+                        page_kind: PersistedPageKind::ColumnBlockIndex,
+                        page_id: 77,
+                        cause: PersistedPageCorruptionCause::InvalidPayload,
+                    })
+                ));
 
                 drop(table_file);
                 drop(fs);
                 let _ = std::fs::remove_file("210.tbl");
+            })
+        });
+    }
+
+    #[test]
+    fn test_load_payload_deletion_deltas_maps_invalid_blob_contents_to_corruption() {
+        run_with_large_stack(|| {
+            smol::block_on(async {
+                let fs = TableFileSystemConfig::default().build().unwrap();
+                let _ = std::fs::remove_file("214.tbl");
+                let table_file = fs
+                    .create_table_file(214, build_test_metadata(), false)
+                    .unwrap();
+                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+                drop(old_root);
+                let disk_pool = readonly_pool(214, &table_file);
+
+                let entries = build_entries(0, 1, 9100);
+                let mut mutable = MutableTableFile::fork(&table_file);
+                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+                    .batch_insert(&mut mutable, &entries, 1, 2)
+                    .await
+                    .unwrap();
+                let bad_blob = [1u8, 2, 3];
+                let root_v2 = ColumnBlockIndex::new(root_v1, 1, &disk_pool)
+                    .batch_update_offloaded_bitmaps(
+                        &mut mutable,
+                        &[OffloadedBitmapPatch {
+                            start_row_id: 0,
+                            bitmap_bytes: &bad_blob,
+                        }],
+                        3,
+                    )
+                    .await
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
+                drop(old_root);
+
+                let index = ColumnBlockIndex::new(root_v2, 1, &disk_pool);
+                let entry = index.find_entry(0).await.unwrap().unwrap();
+                let blob_ref = entry.payload.try_offloaded_ref().unwrap().unwrap();
+                let err = load_payload_deletion_deltas(&index, entry)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    Error::PersistedPageCorrupted {
+                        file_kind: PersistedFileKind::TableFile,
+                        page_kind: PersistedPageKind::ColumnDeletionBlob,
+                        page_id,
+                        cause: PersistedPageCorruptionCause::InvalidPayload,
+                    } if page_id == blob_ref.start_page_id
+                ));
+
+                drop(table_file);
+                drop(fs);
+                let _ = std::fs::remove_file("214.tbl");
             })
         });
     }

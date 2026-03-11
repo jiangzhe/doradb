@@ -1,12 +1,16 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
-use crate::buffer::page::PageID;
+use crate::buffer::ReadonlyBufferPool;
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
+use crate::buffer::page::{Page, PageID};
 use crate::catalog::TableMetadata;
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::page_integrity::{LWC_PAGE_SPEC, max_payload_len, validate_page};
+use crate::file::page_integrity::{
+    LWC_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
+};
 use crate::lwc::{
     FlatU64, ForBitpacking1, ForBitpacking2, ForBitpacking4, ForBitpacking8, ForBitpacking16,
     ForBitpacking32, LwcData, LwcNullBitmap, LwcPrimitive, LwcPrimitiveData, SortedPosition,
@@ -318,6 +322,94 @@ impl LwcPage {
         data.value(row_idx)
             .ok_or(Error::InvalidCompressedData)
             .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))
+    }
+}
+
+/// Validates one persisted LWC page image for readonly-cache residency.
+#[inline]
+pub(crate) fn validate_persisted_lwc_page(
+    input: &[u8],
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<()> {
+    LwcPage::try_from_persisted_bytes(input, file_kind, page_id).map(|_| ())
+}
+
+/// Borrowed validated persisted LWC page backed by a readonly-cache guard.
+pub(crate) struct PersistedLwcPage {
+    guard: PageSharedGuard<Page>,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+}
+
+impl PersistedLwcPage {
+    /// Loads one persisted LWC page through the validated readonly-cache path.
+    #[inline]
+    pub async fn load(disk_pool: &ReadonlyBufferPool, page_id: PageID) -> Result<Self> {
+        let file_kind = disk_pool.persisted_file_kind();
+        let guard = disk_pool
+            .try_get_validated_page_shared(page_id, validate_persisted_lwc_page)
+            .await?;
+        Ok(PersistedLwcPage {
+            guard,
+            file_kind,
+            page_id,
+        })
+    }
+
+    #[inline]
+    fn page(&self) -> &LwcPage {
+        let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+        LwcPage::try_from_bytes(&self.guard.page()[payload_start..payload_end])
+            .expect("validated readonly LWC page must have a valid payload layout")
+    }
+
+    #[inline]
+    pub fn row_count(&self) -> usize {
+        self.page().header.row_count() as usize
+    }
+
+    #[inline]
+    pub fn find_row_idx(&self, row_id: RowID) -> Result<Option<usize>> {
+        self.page()
+            .find_persisted_row_idx(row_id, self.file_kind, self.page_id)
+    }
+
+    #[inline]
+    pub fn decode_row_ids(&self) -> Result<Vec<RowID>> {
+        self.page()
+            .decode_persisted_row_ids(self.file_kind, self.page_id)
+    }
+
+    #[inline]
+    pub fn decode_row_values(
+        &self,
+        metadata: &TableMetadata,
+        row_idx: usize,
+        read_set: &[usize],
+    ) -> Result<Vec<Val>> {
+        self.page().decode_persisted_row_values(
+            metadata,
+            row_idx,
+            read_set,
+            self.file_kind,
+            self.page_id,
+        )
+    }
+
+    #[inline]
+    pub fn decode_full_row_values(
+        &self,
+        metadata: &TableMetadata,
+        row_idx: usize,
+    ) -> Result<Vec<Val>> {
+        self.page().decode_persisted_full_row_values(
+            metadata,
+            row_idx,
+            self.file_kind,
+            self.page_id,
+        )
     }
 }
 

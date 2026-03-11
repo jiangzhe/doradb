@@ -2,6 +2,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool};
 use crate::catalog::{TableID, TableMetadata};
+use crate::error::{PersistedFileKind, Result};
 use crate::file::table_file::TableFile;
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
@@ -48,8 +49,12 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         let metadata = Arc::clone(&table_file.active_root().metadata);
         let row = GenericRowBlockIndex::new(pool, table_id, pivot_row_id, metadata).await;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_page_id);
-        let disk_pool =
-            ReadonlyBufferPool::new(table_id, Arc::clone(&table_file), global_disk_pool);
+        let disk_pool = ReadonlyBufferPool::new(
+            table_id,
+            PersistedFileKind::TableFile,
+            Arc::clone(&table_file),
+            global_disk_pool,
+        );
         GenericBlockIndex {
             table_id,
             root,
@@ -174,6 +179,19 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     /// path when the row lookup misses due to concurrent boundary movement.
     #[inline]
     pub async fn find_row(&self, row_id: RowID) -> RowLocation {
+        match self.try_find_row(row_id).await {
+            Ok(location) => location,
+            Err(err) => todo!(
+                "block-index column-path error policy is deferred (row_id={}, err={})",
+                row_id,
+                err
+            ),
+        }
+    }
+
+    /// Finds the physical location of one row id with persisted column-path errors surfaced.
+    #[inline]
+    pub async fn try_find_row(&self, row_id: RowID) -> Result<RowLocation> {
         debug_assert!(!row_id.is_deleted());
         match self.root.guide(row_id) {
             BlockIndexRoute::Column {
@@ -186,14 +204,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             BlockIndexRoute::Row => {
                 let found = self.row.find_row(row_id).await;
                 if !matches!(found, RowLocation::NotFound) {
-                    return found;
+                    return Ok(found);
                 }
                 match self.root.try_column(row_id) {
                     Some((pivot_row_id, root_page_id)) => {
                         self.find_row_in_column(row_id, pivot_row_id, root_page_id)
                             .await
                     }
-                    None => RowLocation::NotFound,
+                    None => Ok(RowLocation::NotFound),
                 }
             }
         }
@@ -205,19 +223,15 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         row_id: RowID,
         pivot_row_id: RowID,
         root_page_id: PageID,
-    ) -> RowLocation {
+    ) -> Result<RowLocation> {
         let Some(disk_pool) = &self.disk_pool else {
-            return RowLocation::NotFound;
+            return Ok(RowLocation::NotFound);
         };
         let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, disk_pool);
         match index.find(row_id).await {
-            Ok(Some(payload)) => RowLocation::LwcPage(payload.block_id as PageID),
-            Ok(None) => RowLocation::NotFound,
-            Err(err) => todo!(
-                "block-index column-path error policy is deferred (row_id={}, err={})",
-                row_id,
-                err
-            ),
+            Ok(Some(payload)) => Ok(RowLocation::LwcPage(payload.block_id as PageID)),
+            Ok(None) => Ok(RowLocation::NotFound),
+            Err(err) => Err(err),
         }
     }
 }

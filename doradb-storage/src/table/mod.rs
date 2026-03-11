@@ -17,7 +17,7 @@ use crate::buffer::{
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
-use crate::error::Result;
+use crate::error::{PersistedFileKind, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::Maskable;
 use crate::index::{
@@ -129,7 +129,12 @@ impl Table {
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
         let sec_idx = build_secondary_indexes(index_pool, &metadata, active_root.trx_id).await;
-        let disk_pool = ReadonlyBufferPool::new(table_id, Arc::clone(&file), global_disk_pool);
+        let disk_pool = ReadonlyBufferPool::new(
+            table_id,
+            PersistedFileKind::TableFile,
+            Arc::clone(&file),
+            global_disk_pool,
+        );
         Table {
             mem_pool,
             disk_pool,

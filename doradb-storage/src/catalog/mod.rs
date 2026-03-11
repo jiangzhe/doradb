@@ -469,12 +469,17 @@ pub mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::engine::{Engine, EngineConfig};
+    use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::index::ColumnBlockIndex;
     use crate::table::TablePersistence;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
     /// Table1 has single i32 column, with unique index of this column.
@@ -606,6 +611,22 @@ pub mod tests {
 
         drop(session);
         table_id
+    }
+
+    fn corrupt_page_checksum(path: &str, page_id: u64) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
     }
 
     #[test]
@@ -771,6 +792,80 @@ pub mod tests {
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, snap1.meta.table_roots);
+        });
+    }
+
+    #[test]
+    fn test_catalog_bootstrap_fails_on_corrupted_checkpoint_lwc_page() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+
+            let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-checkpoint-corrupt-bootstrap")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+
+            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let root = snap
+                .meta
+                .table_roots
+                .iter()
+                .copied()
+                .find(|root| root.root_page_id.is_some())
+                .expect("catalog checkpoint should publish at least one root");
+            let root_page_id = root.root_page_id.unwrap().get();
+            let index = ColumnBlockIndex::new(
+                root_page_id,
+                root.pivot_row_id,
+                &engine.catalog().storage.disk_pool,
+            );
+            let entry = index
+                .collect_leaf_entries()
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("catalog checkpoint should publish at least one LWC page");
+            drop(engine);
+
+            corrupt_page_checksum(&format!("{}/catalog.mtb", main_dir), entry.payload.block_id);
+
+            let err = match EngineConfig::default()
+                .main_dir(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("catalog-checkpoint-corrupt-bootstrap")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected catalog bootstrap corruption failure"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::CatalogMultiTableFile,
+                    page_kind: PersistedPageKind::LwcPage,
+                    page_id,
+                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                } if page_id == entry.payload.block_id
+            ));
         });
     }
 

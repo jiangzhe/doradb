@@ -1,20 +1,20 @@
 use crate::buffer::guard::PageGuard;
-use crate::buffer::page::{BufferPage, Page, PageID};
+use crate::buffer::page::{BufferPage, PageID};
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{Error, PersistedFileKind, Result};
+use crate::error::{Error, Result};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
     MutableMultiTableFile,
 };
 use crate::index::{
-    ColumnBlockIndex, ColumnPagePayload, ColumnPagePayloadPatch, OffloadedBitmapPatch,
+    ColumnBlockIndex, ColumnLeafEntry, ColumnPagePayloadPatch, OffloadedBitmapPatch,
     encode_deletion_deltas_to_bytes, load_payload_deletion_deltas,
 };
 use crate::io::DirectBuf;
-use crate::lwc::{LwcBuilder, LwcPage};
+use crate::lwc::{LwcBuilder, PersistedLwcPage};
 use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowID, RowPage};
 use crate::table::TableAccess;
@@ -29,11 +29,7 @@ struct PendingLwcPage {
     buf: DirectBuf,
 }
 
-#[derive(Clone, Copy)]
-struct CatalogIndexEntry {
-    start_row_id: RowID,
-    payload: ColumnPagePayload,
-}
+type CatalogIndexEntry = ColumnLeafEntry;
 
 struct RowRecord {
     row_id: RowID,
@@ -179,12 +175,7 @@ impl CatalogStorage {
         } else {
             self.collect_index_entries(root_page_id).await?
         };
-        let base_index = ColumnBlockIndex::new_in_file(
-            root_page_id,
-            root.pivot_row_id,
-            &self.disk_pool,
-            PersistedFileKind::CatalogMultiTableFile,
-        );
+        let base_index = ColumnBlockIndex::new(root_page_id, root.pivot_row_id, &self.disk_pool);
         let mut next_row_id = root.pivot_row_id;
 
         // Step 2: Preload existing visible rows only when delete-by-key appears.
@@ -284,11 +275,10 @@ impl CatalogStorage {
                     start_row_id: last_entry.start_row_id,
                     payload: updated_payload,
                 }];
-                let column_index = ColumnBlockIndex::new_in_file(
+                let column_index = ColumnBlockIndex::new(
                     current_root_page_id,
                     current_end_row_id,
                     &self.disk_pool,
-                    PersistedFileKind::CatalogMultiTableFile,
                 );
                 current_root_page_id = column_index
                     .batch_replace_payloads(mutable, &patches, checkpoint_cts)
@@ -314,11 +304,10 @@ impl CatalogStorage {
             }
             if !new_entries.is_empty() {
                 let new_end_row_id = next_row_id.max(root.pivot_row_id);
-                let column_index = ColumnBlockIndex::new_in_file(
+                let column_index = ColumnBlockIndex::new(
                     current_root_page_id,
                     current_end_row_id,
                     &self.disk_pool,
-                    PersistedFileKind::CatalogMultiTableFile,
                 );
                 current_root_page_id = column_index
                     .batch_insert(mutable, &new_entries, new_end_row_id, checkpoint_cts)
@@ -335,7 +324,7 @@ impl CatalogStorage {
                 .binary_search_by_key(start_row_id, |entry| entry.start_row_id)
                 .map_err(|_| Error::InvalidState)?;
             let entry = entries[idx];
-            let mut base = load_payload_deletion_deltas(&base_index, entry.payload).await?;
+            let mut base = load_payload_deletion_deltas(&base_index, entry).await?;
             let old_len = base.len();
             base.extend(pending);
             if base.len() == old_len {
@@ -353,12 +342,8 @@ impl CatalogStorage {
                     bitmap_bytes: bytes,
                 })
                 .collect();
-            let column_index = ColumnBlockIndex::new_in_file(
-                current_root_page_id,
-                current_end_row_id,
-                &self.disk_pool,
-                PersistedFileKind::CatalogMultiTableFile,
-            );
+            let column_index =
+                ColumnBlockIndex::new(current_root_page_id, current_end_row_id, &self.disk_pool);
             current_root_page_id = column_index
                 .batch_update_offloaded_bitmaps(mutable, &patches, checkpoint_cts)
                 .await?;
@@ -380,21 +365,8 @@ impl CatalogStorage {
 
     async fn collect_index_entries(&self, root_page_id: PageID) -> Result<Vec<CatalogIndexEntry>> {
         assert_ne!(root_page_id, 0, "root_page_id must be non-zero");
-        let index = ColumnBlockIndex::new_in_file(
-            root_page_id,
-            RowID::MAX,
-            &self.disk_pool,
-            PersistedFileKind::CatalogMultiTableFile,
-        );
-        Ok(index
-            .collect_leaf_entries()
-            .await?
-            .into_iter()
-            .map(|(start_row_id, payload)| CatalogIndexEntry {
-                start_row_id,
-                payload,
-            })
-            .collect())
+        let index = ColumnBlockIndex::new(root_page_id, RowID::MAX, &self.disk_pool);
+        index.collect_leaf_entries().await
     }
 
     async fn load_visible_rows_from_root(
@@ -410,15 +382,10 @@ impl CatalogStorage {
         }
         let root_page_id = root.root_page_id.map(NonZeroU64::get).unwrap_or(0);
         let entries = self.collect_index_entries(root_page_id).await?;
-        let column_index = ColumnBlockIndex::new_in_file(
-            root_page_id,
-            root.pivot_row_id,
-            &self.disk_pool,
-            PersistedFileKind::CatalogMultiTableFile,
-        );
+        let column_index = ColumnBlockIndex::new(root_page_id, root.pivot_row_id, &self.disk_pool);
         let mut rows = Vec::new();
         for entry in entries {
-            let deleted = load_payload_deletion_deltas(&column_index, entry.payload).await?;
+            let deleted = load_payload_deletion_deltas(&column_index, entry).await?;
             let page_rows = self
                 .decode_lwc_page_rows(entry.payload.block_id, metadata)
                 .await?;
@@ -447,7 +414,7 @@ impl CatalogStorage {
     ) -> Result<Vec<ExistingVisibleRow>> {
         let mut rows = Vec::new();
         for entry in entries {
-            let deleted = load_payload_deletion_deltas(column_index, entry.payload).await?;
+            let deleted = load_payload_deletion_deltas(column_index, *entry).await?;
             let page_rows = self
                 .decode_lwc_page_rows(entry.payload.block_id, metadata)
                 .await?;
@@ -478,23 +445,12 @@ impl CatalogStorage {
         page_id: u64,
         metadata: &TableMetadata,
     ) -> Result<Vec<RowRecord>> {
-        let page_guard = self.disk_pool.try_get_page_shared::<Page>(page_id).await?;
-        let lwc_page = LwcPage::try_from_persisted_bytes(
-            page_guard.page(),
-            PersistedFileKind::CatalogMultiTableFile,
-            page_id,
-        )?;
-        let row_count = lwc_page.header.row_count() as usize;
-        let row_ids =
-            lwc_page.decode_persisted_row_ids(PersistedFileKind::CatalogMultiTableFile, page_id)?;
+        let lwc_page = PersistedLwcPage::load(&self.disk_pool, page_id).await?;
+        let row_count = lwc_page.row_count();
+        let row_ids = lwc_page.decode_row_ids()?;
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-            let vals = lwc_page.decode_persisted_full_row_values(
-                metadata,
-                row_idx,
-                PersistedFileKind::CatalogMultiTableFile,
-                page_id,
-            )?;
+            let vals = lwc_page.decode_full_row_values(metadata, row_idx)?;
             rows.push(RowRecord { row_id, vals });
         }
         Ok(rows)
