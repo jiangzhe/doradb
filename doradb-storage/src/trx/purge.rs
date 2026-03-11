@@ -656,7 +656,7 @@ mod tests {
             trx.commit().await.unwrap();
             drop(session);
             let key = vec![Val::from(1001i32)];
-            let (row_id, _) = table.sec_idx[0]
+            let (row_id, _) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(&key, MAX_SNAPSHOT_TS)
@@ -734,7 +734,7 @@ mod tests {
             trx.commit().await.unwrap();
             drop(session);
             let key = vec![Val::from(1002i32)];
-            let (row_id, _) = table.sec_idx[0]
+            let (row_id, _) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(&key, MAX_SNAPSHOT_TS)
@@ -816,18 +816,18 @@ mod tests {
             trx.commit().await.unwrap();
             drop(session);
             let key = vec![Val::from(1003i32)];
-            let (row_id, _) = table.sec_idx[0]
+            let (row_id, _) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
-            let page_id = match table.blk_idx.find_row(row_id).await {
+            let page_id = match table.find_row(row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcPage(..) | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
-                .mem_pool
+                .mem_pool()
                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                 .await;
             let stale_page_id = VersionedPageID {
@@ -906,18 +906,18 @@ mod tests {
             trx.commit().await.unwrap();
             drop(session);
             let key = vec![Val::from(1004i32)];
-            let (row_id, _) = table.sec_idx[0]
+            let (row_id, _) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
-            let page_id = match table.blk_idx.find_row(row_id).await {
+            let page_id = match table.find_row(row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcPage(..) | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
-                .mem_pool
+                .mem_pool()
                 .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                 .await;
             let stale_page_id = VersionedPageID {
@@ -1134,12 +1134,12 @@ mod tests {
             }
             if gc_timeout {
                 // see which one is not purged, and its cts.
-                let index = table.sec_idx[0].unique().unwrap();
+                let index = table.sec_idx()[0].unique().unwrap();
                 let mut remained_row_ids = vec![];
                 index.scan_values(&mut remained_row_ids, 100).await;
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
-                let location = table.blk_idx.find_row(row_id).await;
+                let location = table.find_row(row_id).await;
                 let page_id = match location {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),

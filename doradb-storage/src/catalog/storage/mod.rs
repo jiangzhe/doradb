@@ -29,7 +29,7 @@ pub(crate) const CATALOG_MTB_READONLY_FILE_ID: ReadonlyFileID = USER_OBJ_ID_STAR
 /// Runtime storage container for all catalog logical tables.
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
-    tables: Box<[CatalogTable]>,
+    tables: Box<[Arc<CatalogTable>]>,
     next_user_obj_id: ObjID,
     mtb: Arc<MultiTableFile>,
     pub(super) disk_pool: ReadonlyBufferPool,
@@ -53,7 +53,7 @@ impl CatalogStorage {
             global_disk_pool,
         );
 
-        let mut cat: Vec<CatalogTable> = vec![];
+        let mut cat: Vec<Arc<CatalogTable>> = vec![];
         for CatalogDefinition { table_id, metadata } in [
             catalog_definition_of_tables(),
             catalog_definition_of_columns(),
@@ -63,9 +63,10 @@ impl CatalogStorage {
             // make sure table id matches.
             assert_eq!(cat.len(), *table_id as usize);
             let metadata = Arc::new(metadata.clone());
-            let blk_idx =
-                BlockIndex::new_catalog(meta_pool, *table_id, Arc::clone(&metadata)).await;
-            let table = CatalogTable::new(meta_pool, index_pool, blk_idx, metadata).await;
+            let blk_idx = BlockIndex::new_catalog(meta_pool).await;
+            let table = Arc::new(
+                CatalogTable::new(meta_pool, index_pool, *table_id, blk_idx, metadata).await,
+            );
             cat.push(table);
         }
         let storage = CatalogStorage {
@@ -113,8 +114,8 @@ impl CatalogStorage {
 
     /// Return one catalog table runtime by table id.
     #[inline]
-    pub fn get_catalog_table(&self, table_id: TableID) -> Option<CatalogTable> {
-        self.tables.get(table_id as usize).cloned()
+    pub fn get_catalog_table(&self, table_id: TableID) -> Option<Arc<CatalogTable>> {
+        self.tables.get(table_id as usize).map(Arc::clone)
     }
 
     /// Return number of catalog logical tables.

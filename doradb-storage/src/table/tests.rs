@@ -17,6 +17,7 @@ use crate::trx::{ActiveTrx, TrxID};
 use crate::value::Val;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -292,11 +293,11 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let row_id = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
         trx.commit().await.unwrap();
 
-        let active_root = sys.table.file.active_root();
+        let active_root = sys.table.file().active_root();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
-            &sys.table.disk_pool,
+            sys.table.disk_pool(),
         );
         let entry = index.find_entry(row_id).await.unwrap().unwrap();
 
@@ -528,11 +529,11 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
             .await
             .unwrap();
 
-        let active_root = sys.table.file.active_root();
+        let active_root = sys.table.file().active_root();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
-            &sys.table.disk_pool,
+            sys.table.disk_pool(),
         );
         let entry = index
             .find_entry(row_id)
@@ -591,11 +592,11 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
             .await
             .unwrap();
 
-        let active_root = sys.table.file.active_root();
+        let active_root = sys.table.file().active_root();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
-            &sys.table.disk_pool,
+            sys.table.disk_pool(),
         );
         let entry = index
             .find_entry(row_id)
@@ -627,9 +628,9 @@ fn test_row_page_transition_retries_update_delete() {
         let key = single_key(1i32);
         let mut trx = session.begin_trx().unwrap();
         let mut stmt = trx.start_stmt();
-        let index = sys.table.sec_idx[key.index_no].unique().unwrap();
+        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
         let (row_id, _) = index.lookup(&key.vals, stmt.trx.sts).await.unwrap();
-        let page_id = match sys.table.blk_idx.find_row(row_id).await {
+        let page_id = match sys.table.find_row(row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
             RowLocation::LwcPage(..) => unreachable!("lwc page"),
@@ -1338,9 +1339,9 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let key = single_key(1i32);
         let mut trx = session.begin_trx().unwrap();
         let mut stmt = trx.start_stmt();
-        let index = sys.table.sec_idx[key.index_no].unique().unwrap();
+        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
         let (row_id, _) = index.lookup(&key.vals, stmt.trx.sts).await.unwrap();
-        let page_id = match sys.table.blk_idx.find_row(row_id).await {
+        let page_id = match sys.table.find_row(row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
             RowLocation::LwcPage(..) => unreachable!("row page expected"),
@@ -1403,14 +1404,14 @@ fn test_data_checkpoint_basic_flow() {
         let name = "x".repeat(1024);
         insert_rows(&sys, &mut session, 0, 200, &name).await;
 
-        let old_root = sys.table.file.active_root().clone();
+        let old_root = sys.table.file().active_root().clone();
         sys.table.freeze(usize::MAX).await;
         let (frozen_pages, _) = sys.table.collect_frozen_pages().await;
         assert!(!frozen_pages.is_empty());
 
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
-        let new_root = sys.table.file.active_root();
+        let new_root = sys.table.file().active_root();
         assert!(new_root.pivot_row_id > old_root.pivot_row_id);
         assert!(new_root.column_block_index_root > 0);
 
@@ -1489,7 +1490,7 @@ fn test_data_checkpoint_persistence_recovery() {
         table.freeze(usize::MAX).await;
         table.data_checkpoint(&mut session).await.unwrap();
 
-        let root_before = table.file.active_root().clone();
+        let root_before = table.file().active_root().clone();
         drop(table);
 
         let table_file = engine.table_fs.open_table_file(table_id).await.unwrap();
@@ -1515,9 +1516,9 @@ fn test_data_checkpoint_heartbeat() {
         let name = "h".repeat(128);
         insert_rows(&sys, &mut session, 0, 40, &name).await;
 
-        let root_before = sys.table.file.active_root().clone();
+        let root_before = sys.table.file().active_root().clone();
         sys.table.data_checkpoint(&mut session).await.unwrap();
-        let root_after = sys.table.file.active_root();
+        let root_after = sys.table.file().active_root();
 
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
         assert!(root_after.heap_redo_start_ts > root_before.heap_redo_start_ts);
@@ -1568,14 +1569,14 @@ fn test_data_checkpoint_error_rollback() {
         insert_rows(&sys, &mut session, 0, 80, &name).await;
 
         sys.table.freeze(usize::MAX).await;
-        let root_before = sys.table.file.active_root().clone();
+        let root_before = sys.table.file().active_root().clone();
 
         super::set_test_force_lwc_build_error(true);
         let res = sys.table.data_checkpoint(&mut session).await;
         super::set_test_force_lwc_build_error(false);
         assert!(res.is_err());
 
-        let root_after = sys.table.file.active_root();
+        let root_after = sys.table.file().active_root();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
         assert_eq!(
             root_after.heap_redo_start_ts,
@@ -1593,7 +1594,7 @@ fn test_data_checkpoint_error_rollback() {
 
 struct TestSys {
     engine: Engine,
-    table: Table,
+    table: Arc<Table>,
     _temp_dir: TempDir,
 }
 
@@ -1758,12 +1759,12 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
 }
 
 async fn assert_row_in_lwc(table: &Table, key: &SelectKey, sts: TrxID) -> RowID {
-    let index = table.sec_idx[key.index_no].unique().unwrap();
+    let index = table.sec_idx()[key.index_no].unique().unwrap();
     let (row_id, _) = index
         .lookup(&key.vals, sts)
         .await
         .expect("row should exist");
-    match table.blk_idx.find_row(row_id).await {
+    match table.find_row(row_id).await {
         RowLocation::LwcPage(..) => row_id,
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),

@@ -38,8 +38,8 @@ impl Table {
         include_new_data: bool,
         include_deletion: bool,
     ) -> Result<()> {
-        let table_file = &self.file;
-        let disk_pool = &self.disk_pool;
+        let table_file = self.file();
+        let disk_pool = self.disk_pool();
         // Step 1: snapshot current table root and initialize checkpoint boundaries.
         let trx_sys = session.engine().trx_sys;
         let active_root = table_file.active_root();
@@ -143,7 +143,7 @@ impl Table {
         // Step 9: publish new table-file root and then commit checkpoint transaction.
         let (table_file, old_root) = mutable_file.commit(checkpoint_ts, false).await?;
         let active_root = table_file.active_root();
-        self.blk_idx
+        self.blk_idx()
             .update_column_root(
                 active_root.pivot_row_id,
                 active_root.column_block_index_root,
@@ -161,7 +161,7 @@ impl Table {
         cutoff_ts: TrxID,
         checkpoint_ts: TrxID,
     ) -> Result<bool> {
-        let disk_pool = &self.disk_pool;
+        let disk_pool = self.disk_pool();
         // Step 1: ensure there is a persisted column index to patch.
         let mutable_root = mutable_file.root();
         if mutable_root.column_block_index_root == 0 || mutable_root.pivot_row_id == 0 {
@@ -173,7 +173,7 @@ impl Table {
         // For very large deletion buffers, we can optimize this step later by
         // introducing parallel marker selection and parallel sort/merge while
         // preserving deterministic ordering before patch application.
-        let mut selected_row_ids = self.deletion_buffer.collect_committed_before(cutoff_ts);
+        let mut selected_row_ids = self.deletion_buffer().collect_committed_before(cutoff_ts);
         selected_row_ids.retain(|row_id| *row_id < mutable_root.pivot_row_id);
         if selected_row_ids.is_empty() {
             return Ok(false);

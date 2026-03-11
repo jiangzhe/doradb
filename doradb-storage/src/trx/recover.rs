@@ -259,7 +259,7 @@ impl<'a> LogRecovery<'a> {
         let old = self.table_states.insert(
             table_id,
             RecoveryTableState {
-                heap_redo_start_ts: table.file.active_root().heap_redo_start_ts,
+                heap_redo_start_ts: table.file().active_root().heap_redo_start_ts,
                 preloaded_from_checkpoint,
             },
         );
@@ -397,10 +397,7 @@ impl<'a> LogRecovery<'a> {
                     .await
                     .ok_or(Error::TableNotFound)?;
                 let count = end_row_id - start_row_id;
-                let mut page_guard = table
-                    .blk_idx
-                    .allocate_row_page_at(self.mem_pool, count as usize, *page_id)
-                    .await;
+                let mut page_guard = table.allocate_row_page_at(count as usize, *page_id).await;
                 // Here we switch row page to recover mode.
                 page_guard.bf_mut().init_recover_map(cts);
 
@@ -950,7 +947,7 @@ mod tests {
                 .data_checkpoint(&mut checkpoint_session)
                 .await
                 .unwrap();
-            let root_after_checkpoint = table.file.active_root();
+            let root_after_checkpoint = table.file().active_root();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
             drop(table);
@@ -1058,7 +1055,7 @@ mod tests {
                 .data_checkpoint(&mut checkpoint_session)
                 .await
                 .unwrap();
-            let root_after_checkpoint = table.file.active_root();
+            let root_after_checkpoint = table.file().active_root();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
             let mut trx = session.begin_trx().unwrap();
@@ -1226,10 +1223,10 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
-            assert!(checkpointed_table.file.active_root().pivot_row_id > 0);
-            assert_eq!(replay_only_table.file.active_root().pivot_row_id, 0);
+            assert!(checkpointed_table.file().active_root().pivot_row_id > 0);
+            assert_eq!(replay_only_table.file().active_root().pivot_row_id, 0);
             assert!(
-                checkpointed_table.file.active_root().heap_redo_start_ts
+                checkpointed_table.file().active_root().heap_redo_start_ts
                     > baseline_catalog_replay_start_ts
             );
 
@@ -1373,11 +1370,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let active_root = table.file.active_root();
+            let active_root = table.file().active_root();
             let index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,
-                &table.disk_pool,
+                table.disk_pool(),
             );
             let entry = index
                 .collect_leaf_entries()

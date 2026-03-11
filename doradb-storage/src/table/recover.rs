@@ -73,7 +73,7 @@ impl TableRecover for Table {
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
         let mut page_guard = self
-            .mem_pool
+            .mem_pool()
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
@@ -104,7 +104,7 @@ impl TableRecover for Table {
         disable_index: bool,
     ) {
         let mut page_guard = self
-            .mem_pool
+            .mem_pool()
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
@@ -130,7 +130,7 @@ impl TableRecover for Table {
             if !index_change_cols.is_empty() {
                 // There is index change, we need to update index.
                 let page_guard = self
-                    .mem_pool
+                    .mem_pool()
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -138,7 +138,7 @@ impl TableRecover for Table {
                     .unwrap();
 
                 let metadata = self.metadata();
-                for (index, index_schema) in self.sec_idx.iter().zip(&metadata.index_specs) {
+                for (index, index_schema) in self.sec_idx().iter().zip(&metadata.index_specs) {
                     debug_assert!(index.is_unique() == index_schema.unique());
                     if index_key_is_changed(index_schema, &index_change_cols) {
                         let new_key =
@@ -168,7 +168,7 @@ impl TableRecover for Table {
         disable_index: bool,
     ) {
         let mut page_guard = self
-            .mem_pool
+            .mem_pool()
             .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
@@ -189,7 +189,7 @@ impl TableRecover for Table {
             );
             assert!(res.is_ok());
             page_guard.set_dirty(); // mark as dirty page.
-            for (index, index_schema) in self.sec_idx.iter().zip(&self.metadata().index_specs) {
+            for (index, index_schema) in self.sec_idx().iter().zip(&self.metadata().index_specs) {
                 debug_assert!(index.is_unique() == index_schema.unique());
                 let vals: Vec<Val> = index_schema
                     .index_cols
@@ -207,7 +207,7 @@ impl TableRecover for Table {
 
     async fn populate_index_via_row_page(&self, page_id: PageID) -> Result<()> {
         let page_guard = self
-            .mem_pool
+            .mem_pool()
             .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
             .await
             .lock_shared_async()
@@ -215,7 +215,7 @@ impl TableRecover for Table {
             .unwrap();
         let metadata = self.metadata();
         let (ctx, page) = page_guard.ctx_and_page();
-        for (index_spec, sec_idx) in metadata.index_specs.iter().zip(&*self.sec_idx) {
+        for (index_spec, sec_idx) in metadata.index_specs.iter().zip(self.sec_idx()) {
             let read_set: Vec<_> = index_spec
                 .index_cols
                 .iter()
@@ -248,10 +248,10 @@ impl TableRecover for Table {
     }
 
     async fn populate_index_via_persisted_data(&self) -> Result<()> {
-        if self.sec_idx.is_empty() {
+        if self.sec_idx().is_empty() {
             return Ok(());
         }
-        let active_root = self.file.active_root();
+        let active_root = self.file().active_root();
         if active_root.column_block_index_root == 0 || active_root.pivot_row_id == 0 {
             return Ok(());
         }
@@ -259,11 +259,11 @@ impl TableRecover for Table {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
-            &self.disk_pool,
+            self.disk_pool(),
         );
         for entry in index.collect_leaf_entries().await? {
             let deleted = load_payload_deletion_deltas(&index, entry).await?;
-            let page = PersistedLwcPage::load(&self.disk_pool, entry.payload.block_id).await?;
+            let page = PersistedLwcPage::load(self.disk_pool(), entry.payload.block_id).await?;
             let row_ids = page.decode_row_ids()?;
 
             for (row_idx, row_id) in row_ids.into_iter().enumerate() {
@@ -281,14 +281,14 @@ impl TableRecover for Table {
 
                 for key in self.metadata().keys_for_insert(&vals) {
                     if self.metadata().index_specs[key.index_no].unique() {
-                        let res = self.sec_idx[key.index_no]
+                        let res = self.sec_idx()[key.index_no]
                             .unique()
                             .unwrap()
                             .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                             .await;
                         ensure_recovery_index_insert(key.index_no, res)?;
                     } else {
-                        let res = self.sec_idx[key.index_no]
+                        let res = self.sec_idx()[key.index_no]
                             .non_unique()
                             .unwrap()
                             .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)

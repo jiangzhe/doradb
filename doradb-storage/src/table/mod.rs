@@ -37,6 +37,7 @@ use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,14 +85,23 @@ pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
 /// Additional key validation is performed if index lookup is used, because
 /// index does not contain version information, and out-of-date index entry
 /// should ignored if visible data version does not match index key.
-pub struct Table {
-    pub mem_pool: &'static EvictableBufferPool,
-    pub(crate) disk_pool: ReadonlyBufferPool,
-    pub file: Arc<TableFile>,
+pub struct GenericMemTable<P: 'static> {
+    pub(crate) table_id: TableID,
     pub(crate) metadata: Arc<TableMetadata>,
-    pub blk_idx: Arc<BlockIndex>,
-    pub(crate) sec_idx: Arc<[SecondaryIndex]>,
-    pub(crate) deletion_buffer: Arc<ColumnDeletionBuffer>,
+    pub(crate) mem_pool: &'static P,
+    pub(crate) blk_idx: BlockIndex,
+    pub(crate) sec_idx: Box<[SecondaryIndex]>,
+}
+
+pub struct ColumnStorage {
+    pub(crate) file: Arc<TableFile>,
+    pub(crate) disk_pool: ReadonlyBufferPool,
+    pub(crate) deletion_buffer: ColumnDeletionBuffer,
+}
+
+pub struct Table {
+    pub(crate) mem: GenericMemTable<EvictableBufferPool>,
+    pub(crate) storage: ColumnStorage,
 }
 
 struct FrozenPage {
@@ -105,14 +115,182 @@ pub(crate) async fn build_secondary_indexes(
     index_pool: &'static FixedBufferPool,
     metadata: &TableMetadata,
     index_ts: TrxID,
-) -> Arc<[SecondaryIndex]> {
+) -> Box<[SecondaryIndex]> {
     let mut sec_idx = Vec::with_capacity(metadata.index_specs.len());
     for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
         let ty_infer = |col_no: usize| metadata.col_type(col_no);
         let si = SecondaryIndex::new(index_pool, index_no, index_spec, ty_infer, index_ts).await;
         sec_idx.push(si);
     }
-    Arc::from(sec_idx.into_boxed_slice())
+    sec_idx.into_boxed_slice()
+}
+
+impl<P: BufferPool> GenericMemTable<P> {
+    #[inline]
+    pub(crate) async fn new(
+        mem_pool: &'static P,
+        index_pool: &'static FixedBufferPool,
+        table_id: TableID,
+        metadata: Arc<TableMetadata>,
+        blk_idx: BlockIndex,
+        index_ts: TrxID,
+    ) -> Self {
+        let sec_idx = build_secondary_indexes(index_pool, &metadata, index_ts).await;
+        GenericMemTable {
+            table_id,
+            metadata,
+            mem_pool,
+            blk_idx,
+            sec_idx,
+        }
+    }
+
+    #[inline]
+    pub fn table_id(&self) -> TableID {
+        self.table_id
+    }
+
+    #[inline]
+    pub fn metadata(&self) -> &TableMetadata {
+        &self.metadata
+    }
+
+    #[inline]
+    pub fn mem_pool(&self) -> &'static P {
+        self.mem_pool
+    }
+
+    #[inline]
+    pub fn blk_idx(&self) -> &BlockIndex {
+        &self.blk_idx
+    }
+
+    #[inline]
+    pub fn sec_idx(&self) -> &[SecondaryIndex] {
+        &self.sec_idx
+    }
+
+    #[inline]
+    pub fn pivot_row_id(&self) -> RowID {
+        self.blk_idx.pivot_row_id()
+    }
+
+    #[inline]
+    pub fn enable_page_committer(&self, trx_sys: &'static TransactionSystem) {
+        self.blk_idx.enable_page_committer(self.table_id, trx_sys)
+    }
+
+    #[inline]
+    pub(crate) async fn get_insert_page(&self, count: usize) -> PageSharedGuard<RowPage> {
+        self.blk_idx
+            .get_insert_page(self.mem_pool, &self.metadata, count)
+            .await
+    }
+
+    #[inline]
+    pub(crate) async fn get_insert_page_exclusive(
+        &self,
+        count: usize,
+    ) -> PageExclusiveGuard<RowPage> {
+        self.blk_idx
+            .get_insert_page_exclusive(self.mem_pool, &self.metadata, count)
+            .await
+    }
+
+    #[inline]
+    pub(crate) async fn allocate_row_page_at(
+        &self,
+        count: usize,
+        page_id: PageID,
+    ) -> PageExclusiveGuard<RowPage> {
+        self.blk_idx
+            .allocate_row_page_at(self.mem_pool, &self.metadata, count, page_id)
+            .await
+    }
+
+    #[inline]
+    pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
+        self.blk_idx.cache_exclusive_insert_page(guard)
+    }
+
+    pub(crate) async fn mem_scan<F>(&self, mut page_action: F)
+    where
+        F: FnMut(PageSharedGuard<RowPage>) -> bool,
+    {
+        let mut cursor = self.blk_idx.mem_cursor();
+        cursor.seek(0).await;
+        while let Some(leaf) = cursor.next().await {
+            let g = leaf.lock_shared_async().await.unwrap();
+            debug_assert!(g.page().is_leaf());
+            let entries = g.page().leaf_entries();
+            for page_entry in entries {
+                let page_guard: PageSharedGuard<RowPage> = self
+                    .mem_pool
+                    .get_page(page_entry.page_id, LatchFallbackMode::Shared)
+                    .await
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
+                if !page_action(page_guard) {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) async fn find_row(
+        &self,
+        row_id: RowID,
+        storage: Option<&ColumnStorage>,
+    ) -> RowLocation {
+        self.blk_idx.find_row(row_id, storage).await
+    }
+
+    #[inline]
+    pub(crate) async fn try_find_row(
+        &self,
+        row_id: RowID,
+        storage: Option<&ColumnStorage>,
+    ) -> Result<RowLocation> {
+        self.blk_idx.try_find_row(row_id, storage).await
+    }
+}
+
+impl ColumnStorage {
+    #[inline]
+    pub(crate) fn new(
+        table_id: TableID,
+        file: Arc<TableFile>,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
+    ) -> Self {
+        let disk_pool = ReadonlyBufferPool::new(
+            table_id,
+            PersistedFileKind::TableFile,
+            Arc::clone(&file),
+            global_disk_pool,
+        );
+        ColumnStorage {
+            file,
+            disk_pool,
+            deletion_buffer: ColumnDeletionBuffer::new(),
+        }
+    }
+
+    #[inline]
+    pub fn file(&self) -> &Arc<TableFile> {
+        &self.file
+    }
+
+    #[inline]
+    pub fn disk_pool(&self) -> &ReadonlyBufferPool {
+        &self.disk_pool
+    }
+
+    #[inline]
+    pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
+        &self.deletion_buffer
+    }
 }
 
 impl Table {
@@ -122,34 +300,23 @@ impl Table {
         mem_pool: &'static EvictableBufferPool,
         index_pool: &'static FixedBufferPool,
         global_disk_pool: &'static GlobalReadonlyBufferPool,
+        table_id: TableID,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
     ) -> Self {
-        let table_id = blk_idx.table_id;
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
-        let sec_idx = build_secondary_indexes(index_pool, &metadata, active_root.trx_id).await;
-        let disk_pool = ReadonlyBufferPool::new(
-            table_id,
-            PersistedFileKind::TableFile,
-            Arc::clone(&file),
-            global_disk_pool,
-        );
-        Table {
+        let mem = GenericMemTable::new(
             mem_pool,
-            disk_pool,
-            file,
+            index_pool,
+            table_id,
             metadata,
-            blk_idx: Arc::new(blk_idx),
-            sec_idx,
-            deletion_buffer: Arc::new(ColumnDeletionBuffer::new()),
-        }
-    }
-
-    /// Returns table id.
-    #[inline]
-    pub fn table_id(&self) -> TableID {
-        self.blk_idx.table_id
+            blk_idx,
+            active_root.trx_id,
+        )
+        .await;
+        let storage = ColumnStorage::new(table_id, file, global_disk_pool);
+        Table { mem, storage }
     }
 
     /// Build a lightweight operation accessor over this table runtime.
@@ -158,15 +325,28 @@ impl Table {
         HybridTableAccessor::from(self)
     }
 
-    /// Returns current pivot row id for row-store/column-store boundary.
     #[inline]
-    pub fn pivot_row_id(&self) -> RowID {
-        self.blk_idx.pivot_row_id()
+    pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
+        self.storage.deletion_buffer()
     }
 
     #[inline]
-    pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
-        &self.deletion_buffer
+    pub(crate) fn disk_pool(&self) -> &ReadonlyBufferPool {
+        self.storage.disk_pool()
+    }
+
+    #[inline]
+    pub fn file(&self) -> &Arc<TableFile> {
+        self.storage.file()
+    }
+
+    #[inline]
+    pub(crate) async fn find_row(&self, row_id: RowID) -> RowLocation {
+        GenericMemTable::find_row(self, row_id, Some(&self.storage)).await
+    }
+    #[inline]
+    pub(crate) fn enable_page_committer(&self, trx_sys: &'static TransactionSystem) {
+        GenericMemTable::enable_page_committer(self, trx_sys)
     }
 
     async fn collect_frozen_pages(&self) -> (Vec<FrozenPage>, Option<TrxID>) {
@@ -221,7 +401,7 @@ impl Table {
                 // A potential optimization is to check row version map without loading
                 // row page back. This requires interface change of buffer pool.
                 let page_guard = self
-                    .mem_pool
+                    .mem_pool()
                     .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -247,7 +427,7 @@ impl Table {
     async fn set_frozen_pages_to_transition(&self, frozen_pages: &[FrozenPage], cutoff_ts: TrxID) {
         for page_info in frozen_pages {
             let page_guard = self
-                .mem_pool
+                .mem_pool()
                 .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
@@ -278,7 +458,7 @@ impl Table {
             let mut current_end: RowID = 0;
             for page_info in frozen_pages {
                 let page_guard = self
-                    .mem_pool
+                    .mem_pool()
                     .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -351,7 +531,7 @@ impl Table {
                         if let Some(trx_status) = status.as_ref()
                             && !trx_is_committed(trx_status.ts())
                         {
-                            let _ = self.deletion_buffer.put_ref(row_id, trx_status.clone());
+                            let _ = self.deletion_buffer().put_ref(row_id, trx_status.clone());
                         }
                     }
                     RowUndoKind::Delete => {
@@ -361,16 +541,16 @@ impl Table {
                                 if trx_is_committed(status_ts) {
                                     if status_ts >= cutoff_ts {
                                         let _ =
-                                            self.deletion_buffer.put_committed(row_id, status_ts);
+                                            self.deletion_buffer().put_committed(row_id, status_ts);
                                     }
                                 } else {
                                     let _ =
-                                        self.deletion_buffer.put_ref(row_id, trx_status.clone());
+                                        self.deletion_buffer().put_ref(row_id, trx_status.clone());
                                 }
                             }
                             None => {
                                 if ts >= cutoff_ts {
-                                    let _ = self.deletion_buffer.put_committed(row_id, ts);
+                                    let _ = self.deletion_buffer().put_committed(row_id, ts);
                                 }
                             }
                         };
@@ -402,7 +582,7 @@ impl Table {
     #[inline]
     pub async fn total_row_pages(&self) -> usize {
         let mut res = 0usize;
-        let mut cursor = self.blk_idx.mem_cursor();
+        let mut cursor = self.blk_idx().mem_cursor();
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -418,7 +598,7 @@ impl Table {
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let mut cursor = self.blk_idx.mem_cursor();
+        let mut cursor = self.blk_idx().mem_cursor();
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -426,7 +606,7 @@ impl Table {
             let entries = g.page().leaf_entries();
             for page_entry in entries {
                 let page_guard: PageSharedGuard<RowPage> = self
-                    .mem_pool
+                    .mem_pool()
                     .get_page(page_entry.page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -605,7 +785,7 @@ impl Table {
         row_id: RowID,
         cts: TrxID,
     ) -> RecoverIndex {
-        let index = self.sec_idx[key.index_no].unique().unwrap();
+        let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
             match index
                 .insert_if_not_exists(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -655,7 +835,7 @@ impl Table {
 
     #[inline]
     async fn recover_non_unique_index_insert(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
-        let index = self.sec_idx[key.index_no].non_unique().unwrap();
+        let index = self.sec_idx()[key.index_no].non_unique().unwrap();
         // The recovery should make sure no duplicate key.
         let res = index
             .insert_if_not_exists(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -666,7 +846,7 @@ impl Table {
 
     #[inline]
     async fn recover_unique_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
-        let index = self.sec_idx[key.index_no].unique().unwrap();
+        let index = self.sec_idx()[key.index_no].unique().unwrap();
         if !index
             .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await
@@ -680,7 +860,7 @@ impl Table {
 
     #[inline]
     async fn recover_non_unique_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
-        let index = self.sec_idx[key.index_no].non_unique().unwrap();
+        let index = self.sec_idx()[key.index_no].non_unique().unwrap();
         if !index
             .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await
@@ -692,12 +872,12 @@ impl Table {
 
     #[inline]
     async fn find_recover_cts_for_row_id(&self, row_id: RowID) -> Option<TrxID> {
-        match self.blk_idx.find_row(row_id).await {
+        match self.find_row(row_id).await {
             RowLocation::NotFound => None,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
                 let page_guard = self
-                    .mem_pool
+                    .mem_pool()
                     .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
@@ -711,25 +891,14 @@ impl Table {
             }
         }
     }
-
-    #[inline]
-    pub fn metadata(&self) -> &TableMetadata {
-        &self.metadata
-    }
 }
 
-impl Clone for Table {
+impl Deref for Table {
+    type Target = GenericMemTable<EvictableBufferPool>;
+
     #[inline]
-    fn clone(&self) -> Self {
-        Table {
-            mem_pool: self.mem_pool,
-            disk_pool: self.disk_pool.clone(),
-            file: Arc::clone(&self.file),
-            metadata: Arc::clone(&self.metadata),
-            blk_idx: Arc::clone(&self.blk_idx),
-            sec_idx: Arc::clone(&self.sec_idx),
-            deletion_buffer: Arc::clone(&self.deletion_buffer),
-        }
+    fn deref(&self) -> &Self::Target {
+        &self.mem
     }
 }
 
