@@ -611,7 +611,12 @@ mod tests {
     }
 
     fn readonly_pool(table_id: u64, table_file: &Arc<TableFile>) -> ReadonlyBufferPool {
-        ReadonlyBufferPool::new(table_id, Arc::clone(table_file), global_readonly_pool())
+        ReadonlyBufferPool::new(
+            table_id,
+            PersistedFileKind::TableFile,
+            Arc::clone(table_file),
+            global_readonly_pool(),
+        )
     }
 
     async fn read_page_for_test(table_file: &TableFile, page_id: PageID) -> Result<DirectBuf> {

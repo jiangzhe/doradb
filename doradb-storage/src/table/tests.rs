@@ -1,10 +1,12 @@
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
+use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::table_fs::TableFileSystemConfig;
 use crate::index::{ColumnBlockIndex, RowLocation, UniqueIndex};
 use crate::latch::LatchFallbackMode;
-use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol};
+use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol};
 use crate::row::{RowID, RowPage};
 use crate::session::Session;
 use crate::table::{DeleteMarker, Table, TableAccess, TablePersistence};
@@ -13,6 +15,8 @@ use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::{ActiveTrx, TrxID};
 use crate::value::Val;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -275,6 +279,57 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
 }
 
 #[test]
+fn test_lwc_select_surfaces_persisted_corruption() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let trx = session.begin_trx().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let active_root = sys.table.file.active_root();
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            &sys.table.disk_pool,
+        );
+        let entry = index.find_entry(row_id).await.unwrap().unwrap();
+
+        let fs = TableFileSystemConfig::default()
+            .with_main_dir(sys._temp_dir.path())
+            .build()
+            .unwrap();
+        corrupt_page_checksum(
+            &fs.table_file_path(sys.table.table_id()),
+            entry.payload.block_id,
+        );
+
+        let mut trx = session.begin_trx().unwrap();
+        let stmt = trx.start_stmt();
+        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        match res {
+            SelectMvcc::Err(Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::LwcPage,
+                page_id,
+                cause: PersistedPageCorruptionCause::ChecksumMismatch,
+            }) => assert_eq!(page_id, entry.payload.block_id),
+            other => panic!("expected persisted LWC corruption, got {other:?}"),
+        }
+        trx = stmt.fail().await;
+        trx.rollback().await;
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_column_delete_rollback() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -479,19 +534,19 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
             active_root.pivot_row_id,
             &sys.table.disk_pool,
         );
-        let (start_row_id, payload) = index
+        let entry = index
             .find_entry(row_id)
             .await
             .unwrap()
             .expect("payload should exist");
-        assert!(payload.offloaded_ref().is_some());
+        assert!(entry.payload.offloaded_ref().is_some());
         let bytes = index
-            .read_offloaded_bitmap_bytes(&payload)
+            .read_offloaded_bitmap_bytes(&entry)
             .await
             .unwrap()
             .expect("offloaded bytes should exist");
         let deltas = decode_offloaded_deltas(&bytes);
-        let expected_delta = (row_id - start_row_id) as u32;
+        let expected_delta = (row_id - entry.start_row_id) as u32;
         assert!(deltas.binary_search(&expected_delta).is_ok());
 
         drop(session);
@@ -542,12 +597,12 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
             active_root.pivot_row_id,
             &sys.table.disk_pool,
         );
-        let (_start_row_id, payload) = index
+        let entry = index
             .find_entry(row_id)
             .await
             .unwrap()
             .expect("payload should exist");
-        assert!(payload.offloaded_ref().is_none());
+        assert!(entry.payload.offloaded_ref().is_none());
 
         hold_trx.rollback().await;
         drop(checkpoint_session);
@@ -1724,6 +1779,22 @@ fn decode_offloaded_deltas(bytes: &[u8]) -> Vec<u32> {
         .collect::<Vec<_>>();
     deltas.sort_unstable();
     deltas
+}
+
+fn corrupt_page_checksum(path: &str, page_id: u64) {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0xFF;
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&byte).unwrap();
+    file.flush().unwrap();
 }
 
 async fn insert_rows(sys: &TestSys, session: &mut Session, start: i32, count: i32, name: &str) {

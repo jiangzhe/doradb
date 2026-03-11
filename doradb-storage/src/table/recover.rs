@@ -1,12 +1,11 @@
 use crate::buffer::BufferPool;
-use crate::buffer::guard::PageGuard;
-use crate::buffer::page::{Page, PageID};
-use crate::error::{Error, PersistedFileKind, Result};
+use crate::buffer::page::PageID;
+use crate::error::{Error, Result};
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_payload_deletion_deltas,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::LwcPage;
+use crate::lwc::PersistedLwcPage;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::table::{
@@ -262,23 +261,14 @@ impl TableRecover for Table {
             active_root.pivot_row_id,
             &self.disk_pool,
         );
-        for (start_row_id, payload) in index.collect_leaf_entries().await? {
-            let deleted = load_payload_deletion_deltas(&index, payload).await?;
-            let page_guard = self
-                .disk_pool
-                .try_get_page_shared::<Page>(payload.block_id)
-                .await?;
-            let page = LwcPage::try_from_persisted_bytes(
-                page_guard.page(),
-                PersistedFileKind::TableFile,
-                payload.block_id,
-            )?;
-            let row_ids =
-                page.decode_persisted_row_ids(PersistedFileKind::TableFile, payload.block_id)?;
+        for entry in index.collect_leaf_entries().await? {
+            let deleted = load_payload_deletion_deltas(&index, entry).await?;
+            let page = PersistedLwcPage::load(&self.disk_pool, entry.payload.block_id).await?;
+            let row_ids = page.decode_row_ids()?;
 
             for (row_idx, row_id) in row_ids.into_iter().enumerate() {
                 let delta = row_id
-                    .checked_sub(start_row_id)
+                    .checked_sub(entry.start_row_id)
                     .ok_or(Error::InvalidState)?;
                 if delta > u32::MAX as u64 {
                     return Err(Error::InvalidState);
@@ -287,12 +277,7 @@ impl TableRecover for Table {
                     continue;
                 }
 
-                let vals = page.decode_persisted_full_row_values(
-                    self.metadata(),
-                    row_idx,
-                    PersistedFileKind::TableFile,
-                    payload.block_id,
-                )?;
+                let vals = page.decode_full_row_values(self.metadata(), row_idx)?;
 
                 for key in self.metadata().keys_for_insert(&vals) {
                     if self.metadata().index_specs[key.index_no].unique() {

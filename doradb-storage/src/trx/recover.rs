@@ -560,6 +560,10 @@ mod tests {
         TableMetadata, TableSpec,
     };
     use crate::engine::EngineConfig;
+    use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::table_fs::TableFileSystemConfig;
+    use crate::index::ColumnBlockIndex;
     use crate::row::RowRead;
     use crate::row::ops::{SelectKey, UpdateCol};
     use crate::table::{TableAccess, TablePersistence};
@@ -567,7 +571,25 @@ mod tests {
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::Val;
     use crate::value::ValKind;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
+
+    fn corrupt_page_checksum(path: &str, page_id: u64) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+    }
 
     #[test]
     fn test_log_recover_empty() {
@@ -1288,6 +1310,121 @@ mod tests {
             drop(checkpointed_table);
             drop(session);
             drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_log_recover_fails_on_corrupted_persisted_lwc_page() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let engine = EngineConfig::default()
+                .main_dir(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover8")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.new_session();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![IndexSpec::new(
+                        "idx_t8_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(engine.trx_sys)
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt
+                .insert_row(&table, vec![Val::from(7u32), Val::from("persisted-row")])
+                .await;
+            assert!(insert.is_ok());
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            table.freeze(usize::MAX).await;
+            let mut checkpoint_session = engine.new_session();
+            table
+                .data_checkpoint(&mut checkpoint_session)
+                .await
+                .unwrap();
+
+            let active_root = table.file.active_root();
+            let index = ColumnBlockIndex::new(
+                active_root.column_block_index_root,
+                active_root.pivot_row_id,
+                &table.disk_pool,
+            );
+            let entry = index
+                .collect_leaf_entries()
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("checkpointed table should publish a persisted LWC page");
+
+            drop(checkpoint_session);
+            drop(table);
+            drop(session);
+            drop(engine);
+
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            corrupt_page_checksum(&fs.table_file_path(table_id), entry.payload.block_id);
+
+            let err = match EngineConfig::default()
+                .main_dir(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_prefix("recover8")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected recovery corruption failure"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::TableFile,
+                    page_kind: PersistedPageKind::LwcPage,
+                    page_id,
+                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                } if page_id == entry.payload.block_id
+            ));
         })
     }
 }

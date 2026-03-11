@@ -1,16 +1,16 @@
 use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID};
+use crate::buffer::page::{INVALID_PAGE_ID, PageID};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
 use crate::catalog::{CatalogTable, TableID, TableMetadata};
-use crate::error::{Error, PersistedFileKind, Result};
+use crate::error::{Error, Result};
 use crate::index::util::Maskable;
 use crate::index::{
     BlockIndex, GenericNonUniqueBTreeIndex, GenericSecondaryIndex, GenericUniqueBTreeIndex,
     IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lwc::LwcPage;
+use crate::lwc::PersistedLwcPage;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey,
     SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
@@ -236,7 +236,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         user_read_set: &[usize],
         row_id: RowID,
     ) -> SelectMvcc {
-        match self.blk_idx.find_row(row_id).await {
+        let location = match self.blk_idx.try_find_row(row_id).await {
+            Ok(location) => location,
+            Err(err) => return SelectMvcc::Err(err),
+        };
+        match location {
             RowLocation::NotFound => SelectMvcc::NotFound,
             RowLocation::LwcPage(page_id) => {
                 let Some(deletion_buffer) = self.deletion_buffer else {
@@ -299,25 +303,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let Some(disk_pool) = self.disk_pool else {
             return Err(Error::InvalidState);
         };
-        let page_guard = disk_pool.try_get_page_shared::<Page>(page_id).await?;
-        let page = LwcPage::try_from_persisted_bytes(
-            page_guard.page(),
-            PersistedFileKind::TableFile,
-            page_id,
-        )?;
-        let Some(row_idx) =
-            page.find_persisted_row_idx(row_id, PersistedFileKind::TableFile, page_id)?
-        else {
+        let page = PersistedLwcPage::load(disk_pool, page_id).await?;
+        let Some(row_idx) = page.find_row_idx(row_id)? else {
             return Ok(None);
         };
-        page.decode_persisted_row_values(
-            self.metadata(),
-            row_idx,
-            read_set,
-            PersistedFileKind::TableFile,
-            page_id,
-        )
-        .map(Some)
+        page.decode_row_values(self.metadata(), row_idx, read_set)
+            .map(Some)
     }
 
     #[inline]

@@ -5,13 +5,13 @@ use crate::buffer::evictor::{
     FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::{
     deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays, madvise_dontneed,
 };
 use crate::error::Validation::Valid;
-use crate::error::{Error, Result, Validation};
+use crate::error::{Error, PersistedFileKind, Result, Validation};
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
 use crate::latch::LatchFallbackMode;
@@ -62,6 +62,8 @@ pub trait ReadonlyPageSource: Send + Sync {
         ptr: UnsafePtr<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
+
+type ReadonlyPageValidator = fn(&[u8], PersistedFileKind, PageID) -> Result<()>;
 
 impl ReadonlyPageSource for TableFile {
     #[inline]
@@ -439,69 +441,28 @@ impl GlobalReadonlyBufferPool {
         key: ReadonlyCacheKey,
         page_source: &dyn ReadonlyPageSource,
     ) -> Result<PageID> {
-        let frame_id = self.reserve_frame_id().await;
-        let mut page_guard = match self.frames.try_lock_page_exclusive(frame_id) {
-            Some(page_guard) => page_guard,
-            None => {
-                self.residency.release_free(frame_id);
-                return Err(Error::InvalidState);
-            }
-        };
-        {
-            let frame = page_guard.bf_mut();
-            frame.clear_readonly_key();
-            frame.set_dirty(false);
-            frame.set_kind(FrameKind::Evicting);
-        }
+        let mut reserved = ReservedMissFrameGuard::acquire(self).await?;
+        // Destination memory is exclusively held by the reserved miss-frame guard,
+        // aligned to page size, and remains valid until IO completion because the
+        // guard is held for the full await.
+        let dst = UnsafePtr(reserved.page_mut() as *mut Page as *mut u8);
+        page_source.read_page_into_ptr(key.block_id, dst).await?;
+        reserved.publish(key)
+    }
 
-        // Destination memory is exclusively held by `page_guard`, aligned to page size,
-        // and remains valid until IO completion because the guard is held for the full await.
-        let read_res = page_source
-            .read_page_into_ptr(
-                key.block_id,
-                UnsafePtr(page_guard.page_mut() as *mut Page as *mut u8),
-            )
-            .await;
-
-        if let Err(err) = read_res {
-            page_guard.page_mut().zero();
-            let frame = page_guard.bf_mut();
-            frame.clear_readonly_key();
-            frame.bump_generation();
-            frame.set_kind(FrameKind::Uninitialized);
-            drop(page_guard);
-            self.residency.release_free(frame_id);
-            return Err(err);
-        }
-
-        {
-            let frame = page_guard.bf_mut();
-            frame.set_readonly_key(key.file_id, key.block_id);
-            frame.set_dirty(false);
-            frame.bump_generation();
-            frame.set_kind(FrameKind::Hot);
-        }
-        match self.mappings.entry(key) {
-            Entry::Vacant(vac) => {
-                vac.insert(frame_id);
-            }
-            Entry::Occupied(_) => {
-                page_guard.page_mut().zero();
-                let frame = page_guard.bf_mut();
-                frame.clear_readonly_key();
-                frame.bump_generation();
-                frame.set_kind(FrameKind::Uninitialized);
-                drop(page_guard);
-                self.residency.release_free(frame_id);
-                return Err(Error::InvalidState);
-            }
-        }
-        drop(page_guard);
-        self.residency.mark_resident(frame_id);
-        if self.residency.no_free_frame() {
-            self.residency.evict_ev.notify(1);
-        }
-        Ok(frame_id)
+    #[inline]
+    async fn load_cache_miss_validated(
+        &'static self,
+        key: ReadonlyCacheKey,
+        page_source: &dyn ReadonlyPageSource,
+        file_kind: PersistedFileKind,
+        validator: ReadonlyPageValidator,
+    ) -> Result<PageID> {
+        let mut reserved = ReservedMissFrameGuard::acquire(self).await?;
+        let dst = UnsafePtr(reserved.page_mut() as *mut Page as *mut u8);
+        page_source.read_page_into_ptr(key.block_id, dst).await?;
+        validator(reserved.page(), file_kind, key.block_id)?;
+        reserved.publish(key)
     }
 
     #[inline]
@@ -534,6 +495,50 @@ impl GlobalReadonlyBufferPool {
                     Err(err) => {
                         return Err(err);
                     }
+                }
+            } else {
+                let listener = inflight.ev.listen();
+                if self.try_get_frame_id(&key).is_some() || !self.inflight_loads.contains_key(&key)
+                {
+                    continue;
+                }
+                listener.await;
+            }
+        }
+    }
+
+    #[inline]
+    async fn get_or_load_frame_id_validated(
+        &'static self,
+        key: ReadonlyCacheKey,
+        page_source: &dyn ReadonlyPageSource,
+        file_kind: PersistedFileKind,
+        validator: ReadonlyPageValidator,
+    ) -> Result<PageID> {
+        loop {
+            if let Some(frame_id) = self.try_get_frame_id(&key) {
+                return Ok(frame_id);
+            }
+
+            let (is_loader, inflight) = match self.inflight_loads.entry(key) {
+                Entry::Vacant(vac) => {
+                    let inflight = Arc::new(InflightLoad::new());
+                    vac.insert(Arc::clone(&inflight));
+                    (true, inflight)
+                }
+                Entry::Occupied(occ) => (false, Arc::clone(occ.get())),
+            };
+
+            if is_loader {
+                let load_res = self
+                    .load_cache_miss_validated(key, page_source, file_kind, validator)
+                    .await;
+                if let Some((_, inflight)) = self.inflight_loads.remove(&key) {
+                    inflight.ev.notify(usize::MAX);
+                }
+                match load_res {
+                    Ok(frame_id) => return Ok(frame_id),
+                    Err(err) => return Err(err),
                 }
             } else {
                 let listener = inflight.ev.listen();
@@ -581,6 +586,103 @@ impl GlobalReadonlyBufferPool {
         {
             occ.remove();
         }
+    }
+}
+
+struct ReservedMissFrameGuard<'a> {
+    pool: &'a GlobalReadonlyBufferPool,
+    frame_id: PageID,
+    page_guard: Option<PageExclusiveGuard<Page>>,
+    published: bool,
+}
+
+impl<'a> ReservedMissFrameGuard<'a> {
+    #[inline]
+    async fn acquire(pool: &'a GlobalReadonlyBufferPool) -> Result<Self> {
+        let frame_id = pool.reserve_frame_id().await;
+        let mut page_guard = match pool.frames.try_lock_page_exclusive(frame_id) {
+            Some(page_guard) => page_guard,
+            None => {
+                pool.residency.release_free(frame_id);
+                return Err(Error::InvalidState);
+            }
+        };
+        {
+            let frame = page_guard.bf_mut();
+            frame.clear_readonly_key();
+            frame.set_dirty(false);
+            frame.set_kind(FrameKind::Evicting);
+        }
+        Ok(ReservedMissFrameGuard {
+            pool,
+            frame_id,
+            page_guard: Some(page_guard),
+            published: false,
+        })
+    }
+
+    #[inline]
+    fn page(&self) -> &Page {
+        self.page_guard
+            .as_ref()
+            .expect("reserved miss frame must hold an exclusive page guard before publish")
+            .page()
+    }
+
+    #[inline]
+    fn page_mut(&mut self) -> &mut Page {
+        self.page_guard
+            .as_mut()
+            .expect("reserved miss frame must hold an exclusive page guard before publish")
+            .page_mut()
+    }
+
+    #[inline]
+    fn publish(&mut self, key: ReadonlyCacheKey) -> Result<PageID> {
+        {
+            let frame = self
+                .page_guard
+                .as_mut()
+                .expect("reserved miss frame must hold an exclusive page guard before publish")
+                .bf_mut();
+            frame.set_readonly_key(key.file_id, key.block_id);
+            frame.set_dirty(false);
+            frame.bump_generation();
+            frame.set_kind(FrameKind::Hot);
+        }
+        match self.pool.mappings.entry(key) {
+            Entry::Vacant(vac) => {
+                vac.insert(self.frame_id);
+            }
+            Entry::Occupied(_) => return Err(Error::InvalidState),
+        }
+        self.published = true;
+        drop(self.page_guard.take());
+        self.pool.residency.mark_resident(self.frame_id);
+        if self.pool.residency.no_free_frame() {
+            self.pool.residency.evict_ev.notify(1);
+        }
+        Ok(self.frame_id)
+    }
+}
+
+impl Drop for ReservedMissFrameGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        let Some(mut page_guard) = self.page_guard.take() else {
+            return;
+        };
+        page_guard.page_mut().zero();
+        let frame = page_guard.bf_mut();
+        frame.clear_readonly_key();
+        frame.set_dirty(false);
+        frame.bump_generation();
+        frame.set_kind(FrameKind::Uninitialized);
+        drop(page_guard);
+        self.pool.residency.release_free(self.frame_id);
     }
 }
 
@@ -835,6 +937,7 @@ unsafe impl Send for ReadonlyRuntime {}
 #[derive(Clone)]
 pub struct ReadonlyBufferPool {
     file_id: ReadonlyFileID,
+    file_kind: PersistedFileKind,
     page_source: Arc<dyn ReadonlyPageSource>,
     global: &'static GlobalReadonlyBufferPool,
 }
@@ -844,6 +947,7 @@ impl ReadonlyBufferPool {
     #[inline]
     pub fn new<S>(
         file_id: ReadonlyFileID,
+        file_kind: PersistedFileKind,
         page_source: Arc<S>,
         global: &'static GlobalReadonlyBufferPool,
     ) -> Self
@@ -852,9 +956,16 @@ impl ReadonlyBufferPool {
     {
         ReadonlyBufferPool {
             file_id,
+            file_kind,
             page_source,
             global,
         }
+    }
+
+    /// Returns which persisted file format this pool reads from.
+    #[inline]
+    pub fn persisted_file_kind(&self) -> PersistedFileKind {
+        self.file_kind
     }
 
     #[inline]
@@ -883,20 +994,38 @@ impl ReadonlyBufferPool {
         }
     }
 
-    /// Returns a shared lock guard for a cached page.
+    /// Returns a shared guard for one persisted page after validating its page-kind contract.
     ///
-    /// This helper is intended for runtime call sites that hold `&self`
-    /// instead of `&'static self`.
+    /// On cache miss, validation runs before the new frame becomes resident.
+    /// On cached hits, validation is re-run against the resident bytes and a
+    /// failed validation invalidates the mapping before returning the error.
     #[inline]
-    pub(crate) async fn try_get_page_shared<T: BufferPage>(
+    pub(crate) async fn try_get_validated_page_shared(
         &self,
         page_id: PageID,
-    ) -> Result<PageSharedGuard<T>> {
+        validator: ReadonlyPageValidator,
+    ) -> Result<PageSharedGuard<Page>> {
+        let key = self.cache_key(page_id);
         loop {
-            let guard = self
-                .get_page_facade::<T>(page_id, LatchFallbackMode::Shared)
+            let frame_id = self
+                .global
+                .get_or_load_frame_id_validated(key, &*self.page_source, self.file_kind, validator)
                 .await?;
+            let guard = self
+                .global
+                .get_page_internal::<Page>(frame_id, LatchFallbackMode::Shared)
+                .await?;
+            if !self.global.validate_guarded_frame_key(&guard, key) {
+                self.global
+                    .invalidate_stale_mapping_if_same_frame(key, frame_id);
+                continue;
+            }
             if let Some(shared) = guard.lock_shared_async().await {
+                if let Err(err) = validator(shared.page(), self.file_kind, page_id) {
+                    drop(shared);
+                    let _ = self.invalidate_block_id(page_id);
+                    return Err(err);
+                }
                 return Ok(shared);
             }
         }
@@ -996,9 +1125,21 @@ mod tests {
     use crate::buffer::guard::{FacadePageGuard, PageGuard};
     use crate::buffer::page::Page;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
+    use crate::error::{PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::page_integrity::{
+        COLUMN_BLOCK_INDEX_PAGE_SPEC, COLUMN_DELETION_BLOB_PAGE_SPEC, LWC_PAGE_SPEC,
+        max_payload_len, write_page_checksum, write_page_header,
+    };
     use crate::file::table_fs::TableFileSystemConfig;
+    use crate::index::{
+        COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
+        COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockNodeHeader, validate_persisted_blob_page,
+        validate_persisted_column_block_index_page,
+    };
     use crate::io::AIOBuf;
     use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
+    use crate::lwc::{LWC_PAGE_PAYLOAD_SIZE, LwcPage, LwcPageHeader, validate_persisted_lwc_page};
     use crate::value::ValKind;
     use tempfile::TempDir;
 
@@ -1022,6 +1163,51 @@ mod tests {
         let bytes = buf.as_bytes_mut();
         bytes[..payload.len()].copy_from_slice(payload);
         table_file.write_page(page_id, buf).await.unwrap();
+    }
+
+    async fn write_page_bytes(table_file: &Arc<TableFile>, page_id: PageID, bytes: &[u8]) {
+        let mut buf = table_file.buf_list().pop_async(true).await;
+        buf.as_bytes_mut().copy_from_slice(bytes);
+        table_file.write_page(page_id, buf).await.unwrap();
+    }
+
+    fn build_valid_persisted_lwc_page() -> Vec<u8> {
+        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
+        let payload_start = write_page_header(&mut buf, LWC_PAGE_SPEC);
+        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+        let page = LwcPage::try_from_bytes_mut(&mut buf[payload_start..payload_end]).unwrap();
+        page.header = LwcPageHeader::new(1, 1, 0, 0, 0);
+        write_page_checksum(&mut buf);
+        buf
+    }
+
+    fn build_valid_persisted_column_block_page() -> Vec<u8> {
+        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
+        let payload_start = write_page_header(&mut buf, COLUMN_BLOCK_INDEX_PAGE_SPEC);
+        let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
+        let header = ColumnBlockNodeHeader {
+            height: 0,
+            count: 0,
+            start_row_id: 0,
+            create_ts: 1,
+        };
+        let header_bytes = bytemuck::bytes_of(&header);
+        buf[payload_start..payload_start + COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
+        buf[payload_start + COLUMN_BLOCK_HEADER_SIZE..payload_end].fill(0);
+        write_page_checksum(&mut buf);
+        buf
+    }
+
+    fn build_valid_persisted_blob_page() -> Vec<u8> {
+        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
+        let payload_start = write_page_header(&mut buf, COLUMN_DELETION_BLOB_PAGE_SPEC);
+        let payload_end = payload_start + max_payload_len(COW_FILE_PAGE_SIZE);
+        let payload = &mut buf[payload_start..payload_end];
+        payload[..COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE].fill(0);
+        payload[8..10].copy_from_slice(&(1u16).to_le_bytes());
+        payload[COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE] = 7;
+        write_page_checksum(&mut buf);
+        buf
     }
 
     #[test]
@@ -1170,6 +1356,7 @@ mod tests {
 
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 111,
+                PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
                 global,
             )));
@@ -1207,6 +1394,7 @@ mod tests {
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 101,
+                PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
                 global.as_static(),
             )));
@@ -1250,6 +1438,7 @@ mod tests {
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 102,
+                PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
                 global.as_static(),
             )));
@@ -1273,32 +1462,155 @@ mod tests {
     }
 
     #[test]
-    fn test_readonly_pool_try_get_page_shared_returns_error() {
+    fn test_readonly_pool_validated_lwc_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
                 .with_main_dir(temp_dir.path())
                 .build()
                 .unwrap();
-            let table_file = fs.create_table_file(106, make_metadata(), false).unwrap();
+            let table_file = fs.create_table_file(107, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
+
+            let mut page = build_valid_persisted_lwc_page();
+            let last_idx = page.len() - 1;
+            page[last_idx] ^= 0xFF;
+            write_page_bytes(&table_file, 9, &page).await;
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
                 GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(4)).unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
-                106,
+                107,
+                PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
                 global.as_static(),
             )));
+            let key = ReadonlyCacheKey::new(107, 9);
 
-            let res = pool.as_static().try_get_page_shared::<Page>(100_000).await;
-            assert!(res.is_err());
+            let err = match pool
+                .as_static()
+                .try_get_validated_page_shared(9, validate_persisted_lwc_page)
+                .await
+            {
+                Ok(_) => panic!("expected persisted LWC corruption"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::TableFile,
+                    page_kind: PersistedPageKind::LwcPage,
+                    page_id: 9,
+                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                }
+            ));
+            assert_eq!(global.as_static().try_get_frame_id(&key), None);
+            assert_eq!(global.as_static().allocated(), 0);
+        });
+    }
 
-            drop(table_file);
-            drop(fs);
+    #[test]
+    fn test_readonly_pool_validated_column_index_miss_rejects_corruption_without_mapping() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let table_file = fs.create_table_file(108, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let mut page = build_valid_persisted_column_block_page();
+            let last_idx = page.len() - 1;
+            page[last_idx] ^= 0xFF;
+            write_page_bytes(&table_file, 10, &page).await;
+
+            let scope = StaticLifetimeScope::new();
+            let global = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(4)).unwrap(),
+            );
+            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+                108,
+                PersistedFileKind::TableFile,
+                Arc::clone(&table_file),
+                global.as_static(),
+            )));
+            let key = ReadonlyCacheKey::new(108, 10);
+
+            let err = match pool
+                .as_static()
+                .try_get_validated_page_shared(10, validate_persisted_column_block_index_page)
+                .await
+            {
+                Ok(_) => panic!("expected persisted column-block corruption"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::TableFile,
+                    page_kind: PersistedPageKind::ColumnBlockIndex,
+                    page_id: 10,
+                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                }
+            ));
+            assert_eq!(global.as_static().try_get_frame_id(&key), None);
+            assert_eq!(global.as_static().allocated(), 0);
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_validated_blob_miss_rejects_corruption_without_mapping() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .with_main_dir(temp_dir.path())
+                .build()
+                .unwrap();
+            let table_file = fs.create_table_file(109, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let mut page = build_valid_persisted_blob_page();
+            let last_idx = page.len() - 1;
+            page[last_idx] ^= 0xFF;
+            write_page_bytes(&table_file, 11, &page).await;
+
+            let scope = StaticLifetimeScope::new();
+            let global = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(4)).unwrap(),
+            );
+            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+                109,
+                PersistedFileKind::TableFile,
+                Arc::clone(&table_file),
+                global.as_static(),
+            )));
+            let key = ReadonlyCacheKey::new(109, 11);
+
+            let err = match pool
+                .as_static()
+                .try_get_validated_page_shared(11, validate_persisted_blob_page)
+                .await
+            {
+                Ok(_) => panic!("expected persisted deletion-blob corruption"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::TableFile,
+                    page_kind: PersistedPageKind::ColumnDeletionBlob,
+                    page_id: 11,
+                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                }
+            ));
+            assert_eq!(global.as_static().try_get_frame_id(&key), None);
+            assert_eq!(global.as_static().allocated(), 0);
         });
     }
 
@@ -1320,6 +1632,7 @@ mod tests {
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 103,
+                PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
                 global.as_static(),
             )));
@@ -1389,6 +1702,7 @@ mod tests {
             let _fs = scope.adopt(fs);
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 105,
+                PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
                 global.as_static(),
             )));
@@ -1422,6 +1736,7 @@ mod tests {
                 .adopt(GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 104,
+                PersistedFileKind::TableFile,
                 table_file,
                 global.as_static(),
             )));

@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::index::column_block_index::ColumnBlockIndex;
+use crate::index::column_block_index::{ColumnBlockIndex, ColumnLeafEntry};
 use crate::index::column_payload::ColumnPagePayload;
 use std::collections::BTreeSet;
 use std::mem;
@@ -30,13 +30,27 @@ pub fn decode_deletion_deltas_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
 /// Loads persisted deletion deltas from either inline payload bytes or an offloaded blob.
 pub async fn load_payload_deletion_deltas(
     column_index: &ColumnBlockIndex<'_>,
-    mut payload: ColumnPagePayload,
+    entry: ColumnLeafEntry,
 ) -> Result<BTreeSet<u32>> {
-    if let Some(bytes) = column_index.read_offloaded_bitmap_bytes(&payload).await? {
-        return Ok(decode_deletion_deltas_from_bytes(&bytes)?
-            .into_iter()
-            .collect());
+    if let Some(bytes) = column_index.read_offloaded_bitmap_bytes(&entry).await? {
+        let blob_ref = entry
+            .payload
+            .try_offloaded_ref()
+            .ok()
+            .flatten()
+            .ok_or(Error::InvalidState)?;
+        let deltas = decode_deletion_deltas_from_bytes(&bytes).map_err(|err| match err {
+            Error::InvalidFormat => Error::persisted_page_corrupted(
+                column_index.file_kind(),
+                crate::error::PersistedPageKind::ColumnDeletionBlob,
+                blob_ref.start_page_id,
+                crate::error::PersistedPageCorruptionCause::InvalidPayload,
+            ),
+            other => other,
+        })?;
+        return Ok(deltas.into_iter().collect());
     }
+    let mut payload: ColumnPagePayload = entry.payload;
     Ok(payload.deletion_list().iter().collect())
 }
 

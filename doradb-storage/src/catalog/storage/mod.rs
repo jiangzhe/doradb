@@ -14,7 +14,7 @@ pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::Result;
+use crate::error::{PersistedFileKind, Result};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
 };
@@ -48,6 +48,7 @@ impl CatalogStorage {
         let mtb_snapshot = mtb.load_snapshot()?;
         let disk_pool = ReadonlyBufferPool::new(
             CATALOG_MTB_READONLY_FILE_ID,
+            PersistedFileKind::CatalogMultiTableFile,
             Arc::clone(&mtb),
             global_disk_pool,
         );
