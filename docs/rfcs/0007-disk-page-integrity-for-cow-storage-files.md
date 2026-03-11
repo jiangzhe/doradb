@@ -347,7 +347,7 @@ Reference:
     make startup/recovery failure behavior deterministic.
   - Non-goals: no redo-log checksums, no repair tooling, and no compatibility
     or migration layer for old files.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000061-readonly-cache-validation-recovery-hardening-and-corruption-tests.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
