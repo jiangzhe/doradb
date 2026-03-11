@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Disk Page Integrity for CoW Storage Files
-status: proposal
+status: implemented
 tags: [storage-engine, file-format, checksum, checkpoint, recovery]
 created: 2026-03-10
 github_issue: 405
@@ -320,7 +320,7 @@ Reference:
   - Task Doc: `docs/tasks/000059-file-integrity-foundation.md`
   - Task Issue: `#406`
   - Phase Status: done
-  - Implementation Summary: 1. Implemented phase-1 CoW meta-page integrity across the table/catalog root [Task Resolve Sync: docs/tasks/000059-file-integrity-foundation.md @ 2026-03-10]
+  - Implementation Summary: Implemented the shared CoW meta-page integrity envelope for table and `catalog.mtb` roots, added contextual persisted-page corruption errors, and made newest-root open fail fast when the selected super page references corrupt or invalid meta state. [Task Resolve Sync: docs/tasks/000059-file-integrity-foundation.md @ 2026-03-10]
   - Related Backlogs:
     - `docs/backlogs/closed/000051-disk-page-checksum-mechanism.md`
 
@@ -336,7 +336,7 @@ Reference:
   - Task Doc: `docs/tasks/000060-checksum-rollout-for-data-pages.md`
   - Task Issue: `#408`
   - Phase Status: done
-  - Implementation Summary: 1. Implemented the phase-2 page-integrity rollout across LWC pages, column block-index nodes, and deletion-blob pages, including zero-copy column-block reads and centralized persisted LWC row decoding [Task Resolve Sync: docs/tasks/000060-checksum-rollout-for-data-pages.md @ 2026-03-11]
+  - Implementation Summary: Rolled the shared page-integrity envelope out across LWC pages, column block-index nodes, and deletion-blob pages, updated builders and payload-capacity contracts for the reduced usable page size, and normalized checkpoint/recovery readers onto validated persisted-page decode paths. [Task Resolve Sync: docs/tasks/000060-checksum-rollout-for-data-pages.md @ 2026-03-11]
 
 - **Phase 3: Readonly-Cache Validation, Recovery Hardening, and Corruption Tests**
   - Scope: validate persisted pages before readonly-cache residency, convert raw
@@ -350,7 +350,7 @@ Reference:
   - Task Doc: `docs/tasks/000061-readonly-cache-validation-recovery-hardening-and-corruption-tests.md`
   - Task Issue: `#412`
   - Phase Status: done
-  - Implementation Summary: 1. Implemented miss-time persisted-page validation at the shared readonly-cache [Task Resolve Sync: docs/tasks/000061-readonly-cache-validation-recovery-hardening-and-corruption-tests.md @ 2026-03-11]
+  - Implementation Summary: Moved persisted-page validation to readonly-cache miss time, invalidated corrupted resident mappings on validated reads, hardened corruption propagation through access/catalog bootstrap/recovery paths, and added corruption-injection coverage proving corrupted persisted pages are neither cached nor processed. [Task Resolve Sync: docs/tasks/000061-readonly-cache-validation-recovery-hardening-and-corruption-tests.md @ 2026-03-11]
 
 ## Consequences
 
