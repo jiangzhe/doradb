@@ -1,7 +1,7 @@
 ---
 id: 000064
 title: Readonly Cache Cancellation-Safe Inflight Miss Loading
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-12
 github_issue: 419
 ---

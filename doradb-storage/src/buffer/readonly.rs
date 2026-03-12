@@ -436,119 +436,105 @@ impl GlobalReadonlyBufferPool {
     }
 
     #[inline]
-    async fn load_cache_miss(
+    async fn run_inflight_load(
         &'static self,
         key: ReadonlyCacheKey,
-        page_source: &dyn ReadonlyPageSource,
+        page_source: Arc<dyn ReadonlyPageSource>,
+        validation: Option<InflightLoadValidation>,
     ) -> Result<PageID> {
         let mut reserved = ReservedMissFrameGuard::acquire(self).await?;
-        // Destination memory is exclusively held by the reserved miss-frame guard,
-        // aligned to page size, and remains valid until IO completion because the
-        // guard is held for the full await.
+        // SAFETY: destination memory is page-sized, aligned, and exclusively owned
+        // by the reserved miss-frame guard for the full background miss attempt.
         let dst = UnsafePtr(reserved.page_mut() as *mut Page as *mut u8);
         page_source.read_page_into_ptr(key.block_id, dst).await?;
+        if let Some(validation) = validation {
+            (validation.validator)(reserved.page(), validation.file_kind, key.block_id)?;
+        }
         reserved.publish(key)
     }
 
     #[inline]
-    async fn load_cache_miss_validated(
+    fn join_or_start_inflight_load(
         &'static self,
         key: ReadonlyCacheKey,
-        page_source: &dyn ReadonlyPageSource,
-        file_kind: PersistedFileKind,
-        validator: ReadonlyPageValidator,
-    ) -> Result<PageID> {
-        let mut reserved = ReservedMissFrameGuard::acquire(self).await?;
-        let dst = UnsafePtr(reserved.page_mut() as *mut Page as *mut u8);
-        page_source.read_page_into_ptr(key.block_id, dst).await?;
-        validator(reserved.page(), file_kind, key.block_id)?;
-        reserved.publish(key)
+        page_source: Arc<dyn ReadonlyPageSource>,
+        validation: Option<InflightLoadValidation>,
+    ) -> Arc<InflightLoad> {
+        match self.inflight_loads.entry(key) {
+            Entry::Vacant(vac) => {
+                let inflight = Arc::new(InflightLoad::new());
+                vac.insert(Arc::clone(&inflight));
+                let task_inflight = Arc::clone(&inflight);
+                smol::spawn(async move {
+                    let mut completion = InflightLoadCompletion::new(self, key, task_inflight);
+                    let load_res = self.run_inflight_load(key, page_source, validation).await;
+                    completion.complete(load_res);
+                })
+                .detach();
+                inflight
+            }
+            // The first miss attempt for one key owns the shared validation policy.
+            // Followers join that attempt and observe its terminal result.
+            Entry::Occupied(occ) => Arc::clone(occ.get()),
+        }
+    }
+
+    #[inline]
+    fn complete_inflight_load(
+        &self,
+        key: ReadonlyCacheKey,
+        inflight: &Arc<InflightLoad>,
+        result: Result<PageID>,
+    ) {
+        inflight.complete(result);
+        match self.inflight_loads.entry(key) {
+            Entry::Occupied(occ) if Arc::ptr_eq(occ.get(), inflight) => {
+                occ.remove();
+            }
+            _ => {}
+        }
+        inflight.notify();
     }
 
     #[inline]
     async fn get_or_load_frame_id(
         &'static self,
         key: ReadonlyCacheKey,
-        page_source: &dyn ReadonlyPageSource,
+        page_source: Arc<dyn ReadonlyPageSource>,
     ) -> Result<PageID> {
-        loop {
-            if let Some(frame_id) = self.try_get_frame_id(&key) {
-                return Ok(frame_id);
-            }
-
-            let (is_loader, inflight) = match self.inflight_loads.entry(key) {
-                Entry::Vacant(vac) => {
-                    let inflight = Arc::new(InflightLoad::new());
-                    vac.insert(Arc::clone(&inflight));
-                    (true, inflight)
-                }
-                Entry::Occupied(occ) => (false, Arc::clone(occ.get())),
-            };
-
-            if is_loader {
-                let load_res = self.load_cache_miss(key, page_source).await;
-                if let Some((_, inflight)) = self.inflight_loads.remove(&key) {
-                    inflight.ev.notify(usize::MAX);
-                }
-                match load_res {
-                    Ok(frame_id) => return Ok(frame_id),
-                    Err(err) => {
-                        return Err(err);
-                    }
-                }
-            } else {
-                let listener = inflight.ev.listen();
-                if self.try_get_frame_id(&key).is_some() || !self.inflight_loads.contains_key(&key)
-                {
-                    continue;
-                }
-                listener.await;
-            }
+        if let Some(frame_id) = self.try_get_frame_id(&key) {
+            return Ok(frame_id);
         }
+        let inflight = self.join_or_start_inflight_load(key, page_source, None);
+        if let Some(frame_id) = self.try_get_frame_id(&key) {
+            return Ok(frame_id);
+        }
+        inflight.wait_result().await
     }
 
     #[inline]
     async fn get_or_load_frame_id_validated(
         &'static self,
         key: ReadonlyCacheKey,
-        page_source: &dyn ReadonlyPageSource,
+        page_source: Arc<dyn ReadonlyPageSource>,
         file_kind: PersistedFileKind,
         validator: ReadonlyPageValidator,
     ) -> Result<PageID> {
-        loop {
-            if let Some(frame_id) = self.try_get_frame_id(&key) {
-                return Ok(frame_id);
-            }
-
-            let (is_loader, inflight) = match self.inflight_loads.entry(key) {
-                Entry::Vacant(vac) => {
-                    let inflight = Arc::new(InflightLoad::new());
-                    vac.insert(Arc::clone(&inflight));
-                    (true, inflight)
-                }
-                Entry::Occupied(occ) => (false, Arc::clone(occ.get())),
-            };
-
-            if is_loader {
-                let load_res = self
-                    .load_cache_miss_validated(key, page_source, file_kind, validator)
-                    .await;
-                if let Some((_, inflight)) = self.inflight_loads.remove(&key) {
-                    inflight.ev.notify(usize::MAX);
-                }
-                match load_res {
-                    Ok(frame_id) => return Ok(frame_id),
-                    Err(err) => return Err(err),
-                }
-            } else {
-                let listener = inflight.ev.listen();
-                if self.try_get_frame_id(&key).is_some() || !self.inflight_loads.contains_key(&key)
-                {
-                    continue;
-                }
-                listener.await;
-            }
+        if let Some(frame_id) = self.try_get_frame_id(&key) {
+            return Ok(frame_id);
         }
+        let inflight = self.join_or_start_inflight_load(
+            key,
+            page_source,
+            Some(InflightLoadValidation {
+                file_kind,
+                validator,
+            }),
+        );
+        if let Some(frame_id) = self.try_get_frame_id(&key) {
+            return Ok(frame_id);
+        }
+        inflight.wait_result().await
     }
 
     #[inline]
@@ -713,14 +699,107 @@ unsafe impl Send for GlobalReadonlyBufferPool {}
 unsafe impl Sync for GlobalReadonlyBufferPool {}
 unsafe impl StaticLifetime for GlobalReadonlyBufferPool {}
 
+#[derive(Clone, Copy)]
+struct InflightLoadValidation {
+    file_kind: PersistedFileKind,
+    validator: ReadonlyPageValidator,
+}
+
+enum InflightState {
+    Running,
+    Completed(Result<PageID>),
+}
+
 struct InflightLoad {
+    state: Mutex<InflightState>,
     ev: Event,
 }
 
 impl InflightLoad {
     #[inline]
     fn new() -> Self {
-        InflightLoad { ev: Event::new() }
+        InflightLoad {
+            state: Mutex::new(InflightState::Running),
+            ev: Event::new(),
+        }
+    }
+
+    #[inline]
+    fn complete(&self, result: Result<PageID>) {
+        let mut state = self.state.lock();
+        if matches!(&*state, InflightState::Running) {
+            *state = InflightState::Completed(result);
+        }
+    }
+
+    #[inline]
+    fn notify(&self) {
+        self.ev.notify(usize::MAX);
+    }
+
+    #[inline]
+    fn completed_result(&self) -> Option<Result<PageID>> {
+        let state = self.state.lock();
+        match &*state {
+            InflightState::Running => None,
+            InflightState::Completed(result) => Some(result.clone()),
+        }
+    }
+
+    #[inline]
+    async fn wait_result(&self) -> Result<PageID> {
+        loop {
+            listener!(self.ev => listener);
+            if let Some(result) = self.completed_result() {
+                return result;
+            }
+            listener.await;
+        }
+    }
+}
+
+struct InflightLoadCompletion<'a> {
+    pool: &'a GlobalReadonlyBufferPool,
+    key: ReadonlyCacheKey,
+    inflight: Arc<InflightLoad>,
+    completed: bool,
+}
+
+impl<'a> InflightLoadCompletion<'a> {
+    #[inline]
+    fn new(
+        pool: &'a GlobalReadonlyBufferPool,
+        key: ReadonlyCacheKey,
+        inflight: Arc<InflightLoad>,
+    ) -> Self {
+        InflightLoadCompletion {
+            pool,
+            key,
+            inflight,
+            completed: false,
+        }
+    }
+
+    #[inline]
+    fn complete(&mut self, result: Result<PageID>) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        self.pool
+            .complete_inflight_load(self.key, &self.inflight, result);
+    }
+}
+
+impl Drop for InflightLoadCompletion<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        self.pool
+            .complete_inflight_load(self.key, &self.inflight, Err(Error::InternalError));
     }
 }
 
@@ -983,7 +1062,7 @@ impl ReadonlyBufferPool {
         loop {
             let frame_id = self
                 .global
-                .get_or_load_frame_id(key, &*self.page_source)
+                .get_or_load_frame_id(key, Arc::clone(&self.page_source))
                 .await?;
             let guard = self.global.get_page_internal(frame_id, mode).await?;
             if self.global.validate_guarded_frame_key(&guard, key) {
@@ -1009,7 +1088,12 @@ impl ReadonlyBufferPool {
         loop {
             let frame_id = self
                 .global
-                .get_or_load_frame_id_validated(key, &*self.page_source, self.file_kind, validator)
+                .get_or_load_frame_id_validated(
+                    key,
+                    Arc::clone(&self.page_source),
+                    self.file_kind,
+                    validator,
+                )
                 .await?;
             let guard = self
                 .global
@@ -1141,6 +1225,8 @@ mod tests {
     use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
     use crate::lwc::{LWC_PAGE_PAYLOAD_SIZE, LwcPage, LwcPageHeader, validate_persisted_lwc_page};
     use crate::value::ValKind;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn frame_page_bytes(cap: usize) -> usize {
@@ -1208,6 +1294,121 @@ mod tests {
         payload[COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE] = 7;
         write_page_checksum(&mut buf);
         buf
+    }
+
+    fn page_from_bytes(bytes: &[u8]) -> Page {
+        assert_eq!(bytes.len(), PAGE_SIZE);
+        let mut page = [0u8; PAGE_SIZE];
+        page.copy_from_slice(bytes);
+        page
+    }
+
+    #[derive(Clone)]
+    enum ControlledReadOutcome {
+        Page(Arc<Page>),
+        Error(Error),
+    }
+
+    struct ControlledPageSource {
+        outcome: ControlledReadOutcome,
+        calls: AtomicUsize,
+        start_ev: Event,
+        released: AtomicBool,
+        release_ev: Event,
+    }
+
+    impl ControlledPageSource {
+        fn with_page(page: Page) -> Self {
+            ControlledPageSource {
+                outcome: ControlledReadOutcome::Page(Arc::new(page)),
+                calls: AtomicUsize::new(0),
+                start_ev: Event::new(),
+                released: AtomicBool::new(false),
+                release_ev: Event::new(),
+            }
+        }
+
+        fn with_error(err: Error) -> Self {
+            ControlledPageSource {
+                outcome: ControlledReadOutcome::Error(err),
+                calls: AtomicUsize::new(0),
+                start_ev: Event::new(),
+                released: AtomicBool::new(false),
+                release_ev: Event::new(),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release_ev.notify(usize::MAX);
+        }
+
+        async fn wait_started(&self, expected_calls: usize) {
+            loop {
+                if self.call_count() >= expected_calls {
+                    return;
+                }
+                listener!(self.start_ev => listener);
+                if self.call_count() >= expected_calls {
+                    return;
+                }
+                listener.await;
+            }
+        }
+    }
+
+    impl ReadonlyPageSource for ControlledPageSource {
+        fn read_page_into_ptr<'a>(
+            &'a self,
+            _page_id: PageID,
+            ptr: UnsafePtr<u8>,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.start_ev.notify(usize::MAX);
+                loop {
+                    if self.released.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    listener!(self.release_ev => listener);
+                    if self.released.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    listener.await;
+                }
+                match &self.outcome {
+                    ControlledReadOutcome::Page(page) => {
+                        // SAFETY: readonly miss tests reserve page-sized aligned frame memory.
+                        unsafe { copy_page_into_ptr(page.as_ref(), ptr) }
+                        Ok(())
+                    }
+                    ControlledReadOutcome::Error(err) => Err(err.clone()),
+                }
+            })
+        }
+    }
+
+    async fn wait_for<F>(mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..100 {
+            if predicate() {
+                return;
+            }
+            smol::Timer::after(Duration::from_millis(10)).await;
+        }
+        panic!("condition was not satisfied before timeout");
+    }
+
+    unsafe fn copy_page_into_ptr(src: &Page, dst: UnsafePtr<u8>) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.0, PAGE_SIZE);
+        }
     }
 
     #[test]
@@ -1458,6 +1659,213 @@ mod tests {
             assert_eq!(global.as_static().allocated(), 1);
             drop(table_file);
             drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_cancelled_loader_keeps_shared_miss_attempt_alive() {
+        smol::block_on(async {
+            let mut page = [0u8; PAGE_SIZE];
+            page[..5].copy_from_slice(b"hello");
+            let page_source = Arc::new(ControlledPageSource::with_page(page));
+
+            let scope = StaticLifetimeScope::new();
+            let global = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(2)).unwrap(),
+            );
+            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+                112,
+                PersistedFileKind::TableFile,
+                Arc::clone(&page_source),
+                global.as_static(),
+            )));
+            let pool = pool.as_static();
+            let key = ReadonlyCacheKey::new(112, 5);
+
+            let loader = smol::spawn(async move {
+                let _ = pool
+                    .get_page_facade::<Page>(5, LatchFallbackMode::Shared)
+                    .await
+                    .unwrap();
+            });
+            page_source.wait_started(1).await;
+            assert!(global.as_static().inflight_loads.contains_key(&key));
+
+            drop(loader);
+
+            let waiter = smol::spawn(async move {
+                let g = pool
+                    .get_page_facade::<Page>(5, LatchFallbackMode::Shared)
+                    .await
+                    .unwrap();
+                let g = g.lock_shared_async().await.unwrap();
+                g.page()[..5].to_vec()
+            });
+            smol::future::yield_now().await;
+
+            page_source.release();
+
+            assert_eq!(waiter.await, b"hello");
+            assert_eq!(page_source.call_count(), 1);
+            assert_eq!(global.as_static().allocated(), 1);
+            assert!(global.as_static().try_get_frame_id(&key).is_some());
+            assert!(!global.as_static().inflight_loads.contains_key(&key));
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_cancelled_single_loader_does_not_leak_completed_inflight() {
+        smol::block_on(async {
+            let mut page = [0u8; PAGE_SIZE];
+            page[..4].copy_from_slice(b"solo");
+            let page_source = Arc::new(ControlledPageSource::with_page(page));
+
+            let scope = StaticLifetimeScope::new();
+            let global = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(2)).unwrap(),
+            );
+            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+                113,
+                PersistedFileKind::TableFile,
+                Arc::clone(&page_source),
+                global.as_static(),
+            )));
+            let pool = pool.as_static();
+            let key = ReadonlyCacheKey::new(113, 9);
+
+            let loader = smol::spawn(async move {
+                let _ = pool
+                    .get_page_facade::<Page>(9, LatchFallbackMode::Shared)
+                    .await
+                    .unwrap();
+            });
+            page_source.wait_started(1).await;
+            assert!(global.as_static().inflight_loads.contains_key(&key));
+
+            drop(loader);
+            page_source.release();
+
+            wait_for(|| {
+                !global.as_static().inflight_loads.contains_key(&key)
+                    && global.as_static().try_get_frame_id(&key).is_some()
+            })
+            .await;
+
+            assert_eq!(page_source.call_count(), 1);
+            assert_eq!(global.as_static().allocated(), 1);
+            let g = pool
+                .get_page_facade::<Page>(9, LatchFallbackMode::Shared)
+                .await
+                .unwrap();
+            let g = g.lock_shared_async().await.unwrap();
+            assert_eq!(&g.page()[..4], b"solo");
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_shared_io_failure_propagates_to_all_waiters() {
+        smol::block_on(async {
+            let page_source = Arc::new(ControlledPageSource::with_error(Error::IOError));
+
+            let scope = StaticLifetimeScope::new();
+            let global = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(2)).unwrap(),
+            );
+            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+                114,
+                PersistedFileKind::TableFile,
+                Arc::clone(&page_source),
+                global.as_static(),
+            )));
+            let pool = pool.as_static();
+            let key = ReadonlyCacheKey::new(114, 7);
+
+            let waiter1 = smol::spawn(async move {
+                pool.get_page_facade::<Page>(7, LatchFallbackMode::Shared)
+                    .await
+            });
+            let waiter2 = smol::spawn(async move {
+                pool.get_page_facade::<Page>(7, LatchFallbackMode::Shared)
+                    .await
+            });
+
+            page_source.wait_started(1).await;
+            smol::Timer::after(Duration::from_millis(10)).await;
+            page_source.release();
+
+            assert!(matches!(waiter1.await, Err(Error::IOError)));
+            assert!(matches!(waiter2.await, Err(Error::IOError)));
+            assert_eq!(page_source.call_count(), 1);
+            assert_eq!(global.as_static().allocated(), 0);
+            assert_eq!(global.as_static().try_get_frame_id(&key), None);
+            assert!(!global.as_static().inflight_loads.contains_key(&key));
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_shared_validated_load_propagates_validation_failure() {
+        smol::block_on(async {
+            let mut page = build_valid_persisted_lwc_page();
+            let last_idx = page.len() - 1;
+            page[last_idx] ^= 0xFF;
+            let page_source = Arc::new(ControlledPageSource::with_page(page_from_bytes(&page)));
+
+            let scope = StaticLifetimeScope::new();
+            let global = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(2)).unwrap(),
+            );
+            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+                115,
+                PersistedFileKind::TableFile,
+                Arc::clone(&page_source),
+                global.as_static(),
+            )));
+            let pool = pool.as_static();
+            let key = ReadonlyCacheKey::new(115, 8);
+
+            let waiter1 = smol::spawn(async move {
+                pool.try_get_validated_page_shared(8, validate_persisted_lwc_page)
+                    .await
+            });
+            let waiter2 = smol::spawn(async move {
+                pool.try_get_validated_page_shared(8, validate_persisted_lwc_page)
+                    .await
+            });
+
+            page_source.wait_started(1).await;
+            smol::Timer::after(Duration::from_millis(10)).await;
+            page_source.release();
+
+            let err1 = match waiter1.await {
+                Ok(_) => panic!("expected persisted LWC corruption"),
+                Err(err) => err,
+            };
+            let err2 = match waiter2.await {
+                Ok(_) => panic!("expected persisted LWC corruption"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err1,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::TableFile,
+                    page_kind: PersistedPageKind::LwcPage,
+                    page_id: 8,
+                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                }
+            ));
+            assert!(matches!(
+                err2,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::TableFile,
+                    page_kind: PersistedPageKind::LwcPage,
+                    page_id: 8,
+                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                }
+            ));
+            assert_eq!(page_source.call_count(), 1);
+            assert_eq!(global.as_static().allocated(), 0);
+            assert_eq!(global.as_static().try_get_frame_id(&key), None);
+            assert!(!global.as_static().inflight_loads.contains_key(&key));
         });
     }
 
