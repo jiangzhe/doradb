@@ -1,6 +1,6 @@
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
@@ -10,7 +10,7 @@ use crate::io::{AIOClient, AIOContext};
 use crate::lifetime::StaticLifetime;
 use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -20,7 +20,7 @@ pub struct TableFileSystem {
     io_client: AIOClient<FileIO>,
     handle: Option<JoinHandle<()>>,
     buf_list: FixedSizeBufferFreeList,
-    data_dir: String,
+    data_dir: PathBuf,
     // Catalog multi-table file name.
     catalog_file_name: String,
 }
@@ -31,7 +31,7 @@ impl TableFileSystem {
     /// This initializes one async IO context, its event loop thread, and a
     /// shared direct-buffer free list for table and catalog files.
     #[inline]
-    pub fn new(io_depth: usize, data_dir: String, catalog_file_name: String) -> Result<Self> {
+    fn new(io_depth: usize, data_dir: PathBuf, catalog_file_name: String) -> Result<Self> {
         let ctx = AIOContext::new(io_depth)?;
         let buf_list = FixedSizeBufferFreeList::new(COW_FILE_PAGE_SIZE, io_depth, io_depth * 2);
         let (event_loop, io_client) = ctx.event_loop();
@@ -87,17 +87,21 @@ impl TableFileSystem {
     /// reserved/catalog ids keep compact decimal names.
     #[inline]
     pub fn table_file_path(&self, table_id: TableID) -> String {
-        if table_id >= USER_OBJ_ID_START {
-            format!("{}/{table_id:016x}.tbl", self.data_dir)
+        let file_name = if table_id >= USER_OBJ_ID_START {
+            format!("{table_id:016x}.tbl")
         } else {
-            format!("{}/{}.tbl", self.data_dir, table_id)
-        }
+            format!("{table_id}.tbl")
+        };
+        path_to_string(&self.data_dir.join(file_name), "table file path")
     }
 
     /// Build absolute path for the unified catalog file (`*.mtb`).
     #[inline]
     pub fn catalog_mtb_file_path(&self) -> String {
-        format!("{}/{}", self.data_dir, self.catalog_file_name)
+        path_to_string(
+            &self.data_dir.join(&self.catalog_file_name),
+            "catalog multi-table file path",
+        )
     }
 
     /// Open existing catalog multi-table file or create a new one.
@@ -172,14 +176,41 @@ impl TableFileSystemConfig {
     #[inline]
     pub fn build(self) -> Result<TableFileSystem> {
         if !validate_catalog_file_name(&self.catalog_file_name) {
-            return Err(crate::error::Error::InvalidStoragePath(format!(
+            return Err(Error::InvalidStoragePath(format!(
                 "catalog file name must be a plain `.mtb` file name: {}",
                 self.catalog_file_name
             )));
         }
-        let data_dir = path_to_utf8(&self.data_dir, "data_dir")?.to_owned();
+        let data_dir = validate_data_dir(&self.data_dir)?;
         TableFileSystem::new(self.io_depth, data_dir, self.catalog_file_name)
     }
+}
+
+#[inline]
+fn validate_data_dir(data_dir: &Path) -> Result<PathBuf> {
+    if data_dir.as_os_str().is_empty() {
+        return Err(Error::InvalidStoragePath(
+            "data_dir must not be empty".into(),
+        ));
+    }
+    path_to_utf8(data_dir, "data_dir")?;
+    if data_dir
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(Error::InvalidStoragePath(format!(
+            "data_dir must not contain parent traversal: {}",
+            data_dir.display()
+        )));
+    }
+    Ok(data_dir.to_path_buf())
+}
+
+#[inline]
+fn path_to_string(path: &Path, field: &str) -> String {
+    path_to_utf8(path, field)
+        .expect("table file system paths are validated during construction")
+        .to_owned()
 }
 
 impl Default for TableFileSystemConfig {
@@ -277,6 +308,30 @@ mod tests {
             .catalog_file_name("dir/catalog.mtb")
             .build();
         assert!(res.is_err());
+
+        let res = TableFileSystemConfig::default()
+            .data_dir(temp_dir.path())
+            .catalog_file_name("../catalog.mtb")
+            .build();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_data_dir_validation() {
+        let err = match TableFileSystemConfig::default()
+            .data_dir(PathBuf::new())
+            .build()
+        {
+            Ok(_) => panic!("expected invalid storage path"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
+
+        let err = match TableFileSystemConfig::default().data_dir("../data").build() {
+            Ok(_) => panic!("expected invalid storage path"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
     }
 
     #[cfg(unix)]

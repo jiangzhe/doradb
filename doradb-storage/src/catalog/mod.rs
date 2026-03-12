@@ -90,9 +90,10 @@ impl Catalog {
     /// # Panics
     ///
     /// Panics if another checkpoint is already in progress on the same
-    /// `CatalogStorage`/`MultiTableFile`. Concurrent checkpoint publishes are
-    /// not supported by design; the underlying [`CowFile`] enforces a single
-    /// mutable writer via an atomic claim and will panic on violation.
+    /// shared `CatalogStorage`/`MultiTableFile`. Concurrent checkpoint
+    /// publishes are not supported by design; the underlying
+    /// [`crate::file::cow_file::CowFile`] enforces a single mutable writer via
+    /// an atomic claim and will panic on violation.
     #[inline]
     pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let batch = self.scan_checkpoint_batch(trx_sys)?;
@@ -105,7 +106,8 @@ impl Catalog {
     /// using the global persisted watermark across all log partitions.
     ///
     /// Scanned batches are intended for single-flight publish flow and must not
-    /// be raced with other catalog checkpoint publishes on the same `Catalog`.
+    /// be raced with other catalog checkpoint publishes against the same shared
+    /// `CatalogStorage`/`MultiTableFile` writer.
     pub fn scan_checkpoint_batch(
         &self,
         trx_sys: &TransactionSystem,
@@ -124,10 +126,11 @@ impl Catalog {
     ///
     /// # Panics
     ///
-    /// Panics if another mutable writer is already active on `catalog.mtb`.
-    /// Only one checkpoint publish may be in flight at a time per `Catalog`
-    /// instance; callers are responsible for ensuring mutual exclusion at a
-    /// higher level (e.g., a single background checkpoint task).
+    /// Panics if another mutable writer is already active on the shared
+    /// `catalog.mtb` `MultiTableFile`. Only one checkpoint publish may be in
+    /// flight at a time per shared `CatalogStorage`/`MultiTableFile`; callers
+    /// are responsible for ensuring mutual exclusion at a higher level (e.g.,
+    /// a single background checkpoint task).
     #[inline]
     pub async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
         self.storage
