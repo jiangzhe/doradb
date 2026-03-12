@@ -176,30 +176,45 @@ Reference:
    - normalizes root-relative `data_dir`, `log_dir`, and `data_swap_file`
    - validates `catalog_file_name`, `log_file_stem`, and `.bin` swap-file
      suffixes
-   - persists and validates `storage-layout.toml`
+   - validates an existing `storage-layout.toml` before startup
+   - persists `storage-layout.toml` only after recovery preparation succeeds
    - rejects durable-layout drift on restart while allowing `data_swap_file`
      changes and whole-root relocation
-2. Renamed the primary config surface in code and serialization:
+2. Renamed the primary config surface in code and serialization, and removed
+   the leftover compatibility builders from the public API:
    - `EngineConfig.main_dir` -> `storage_root`
    - `TableFileSystemConfig.base_dir` -> `data_dir`
    - `TrxSysConfig.log_file_prefix` -> `log_dir` + `log_file_stem`
    - `EvictableBufferPoolConfig.file_path` -> `data_swap_file`
-3. Updated engine startup to resolve storage paths once before subsystem
-   construction, create required directories, and enforce the durable-layout
-   marker before recovery starts.
-4. Updated the table-file, buffer-pool, and redo-log configs/builders to
-   consume resolved absolute paths from engine startup while keeping the
+   - removed `with_main_dir` / `with_storage_root` helpers from
+     `TableFileSystemConfig` and `EvictableBufferPoolConfig`
+3. Updated engine startup and transaction-system initialization to resolve
+   storage paths once, validate marker compatibility early, prepare recovery,
+   persist the durable-layout marker, and only then start transaction
+   background threads.
+4. Updated the table-file, buffer-pool, and redo-log configs/builders, plus
+   direct subsystem tests, to use explicit `storage_root`, `data_dir`,
+   `data_swap_file`, `log_dir`, and `log_file_stem` settings while keeping the
    existing low-level subsystem behavior unchanged.
 5. Updated benchmark/example entry points to use the renamed swap/log config
    knobs and the new `data.bin`-style naming.
 6. Added coverage for:
    - `storage_path` validation and marker mismatch
+   - failed startup does not persist `storage-layout.toml`
    - engine restart with changed `data_swap_file`
    - engine restart with durable-layout mismatch
    - engine restart after storage-root relocation
-7. Verification:
+7. Addressed review follow-up after the initial implementation:
+   - delayed marker persistence so failed startup attempts do not pin an empty
+     or partial storage root to the wrong durable layout
+   - removed the remaining stale compatibility APIs (`main_dir`, old swap-file
+     builder alias, and per-subsystem root-joining helpers) instead of keeping
+     ambiguous duplicate path semantics
+8. Verification:
    - `cargo check -p doradb-storage --no-default-features --all-targets`
    - `cargo test -p doradb-storage --no-default-features`
+   - pre-commit `cargo fmt`
+   - pre-commit `cargo clippy --all-features --all-targets -- -D warnings`
 
 ## Impacts
 

@@ -19,3 +19,10 @@ Audit all storage file path configuration points to ensure they consistently der
 
 All relevant path sites are documented and validated; remaining hardcoded path usage is either removed or explicitly justified.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000063-refine-storage-path-configuration-and-restart-contract.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-12
