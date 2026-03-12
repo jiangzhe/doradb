@@ -627,7 +627,7 @@ pub mod tests {
         table_id
     }
 
-    fn corrupt_page_checksum(path: &str, page_id: u64) {
+    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -655,7 +655,7 @@ pub mod tests {
     fn test_bootstrap_creates_catalog_mtb_without_catalog_tbl_files() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
                 .trx(TrxSysConfig::default().skip_recovery(true))
@@ -676,7 +676,7 @@ pub mod tests {
     fn test_next_user_obj_id_monotonic_across_restart() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
@@ -748,7 +748,7 @@ pub mod tests {
     fn test_catalog_checkpoint_now_publish_and_noop() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
@@ -813,7 +813,7 @@ pub mod tests {
     fn test_catalog_bootstrap_fails_on_corrupted_checkpoint_lwc_page() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
@@ -856,7 +856,7 @@ pub mod tests {
                 .expect("catalog checkpoint should publish at least one LWC page");
             drop(engine);
 
-            corrupt_page_checksum(&format!("{}/catalog.mtb", main_dir), entry.payload.block_id);
+            corrupt_page_checksum(main_dir.join("catalog.mtb"), entry.payload.block_id);
 
             let err = match EngineConfig::default()
                 .storage_root(main_dir)
@@ -887,7 +887,7 @@ pub mod tests {
     fn test_catalog_checkpoint_now_heartbeat_without_catalog_ops() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
@@ -933,7 +933,7 @@ pub mod tests {
     fn test_catalog_checkpoint_scan_apply_full_range() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
@@ -987,7 +987,7 @@ pub mod tests {
     fn test_catalog_checkpoint_now_heartbeat_with_mixed_user_table_checkpoint_states() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)

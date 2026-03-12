@@ -606,7 +606,7 @@ mod tests {
     fn test_catalog_checkpoint_collect_index_entries_uses_readonly_cache() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .trx(
@@ -659,7 +659,7 @@ mod tests {
     fn test_catalog_checkpoint_tail_merge_rewrites_last_payload_without_new_entry() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .trx(

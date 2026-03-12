@@ -16,6 +16,7 @@ use crate::trx::sys_conf::TrxSysConfig;
 use byte_unit::Byte;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Storage engine of DoraDB.
@@ -110,7 +111,7 @@ const DEFAULT_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
-    storage_root: String,
+    storage_root: PathBuf,
     trx: TrxSysConfig,
     meta_buffer: Byte,
     index_buffer: Byte,
@@ -122,7 +123,7 @@ impl Default for EngineConfig {
     #[inline]
     fn default() -> Self {
         EngineConfig {
-            storage_root: String::from("."),
+            storage_root: PathBuf::from("."),
             trx: TrxSysConfig::default(),
             meta_buffer: Byte::from_u64(DEFAULT_META_BUFFER as u64),
             index_buffer: Byte::from_u64(DEFAULT_INDEX_BUFFER as u64),
@@ -134,7 +135,7 @@ impl Default for EngineConfig {
 
 impl EngineConfig {
     #[inline]
-    pub fn storage_root(mut self, storage_root: impl Into<String>) -> Self {
+    pub fn storage_root(mut self, storage_root: impl Into<PathBuf>) -> Self {
         self.storage_root = storage_root.into();
         self
     }
@@ -180,10 +181,10 @@ impl EngineConfig {
             self.trx.log_partitions,
             self.data_buffer.data_swap_file_ref(),
         )?;
-        resolved.ensure_directories()?;
         resolved.validate_marker_if_present()?;
+        resolved.ensure_directories()?;
 
-        let file = self.file.data_dir(resolved.data_dir_string());
+        let file = self.file.data_dir(resolved.data_dir_path());
         let readonly_buffer_size = file.readonly_buffer_size;
         let table_fs = file.build()?;
         let table_fs = StaticLifetime::new_static(table_fs);
@@ -194,13 +195,13 @@ impl EngineConfig {
             FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
         let mem_pool = self
             .data_buffer
-            .data_swap_file(resolved.data_swap_file_string())
+            .data_swap_file(resolved.data_swap_file_path())
             .build()?;
         let mem_pool = StaticLifetime::new_static(mem_pool);
         let disk_pool = GlobalReadonlyBufferPool::with_capacity_static(readonly_buffer_size)?;
         let pending_trx_sys = self
             .trx
-            .log_dir(resolved.log_dir_string())
+            .log_dir(resolved.log_dir_path())
             .prepare_static(meta_pool, index_pool, mem_pool, table_fs, disk_pool)
             .await?;
         resolved.persist_marker_if_missing()?;
@@ -228,7 +229,7 @@ mod tests {
 
     fn test_engine_config_for(root: &std::path::Path) -> EngineConfig {
         EngineConfig::default()
-            .storage_root(root.to_string_lossy().to_string())
+            .storage_root(root)
             .meta_buffer(TEST_POOL_BYTES)
             .index_buffer(TEST_POOL_BYTES)
             .data_buffer(
@@ -291,6 +292,29 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_layout_mismatch_does_not_create_new_directories() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            drop(engine);
+
+            let new_data_dir = root.path().join("other-data");
+            assert!(!new_data_dir.exists());
+
+            let err = match test_engine_config_for(root.path())
+                .file(TableFileSystemConfig::default().data_dir("other-data"))
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected storage layout mismatch"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageLayoutMismatch(_)));
+            assert!(!new_data_dir.exists());
+        });
+    }
+
+    #[test]
     fn test_storage_layout_marker_allows_storage_root_relocation() {
         smol::block_on(async {
             let parent = TempDir::new().unwrap();
@@ -314,7 +338,7 @@ mod tests {
             let marker_path = root.path().join(STORAGE_LAYOUT_FILE_NAME);
 
             let err = match EngineConfig::default()
-                .storage_root(root.path().to_string_lossy().to_string())
+                .storage_root(root.path())
                 .meta_buffer(TEST_POOL_BYTES)
                 .index_buffer(TEST_POOL_BYTES)
                 .file(TableFileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))

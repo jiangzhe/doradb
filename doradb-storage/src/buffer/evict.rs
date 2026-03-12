@@ -21,7 +21,7 @@ use crate::io::{
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::lifetime::StaticLifetime;
 use crate::notify::EventNotifyOnDrop;
-use crate::storage_path::validate_swap_file_path_candidate;
+use crate::storage_path::{path_to_utf8, validate_swap_file_path_candidate};
 use byte_unit::Byte;
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -1000,7 +1001,7 @@ const DEFAULT_MAX_IO_DEPTH: usize = 64;
 /// used to build the background evictor policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvictableBufferPoolConfig {
-    data_swap_file: String,
+    data_swap_file: PathBuf,
     max_file_size: Byte,
     max_mem_size: Byte,
     max_io_depth: usize,
@@ -1011,7 +1012,7 @@ impl Default for EvictableBufferPoolConfig {
     #[inline]
     fn default() -> Self {
         EvictableBufferPoolConfig {
-            data_swap_file: String::from(DEFAULT_DATA_SWAP_FILE),
+            data_swap_file: PathBuf::from(DEFAULT_DATA_SWAP_FILE),
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             max_mem_size: DEFAULT_MAX_MEM_SIZE,
             max_io_depth: DEFAULT_MAX_IO_DEPTH,
@@ -1022,13 +1023,13 @@ impl Default for EvictableBufferPoolConfig {
 
 impl EvictableBufferPoolConfig {
     #[inline]
-    pub fn data_swap_file(mut self, data_swap_file: impl Into<String>) -> Self {
+    pub fn data_swap_file(mut self, data_swap_file: impl Into<PathBuf>) -> Self {
         self.data_swap_file = data_swap_file.into();
         self
     }
 
     #[inline]
-    pub(crate) fn data_swap_file_ref(&self) -> &str {
+    pub(crate) fn data_swap_file_ref(&self) -> &Path {
         &self.data_swap_file
     }
 
@@ -1130,7 +1131,8 @@ impl EvictableBufferPoolConfig {
         let io_ctx = AIOContext::new(self.max_io_depth)?;
         let (event_loop, io_client) = io_ctx.event_loop();
 
-        let file = SparseFile::create_or_trunc(&self.data_swap_file, max_file_size)?;
+        let data_swap_file = path_to_utf8(&self.data_swap_file, "data_swap_file")?;
+        let file = SparseFile::create_or_trunc(data_swap_file, max_file_size)?;
         let file_io = SingleFileIO::new(file);
 
         let pool = EvictableBufferPool {
@@ -1336,13 +1338,7 @@ mod tests {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
                 EvictableBufferPoolConfig::default()
-                    .data_swap_file(
-                        temp_dir
-                            .path()
-                            .join("data.bin")
-                            .to_string_lossy()
-                            .to_string(),
-                    )
+                    .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256)
                     .build_static()
@@ -1445,13 +1441,7 @@ mod tests {
         let pool: &EvictableBufferPool = scope
             .adopt(
                 EvictableBufferPoolConfig::default()
-                    .data_swap_file(
-                        temp_dir
-                            .path()
-                            .join("data.bin")
-                            .to_string_lossy()
-                            .to_string(),
-                    )
+                    .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(64u64 * 1024 * 130)
                     .max_file_size(128u64 * 1024 * 130)
                     .build_static()
@@ -1499,13 +1489,7 @@ mod tests {
         let scope = StaticLifetimeScope::new();
         let pool = scope.adopt(
             EvictableBufferPoolConfig::default()
-                .data_swap_file(
-                    temp_dir
-                        .path()
-                        .join("data.bin")
-                        .to_string_lossy()
-                        .to_string(),
-                )
+                .data_swap_file(temp_dir.path().join("data.bin"))
                 .max_mem_size(1024u64 * 1024 * 64)
                 .max_file_size(1024u64 * 1024 * 128)
                 .build_static()
@@ -1537,13 +1521,7 @@ mod tests {
         let pool = scope
             .adopt(
                 EvictableBufferPoolConfig::default()
-                    .data_swap_file(
-                        temp_dir
-                            .path()
-                            .join("data.bin")
-                            .to_string_lossy()
-                            .to_string(),
-                    )
+                    .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(64u64 * 1024 * 2048)
                     .build_static()
@@ -1616,13 +1594,7 @@ mod tests {
         let scope = StaticLifetimeScope::new();
         let pool = scope.adopt(
             EvictableBufferPoolConfig::default()
-                .data_swap_file(
-                    temp_dir
-                        .path()
-                        .join("data.bin")
-                        .to_string_lossy()
-                        .to_string(),
-                )
+                .data_swap_file(temp_dir.path().join("data.bin"))
                 .max_mem_size(1024u64 * 1024 * 10)
                 .max_file_size(1024u64 * 1024 * 16)
                 .eviction_arbiter_builder(

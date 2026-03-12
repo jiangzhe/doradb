@@ -390,7 +390,7 @@ impl TransactionSystem {
         }
 
         let mut log_merger = LogMerger::default();
-        let file_prefix = self.config.file_prefix();
+        let file_prefix = self.config.file_prefix()?;
         for log_no in 0..self.config.log_partitions {
             let logs = list_log_files(&file_prefix, log_no, false)?;
             if logs.is_empty() {
@@ -560,7 +560,7 @@ mod tests {
     fn test_transaction_system() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -601,7 +601,7 @@ mod tests {
     fn test_catalog_checkpoint_scan_respects_upper_bound_and_replay_start() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -824,7 +824,7 @@ mod tests {
         const COUNT: usize = 1000000;
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -868,7 +868,7 @@ mod tests {
         const COUNT: usize = 2000;
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(

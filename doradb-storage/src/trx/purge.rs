@@ -626,7 +626,7 @@ mod tests {
     fn test_purge_promote_delete_marker_if_committed_for_delete_without_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -704,7 +704,7 @@ mod tests {
     fn test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_without_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -786,7 +786,7 @@ mod tests {
     fn test_purge_promote_delete_marker_if_committed_for_delete_with_missing_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -876,7 +876,7 @@ mod tests {
     fn test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_with_missing_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -973,7 +973,7 @@ mod tests {
         const PURGE_SIZE: usize = 100;
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -1057,7 +1057,7 @@ mod tests {
         smol::block_on(async {
             const PURGE_SIZE: usize = 100;
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(

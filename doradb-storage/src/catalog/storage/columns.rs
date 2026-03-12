@@ -172,7 +172,7 @@ mod tests {
     fn test_columns_delete_by_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .trx(TrxSysConfig::default().skip_recovery(true))

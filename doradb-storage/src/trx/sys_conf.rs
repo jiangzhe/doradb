@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
 use crate::io::{AIOContext, align_to_sector_size};
 use crate::lifetime::StaticLifetime;
-use crate::storage_path::validate_log_file_stem;
+use crate::storage_path::{path_to_utf8, validate_log_file_stem};
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
 use crate::trx::purge::{GC, Purge};
 use crate::trx::recover::log_recover;
@@ -14,6 +14,7 @@ use byte_unit::Byte;
 use flume::Receiver;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
 use super::log::list_log_files;
 
@@ -38,7 +39,7 @@ pub struct TrxSysConfig {
     // what it is and send to AIO manager as one IO request.
     pub max_io_size: Byte,
     // Directory where redo log files live.
-    pub log_dir: String,
+    pub log_dir: PathBuf,
     // Base file name of one redo log family.
     // the complete file name pattern is:
     // <log-dir>/<log-file-stem>.<partition_idx>.<file-sequence>
@@ -109,7 +110,7 @@ impl TrxSysConfig {
 
     /// Redo log directory.
     #[inline]
-    pub fn log_dir(mut self, log_dir: impl Into<String>) -> Self {
+    pub fn log_dir(mut self, log_dir: impl Into<PathBuf>) -> Self {
         self.log_dir = log_dir.into();
         self
     }
@@ -158,7 +159,7 @@ impl TrxSysConfig {
     pub fn log_partition_initializer(&self, log_no: usize) -> Result<LogPartitionInitializer> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let ctx = AIOContext::new(self.io_depth_per_log)?;
-        let file_prefix = self.file_prefix();
+        let file_prefix = self.file_prefix()?;
 
         // determine whether we should recovery from previous logs.
         let mode = if self.skip_recovery {
@@ -185,7 +186,7 @@ impl TrxSysConfig {
     }
 
     #[inline]
-    pub(crate) fn log_dir_ref(&self) -> &str {
+    pub(crate) fn log_dir_ref(&self) -> &Path {
         &self.log_dir
     }
 
@@ -195,11 +196,9 @@ impl TrxSysConfig {
     }
 
     #[inline]
-    pub(crate) fn file_prefix(&self) -> String {
-        std::path::Path::new(&self.log_dir)
-            .join(&self.log_file_stem)
-            .to_string_lossy()
-            .to_string()
+    pub(crate) fn file_prefix(&self) -> Result<String> {
+        let file_prefix = self.log_dir.join(&self.log_file_stem);
+        Ok(path_to_utf8(&file_prefix, "redo log path")?.to_owned())
     }
 
     pub async fn build_static(
@@ -265,7 +264,7 @@ impl Default for TrxSysConfig {
         TrxSysConfig {
             io_depth_per_log: DEFAULT_LOG_IO_DEPTH,
             max_io_size: DEFAULT_LOG_IO_MAX_SIZE,
-            log_dir: String::from(DEFAULT_LOG_DIR),
+            log_dir: PathBuf::from(DEFAULT_LOG_DIR),
             log_file_stem: String::from(DEFAULT_LOG_FILE_STEM),
             log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,
             log_partitions: DEFAULT_LOG_PARTITIONS,

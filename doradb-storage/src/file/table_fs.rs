@@ -8,8 +8,9 @@ use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
 use crate::io::{AIOClient, AIOContext};
 use crate::lifetime::StaticLifetime;
-use crate::storage_path::validate_catalog_file_name;
+use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -131,7 +132,7 @@ pub struct TableFileSystemConfig {
     // IO depth of reading/write table files.
     pub io_depth: usize,
     // Data directory used for table and catalog files.
-    pub data_dir: String,
+    pub data_dir: PathBuf,
     // Global readonly buffer pool size in bytes.
     pub readonly_buffer_size: usize,
     // Catalog multi-table file name.
@@ -148,7 +149,7 @@ impl TableFileSystemConfig {
 
     /// Set data directory used for table and catalog files.
     #[inline]
-    pub fn data_dir(mut self, data_dir: impl Into<String>) -> Self {
+    pub fn data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
         self.data_dir = data_dir.into();
         self
     }
@@ -176,7 +177,8 @@ impl TableFileSystemConfig {
                 self.catalog_file_name
             )));
         }
-        TableFileSystem::new(self.io_depth, self.data_dir, self.catalog_file_name)
+        let data_dir = path_to_utf8(&self.data_dir, "data_dir")?.to_owned();
+        TableFileSystem::new(self.io_depth, data_dir, self.catalog_file_name)
     }
 }
 
@@ -185,7 +187,7 @@ impl Default for TableFileSystemConfig {
     fn default() -> Self {
         TableFileSystemConfig {
             io_depth: DEFAULT_TABLE_FILE_IO_DEPTH,
-            data_dir: String::from(DEFAULT_TABLE_FILE_DATA_DIR),
+            data_dir: PathBuf::from(DEFAULT_TABLE_FILE_DATA_DIR),
             readonly_buffer_size: DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
             catalog_file_name: String::from(DEFAULT_CATALOG_FILE_NAME),
         }
@@ -198,6 +200,7 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
     };
+    use crate::error::Error;
     use crate::value::ValKind;
     use std::path::Path;
     use tempfile::TempDir;
@@ -207,7 +210,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
 
@@ -245,14 +248,14 @@ mod tests {
     fn test_catalog_file_name_default_and_custom_path() {
         let temp_dir = TempDir::new().unwrap();
         let fs = TableFileSystemConfig::default()
-            .data_dir(temp_dir.path().to_string_lossy().to_string())
+            .data_dir(temp_dir.path())
             .build()
             .unwrap();
         assert!(fs.catalog_mtb_file_path().ends_with("catalog.mtb"));
         drop(fs);
 
         let fs = TableFileSystemConfig::default()
-            .data_dir(temp_dir.path().to_string_lossy().to_string())
+            .data_dir(temp_dir.path())
             .catalog_file_name("cat_meta.mtb")
             .build()
             .unwrap();
@@ -264,15 +267,29 @@ mod tests {
     fn test_catalog_file_name_validation() {
         let temp_dir = TempDir::new().unwrap();
         let res = TableFileSystemConfig::default()
-            .data_dir(temp_dir.path().to_string_lossy().to_string())
+            .data_dir(temp_dir.path())
             .catalog_file_name("catalog.bin")
             .build();
         assert!(res.is_err());
 
         let res = TableFileSystemConfig::default()
-            .data_dir(temp_dir.path().to_string_lossy().to_string())
+            .data_dir(temp_dir.path())
             .catalog_file_name("dir/catalog.mtb")
             .build();
         assert!(res.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_data_dir_rejects_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(vec![b'd', b'a', b't', b'a', 0xff]));
+        let err = match TableFileSystemConfig::default().data_dir(path).build() {
+            Ok(_) => panic!("expected invalid storage path"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
     }
 }

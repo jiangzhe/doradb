@@ -31,13 +31,13 @@ pub(crate) struct ResolvedStoragePaths {
 
 impl ResolvedStoragePaths {
     pub(crate) fn resolve(
-        storage_root: &str,
-        data_dir: &str,
+        storage_root: &Path,
+        data_dir: &Path,
         catalog_file_name: &str,
-        log_dir: &str,
+        log_dir: &Path,
         log_file_stem: &str,
         log_partitions: usize,
-        data_swap_file: &str,
+        data_swap_file: &Path,
     ) -> Result<Self> {
         if !validate_catalog_file_name(catalog_file_name) {
             return Err(Error::InvalidStoragePath(format!(
@@ -67,9 +67,9 @@ impl ResolvedStoragePaths {
         let data_swap_file = storage_root.join(&data_swap_file_rel);
         let durable_layout = DurableStorageLayout {
             version: STORAGE_LAYOUT_VERSION,
-            data_dir: relative_dir_display(&data_dir_rel),
+            data_dir: relative_dir_display(&data_dir_rel, "data_dir")?,
             catalog_file_name: catalog_file_name.to_string(),
-            log_dir: relative_dir_display(&log_dir_rel),
+            log_dir: relative_dir_display(&log_dir_rel, "log_dir")?,
             log_file_stem: log_file_stem.to_string(),
             log_partitions,
         };
@@ -86,16 +86,16 @@ impl ResolvedStoragePaths {
         Ok(res)
     }
 
-    pub(crate) fn data_dir_string(&self) -> String {
-        self.data_dir.to_string_lossy().to_string()
+    pub(crate) fn data_dir_path(&self) -> &Path {
+        &self.data_dir
     }
 
-    pub(crate) fn log_dir_string(&self) -> String {
-        self.log_dir.to_string_lossy().to_string()
+    pub(crate) fn log_dir_path(&self) -> &Path {
+        &self.log_dir
     }
 
-    pub(crate) fn data_swap_file_string(&self) -> String {
-        self.data_swap_file.to_string_lossy().to_string()
+    pub(crate) fn data_swap_file_path(&self) -> &Path {
+        &self.data_swap_file
     }
 
     pub(crate) fn ensure_directories(&self) -> Result<()> {
@@ -156,13 +156,13 @@ impl ResolvedStoragePaths {
         if self.data_swap_file == self.catalog_file_path {
             return Err(Error::InvalidStoragePath(format!(
                 "data swap file must not overlap catalog file: {}",
-                self.data_swap_file.to_string_lossy()
+                self.data_swap_file.display()
             )));
         }
         if self.data_swap_file == self.marker_path() {
             return Err(Error::InvalidStoragePath(format!(
                 "data swap file must not overlap storage marker: {}",
-                self.data_swap_file.to_string_lossy()
+                self.data_swap_file.display()
             )));
         }
         if self
@@ -173,25 +173,36 @@ impl ResolvedStoragePaths {
         {
             return Err(Error::InvalidStoragePath(format!(
                 "data swap file must not use durable storage suffix `.tbl` or `.mtb`: {}",
-                self.data_swap_file.to_string_lossy()
+                self.data_swap_file.display()
             )));
         }
-        let swap = self.data_swap_file.to_string_lossy();
-        let log_prefix = self.log_file_prefix();
-        if swap.as_ref() == log_prefix || swap.starts_with(&format!("{log_prefix}.")) {
+        let log_family_base = self.log_family_base_path();
+        if self.data_swap_file == log_family_base {
             return Err(Error::InvalidStoragePath(format!(
                 "data swap file must not overlap redo log family: {}",
-                self.data_swap_file.to_string_lossy()
+                self.data_swap_file.display()
+            )));
+        }
+        let same_parent = self.data_swap_file.parent() == Some(self.log_dir.as_path());
+        let swap_file_name = path_to_utf8(
+            Path::new(
+                self.data_swap_file
+                    .file_name()
+                    .expect("data swap file must resolve to a file path"),
+            ),
+            "data_swap_file",
+        )?;
+        if same_parent && swap_file_name.starts_with(&format!("{}.", self.log_file_stem)) {
+            return Err(Error::InvalidStoragePath(format!(
+                "data swap file must not overlap redo log family: {}",
+                self.data_swap_file.display()
             )));
         }
         Ok(())
     }
 
-    fn log_file_prefix(&self) -> String {
-        self.log_dir
-            .join(&self.log_file_stem)
-            .to_string_lossy()
-            .to_string()
+    fn log_family_base_path(&self) -> PathBuf {
+        self.log_dir.join(&self.log_file_stem)
     }
 }
 
@@ -214,41 +225,54 @@ pub(crate) fn validate_log_file_stem(file_stem: &str) -> bool {
         .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
 }
 
-pub(crate) fn validate_swap_file_path_candidate(path: &str) -> Result<()> {
-    if path.is_empty() || !path.ends_with(".bin") {
+pub(crate) fn validate_swap_file_path_candidate(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    if path.as_os_str().is_empty() {
         return Err(Error::InvalidStoragePath(format!(
-            "data swap file must end with `.bin`: {path}"
+            "data swap file must end with `.bin`: {}",
+            path.display()
         )));
     }
-    if Path::new(path).file_name().is_none() {
+    if !path_to_utf8(path, "data_swap_file")?.ends_with(".bin") {
         return Err(Error::InvalidStoragePath(format!(
-            "data swap file must resolve to a file path: {path}"
+            "data swap file must end with `.bin`: {}",
+            path.display()
+        )));
+    }
+    if path.file_name().is_none() {
+        return Err(Error::InvalidStoragePath(format!(
+            "data swap file must resolve to a file path: {}",
+            path.display()
         )));
     }
     Ok(())
 }
 
-fn resolve_storage_root(storage_root: &str) -> Result<PathBuf> {
-    if storage_root.is_empty() {
+pub(crate) fn path_to_utf8<'a>(path: &'a Path, field: &str) -> Result<&'a str> {
+    path.to_str()
+        .ok_or_else(|| Error::InvalidStoragePath(format!("{field} must be valid UTF-8")))
+}
+
+fn resolve_storage_root(storage_root: &Path) -> Result<PathBuf> {
+    if storage_root.as_os_str().is_empty() {
         return Err(Error::InvalidStoragePath(
             "storage root must not be empty".into(),
         ));
     }
-    let path = PathBuf::from(storage_root);
-    let abs = if path.is_absolute() {
-        path
+    let abs = if storage_root.is_absolute() {
+        storage_root.to_path_buf()
     } else {
-        std::env::current_dir()?.join(path)
+        std::env::current_dir()?.join(storage_root)
     };
     fs::create_dir_all(&abs)?;
     fs::canonicalize(abs).map_err(Into::into)
 }
 
-fn normalize_relative_dir(path: &str, field: &str) -> Result<PathBuf> {
+fn normalize_relative_dir(path: &Path, field: &str) -> Result<PathBuf> {
     normalize_relative_path(path, field, true)
 }
 
-fn normalize_relative_file_path(path: &str, field: &str) -> Result<PathBuf> {
+fn normalize_relative_file_path(path: &Path, field: &str) -> Result<PathBuf> {
     let normalized = normalize_relative_path(path, field, false)?;
     if normalized.as_os_str().is_empty() {
         return Err(Error::InvalidStoragePath(format!(
@@ -258,8 +282,7 @@ fn normalize_relative_file_path(path: &str, field: &str) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn normalize_relative_path(path: &str, field: &str, allow_empty: bool) -> Result<PathBuf> {
-    let path = Path::new(path);
+fn normalize_relative_path(path: &Path, field: &str, allow_empty: bool) -> Result<PathBuf> {
     if path.is_absolute() {
         return Err(Error::InvalidStoragePath(format!(
             "{field} must be relative to storage_root"
@@ -290,11 +313,11 @@ fn normalize_relative_path(path: &str, field: &str, allow_empty: bool) -> Result
     Ok(normalized)
 }
 
-fn relative_dir_display(path: &Path) -> String {
+fn relative_dir_display(path: &Path, field: &str) -> Result<String> {
     if path.as_os_str().is_empty() {
-        ".".to_string()
+        Ok(".".to_string())
     } else {
-        path.to_string_lossy().to_string()
+        Ok(path_to_utf8(path, field)?.to_string())
     }
 }
 
@@ -307,13 +330,13 @@ mod tests {
     fn test_resolve_storage_paths_default_layout() {
         let root = TempDir::new().unwrap();
         let paths = ResolvedStoragePaths::resolve(
-            &root.path().to_string_lossy(),
-            ".",
+            root.path(),
+            Path::new("."),
             "catalog.mtb",
-            ".",
+            Path::new("."),
             "redo.log",
             1,
-            "data.bin",
+            Path::new("data.bin"),
         )
         .unwrap();
         assert_eq!(paths.durable_layout.catalog_file_name, "catalog.mtb");
@@ -328,13 +351,13 @@ mod tests {
         assert!(matches!(err, Error::InvalidStoragePath(_)));
 
         let err = ResolvedStoragePaths::resolve(
-            ".",
-            ".",
+            Path::new("."),
+            Path::new("."),
             "catalog.mtb",
-            ".",
+            Path::new("."),
             "redo.log",
             1,
-            "../data.bin",
+            Path::new("../data.bin"),
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidStoragePath(_)));
@@ -343,15 +366,14 @@ mod tests {
     #[test]
     fn test_marker_rejects_durable_layout_change() {
         let root = TempDir::new().unwrap();
-        let path = root.path().to_string_lossy().to_string();
         let initial = ResolvedStoragePaths::resolve(
-            &path,
-            ".",
+            root.path(),
+            Path::new("."),
             "catalog.mtb",
-            ".",
+            Path::new("."),
             "redo.log",
             1,
-            "data.bin",
+            Path::new("data.bin"),
         )
         .unwrap();
         initial.ensure_directories().unwrap();
@@ -359,13 +381,13 @@ mod tests {
         initial.persist_marker_if_missing().unwrap();
 
         let changed = ResolvedStoragePaths::resolve(
-            &path,
-            "data",
+            root.path(),
+            Path::new("data"),
             "catalog.mtb",
-            ".",
+            Path::new("."),
             "redo.log",
             1,
-            "data.bin",
+            Path::new("data.bin"),
         )
         .unwrap();
         changed.ensure_directories().unwrap();

@@ -1330,7 +1330,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
             let table_file = fs.create_table_file(111, make_metadata(), false).unwrap();
@@ -1380,7 +1380,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
             let table_file = fs.create_table_file(101, make_metadata(), false).unwrap();
@@ -1424,7 +1424,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
             let table_file = fs.create_table_file(102, make_metadata(), false).unwrap();
@@ -1466,7 +1466,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
             let table_file = fs.create_table_file(107, make_metadata(), false).unwrap();
@@ -1517,7 +1517,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
             let table_file = fs.create_table_file(108, make_metadata(), false).unwrap();
@@ -1568,7 +1568,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
             let table_file = fs.create_table_file(109, make_metadata(), false).unwrap();
@@ -1619,7 +1619,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
             let table_file = fs.create_table_file(103, make_metadata(), false).unwrap();
@@ -1685,7 +1685,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let fs = StaticLifetime::new_static(
                 TableFileSystemConfig::default()
-                    .data_dir(temp_dir.path().to_string_lossy().to_string())
+                    .data_dir(temp_dir.path())
                     .build()
                     .unwrap(),
             );
@@ -1724,7 +1724,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
             let table_file = fs.create_table_file(104, make_metadata(), false).unwrap();

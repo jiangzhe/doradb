@@ -861,7 +861,7 @@ mod tests {
             const SIZE: i32 = 100;
 
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .trx(
@@ -930,7 +930,7 @@ mod tests {
             const SIZE: i32 = 1000;
 
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let log_file_stem = String::from("redo_merger");
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
@@ -991,7 +991,7 @@ mod tests {
 
             // after the first engine is done, we reopen log files to test log merger.
             let trx_sys_config = TrxSysConfig::default()
-                .log_dir(temp_dir.path().to_string_lossy().to_string())
+                .log_dir(temp_dir.path())
                 .log_file_stem(log_file_stem)
                 .log_partitions(2)
                 .skip_recovery(true);
@@ -1014,7 +1014,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let config = TrxSysConfig::default()
-                .log_dir(temp_dir.path().to_string_lossy().to_string())
+                .log_dir(temp_dir.path())
                 .log_file_stem("redo_no_wait")
                 .skip_recovery(true);
             let initializer = config.log_partition_initializer(0).unwrap();

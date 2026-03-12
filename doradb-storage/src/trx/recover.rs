@@ -572,7 +572,7 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
-    fn corrupt_page_checksum(path: &str, page_id: u64) {
+    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -592,7 +592,7 @@ mod tests {
     fn test_log_recover_empty() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
@@ -617,7 +617,7 @@ mod tests {
     fn test_log_recover_ddl() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
                 .data_buffer(
@@ -696,7 +696,7 @@ mod tests {
             const DEL_STEP: usize = 13;
 
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
                 .data_buffer(
@@ -817,7 +817,7 @@ mod tests {
     fn test_log_recover_bootstraps_catalog_from_checkpoint() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
                 .data_buffer(
@@ -886,7 +886,7 @@ mod tests {
     fn test_log_recover_skips_pre_checkpoint_table_redo_and_rebuilds_persisted_index() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
                 .data_buffer(
@@ -992,7 +992,7 @@ mod tests {
     fn test_log_recover_replays_post_checkpoint_heap_redo_after_bootstrap() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
                 .data_buffer(
@@ -1121,7 +1121,7 @@ mod tests {
     fn test_log_recover_handles_mixed_user_table_checkpoint_states() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
                 .data_buffer(
@@ -1314,7 +1314,7 @@ mod tests {
     fn test_log_recover_fails_on_corrupted_persisted_lwc_page() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
                 .data_buffer(
@@ -1390,10 +1390,10 @@ mod tests {
             drop(engine);
 
             let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path().to_string_lossy().to_string())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
-            corrupt_page_checksum(&fs.table_file_path(table_id), entry.payload.block_id);
+            corrupt_page_checksum(fs.table_file_path(table_id), entry.payload.block_id);
 
             let err = match EngineConfig::default()
                 .storage_root(main_dir)
