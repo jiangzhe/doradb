@@ -15,7 +15,7 @@ use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, Pre
 use crossbeam_utils::CachePadded;
 use event_listener::EventListener;
 use flume::{Receiver, Sender};
-use glob::glob;
+use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -811,7 +811,7 @@ pub(super) fn create_log_file(
 
 #[inline]
 pub fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<PathBuf>> {
-    let pattern = format!("{file_prefix}.{log_no}.*");
+    let pattern = format!("{}.{log_no}.*", Pattern::escape(file_prefix));
     let mut res = vec![];
     for entry in glob(&pattern).unwrap() {
         res.push(entry?);
@@ -852,8 +852,35 @@ mod tests {
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::sys_trx::SysTrx;
     use crate::value::Val;
+    use std::fs::{self, File};
     use std::sync::atomic::AtomicU64;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_list_log_files_escapes_directory_metacharacters() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("redo[dir]");
+        fs::create_dir(&log_dir).unwrap();
+
+        let file_prefix = log_dir.join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        let expected = [
+            PathBuf::from(format!("{file_prefix}.0.00000000")),
+            PathBuf::from(format!("{file_prefix}.0.00000001")),
+            PathBuf::from(format!("{file_prefix}.0.0000000a")),
+        ];
+        for path in &expected {
+            File::create(path).unwrap();
+        }
+        File::create(format!("{file_prefix}.1.00000000")).unwrap();
+        File::create(log_dir.join("redo.logx.0.00000000")).unwrap();
+
+        let asc = list_log_files(file_prefix, 0, false).unwrap();
+        assert_eq!(expected.to_vec(), asc);
+
+        let desc = list_log_files(file_prefix, 0, true).unwrap();
+        assert_eq!(expected.iter().rev().cloned().collect::<Vec<_>>(), desc);
+    }
 
     #[test]
     fn test_mmap_log_reader() {
