@@ -572,7 +572,7 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
-    fn corrupt_page_checksum(path: &str, page_id: u64) {
+    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -592,9 +592,9 @@ mod tests {
     fn test_log_recover_empty() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -602,7 +602,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover1")
+                        .log_file_stem("recover1")
                         .skip_recovery(false),
                 )
                 .build()
@@ -617,9 +617,9 @@ mod tests {
     fn test_log_recover_ddl() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -627,7 +627,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover2")
+                        .log_file_stem("recover2")
                         .skip_recovery(false),
                 )
                 .build()
@@ -664,7 +664,7 @@ mod tests {
 
             // second recovery.
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -672,7 +672,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover2")
+                        .log_file_stem("recover2")
                         .skip_recovery(false),
                 )
                 .build()
@@ -696,9 +696,9 @@ mod tests {
             const DEL_STEP: usize = 13;
 
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -706,7 +706,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover3")
+                        .log_file_stem("recover3")
                         .skip_recovery(false),
                 )
                 .build()
@@ -782,7 +782,7 @@ mod tests {
 
             // second recovery.
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -790,7 +790,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover3")
+                        .log_file_stem("recover3")
                         .skip_recovery(false),
                 )
                 .build()
@@ -817,9 +817,9 @@ mod tests {
     fn test_log_recover_bootstraps_catalog_from_checkpoint() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -827,7 +827,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover4")
+                        .log_file_stem("recover4")
                         .skip_recovery(false),
                 )
                 .build()
@@ -862,7 +862,7 @@ mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -870,7 +870,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover4")
+                        .log_file_stem("recover4")
                         .skip_recovery(false),
                 )
                 .build()
@@ -886,9 +886,9 @@ mod tests {
     fn test_log_recover_skips_pre_checkpoint_table_redo_and_rebuilds_persisted_index() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -896,7 +896,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover5")
+                        .log_file_stem("recover5")
                         .skip_recovery(false),
                 )
                 .build()
@@ -956,7 +956,7 @@ mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -964,7 +964,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover5")
+                        .log_file_stem("recover5")
                         .skip_recovery(false),
                 )
                 .build()
@@ -992,9 +992,9 @@ mod tests {
     fn test_log_recover_replays_post_checkpoint_heap_redo_after_bootstrap() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1002,7 +1002,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover6")
+                        .log_file_stem("recover6")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1073,7 +1073,7 @@ mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1081,7 +1081,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover6")
+                        .log_file_stem("recover6")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1121,9 +1121,9 @@ mod tests {
     fn test_log_recover_handles_mixed_user_table_checkpoint_states() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1131,7 +1131,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover7")
+                        .log_file_stem("recover7")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1250,7 +1250,7 @@ mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1258,7 +1258,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover7")
+                        .log_file_stem("recover7")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1314,9 +1314,9 @@ mod tests {
     fn test_log_recover_fails_on_corrupted_persisted_lwc_page() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1324,7 +1324,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover8")
+                        .log_file_stem("recover8")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1390,13 +1390,13 @@ mod tests {
             drop(engine);
 
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(temp_dir.path())
+                .data_dir(temp_dir.path())
                 .build()
                 .unwrap();
-            corrupt_page_checksum(&fs.table_file_path(table_id), entry.payload.block_id);
+            corrupt_page_checksum(fs.table_file_path(table_id), entry.payload.block_id);
 
             let err = match EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1404,7 +1404,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover8")
+                        .log_file_stem("recover8")
                         .skip_recovery(false),
                 )
                 .build()

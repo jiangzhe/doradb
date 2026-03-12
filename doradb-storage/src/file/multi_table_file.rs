@@ -554,7 +554,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let path = fs.catalog_mtb_file_path();
@@ -596,7 +596,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
@@ -628,7 +628,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let path = fs.catalog_mtb_file_path();
@@ -653,7 +653,7 @@ mod tests {
             file.sync_all().unwrap();
 
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let res = fs.open_or_create_multi_table_file().await;
@@ -666,7 +666,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let path = fs.catalog_mtb_file_path();
@@ -691,7 +691,7 @@ mod tests {
             file.sync_all().unwrap();
 
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let err = match fs.open_or_create_multi_table_file().await {
@@ -711,7 +711,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let path = fs.catalog_mtb_file_path();
@@ -725,7 +725,7 @@ mod tests {
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let err = match fs.open_or_create_multi_table_file().await {
@@ -745,7 +745,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let path = fs.catalog_mtb_file_path();
@@ -777,7 +777,7 @@ mod tests {
             overwrite_file_bytes(&path, version_offset, &2u64.to_le_bytes());
 
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
@@ -795,7 +795,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let path = fs.catalog_mtb_file_path();
@@ -850,7 +850,7 @@ mod tests {
             );
 
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let err = match fs.open_or_create_multi_table_file().await {
@@ -871,7 +871,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
@@ -886,7 +886,7 @@ mod tests {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(dir.path())
+                .data_dir(dir.path())
                 .build()
                 .unwrap();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();

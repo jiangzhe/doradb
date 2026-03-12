@@ -626,9 +626,9 @@ mod tests {
     fn test_purge_promote_delete_marker_if_committed_for_delete_without_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -637,7 +637,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge_promote")
+                        .log_file_stem("redo_purge_promote")
                         .skip_recovery(true),
                 )
                 .build()
@@ -704,9 +704,9 @@ mod tests {
     fn test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_without_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -715,7 +715,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge_no_promote")
+                        .log_file_stem("redo_purge_no_promote")
                         .skip_recovery(true),
                 )
                 .build()
@@ -786,9 +786,9 @@ mod tests {
     fn test_purge_promote_delete_marker_if_committed_for_delete_with_missing_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -797,7 +797,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge_promote_missing_page")
+                        .log_file_stem("redo_purge_promote_missing_page")
                         .skip_recovery(true),
                 )
                 .build()
@@ -876,9 +876,9 @@ mod tests {
     fn test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_with_missing_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -887,7 +887,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge_no_promote_missing_page")
+                        .log_file_stem("redo_purge_no_promote_missing_page")
                         .skip_recovery(true),
                 )
                 .build()
@@ -973,9 +973,9 @@ mod tests {
         const PURGE_SIZE: usize = 100;
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -984,7 +984,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge")
+                        .log_file_stem("redo_purge")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1057,9 +1057,9 @@ mod tests {
         smol::block_on(async {
             const PURGE_SIZE: usize = 100;
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1068,7 +1068,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(2)
-                        .log_file_prefix("redo_purge")
+                        .log_file_stem("redo_purge")
                         .skip_recovery(true),
                 )
                 .build()

@@ -991,9 +991,9 @@ mod tests {
     fn test_row_block_index_free_list_shared() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1001,7 +1001,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_row_blk_idx")
+                        .log_file_stem("redo_row_blk_idx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1031,9 +1031,9 @@ mod tests {
     fn test_row_block_index_free_list_exclusive() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1041,7 +1041,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_row_blk_idx")
+                        .log_file_stem("redo_row_blk_idx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1070,11 +1070,11 @@ mod tests {
     fn test_row_block_index_cursor_shared() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let row_pages = 1024usize;
             // 1024 row pages ~= 64MB.
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(100usize * 1024 * 1024)
@@ -1082,7 +1082,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_row_blk_idx")
+                        .log_file_stem("redo_row_blk_idx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1257,9 +1257,9 @@ mod tests {
     fn test_row_block_index_enable_page_committer() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1267,7 +1267,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_row_blk_idx")
+                        .log_file_stem("redo_row_blk_idx")
                         .skip_recovery(true),
                 )
                 .build()

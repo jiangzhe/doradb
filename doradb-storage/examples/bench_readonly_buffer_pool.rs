@@ -54,7 +54,7 @@ fn main() {
     smol::block_on(async move {
         let temp_dir = TempDir::new().unwrap();
         let fs = TableFileSystemConfig::default()
-            .with_main_dir(temp_dir.path())
+            .data_dir(temp_dir.path())
             .build()
             .unwrap();
         let table_file = fs.create_table_file(901, make_metadata(), false).unwrap();

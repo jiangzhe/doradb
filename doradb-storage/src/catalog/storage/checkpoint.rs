@@ -606,12 +606,12 @@ mod tests {
     fn test_catalog_checkpoint_collect_index_entries_uses_readonly_cache() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-checkpoint-readonly-cache")
+                        .log_file_stem("catalog-checkpoint-readonly-cache")
                         .skip_recovery(false),
                 )
                 .build()
@@ -659,12 +659,12 @@ mod tests {
     fn test_catalog_checkpoint_tail_merge_rewrites_last_payload_without_new_entry() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-checkpoint-tail-merge")
+                        .log_file_stem("catalog-checkpoint-tail-merge")
                         .skip_recovery(false),
                 )
                 .build()

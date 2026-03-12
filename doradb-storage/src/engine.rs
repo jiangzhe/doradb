@@ -10,11 +10,13 @@ use crate::error::Result;
 use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
 use crate::lifetime::StaticLifetime;
 use crate::session::Session;
+use crate::storage_path::ResolvedStoragePaths;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::sys_conf::TrxSysConfig;
 use byte_unit::Byte;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Storage engine of DoraDB.
@@ -109,7 +111,7 @@ const DEFAULT_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
-    main_dir: String,
+    storage_root: PathBuf,
     trx: TrxSysConfig,
     meta_buffer: Byte,
     index_buffer: Byte,
@@ -121,7 +123,7 @@ impl Default for EngineConfig {
     #[inline]
     fn default() -> Self {
         EngineConfig {
-            main_dir: String::from("."),
+            storage_root: PathBuf::from("."),
             trx: TrxSysConfig::default(),
             meta_buffer: Byte::from_u64(DEFAULT_META_BUFFER as u64),
             index_buffer: Byte::from_u64(DEFAULT_INDEX_BUFFER as u64),
@@ -133,8 +135,8 @@ impl Default for EngineConfig {
 
 impl EngineConfig {
     #[inline]
-    pub fn main_dir(mut self, main_dir: impl Into<String>) -> Self {
-        self.main_dir = main_dir.into();
+    pub fn storage_root(mut self, storage_root: impl Into<PathBuf>) -> Self {
+        self.storage_root = storage_root.into();
         self
     }
 
@@ -170,10 +172,20 @@ impl EngineConfig {
 
     #[inline]
     pub async fn build(self) -> Result<Engine> {
-        std::fs::create_dir_all(&self.main_dir)?;
-        let file = self.file.with_main_dir(&self.main_dir);
+        let resolved = ResolvedStoragePaths::resolve(
+            &self.storage_root,
+            &self.file.data_dir,
+            &self.file.catalog_file_name,
+            self.trx.log_dir_ref(),
+            self.trx.log_file_stem_ref(),
+            self.trx.log_partitions,
+            self.data_buffer.data_swap_file_ref(),
+        )?;
+        resolved.validate_marker_if_present()?;
+        resolved.ensure_directories()?;
+
+        let file = self.file.data_dir(resolved.data_dir_path());
         let readonly_buffer_size = file.readonly_buffer_size;
-        std::fs::create_dir_all(&file.base_dir)?;
         let table_fs = file.build()?;
         let table_fs = StaticLifetime::new_static(table_fs);
         // todo: avoid resource leak when errors occur.
@@ -181,14 +193,19 @@ impl EngineConfig {
         // todo: implement index pool
         let index_pool =
             FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
-        let mem_pool = self.data_buffer.with_main_dir(&self.main_dir).build()?;
+        let mem_pool = self
+            .data_buffer
+            .data_swap_file(resolved.data_swap_file_path())
+            .build()?;
         let mem_pool = StaticLifetime::new_static(mem_pool);
         let disk_pool = GlobalReadonlyBufferPool::with_capacity_static(readonly_buffer_size)?;
-        let trx_sys = self
+        let pending_trx_sys = self
             .trx
-            .with_main_dir(&self.main_dir)
-            .build_static(meta_pool, index_pool, mem_pool, table_fs, disk_pool)
+            .log_dir(resolved.log_dir_path())
+            .prepare_static(meta_pool, index_pool, mem_pool, table_fs, disk_pool)
             .await?;
+        resolved.persist_marker_if_missing()?;
+        let trx_sys = pending_trx_sys.start().await;
         Ok(Engine(Arc::new(EngineInner {
             trx_sys,
             meta_pool,
@@ -203,12 +220,154 @@ impl EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
+    use crate::storage_path::STORAGE_LAYOUT_FILE_NAME;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
+
+    fn test_engine_config_for(root: &std::path::Path) -> EngineConfig {
+        EngineConfig::default()
+            .storage_root(root)
+            .meta_buffer(TEST_POOL_BYTES)
+            .index_buffer(TEST_POOL_BYTES)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(TEST_POOL_BYTES)
+                    .max_file_size(128usize * 1024 * 1024),
+            )
+            .file(TableFileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
+            .trx(TrxSysConfig::default().skip_recovery(false))
+    }
 
     #[test]
     fn test_engine_config() {
         let config = EngineConfig::default();
-        println!("{:?}", config);
         let config_str = toml::to_string(&config).unwrap();
-        println!("{}", config_str);
+        assert!(config_str.contains("storage_root"));
+        assert!(config_str.contains("data_swap_file"));
+        assert!(config_str.contains("log_dir"));
+        assert!(config_str.contains("log_file_stem"));
+    }
+
+    #[test]
+    fn test_storage_layout_marker_allows_data_swap_change() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            drop(engine);
+
+            let engine = test_engine_config_for(root.path())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024)
+                        .data_swap_file("alt-data.bin"),
+                )
+                .build()
+                .await
+                .unwrap();
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_storage_layout_marker_rejects_data_dir_change() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            drop(engine);
+
+            let err = match test_engine_config_for(root.path())
+                .file(TableFileSystemConfig::default().data_dir("data"))
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected storage layout mismatch"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageLayoutMismatch(_)));
+        });
+    }
+
+    #[test]
+    fn test_storage_layout_mismatch_does_not_create_new_directories() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            drop(engine);
+
+            let new_data_dir = root.path().join("other-data");
+            assert!(!new_data_dir.exists());
+
+            let err = match test_engine_config_for(root.path())
+                .file(TableFileSystemConfig::default().data_dir("other-data"))
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected storage layout mismatch"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageLayoutMismatch(_)));
+            assert!(!new_data_dir.exists());
+        });
+    }
+
+    #[test]
+    fn test_storage_layout_marker_allows_storage_root_relocation() {
+        smol::block_on(async {
+            let parent = TempDir::new().unwrap();
+            let root_a = parent.path().join("root-a");
+            let root_b = parent.path().join("root-b");
+
+            let engine = test_engine_config_for(&root_a).build().await.unwrap();
+            drop(engine);
+
+            fs::rename(&root_a, &root_b).unwrap();
+
+            let engine = test_engine_config_for(&root_b).build().await.unwrap();
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_failed_startup_does_not_persist_storage_layout_marker() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let marker_path = root.path().join(STORAGE_LAYOUT_FILE_NAME);
+
+            let err = match EngineConfig::default()
+                .storage_root(root.path())
+                .meta_buffer(TEST_POOL_BYTES)
+                .index_buffer(TEST_POOL_BYTES)
+                .file(TableFileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(1024usize * 1024)
+                        .max_file_size(2usize * 1024 * 1024),
+                )
+                .trx(TrxSysConfig::default().skip_recovery(false))
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected startup failure"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::BufferPoolSizeTooSmall));
+            assert!(!marker_path.exists());
+
+            let engine = test_engine_config_for(root.path())
+                .file(
+                    TableFileSystemConfig::default()
+                        .data_dir("data")
+                        .readonly_buffer_size(TEST_POOL_BYTES),
+                )
+                .build()
+                .await
+                .unwrap();
+            drop(engine);
+            assert!(marker_path.exists());
+        });
     }
 }

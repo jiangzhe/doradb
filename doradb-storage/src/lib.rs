@@ -21,6 +21,7 @@ pub mod row;
 pub mod serde;
 pub mod session;
 pub mod stmt;
+mod storage_path;
 pub mod table;
 pub mod thread;
 pub mod trx;

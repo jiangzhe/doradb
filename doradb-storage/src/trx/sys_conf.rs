@@ -5,19 +5,23 @@ use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
 use crate::io::{AIOContext, align_to_sector_size};
 use crate::lifetime::StaticLifetime;
+use crate::storage_path::{path_to_utf8, validate_log_file_stem};
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
+use crate::trx::purge::{GC, Purge};
 use crate::trx::recover::log_recover;
 use crate::trx::sys::TransactionSystem;
 use byte_unit::Byte;
+use flume::Receiver;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::log::list_log_files;
 
 pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
 pub const DEFAULT_LOG_IO_MAX_SIZE: Byte = Byte::from_u64(8192);
-pub const DEFAULT_LOG_FILE_PREFIX: &str = "redo.log";
+pub const DEFAULT_LOG_DIR: &str = ".";
+pub const DEFAULT_LOG_FILE_STEM: &str = "redo.log";
 pub const DEFAULT_LOG_PARTITIONS: usize = 1;
 pub const MAX_LOG_PARTITIONS: usize = 99; // big enough for log partitions, so fix two digits in file name.
 pub const DEFAULT_LOG_FILE_MAX_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // 1GB, sparse file will not occupy space until actual write.
@@ -34,11 +38,12 @@ pub struct TrxSysConfig {
     // If single transaction has very large redo log. It is kept
     // what it is and send to AIO manager as one IO request.
     pub max_io_size: Byte,
-    // Prefix of log file.
+    // Directory where redo log files live.
+    pub log_dir: PathBuf,
+    // Base file name of one redo log family.
     // the complete file name pattern is:
-    // <file-prefix>.<partition_idx>.<file-sequence>
-    // e.g. redo.log.0.00000001
-    pub log_file_prefix: String,
+    // <log-dir>/<log-file-stem>.<partition_idx>.<file-sequence>
+    pub log_file_stem: String,
     // Log partition number.
     pub log_partitions: usize,
     // Controls the maximum size of each log file.
@@ -56,15 +61,29 @@ pub struct TrxSysConfig {
     pub skip_recovery: bool,
 }
 
-impl TrxSysConfig {
-    #[inline]
-    pub fn with_main_dir(mut self, main_dir: impl AsRef<Path>) -> Self {
-        let path = main_dir.as_ref().join(&self.log_file_prefix);
-        self.log_file_prefix = path.to_string_lossy().to_string();
-        self
-    }
+pub(crate) struct PendingTransactionSystem {
+    trx_sys: &'static TransactionSystem,
+    gc_rxs: Vec<Receiver<GC>>,
+    purge_rx: Receiver<Purge>,
+    mem_pool: &'static EvictableBufferPool,
+}
 
-    /// How many commits can be issued concurrently.
+impl PendingTransactionSystem {
+    #[inline]
+    pub(crate) async fn start(self) -> &'static TransactionSystem {
+        self.trx_sys
+            .catalog
+            .enable_page_committer_for_tables(self.trx_sys)
+            .await;
+        self.trx_sys.start_io_threads();
+        self.trx_sys.start_gc_threads(self.gc_rxs);
+        self.trx_sys
+            .start_purge_threads(self.mem_pool, self.purge_rx);
+        self.trx_sys
+    }
+}
+
+impl TrxSysConfig {
     #[inline]
     pub fn io_depth_per_log(mut self, io_depth_per_log: usize) -> Self {
         self.io_depth_per_log = io_depth_per_log;
@@ -89,10 +108,17 @@ impl TrxSysConfig {
         self
     }
 
-    /// Log file name.
+    /// Redo log directory.
     #[inline]
-    pub fn log_file_prefix(mut self, log_file_prefix: impl Into<String>) -> Self {
-        self.log_file_prefix = log_file_prefix.into();
+    pub fn log_dir(mut self, log_dir: impl Into<PathBuf>) -> Self {
+        self.log_dir = log_dir.into();
+        self
+    }
+
+    /// Redo log base file name.
+    #[inline]
+    pub fn log_file_stem(mut self, log_file_stem: impl Into<String>) -> Self {
+        self.log_file_stem = log_file_stem.into();
         self
     }
 
@@ -131,13 +157,15 @@ impl TrxSysConfig {
 
     #[inline]
     pub fn log_partition_initializer(&self, log_no: usize) -> Result<LogPartitionInitializer> {
+        debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let ctx = AIOContext::new(self.io_depth_per_log)?;
+        let file_prefix = self.file_prefix()?;
 
         // determine whether we should recovery from previous logs.
         let mode = if self.skip_recovery {
             LogPartitionMode::Done
         } else {
-            let logs = list_log_files(&self.log_file_prefix, log_no, false)?;
+            let logs = list_log_files(&file_prefix, log_no, false)?;
             if logs.is_empty() {
                 LogPartitionMode::Done
             } else {
@@ -147,7 +175,7 @@ impl TrxSysConfig {
         Ok(LogPartitionInitializer {
             ctx,
             mode,
-            file_prefix: self.log_file_prefix.clone(),
+            file_prefix,
             file_max_size: self.log_file_max_size.as_u64() as usize,
             page_size: self.max_io_size.as_u64() as usize,
             file_header_size: self.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
@@ -155,6 +183,22 @@ impl TrxSysConfig {
             log_no,
             file_seq: None,
         })
+    }
+
+    #[inline]
+    pub(crate) fn log_dir_ref(&self) -> &Path {
+        &self.log_dir
+    }
+
+    #[inline]
+    pub(crate) fn log_file_stem_ref(&self) -> &str {
+        &self.log_file_stem
+    }
+
+    #[inline]
+    pub(crate) fn file_prefix(&self) -> Result<String> {
+        let file_prefix = self.log_dir.join(&self.log_file_stem);
+        Ok(path_to_utf8(&file_prefix, "redo log path")?.to_owned())
     }
 
     pub async fn build_static(
@@ -165,6 +209,20 @@ impl TrxSysConfig {
         table_fs: &'static TableFileSystem,
         global_disk_pool: &'static GlobalReadonlyBufferPool,
     ) -> Result<&'static TransactionSystem> {
+        let pending = self
+            .prepare_static(meta_pool, index_pool, mem_pool, table_fs, global_disk_pool)
+            .await?;
+        Ok(pending.start().await)
+    }
+
+    pub(crate) async fn prepare_static(
+        self,
+        meta_pool: &'static FixedBufferPool,
+        index_pool: &'static FixedBufferPool,
+        mem_pool: &'static EvictableBufferPool,
+        table_fs: &'static TableFileSystem,
+        global_disk_pool: &'static GlobalReadonlyBufferPool,
+    ) -> Result<PendingTransactionSystem> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
             let initializer = self.log_partition_initializer(idx)?;
@@ -191,16 +249,12 @@ impl TrxSysConfig {
         let (purge_chan, purge_rx) = flume::unbounded();
         let trx_sys = TransactionSystem::new(self, catalog, log_partitions, purge_chan);
         let trx_sys = StaticLifetime::new_static(trx_sys);
-
-        trx_sys
-            .catalog
-            .enable_page_committer_for_tables(trx_sys)
-            .await;
-        trx_sys.start_io_threads();
-        trx_sys.start_gc_threads(gc_rxs);
-        trx_sys.start_purge_threads(mem_pool, purge_rx);
-
-        Ok(trx_sys)
+        Ok(PendingTransactionSystem {
+            trx_sys,
+            gc_rxs,
+            purge_rx,
+            mem_pool,
+        })
     }
 }
 
@@ -210,7 +264,8 @@ impl Default for TrxSysConfig {
         TrxSysConfig {
             io_depth_per_log: DEFAULT_LOG_IO_DEPTH,
             max_io_size: DEFAULT_LOG_IO_MAX_SIZE,
-            log_file_prefix: String::from(DEFAULT_LOG_FILE_PREFIX),
+            log_dir: PathBuf::from(DEFAULT_LOG_DIR),
+            log_file_stem: String::from(DEFAULT_LOG_FILE_STEM),
             log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,
             log_partitions: DEFAULT_LOG_PARTITIONS,
             log_sync: DEFAULT_LOG_SYNC,

@@ -302,11 +302,11 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let entry = index.find_entry(row_id).await.unwrap().unwrap();
 
         let fs = TableFileSystemConfig::default()
-            .with_main_dir(sys._temp_dir.path())
+            .data_dir(sys._temp_dir.path())
             .build()
             .unwrap();
         corrupt_page_checksum(
-            &fs.table_file_path(sys.table.table_id()),
+            fs.table_file_path(sys.table.table_id()),
             entry.payload.block_id,
         );
 
@@ -1604,9 +1604,9 @@ impl TestSys {
         use crate::catalog::tests::table2;
         // 64KB * 16
         let temp_dir = TempDir::new().unwrap();
-        let main_dir = temp_dir.path().to_string_lossy().to_string();
+        let main_dir = temp_dir.path().to_path_buf();
         let engine = EngineConfig::default()
-            .main_dir(main_dir)
+            .storage_root(main_dir)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(64u64 * 1024 * 1024)
@@ -1614,7 +1614,7 @@ impl TestSys {
             )
             .trx(
                 TrxSysConfig::default()
-                    .log_file_prefix("redo_testsys")
+                    .log_file_stem("redo_testsys")
                     .skip_recovery(true),
             )
             .file(
@@ -1782,7 +1782,7 @@ fn decode_offloaded_deltas(bytes: &[u8]) -> Vec<u32> {
     deltas
 }
 
-fn corrupt_page_checksum(path: &str, page_id: u64) {
+fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)

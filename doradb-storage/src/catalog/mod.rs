@@ -90,9 +90,10 @@ impl Catalog {
     /// # Panics
     ///
     /// Panics if another checkpoint is already in progress on the same
-    /// `CatalogStorage`/`MultiTableFile`. Concurrent checkpoint publishes are
-    /// not supported by design; the underlying [`CowFile`] enforces a single
-    /// mutable writer via an atomic claim and will panic on violation.
+    /// shared `CatalogStorage`/`MultiTableFile`. Concurrent checkpoint
+    /// publishes are not supported by design; the underlying
+    /// [`crate::file::cow_file::CowFile`] enforces a single mutable writer via
+    /// an atomic claim and will panic on violation.
     #[inline]
     pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let batch = self.scan_checkpoint_batch(trx_sys)?;
@@ -105,7 +106,8 @@ impl Catalog {
     /// using the global persisted watermark across all log partitions.
     ///
     /// Scanned batches are intended for single-flight publish flow and must not
-    /// be raced with other catalog checkpoint publishes on the same `Catalog`.
+    /// be raced with other catalog checkpoint publishes against the same shared
+    /// `CatalogStorage`/`MultiTableFile` writer.
     pub fn scan_checkpoint_batch(
         &self,
         trx_sys: &TransactionSystem,
@@ -124,10 +126,11 @@ impl Catalog {
     ///
     /// # Panics
     ///
-    /// Panics if another mutable writer is already active on `catalog.mtb`.
-    /// Only one checkpoint publish may be in flight at a time per `Catalog`
-    /// instance; callers are responsible for ensuring mutual exclusion at a
-    /// higher level (e.g., a single background checkpoint task).
+    /// Panics if another mutable writer is already active on the shared
+    /// `catalog.mtb` `MultiTableFile`. Only one checkpoint publish may be in
+    /// flight at a time per shared `CatalogStorage`/`MultiTableFile`; callers
+    /// are responsible for ensuring mutual exclusion at a higher level (e.g.,
+    /// a single background checkpoint task).
     #[inline]
     pub async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
         self.storage
@@ -627,7 +630,7 @@ pub mod tests {
         table_id
     }
 
-    fn corrupt_page_checksum(path: &str, page_id: u64) {
+    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -655,9 +658,9 @@ pub mod tests {
     fn test_bootstrap_creates_catalog_mtb_without_catalog_tbl_files() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .trx(TrxSysConfig::default().skip_recovery(true))
                 .build()
                 .await
@@ -676,13 +679,13 @@ pub mod tests {
     fn test_next_user_obj_id_monotonic_across_restart() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-allocator")
+                        .log_file_stem("catalog-allocator")
                         .skip_recovery(false),
                 )
                 .build()
@@ -727,10 +730,10 @@ pub mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-allocator")
+                        .log_file_stem("catalog-allocator")
                         .skip_recovery(false),
                 )
                 .build()
@@ -748,13 +751,13 @@ pub mod tests {
     fn test_catalog_checkpoint_now_publish_and_noop() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-checkpoint-now")
+                        .log_file_stem("catalog-checkpoint-now")
                         .skip_recovery(false),
                 )
                 .build()
@@ -813,13 +816,13 @@ pub mod tests {
     fn test_catalog_bootstrap_fails_on_corrupted_checkpoint_lwc_page() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-checkpoint-corrupt-bootstrap")
+                        .log_file_stem("catalog-checkpoint-corrupt-bootstrap")
                         .skip_recovery(false),
                 )
                 .build()
@@ -856,13 +859,13 @@ pub mod tests {
                 .expect("catalog checkpoint should publish at least one LWC page");
             drop(engine);
 
-            corrupt_page_checksum(&format!("{}/catalog.mtb", main_dir), entry.payload.block_id);
+            corrupt_page_checksum(main_dir.join("catalog.mtb"), entry.payload.block_id);
 
             let err = match EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-checkpoint-corrupt-bootstrap")
+                        .log_file_stem("catalog-checkpoint-corrupt-bootstrap")
                         .skip_recovery(false),
                 )
                 .build()
@@ -887,13 +890,13 @@ pub mod tests {
     fn test_catalog_checkpoint_now_heartbeat_without_catalog_ops() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-checkpoint-heartbeat")
+                        .log_file_stem("catalog-checkpoint-heartbeat")
                         .skip_recovery(false),
                 )
                 .build()
@@ -933,13 +936,13 @@ pub mod tests {
     fn test_catalog_checkpoint_scan_apply_full_range() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-checkpoint-batch-full-range")
+                        .log_file_stem("catalog-checkpoint-batch-full-range")
                         .skip_recovery(false),
                 )
                 .build()
@@ -987,13 +990,13 @@ pub mod tests {
     fn test_catalog_checkpoint_now_heartbeat_with_mixed_user_table_checkpoint_states() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_string_lossy().to_string();
+            let main_dir = temp_dir.path().to_path_buf();
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-checkpoint-mixed-user-states")
+                        .log_file_stem("catalog-checkpoint-mixed-user-states")
                         .skip_recovery(false),
                 )
                 .build()
