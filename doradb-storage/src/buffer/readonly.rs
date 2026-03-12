@@ -1309,6 +1309,10 @@ mod tests {
         Error(Error),
     }
 
+    // Test-only page source that lets readonly miss-load tests control both
+    // outcome and timing. Tests use `wait_started()` to observe that the miss
+    // load has submitted into the shared inflight path, then cancel or attach
+    // other waiters before calling `release()` to let the read complete.
     struct ControlledPageSource {
         outcome: ControlledReadOutcome,
         calls: AtomicUsize,
@@ -1342,11 +1346,16 @@ mod tests {
             self.calls.load(Ordering::SeqCst)
         }
 
+        // Unblocks the in-flight read so the test can deterministically decide
+        // when the mock IO completes.
         fn release(&self) {
             self.released.store(true, Ordering::SeqCst);
             self.release_ev.notify(usize::MAX);
         }
 
+        // Waits until the mock source has observed the requested number of read
+        // attempts. Tests use this to synchronize on "IO started" before
+        // canceling the initiating future or attaching followers.
         async fn wait_started(&self, expected_calls: usize) {
             loop {
                 if self.call_count() >= expected_calls {
@@ -1370,6 +1379,7 @@ mod tests {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.start_ev.notify(usize::MAX);
+                // Keep the read artificially in-flight until the test releases it.
                 loop {
                     if self.released.load(Ordering::SeqCst) {
                         break;
