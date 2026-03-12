@@ -333,11 +333,11 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(EvictableBufferPoolConfig::default())
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_secidx1")
+                        .log_file_stem("redo_secidx1")
                         .skip_recovery(true),
                 )
                 .build()
@@ -436,11 +436,11 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(EvictableBufferPoolConfig::default())
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_secidx2")
+                        .log_file_stem("redo_secidx2")
                         .skip_recovery(true),
                 )
                 .build()

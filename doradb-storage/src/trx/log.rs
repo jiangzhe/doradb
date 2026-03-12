@@ -863,10 +863,10 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix(String::from("mmap_log_reader_redo.log"))
+                        .log_file_stem(String::from("mmap_log_reader_redo.log"))
                         .skip_recovery(true),
                 )
                 .data_buffer(
@@ -931,13 +931,12 @@ mod tests {
 
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
-            let log_prefix = temp_dir.path().join("redo_merger");
-            let log_prefix = log_prefix.to_string_lossy().to_string();
+            let log_file_stem = String::from("redo_merger");
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix(log_prefix.clone())
+                        .log_file_stem(log_file_stem.clone())
                         .log_partitions(2)
                         .skip_recovery(true),
                 )
@@ -992,7 +991,8 @@ mod tests {
 
             // after the first engine is done, we reopen log files to test log merger.
             let trx_sys_config = TrxSysConfig::default()
-                .log_file_prefix(log_prefix)
+                .log_dir(temp_dir.path().to_string_lossy().to_string())
+                .log_file_stem(log_file_stem)
                 .log_partitions(2)
                 .skip_recovery(true);
 
@@ -1013,13 +1013,9 @@ mod tests {
     fn test_commit_no_wait_returns_cts() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let log_prefix = temp_dir
-                .path()
-                .join("redo_no_wait")
-                .to_string_lossy()
-                .to_string();
             let config = TrxSysConfig::default()
-                .log_file_prefix(log_prefix)
+                .log_dir(temp_dir.path().to_string_lossy().to_string())
+                .log_file_stem("redo_no_wait")
                 .skip_recovery(true);
             let initializer = config.log_partition_initializer(0).unwrap();
             let (partition, _gc_rx) = initializer.finish().unwrap();

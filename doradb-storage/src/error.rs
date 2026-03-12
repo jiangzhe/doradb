@@ -75,6 +75,10 @@ impl fmt::Display for PersistedPageCorruptionCause {
 pub enum Error {
     #[error("invalid argument")]
     InvalidArgument,
+    #[error("invalid storage path: {0}")]
+    InvalidStoragePath(String),
+    #[error("storage layout mismatch: {0}")]
+    StorageLayoutMismatch(String),
     #[error("internal error")]
     InternalError,
     #[error("invalid state")]

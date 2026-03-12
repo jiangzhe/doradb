@@ -8,8 +8,8 @@ use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
 use crate::io::{AIOClient, AIOContext};
 use crate::lifetime::StaticLifetime;
+use crate::storage_path::validate_catalog_file_name;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -19,7 +19,7 @@ pub struct TableFileSystem {
     io_client: AIOClient<FileIO>,
     handle: Option<JoinHandle<()>>,
     buf_list: FixedSizeBufferFreeList,
-    base_dir: String,
+    data_dir: String,
     // Catalog multi-table file name.
     catalog_file_name: String,
 }
@@ -30,7 +30,7 @@ impl TableFileSystem {
     /// This initializes one async IO context, its event loop thread, and a
     /// shared direct-buffer free list for table and catalog files.
     #[inline]
-    pub fn new(io_depth: usize, base_dir: String, catalog_file_name: String) -> Result<Self> {
+    pub fn new(io_depth: usize, data_dir: String, catalog_file_name: String) -> Result<Self> {
         let ctx = AIOContext::new(io_depth)?;
         let buf_list = FixedSizeBufferFreeList::new(COW_FILE_PAGE_SIZE, io_depth, io_depth * 2);
         let (event_loop, io_client) = ctx.event_loop();
@@ -40,7 +40,7 @@ impl TableFileSystem {
             io_client,
             handle: Some(handle),
             buf_list,
-            base_dir,
+            data_dir,
             catalog_file_name,
         })
     }
@@ -87,16 +87,16 @@ impl TableFileSystem {
     #[inline]
     pub fn table_file_path(&self, table_id: TableID) -> String {
         if table_id >= USER_OBJ_ID_START {
-            format!("{}/{table_id:016x}.tbl", self.base_dir)
+            format!("{}/{table_id:016x}.tbl", self.data_dir)
         } else {
-            format!("{}/{}.tbl", self.base_dir, table_id)
+            format!("{}/{}.tbl", self.data_dir, table_id)
         }
     }
 
     /// Build absolute path for the unified catalog file (`*.mtb`).
     #[inline]
     pub fn catalog_mtb_file_path(&self) -> String {
-        format!("{}/{}", self.base_dir, self.catalog_file_name)
+        format!("{}/{}", self.data_dir, self.catalog_file_name)
     }
 
     /// Open existing catalog multi-table file or create a new one.
@@ -122,7 +122,7 @@ impl Drop for TableFileSystem {
 unsafe impl StaticLifetime for TableFileSystem {}
 
 const DEFAULT_TABLE_FILE_IO_DEPTH: usize = 64;
-const DEFAULT_TABLE_FILE_BASE_DIR: &str = ".";
+const DEFAULT_TABLE_FILE_DATA_DIR: &str = ".";
 const DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 const DEFAULT_CATALOG_FILE_NAME: &str = "catalog.mtb";
 
@@ -130,8 +130,8 @@ const DEFAULT_CATALOG_FILE_NAME: &str = "catalog.mtb";
 pub struct TableFileSystemConfig {
     // IO depth of reading/write table files.
     pub io_depth: usize,
-    // Base directory.
-    pub base_dir: String,
+    // Data directory used for table and catalog files.
+    pub data_dir: String,
     // Global readonly buffer pool size in bytes.
     pub readonly_buffer_size: usize,
     // Catalog multi-table file name.
@@ -139,14 +139,6 @@ pub struct TableFileSystemConfig {
 }
 
 impl TableFileSystemConfig {
-    /// Prefix `base_dir` with a repository/runtime main directory.
-    #[inline]
-    pub fn with_main_dir(mut self, main_dir: impl AsRef<Path>) -> Self {
-        let base_dir = main_dir.as_ref().join(&self.base_dir);
-        self.base_dir = base_dir.to_string_lossy().to_string();
-        self
-    }
-
     /// Set async IO queue depth used by table-file subsystem.
     #[inline]
     pub fn io_depth(mut self, io_depth: usize) -> Self {
@@ -156,8 +148,8 @@ impl TableFileSystemConfig {
 
     /// Set data directory used for table and catalog files.
     #[inline]
-    pub fn data_dir(mut self, base_dir: impl Into<String>) -> Self {
-        self.base_dir = base_dir.into();
+    pub fn data_dir(mut self, data_dir: impl Into<String>) -> Self {
+        self.data_dir = data_dir.into();
         self
     }
 
@@ -168,7 +160,7 @@ impl TableFileSystemConfig {
         self
     }
 
-    /// Set unified catalog file name under `base_dir` (must end with `.mtb`).
+    /// Set unified catalog file name under `data_dir` (must end with `.mtb`).
     #[inline]
     pub fn catalog_file_name(mut self, catalog_file_name: impl Into<String>) -> Self {
         self.catalog_file_name = catalog_file_name.into();
@@ -179,9 +171,12 @@ impl TableFileSystemConfig {
     #[inline]
     pub fn build(self) -> Result<TableFileSystem> {
         if !validate_catalog_file_name(&self.catalog_file_name) {
-            return Err(crate::error::Error::InvalidArgument);
+            return Err(crate::error::Error::InvalidStoragePath(format!(
+                "catalog file name must be a plain `.mtb` file name: {}",
+                self.catalog_file_name
+            )));
         }
-        TableFileSystem::new(self.io_depth, self.base_dir, self.catalog_file_name)
+        TableFileSystem::new(self.io_depth, self.data_dir, self.catalog_file_name)
     }
 }
 
@@ -190,20 +185,11 @@ impl Default for TableFileSystemConfig {
     fn default() -> Self {
         TableFileSystemConfig {
             io_depth: DEFAULT_TABLE_FILE_IO_DEPTH,
-            base_dir: String::from(DEFAULT_TABLE_FILE_BASE_DIR),
+            data_dir: String::from(DEFAULT_TABLE_FILE_DATA_DIR),
             readonly_buffer_size: DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
             catalog_file_name: String::from(DEFAULT_CATALOG_FILE_NAME),
         }
     }
-}
-
-#[inline]
-fn validate_catalog_file_name(file_name: &str) -> bool {
-    if file_name.is_empty() || !file_name.ends_with(".mtb") {
-        return false;
-    }
-    // Must be a plain file name under base_dir, not a path.
-    Path::new(file_name).file_name().and_then(|n| n.to_str()) == Some(file_name)
 }
 
 #[cfg(test)]
@@ -221,7 +207,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(temp_dir.path())
+                .data_dir(temp_dir.path().to_string_lossy().to_string())
                 .build()
                 .unwrap();
 
@@ -259,14 +245,14 @@ mod tests {
     fn test_catalog_file_name_default_and_custom_path() {
         let temp_dir = TempDir::new().unwrap();
         let fs = TableFileSystemConfig::default()
-            .with_main_dir(temp_dir.path())
+            .data_dir(temp_dir.path().to_string_lossy().to_string())
             .build()
             .unwrap();
         assert!(fs.catalog_mtb_file_path().ends_with("catalog.mtb"));
         drop(fs);
 
         let fs = TableFileSystemConfig::default()
-            .with_main_dir(temp_dir.path())
+            .data_dir(temp_dir.path().to_string_lossy().to_string())
             .catalog_file_name("cat_meta.mtb")
             .build()
             .unwrap();
@@ -278,13 +264,13 @@ mod tests {
     fn test_catalog_file_name_validation() {
         let temp_dir = TempDir::new().unwrap();
         let res = TableFileSystemConfig::default()
-            .with_main_dir(temp_dir.path())
+            .data_dir(temp_dir.path().to_string_lossy().to_string())
             .catalog_file_name("catalog.bin")
             .build();
         assert!(res.is_err());
 
         let res = TableFileSystemConfig::default()
-            .with_main_dir(temp_dir.path())
+            .data_dir(temp_dir.path().to_string_lossy().to_string())
             .catalog_file_name("dir/catalog.mtb")
             .build();
         assert!(res.is_err());

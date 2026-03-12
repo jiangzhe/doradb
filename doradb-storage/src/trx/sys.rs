@@ -390,15 +390,16 @@ impl TransactionSystem {
         }
 
         let mut log_merger = LogMerger::default();
+        let file_prefix = self.config.file_prefix();
         for log_no in 0..self.config.log_partitions {
-            let logs = list_log_files(&self.config.log_file_prefix, log_no, false)?;
+            let logs = list_log_files(&file_prefix, log_no, false)?;
             if logs.is_empty() {
                 continue;
             }
             let stream = LogPartitionInitializer {
                 ctx: AIOContext::new(self.config.io_depth_per_log)?,
                 mode: LogPartitionMode::Recovery(VecDeque::from(logs)),
-                file_prefix: self.config.log_file_prefix.clone(),
+                file_prefix: file_prefix.clone(),
                 file_max_size: self.config.log_file_max_size.as_u64() as usize,
                 file_header_size: self.config.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
                 page_size: self.config.max_io_size.as_u64() as usize,
@@ -561,7 +562,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(128usize * 1024 * 1024)
@@ -569,7 +570,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_trx")
+                        .log_file_stem("redo_trx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -602,7 +603,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(128usize * 1024 * 1024)
@@ -610,7 +611,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("catalog-scan-upper-bound")
+                        .log_file_stem("catalog-scan-upper-bound")
                         .skip_recovery(false),
                 )
                 .build()
@@ -825,7 +826,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(128usize * 1024 * 1024)
@@ -833,7 +834,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("redo_trx")
+                        .log_file_stem("redo_trx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -869,7 +870,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(128usize * 1024 * 1024)
@@ -878,7 +879,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .log_partitions(1)
-                        .log_file_prefix("redo_rotate")
+                        .log_file_stem("redo_rotate")
                         .log_file_max_size(1024u64 * 1024)
                         .skip_recovery(true),
                 )

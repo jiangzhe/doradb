@@ -25,11 +25,12 @@ fn main() {
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(2usize * 1024 * 1024 * 1024)
                     .max_file_size(3usize * 1024 * 1024 * 1024)
-                    .file_path("databuffer_bench2.bin"),
+                    .data_swap_file("data_bench3.bin"),
             )
             .trx(
                 TrxSysConfig::default()
-                    .log_file_prefix(args.log_file_prefix.to_string())
+                    .log_dir(args.log_dir.to_string())
+                    .log_file_stem(args.log_file_stem.to_string())
                     .log_partitions(args.log_partitions)
                     .io_depth_per_log(args.io_depth_per_log)
                     .log_file_max_size(args.log_file_max_size)
@@ -113,7 +114,7 @@ fn main() {
         }
         drop(engine);
 
-        let _ = std::fs::remove_file("databuffer_bench3.bin");
+        let _ = std::fs::remove_file("data_bench3.bin");
         remove_files("*.tbl");
     })
 }
@@ -144,9 +145,13 @@ struct Args {
     #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]
     duration: Duration,
 
-    /// path of redo log file
+    /// directory of redo log files
+    #[arg(long, default_value = ".")]
+    log_dir: String,
+
+    /// base file name of redo log files
     #[arg(long, default_value = "redo.log")]
-    log_file_prefix: String,
+    log_file_stem: String,
 
     #[arg(long, default_value = "1")]
     log_partitions: usize,

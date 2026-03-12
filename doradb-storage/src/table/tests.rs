@@ -302,7 +302,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let entry = index.find_entry(row_id).await.unwrap().unwrap();
 
         let fs = TableFileSystemConfig::default()
-            .with_main_dir(sys._temp_dir.path())
+            .data_dir(sys._temp_dir.path().to_string_lossy().to_string())
             .build()
             .unwrap();
         corrupt_page_checksum(
@@ -1606,7 +1606,7 @@ impl TestSys {
         let temp_dir = TempDir::new().unwrap();
         let main_dir = temp_dir.path().to_string_lossy().to_string();
         let engine = EngineConfig::default()
-            .main_dir(main_dir)
+            .storage_root(main_dir)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(64u64 * 1024 * 1024)
@@ -1614,7 +1614,7 @@ impl TestSys {
             )
             .trx(
                 TrxSysConfig::default()
-                    .log_file_prefix("redo_testsys")
+                    .log_file_stem("redo_testsys")
                     .skip_recovery(true),
             )
             .file(

@@ -628,7 +628,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -637,7 +637,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge_promote")
+                        .log_file_stem("redo_purge_promote")
                         .skip_recovery(true),
                 )
                 .build()
@@ -706,7 +706,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -715,7 +715,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge_no_promote")
+                        .log_file_stem("redo_purge_no_promote")
                         .skip_recovery(true),
                 )
                 .build()
@@ -788,7 +788,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -797,7 +797,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge_promote_missing_page")
+                        .log_file_stem("redo_purge_promote_missing_page")
                         .skip_recovery(true),
                 )
                 .build()
@@ -878,7 +878,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -887,7 +887,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge_no_promote_missing_page")
+                        .log_file_stem("redo_purge_no_promote_missing_page")
                         .skip_recovery(true),
                 )
                 .build()
@@ -975,7 +975,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -984,7 +984,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_prefix("redo_purge")
+                        .log_file_stem("redo_purge")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1059,7 +1059,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1068,7 +1068,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(2)
-                        .log_file_prefix("redo_purge")
+                        .log_file_stem("redo_purge")
                         .skip_recovery(true),
                 )
                 .build()

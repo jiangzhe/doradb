@@ -594,7 +594,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -602,7 +602,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover1")
+                        .log_file_stem("recover1")
                         .skip_recovery(false),
                 )
                 .build()
@@ -619,7 +619,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -627,7 +627,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover2")
+                        .log_file_stem("recover2")
                         .skip_recovery(false),
                 )
                 .build()
@@ -664,7 +664,7 @@ mod tests {
 
             // second recovery.
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -672,7 +672,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover2")
+                        .log_file_stem("recover2")
                         .skip_recovery(false),
                 )
                 .build()
@@ -698,7 +698,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -706,7 +706,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover3")
+                        .log_file_stem("recover3")
                         .skip_recovery(false),
                 )
                 .build()
@@ -782,7 +782,7 @@ mod tests {
 
             // second recovery.
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -790,7 +790,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover3")
+                        .log_file_stem("recover3")
                         .skip_recovery(false),
                 )
                 .build()
@@ -819,7 +819,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -827,7 +827,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover4")
+                        .log_file_stem("recover4")
                         .skip_recovery(false),
                 )
                 .build()
@@ -862,7 +862,7 @@ mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -870,7 +870,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover4")
+                        .log_file_stem("recover4")
                         .skip_recovery(false),
                 )
                 .build()
@@ -888,7 +888,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -896,7 +896,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover5")
+                        .log_file_stem("recover5")
                         .skip_recovery(false),
                 )
                 .build()
@@ -956,7 +956,7 @@ mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -964,7 +964,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover5")
+                        .log_file_stem("recover5")
                         .skip_recovery(false),
                 )
                 .build()
@@ -994,7 +994,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1002,7 +1002,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover6")
+                        .log_file_stem("recover6")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1073,7 +1073,7 @@ mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1081,7 +1081,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover6")
+                        .log_file_stem("recover6")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1123,7 +1123,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1131,7 +1131,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover7")
+                        .log_file_stem("recover7")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1250,7 +1250,7 @@ mod tests {
             drop(engine);
 
             let engine = EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1258,7 +1258,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover7")
+                        .log_file_stem("recover7")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1316,7 +1316,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_string_lossy().to_string();
             let engine = EngineConfig::default()
-                .main_dir(main_dir.clone())
+                .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1324,7 +1324,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover8")
+                        .log_file_stem("recover8")
                         .skip_recovery(false),
                 )
                 .build()
@@ -1390,13 +1390,13 @@ mod tests {
             drop(engine);
 
             let fs = TableFileSystemConfig::default()
-                .with_main_dir(temp_dir.path())
+                .data_dir(temp_dir.path().to_string_lossy().to_string())
                 .build()
                 .unwrap();
             corrupt_page_checksum(&fs.table_file_path(table_id), entry.payload.block_id);
 
             let err = match EngineConfig::default()
-                .main_dir(main_dir)
+                .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .max_mem_size(64usize * 1024 * 1024)
@@ -1404,7 +1404,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_prefix("recover8")
+                        .log_file_stem("recover8")
                         .skip_recovery(false),
                 )
                 .build()
