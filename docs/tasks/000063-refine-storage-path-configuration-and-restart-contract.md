@@ -3,6 +3,7 @@ id: 000063
 title: Refine Storage Path Configuration and Restart Contract
 status: implemented  # proposal | implemented | superseded
 created: 2026-03-12
+github_issue: 417
 ---
 
 # Task: Refine Storage Path Configuration and Restart Contract
