@@ -149,6 +149,30 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented the readonly miss path in `doradb-storage/src/buffer/readonly.rs`
+   with a shared `InflightLoad` state machine and detached background owner
+   task. `inflight_loads` now tracks only active attempts, the reserved miss
+   frame remains owned until publish or cleanup completes, and terminal
+   results are stored in shared state so caller cancellation no longer drops
+   the underlying load attempt.
+2. Added resolve-phase tests for the critical cancellation and shared-result
+   cases:
+   - canceled initiating loader with a surviving waiter that still succeeds;
+   - canceled single loader with no stale completed entry left in
+     `inflight_loads`;
+   - shared IO failure propagation to all waiters;
+   - shared validation failure propagation to all waiters.
+   Existing readonly cache tests remained green.
+3. Verification completed with:
+   - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+   - `cargo test -p doradb-storage --no-default-features`
+   - `cargo test -p doradb-storage`
+   Both crate-wide test runs passed after the readonly changes.
+4. Follow-up design work for a broader IO-thread-owned completion framework
+   was deferred and tracked separately in
+   `docs/backlogs/000053-io-thread-owned-completion-callback-framework-for-file-io.md`.
+5. No parent RFC linkage was present for this task at resolve time.
+
 ## Impacts
 
 1. `doradb-storage/src/buffer/readonly.rs`
@@ -177,7 +201,10 @@ Reference:
 ## Open Questions
 
 1. Generic static-read cancellation safety outside the readonly cache remains
-   a separate follow-up task.
+   deferred to
+   `docs/backlogs/000053-io-thread-owned-completion-callback-framework-for-file-io.md`,
+   which tracks the larger RFC-scale design for IO-thread-owned completion
+   callbacks and shared completion semantics.
 2. If transient IO retry or backoff is needed in the future, that policy
    should be designed separately from this task's shared terminal-result
    semantics.
