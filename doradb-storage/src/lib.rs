@@ -17,6 +17,7 @@ pub mod lwc;
 pub mod memcmp;
 pub mod notify;
 pub mod ptr;
+pub mod quiescent;
 pub mod row;
 pub mod serde;
 pub mod session;
