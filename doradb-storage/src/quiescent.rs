@@ -8,6 +8,10 @@ use std::time::Duration;
 // Match Arc's soft refcount ceiling while leaving headroom above the panic
 // threshold for the fetch-add rollback path.
 const MAX_GUARD_COUNT: usize = isize::MAX as usize;
+const OWNER_DROP_SPIN_LIMIT: u32 = 64;
+const OWNER_DROP_YIELD_LIMIT: u32 = 128;
+const OWNER_DROP_INITIAL_SLEEP_US: u64 = 50;
+const OWNER_DROP_MAX_SLEEP_US: u64 = 1_000;
 
 struct QuiescentInner<T> {
     guard_count: AtomicUsize,
@@ -68,9 +72,11 @@ fn guard_count_underflow() -> ! {
 ///
 /// The owner allocation is pinned for the full lifetime of the box, so the
 /// stored value stays at a stable heap address while guards exist. Dropping the
-/// owner blocks until all outstanding guards have been released. Callers must
-/// therefore avoid dropping the owner while still holding guards themselves, or
-/// teardown will block forever.
+/// owner blocks until all outstanding guards have been released. Teardown is a
+/// cold polling path with bounded spin/yield and capped sleep backoff so guard
+/// release stays on a single-atomic hot path. Callers must therefore avoid
+/// dropping the owner while still holding guards themselves, or teardown will
+/// block forever.
 pub struct QuiescentBox<T> {
     inner: Pin<Box<QuiescentInner<T>>>,
 }
@@ -116,12 +122,15 @@ impl<T> Drop for QuiescentBox<T> {
         // Owner teardown is cold, so use backoff here and keep guard release as
         // a single atomic decrement on the hot path.
         while inner.guard_count.load(Ordering::Acquire) != 0 {
-            if attempts < 64 {
+            if attempts < OWNER_DROP_SPIN_LIMIT {
                 std::hint::spin_loop();
-            } else if attempts < 128 {
+            } else if attempts < OWNER_DROP_YIELD_LIMIT {
                 thread::yield_now();
             } else {
-                thread::sleep(Duration::from_micros(50));
+                let sleep_shift = (attempts - OWNER_DROP_YIELD_LIMIT).min(5);
+                let sleep_us =
+                    (OWNER_DROP_INITIAL_SLEEP_US << sleep_shift).min(OWNER_DROP_MAX_SLEEP_US);
+                thread::sleep(Duration::from_micros(sleep_us));
             }
             attempts = attempts.saturating_add(1);
         }
