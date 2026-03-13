@@ -3,7 +3,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{NonNull, addr_of_mut};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
@@ -16,6 +16,7 @@ const OWNER_DROP_SPIN_LIMIT: u32 = 64;
 const OWNER_DROP_YIELD_LIMIT: u32 = 128;
 const OWNER_DROP_INITIAL_SLEEP_US: u64 = 50;
 const OWNER_DROP_MAX_SLEEP_US: u64 = 1_000;
+static NEXT_QUI_DAG_ID: AtomicU64 = AtomicU64::new(1);
 
 struct QuiescentInner<T> {
     guard_count: AtomicUsize,
@@ -70,6 +71,28 @@ fn guard_count_overflow() -> ! {
 #[cold]
 fn guard_count_underflow() -> ! {
     panic!("quiescent guard count underflow");
+}
+
+#[cold]
+fn qui_handle_count_overflow() -> ! {
+    panic!("quiescent handle count overflow");
+}
+
+#[cold]
+fn qui_handle_count_underflow() -> ! {
+    panic!("quiescent handle count underflow");
+}
+
+#[cold]
+fn qui_dag_id_overflow() -> ! {
+    panic!("quiescent dependency graph id overflow");
+}
+
+#[cold]
+fn qui_handle_leaked(node_id: NodeId, name: &str, handle_count: usize) -> ! {
+    panic!(
+        "quiescent handle leaked during teardown: node={node_id}, name={name}, outstanding_handles={handle_count}"
+    );
 }
 
 /// Owns a heap-allocated value that can be shared by quiescent guards.
@@ -220,6 +243,46 @@ unsafe impl<T: Sync> Send for QuiescentGuard<T> {}
 // `&T`, so this is sound exactly when `T: Sync`.
 unsafe impl<T: Sync> Sync for QuiescentGuard<T> {}
 
+#[derive(Debug)]
+struct QuiHandleState {
+    handle_count: AtomicUsize,
+}
+
+impl QuiHandleState {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            handle_count: AtomicUsize::new(1),
+        }
+    }
+
+    #[inline]
+    fn acquire_handle(&self) {
+        let old_count = self.handle_count.fetch_add(1, Ordering::Relaxed);
+        if old_count >= MAX_GUARD_COUNT {
+            self.handle_count.fetch_sub(1, Ordering::Relaxed);
+            qui_handle_count_overflow();
+        }
+    }
+
+    #[inline]
+    fn release_handle(&self) {
+        let old_count = self.handle_count.fetch_sub(1, Ordering::Release);
+        if old_count == 0 {
+            self.handle_count.fetch_add(1, Ordering::Relaxed);
+            qui_handle_count_underflow();
+        }
+    }
+
+    #[inline]
+    fn assert_no_handles(&self, node_id: NodeId, name: &str) {
+        let handle_count = self.handle_count.load(Ordering::Acquire);
+        if handle_count != 0 {
+            qui_handle_leaked(node_id, name, handle_count);
+        }
+    }
+}
+
 /// Long-lived dependency edge to a quiescent-owned value.
 ///
 /// `QuiDep<T>` is a thin wrapper around [`QuiescentGuard<T>`] for component
@@ -267,12 +330,22 @@ impl<T> Deref for QuiDep<T> {
 
 /// Opaque identifier of one node registered in a [`QuiDAG`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(usize);
+pub struct NodeId {
+    dag_id: u64,
+    slot: usize,
+}
+
+impl NodeId {
+    #[inline]
+    const fn new(dag_id: u64, slot: usize) -> Self {
+        Self { dag_id, slot }
+    }
+}
 
 impl fmt::Display for NodeId {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}:{}", self.dag_id, self.slot)
     }
 }
 
@@ -292,21 +365,25 @@ pub enum QuiDagError {
 
 /// Typed access handle for a component registered in a [`QuiDAG`].
 ///
-/// Handles are non-owning and can be cloned freely. They can create transient
-/// [`QuiescentGuard`] borrows or longer-lived [`QuiDep`] edges while the graph
-/// still owns the node.
-#[derive(Clone)]
+/// Handles are non-owning and can be cloned freely while the graph is live.
+/// They are intended for graph construction and dependency wiring, not for
+/// teardown. Callers must drop every `QuiHandle` clone before the graph starts
+/// dropping owners. Violating that contract is a bug and will panic during
+/// `QuiDAG` teardown. Convert long-lived runtime dependencies into
+/// [`QuiDep`] or [`QuiescentGuard`] values before dropping the handles.
 pub struct QuiHandle<T> {
     id: NodeId,
     owner: Weak<QuiescentBox<T>>,
+    handle_state: Arc<QuiHandleState>,
 }
 
 impl<T> QuiHandle<T> {
     #[inline]
-    fn new(id: NodeId, owner: &Arc<QuiescentBox<T>>) -> Self {
+    fn new(id: NodeId, owner: &Arc<QuiescentBox<T>>, handle_state: &Arc<QuiHandleState>) -> Self {
         Self {
             id,
             owner: Arc::downgrade(owner),
+            handle_state: Arc::clone(handle_state),
         }
     }
 
@@ -319,6 +396,8 @@ impl<T> QuiHandle<T> {
     /// Attempts to create a transient shared guard to the registered value.
     ///
     /// This returns `None` after the graph has already dropped the owner.
+    /// Callers must not race this with graph teardown; keeping any handle alive
+    /// during `QuiDAG` drop violates the handle contract and will panic.
     #[inline]
     pub fn try_guard(&self) -> Option<QuiescentGuard<T>> {
         self.owner.upgrade().map(|owner| owner.guard())
@@ -359,6 +438,25 @@ impl<T> QuiHandle<T> {
     }
 }
 
+impl<T> Clone for QuiHandle<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        self.handle_state.acquire_handle();
+        Self {
+            id: self.id,
+            owner: self.owner.clone(),
+            handle_state: Arc::clone(&self.handle_state),
+        }
+    }
+}
+
+impl<T> Drop for QuiHandle<T> {
+    #[inline]
+    fn drop(&mut self) {
+        self.handle_state.release_handle();
+    }
+}
+
 #[cold]
 fn qui_handle_owner_dropped() -> ! {
     panic!("quiescent handle used after owner drop");
@@ -369,19 +467,24 @@ trait ErasedQuiOwner {
 }
 
 struct TypedQuiOwner<T> {
+    node_id: NodeId,
+    name: String,
     owner: Option<Arc<QuiescentBox<T>>>,
+    handle_state: Arc<QuiHandleState>,
 }
 
 impl<T> ErasedQuiOwner for TypedQuiOwner<T> {
     #[inline]
     fn drop_owner(&mut self) {
+        self.handle_state
+            .assert_no_handles(self.node_id, &self.name);
         drop(self.owner.take());
     }
 }
 
 struct QuiDagNode {
     _name: String,
-    edges: Vec<NodeId>,
+    edges: Vec<usize>,
     owner: Box<dyn ErasedQuiOwner>,
 }
 
@@ -390,10 +493,13 @@ struct QuiDagNode {
 /// Each edge represents one teardown ordering constraint: if `A` depends on
 /// `B`, then `A` must be dropped before `B`. Callers must register all
 /// components, add any teardown-only ordering edges, and then call
-/// [`Self::seal`] to validate the graph and freeze its structure.
+/// [`Self::seal`] to validate the graph and freeze its structure. All
+/// [`QuiHandle`] values must be dropped before this graph starts teardown; the
+/// graph asserts that contract and panics on leaked handles.
 pub struct QuiDAG {
+    dag_id: u64,
     nodes: Vec<QuiDagNode>,
-    drop_order: Option<Vec<NodeId>>,
+    drop_order: Option<Vec<usize>>,
 }
 
 impl Default for QuiDAG {
@@ -408,6 +514,7 @@ impl QuiDAG {
     #[inline]
     pub fn new() -> Self {
         Self {
+            dag_id: next_qui_dag_id(),
             nodes: Vec::new(),
             drop_order: None,
         }
@@ -437,13 +544,20 @@ impl QuiDAG {
     {
         self.ensure_mutable()?;
         let edges = self.collect_edges(depends_on)?;
-        let id = NodeId(self.nodes.len());
+        let id = NodeId::new(self.dag_id, self.nodes.len());
         let owner = Arc::new(QuiescentBox::new(value));
-        let handle = QuiHandle::new(id, &owner);
+        let handle_state = Arc::new(QuiHandleState::new());
+        let handle = QuiHandle::new(id, &owner, &handle_state);
+        let name = name.into();
         self.nodes.push(QuiDagNode {
-            _name: name.into(),
+            _name: name.clone(),
             edges,
-            owner: Box::new(TypedQuiOwner { owner: Some(owner) }),
+            owner: Box::new(TypedQuiOwner {
+                node_id: id,
+                name,
+                owner: Some(owner),
+                handle_state,
+            }),
         });
         Ok(handle)
     }
@@ -458,9 +572,9 @@ impl QuiDAG {
         after: NodeId,
     ) -> std::result::Result<(), QuiDagError> {
         self.ensure_mutable()?;
-        self.validate_node(before)?;
-        self.validate_node(after)?;
-        self.nodes[before.0].edges.push(after);
+        let before_idx = self.validate_node(before)?;
+        let after_idx = self.validate_node(after)?;
+        self.nodes[before_idx].edges.push(after_idx);
         Ok(())
     }
 
@@ -481,38 +595,32 @@ impl QuiDAG {
         }
     }
 
-    fn collect_edges<I>(&self, edges: I) -> std::result::Result<Vec<NodeId>, QuiDagError>
+    fn collect_edges<I>(&self, edges: I) -> std::result::Result<Vec<usize>, QuiDagError>
     where
         I: IntoIterator<Item = NodeId>,
     {
         let mut collected = Vec::new();
         for edge in edges {
-            self.validate_node(edge)?;
-            collected.push(edge);
+            collected.push(self.validate_node(edge)?);
         }
         Ok(collected)
     }
 
     #[inline]
-    fn validate_node(&self, node: NodeId) -> std::result::Result<(), QuiDagError> {
-        if node.0 < self.nodes.len() {
-            Ok(())
+    fn validate_node(&self, node: NodeId) -> std::result::Result<usize, QuiDagError> {
+        if node.dag_id == self.dag_id && node.slot < self.nodes.len() {
+            Ok(node.slot)
         } else {
             Err(QuiDagError::UnknownNode { node })
         }
     }
 
-    fn compute_drop_order(&self) -> std::result::Result<Vec<NodeId>, QuiDagError> {
+    fn compute_drop_order(&self) -> std::result::Result<Vec<usize>, QuiDagError> {
         let mut indegree = vec![0usize; self.nodes.len()];
         let mut outgoing = vec![Vec::new(); self.nodes.len()];
         for (idx, node) in self.nodes.iter().enumerate() {
-            let unique_edges = node
-                .edges
-                .iter()
-                .copied()
-                .map(|node_id| node_id.0)
-                .collect::<BTreeSet<_>>();
-            outgoing[idx] = unique_edges.iter().copied().map(NodeId).collect();
+            let unique_edges = node.edges.iter().copied().collect::<BTreeSet<_>>();
+            outgoing[idx] = unique_edges.iter().copied().collect();
             for dep in unique_edges {
                 indegree[dep] += 1;
             }
@@ -525,11 +633,11 @@ impl QuiDAG {
             .collect::<BTreeSet<_>>();
         let mut order = Vec::with_capacity(self.nodes.len());
         while let Some(next_idx) = ready.pop_first() {
-            order.push(NodeId(next_idx));
+            order.push(next_idx);
             for dep in &outgoing[next_idx] {
-                indegree[dep.0] -= 1;
-                if indegree[dep.0] == 0 {
-                    ready.insert(dep.0);
+                indegree[*dep] -= 1;
+                if indegree[*dep] == 0 {
+                    ready.insert(*dep);
                 }
             }
         }
@@ -538,7 +646,7 @@ impl QuiDAG {
             let nodes = indegree
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, degree)| (*degree != 0).then_some(NodeId(idx)))
+                .filter_map(|(idx, degree)| (*degree != 0).then_some(NodeId::new(self.dag_id, idx)))
                 .collect();
             return Err(QuiDagError::Cycle { nodes });
         }
@@ -550,8 +658,8 @@ impl Drop for QuiDAG {
     #[inline]
     fn drop(&mut self) {
         if let Some(drop_order) = self.drop_order.take() {
-            for node_id in drop_order {
-                self.nodes[node_id.0].owner.drop_owner();
+            for node_idx in drop_order {
+                self.nodes[node_idx].owner.drop_owner();
             }
         } else {
             for node in self.nodes.iter_mut().rev() {
@@ -559,6 +667,15 @@ impl Drop for QuiDAG {
             }
         }
     }
+}
+
+#[inline]
+fn next_qui_dag_id() -> u64 {
+    let dag_id = NEXT_QUI_DAG_ID.fetch_add(1, Ordering::Relaxed);
+    if dag_id == u64::MAX {
+        qui_dag_id_overflow();
+    }
+    dag_id
 }
 
 #[cfg(test)]
@@ -765,6 +882,8 @@ mod tests {
         )
         .unwrap();
         dag.seal().unwrap();
+        drop(b);
+        drop(c);
 
         drop(dag);
 
@@ -803,6 +922,7 @@ mod tests {
         )
         .unwrap();
         dag.seal().unwrap();
+        drop(shared);
 
         drop(dag);
 
@@ -820,6 +940,8 @@ mod tests {
         dag.drop_before(a.id(), b.id()).unwrap();
 
         assert!(matches!(dag.seal(), Err(QuiDagError::Cycle { .. })));
+        drop(b);
+        drop(a);
     }
 
     #[test]
@@ -846,10 +968,31 @@ mod tests {
             .unwrap();
         dag.drop_before(table_fs.id(), disk_pool.id()).unwrap();
         dag.seal().unwrap();
+        drop(disk_pool);
+        drop(table_fs);
 
         drop(dag);
 
         assert_eq!(drops.lock().unwrap().as_slice(), &["table_fs", "disk_pool"]);
+    }
+
+    #[test]
+    fn test_quidag_rejects_foreign_node_ids() {
+        let mut dag1 = QuiDAG::new();
+        let a = dag1.insert("a", ()).unwrap();
+        let mut dag2 = QuiDAG::new();
+        let b = dag2.insert("b", ()).unwrap();
+
+        assert!(matches!(
+            dag1.insert_with_deps("dep", (), [b.id()]),
+            Err(QuiDagError::UnknownNode { node }) if node == b.id()
+        ));
+        assert!(matches!(
+            dag1.drop_before(a.id(), b.id()),
+            Err(QuiDagError::UnknownNode { node }) if node == b.id()
+        ));
+        drop(b);
+        drop(a);
     }
 
     #[test]
@@ -867,6 +1010,7 @@ mod tests {
         dag.seal().unwrap();
 
         let dep = worker.dep();
+        drop(worker);
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let dep_handle = thread::spawn(move || {
@@ -887,5 +1031,24 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         dep_handle.join().unwrap();
         release_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_quidag_drop_panics_when_handle_leaked() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut dag = QuiDAG::new();
+        let leaked_handle = dag
+            .insert(
+                "leaked",
+                DropSpy {
+                    dropped: Arc::clone(&dropped),
+                },
+            )
+            .unwrap();
+        dag.seal().unwrap();
+
+        let res = panic::catch_unwind(AssertUnwindSafe(|| drop(dag)));
+        assert!(res.is_err());
+        drop(leaked_handle);
     }
 }
