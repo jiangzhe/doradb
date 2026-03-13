@@ -360,7 +360,7 @@ pub enum QuiDagError {
     UnknownNode { node: NodeId },
     /// The graph contains a cycle and therefore has no valid drop order.
     #[error("quiescent dependency graph contains a cycle involving nodes {nodes:?}")]
-    Cycle { nodes: Vec<NodeId> },
+    Cycle { nodes: Box<[NodeId]> },
 }
 
 /// Typed access handle for a component registered in a [`QuiDAG`].
@@ -647,7 +647,8 @@ impl QuiDAG {
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, degree)| (*degree != 0).then_some(NodeId::new(self.dag_id, idx)))
-                .collect();
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
             return Err(QuiDagError::Cycle { nodes });
         }
         Ok(order)
@@ -993,6 +994,18 @@ mod tests {
         ));
         drop(b);
         drop(a);
+    }
+
+    #[test]
+    fn test_quidag_error_converts_to_storage_error() {
+        let err: crate::error::Error = QuiDagError::Cycle {
+            nodes: vec![NodeId::new(7, 11)].into_boxed_slice(),
+        }
+        .into();
+        assert!(matches!(
+            err,
+            crate::error::Error::QuiescentDag(QuiDagError::Cycle { .. })
+        ));
     }
 
     #[test]
