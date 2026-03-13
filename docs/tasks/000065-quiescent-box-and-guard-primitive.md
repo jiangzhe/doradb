@@ -3,6 +3,7 @@ id: 000065
 title: Quiescent Box And Guard Primitive
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-13
+github_issue: 421
 ---
 
 # Task: Quiescent Box And Guard Primitive
