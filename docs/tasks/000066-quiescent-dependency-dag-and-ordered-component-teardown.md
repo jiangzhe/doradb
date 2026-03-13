@@ -1,8 +1,9 @@
 ---
 id: 000066
 title: Quiescent Dependency DAG And Ordered Component Teardown
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-13
+github_issue: 423
 ---
 
 # Task: Quiescent Dependency DAG And Ordered Component Teardown
@@ -143,6 +144,15 @@ Reference:
    stable.
 
 ## Implementation Notes
+
+Implemented in `doradb-storage/src/quiescent.rs` with:
+
+1. `QuiDep<T>` as a long-lived dependency wrapper over `QuiescentGuard<T>`.
+2. `QuiHandle<T>` as a typed node handle backed by a non-owning `Weak` owner
+   reference, with `guard()`/`dep()` and `try_guard()`/`try_dep()` accessors.
+3. `QuiDAG` with explicit dependency-edge registration, cycle rejection in
+   `seal()`, deterministic drop ordering, and focused quiescent tests for
+   linear, shared, teardown-only, and worker-held dependency cases.
 
 
 ## Impacts

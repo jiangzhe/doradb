@@ -1,9 +1,13 @@
+use std::collections::BTreeSet;
+use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{NonNull, addr_of_mut};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
+use thiserror::Error;
 
 // Match Arc's soft refcount ceiling while leaving headroom above the panic
 // threshold for the fetch-add rollback path.
@@ -102,6 +106,16 @@ impl<T> QuiescentBox<T> {
     #[inline]
     pub fn guard(&self) -> QuiescentGuard<T> {
         QuiescentGuard::new(self.inner_ptr())
+    }
+
+    /// Creates a long-lived dependency edge to the owned value.
+    ///
+    /// Unlike transient [`QuiescentGuard`] borrows, a [`QuiDep`] is intended to
+    /// be stored inside dependent components or worker closures so owner
+    /// teardown waits until the dependency edge is released.
+    #[inline]
+    pub fn dep(&self) -> QuiDep<T> {
+        QuiDep::from(self.guard())
     }
 }
 
@@ -206,10 +220,352 @@ unsafe impl<T: Sync> Send for QuiescentGuard<T> {}
 // `&T`, so this is sound exactly when `T: Sync`.
 unsafe impl<T: Sync> Sync for QuiescentGuard<T> {}
 
+/// Long-lived dependency edge to a quiescent-owned value.
+///
+/// `QuiDep<T>` is a thin wrapper around [`QuiescentGuard<T>`] for component
+/// fields and worker-thread captures that must keep a dependency alive until
+/// the dependent shuts down.
+#[derive(Clone)]
+pub struct QuiDep<T> {
+    guard: QuiescentGuard<T>,
+}
+
+impl<T> QuiDep<T> {
+    #[inline]
+    fn new(guard: QuiescentGuard<T>) -> Self {
+        Self { guard }
+    }
+
+    /// Clones a transient shared guard from this dependency edge.
+    #[inline]
+    pub fn guard(&self) -> QuiescentGuard<T> {
+        self.guard.clone()
+    }
+
+    /// Returns the raw pointer to the dependency target.
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.guard.as_ptr()
+    }
+}
+
+impl<T> From<QuiescentGuard<T>> for QuiDep<T> {
+    #[inline]
+    fn from(guard: QuiescentGuard<T>) -> Self {
+        Self::new(guard)
+    }
+}
+
+impl<T> Deref for QuiDep<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+/// Opaque identifier of one node registered in a [`QuiDAG`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(usize);
+
+impl fmt::Display for NodeId {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Error returned by [`QuiDAG`] registration or validation.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum QuiDagError {
+    /// Structural edits were attempted after the graph was sealed.
+    #[error("quiescent dependency graph is sealed")]
+    Sealed,
+    /// One referenced node id does not belong to this graph.
+    #[error("unknown quiescent dependency graph node {node}")]
+    UnknownNode { node: NodeId },
+    /// The graph contains a cycle and therefore has no valid drop order.
+    #[error("quiescent dependency graph contains a cycle involving nodes {nodes:?}")]
+    Cycle { nodes: Vec<NodeId> },
+}
+
+/// Typed access handle for a component registered in a [`QuiDAG`].
+///
+/// Handles are non-owning and can be cloned freely. They can create transient
+/// [`QuiescentGuard`] borrows or longer-lived [`QuiDep`] edges while the graph
+/// still owns the node.
+#[derive(Clone)]
+pub struct QuiHandle<T> {
+    id: NodeId,
+    owner: Weak<QuiescentBox<T>>,
+}
+
+impl<T> QuiHandle<T> {
+    #[inline]
+    fn new(id: NodeId, owner: &Arc<QuiescentBox<T>>) -> Self {
+        Self {
+            id,
+            owner: Arc::downgrade(owner),
+        }
+    }
+
+    /// Returns this node's graph identifier.
+    #[inline]
+    pub const fn id(&self) -> NodeId {
+        self.id
+    }
+
+    /// Attempts to create a transient shared guard to the registered value.
+    ///
+    /// This returns `None` after the graph has already dropped the owner.
+    #[inline]
+    pub fn try_guard(&self) -> Option<QuiescentGuard<T>> {
+        self.owner.upgrade().map(|owner| owner.guard())
+    }
+
+    /// Creates a transient shared guard to the registered value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the graph has already dropped this node's owner.
+    #[inline]
+    pub fn guard(&self) -> QuiescentGuard<T> {
+        match self.try_guard() {
+            Some(guard) => guard,
+            None => qui_handle_owner_dropped(),
+        }
+    }
+
+    /// Attempts to create a long-lived dependency edge to the registered value.
+    ///
+    /// This returns `None` after the graph has already dropped the owner.
+    #[inline]
+    pub fn try_dep(&self) -> Option<QuiDep<T>> {
+        self.try_guard().map(QuiDep::from)
+    }
+
+    /// Creates a long-lived dependency edge to the registered value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the graph has already dropped this node's owner.
+    #[inline]
+    pub fn dep(&self) -> QuiDep<T> {
+        match self.try_dep() {
+            Some(dep) => dep,
+            None => qui_handle_owner_dropped(),
+        }
+    }
+}
+
+#[cold]
+fn qui_handle_owner_dropped() -> ! {
+    panic!("quiescent handle used after owner drop");
+}
+
+trait ErasedQuiOwner {
+    fn drop_owner(&mut self);
+}
+
+struct TypedQuiOwner<T> {
+    owner: Option<Arc<QuiescentBox<T>>>,
+}
+
+impl<T> ErasedQuiOwner for TypedQuiOwner<T> {
+    #[inline]
+    fn drop_owner(&mut self) {
+        drop(self.owner.take());
+    }
+}
+
+struct QuiDagNode {
+    _name: String,
+    edges: Vec<NodeId>,
+    owner: Box<dyn ErasedQuiOwner>,
+}
+
+/// Dependency-aware owner that drops registered components in graph order.
+///
+/// Each edge represents one teardown ordering constraint: if `A` depends on
+/// `B`, then `A` must be dropped before `B`. Callers must register all
+/// components, add any teardown-only ordering edges, and then call
+/// [`Self::seal`] to validate the graph and freeze its structure.
+pub struct QuiDAG {
+    nodes: Vec<QuiDagNode>,
+    drop_order: Option<Vec<NodeId>>,
+}
+
+impl Default for QuiDAG {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QuiDAG {
+    /// Creates an empty quiescent dependency graph.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            drop_order: None,
+        }
+    }
+
+    /// Registers one component with no initial dependency edges.
+    #[inline]
+    pub fn insert<T: 'static>(
+        &mut self,
+        name: impl Into<String>,
+        value: T,
+    ) -> std::result::Result<QuiHandle<T>, QuiDagError> {
+        self.insert_with_deps(name, value, std::iter::empty())
+    }
+
+    /// Registers one component together with its dependency edges.
+    ///
+    /// Each `depends_on` node must already be registered in the graph.
+    pub fn insert_with_deps<T: 'static, I>(
+        &mut self,
+        name: impl Into<String>,
+        value: T,
+        depends_on: I,
+    ) -> std::result::Result<QuiHandle<T>, QuiDagError>
+    where
+        I: IntoIterator<Item = NodeId>,
+    {
+        self.ensure_mutable()?;
+        let edges = self.collect_edges(depends_on)?;
+        let id = NodeId(self.nodes.len());
+        let owner = Arc::new(QuiescentBox::new(value));
+        let handle = QuiHandle::new(id, &owner);
+        self.nodes.push(QuiDagNode {
+            _name: name.into(),
+            edges,
+            owner: Box::new(TypedQuiOwner { owner: Some(owner) }),
+        });
+        Ok(handle)
+    }
+
+    /// Adds a teardown-only ordering edge.
+    ///
+    /// After sealing, the graph will always drop `before` ahead of `after`
+    /// even if the two components do not have a normal runtime dependency.
+    pub fn drop_before(
+        &mut self,
+        before: NodeId,
+        after: NodeId,
+    ) -> std::result::Result<(), QuiDagError> {
+        self.ensure_mutable()?;
+        self.validate_node(before)?;
+        self.validate_node(after)?;
+        self.nodes[before.0].edges.push(after);
+        Ok(())
+    }
+
+    /// Validates the graph, computes one deterministic drop order, and freezes
+    /// the structure against further mutation.
+    pub fn seal(&mut self) -> std::result::Result<(), QuiDagError> {
+        self.ensure_mutable()?;
+        self.drop_order = Some(self.compute_drop_order()?);
+        Ok(())
+    }
+
+    #[inline]
+    fn ensure_mutable(&self) -> std::result::Result<(), QuiDagError> {
+        if self.drop_order.is_some() {
+            Err(QuiDagError::Sealed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn collect_edges<I>(&self, edges: I) -> std::result::Result<Vec<NodeId>, QuiDagError>
+    where
+        I: IntoIterator<Item = NodeId>,
+    {
+        let mut collected = Vec::new();
+        for edge in edges {
+            self.validate_node(edge)?;
+            collected.push(edge);
+        }
+        Ok(collected)
+    }
+
+    #[inline]
+    fn validate_node(&self, node: NodeId) -> std::result::Result<(), QuiDagError> {
+        if node.0 < self.nodes.len() {
+            Ok(())
+        } else {
+            Err(QuiDagError::UnknownNode { node })
+        }
+    }
+
+    fn compute_drop_order(&self) -> std::result::Result<Vec<NodeId>, QuiDagError> {
+        let mut indegree = vec![0usize; self.nodes.len()];
+        let mut outgoing = vec![Vec::new(); self.nodes.len()];
+        for (idx, node) in self.nodes.iter().enumerate() {
+            let unique_edges = node
+                .edges
+                .iter()
+                .copied()
+                .map(|node_id| node_id.0)
+                .collect::<BTreeSet<_>>();
+            outgoing[idx] = unique_edges.iter().copied().map(NodeId).collect();
+            for dep in unique_edges {
+                indegree[dep] += 1;
+            }
+        }
+
+        let mut ready = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, degree)| (*degree == 0).then_some(idx))
+            .collect::<BTreeSet<_>>();
+        let mut order = Vec::with_capacity(self.nodes.len());
+        while let Some(next_idx) = ready.pop_first() {
+            order.push(NodeId(next_idx));
+            for dep in &outgoing[next_idx] {
+                indegree[dep.0] -= 1;
+                if indegree[dep.0] == 0 {
+                    ready.insert(dep.0);
+                }
+            }
+        }
+
+        if order.len() != self.nodes.len() {
+            let nodes = indegree
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, degree)| (*degree != 0).then_some(NodeId(idx)))
+                .collect();
+            return Err(QuiDagError::Cycle { nodes });
+        }
+        Ok(order)
+    }
+}
+
+impl Drop for QuiDAG {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(drop_order) = self.drop_order.take() {
+            for node_id in drop_order {
+                self.nodes[node_id.0].owner.drop_owner();
+            }
+        } else {
+            for node in self.nodes.iter_mut().rev() {
+                node.owner.drop_owner();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread;
@@ -223,6 +579,17 @@ mod tests {
     impl Drop for DropSpy {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    struct DropOrderSpy {
+        name: &'static str,
+        drops: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropOrderSpy {
+        fn drop(&mut self) {
+            self.drops.lock().unwrap().push(self.name);
         }
     }
 
@@ -337,5 +704,188 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         clone_handle.join().unwrap();
         owner_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_quiescent_box_dep_keeps_owner_alive() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = QuiescentBox::new(DropSpy {
+            dropped: Arc::clone(&dropped),
+        });
+        let dep = owner.dep();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            drop(owner);
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(!dropped.load(Ordering::Acquire));
+
+        drop(dep);
+
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_quidag_linear_dependency_drop_order() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let mut dag = QuiDAG::new();
+        let c = dag
+            .insert(
+                "c",
+                DropOrderSpy {
+                    name: "c",
+                    drops: Arc::clone(&drops),
+                },
+            )
+            .unwrap();
+        let b = dag
+            .insert_with_deps(
+                "b",
+                DropOrderSpy {
+                    name: "b",
+                    drops: Arc::clone(&drops),
+                },
+                [c.id()],
+            )
+            .unwrap();
+        dag.insert_with_deps(
+            "a",
+            DropOrderSpy {
+                name: "a",
+                drops: Arc::clone(&drops),
+            },
+            [b.id()],
+        )
+        .unwrap();
+        dag.seal().unwrap();
+
+        drop(dag);
+
+        assert_eq!(drops.lock().unwrap().as_slice(), &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_quidag_shared_dependency_drop_order() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let mut dag = QuiDAG::new();
+        let shared = dag
+            .insert(
+                "shared",
+                DropOrderSpy {
+                    name: "shared",
+                    drops: Arc::clone(&drops),
+                },
+            )
+            .unwrap();
+        dag.insert_with_deps(
+            "left",
+            DropOrderSpy {
+                name: "left",
+                drops: Arc::clone(&drops),
+            },
+            [shared.id()],
+        )
+        .unwrap();
+        dag.insert_with_deps(
+            "right",
+            DropOrderSpy {
+                name: "right",
+                drops: Arc::clone(&drops),
+            },
+            [shared.id()],
+        )
+        .unwrap();
+        dag.seal().unwrap();
+
+        drop(dag);
+
+        assert_eq!(
+            drops.lock().unwrap().as_slice(),
+            &["left", "right", "shared"]
+        );
+    }
+
+    #[test]
+    fn test_quidag_cycle_rejected_on_seal() {
+        let mut dag = QuiDAG::new();
+        let a = dag.insert("a", ()).unwrap();
+        let b = dag.insert_with_deps("b", (), [a.id()]).unwrap();
+        dag.drop_before(a.id(), b.id()).unwrap();
+
+        assert!(matches!(dag.seal(), Err(QuiDagError::Cycle { .. })));
+    }
+
+    #[test]
+    fn test_quidag_drop_before_adds_teardown_only_edge() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let mut dag = QuiDAG::new();
+        let table_fs = dag
+            .insert(
+                "table_fs",
+                DropOrderSpy {
+                    name: "table_fs",
+                    drops: Arc::clone(&drops),
+                },
+            )
+            .unwrap();
+        let disk_pool = dag
+            .insert(
+                "disk_pool",
+                DropOrderSpy {
+                    name: "disk_pool",
+                    drops: Arc::clone(&drops),
+                },
+            )
+            .unwrap();
+        dag.drop_before(table_fs.id(), disk_pool.id()).unwrap();
+        dag.seal().unwrap();
+
+        drop(dag);
+
+        assert_eq!(drops.lock().unwrap().as_slice(), &["table_fs", "disk_pool"]);
+    }
+
+    #[test]
+    fn test_quidag_worker_dep_blocks_owner_drop_until_release() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut dag = QuiDAG::new();
+        let worker = dag
+            .insert(
+                "worker",
+                DropSpy {
+                    dropped: Arc::clone(&dropped),
+                },
+            )
+            .unwrap();
+        dag.seal().unwrap();
+
+        let dep = worker.dep();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let dep_handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(dep);
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!dropped.load(Ordering::Acquire));
+        let release_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        drop(dag);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(dropped.load(Ordering::Acquire));
+        dep_handle.join().unwrap();
+        release_handle.join().unwrap();
     }
 }
