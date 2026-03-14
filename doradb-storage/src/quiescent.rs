@@ -115,6 +115,10 @@ fn qui_node_dep_not_declared(node_id: NodeId) -> ! {
 /// release stays on a single-atomic hot path. Callers must therefore avoid
 /// dropping the owner while still holding guards themselves, or teardown will
 /// block forever.
+///
+/// This is the low-level primitive layer. Persistent dependency edges are
+/// managed through [`QuiDAG`] and [`QuiNodeDeps`], not directly through
+/// `QuiescentBox`.
 pub struct QuiescentBox<T> {
     inner: Pin<Box<QuiescentInner<T>>>,
 }
@@ -140,16 +144,6 @@ impl<T> QuiescentBox<T> {
     #[inline]
     pub fn guard(&self) -> QuiescentGuard<T> {
         QuiescentGuard::new(self.inner_ptr())
-    }
-
-    /// Creates a long-lived dependency edge to the owned value.
-    ///
-    /// Unlike transient [`QuiescentGuard`] borrows, a [`QuiDep`] is intended to
-    /// be stored inside dependent components or worker closures so owner
-    /// teardown waits until the dependency edge is released.
-    #[inline]
-    pub fn dep(&self) -> QuiDep<T> {
-        QuiDep::new(self.guard())
     }
 }
 
@@ -300,10 +294,10 @@ impl QuiHandleState {
 /// fields and worker-thread captures that must keep a dependency alive until
 /// the dependent shuts down.
 ///
-/// For DAG-managed components, persistent `QuiDep` values must come from
-/// [`QuiNodeDeps::dep`] inside [`QuiNodeBuilder::build`] or
-/// [`QuiNodeBuilder::build_async`]. That keeps runtime keepalive edges aligned
-/// with the teardown order enforced by [`QuiDAG::drop`].
+/// `QuiDep` values are created only through [`QuiNodeDeps::dep`] inside
+/// [`QuiNodeBuilder::build`] or [`QuiNodeBuilder::build_async`]. That keeps
+/// runtime keepalive edges aligned with the teardown order enforced by
+/// [`QuiDAG::drop`].
 pub struct QuiDep<T> {
     guard: QuiescentGuard<T>,
 }
@@ -1105,32 +1099,6 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         clone_handle.join().unwrap();
         owner_handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_quiescent_box_dep_keeps_owner_alive() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let owner = QuiescentBox::new(DropSpy {
-            dropped: Arc::clone(&dropped),
-        });
-        let dep = owner.dep();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            drop(owner);
-            done_tx.send(()).unwrap();
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-        assert!(!dropped.load(Ordering::Acquire));
-
-        drop(dep);
-
-        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(dropped.load(Ordering::Acquire));
-        handle.join().unwrap();
     }
 
     #[test]
