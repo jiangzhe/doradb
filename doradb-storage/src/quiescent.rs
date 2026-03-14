@@ -13,6 +13,9 @@ use thiserror::Error;
 // Match Arc's soft refcount ceiling while leaving headroom above the panic
 // threshold for the fetch-add rollback path.
 const MAX_GUARD_COUNT: usize = isize::MAX as usize;
+// Keep DAG ids within the same signed-range ceiling used elsewhere instead of
+// allowing the global allocator to march toward u64 wraparound.
+const MAX_QUI_DAG_ID: u64 = isize::MAX as u64;
 const OWNER_DROP_SPIN_LIMIT: u32 = 64;
 const OWNER_DROP_YIELD_LIMIT: u32 = 128;
 const OWNER_DROP_INITIAL_SLEEP_US: u64 = 50;
@@ -893,8 +896,14 @@ impl Drop for QuiDAG {
 
 #[inline]
 fn next_qui_dag_id() -> u64 {
-    let dag_id = NEXT_QUI_DAG_ID.fetch_add(1, Ordering::Relaxed);
-    if dag_id == u64::MAX {
+    next_qui_dag_id_from(&NEXT_QUI_DAG_ID)
+}
+
+#[inline]
+fn next_qui_dag_id_from(counter: &AtomicU64) -> u64 {
+    let dag_id = counter.fetch_add(1, Ordering::Relaxed);
+    if dag_id >= MAX_QUI_DAG_ID {
+        counter.fetch_sub(1, Ordering::Relaxed);
         qui_dag_id_overflow();
     }
     dag_id
@@ -903,13 +912,12 @@ fn next_qui_dag_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
     use std::any::Any;
-    use std::future::Future;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     use std::thread;
     use std::time::Duration;
     use std::{panic, panic::AssertUnwindSafe};
@@ -957,31 +965,33 @@ mod tests {
         }
     }
 
-    fn noop_waker() -> Waker {
-        unsafe fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
+    #[test]
+    fn test_next_qui_dag_id_from_allocates_monotonic_ids() {
+        let counter = AtomicU64::new(1);
 
-        unsafe fn wake(_: *const ()) {}
-
-        unsafe fn wake_by_ref(_: *const ()) {}
-
-        unsafe fn drop(_: *const ()) {}
-
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        assert_eq!(next_qui_dag_id_from(&counter), 1);
+        assert_eq!(next_qui_dag_id_from(&counter), 2);
+        assert_eq!(next_qui_dag_id_from(&counter), 3);
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
     }
 
-    fn block_on<F: Future>(future: F) -> F::Output {
-        let waker = noop_waker();
-        let mut future = std::pin::pin!(future);
-        let mut cx = Context::from_waker(&waker);
-        loop {
-            match future.as_mut().poll(&mut cx) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => thread::yield_now(),
-            }
-        }
+    #[test]
+    fn test_next_qui_dag_id_from_panics_at_isize_max_boundary() {
+        let counter = AtomicU64::new(MAX_QUI_DAG_ID - 1);
+
+        assert_eq!(next_qui_dag_id_from(&counter), MAX_QUI_DAG_ID - 1);
+        let res = panic::catch_unwind(AssertUnwindSafe(|| next_qui_dag_id_from(&counter)));
+        assert!(res.is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), MAX_QUI_DAG_ID);
+    }
+
+    #[test]
+    fn test_next_qui_dag_id_from_overflow_rollback_preserves_counter() {
+        let counter = AtomicU64::new(MAX_QUI_DAG_ID);
+
+        let res = panic::catch_unwind(AssertUnwindSafe(|| next_qui_dag_id_from(&counter)));
+        assert!(res.is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), MAX_QUI_DAG_ID);
     }
 
     #[test]
@@ -1427,15 +1437,37 @@ mod tests {
         drop(worker);
         drop(resource);
 
+        let (release_start_tx, release_start_rx) = mpsc::channel();
+        let (release_done_tx, release_done_rx) = mpsc::channel();
         let release_handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
-            release.store(true, Ordering::Release);
+            if release_start_rx.recv().is_ok() {
+                release.store(true, Ordering::Release);
+                release_done_tx.send(()).unwrap();
+            }
         });
 
-        let started = std::time::Instant::now();
+        let (drop_done_tx, drop_done_rx) = mpsc::channel();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let watchdog = thread::spawn(move || {
+            let blocked = drop_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err();
+            blocked_tx.send(blocked).unwrap();
+            if blocked {
+                release_start_tx.send(()).unwrap();
+            }
+        });
+
         drop(dag);
-        assert!(started.elapsed() >= Duration::from_millis(100));
+        let _ = drop_done_tx.send(());
+
+        assert!(blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        release_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         assert!(dropped.load(Ordering::Acquire));
+
+        watchdog.join().unwrap();
         release_handle.join().unwrap();
     }
 
