@@ -10,6 +10,7 @@ use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::{
     deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays, madvise_dontneed,
 };
+use crate::engine::StaticHandle;
 use crate::error::Validation::Valid;
 use crate::error::{Error, PersistedFileKind, Result, Validation};
 use crate::file::multi_table_file::MultiTableFile;
@@ -1018,7 +1019,7 @@ pub struct ReadonlyBufferPool {
     file_id: ReadonlyFileID,
     file_kind: PersistedFileKind,
     page_source: Arc<dyn ReadonlyPageSource>,
-    global: &'static GlobalReadonlyBufferPool,
+    global: StaticHandle<GlobalReadonlyBufferPool>,
 }
 
 impl ReadonlyBufferPool {
@@ -1033,11 +1034,24 @@ impl ReadonlyBufferPool {
     where
         S: ReadonlyPageSource + 'static,
     {
+        Self::new_with_handle(file_id, file_kind, page_source, global)
+    }
+
+    #[inline]
+    pub(crate) fn new_with_handle<S>(
+        file_id: ReadonlyFileID,
+        file_kind: PersistedFileKind,
+        page_source: Arc<S>,
+        global: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+    ) -> Self
+    where
+        S: ReadonlyPageSource + 'static,
+    {
         ReadonlyBufferPool {
             file_id,
             file_kind,
             page_source,
-            global,
+            global: global.into(),
         }
     }
 
@@ -1059,17 +1073,16 @@ impl ReadonlyBufferPool {
         mode: LatchFallbackMode,
     ) -> Result<FacadePageGuard<T>> {
         let key = self.cache_key(page_id);
+        let global = self.global.as_static();
         loop {
-            let frame_id = self
-                .global
+            let frame_id = global
                 .get_or_load_frame_id(key, Arc::clone(&self.page_source))
                 .await?;
-            let guard = self.global.get_page_internal(frame_id, mode).await?;
-            if self.global.validate_guarded_frame_key(&guard, key) {
+            let guard = global.get_page_internal(frame_id, mode).await?;
+            if global.validate_guarded_frame_key(&guard, key) {
                 return Ok(guard);
             }
-            self.global
-                .invalidate_stale_mapping_if_same_frame(key, frame_id);
+            global.invalidate_stale_mapping_if_same_frame(key, frame_id);
         }
     }
 
@@ -1085,9 +1098,9 @@ impl ReadonlyBufferPool {
         validator: ReadonlyPageValidator,
     ) -> Result<PageSharedGuard<Page>> {
         let key = self.cache_key(page_id);
+        let global = self.global.as_static();
         loop {
-            let frame_id = self
-                .global
+            let frame_id = global
                 .get_or_load_frame_id_validated(
                     key,
                     Arc::clone(&self.page_source),
@@ -1095,13 +1108,11 @@ impl ReadonlyBufferPool {
                     validator,
                 )
                 .await?;
-            let guard = self
-                .global
+            let guard = global
                 .get_page_internal::<Page>(frame_id, LatchFallbackMode::Shared)
                 .await?;
-            if !self.global.validate_guarded_frame_key(&guard, key) {
-                self.global
-                    .invalidate_stale_mapping_if_same_frame(key, frame_id);
+            if !global.validate_guarded_frame_key(&guard, key) {
+                global.invalidate_stale_mapping_if_same_frame(key, frame_id);
                 continue;
             }
             if let Some(shared) = guard.lock_shared_async().await {

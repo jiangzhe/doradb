@@ -1,5 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::catalog::TableID;
+use crate::engine::StaticHandle;
 use crate::row::{INVALID_ROW_ID, RowID};
 use crate::trx::TrxID;
 use crate::trx::sys::TransactionSystem;
@@ -55,7 +56,7 @@ pub(super) struct ParentPosition<G> {
 }
 
 pub(super) struct RedoLogPageCommitter {
-    trx_sys: &'static TransactionSystem,
+    trx_sys: StaticHandle<TransactionSystem>,
     table_id: TableID,
 }
 
@@ -63,7 +64,7 @@ impl Clone for RedoLogPageCommitter {
     #[inline]
     fn clone(&self) -> Self {
         RedoLogPageCommitter {
-            trx_sys: self.trx_sys,
+            trx_sys: self.trx_sys.clone(),
             table_id: self.table_id,
         }
     }
@@ -71,8 +72,11 @@ impl Clone for RedoLogPageCommitter {
 
 impl RedoLogPageCommitter {
     #[inline]
-    pub fn new(trx_sys: &'static TransactionSystem, table_id: TableID) -> Self {
-        RedoLogPageCommitter { trx_sys, table_id }
+    pub fn new(trx_sys: impl Into<StaticHandle<TransactionSystem>>, table_id: TableID) -> Self {
+        RedoLogPageCommitter {
+            trx_sys: trx_sys.into(),
+            table_id,
+        }
     }
 
     #[inline]

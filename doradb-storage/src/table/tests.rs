@@ -1593,8 +1593,8 @@ fn test_data_checkpoint_error_rollback() {
 }
 
 struct TestSys {
-    engine: Engine,
     table: Arc<Table>,
+    engine: Engine,
     _temp_dir: TempDir,
 }
 
