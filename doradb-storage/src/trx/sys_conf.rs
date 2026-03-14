@@ -70,6 +70,11 @@ pub(crate) struct PendingTransactionSystem {
 
 impl PendingTransactionSystem {
     #[inline]
+    pub(crate) fn trx_sys(&self) -> &'static TransactionSystem {
+        self.trx_sys
+    }
+
+    #[inline]
     pub(crate) async fn start(self) -> &'static TransactionSystem {
         self.trx_sys
             .catalog
