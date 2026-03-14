@@ -4,6 +4,7 @@ use crate::buffer::guard::{
 use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::{TableID, TableMetadata};
+use crate::engine::StaticHandle;
 use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
@@ -339,7 +340,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     pub(crate) fn enable_page_committer(
         &self,
         table_id: TableID,
-        trx_sys: &'static TransactionSystem,
+        trx_sys: impl Into<StaticHandle<TransactionSystem>>,
     ) {
         let mut g = self.page_committer.lock();
         *g = Some(RedoLogPageCommitter::new(trx_sys, table_id))

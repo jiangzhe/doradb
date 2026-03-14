@@ -1,6 +1,7 @@
 use crate::buffer::{EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
 use crate::catalog::Catalog;
 use crate::catalog::storage::CatalogStorage;
+use crate::engine::StaticHandle;
 use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
 use crate::io::{AIOContext, align_to_sector_size};
@@ -62,29 +63,24 @@ pub struct TrxSysConfig {
 }
 
 pub(crate) struct PendingTransactionSystem {
-    trx_sys: &'static TransactionSystem,
+    pub(crate) trx_sys: StaticHandle<TransactionSystem>,
     gc_rxs: Vec<Receiver<GC>>,
     purge_rx: Receiver<Purge>,
-    mem_pool: &'static EvictableBufferPool,
+    mem_pool: StaticHandle<EvictableBufferPool>,
 }
 
 impl PendingTransactionSystem {
     #[inline]
-    pub(crate) fn trx_sys(&self) -> &'static TransactionSystem {
-        self.trx_sys
-    }
-
-    #[inline]
     pub(crate) async fn start(self) -> &'static TransactionSystem {
-        self.trx_sys
+        let trx_sys = self.trx_sys.as_static();
+        trx_sys
             .catalog
-            .enable_page_committer_for_tables(self.trx_sys)
+            .enable_page_committer_for_tables(self.trx_sys.clone())
             .await;
-        self.trx_sys.start_io_threads();
-        self.trx_sys.start_gc_threads(self.gc_rxs);
-        self.trx_sys
-            .start_purge_threads(self.mem_pool, self.purge_rx);
-        self.trx_sys
+        trx_sys.start_io_threads();
+        trx_sys.start_gc_threads(self.gc_rxs);
+        trx_sys.start_purge_threads(self.mem_pool.as_static(), self.purge_rx);
+        trx_sys
     }
 }
 
@@ -224,10 +220,12 @@ impl TrxSysConfig {
         self,
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: impl Into<StaticHandle<EvictableBufferPool>>,
         table_fs: &'static TableFileSystem,
-        global_disk_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
     ) -> Result<PendingTransactionSystem> {
+        let mem_pool = mem_pool.into();
+        let global_disk_pool = global_disk_pool.into();
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
             let initializer = self.log_partition_initializer(idx)?;
@@ -235,14 +233,14 @@ impl TrxSysConfig {
         }
 
         let catalog_storage =
-            CatalogStorage::new(meta_pool, index_pool, table_fs, global_disk_pool).await?;
+            CatalogStorage::new(meta_pool, index_pool, table_fs, global_disk_pool.clone()).await?;
         let mut catalog = Catalog::new(catalog_storage);
 
         // Now we have an empty catalog, all log partitions and buffer pool.
         // Recover all committed data if required.
         let (log_partitions, gc_rxs) = log_recover(
             index_pool,
-            mem_pool,
+            mem_pool.as_static(),
             table_fs,
             global_disk_pool,
             &mut catalog,
@@ -255,7 +253,7 @@ impl TrxSysConfig {
         let trx_sys = TransactionSystem::new(self, catalog, log_partitions, purge_chan);
         let trx_sys = StaticLifetime::new_static(trx_sys);
         Ok(PendingTransactionSystem {
-            trx_sys,
+            trx_sys: trx_sys.into(),
             gc_rxs,
             purge_rx,
             mem_pool,

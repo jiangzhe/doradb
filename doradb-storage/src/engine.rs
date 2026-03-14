@@ -9,7 +9,7 @@ use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
 use crate::lifetime::StaticLifetime;
-use crate::quiescent::{QuiDAG, QuiHandle};
+use crate::quiescent::{QuiDAG, QuiDep, QuiHandle};
 use crate::session::Session;
 use crate::storage_path::ResolvedStoragePaths;
 use crate::trx::sys::TransactionSystem;
@@ -90,6 +90,11 @@ impl<T: StaticLifetime + 'static> StaticOwner<T> {
     fn new(inner: &'static T) -> Self {
         Self { inner }
     }
+
+    #[inline]
+    pub(crate) fn as_static(&self) -> &'static T {
+        self.inner
+    }
 }
 
 impl<T: StaticLifetime + 'static> Drop for StaticOwner<T> {
@@ -100,6 +105,55 @@ impl<T: StaticLifetime + 'static> Drop for StaticOwner<T> {
         unsafe {
             StaticLifetime::drop_static(self.inner);
         }
+    }
+}
+
+pub(crate) struct StaticHandle<T: StaticLifetime + 'static> {
+    inner: &'static T,
+    owner: Option<QuiDep<StaticOwner<T>>>,
+}
+
+impl<T: StaticLifetime + 'static> StaticHandle<T> {
+    #[inline]
+    pub(crate) fn as_static(&self) -> &'static T {
+        self.inner
+    }
+}
+
+impl<T: StaticLifetime + 'static> Clone for StaticHandle<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner,
+            owner: self.owner.clone(),
+        }
+    }
+}
+
+impl<T: StaticLifetime + 'static> From<&'static T> for StaticHandle<T> {
+    #[inline]
+    fn from(inner: &'static T) -> Self {
+        Self { inner, owner: None }
+    }
+}
+
+impl<T: StaticLifetime + 'static> From<QuiDep<StaticOwner<T>>> for StaticHandle<T> {
+    #[inline]
+    fn from(owner: QuiDep<StaticOwner<T>>) -> Self {
+        let inner = owner.as_static();
+        Self {
+            inner,
+            owner: Some(owner),
+        }
+    }
+}
+
+impl<T: StaticLifetime + 'static> Deref for StaticHandle<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.inner
     }
 }
 
@@ -257,29 +311,38 @@ impl EngineConfig {
         );
         let mem_pool_h = insert_static_owner(&mut dag, "mem_pool", mem_pool)?;
 
-        let pending_trx_sys = self
-            .trx
-            .log_dir(resolved.log_dir_path())
-            .prepare_static(meta_pool, index_pool, mem_pool, table_fs, disk_pool)
+        let trx_cfg = self.trx.log_dir(resolved.log_dir_path());
+        let mem_pool_h_for_trx = mem_pool_h.clone();
+        let disk_pool_h_for_trx = disk_pool_h.clone();
+        let trx_sys_h = dag
+            .node("trx_sys")?
+            .depends_on(&meta_pool_h)?
+            .depends_on(&index_pool_h)?
+            .depends_on(&mem_pool_h)?
+            .depends_on(&table_fs_h)?
+            .depends_on(&disk_pool_h)?
+            .build_async(move |deps| async move {
+                let pending_trx_sys = trx_cfg
+                    .prepare_static(
+                        meta_pool,
+                        index_pool,
+                        StaticHandle::from(deps.dep(&mem_pool_h_for_trx)),
+                        table_fs,
+                        StaticHandle::from(deps.dep(&disk_pool_h_for_trx)),
+                    )
+                    .await?;
+                let trx_sys = pending_trx_sys.start().await;
+                Ok::<StaticOwner<TransactionSystem>, crate::error::Error>(StaticOwner::new(trx_sys))
+            })
             .await?;
-        let trx_sys = pending_trx_sys.trx_sys();
-        let trx_sys_h = dag.insert_with_deps(
-            "trx_sys",
-            StaticOwner::new(trx_sys),
-            [
-                meta_pool_h.id(),
-                index_pool_h.id(),
-                mem_pool_h.id(),
-                table_fs_h.id(),
-                disk_pool_h.id(),
-            ],
-        )?;
         dag.drop_before(table_fs_h.id(), disk_pool_h.id())?;
         dag.seal()?;
 
         resolved.persist_marker_if_missing()?;
-        let started_trx_sys = pending_trx_sys.start().await;
-        debug_assert!(std::ptr::eq(started_trx_sys, trx_sys));
+        let started_trx_sys = {
+            let trx_sys_guard = trx_sys_h.guard();
+            trx_sys_guard.as_static()
+        };
         drop((
             trx_sys_h,
             mem_pool_h,
@@ -655,7 +718,7 @@ mod tests {
             // SAFETY: this test exercises the failed-startup cleanup path where
             // the leaked transaction system is dropped before `start()` runs.
             unsafe {
-                StaticLifetime::drop_static(pending.trx_sys());
+                StaticLifetime::drop_static(pending.trx_sys.as_static());
             }
             drop(pending);
         });

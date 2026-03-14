@@ -12,6 +12,7 @@ pub use table::*;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
@@ -147,21 +148,25 @@ impl Catalog {
     /// Enable page committer for tables, excluding catalog tables.
     /// No page creation should be persisted in redo log for catalog tables.
     #[inline]
-    pub async fn enable_page_committer_for_tables(&self, trx_sys: &'static TransactionSystem) {
+    pub(crate) async fn enable_page_committer_for_tables(
+        &self,
+        trx_sys: StaticHandle<TransactionSystem>,
+    ) {
         for entry in &self.user_tables {
-            entry.value().enable_page_committer(trx_sys);
+            entry.value().enable_page_committer(trx_sys.clone());
         }
     }
 
     /// Reload one user table runtime from catalog metadata and table file.
-    pub async fn reload_create_table(
+    pub(crate) async fn reload_create_table(
         &self,
         mem_pool: &'static EvictableBufferPool,
         index_pool: &'static FixedBufferPool,
         table_fs: &'static TableFileSystem,
-        global_disk_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
         table_id: TableID,
     ) -> Result<()> {
+        let global_disk_pool = global_disk_pool.into();
         if self.user_tables.contains_key(&table_id) {
             return Err(Error::TableAlreadyExists);
         }
@@ -247,7 +252,7 @@ impl Catalog {
                     Table::new(
                         mem_pool,
                         index_pool,
-                        global_disk_pool,
+                        global_disk_pool.clone(),
                         table.table_id,
                         blk_idx,
                         table_file,

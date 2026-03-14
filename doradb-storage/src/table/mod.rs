@@ -17,6 +17,7 @@ use crate::buffer::{
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
+use crate::engine::StaticHandle;
 use crate::error::{PersistedFileKind, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::Maskable;
@@ -176,7 +177,10 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
-    pub fn enable_page_committer(&self, trx_sys: &'static TransactionSystem) {
+    pub(crate) fn enable_page_committer(
+        &self,
+        trx_sys: impl Into<StaticHandle<TransactionSystem>>,
+    ) {
         self.blk_idx.enable_page_committer(self.table_id, trx_sys)
     }
 
@@ -262,9 +266,9 @@ impl ColumnStorage {
     pub(crate) fn new(
         table_id: TableID,
         file: Arc<TableFile>,
-        global_disk_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
     ) -> Self {
-        let disk_pool = ReadonlyBufferPool::new(
+        let disk_pool = ReadonlyBufferPool::new_with_handle(
             table_id,
             PersistedFileKind::TableFile,
             Arc::clone(&file),
@@ -296,14 +300,15 @@ impl ColumnStorage {
 impl Table {
     /// Create a new table.
     #[inline]
-    pub async fn new(
+    pub(crate) async fn new(
         mem_pool: &'static EvictableBufferPool,
         index_pool: &'static FixedBufferPool,
-        global_disk_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
         table_id: TableID,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
     ) -> Self {
+        let global_disk_pool = global_disk_pool.into();
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
         let mem = GenericMemTable::new(
@@ -345,7 +350,10 @@ impl Table {
         GenericMemTable::find_row(self, row_id, Some(&self.storage)).await
     }
     #[inline]
-    pub(crate) fn enable_page_committer(&self, trx_sys: &'static TransactionSystem) {
+    pub(crate) fn enable_page_committer(
+        &self,
+        trx_sys: impl Into<StaticHandle<TransactionSystem>>,
+    ) {
         GenericMemTable::enable_page_committer(self, trx_sys)
     }
 

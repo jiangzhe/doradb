@@ -188,13 +188,13 @@ Targeted performance regression checks for optimistic B+Tree lookup should accom
   - Implementation Summary: Adopted a private QuiDAG as the engine owner for leaked-static top-level components, moved engine startup to staged DAG assembly with explicit trx_sys and table_fs -> disk_pool ordering, and hardened failed-startup cleanup for unstarted TransactionSystem teardown. [Task Resolve Sync: docs/tasks/000067-engine-dag-adoption.md @ 2026-03-14]
 
 - **Phase 2: Worker And Component Handle Migration**
-  - Scope: Convert long-lived runtime captures and startup/shutdown paths to `QuiDep`/quiescent handles, including transaction-system background workers, purge dependencies, and file-system/readonly-pool interactions that currently rely on external drop ordering.
-  - Goals: Ensure runtime dependency lifetimes are represented explicitly instead of by leaked-static references or teardown comments.
-  - Non-goals: No buffer-page guard refactor yet; no public API cleanup for table/index callers.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Scope: Convert long-lived runtime handle storage and startup/recovery capture paths to the transitional quiescent bridge layer, especially for readonly-pool dependencies and other cross-component stored handles, while keeping transaction-system worker ownership and shutdown inside `TransactionSystem`.
+  - Goals: Represent long-lived stored component dependencies explicitly instead of relying on bare leaked-static captures or teardown comments.
+  - Non-goals: No transaction-system worker extraction yet; no buffer-page guard refactor; no public API cleanup for broad table/index callers.
+  - Task Doc: `docs/tasks/000068-worker-and-component-handle-migration.md`
+  - Task Issue: `#428`
+  - Phase Status: done
+  - Implementation Summary: Extended the transitional StaticOwner bridge into StaticHandle, migrated readonly and recovery/startup handle storage off bare &'static captures, and kept TransactionSystem worker ownership/shutdown unchanged in this phase. [Task Resolve Sync: docs/tasks/000068-worker-and-component-handle-migration.md @ 2026-03-14]
 
 - **Phase 3: Buffer-Pool Arena Ownership And Lifetime-Free Page Guards**
   - Scope: Introduce `QuiescentArena` for fixed, evictable, and readonly pool frame/page memory; replace `HybridGuard<'static>` storage in buffer page guards with lifetime-free page guards under an arena-lease contract; preserve current page-latch optimistic behavior.

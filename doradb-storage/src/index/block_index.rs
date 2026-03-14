@@ -2,6 +2,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool};
 use crate::catalog::TableMetadata;
+use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
@@ -58,7 +59,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub(crate) fn enable_page_committer(
         &self,
         table_id: crate::catalog::TableID,
-        trx_sys: &'static TransactionSystem,
+        trx_sys: impl Into<StaticHandle<TransactionSystem>>,
     ) {
         self.row.enable_page_committer(table_id, trx_sys)
     }

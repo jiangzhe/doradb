@@ -14,6 +14,7 @@ pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
+use crate::engine::StaticHandle;
 use crate::error::{PersistedFileKind, Result};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
@@ -38,15 +39,16 @@ pub struct CatalogStorage {
 impl CatalogStorage {
     /// Open or initialize catalog storage and bootstrap catalog table runtimes.
     #[inline]
-    pub async fn new(
+    pub(crate) async fn new(
         meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
         table_fs: &'static TableFileSystem,
-        global_disk_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
     ) -> Result<Self> {
+        let global_disk_pool = global_disk_pool.into();
         let mtb = table_fs.open_or_create_multi_table_file().await?;
         let mtb_snapshot = mtb.load_snapshot()?;
-        let disk_pool = ReadonlyBufferPool::new(
+        let disk_pool = ReadonlyBufferPool::new_with_handle(
             CATALOG_MTB_READONLY_FILE_ID,
             PersistedFileKind::CatalogMultiTableFile,
             Arc::clone(&mtb),

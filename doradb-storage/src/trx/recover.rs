@@ -18,6 +18,7 @@ use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, GlobalRead
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
 };
+use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
@@ -116,11 +117,12 @@ pub(super) async fn log_recover(
     index_pool: &'static FixedBufferPool,
     mem_pool: &'static EvictableBufferPool,
     table_fs: &'static TableFileSystem,
-    global_disk_pool: &'static GlobalReadonlyBufferPool,
+    global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
     catalog: &mut Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
 ) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>)> {
+    let global_disk_pool = global_disk_pool.into();
     // In recovery, we disable GC and redo logging.
     // All data are purely processed in memory and if
     // any failure occurs, we abort the whole process.
@@ -161,7 +163,7 @@ pub struct LogRecovery<'a> {
     index_pool: &'static FixedBufferPool,
     mem_pool: &'static EvictableBufferPool,
     table_fs: &'static TableFileSystem,
-    global_disk_pool: &'static GlobalReadonlyBufferPool,
+    global_disk_pool: StaticHandle<GlobalReadonlyBufferPool>,
     catalog: &'a mut Catalog,
     log_merger: LogMerger,
     catalog_replay_start_ts: TrxID,
@@ -178,11 +180,11 @@ struct RecoveryTableState {
 
 impl<'a> LogRecovery<'a> {
     #[inline]
-    pub fn new(
+    fn new(
         index_pool: &'static FixedBufferPool,
         mem_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
-        global_disk_pool: &'static GlobalReadonlyBufferPool,
+        global_disk_pool: StaticHandle<GlobalReadonlyBufferPool>,
         catalog: &'a mut Catalog,
         log_merger: LogMerger,
     ) -> Self {
@@ -227,7 +229,7 @@ impl<'a> LogRecovery<'a> {
                     self.mem_pool,
                     self.index_pool,
                     self.table_fs,
-                    self.global_disk_pool,
+                    self.global_disk_pool.clone(),
                     table.table_id,
                 )
                 .await?;
@@ -362,7 +364,7 @@ impl<'a> LogRecovery<'a> {
                         self.mem_pool,
                         self.index_pool,
                         self.table_fs,
-                        self.global_disk_pool,
+                        self.global_disk_pool.clone(),
                         *table_id,
                     )
                     .await?;
@@ -683,6 +685,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(table.metadata(), &expected_metadata);
 
+            drop(table);
             drop(engine);
         })
     }
@@ -809,6 +812,7 @@ mod tests {
                 .await;
             assert_eq!(rows, DML_SIZE - (DML_SIZE / DEL_STEP + 1));
 
+            drop(table);
             drop(engine);
         })
     }
