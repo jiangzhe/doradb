@@ -613,6 +613,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let data_dir = temp_dir.path().join("data");
             let log_dir = temp_dir.path().join("log");
+            let swap_file = temp_dir.path().join("data.bin");
             fs::create_dir_all(&data_dir).unwrap();
             fs::create_dir_all(&log_dir).unwrap();
             let scope = StaticLifetimeScope::new();
@@ -628,6 +629,7 @@ mod tests {
                 scope.adopt(FixedBufferPool::with_capacity_static(TEST_POOL_BYTES).unwrap());
             let mem_pool = scope.adopt(
                 EvictableBufferPoolConfig::default()
+                    .data_swap_file(&swap_file)
                     .max_mem_size(TEST_POOL_BYTES)
                     .max_file_size(128usize * 1024 * 1024)
                     .build_static()

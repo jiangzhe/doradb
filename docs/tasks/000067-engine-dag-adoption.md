@@ -1,7 +1,7 @@
 ---
 id: 000067
 title: Engine DAG Adoption
-status: proposal
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-14
 github_issue: 426
 ---
@@ -157,6 +157,42 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented private engine-owned DAG wrappers in
+   `doradb-storage/src/engine.rs`:
+   - `StaticOwner<T>` owns one leaked `&'static T` and drops it via
+     `StaticLifetime::drop_static(...)`;
+   - `EngineOwners` stores the sealed `QuiDAG` alongside the unchanged public
+     `EngineInner` `&'static` component fields.
+2. Refactored `EngineConfig::build` into staged DAG assembly:
+   - register `disk_pool`, `table_fs`, `meta_pool`, `index_pool`, and
+     `mem_pool` immediately after construction so late startup failures clean
+     up previously built statics;
+   - register the leaked `trx_sys` before final startup;
+   - add explicit `trx_sys` dependency edges plus the teardown-only
+     `table_fs -> disk_pool` ordering edge;
+   - seal the DAG before persisting the storage marker and calling
+     `PendingTransactionSystem::start()`.
+3. Removed the handwritten `drop_static` sequence from `Engine::drop`; engine
+   teardown now depends on the private DAG owner while preserving the
+   leaked-`EngineRef` panic contract.
+4. Added `PendingTransactionSystem::trx_sys()` and hardened
+   `TransactionSystem::drop` so failed-startup cleanup is safe even when the
+   transaction-system IO/GC threads were never started.
+5. Added engine-local regression coverage for:
+   - sealed DAG drop order (`trx_sys` before all dependencies and `table_fs`
+     before `disk_pool`);
+   - unsealed partial-build cleanup using reverse insertion order;
+   - failed-startup cleanup dropping an unstarted transaction system safely in
+     both default-feature and `--no-default-features` test passes.
+6. Verified with:
+```bash
+cargo fmt --all
+cargo test -p doradb-storage engine -- --nocapture
+cargo test -p doradb-storage trx::sys -- --nocapture
+cargo test -p doradb-storage
+cargo test -p doradb-storage --no-default-features
+```
+
 ## Impacts
 
 1. `doradb-storage/src/engine.rs`
@@ -195,8 +231,10 @@ cargo test -p doradb-storage --no-default-features
 
 ## Open Questions
 
-1. If implementation uncovers additional real top-level teardown dependencies
-   beyond `trx_sys` and `table_fs -> disk_pool`, they should be added with
-   explicit tests and documented rationale.
+1. This phase keeps `table_fs` and `disk_pool` as separate engine DAG nodes
+   with an explicit ordering edge. A later RFC-0008 phase can revisit whether
+   readonly-pool ownership should move under `TableFileSystem` once broader
+   worker and lease refactors reach that area.
 2. Worker dependency handles and non-static engine component APIs remain for
-   later RFC-0008 phases and must not be folded into this task opportunistically.
+   later RFC-0008 phases and must not be folded into this task
+   opportunistically.

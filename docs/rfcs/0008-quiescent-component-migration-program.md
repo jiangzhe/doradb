@@ -182,10 +182,10 @@ Targeted performance regression checks for optimistic B+Tree lookup should accom
   - Scope: Replace top-level leaked-static engine ownership with `QuiDAG`-managed component owners and validated dependency/ordering edges for `TransactionSystem`, the three mutable pools, `TableFileSystem`, and the global readonly pool. Keep `Catalog` nested inside `TransactionSystem`.
   - Goals: Remove handwritten engine teardown order and establish one authoritative quiescent ownership graph for the engine root.
   - Non-goals: No buffer-pool API redesign yet; no graceful-shutdown state machine.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000067-engine-dag-adoption.md`
+  - Task Issue: `#426`
+  - Phase Status: done
+  - Implementation Summary: Adopted a private QuiDAG as the engine owner for leaked-static top-level components, moved engine startup to staged DAG assembly with explicit trx_sys and table_fs -> disk_pool ordering, and hardened failed-startup cleanup for unstarted TransactionSystem teardown. [Task Resolve Sync: docs/tasks/000067-engine-dag-adoption.md @ 2026-03-14]
 
 - **Phase 2: Worker And Component Handle Migration**
   - Scope: Convert long-lived runtime captures and startup/shutdown paths to `QuiDep`/quiescent handles, including transaction-system background workers, purge dependencies, and file-system/readonly-pool interactions that currently rely on external drop ordering.
