@@ -497,10 +497,12 @@ impl Drop for TransactionSystem {
         }
         // wait for sync thread and GC thread to quit.
         for partition in log_partitions {
-            let sync_thread = { partition.io_thread.lock().take().unwrap() };
-            sync_thread.join().unwrap();
-            let gc_thread = { partition.gc_thread.lock().take().unwrap() };
-            gc_thread.join().unwrap();
+            if let Some(sync_thread) = partition.io_thread.lock().take() {
+                sync_thread.join().unwrap();
+            }
+            if let Some(gc_thread) = partition.gc_thread.lock().take() {
+                gc_thread.join().unwrap();
+            }
         }
         // notify purge threads and wait for them to quit.
         {

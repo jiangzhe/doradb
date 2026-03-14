@@ -9,6 +9,7 @@ use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
 use crate::lifetime::StaticLifetime;
+use crate::quiescent::{QuiDAG, QuiHandle};
 use crate::session::Session;
 use crate::storage_path::ResolvedStoragePaths;
 use crate::trx::sys::TransactionSystem;
@@ -54,14 +55,6 @@ impl Drop for Engine {
         if Arc::strong_count(&self.0) != 1 {
             panic!("fatal: engine ref is leaked");
         }
-        unsafe {
-            StaticLifetime::drop_static(self.trx_sys);
-            StaticLifetime::drop_static(self.mem_pool);
-            StaticLifetime::drop_static(self.meta_pool);
-            StaticLifetime::drop_static(self.index_pool);
-            StaticLifetime::drop_static(self.table_fs);
-            StaticLifetime::drop_static(self.disk_pool);
-        }
     }
 }
 
@@ -88,6 +81,48 @@ impl EngineRef {
     }
 }
 
+struct StaticOwner<T: StaticLifetime + 'static> {
+    inner: &'static T,
+}
+
+impl<T: StaticLifetime + 'static> StaticOwner<T> {
+    #[inline]
+    fn new(inner: &'static T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: StaticLifetime + 'static> Drop for StaticOwner<T> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: `StaticOwner<T>` owns exactly one leaked `&'static T` created
+        // during engine assembly and is dropped exactly once via the engine DAG.
+        unsafe {
+            StaticLifetime::drop_static(self.inner);
+        }
+    }
+}
+
+struct EngineOwners {
+    _dag: QuiDAG,
+}
+
+impl EngineOwners {
+    #[inline]
+    fn new(dag: QuiDAG) -> Self {
+        Self { _dag: dag }
+    }
+}
+
+// SAFETY: `EngineOwners` is private engine teardown state. The embedded DAG is
+// not exposed through any public API and only drops once the final `Arc` to the
+// enclosing engine has gone away, after the leaked-engine-ref check in
+// `Engine::drop` has ensured no shared engine handles remain.
+unsafe impl Send for EngineOwners {}
+// SAFETY: see `Send` above. Concurrent readers only observe the engine's public
+// component references; the private DAG is not accessed concurrently.
+unsafe impl Sync for EngineOwners {}
+
 pub struct EngineInner {
     pub trx_sys: &'static TransactionSystem,
     // meta pool is used for block index and catalog tables.
@@ -101,10 +136,23 @@ pub struct EngineInner {
     pub table_fs: &'static TableFileSystem,
     // Global readonly buffer pool for table-file page reads.
     pub disk_pool: &'static GlobalReadonlyBufferPool,
+    _owners: EngineOwners,
 }
 
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
+
+#[inline]
+fn insert_static_owner<T>(
+    dag: &mut QuiDAG,
+    name: impl Into<String>,
+    inner: &'static T,
+) -> Result<QuiHandle<StaticOwner<T>>>
+where
+    T: StaticLifetime + 'static,
+{
+    Ok(dag.insert(name, StaticOwner::new(inner))?)
+}
 
 const DEFAULT_META_BUFFER: usize = 32 * 1024 * 1024;
 const DEFAULT_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
@@ -186,33 +234,68 @@ impl EngineConfig {
 
         let file = self.file.data_dir(resolved.data_dir_path());
         let readonly_buffer_size = file.readonly_buffer_size;
-        let table_fs = file.build()?;
-        let table_fs = StaticLifetime::new_static(table_fs);
-        // todo: avoid resource leak when errors occur.
+        let mut dag = QuiDAG::new();
+
+        let disk_pool = GlobalReadonlyBufferPool::with_capacity_static(readonly_buffer_size)?;
+        let disk_pool_h = insert_static_owner(&mut dag, "disk_pool", disk_pool)?;
+
+        let table_fs = StaticLifetime::new_static(file.build()?);
+        let table_fs_h = insert_static_owner(&mut dag, "table_fs", table_fs)?;
+
         let meta_pool = FixedBufferPool::with_capacity_static(self.meta_buffer.as_u64() as usize)?;
+        let meta_pool_h = insert_static_owner(&mut dag, "meta_pool", meta_pool)?;
+
         // todo: implement index pool
         let index_pool =
             FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
-        let mem_pool = self
-            .data_buffer
-            .data_swap_file(resolved.data_swap_file_path())
-            .build()?;
-        let mem_pool = StaticLifetime::new_static(mem_pool);
-        let disk_pool = GlobalReadonlyBufferPool::with_capacity_static(readonly_buffer_size)?;
+        let index_pool_h = insert_static_owner(&mut dag, "index_pool", index_pool)?;
+
+        let mem_pool = StaticLifetime::new_static(
+            self.data_buffer
+                .data_swap_file(resolved.data_swap_file_path())
+                .build()?,
+        );
+        let mem_pool_h = insert_static_owner(&mut dag, "mem_pool", mem_pool)?;
+
         let pending_trx_sys = self
             .trx
             .log_dir(resolved.log_dir_path())
             .prepare_static(meta_pool, index_pool, mem_pool, table_fs, disk_pool)
             .await?;
+        let trx_sys = pending_trx_sys.trx_sys();
+        let trx_sys_h = dag.insert_with_deps(
+            "trx_sys",
+            StaticOwner::new(trx_sys),
+            [
+                meta_pool_h.id(),
+                index_pool_h.id(),
+                mem_pool_h.id(),
+                table_fs_h.id(),
+                disk_pool_h.id(),
+            ],
+        )?;
+        dag.drop_before(table_fs_h.id(), disk_pool_h.id())?;
+        dag.seal()?;
+
         resolved.persist_marker_if_missing()?;
-        let trx_sys = pending_trx_sys.start().await;
+        let started_trx_sys = pending_trx_sys.start().await;
+        debug_assert!(std::ptr::eq(started_trx_sys, trx_sys));
+        drop((
+            trx_sys_h,
+            mem_pool_h,
+            index_pool_h,
+            meta_pool_h,
+            table_fs_h,
+            disk_pool_h,
+        ));
         Ok(Engine(Arc::new(EngineInner {
-            trx_sys,
+            trx_sys: started_trx_sys,
             meta_pool,
             index_pool,
             mem_pool,
             table_fs,
             disk_pool,
+            _owners: EngineOwners::new(dag),
         })))
     }
 }
@@ -221,8 +304,10 @@ impl EngineConfig {
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::lifetime::StaticLifetimeScope;
     use crate::storage_path::STORAGE_LAYOUT_FILE_NAME;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
@@ -368,6 +453,209 @@ mod tests {
                 .unwrap();
             drop(engine);
             assert!(marker_path.exists());
+        });
+    }
+
+    struct DropOrderStatic {
+        name: &'static str,
+        drops: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropOrderStatic {
+        fn drop(&mut self) {
+            self.drops.lock().unwrap().push(self.name);
+        }
+    }
+
+    unsafe impl StaticLifetime for DropOrderStatic {}
+
+    #[test]
+    fn test_engine_owner_dag_enforces_runtime_and_order_only_edges() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let mut dag = QuiDAG::new();
+
+        let disk_pool = StaticLifetime::new_static(DropOrderStatic {
+            name: "disk_pool",
+            drops: Arc::clone(&drops),
+        });
+        let disk_pool_h = insert_static_owner(&mut dag, "disk_pool", disk_pool).unwrap();
+
+        let table_fs = StaticLifetime::new_static(DropOrderStatic {
+            name: "table_fs",
+            drops: Arc::clone(&drops),
+        });
+        let table_fs_h = insert_static_owner(&mut dag, "table_fs", table_fs).unwrap();
+
+        let meta_pool = StaticLifetime::new_static(DropOrderStatic {
+            name: "meta_pool",
+            drops: Arc::clone(&drops),
+        });
+        let meta_pool_h = insert_static_owner(&mut dag, "meta_pool", meta_pool).unwrap();
+
+        let index_pool = StaticLifetime::new_static(DropOrderStatic {
+            name: "index_pool",
+            drops: Arc::clone(&drops),
+        });
+        let index_pool_h = insert_static_owner(&mut dag, "index_pool", index_pool).unwrap();
+
+        let mem_pool = StaticLifetime::new_static(DropOrderStatic {
+            name: "mem_pool",
+            drops: Arc::clone(&drops),
+        });
+        let mem_pool_h = insert_static_owner(&mut dag, "mem_pool", mem_pool).unwrap();
+
+        let trx_sys = StaticLifetime::new_static(DropOrderStatic {
+            name: "trx_sys",
+            drops: Arc::clone(&drops),
+        });
+        let trx_sys_h = dag
+            .insert_with_deps(
+                "trx_sys",
+                StaticOwner::new(trx_sys),
+                [
+                    meta_pool_h.id(),
+                    index_pool_h.id(),
+                    mem_pool_h.id(),
+                    table_fs_h.id(),
+                    disk_pool_h.id(),
+                ],
+            )
+            .unwrap();
+        dag.drop_before(table_fs_h.id(), disk_pool_h.id()).unwrap();
+        dag.seal().unwrap();
+        drop((
+            trx_sys_h,
+            mem_pool_h,
+            index_pool_h,
+            meta_pool_h,
+            table_fs_h,
+            disk_pool_h,
+        ));
+        drop(dag);
+
+        let drops = drops.lock().unwrap();
+        let pos = |name| drops.iter().position(|d| *d == name).unwrap();
+        assert!(pos("trx_sys") < pos("meta_pool"));
+        assert!(pos("trx_sys") < pos("index_pool"));
+        assert!(pos("trx_sys") < pos("mem_pool"));
+        assert!(pos("trx_sys") < pos("table_fs"));
+        assert!(pos("trx_sys") < pos("disk_pool"));
+        assert!(pos("table_fs") < pos("disk_pool"));
+    }
+
+    #[test]
+    fn test_engine_owner_dag_unsealed_cleanup_uses_reverse_insertion_order() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let mut dag = QuiDAG::new();
+
+        let disk_pool = StaticLifetime::new_static(DropOrderStatic {
+            name: "disk_pool",
+            drops: Arc::clone(&drops),
+        });
+        let disk_pool_h = insert_static_owner(&mut dag, "disk_pool", disk_pool).unwrap();
+
+        let table_fs = StaticLifetime::new_static(DropOrderStatic {
+            name: "table_fs",
+            drops: Arc::clone(&drops),
+        });
+        let table_fs_h = insert_static_owner(&mut dag, "table_fs", table_fs).unwrap();
+
+        let meta_pool = StaticLifetime::new_static(DropOrderStatic {
+            name: "meta_pool",
+            drops: Arc::clone(&drops),
+        });
+        let meta_pool_h = insert_static_owner(&mut dag, "meta_pool", meta_pool).unwrap();
+
+        let index_pool = StaticLifetime::new_static(DropOrderStatic {
+            name: "index_pool",
+            drops: Arc::clone(&drops),
+        });
+        let index_pool_h = insert_static_owner(&mut dag, "index_pool", index_pool).unwrap();
+
+        let mem_pool = StaticLifetime::new_static(DropOrderStatic {
+            name: "mem_pool",
+            drops: Arc::clone(&drops),
+        });
+        let mem_pool_h = insert_static_owner(&mut dag, "mem_pool", mem_pool).unwrap();
+
+        let trx_sys = StaticLifetime::new_static(DropOrderStatic {
+            name: "trx_sys",
+            drops: Arc::clone(&drops),
+        });
+        let trx_sys_h = insert_static_owner(&mut dag, "trx_sys", trx_sys).unwrap();
+
+        drop((
+            trx_sys_h,
+            mem_pool_h,
+            index_pool_h,
+            meta_pool_h,
+            table_fs_h,
+            disk_pool_h,
+        ));
+        drop(dag);
+
+        assert_eq!(
+            drops.lock().unwrap().as_slice(),
+            &[
+                "trx_sys",
+                "mem_pool",
+                "index_pool",
+                "meta_pool",
+                "table_fs",
+                "disk_pool"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unstarted_transaction_system_drop_is_safe() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let data_dir = temp_dir.path().join("data");
+            let log_dir = temp_dir.path().join("log");
+            fs::create_dir_all(&data_dir).unwrap();
+            fs::create_dir_all(&log_dir).unwrap();
+            let scope = StaticLifetimeScope::new();
+            let table_fs = scope.adopt(StaticLifetime::new_static(
+                TableFileSystemConfig::default()
+                    .data_dir(&data_dir)
+                    .build()
+                    .unwrap(),
+            ));
+            let meta_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(TEST_POOL_BYTES).unwrap());
+            let index_pool =
+                scope.adopt(FixedBufferPool::with_capacity_static(TEST_POOL_BYTES).unwrap());
+            let mem_pool = scope.adopt(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(TEST_POOL_BYTES)
+                    .max_file_size(128usize * 1024 * 1024)
+                    .build_static()
+                    .unwrap(),
+            );
+            let disk_pool = scope
+                .adopt(GlobalReadonlyBufferPool::with_capacity_static(TEST_POOL_BYTES).unwrap());
+
+            let pending = TrxSysConfig::default()
+                .log_dir(&log_dir)
+                .log_file_stem("pending-startup-cleanup")
+                .skip_recovery(true)
+                .prepare_static(
+                    meta_pool.as_static(),
+                    index_pool.as_static(),
+                    mem_pool.as_static(),
+                    table_fs.as_static(),
+                    disk_pool.as_static(),
+                )
+                .await
+                .unwrap();
+
+            // SAFETY: this test exercises the failed-startup cleanup path where
+            // the leaked transaction system is dropped before `start()` runs.
+            unsafe {
+                StaticLifetime::drop_static(pending.trx_sys());
+            }
+            drop(pending);
         });
     }
 }
