@@ -1,5 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::io::AIOError;
+use crate::quiescent::QuiDagError;
 use crate::row::RowID;
 use std::array::TryFromSliceError;
 use std::fmt;
@@ -83,6 +84,8 @@ pub enum Error {
     InternalError,
     #[error("invalid state")]
     InvalidState,
+    #[error("{0}")]
+    QuiescentDag(#[from] QuiDagError),
     #[error("Invalid format")]
     InvalidFormat,
     #[error("Checksum mismatch")]
