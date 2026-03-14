@@ -1,7 +1,7 @@
 ---
 id: 000068
 title: Worker And Component Handle Migration
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-14
 github_issue: 428
 ---
@@ -171,6 +171,54 @@ Reference:
 
 ## Implementation Notes
 
+Implemented on branch `worker-handle-migration` and proposed in PR `#429`.
+
+1. Extended the transitional engine bridge in
+   `doradb-storage/src/engine.rs` by keeping `StaticOwner<T>` in place,
+   adding explicit `as_static()` access, and introducing `StaticHandle<T>`
+   as the reusable handle shape for either raw-static access or a
+   `QuiDep<StaticOwner<T>>` keepalive edge.
+2. Reworked engine startup so `trx_sys` is assembled through
+   `QuiDAG::node(...).build_async(...)`. This allows transaction-system
+   startup to capture bridge-backed dependencies during construction without
+   extracting worker ownership from `TransactionSystem`.
+3. Migrated long-lived readonly-pool handle storage away from bare
+   `&'static GlobalReadonlyBufferPool` in:
+   - `doradb-storage/src/buffer/readonly.rs`
+   - `doradb-storage/src/catalog/storage/mod.rs`
+   - `doradb-storage/src/catalog/mod.rs`
+   - `doradb-storage/src/table/mod.rs`
+   - `doradb-storage/src/trx/recover.rs`
+   `ReadonlyBufferPool` now stores `StaticHandle<GlobalReadonlyBufferPool>`.
+   The public `ReadonlyBufferPool::new(...)` raw-static constructor was kept
+   for external/tests/example compatibility, while internal runtime assembly
+   uses `new_with_handle(...)`.
+4. Migrated transaction-system-related stored handles to the same bridge in:
+   - `doradb-storage/src/trx/sys_conf.rs`
+   - `doradb-storage/src/index/util.rs`
+   - `doradb-storage/src/index/block_index.rs`
+   - `doradb-storage/src/index/row_block_index.rs`
+   `PendingTransactionSystem` now stores bridge-backed `trx_sys` and
+   `mem_pool` handles. `RedoLogPageCommitter` stores `StaticHandle<TransactionSystem>`
+   instead of a bare leaked-static reference.
+5. Worker ownership and shutdown remain in `TransactionSystem::drop`, as
+   planned. `PendingTransactionSystem::start(...)` still enables page
+   committers and starts IO/GC/purge workers through the existing
+   transaction-system APIs. No worker-group DAG node was introduced in this
+   phase.
+6. Review during testing exposed one important behavioral change: once
+   `ReadonlyBufferPool` started carrying explicit keepalive state, live
+   `Arc<Table>` handles legitimately kept the engine's readonly pool alive.
+   Recovery tests and the `table::tests::TestSys` helper were updated to drop
+   table handles before dropping `Engine`, matching the now-explicit teardown
+   dependency instead of relying on the former implicit leaked-static model.
+7. Verification completed with:
+```bash
+cargo test -p doradb-storage --no-default-features test_unstarted_transaction_system_drop_is_safe
+cargo test -p doradb-storage --no-default-features test_log_recover_ddl -- --nocapture
+cargo test -p doradb-storage --no-default-features
+cargo test -p doradb-storage
+```
 
 ## Impacts
 
@@ -200,20 +248,20 @@ cargo test -p doradb-storage
 cargo test -p doradb-storage --no-default-features
 ```
 
-## Decisions And Follow-Ups
+## Open Questions
 
-1. Keep the shared bridge as an extended `StaticOwner<T>` in `engine.rs` for
-   this phase. The current design is transitional, and the long-term plan is
-   likely to remove most or all static-lifetime machinery by the end of
-   RFC-0008 rather than reshuffle it now.
-2. In recovery/startup code, prefer short-lived borrowed access when that can
-   be achieved with small local changes. If forcing a borrow-only shape would
-   cause disproportionate churn, stored bridge-backed handles remain an
-   acceptable fallback for this phase.
-3. Component-internal service threads stay internal in this task. The
-   long-term direction can still aim to extract all background threads and
-   treat them as top-level components with customizable teardown, but that
-   should be designed in a future RFC.
-4. Transaction-system worker extraction is deferred entirely out of RFC-0008
-   phase 2. Revisit it in a future task as part of a new RFC rather than
-   expanding this transitional phase.
+1. `RedoLogPageCommitter` now uses `StaticHandle<TransactionSystem>`, but the
+   current page-committer path still constructs that handle from the raw
+   static transaction-system reference rather than a `QuiDep` keepalive. This
+   avoids self-pinning the `TransactionSystem` owner graph, but a future RFC
+   phase should decide whether a different ownership/control seam is needed to
+   make that dependency fully explicit.
+2. Transaction-system worker extraction remains deferred. If the engine moves
+   toward DAG-managed background thread components later, that work should be
+   designed under a new RFC with an explicit runtime-control and customized
+   teardown model.
+3. Component-internal service threads such as readonly/evictable pool workers
+   and the `TableFileSystem` event loop remain internal in this phase. The
+   longer-term direction can still revisit whether all background threads
+   should become top-level components once the broader ownership redesign is
+   better defined.
