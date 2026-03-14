@@ -145,25 +145,54 @@ Reference:
 
 ## Implementation Notes
 
-Implemented in `doradb-storage/src/quiescent.rs` with:
+Implemented in `doradb-storage/src/quiescent.rs` and
+`doradb-storage/src/error.rs` with:
 
-1. `QuiDep<T>` as a long-lived dependency wrapper over `QuiescentGuard<T>`.
-2. `QuiHandle<T>` as a typed node handle backed by a non-owning `Weak` owner
-   reference, with `guard()`/`dep()` and `try_guard()`/`try_dep()` accessors.
-3. `QuiDAG` with explicit dependency-edge registration, cycle rejection in
-   `seal()`, deterministic drop ordering, and focused quiescent tests for
-   linear, shared, teardown-only, and worker-held dependency cases.
+1. Final public surface:
+   - `QuiDAG`, graph-scoped `NodeId`, `QuiHandle<T>` (`id()`, `try_guard()`,
+     `guard()`), `QuiNodeBuilder<'_>`, `QuiNodeDeps`, and `QuiDep<T>`;
+   - `QuiHandle` is transient-only; persistent dependencies are created only
+     through `QuiNodeDeps::dep(...)`;
+   - `QuiescentBox<T>` remains the low-level owner/guard primitive, and the
+     intermediate `QuiescentBox::dep()` / handle-derived `dep()` accessors were
+     removed from the final API to centralize dependency management in
+     `QuiDAG`.
+2. Validation and teardown behavior:
+   - builder registration defers graph mutation until `build(...)` or
+     `build_async(...)` succeeds;
+   - `drop_before(...)` supports teardown-only ordering edges;
+   - `seal()` rejects cycles and precomputes deterministic drop order;
+   - `NodeId` is graph-scoped, foreign/stale ids are rejected, and
+     `QuiDagError::Cycle.nodes` uses `Box<[NodeId]>`;
+   - `QuiDAG::drop` panics on leaked `QuiHandle` clones instead of maintaining
+     teardown leases;
+   - DAG id allocation is capped at `isize::MAX` with rollback on overflow.
+3. Integration, review, and verification:
+   - `crate::error::Error` now has `QuiescentDag(#[from] QuiDagError)` for
+     direct propagation;
+   - follow-up review fixes removed the handle-derived persistent-dependency
+     path, replaced the timing-based worker-dependency test with explicit
+     synchronization, and replaced the test-local custom waker/executor with
+     `futures::executor::block_on`;
+   - verified with:
+```bash
+cargo test -p doradb-storage quiescent -- --nocapture
+cargo test -p doradb-storage --no-default-features quiescent -- --nocapture
+```
 
 
 ## Impacts
 
 1. `doradb-storage/src/quiescent.rs`
-2. public APIs:
+2. `doradb-storage/src/error.rs`
+3. public APIs:
    - `QuiDep<T>`
    - `QuiDAG`
-   - `QuiHandle<T>` or equivalent typed registered-node handle
+   - `QuiHandle<T>`
+   - `QuiNodeBuilder<'_>`
+   - `QuiNodeDeps`
    - `NodeId`
-3. lifecycle/ownership design for future users of:
+4. lifecycle/ownership design for future users of:
    - `Engine`
    - `TransactionSystem`
    - `TableFileSystem`
@@ -178,9 +207,16 @@ Implemented in `doradb-storage/src/quiescent.rs` with:
 3. Attempt to seal a graph with a cycle and verify it fails deterministically.
 4. Add a teardown-only ordering edge and verify it affects drop order even when
    no normal runtime dependency edge exists.
-5. Hold one `QuiDep<T>` clone on a worker thread, start owner teardown, and
-   verify the dependency remains alive until the worker releases it.
-6. Run focused quiescent tests with and without default features:
+5. Verify builder-only dependency construction:
+   - undeclared `QuiNodeDeps::dep(...)` panics;
+   - failed `build(...)` leaves the graph unchanged;
+   - `build_async(...)` inserts a node only after successful completion.
+6. Verify foreign/stale `NodeId` rejection and leaked `QuiHandle` teardown
+   panic behavior.
+7. Verify worker-thread-held `QuiDep<T>` clones keep the dependency alive until
+   explicit release.
+8. Verify DAG id allocation monotonicity and `isize::MAX` overflow rollback.
+9. Run focused quiescent tests with and without default features:
 ```bash
 cargo test -p doradb-storage quiescent -- --nocapture
 cargo test -p doradb-storage --no-default-features quiescent -- --nocapture
@@ -190,8 +226,11 @@ cargo test -p doradb-storage --no-default-features quiescent -- --nocapture
 
 1. Should a future follow-up migrate `StaticLifetimeScope` tests to use
    `QuiDAG`, or should the two ownership helpers remain separate?
-2. Does a later engine-migration task need a dedicated engine-facing builder on
-   top of `QuiDAG`, or is the generic graph API sufficient?
+2. Engine-level adoption and graceful shutdown integration remain deferred and
+   overlap with
+   `docs/backlogs/000042-graceful-storage-engine-shutdown-lifecycle-for-sessions-and-system-components.md`.
+   Does that follow-up need a dedicated engine-facing builder on top of
+   `QuiDAG`, or is the generic graph API sufficient?
 3. If owner-drop latency becomes material during broader adoption, should a
    later follow-up add a non-polling quiescent owner variant rather than
    changing `QuiescentBox<T>` itself?
