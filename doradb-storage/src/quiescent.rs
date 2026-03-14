@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{NonNull, addr_of_mut};
@@ -95,6 +96,13 @@ fn qui_handle_leaked(node_id: NodeId, name: &str, handle_count: usize) -> ! {
     );
 }
 
+#[cold]
+fn qui_node_dep_not_declared(node_id: NodeId) -> ! {
+    panic!(
+        "QuiNodeDeps::dep requires the handle to be declared first with QuiNodeBuilder::depends_on: undeclared dependency node={node_id}"
+    );
+}
+
 /// Owns a heap-allocated value that can be shared by quiescent guards.
 ///
 /// The owner allocation is pinned for the full lifetime of the box, so the
@@ -138,7 +146,7 @@ impl<T> QuiescentBox<T> {
     /// teardown waits until the dependency edge is released.
     #[inline]
     pub fn dep(&self) -> QuiDep<T> {
-        QuiDep::from(self.guard())
+        QuiDep::new(self.guard())
     }
 }
 
@@ -288,7 +296,11 @@ impl QuiHandleState {
 /// `QuiDep<T>` is a thin wrapper around [`QuiescentGuard<T>`] for component
 /// fields and worker-thread captures that must keep a dependency alive until
 /// the dependent shuts down.
-#[derive(Clone)]
+///
+/// For DAG-managed components, persistent `QuiDep` values must come from
+/// [`QuiNodeDeps::dep`] inside [`QuiNodeBuilder::build`] or
+/// [`QuiNodeBuilder::build_async`]. That keeps runtime keepalive edges aligned
+/// with the teardown order enforced by [`QuiDAG::drop`].
 pub struct QuiDep<T> {
     guard: QuiescentGuard<T>,
 }
@@ -312,10 +324,12 @@ impl<T> QuiDep<T> {
     }
 }
 
-impl<T> From<QuiescentGuard<T>> for QuiDep<T> {
+impl<T> Clone for QuiDep<T> {
     #[inline]
-    fn from(guard: QuiescentGuard<T>) -> Self {
-        Self::new(guard)
+    fn clone(&self) -> Self {
+        Self {
+            guard: self.guard.clone(),
+        }
     }
 }
 
@@ -366,11 +380,17 @@ pub enum QuiDagError {
 /// Typed access handle for a component registered in a [`QuiDAG`].
 ///
 /// Handles are non-owning and can be cloned freely while the graph is live.
-/// They are intended for graph construction and dependency wiring, not for
+/// They are intended for graph construction and transient access, not for
 /// teardown. Callers must drop every `QuiHandle` clone before the graph starts
 /// dropping owners. Violating that contract is a bug and will panic during
-/// `QuiDAG` teardown. Convert long-lived runtime dependencies into
-/// [`QuiDep`] or [`QuiescentGuard`] values before dropping the handles.
+/// `QuiDAG` teardown.
+///
+/// Persistent runtime dependencies are intentionally not available from this
+/// type. Declare the edge with [`QuiNodeBuilder::depends_on`] and create the
+/// stored [`QuiDep`] through [`QuiNodeDeps::dep`] inside
+/// [`QuiNodeBuilder::build`] or [`QuiNodeBuilder::build_async`]. That keeps
+/// long-lived `QuiDep` values synchronized with the drop ordering used by
+/// [`QuiDAG::drop`].
 pub struct QuiHandle<T> {
     id: NodeId,
     owner: Weak<QuiescentBox<T>>,
@@ -398,6 +418,11 @@ impl<T> QuiHandle<T> {
     /// This returns `None` after the graph has already dropped the owner.
     /// Callers must not race this with graph teardown; keeping any handle alive
     /// during `QuiDAG` drop violates the handle contract and will panic.
+    ///
+    /// Use this for short-lived access only. If a component needs to retain a
+    /// dependency after construction, declare it through
+    /// [`QuiNodeBuilder::depends_on`] and obtain the persistent [`QuiDep`] from
+    /// [`QuiNodeDeps::dep`] instead of storing a guard derived from a handle.
     #[inline]
     pub fn try_guard(&self) -> Option<QuiescentGuard<T>> {
         self.owner.upgrade().map(|owner| owner.guard())
@@ -412,27 +437,6 @@ impl<T> QuiHandle<T> {
     pub fn guard(&self) -> QuiescentGuard<T> {
         match self.try_guard() {
             Some(guard) => guard,
-            None => qui_handle_owner_dropped(),
-        }
-    }
-
-    /// Attempts to create a long-lived dependency edge to the registered value.
-    ///
-    /// This returns `None` after the graph has already dropped the owner.
-    #[inline]
-    pub fn try_dep(&self) -> Option<QuiDep<T>> {
-        self.try_guard().map(QuiDep::from)
-    }
-
-    /// Creates a long-lived dependency edge to the registered value.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the graph has already dropped this node's owner.
-    #[inline]
-    pub fn dep(&self) -> QuiDep<T> {
-        match self.try_dep() {
-            Some(dep) => dep,
             None => qui_handle_owner_dropped(),
         }
     }
@@ -460,6 +464,199 @@ impl<T> Drop for QuiHandle<T> {
 #[cold]
 fn qui_handle_owner_dropped() -> ! {
     panic!("quiescent handle used after owner drop");
+}
+
+/// Builder-side capability for creating long-lived dependencies.
+///
+/// `QuiNodeDeps` is handed to a [`QuiNodeBuilder::build`] or
+/// [`QuiNodeBuilder::build_async`] closure after the builder has recorded which
+/// nodes the new component depends on. Only handles declared with
+/// [`QuiNodeBuilder::depends_on`] can be turned into a persistent [`QuiDep`].
+///
+/// This keeps two things in sync:
+/// 1. runtime keepalive edges held in fields and worker closures via
+///    [`QuiDep`], and
+/// 2. teardown order enforced by [`QuiDAG::drop`].
+pub struct QuiNodeDeps {
+    declared: Box<[NodeId]>,
+}
+
+impl QuiNodeDeps {
+    #[inline]
+    fn new(declared: &[NodeId]) -> Self {
+        let declared = declared
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { declared }
+    }
+
+    #[inline]
+    fn contains(&self, node: NodeId) -> bool {
+        self.declared.binary_search(&node).is_ok()
+    }
+
+    /// Creates a persistent dependency edge for one previously declared node.
+    ///
+    /// A typical constructor flow is:
+    /// 1. `dag.node("a")?.depends_on(&b)?`
+    /// 2. `build(|deps| { let dep_b = deps.dep(&b); ... })`
+    ///
+    /// That lets the new component store `dep_b`, clone it into worker
+    /// threads, and still guarantees that `QuiDAG::drop` will tear down the
+    /// dependent before the dependency.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle` was not declared with [`QuiNodeBuilder::depends_on`]
+    /// for this builder, or if the owner was already dropped.
+    #[inline]
+    pub fn dep<T>(&self, handle: &QuiHandle<T>) -> QuiDep<T> {
+        if !self.contains(handle.id()) {
+            qui_node_dep_not_declared(handle.id());
+        }
+        QuiDep::new(handle.guard())
+    }
+}
+
+/// Builder for one DAG-managed component that may need persistent dependencies.
+///
+/// Unlike `insert_with_deps`, this builder keeps dependency declarations in
+/// local builder state until the final value has been constructed successfully.
+/// Dropping an unused builder leaves the graph unchanged, which makes the API
+/// robust for fallible or async construction without introducing half-built
+/// graph nodes.
+///
+/// Typical usage:
+/// - call [`QuiDAG::node`] to start the builder,
+/// - declare runtime dependencies with [`Self::depends_on`],
+/// - declare pure teardown ordering with [`Self::drop_before`],
+/// - then finish with [`Self::build`] or [`Self::build_async`].
+///
+/// Inside the build closure, use [`QuiNodeDeps::dep`] to mint the persistent
+/// [`QuiDep`] values that will be stored in the new component or cloned into
+/// worker threads.
+#[must_use = "call build/build_async to insert the node, or drop the builder to leave the graph unchanged"]
+pub struct QuiNodeBuilder<'a> {
+    dag: &'a mut QuiDAG,
+    name: String,
+    runtime_deps: Vec<NodeId>,
+    order_only_edges: Vec<NodeId>,
+}
+
+impl<'a> QuiNodeBuilder<'a> {
+    #[inline]
+    fn new(dag: &'a mut QuiDAG, name: String) -> Self {
+        Self {
+            dag,
+            name,
+            runtime_deps: Vec::new(),
+            order_only_edges: Vec::new(),
+        }
+    }
+
+    /// Declares that the new node has a runtime dependency on `handle`.
+    ///
+    /// Only nodes declared here may be turned into persistent [`QuiDep`] values
+    /// through [`QuiNodeDeps::dep`]. That is what keeps runtime keepalive edges
+    /// aligned with `QuiDAG` drop ordering.
+    pub fn depends_on<T>(
+        mut self,
+        handle: &QuiHandle<T>,
+    ) -> std::result::Result<Self, QuiDagError> {
+        self.dag.validate_node(handle.id())?;
+        push_unique_node(&mut self.runtime_deps, handle.id());
+        Ok(self)
+    }
+
+    /// Declares a teardown-only ordering edge for the new node.
+    ///
+    /// This affects [`QuiDAG::drop`] order but does not authorize
+    /// [`QuiNodeDeps::dep`] to create a persistent dependency.
+    pub fn drop_before<T>(
+        mut self,
+        handle: &QuiHandle<T>,
+    ) -> std::result::Result<Self, QuiDagError> {
+        self.dag.validate_node(handle.id())?;
+        push_unique_node(&mut self.order_only_edges, handle.id());
+        Ok(self)
+    }
+
+    /// Builds the value synchronously and inserts it into the graph on success.
+    ///
+    /// The graph is not mutated until `build` has returned `Ok(value)` from the
+    /// closure. If construction fails, the builder is dropped and the graph
+    /// remains unchanged.
+    pub fn build<T: 'static, E, F>(self, build: F) -> std::result::Result<QuiHandle<T>, E>
+    where
+        F: FnOnce(QuiNodeDeps) -> std::result::Result<T, E>,
+        E: From<QuiDagError>,
+    {
+        let Self {
+            dag,
+            name,
+            runtime_deps,
+            order_only_edges,
+        } = self;
+        let deps = QuiNodeDeps::new(&runtime_deps);
+        let value = build(deps)?;
+        dag.insert_with_deps(
+            name,
+            value,
+            merge_declared_edges(runtime_deps, order_only_edges),
+        )
+        .map_err(E::from)
+    }
+
+    /// Async variant of [`Self::build`].
+    ///
+    /// This keeps `&mut QuiDAG` borrowed across the await, which intentionally
+    /// serializes graph assembly in exchange for the simpler invariant that the
+    /// graph stays unchanged until construction succeeds.
+    pub async fn build_async<T: 'static, E, F, Fut>(
+        self,
+        build: F,
+    ) -> std::result::Result<QuiHandle<T>, E>
+    where
+        F: FnOnce(QuiNodeDeps) -> Fut,
+        Fut: Future<Output = std::result::Result<T, E>>,
+        E: From<QuiDagError>,
+    {
+        let Self {
+            dag,
+            name,
+            runtime_deps,
+            order_only_edges,
+        } = self;
+        let deps = QuiNodeDeps::new(&runtime_deps);
+        let value = build(deps).await?;
+        dag.insert_with_deps(
+            name,
+            value,
+            merge_declared_edges(runtime_deps, order_only_edges),
+        )
+        .map_err(E::from)
+    }
+}
+
+#[inline]
+fn push_unique_node(nodes: &mut Vec<NodeId>, node: NodeId) {
+    if !nodes.contains(&node) {
+        nodes.push(node);
+    }
+}
+
+#[inline]
+fn merge_declared_edges(runtime_deps: Vec<NodeId>, order_only_edges: Vec<NodeId>) -> Vec<NodeId> {
+    runtime_deps
+        .into_iter()
+        .chain(order_only_edges)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 trait ErasedQuiOwner {
@@ -496,6 +693,12 @@ struct QuiDagNode {
 /// [`Self::seal`] to validate the graph and freeze its structure. All
 /// [`QuiHandle`] values must be dropped before this graph starts teardown; the
 /// graph asserts that contract and panics on leaked handles.
+///
+/// Use [`Self::insert`] or [`Self::insert_with_deps`] when the final value is
+/// already constructed. Use [`Self::node`] when construction is fallible,
+/// asynchronous, or needs to store persistent [`QuiDep`] values. The builder
+/// records dependency declarations locally and only mutates the graph after the
+/// constructor returns `Ok(value)`.
 pub struct QuiDAG {
     dag_id: u64,
     nodes: Vec<QuiDagNode>,
@@ -520,6 +723,20 @@ impl QuiDAG {
         }
     }
 
+    /// Starts building one node without mutating the graph yet.
+    ///
+    /// The returned builder stores dependency declarations locally. If the
+    /// builder is dropped before `build` or `build_async` completes
+    /// successfully, this graph is unchanged.
+    #[inline]
+    pub fn node(
+        &mut self,
+        name: impl Into<String>,
+    ) -> std::result::Result<QuiNodeBuilder<'_>, QuiDagError> {
+        self.ensure_mutable()?;
+        Ok(QuiNodeBuilder::new(self, name.into()))
+    }
+
     /// Registers one component with no initial dependency edges.
     #[inline]
     pub fn insert<T: 'static>(
@@ -530,9 +747,13 @@ impl QuiDAG {
         self.insert_with_deps(name, value, std::iter::empty())
     }
 
-    /// Registers one component together with its dependency edges.
+    /// Registers one already-constructed component together with its
+    /// dependency edges.
     ///
-    /// Each `depends_on` node must already be registered in the graph.
+    /// Each `depends_on` node must already be registered in the graph. If the
+    /// component constructor needs to store persistent [`QuiDep`] values, use
+    /// [`Self::node`] instead so edge declaration and `QuiDep` creation stay in
+    /// sync.
     pub fn insert_with_deps<T: 'static, I>(
         &mut self,
         name: impl Into<String>,
@@ -682,10 +903,13 @@ fn next_qui_dag_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     use std::thread;
     use std::time::Duration;
     use std::{panic, panic::AssertUnwindSafe};
@@ -708,6 +932,55 @@ mod tests {
     impl Drop for DropOrderSpy {
         fn drop(&mut self) {
             self.drops.lock().unwrap().push(self.name);
+        }
+    }
+
+    struct WorkerGroup {
+        workers: Vec<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for WorkerGroup {
+        fn drop(&mut self) {
+            for worker in self.workers.drain(..) {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    fn panic_message(payload: Box<dyn Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(msg) => *msg,
+            Err(payload) => match payload.downcast::<&'static str>() {
+                Ok(msg) => (*msg).to_string(),
+                Err(_) => "<non-string panic payload>".to_string(),
+            },
+        }
+    }
+
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+
+        unsafe fn wake(_: *const ()) {}
+
+        unsafe fn wake_by_ref(_: *const ()) {}
+
+        unsafe fn drop(_: *const ()) {}
+
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = noop_waker();
+        let mut future = std::pin::pin!(future);
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => thread::yield_now(),
+            }
         }
     }
 
@@ -992,6 +1265,14 @@ mod tests {
             dag1.drop_before(a.id(), b.id()),
             Err(QuiDagError::UnknownNode { node }) if node == b.id()
         ));
+        assert!(matches!(
+            dag1.node("builder_dep").unwrap().depends_on(&b),
+            Err(QuiDagError::UnknownNode { node }) if node == b.id()
+        ));
+        assert!(matches!(
+            dag1.node("builder_order").unwrap().drop_before(&b),
+            Err(QuiDagError::UnknownNode { node }) if node == b.id()
+        ));
         drop(b);
         drop(a);
     }
@@ -1009,40 +1290,152 @@ mod tests {
     }
 
     #[test]
-    fn test_quidag_worker_dep_blocks_owner_drop_until_release() {
+    fn test_quidag_builder_rejects_undeclared_dep() {
+        let mut dag = QuiDAG::new();
+        let b = dag.insert("b", ()).unwrap();
+        let c = dag.insert("c", ()).unwrap();
+
+        let msg = panic_message(
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                let _: std::result::Result<QuiHandle<()>, crate::error::Error> = dag
+                    .node("a")
+                    .unwrap()
+                    .depends_on(&b)
+                    .unwrap()
+                    .build(|deps| {
+                        let _ = deps.dep(&c);
+                        Ok(())
+                    });
+            }))
+            .unwrap_err(),
+        );
+        assert!(msg.contains("QuiNodeBuilder::depends_on"));
+
+        drop(c);
+        drop(b);
+        dag.seal().unwrap();
+        drop(dag);
+    }
+
+    #[test]
+    fn test_quidag_builder_failure_leaves_graph_unchanged() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let mut dag = QuiDAG::new();
+        let dep = dag
+            .insert(
+                "dep",
+                DropOrderSpy {
+                    name: "dep",
+                    drops: Arc::clone(&drops),
+                },
+            )
+            .unwrap();
+
+        let err = dag
+            .node("failed")
+            .unwrap()
+            .depends_on(&dep)
+            .unwrap()
+            .build::<(), crate::error::Error, _>(|deps| {
+                let dep_guard = deps.dep(&dep);
+                assert_eq!(dep_guard.name, "dep");
+                Err(crate::error::Error::InvalidState)
+            });
+        assert!(matches!(err, Err(crate::error::Error::InvalidState)));
+
+        dag.seal().unwrap();
+        drop(dep);
+        drop(dag);
+
+        assert_eq!(drops.lock().unwrap().as_slice(), &["dep"]);
+    }
+
+    #[test]
+    fn test_quidag_build_async_inserts_node_after_success() {
+        let mut dag = QuiDAG::new();
+        let dep = dag.insert("dep", 41usize).unwrap();
+        let dep_for_build = dep.clone();
+
+        let node = block_on(
+            dag.node("async")
+                .unwrap()
+                .depends_on(&dep)
+                .unwrap()
+                .build_async::<usize, crate::error::Error, _, _>(move |deps| async move {
+                    let dep = deps.dep(&dep_for_build);
+                    Ok(*dep + 1)
+                }),
+        )
+        .unwrap();
+
+        assert_eq!(*node.guard(), 42);
+
+        dag.seal().unwrap();
+        drop(node);
+        drop(dep);
+        drop(dag);
+    }
+
+    #[test]
+    fn test_quidag_builder_dep_can_be_cloned_into_two_worker_threads() {
         let dropped = Arc::new(AtomicBool::new(false));
         let mut dag = QuiDAG::new();
-        let worker = dag
+        let resource = dag
             .insert(
-                "worker",
+                "resource",
                 DropSpy {
                     dropped: Arc::clone(&dropped),
                 },
             )
             .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let release_for_build = Arc::clone(&release);
+        let resource_for_build = resource.clone();
+        let worker = dag
+            .node("worker")
+            .unwrap()
+            .depends_on(&resource)
+            .unwrap()
+            .build::<WorkerGroup, crate::error::Error, _>(move |deps| {
+                // Builder usage contract: declare `worker -> resource` first,
+                // then mint one persistent `QuiDep` and clone it into both
+                // worker threads. `QuiDAG::drop` will drop `worker` before
+                // `resource`, while the `QuiDep` clones keep `resource` alive
+                // until the workers have finished.
+                let dep = deps.dep(&resource_for_build);
+                let mut workers = Vec::new();
+                for thread_dep in [dep.clone(), dep] {
+                    let started_tx = started_tx.clone();
+                    let release = Arc::clone(&release_for_build);
+                    workers.push(thread::spawn(move || {
+                        started_tx.send(()).unwrap();
+                        while !release.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        drop(thread_dep);
+                    }));
+                }
+                Ok(WorkerGroup { workers })
+            })
+            .unwrap();
         dag.seal().unwrap();
 
-        let dep = worker.dep();
-        drop(worker);
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let dep_handle = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            drop(dep);
-        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(!dropped.load(Ordering::Acquire));
+        drop(worker);
+        drop(resource);
+
         let release_handle = thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
-            release_tx.send(()).unwrap();
+            release.store(true, Ordering::Release);
         });
 
         let started = std::time::Instant::now();
         drop(dag);
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert!(dropped.load(Ordering::Acquire));
-        dep_handle.join().unwrap();
         release_handle.join().unwrap();
     }
 
