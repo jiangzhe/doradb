@@ -834,6 +834,7 @@ mod tests {
                 page_id,
                 generation: page_guard.bf().generation().saturating_add(1),
             };
+            drop(page_guard);
             let status = Arc::new(SharedTrxStatus::global_visible());
             table
                 .deletion_buffer()
@@ -924,6 +925,7 @@ mod tests {
                 page_id,
                 generation: page_guard.bf().generation().saturating_add(1),
             };
+            drop(page_guard);
             let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
             table
                 .deletion_buffer()

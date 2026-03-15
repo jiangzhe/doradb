@@ -1,9 +1,9 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
-use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
+use crate::buffer::arena::QuiescentArena;
+use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
-use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
@@ -13,11 +13,10 @@ use std::mem;
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
 /// does not support swap/evict.
 pub struct FixedBufferPool {
-    frames: BufferFrames,
-    pages: *mut Page,
     size: usize,
     // free_list: Mutex<PageID>,
     alloc_map: AllocMap,
+    arena: QuiescentArena,
 }
 
 impl FixedBufferPool {
@@ -30,12 +29,11 @@ impl FixedBufferPool {
     #[inline]
     pub fn with_capacity(pool_size: usize) -> Result<Self> {
         let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
-        let (frames, pages) = unsafe { initialize_frame_and_page_arrays(size)? };
+        let arena = QuiescentArena::new(size)?;
         Ok(FixedBufferPool {
-            frames: BufferFrames(frames),
-            pages,
             size,
             alloc_map: AllocMap::new(size),
+            arena,
         })
     }
 
@@ -59,12 +57,15 @@ impl FixedBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
-        let bf = self.frames.frame_ptr(page_id);
-        let g = BufferFrames::frame_ref(bf.clone())
+        let lease = self.arena.lease();
+        let bf = lease.frame_ptr(page_id);
+        let g = self
+            .arena
+            .frame(page_id)
             .latch
-            .optimistic_fallback(mode)
+            .optimistic_fallback_raw(mode)
             .await;
-        FacadePageGuard::new(bf, g)
+        FacadePageGuard::new(lease, bf, g)
     }
 
     /// Since all pages are kept in memory, we can use spin mode to eliminate
@@ -80,9 +81,10 @@ impl FixedBufferPool {
 
     #[inline]
     fn get_page_spin_internal<T: 'static>(&'static self, page_id: PageID) -> FacadePageGuard<T> {
-        let bf = self.frames.frame_ptr(page_id);
-        let g = BufferFrames::frame_ref(bf.clone()).latch.optimistic_spin();
-        FacadePageGuard::new(bf, g)
+        let lease = self.arena.lease();
+        let bf = lease.frame_ptr(page_id);
+        let g = self.arena.frame(page_id).latch.optimistic_spin_raw();
+        FacadePageGuard::new(lease, bf, g)
     }
 }
 
@@ -101,7 +103,7 @@ impl BufferPool for FixedBufferPool {
     #[inline]
     async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
         match self.alloc_map.try_allocate() {
-            Some(page_id) => self.frames.init_page(page_id as PageID),
+            Some(page_id) => self.arena.init_page(page_id as PageID),
             None => {
                 panic!("buffer pool full");
             }
@@ -114,7 +116,7 @@ impl BufferPool for FixedBufferPool {
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
         if self.alloc_map.allocate_at(page_id as usize) {
-            Ok(self.frames.init_page(page_id as PageID))
+            Ok(self.arena.init_page(page_id as PageID))
         } else {
             Err(Error::BufferPageAlreadyAllocated)
         }
@@ -196,23 +198,6 @@ impl BufferPool for FixedBufferPool {
     }
 }
 
-impl Drop for FixedBufferPool {
-    fn drop(&mut self) {
-        unsafe {
-            // We should drop all active frames before deallocating memory.
-            // Because there might be some user-defined context objects stored
-            // in the frame.
-            for allocated_range in self.alloc_map.allocated_ranges() {
-                for page_id in allocated_range {
-                    let frame_ptr = self.frames.0.add(page_id);
-                    std::ptr::drop_in_place(frame_ptr);
-                }
-            }
-            deallocate_frame_and_page_arrays(self.frames.0, self.pages, self.size);
-        }
-    }
-}
-
 unsafe impl Send for FixedBufferPool {}
 
 unsafe impl Sync for FixedBufferPool {}
@@ -223,7 +208,11 @@ unsafe impl StaticLifetime for FixedBufferPool {}
 mod tests {
     use super::*;
     use crate::index::BlockNode;
-    use crate::lifetime::StaticLifetimeScope;
+    use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_fixed_buffer_pool() {
@@ -489,5 +478,34 @@ mod tests {
 
             let _ = g.lock_shared_async().await;
         })
+    }
+
+    #[test]
+    fn test_fixed_buffer_pool_drop_waits_for_outstanding_guard() {
+        smol::block_on(async {
+            let pool = StaticLifetime::new_static(
+                FixedBufferPool::with_capacity(8 * 1024 * 1024).unwrap(),
+            );
+            let guard = pool.allocate_page::<BlockNode>().await;
+            let dropped = Arc::new(AtomicBool::new(false));
+            let dropped_flag = Arc::clone(&dropped);
+
+            let handle = thread::spawn(move || {
+                // SAFETY: this test stops using `pool` after spawning teardown
+                // and only keeps the page guard alive to validate arena drain.
+                unsafe {
+                    StaticLifetime::drop_static(pool);
+                }
+                dropped_flag.store(true, Ordering::SeqCst);
+            });
+
+            thread::sleep(Duration::from_millis(50));
+            assert!(!dropped.load(Ordering::SeqCst));
+            assert_eq!(guard.page_id(), 0);
+
+            drop(guard);
+            handle.join().unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
+        });
     }
 }
