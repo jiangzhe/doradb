@@ -4,6 +4,7 @@ use parking_lot::lock_api::{
 };
 // use parking_lot::RawRwLock;
 use crate::latch::rwlock::RawRwLock;
+use std::ptr::NonNull;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -112,6 +113,19 @@ impl HybridLatch {
         HybridGuard::new(self, GuardState::Optimistic, ver)
     }
 
+    #[inline]
+    pub(crate) fn optimistic_spin_raw(&self) -> HybridGuardRaw {
+        let mut ver: u64;
+        loop {
+            ver = self.version_acq();
+            if (ver & LATCH_EXCLUSIVE_BIT) != LATCH_EXCLUSIVE_BIT {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        HybridGuardRaw::new(self, GuardState::Optimistic, ver)
+    }
+
     /// Reads data under optimistic mode and retries until version validates.
     ///
     /// The callback may be invoked multiple times. It must be side-effect free
@@ -156,6 +170,18 @@ impl HybridLatch {
         }
     }
 
+    #[inline]
+    pub(crate) async fn optimistic_or_shared_raw(&self) -> HybridGuardRaw {
+        let ver = self.version_acq();
+        if (ver & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT {
+            self.lock.lock_shared_async().await;
+            let ver = self.version_acq();
+            HybridGuardRaw::new(self, GuardState::Shared, ver)
+        } else {
+            HybridGuardRaw::new(self, GuardState::Optimistic, ver)
+        }
+    }
+
     /// Get a write lock if lock is exclusive locked(blocking wait).
     /// Otherwise get an optimistic lock.
     /// This use case is rare.
@@ -173,6 +199,29 @@ impl HybridLatch {
         }
     }
 
+    #[inline]
+    pub(crate) async fn optimistic_or_exclusive_raw(&self) -> HybridGuardRaw {
+        let ver = self.version_acq();
+        if (ver & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT {
+            self.lock.lock_exclusive_async().await;
+            let ver = self
+                .version
+                .fetch_add(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+            HybridGuardRaw::new(self, GuardState::Exclusive, ver + LATCH_EXCLUSIVE_BIT)
+        } else {
+            HybridGuardRaw::new(self, GuardState::Optimistic, ver)
+        }
+    }
+
+    #[inline]
+    pub(crate) async fn optimistic_fallback_raw(&self, mode: LatchFallbackMode) -> HybridGuardRaw {
+        match mode {
+            LatchFallbackMode::Spin => self.optimistic_spin_raw(),
+            LatchFallbackMode::Shared => self.optimistic_or_shared_raw().await,
+            LatchFallbackMode::Exclusive => self.optimistic_or_exclusive_raw().await,
+        }
+    }
+
     /// Get a write lock in async way.
     #[inline]
     pub async fn exclusive_async(&self) -> HybridGuard<'_> {
@@ -183,12 +232,28 @@ impl HybridLatch {
         HybridGuard::new(self, GuardState::Exclusive, ver + LATCH_EXCLUSIVE_BIT)
     }
 
+    #[inline]
+    pub(crate) async fn exclusive_async_raw(&self) -> HybridGuardRaw {
+        self.lock.lock_exclusive_async().await;
+        let ver = self
+            .version
+            .fetch_add(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+        HybridGuardRaw::new(self, GuardState::Exclusive, ver + LATCH_EXCLUSIVE_BIT)
+    }
+
     /// Get a shared lock in async way.
     #[inline]
     pub async fn shared_async(&self) -> HybridGuard<'_> {
         self.lock.lock_shared_async().await;
         let ver = self.version_acq();
         HybridGuard::new(self, GuardState::Shared, ver)
+    }
+
+    #[inline]
+    pub(crate) async fn shared_async_raw(&self) -> HybridGuardRaw {
+        self.lock.lock_shared_async().await;
+        let ver = self.version_acq();
+        HybridGuardRaw::new(self, GuardState::Shared, ver)
     }
 
     /// Try to get a write lock.
@@ -207,12 +272,36 @@ impl HybridLatch {
         None
     }
 
+    #[inline]
+    pub(crate) fn try_exclusive_raw(&self) -> Option<HybridGuardRaw> {
+        if self.lock.try_lock_exclusive() {
+            let ver = self
+                .version
+                .fetch_add(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+            return Some(HybridGuardRaw::new(
+                self,
+                GuardState::Exclusive,
+                ver + LATCH_EXCLUSIVE_BIT,
+            ));
+        }
+        None
+    }
+
     /// Try to get a read lock.
     #[inline]
     pub fn try_shared(&self) -> Option<HybridGuard<'_>> {
         if self.lock.try_lock_shared() {
             let ver = self.version_acq();
             return Some(HybridGuard::new(self, GuardState::Shared, ver));
+        }
+        None
+    }
+
+    #[inline]
+    pub(crate) fn try_shared_raw(&self) -> Option<HybridGuardRaw> {
+        if self.lock.try_lock_shared() {
+            let ver = self.version_acq();
+            return Some(HybridGuardRaw::new(self, GuardState::Shared, ver));
         }
         None
     }
@@ -244,6 +333,223 @@ pub struct HybridGuard<'a> {
     // initial version when guard is created.
     pub version: u64,
 }
+
+pub(crate) struct HybridGuardRaw {
+    lock: NonNull<HybridLatch>,
+    pub state: GuardState,
+    pub version: u64,
+}
+
+impl HybridGuardRaw {
+    #[inline]
+    fn new(lock: &HybridLatch, state: GuardState, version: u64) -> Self {
+        Self {
+            lock: NonNull::from(lock),
+            state,
+            version,
+        }
+    }
+
+    #[inline]
+    fn lock_ref(&self) -> &HybridLatch {
+        // SAFETY: callers construct `HybridGuardRaw` from a live latch, and
+        // arena/page-guard ownership keeps the containing frame allocation
+        // alive until this guard is dropped.
+        unsafe { self.lock.as_ref() }
+    }
+
+    #[inline]
+    pub fn validate(&self) -> bool {
+        self.lock_ref().version_match(self.version)
+    }
+
+    #[inline]
+    pub fn downgrade(mut self) -> Self {
+        match self.state {
+            GuardState::Exclusive => {
+                let ver = self.version + LATCH_EXCLUSIVE_BIT;
+                self.lock_ref().version.store(ver, Ordering::Release);
+                self.unlock_exclusive_raw();
+                self.version = ver;
+                self.state = GuardState::Optimistic;
+                self
+            }
+            GuardState::Shared => {
+                self.unlock_shared_raw();
+                self.state = GuardState::Optimistic;
+                self
+            }
+            GuardState::Optimistic => self,
+        }
+    }
+
+    #[inline]
+    pub fn downgrade_exclusive_to_shared(mut self) -> Self {
+        debug_assert!(self.state == GuardState::Exclusive);
+        let ver = self.version + LATCH_EXCLUSIVE_BIT;
+        self.lock_ref().version.store(ver, Ordering::Release);
+        self.downgrade_exclusive_raw();
+        self.version = ver;
+        self.state = GuardState::Shared;
+        self
+    }
+
+    #[inline]
+    pub fn try_shared(&mut self) -> Validation<()> {
+        match self.state {
+            GuardState::Optimistic => {
+                if let Some(g) = self.lock_ref().try_shared_raw() {
+                    if self.lock_ref().version_match(self.version) {
+                        *self = g;
+                        return Valid(());
+                    }
+                    debug_assert!(self.version != g.version);
+                }
+                Invalid
+            }
+            GuardState::Shared => Valid(()),
+            GuardState::Exclusive => panic!("try shared on exclusive lock is not allowed"),
+        }
+    }
+
+    #[inline]
+    pub async fn verify_shared_async<const PRE_VERIFY: bool>(&mut self) -> Validation<()> {
+        match self.state {
+            GuardState::Optimistic => {
+                if PRE_VERIFY && !self.lock_ref().version_match(self.version) {
+                    return Invalid;
+                }
+                let g = self.lock_ref().shared_async_raw().await;
+                if !self.lock_ref().version_match(self.version) {
+                    return Invalid;
+                }
+                *self = g;
+                Valid(())
+            }
+            GuardState::Shared => Valid(()),
+            GuardState::Exclusive => panic!("verify shared async on exclusive lock is not allowed"),
+        }
+    }
+
+    #[inline]
+    pub async fn shared_async(self) -> Self {
+        debug_assert!(self.state == GuardState::Optimistic);
+        self.lock_ref().shared_async_raw().await
+    }
+
+    #[inline]
+    pub fn try_exclusive(&mut self) -> Validation<()> {
+        match self.state {
+            GuardState::Optimistic => {
+                if let Some(g) = self.lock_ref().try_exclusive_raw() {
+                    if self
+                        .lock_ref()
+                        .version_match(self.version + LATCH_EXCLUSIVE_BIT)
+                    {
+                        *self = g;
+                        return Valid(());
+                    }
+                    debug_assert!(self.version + LATCH_EXCLUSIVE_BIT != g.version);
+                }
+                Invalid
+            }
+            GuardState::Shared => panic!("try exclusive on shared lock is not allowed"),
+            GuardState::Exclusive => Valid(()),
+        }
+    }
+
+    #[inline]
+    pub async fn verify_exclusive_async<const PRE_VERIFY: bool>(&mut self) -> Validation<()> {
+        match self.state {
+            GuardState::Optimistic => {
+                if PRE_VERIFY && !self.lock_ref().version_match(self.version) {
+                    return Invalid;
+                }
+                let g = self.lock_ref().exclusive_async_raw().await;
+                if !self
+                    .lock_ref()
+                    .version_match(self.version + LATCH_EXCLUSIVE_BIT)
+                {
+                    g.rollback_exclusive_bit();
+                    return Invalid;
+                }
+                *self = g;
+                Valid(())
+            }
+            GuardState::Shared => panic!("verify exclusive async on shared lock is not allowed"),
+            GuardState::Exclusive => Valid(()),
+        }
+    }
+
+    #[inline]
+    pub fn rollback_exclusive_bit(mut self) {
+        assert!(
+            self.state == GuardState::Exclusive,
+            "rollback_exclusive_bit requires exclusive guard"
+        );
+        self.lock_ref()
+            .version
+            .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+        self.unlock_exclusive_raw();
+        self.state = GuardState::Optimistic;
+    }
+
+    #[inline]
+    pub async fn exclusive_async(self) -> Self {
+        debug_assert!(self.state == GuardState::Optimistic);
+        self.lock_ref().exclusive_async_raw().await
+    }
+
+    #[inline]
+    pub fn refresh_version(&mut self) {
+        debug_assert!(self.state == GuardState::Optimistic);
+        self.version = self.lock_ref().version_acq();
+    }
+
+    #[inline]
+    fn unlock_exclusive_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard currently owns
+        // one exclusive raw lock acquisition.
+        unsafe {
+            self.lock_ref().lock.unlock_exclusive();
+        }
+    }
+
+    #[inline]
+    fn unlock_shared_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard currently owns
+        // one shared raw lock acquisition.
+        unsafe {
+            self.lock_ref().lock.unlock_shared();
+        }
+    }
+
+    #[inline]
+    fn downgrade_exclusive_raw(&self) {
+        // SAFETY: callers only invoke this helper when the guard is in exclusive state.
+        unsafe {
+            self.lock_ref().lock.downgrade();
+        }
+    }
+}
+
+impl Drop for HybridGuardRaw {
+    #[inline]
+    fn drop(&mut self) {
+        match self.state {
+            GuardState::Exclusive => {
+                let ver = self.version + LATCH_EXCLUSIVE_BIT;
+                self.lock_ref().version.store(ver, Ordering::Release);
+                self.unlock_exclusive_raw();
+            }
+            GuardState::Shared => self.unlock_shared_raw(),
+            GuardState::Optimistic => (),
+        }
+    }
+}
+
+unsafe impl Send for HybridGuardRaw {}
+unsafe impl Sync for HybridGuardRaw {}
 
 impl<'a> HybridGuard<'a> {
     #[inline]

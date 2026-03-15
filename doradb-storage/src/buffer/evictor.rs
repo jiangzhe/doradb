@@ -1,4 +1,5 @@
-use crate::buffer::frame::{BufferFrames, FrameKind};
+use crate::buffer::arena::ArenaLeaseSource;
+use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::{Page, PageID};
 use crate::thread;
@@ -147,15 +148,15 @@ pub(super) fn clock_collect_batch(
 /// is selected for eviction.
 #[inline]
 pub(super) fn clock_sweep_candidate(
-    frames: &BufferFrames,
+    arena: &ArenaLeaseSource,
     page_id: PageID,
 ) -> Option<PageExclusiveGuard<Page>> {
-    match frames.frame_kind(page_id) {
+    match arena.frame_kind(page_id) {
         FrameKind::Uninitialized | FrameKind::Fixed | FrameKind::Evicting | FrameKind::Evicted => {
             None
         }
         FrameKind::Cool => {
-            if let Some(page_guard) = frames.try_lock_page_exclusive(page_id) {
+            if let Some(page_guard) = arena.try_lock_page_exclusive(page_id) {
                 if page_guard
                     .bf()
                     .compare_exchange_kind(FrameKind::Cool, FrameKind::Evicting)
@@ -168,7 +169,7 @@ pub(super) fn clock_sweep_candidate(
             None
         }
         FrameKind::Hot => {
-            let _ = frames.compare_exchange_frame_kind(page_id, FrameKind::Hot, FrameKind::Cool);
+            let _ = arena.compare_exchange_frame_kind(page_id, FrameKind::Hot, FrameKind::Cool);
             None
         }
     }

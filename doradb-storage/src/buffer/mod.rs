@@ -1,3 +1,4 @@
+mod arena;
 mod evict;
 mod evictor;
 mod fixed;

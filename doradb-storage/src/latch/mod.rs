@@ -2,6 +2,7 @@ mod hybrid;
 mod mutex;
 mod rwlock;
 
+pub(crate) use hybrid::HybridGuardRaw;
 pub use hybrid::*;
 pub use mutex::{Mutex, MutexGuard};
 // Use RwLock in async-lock library.

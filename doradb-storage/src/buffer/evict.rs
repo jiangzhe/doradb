@@ -1,16 +1,14 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::BufferPool;
+use crate::buffer::arena::QuiescentArena;
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
     FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
 };
-use crate::buffer::frame::{BufferFrame, BufferFrames, FrameKind};
+use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
-use crate::buffer::util::{
-    deallocate_frame_and_page_arrays, frame_total_bytes, initialize_frame_and_page_arrays,
-    madvise_dontneed,
-};
+use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -39,10 +37,6 @@ const MIN_IN_MEM_PAGES: usize = 128;
 /// EvictableBufferPool is a buffer pool which can evict
 /// pages to disk.
 pub struct EvictableBufferPool {
-    // Continuous memory area of frames.
-    frames: BufferFrames,
-    // Continuous memory area of pages.
-    pages: *mut Page,
     // Takes care of page allocation and deallocation.
     alloc_map: AllocMap,
     // Event to notify allocating new page is available.
@@ -59,9 +53,15 @@ pub struct EvictableBufferPool {
     inflight_io: Arc<InflightIO>,
     // statistics of IO submit/wait.
     stats: Arc<EvictableBufferPoolStats>,
+    arena: QuiescentArena,
 }
 
 impl EvictableBufferPool {
+    #[inline]
+    fn try_lock_page_exclusive(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
+        self.arena.try_lock_page_exclusive(page_id)
+    }
+
     /// Create a new listener to handle IO events on given file.
     #[inline]
     pub fn new_listener(&self, file_io: SingleFileIO) -> EvictableBufferPoolListener {
@@ -78,7 +78,7 @@ impl EvictableBufferPool {
     #[inline]
     fn new_evictor(&self) -> Evictor<EvictableRuntime> {
         let runtime = EvictableRuntime {
-            frames: BufferFrames(self.frames.0),
+            arena: self.arena.lease_source(),
             in_mem: Arc::clone(&self.in_mem),
             io_client: self.io_client.clone(),
             inflight_io: Arc::clone(&self.inflight_io),
@@ -97,7 +97,7 @@ impl EvictableBufferPool {
     #[inline]
     async fn try_wait_for_io_write(&self, page_id: PageID) {
         self.inflight_io
-            .wait_for_write(page_id, self.frames.frame(page_id))
+            .wait_for_write(page_id, self.arena.frame(page_id))
             .await
     }
 
@@ -121,7 +121,7 @@ impl EvictableBufferPool {
             match g.entry(page_id) {
                 Entry::Vacant(vac) => {
                     // First thread to initialize IO read.
-                    match self.frames.try_lock_page_exclusive(page_id) {
+                    match self.try_lock_page_exclusive(page_id) {
                         // Retry path. Yield after lock release to avoid tight spin.
                         None => DispatchAction::RetryYield,
                         Some(page_guard) => {
@@ -295,14 +295,14 @@ impl BufferPool for EvictableBufferPool {
             match self.alloc_map.try_allocate() {
                 Some(page_id) => {
                     self.in_mem.pin(page_id as PageID);
-                    return self.frames.init_page(page_id as PageID);
+                    return self.arena.init_page(page_id as PageID);
                 }
                 None => {
                     listener!(self.alloc_ev => listener);
                     // re-check
                     if let Some(page_id) = self.alloc_map.try_allocate() {
                         self.in_mem.pin(page_id as PageID);
-                        return self.frames.init_page(page_id as PageID);
+                        return self.arena.init_page(page_id as PageID);
                     }
 
                     // Here we cannot find a free page to load, we should cancel reservation of a page
@@ -323,7 +323,7 @@ impl BufferPool for EvictableBufferPool {
 
         if self.alloc_map.allocate_at(page_id as usize) {
             self.in_mem.pin(page_id);
-            Ok(self.frames.init_page(page_id))
+            Ok(self.arena.init_page(page_id))
         } else {
             self.in_mem.dec();
             Err(Error::BufferPageAlreadyAllocated)
@@ -337,15 +337,15 @@ impl BufferPool for EvictableBufferPool {
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
         loop {
-            let bf = self.frames.frame_ptr(page_id);
-            let frame = BufferFrames::frame_ref(bf.clone());
+            let bf = self.arena.frame_ptr(page_id);
+            let frame = self.arena.frame(page_id);
             match frame.kind() {
                 FrameKind::Uninitialized => {
                     panic!("get an uninitialized page");
                 }
                 FrameKind::Fixed | FrameKind::Hot => {
-                    let g = frame.latch.optimistic_fallback(mode).await;
-                    return FacadePageGuard::new(bf, g);
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
+                    return FacadePageGuard::new(self.arena.lease(), bf, g);
                 }
                 FrameKind::Cool => {
                     // Try to mark this page as HOT.
@@ -355,8 +355,8 @@ impl BufferPool for EvictableBufferPool {
                         // This page is going to be evicted. we have to retry and probably wait.
                         continue;
                     }
-                    let g = frame.latch.optimistic_fallback(mode).await;
-                    return FacadePageGuard::new(bf, g);
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
+                    return FacadePageGuard::new(self.arena.lease(), bf, g);
                 }
                 FrameKind::Evicting => {
                     // The page is marked evicting in order to be evicted to disk in near future.
@@ -383,16 +383,16 @@ impl BufferPool for EvictableBufferPool {
         mode: LatchFallbackMode,
     ) -> Option<FacadePageGuard<T>> {
         loop {
-            let bf = self.frames.frame_ptr(id.page_id);
-            let frame = BufferFrames::frame_ref(bf.clone());
+            let bf = self.arena.frame_ptr(id.page_id);
+            let frame = self.arena.frame(id.page_id);
             if frame.generation() != id.generation {
                 return None;
             }
             match frame.kind() {
                 FrameKind::Uninitialized => return None,
                 FrameKind::Fixed | FrameKind::Hot => {
-                    let g = frame.latch.optimistic_fallback(mode).await;
-                    let g = FacadePageGuard::new(bf, g);
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
+                    let g = FacadePageGuard::new(self.arena.lease(), bf, g);
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
                         if g.is_exclusive() {
@@ -403,13 +403,13 @@ impl BufferPool for EvictableBufferPool {
                     return Some(g);
                 }
                 FrameKind::Cool => {
-                    let g = frame.latch.optimistic_fallback(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
                         != FrameKind::Cool
                     {
                         continue;
                     }
-                    let g = FacadePageGuard::new(bf, g);
+                    let g = FacadePageGuard::new(self.arena.lease(), bf, g);
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
                         if g.is_exclusive() {
@@ -450,19 +450,19 @@ impl BufferPool for EvictableBufferPool {
         mode: LatchFallbackMode,
     ) -> Validation<FacadePageGuard<T>> {
         loop {
-            let bf = self.frames.frame_ptr(page_id);
-            let frame = BufferFrames::frame_ref(bf.clone());
+            let bf = self.arena.frame_ptr(page_id);
+            let frame = self.arena.frame(page_id);
             match frame.kind() {
                 FrameKind::Uninitialized => {
                     panic!("get an uninitialized page");
                 }
                 FrameKind::Fixed | FrameKind::Hot => {
-                    let g = frame.latch.optimistic_fallback(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     // apply lock coupling.
                     // the validation make sure parent page does not change until child
                     // page is acquired.
                     if p_guard.validate_bool() {
-                        return Valid(FacadePageGuard::new(bf, g));
+                        return Valid(FacadePageGuard::new(self.arena.lease(), bf, g));
                     }
                     if g.state == GuardState::Exclusive {
                         g.rollback_exclusive_bit();
@@ -470,7 +470,7 @@ impl BufferPool for EvictableBufferPool {
                     return Validation::Invalid;
                 }
                 FrameKind::Cool => {
-                    let g = frame.latch.optimistic_fallback(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     // Try to mark this page as HOT.
                     if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
                         != FrameKind::Cool
@@ -483,7 +483,7 @@ impl BufferPool for EvictableBufferPool {
                     // page is acquired.
                     return p_guard
                         .validate()
-                        .and_then(|_| Valid(FacadePageGuard::new(bf, g)));
+                        .and_then(|_| Valid(FacadePageGuard::new(self.arena.lease(), bf, g)));
                 }
                 FrameKind::Evicting => {
                     // The page is being evicted to disk.
@@ -516,15 +516,6 @@ impl Drop for EvictableBufferPool {
             let handle = g.take().unwrap();
             drop(g);
             handle.join().unwrap();
-        }
-
-        unsafe {
-            // Drop all frames.
-            for page_id in 0..self.capacity() {
-                let frame_ptr = self.frames.0.add(page_id);
-                std::ptr::drop_in_place(frame_ptr);
-            }
-            deallocate_frame_and_page_arrays(self.frames.0, self.pages, self.capacity());
         }
     }
 }
@@ -696,7 +687,7 @@ impl AIOEventListener for EvictableBufferPoolListener {
 }
 
 struct EvictableRuntime {
-    frames: BufferFrames,
+    arena: crate::buffer::arena::ArenaLeaseSource,
     in_mem: Arc<InMemPageSet>,
     inflight_io: Arc<InflightIO>,
     io_client: AIOClient<PoolRequest>,
@@ -761,7 +752,7 @@ impl EvictionRuntime for EvictableRuntime {
 
     #[inline]
     fn try_mark_evicting(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
-        clock_sweep_candidate(&self.frames, page_id)
+        clock_sweep_candidate(&self.arena, page_id)
     }
 
     #[inline]
@@ -1125,7 +1116,7 @@ impl EvictableBufferPoolConfig {
         let eviction_arbiter = self.eviction_arbiter_builder.build(max_nbr_in_mem);
 
         // 2. Initialize memory of frames and pages.
-        let (frames, pages) = unsafe { initialize_frame_and_page_arrays(max_nbr)? };
+        let arena = QuiescentArena::new(max_nbr)?;
 
         // 3. Create file and initialize AIO manager.
         let io_ctx = AIOContext::new(self.max_io_depth)?;
@@ -1136,8 +1127,6 @@ impl EvictableBufferPoolConfig {
         let file_io = SingleFileIO::new(file);
 
         let pool = EvictableBufferPool {
-            frames: BufferFrames(frames),
-            pages,
             alloc_map: AllocMap::new(max_nbr),
             alloc_ev: Event::new(),
             io_client,
@@ -1146,6 +1135,7 @@ impl EvictableBufferPoolConfig {
             in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             inflight_io: Arc::new(InflightIO::default()),
             stats: Arc::new(EvictableBufferPoolStats::default()),
+            arena,
         };
 
         // Start background IO thread.
@@ -1325,8 +1315,10 @@ pub enum PoolRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifetime::StaticLifetimeScope;
+    use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
     use crate::row::RowPage;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1509,6 +1501,41 @@ mod tests {
                 pages.push(g.page_id());
             }
             debug_assert!(pages.len() == 2048);
+        });
+    }
+
+    #[test]
+    fn test_evictable_buffer_pool_drop_waits_for_outstanding_guard() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = StaticLifetime::new_static(
+                EvictableBufferPoolConfig::default()
+                    .data_swap_file(temp_dir.path().join("data.bin"))
+                    .max_mem_size(1024u64 * 1024 * 32)
+                    .max_file_size(1024u64 * 1024 * 64)
+                    .build()
+                    .unwrap(),
+            );
+            let guard = pool.allocate_page::<RowPage>().await;
+            let dropped = Arc::new(AtomicBool::new(false));
+            let dropped_flag = Arc::clone(&dropped);
+
+            let handle = thread::spawn(move || {
+                // SAFETY: this test stops using `pool` after spawning teardown
+                // and only keeps the page guard alive to validate arena drain.
+                unsafe {
+                    StaticLifetime::drop_static(pool);
+                }
+                dropped_flag.store(true, Ordering::SeqCst);
+            });
+
+            thread::sleep(Duration::from_millis(50));
+            assert!(!dropped.load(Ordering::SeqCst));
+            assert_eq!(guard.page_id(), 0);
+
+            drop(guard);
+            handle.join().unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
         });
     }
 
