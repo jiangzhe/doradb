@@ -200,10 +200,10 @@ Targeted performance regression checks for optimistic B+Tree lookup should accom
   - Scope: Introduce `QuiescentArena` for fixed, evictable, and readonly pool frame/page memory; replace `HybridGuard<'static>` storage in buffer page guards with lifetime-free page guards under an arena-lease contract; preserve current page-latch optimistic behavior.
   - Goals: Make buffer-frame/page memory ownership quiescent without adding keepalive writes to `HybridLatch` optimistic access.
   - Non-goals: No full removal of `&'static self` from all buffer-pool consumers yet.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000069-buffer-pool-arena-ownership-and-lifetime-free-page-guards.md`
+  - Task Issue: `#430`
+  - Phase Status: done
+  - Implementation Summary: Implemented direct-mmap `QuiescentArena` ownership with lease-backed lifetime-free page guards across fixed, evictable, and readonly pools; replaced leaked-static buffer guard storage with raw latch guards plus arena leases; and hardened teardown with guard drop-order fixes and readonly miss-load shutdown wakeups. [Task Resolve Sync: docs/tasks/000069-buffer-pool-arena-ownership-and-lifetime-free-page-guards.md @ 2026-03-15]
 
 - **Phase 4: Explicit Pool-Lease API Migration**
   - Scope: Refactor `BufferPool`, table/index access paths, catalog reload, recovery, and purge to use explicit pool-level leases or lease-carrying wrappers instead of `&'static self` and leaked pool references.

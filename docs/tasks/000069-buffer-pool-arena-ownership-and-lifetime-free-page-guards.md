@@ -1,7 +1,7 @@
 ---
 id: 000069
 title: Buffer-Pool Arena Ownership And Lifetime-Free Page Guards
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-14
 github_issue: 430
 ---
@@ -200,6 +200,46 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented arena-backed buffer ownership in
+   `doradb-storage/src/buffer/arena.rs` as a direct mmap owner with
+   `QuiescentDrain` keepalive tracking instead of the originally planned
+   `QuiescentBox` wrapper. The final shape uses `ArenaLease`,
+   `ArenaLeaseSource`, direct `QuiescentToken`, and local sync/unsync token
+   fan-out to keep ordinary page-guard paths on the cheap direct-token path
+   while allowing long-lived shared lease factories.
+2. Completed the page-guard refactor in
+   `doradb-storage/src/buffer/guard.rs` and
+   `doradb-storage/src/latch/hybrid.rs`: buffer guards now store
+   `HybridGuardRaw` plus `ArenaLease`, the raw latch guard preserves the
+   existing optimistic/shared/exclusive behavior, and the final field order
+   ensures raw latch unlock-on-drop runs before releasing the arena keepalive.
+3. Simplified arena/frame ownership beyond the original draft by removing the
+   temporary `BufferFrames` wrapper and moving frame access directly into
+   `QuiescentArena`, `ArenaLease`, and `ArenaLeaseSource`. Fixed, evictable,
+   and readonly pools now acquire and move arena leases internally without
+   relying on leaked-static frame references.
+4. Closed two teardown bugs found during implementation review:
+   readonly detached miss tasks now observe shutdown while waiting for a free
+   frame and cannot hold an arena lease forever, and purge tests were updated
+   to release held page guards before dropping the engine so teardown does not
+   deadlock on same-thread lease draining.
+5. Added or refreshed regression coverage for:
+   fixed/evictable/readonly pool drop waiting on outstanding guards,
+   readonly detached miss-load survival through drop, readonly reserve-waiter
+   shutdown wakeup, quiescent direct/local token drain behavior, and page-guard
+   drop ordering around raw latch unlock.
+6. Verification completed with:
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+   - `cargo test -p doradb-storage --quiet`
+   - `cargo test -p doradb-storage --no-default-features --quiet`
+   - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+   - `cargo run -p doradb-storage --example bench_btree`
+7. The benchmark smoke uncovered a separate follow-up rather than a blocker for
+   this task: `bench_btree` printed the BTree and `std::map` phases, then
+   aborted with a stack overflow before completing the remaining bench phase.
+   Follow-up is tracked in
+   `docs/backlogs/000054-investigate-bench-btree-example-stack-overflow-on-smoke-run.md`.
+
 ## Impacts
 
 1. New internal buffer ownership types:
@@ -255,3 +295,7 @@ cargo run -p doradb-storage --example bench_btree
    handles.
 2. RFC-0008 still leaves segmented or growable arena support open; this task
    assumes fixed-capacity pinned arenas only.
+3. Benchmark smoke follow-up is tracked in
+   `docs/backlogs/000054-investigate-bench-btree-example-stack-overflow-on-smoke-run.md`;
+   the current default `bench_btree` example path overflows the process stack
+   on this environment after the BTree and `std::map` phases.
