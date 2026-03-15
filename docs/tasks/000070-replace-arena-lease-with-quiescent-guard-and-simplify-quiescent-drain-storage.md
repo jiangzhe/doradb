@@ -3,6 +3,7 @@ id: 000070
 title: Merge Quiescent Drain Token Into Box Guard And Replace Arena Lease
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-15
+github_issue: 432
 ---
 
 # Task: Merge Quiescent Drain Token Into Box Guard And Replace Arena Lease
