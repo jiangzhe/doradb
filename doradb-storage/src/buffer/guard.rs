@@ -115,9 +115,9 @@ impl<T: 'static> LockStrategy for ExclusiveLockStrategy<T> {
 }
 
 pub struct FacadePageGuard<T: 'static> {
+    guard: HybridGuardRaw,
     arena: ArenaLease,
     bf: UnsafePtr<BufferFrame>,
-    guard: HybridGuardRaw,
     captured_generation: u64,
     _marker: PhantomData<T>,
 }
@@ -421,9 +421,9 @@ unsafe impl<T: Sync + 'static> Send for FacadePageGuard<T> {}
 unsafe impl<T: Sync + 'static> Sync for FacadePageGuard<T> {}
 
 pub struct PageOptimisticGuard<T: 'static> {
+    guard: HybridGuardRaw,
     arena: ArenaLease,
     bf: UnsafePtr<BufferFrame>,
-    guard: HybridGuardRaw,
     captured_generation: u64,
     _marker: PhantomData<T>,
 }
@@ -511,9 +511,9 @@ unsafe impl<T: Sync + 'static> Send for PageOptimisticGuard<T> {}
 unsafe impl<T: Sync + 'static> Sync for PageOptimisticGuard<T> {}
 
 pub struct PageSharedGuard<T: 'static> {
+    guard: HybridGuardRaw,
     arena: ArenaLease,
     bf: UnsafePtr<BufferFrame>,
-    guard: HybridGuardRaw,
     captured_generation: u64,
     _marker: PhantomData<T>,
 }
@@ -583,9 +583,9 @@ unsafe impl<T: Sync + 'static> Send for PageSharedGuard<T> {}
 unsafe impl<T: Sync + 'static> Sync for PageSharedGuard<T> {}
 
 pub struct PageExclusiveGuard<T: 'static> {
+    guard: HybridGuardRaw,
     arena: ArenaLease,
     bf: UnsafePtr<BufferFrame>,
-    guard: HybridGuardRaw,
     captured_generation: u64,
     _marker: PhantomData<T>,
 }

@@ -353,8 +353,8 @@ impl HybridGuardRaw {
     #[inline]
     fn lock_ref(&self) -> &HybridLatch {
         // SAFETY: callers construct `HybridGuardRaw` from a live latch, and
-        // arena/page-guard ownership keeps the containing frame allocation
-        // alive until this guard is dropped.
+        // page guards declare `HybridGuardRaw` before `ArenaLease`, so raw
+        // latch unlock-on-drop runs before the arena keepalive is released.
         unsafe { self.lock.as_ref() }
     }
 

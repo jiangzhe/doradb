@@ -185,6 +185,7 @@ impl GlobalReadonlyBufferPool {
             mappings: Arc::clone(&self.mappings),
             inflight_loads: Arc::clone(&self.inflight_loads),
             residency: Arc::clone(&self.residency),
+            shutdown_flag: Arc::clone(&self.shutdown_flag),
         }
     }
 
@@ -539,6 +540,7 @@ impl GlobalReadonlyBufferPool {
 impl Drop for GlobalReadonlyBufferPool {
     fn drop(&mut self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.residency.free_ev.notify(usize::MAX);
         self.residency.evict_ev.notify(1);
         {
             let mut g = self.evict_thread.lock();
@@ -574,25 +576,43 @@ struct ReadonlyLoadTaskState {
     mappings: Arc<DashMap<ReadonlyCacheKey, PageID>>,
     inflight_loads: Arc<DashMap<ReadonlyCacheKey, Arc<InflightLoad>>>,
     residency: Arc<ReadonlyResidency>,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl ReadonlyLoadTaskState {
     #[inline]
-    async fn reserve_frame_id(&self) -> PageID {
+    async fn reserve_frame_id(&self) -> Result<PageID> {
         loop {
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return Err(Error::InvalidState);
+            }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
+                if self.shutdown_flag.load(Ordering::Acquire) {
+                    self.residency.release_free(frame_id);
+                    return Err(Error::InvalidState);
+                }
                 self.residency.record_alloc_success();
-                return frame_id;
+                return Ok(frame_id);
             }
             self.residency.record_alloc_failure();
             listener!(self.residency.free_ev => listener);
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return Err(Error::InvalidState);
+            }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
+                if self.shutdown_flag.load(Ordering::Acquire) {
+                    self.residency.release_free(frame_id);
+                    return Err(Error::InvalidState);
+                }
                 self.residency.record_alloc_success();
-                return frame_id;
+                return Ok(frame_id);
             }
             self.residency.record_alloc_failure();
             self.residency.evict_ev.notify(1);
             listener.await;
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return Err(Error::InvalidState);
+            }
         }
     }
 
@@ -643,7 +663,7 @@ struct ReservedMissFrameGuard {
 impl ReservedMissFrameGuard {
     #[inline]
     async fn acquire(state: ReadonlyLoadTaskState, lease: ArenaLease) -> Result<Self> {
-        let frame_id = state.reserve_frame_id().await;
+        let frame_id = state.reserve_frame_id().await?;
         let mut page_guard = match lease.try_lock_page_exclusive(frame_id) {
             Some(page_guard) => page_guard,
             None => {
@@ -1848,6 +1868,48 @@ mod tests {
             assert_eq!(page_source.call_count(), 1);
             assert!(mappings.contains_key(&key));
             assert!(dropped.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_drop_unblocks_detached_reserve_waiter() {
+        smol::block_on(async {
+            let page_source = Arc::new(ControlledPageSource::with_page([0u8; PAGE_SIZE]));
+            let key = ReadonlyCacheKey::new(117, 13);
+            let global =
+                GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(1)).unwrap();
+            let inflight_loads = Arc::clone(&global.inflight_loads);
+
+            {
+                let mut free = global.residency.free.lock();
+                free.clear();
+            }
+
+            let page_source_dyn: Arc<dyn ReadonlyPageSource> = page_source.clone();
+            let _inflight = global.join_or_start_inflight_load(key, page_source_dyn, None);
+            wait_for(|| {
+                inflight_loads.contains_key(&key)
+                    && page_source.call_count() == 0
+                    && global.residency.alloc_failure_rate() > 0.0
+            })
+            .await;
+
+            let dropped = Arc::new(AtomicBool::new(false));
+            let dropped_flag = Arc::clone(&dropped);
+            let teardown = thread::spawn(move || {
+                // SAFETY: this test stops using the leaked static ref after
+                // spawning teardown and only keeps cloned detached state.
+                unsafe {
+                    StaticLifetime::drop_static(global);
+                }
+                dropped_flag.store(true, Ordering::SeqCst);
+            });
+
+            wait_for(|| dropped.load(Ordering::SeqCst)).await;
+            teardown.join().unwrap();
+
+            assert_eq!(page_source.call_count(), 0);
+            assert!(!inflight_loads.contains_key(&key));
         });
     }
 

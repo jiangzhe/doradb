@@ -90,6 +90,12 @@ impl Drop for QuiescentArena {
     }
 }
 
+/// Owns one arena keepalive plus raw arena metadata.
+///
+/// The lease value itself is the keepalive: as long as an `ArenaLease` is
+/// still owned by a guard or background task, arena teardown must wait and the
+/// mmap-backed frame/page regions remain valid. Raw pointer helpers below rely
+/// on lease ownership directly rather than "touching" the keepalive field.
 pub(crate) struct ArenaLease {
     _keepalive: ArenaKeepalive,
     frames: *mut BufferFrame,
@@ -99,10 +105,13 @@ pub(crate) struct ArenaLease {
 }
 
 enum ArenaKeepalive {
-    Direct(QuiescentToken),
-    Shared(SyncQuiescentToken),
+    // Direct keepalive for ordinary guard paths that do not need clone fan-out.
+    Direct(#[allow(dead_code)] QuiescentToken),
+    // Shared keepalive family used by `ArenaLeaseSource` to mint new leases.
+    Shared(#[allow(dead_code)] SyncQuiescentToken),
 }
 
+/// Reusable factory for minting `ArenaLease`s from one shared keepalive family.
 #[derive(Clone)]
 pub(crate) struct ArenaLeaseSource {
     keepalive: SyncQuiescentToken,
@@ -113,22 +122,10 @@ pub(crate) struct ArenaLeaseSource {
 
 impl ArenaLease {
     #[inline]
-    fn hold(&self) {
-        match &self._keepalive {
-            ArenaKeepalive::Direct(token) => {
-                let _ = token;
-            }
-            ArenaKeepalive::Shared(token) => {
-                let _ = token;
-            }
-        }
-    }
-
-    #[inline]
     pub(crate) fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        self.hold();
         debug_assert!((page_id as usize) < self.capacity);
-        // SAFETY: frame memory is one contiguous mmap region indexed by page id.
+        // SAFETY: frame memory is one contiguous mmap region indexed by page
+        // id, and this lease owns the keepalive that prevents arena teardown.
         unsafe { UnsafePtr(self.frames.add(page_id as usize)) }
     }
 
@@ -142,24 +139,22 @@ impl ArenaLease {
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn page_ptr(&self, page_id: PageID) -> UnsafePtr<Page> {
-        self.hold();
         debug_assert!((page_id as usize) < self.capacity);
-        // SAFETY: page memory is one contiguous mmap region indexed by page id.
+        // SAFETY: page memory is one contiguous mmap region indexed by page id,
+        // and this lease owns the keepalive that prevents arena teardown.
         unsafe { UnsafePtr(self.pages.add(page_id as usize)) }
     }
 
     #[inline]
     pub(crate) fn frame_ref(&self, bf: UnsafePtr<BufferFrame>) -> &BufferFrame {
-        self.hold();
         debug_assert!(self.contains_frame_ptr(bf.clone()));
         // SAFETY: `bf` points into the arena-owned frame mmap, and the lease's
-        // keepalive guarantees that mapping remains valid for this borrow.
+        // ownership guarantees that mapping remains valid for this borrow.
         unsafe { &*bf.0 }
     }
 
     #[inline]
     pub(crate) fn contains_frame_ptr(&self, bf: UnsafePtr<BufferFrame>) -> bool {
-        self.hold();
         let start = self.frames as usize;
         let end = start + std::mem::size_of::<BufferFrame>() * self.capacity;
         let ptr = bf.0 as usize;
