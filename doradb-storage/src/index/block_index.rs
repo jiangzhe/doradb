@@ -1,6 +1,6 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
 use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
@@ -103,10 +103,13 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn get_insert_page<B: BufferPool>(
         &self,
         mem_pool: &'static B,
+        mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
-        self.row.get_insert_page(mem_pool, metadata, count).await
+        self.row
+            .get_insert_page(mem_pool, mem_pool_guard, metadata, count)
+            .await
     }
 
     /// Returns an exclusive row page suitable for insert operations.
@@ -114,11 +117,12 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
         mem_pool: &'static B,
+        mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
         self.row
-            .get_insert_page_exclusive(mem_pool, metadata, count)
+            .get_insert_page_exclusive(mem_pool, mem_pool_guard, metadata, count)
             .await
     }
 
@@ -129,12 +133,13 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn allocate_row_page_at<B: BufferPool>(
         &self,
         mem_pool: &'static B,
+        mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
         self.row
-            .allocate_row_page_at(mem_pool, metadata, count, page_id)
+            .allocate_row_page_at(mem_pool, mem_pool_guard, metadata, count, page_id)
             .await
     }
 
@@ -146,8 +151,16 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
     /// Creates a cursor to scan in-memory block-index leaves.
     #[inline]
-    pub fn mem_cursor(&self) -> GenericRowBlockIndexMemCursor<'_, P> {
-        self.row.mem_cursor()
+    pub fn mem_cursor<'a>(
+        &'a self,
+        guards: &'a PoolGuards,
+    ) -> GenericRowBlockIndexMemCursor<'a, P> {
+        self.row.mem_cursor(
+            guards
+                .meta
+                .as_ref()
+                .expect("missing meta pool guard for block-index traversal"),
+        )
     }
 
     /// Finds the physical location of one row id.
@@ -230,7 +243,7 @@ mod tests {
     use super::*;
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
     use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
-    use crate::buffer::{BufferPool, FixedBufferPool};
+    use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::error::Validation;
     use crate::latch::LatchFallbackMode;
     use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
@@ -285,23 +298,31 @@ mod tests {
         }
 
         #[inline]
+        fn guard(&self) -> PoolGuard {
+            self.inner.guard()
+        }
+
+        #[inline]
         fn allocate_page<T: BufferPage>(
             &'static self,
+            guard: &PoolGuard,
         ) -> impl Future<Output = PageExclusiveGuard<T>> + Send {
-            self.inner.allocate_page()
+            self.inner.allocate_page(guard)
         }
 
         #[inline]
         fn allocate_page_at<T: BufferPage>(
             &'static self,
+            guard: &PoolGuard,
             page_id: PageID,
         ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
-            self.inner.allocate_page_at(page_id)
+            self.inner.allocate_page_at(guard, page_id)
         }
 
         #[inline]
         async fn get_page<T: BufferPage>(
             &'static self,
+            guard: &PoolGuard,
             page_id: PageID,
             mode: LatchFallbackMode,
         ) -> FacadePageGuard<T> {
@@ -313,16 +334,17 @@ mod tests {
                 self.entered.wait();
                 self.release.wait();
             }
-            self.inner.get_page(page_id, mode).await
+            self.inner.get_page(guard, page_id, mode).await
         }
 
         #[inline]
         fn try_get_page_versioned<T: BufferPage>(
             &'static self,
+            guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
         ) -> impl Future<Output = Option<FacadePageGuard<T>>> + Send {
-            self.inner.try_get_page_versioned(id, mode)
+            self.inner.try_get_page_versioned(guard, id, mode)
         }
 
         #[inline]
@@ -333,11 +355,12 @@ mod tests {
         #[inline]
         fn get_child_page<T: BufferPage>(
             &'static self,
+            guard: &PoolGuard,
             p_guard: &FacadePageGuard<T>,
             page_id: PageID,
             mode: LatchFallbackMode,
         ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send {
-            self.inner.get_child_page(p_guard, page_id, mode)
+            self.inner.get_child_page(guard, p_guard, page_id, mode)
         }
     }
 

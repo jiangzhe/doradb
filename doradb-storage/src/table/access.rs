@@ -1,6 +1,6 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::{INVALID_PAGE_ID, PageID};
-use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards};
 use crate::catalog::{CatalogTable, TableMetadata};
 use crate::error::{Error, Result};
 use crate::index::util::Maskable;
@@ -15,7 +15,7 @@ use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_f
 use crate::stmt::Statement;
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
-    GenericMemTable, InsertRowIntoPage, Table, UpdateRowInplace, index_key_is_changed,
+    GenericMemTable, InsertRowIntoPage, RowPoolSlot, Table, UpdateRowInplace, index_key_is_changed,
     index_key_replace, read_latest_index_key, row_len, validate_page_row_range,
 };
 use crate::trx::redo::{RowRedo, RowRedoKind};
@@ -41,7 +41,11 @@ pub trait TableAccess {
     ///
     /// Note: this scans only in-memory row-store pages and does not include
     /// persisted column-store rows on disk.
-    fn table_scan_uncommitted<F>(&self, row_action: F) -> impl Future<Output = ()>
+    fn table_scan_uncommitted<F>(
+        &self,
+        guards: &PoolGuards,
+        row_action: F,
+    ) -> impl Future<Output = ()>
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool;
 
@@ -70,6 +74,7 @@ pub trait TableAccess {
     /// Index lookup unique row including uncommitted version.
     fn index_lookup_unique_uncommitted<R, F>(
         &self,
+        guards: &PoolGuards,
         key: &SelectKey,
         row_action: F,
     ) -> impl Future<Output = Option<R>>
@@ -89,7 +94,7 @@ pub trait TableAccess {
     -> impl Future<Output = InsertMvcc>;
 
     /// Insert row in non-transactional way.
-    fn insert_no_trx(&self, cols: &[Val]) -> impl Future<Output = ()>;
+    fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) -> impl Future<Output = ()>;
 
     /// Update row in transaction.
     /// This method is for update based on unique index lookup.
@@ -117,7 +122,11 @@ pub trait TableAccess {
     ) -> impl Future<Output = DeleteMvcc>;
 
     /// Delete row in non-transactional way.
-    fn delete_unique_no_trx(&self, key: &SelectKey) -> impl Future<Output = ()>;
+    fn delete_unique_no_trx(
+        &self,
+        guards: &PoolGuards,
+        key: &SelectKey,
+    ) -> impl Future<Output = ()>;
 
     /// Delete index by purge threads.
     /// This method will be only called by internal threads and don't maintain
@@ -135,6 +144,7 @@ pub trait TableAccess {
     /// to see if all delete-masked values in it can be remove directly.
     fn delete_index(
         &self,
+        guards: &PoolGuards,
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
@@ -223,7 +233,22 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
             RowLocation::RowPage(page_id) => {
                 let page_guard = self
                     .mem_pool()
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .get_page::<RowPage>(
+                        match self.mem.row_pool_slot {
+                            RowPoolSlot::Mem => stmt
+                                .pool_guards()
+                                .mem
+                                .as_ref()
+                                .expect("missing mem pool guard for user-table row pages"),
+                            RowPoolSlot::Meta => stmt
+                                .pool_guards()
+                                .meta
+                                .as_ref()
+                                .expect("missing meta pool guard for catalog-table row pages"),
+                        },
+                        page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await
@@ -877,6 +902,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
     #[inline]
     async fn delete_unique_index(
         &self,
+        guards: &PoolGuards,
         index: &impl UniqueIndex,
         key: &SelectKey,
         row_id: RowID,
@@ -903,7 +929,18 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         RowLocation::RowPage(page_id) => {
                             let page_guard = self
                                 .mem_pool()
-                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                                .get_page::<RowPage>(
+                                    match self.mem.row_pool_slot {
+                                        RowPoolSlot::Mem => guards.mem.as_ref().expect(
+                                            "missing mem pool guard for user-table row pages",
+                                        ),
+                                        RowPoolSlot::Meta => guards.meta.as_ref().expect(
+                                            "missing meta pool guard for catalog-table row pages",
+                                        ),
+                                    },
+                                    page_id,
+                                    LatchFallbackMode::Shared,
+                                )
                                 .await
                                 .lock_shared_async()
                                 .await
@@ -932,6 +969,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
     #[inline]
     async fn delete_non_unique_index(
         &self,
+        guards: &PoolGuards,
         index: &impl NonUniqueIndex,
         key: &SelectKey,
         row_id: RowID,
@@ -961,7 +999,18 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         RowLocation::RowPage(page_id) => {
                             let page_guard = self
                                 .mem_pool()
-                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                                .get_page::<RowPage>(
+                                    match self.mem.row_pool_slot {
+                                        RowPoolSlot::Mem => guards.mem.as_ref().expect(
+                                            "missing mem pool guard for user-table row pages",
+                                        ),
+                                        RowPoolSlot::Meta => guards.meta.as_ref().expect(
+                                            "missing meta pool guard for catalog-table row pages",
+                                        ),
+                                    },
+                                    page_id,
+                                    LatchFallbackMode::Shared,
+                                )
                                 .await
                                 .lock_shared_async()
                                 .await
@@ -996,7 +1045,22 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
             let page_guard = self
                 .mem_pool()
-                .get_page(page_id, LatchFallbackMode::Shared)
+                .get_page(
+                    match self.mem.row_pool_slot {
+                        RowPoolSlot::Mem => stmt
+                            .pool_guards()
+                            .mem
+                            .as_ref()
+                            .expect("missing mem pool guard for user-table row pages"),
+                        RowPoolSlot::Meta => stmt
+                            .pool_guards()
+                            .meta
+                            .as_ref()
+                            .expect("missing meta pool guard for catalog-table row pages"),
+                    },
+                    page_id,
+                    LatchFallbackMode::Shared,
+                )
                 .await
                 .lock_shared_async()
                 .await
@@ -1009,7 +1073,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                 return page_guard;
             }
         }
-        GenericMemTable::get_insert_page(self, row_count).await
+        GenericMemTable::get_insert_page(self, stmt.pool_guards(), row_count).await
     }
 
     // lock row will check write conflict on given row and lock it.
@@ -1104,13 +1168,26 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let old_guard = self
-                        .mem_pool()
-                        .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                        .await
-                        .lock_shared_async()
-                        .await
-                        .unwrap();
+                    let old_guard =
+                        self.mem_pool()
+                            .get_page::<RowPage>(
+                                match self.mem.row_pool_slot {
+                                    RowPoolSlot::Mem => {
+                                        stmt.pool_guards().mem.as_ref().expect(
+                                            "missing mem pool guard for user-table row pages",
+                                        )
+                                    }
+                                    RowPoolSlot::Meta => stmt.pool_guards().meta.as_ref().expect(
+                                        "missing meta pool guard for catalog-table row pages",
+                                    ),
+                                },
+                                page_id,
+                                LatchFallbackMode::Shared,
+                            )
+                            .await
+                            .lock_shared_async()
+                            .await
+                            .unwrap();
                     if validate_page_row_range(&old_guard, page_id, old_id) {
                         break (old_guard, old_id);
                     }
@@ -1728,11 +1805,11 @@ pub type HybridTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool>;
 pub type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool>;
 
 impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
-    async fn table_scan_uncommitted<F>(&self, mut row_action: F)
+    async fn table_scan_uncommitted<F>(&self, guards: &PoolGuards, mut row_action: F)
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
     {
-        self.mem_scan(|page_guard| {
+        self.mem_scan(guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, ctx) {
@@ -1749,7 +1826,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
     where
         F: FnMut(Vec<Val>) -> bool,
     {
-        self.mem_scan(|page_guard| {
+        self.mem_scan(stmt.pool_guards(), |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let metadata = &*ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, ctx) {
@@ -1800,6 +1877,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
 
     async fn index_lookup_unique_uncommitted<R, F>(
         &self,
+        guards: &PoolGuards,
         key: &SelectKey,
         row_action: F,
     ) -> Option<R>
@@ -1820,13 +1898,25 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                 RowLocation::NotFound => return None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self
-                        .mem_pool()
-                        .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
-                        .await
-                        .lock_shared_async()
-                        .await
-                        .unwrap();
+                    let page_guard =
+                        self.mem_pool()
+                            .get_page::<RowPage>(
+                                match self.mem.row_pool_slot {
+                                    RowPoolSlot::Mem => guards
+                                        .mem
+                                        .as_ref()
+                                        .expect("missing mem pool guard for user-table row pages"),
+                                    RowPoolSlot::Meta => guards.meta.as_ref().expect(
+                                        "missing meta pool guard for catalog-table row pages",
+                                    ),
+                                },
+                                page_id,
+                                LatchFallbackMode::Shared,
+                            )
+                            .await
+                            .lock_shared_async()
+                            .await
+                            .unwrap();
                     (page_guard, row_id)
                 }
             },
@@ -1918,7 +2008,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         InsertMvcc::Ok(row_id)
     }
 
-    async fn insert_no_trx(&self, cols: &[Val]) {
+    async fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) {
         debug_assert!(cols.len() == self.metadata().col_count());
         debug_assert!({
             cols.iter()
@@ -1934,7 +2024,8 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         let row_count = estimate_max_row_count(row_len, metadata.col_count());
         loop {
             // acquire insert page from block index.
-            let mut page_guard = GenericMemTable::get_insert_page_exclusive(self, row_count).await;
+            let mut page_guard =
+                GenericMemTable::get_insert_page_exclusive(self, guards, row_count).await;
             let page = page_guard.page_mut();
             debug_assert!(metadata.col_count() == page.header.col_count as usize);
             debug_assert!(cols.len() == page.header.col_count as usize);
@@ -1974,23 +2065,35 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
-            let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
-                None => return UpdateMvcc::NotFound,
-                Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
-                    RowLocation::NotFound => return UpdateMvcc::NotFound,
-                    RowLocation::LwcPage(..) => todo!("lwc page"),
-                    RowLocation::RowPage(page_id) => {
-                        let page_guard = self
+            let (page_guard, row_id) =
+                match index.lookup(&key.vals, stmt.trx.sts).await {
+                    None => return UpdateMvcc::NotFound,
+                    Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
+                        RowLocation::NotFound => return UpdateMvcc::NotFound,
+                        RowLocation::LwcPage(..) => todo!("lwc page"),
+                        RowLocation::RowPage(page_id) => {
+                            let page_guard = self
                             .mem_pool()
-                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                            .get_page::<RowPage>(
+                                match self.mem.row_pool_slot {
+                                    RowPoolSlot::Mem => stmt.pool_guards().mem.as_ref().expect(
+                                        "missing mem pool guard for user-table row pages",
+                                    ),
+                                    RowPoolSlot::Meta => stmt.pool_guards().meta.as_ref().expect(
+                                        "missing meta pool guard for catalog-table row pages",
+                                    ),
+                                },
+                                page_id,
+                                LatchFallbackMode::Shared,
+                            )
                             .await
                             .lock_shared_async()
                             .await
                             .unwrap();
-                        (page_guard, row_id)
-                    }
-                },
-            };
+                            (page_guard, row_id)
+                        }
+                    },
+                };
             let res = self
                 .update_row_inplace(stmt, page_guard, key, row_id, update.clone())
                 .await;
@@ -2077,56 +2180,68 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
-            let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
-                None => return DeleteMvcc::NotFound,
-                Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
-                    RowLocation::NotFound => return DeleteMvcc::NotFound,
-                    RowLocation::LwcPage(..) => {
-                        let deletion_buffer = self
-                            .deletion_buffer()
-                            .expect("catalog table should never have lwc page rows");
-                        match deletion_buffer.put_ref(row_id, stmt.trx.status()) {
-                            Ok(()) => {
-                                let undo = OwnedRowUndo::new(
-                                    self.table_id(),
-                                    None,
-                                    row_id,
-                                    RowUndoKind::Delete,
-                                );
-                                stmt.row_undo.push(undo);
-                                let redo_kind = if log_by_key {
-                                    RowRedoKind::DeleteByUniqueKey(key.clone())
-                                } else {
-                                    RowRedoKind::Delete
-                                };
-                                let redo = RowRedo {
-                                    page_id: INVALID_PAGE_ID,
-                                    row_id,
-                                    kind: redo_kind,
-                                };
-                                stmt.redo.insert_dml(self.table_id(), redo);
-                                return DeleteMvcc::Ok;
-                            }
-                            Err(DeletionError::WriteConflict) => {
-                                return DeleteMvcc::WriteConflict;
-                            }
-                            Err(DeletionError::AlreadyDeleted) => {
-                                return DeleteMvcc::NotFound;
+            let (page_guard, row_id) =
+                match index.lookup(&key.vals, stmt.trx.sts).await {
+                    None => return DeleteMvcc::NotFound,
+                    Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
+                        RowLocation::NotFound => return DeleteMvcc::NotFound,
+                        RowLocation::LwcPage(..) => {
+                            let deletion_buffer = self
+                                .deletion_buffer()
+                                .expect("catalog table should never have lwc page rows");
+                            match deletion_buffer.put_ref(row_id, stmt.trx.status()) {
+                                Ok(()) => {
+                                    let undo = OwnedRowUndo::new(
+                                        self.table_id(),
+                                        None,
+                                        row_id,
+                                        RowUndoKind::Delete,
+                                    );
+                                    stmt.row_undo.push(undo);
+                                    let redo_kind = if log_by_key {
+                                        RowRedoKind::DeleteByUniqueKey(key.clone())
+                                    } else {
+                                        RowRedoKind::Delete
+                                    };
+                                    let redo = RowRedo {
+                                        page_id: INVALID_PAGE_ID,
+                                        row_id,
+                                        kind: redo_kind,
+                                    };
+                                    stmt.redo.insert_dml(self.table_id(), redo);
+                                    return DeleteMvcc::Ok;
+                                }
+                                Err(DeletionError::WriteConflict) => {
+                                    return DeleteMvcc::WriteConflict;
+                                }
+                                Err(DeletionError::AlreadyDeleted) => {
+                                    return DeleteMvcc::NotFound;
+                                }
                             }
                         }
-                    }
-                    RowLocation::RowPage(page_id) => {
-                        let page_guard = self
+                        RowLocation::RowPage(page_id) => {
+                            let page_guard = self
                             .mem_pool()
-                            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                            .get_page::<RowPage>(
+                                match self.mem.row_pool_slot {
+                                    RowPoolSlot::Mem => stmt.pool_guards().mem.as_ref().expect(
+                                        "missing mem pool guard for user-table row pages",
+                                    ),
+                                    RowPoolSlot::Meta => stmt.pool_guards().meta.as_ref().expect(
+                                        "missing meta pool guard for catalog-table row pages",
+                                    ),
+                                },
+                                page_id,
+                                LatchFallbackMode::Shared,
+                            )
                             .await
                             .lock_shared_async()
                             .await
                             .unwrap();
-                        (page_guard, row_id)
-                    }
-                },
-            };
+                            (page_guard, row_id)
+                        }
+                    },
+                };
             match self
                 .delete_row_internal(stmt, page_guard, row_id, key, log_by_key)
                 .await
@@ -2147,7 +2262,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         }
     }
 
-    async fn delete_unique_no_trx(&self, key: &SelectKey) {
+    async fn delete_unique_no_trx(&self, guards: &PoolGuards, key: &SelectKey) {
         debug_assert!(key.index_no < self.sec_idx().len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
@@ -2158,13 +2273,25 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                 RowLocation::NotFound => unreachable!(),
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self
-                        .mem_pool()
-                        .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
-                        .await
-                        .lock_exclusive_async()
-                        .await
-                        .unwrap();
+                    let page_guard =
+                        self.mem_pool()
+                            .get_page::<RowPage>(
+                                match self.mem.row_pool_slot {
+                                    RowPoolSlot::Mem => guards
+                                        .mem
+                                        .as_ref()
+                                        .expect("missing mem pool guard for user-table row pages"),
+                                    RowPoolSlot::Meta => guards.meta.as_ref().expect(
+                                        "missing meta pool guard for catalog-table row pages",
+                                    ),
+                                },
+                                page_id,
+                                LatchFallbackMode::Exclusive,
+                            )
+                            .await
+                            .lock_exclusive_async()
+                            .await
+                            .unwrap();
                     (page_guard, row_id)
                 }
             },
@@ -2182,16 +2309,23 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         page.set_deleted_exclusive(row_idx, true);
     }
 
-    async fn delete_index(&self, key: &SelectKey, row_id: RowID, unique: bool) -> bool {
+    async fn delete_index(
+        &self,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        row_id: RowID,
+        unique: bool,
+    ) -> bool {
         // todo: consider index drop.
         let index_schema = &self.metadata().index_specs[key.index_no];
         debug_assert_eq!(unique, index_schema.unique());
         if unique {
             let index = self.sec_idx()[key.index_no].unique().unwrap();
-            self.delete_unique_index(index, key, row_id).await
+            self.delete_unique_index(guards, index, key, row_id).await
         } else {
             let index = self.sec_idx()[key.index_no].non_unique().unwrap();
-            self.delete_non_unique_index(index, key, row_id).await
+            self.delete_non_unique_index(guards, index, key, row_id)
+                .await
         }
     }
 }

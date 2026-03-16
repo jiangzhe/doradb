@@ -115,135 +115,6 @@ fn wait_for_guard_count_zero(guard_count: &AtomicUsize) {
     }
 }
 
-struct QuiescentDrainInner {
-    guard_count: QuiescentGuardCount,
-}
-
-impl QuiescentDrainInner {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            guard_count: QuiescentGuardCount::new(),
-        }
-    }
-}
-
-/// Owns a quiescent keepalive counter without exposing a dereferenceable value.
-///
-/// This is used for resources whose actual lifetime invariant is not a pinned
-/// owner object, such as mmap-backed frame/page arenas.
-pub(crate) struct QuiescentDrain {
-    inner: Pin<Box<QuiescentDrainInner>>,
-}
-
-impl QuiescentDrain {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: Box::pin(QuiescentDrainInner::new()),
-        }
-    }
-
-    #[inline]
-    fn inner_ptr(&self) -> NonNull<QuiescentDrainInner> {
-        NonNull::from(self.inner.as_ref().get_ref())
-    }
-
-    #[inline]
-    pub(crate) fn token(&self) -> QuiescentToken {
-        QuiescentToken::new(self.inner_ptr())
-    }
-
-    #[inline]
-    pub(crate) fn wait_for_zero(&self) {
-        self.inner.as_ref().get_ref().guard_count.wait_for_zero();
-    }
-}
-
-impl Drop for QuiescentDrain {
-    #[inline]
-    fn drop(&mut self) {
-        self.inner.as_ref().get_ref().guard_count.wait_for_zero();
-    }
-}
-
-/// Single-owner keepalive token for a [`QuiescentDrain`]-owned resource.
-pub(crate) struct QuiescentToken {
-    inner: NonNull<QuiescentDrainInner>,
-}
-
-impl QuiescentToken {
-    #[inline]
-    fn new(inner: NonNull<QuiescentDrainInner>) -> Self {
-        // SAFETY: `inner` originates from a live `QuiescentDrain` allocation
-        // and remains valid while this acquired keepalive count is held.
-        let inner_ref = unsafe { inner.as_ref() };
-        inner_ref.guard_count.acquire();
-        Self { inner }
-    }
-
-    #[inline]
-    fn inner_ref(&self) -> &QuiescentDrainInner {
-        // SAFETY: each token holds one keepalive count from creation until its
-        // `Drop`, so the owner allocation remains live here.
-        unsafe { self.inner.as_ref() }
-    }
-
-    #[inline]
-    pub(crate) fn into_local(self) -> SyncQuiescentToken {
-        SyncQuiescentToken {
-            token: Arc::new(self),
-        }
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn into_local_unsync(self) -> UnsyncQuiescentToken {
-        UnsyncQuiescentToken {
-            token: Rc::new(self),
-        }
-    }
-}
-
-impl Drop for QuiescentToken {
-    #[inline]
-    fn drop(&mut self) {
-        self.inner_ref().guard_count.release();
-    }
-}
-
-unsafe impl Send for QuiescentToken {}
-unsafe impl Sync for QuiescentToken {}
-
-/// Clone-cheap cross-thread keepalive wrapper for a [`QuiescentToken`].
-pub(crate) struct SyncQuiescentToken {
-    token: Arc<QuiescentToken>,
-}
-
-/// Clone-cheap single-thread keepalive wrapper for a [`QuiescentToken`].
-#[allow(dead_code)]
-pub(crate) struct UnsyncQuiescentToken {
-    token: Rc<QuiescentToken>,
-}
-
-impl Clone for SyncQuiescentToken {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            token: Arc::clone(&self.token),
-        }
-    }
-}
-
-impl Clone for UnsyncQuiescentToken {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            token: Rc::clone(&self.token),
-        }
-    }
-}
-
 #[cold]
 fn guard_count_overflow() -> ! {
     panic!("quiescent guard count overflow");
@@ -369,6 +240,29 @@ impl<T> QuiescentGuard<T> {
         unsafe { self.inner.as_ref() }
     }
 
+    /// Converts this direct guard into a clone-cheap cross-thread wrapper.
+    ///
+    /// The wrapped direct guard still holds exactly one quiescent keepalive.
+    /// Further clones only clone the outer `Arc` and do not touch guard_count.
+    #[inline]
+    pub(crate) fn into_sync(self) -> SyncQuiescentGuard<T> {
+        SyncQuiescentGuard {
+            guard: Arc::new(self),
+        }
+    }
+
+    /// Converts this direct guard into a clone-cheap single-thread wrapper.
+    ///
+    /// The wrapped direct guard still holds exactly one quiescent keepalive.
+    /// Further clones only clone the outer `Rc` and do not touch guard_count.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn into_unsync(self) -> UnsyncQuiescentGuard<T> {
+        UnsyncQuiescentGuard {
+            guard: Rc::new(self),
+        }
+    }
+
     /// Returns the raw pointer to the guarded value.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
@@ -408,6 +302,53 @@ unsafe impl<T: Sync> Send for QuiescentGuard<T> {}
 // SAFETY: sharing references to guards is equivalent to sharing references to
 // `&T`, so this is sound exactly when `T: Sync`.
 unsafe impl<T: Sync> Sync for QuiescentGuard<T> {}
+
+/// Clone-cheap cross-thread wrapper for one acquired [`QuiescentGuard`].
+pub struct SyncQuiescentGuard<T> {
+    guard: Arc<QuiescentGuard<T>>,
+}
+
+/// Clone-cheap single-thread wrapper for one acquired [`QuiescentGuard`].
+#[allow(dead_code)]
+pub(crate) struct UnsyncQuiescentGuard<T> {
+    guard: Rc<QuiescentGuard<T>>,
+}
+
+impl<T> Clone for SyncQuiescentGuard<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            guard: Arc::clone(&self.guard),
+        }
+    }
+}
+
+impl<T> Clone for UnsyncQuiescentGuard<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            guard: Rc::clone(&self.guard),
+        }
+    }
+}
+
+impl<T> Deref for SyncQuiescentGuard<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref()
+    }
+}
+
+impl<T> Deref for UnsyncQuiescentGuard<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref()
+    }
+}
 
 #[derive(Debug)]
 struct QuiHandleState {
@@ -1263,46 +1204,28 @@ mod tests {
     }
 
     #[test]
-    fn test_quiescent_drain_drop_waits_for_direct_token() {
-        let drain = QuiescentDrain::new();
-        let token = drain.token();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-
-        let owner_handle = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            drop(drain);
-            done_tx.send(()).unwrap();
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(token);
-        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        owner_handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_quiescent_drain_drop_waits_for_last_sync_local_token() {
-        let drain = QuiescentDrain::new();
-        let token = drain.token().into_local();
-        let token_clone = token.clone();
+    fn test_quiescent_box_drop_waits_for_last_sync_guard_wrapper() {
+        let owner = QuiescentBox::new(());
+        let guard = owner.guard().into_sync();
+        let guard_clone = guard.clone();
         let (release_tx, release_rx) = mpsc::channel();
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
 
         let clone_handle = thread::spawn(move || {
             release_rx.recv().unwrap();
-            drop(token_clone);
+            drop(guard_clone);
         });
         let owner_handle = thread::spawn(move || {
             started_tx.send(()).unwrap();
-            drop(drain);
+            drop(owner);
             done_tx.send(()).unwrap();
         });
 
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        drop(token);
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(guard);
         assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
         release_tx.send(()).unwrap();
@@ -1312,98 +1235,98 @@ mod tests {
     }
 
     #[test]
-    fn test_quiescent_drain_drop_waits_for_last_unsync_local_token() {
-        let drain = QuiescentDrain::new();
-        let token = drain.token().into_local_unsync();
-        let token_clone = token.clone();
+    fn test_quiescent_box_drop_waits_for_last_unsync_guard_wrapper() {
+        let owner = QuiescentBox::new(());
+        let guard = owner.guard().into_unsync();
+        let guard_clone = guard.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
 
         let owner_handle = thread::spawn(move || {
             started_tx.send(()).unwrap();
-            drop(drain);
+            drop(owner);
             done_tx.send(()).unwrap();
         });
 
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
-        drop(token_clone);
+        drop(guard_clone);
         assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
-        drop(token);
+        drop(guard);
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         owner_handle.join().unwrap();
     }
 
     #[test]
-    fn test_sync_local_quiescent_token_clones_do_not_touch_guard_count() {
-        let drain = QuiescentDrain::new();
-        let token = drain.token();
-        assert_eq!(token.inner_ref().guard_count.load(Ordering::Relaxed), 1);
+    fn test_sync_quiescent_guard_clones_do_not_touch_guard_count() {
+        let owner = QuiescentBox::new(());
+        let guard = owner.guard();
+        assert_eq!(guard.inner_ref().guard_count.load(Ordering::Relaxed), 1);
 
-        let token = token.into_local();
+        let guard = guard.into_sync();
         assert_eq!(
-            token.token.inner_ref().guard_count.load(Ordering::Relaxed),
+            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1
         );
 
-        let token_clone1 = token.clone();
-        let token_clone2 = token.clone();
+        let guard_clone1 = guard.clone();
+        let guard_clone2 = guard.clone();
         assert_eq!(
-            token.token.inner_ref().guard_count.load(Ordering::Relaxed),
+            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1
         );
 
-        drop(token_clone1);
+        drop(guard_clone1);
         assert_eq!(
-            token.token.inner_ref().guard_count.load(Ordering::Relaxed),
+            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1
         );
 
-        drop(token_clone2);
+        drop(guard_clone2);
         assert_eq!(
-            token.token.inner_ref().guard_count.load(Ordering::Relaxed),
+            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1
         );
 
-        drop(token);
-        drop(drain);
+        drop(guard);
+        drop(owner);
     }
 
     #[test]
-    fn test_unsync_local_quiescent_token_clones_do_not_touch_guard_count() {
-        let drain = QuiescentDrain::new();
-        let token = drain.token();
-        assert_eq!(token.inner_ref().guard_count.load(Ordering::Relaxed), 1);
+    fn test_unsync_quiescent_guard_clones_do_not_touch_guard_count() {
+        let owner = QuiescentBox::new(());
+        let guard = owner.guard();
+        assert_eq!(guard.inner_ref().guard_count.load(Ordering::Relaxed), 1);
 
-        let token = token.into_local_unsync();
+        let guard = guard.into_unsync();
         assert_eq!(
-            token.token.inner_ref().guard_count.load(Ordering::Relaxed),
+            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1
         );
 
-        let token_clone1 = token.clone();
-        let token_clone2 = token.clone();
+        let guard_clone1 = guard.clone();
+        let guard_clone2 = guard.clone();
         assert_eq!(
-            token.token.inner_ref().guard_count.load(Ordering::Relaxed),
+            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1
         );
 
-        drop(token_clone1);
+        drop(guard_clone1);
         assert_eq!(
-            token.token.inner_ref().guard_count.load(Ordering::Relaxed),
+            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1
         );
 
-        drop(token_clone2);
+        drop(guard_clone2);
         assert_eq!(
-            token.token.inner_ref().guard_count.load(Ordering::Relaxed),
+            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1
         );
 
-        drop(token);
-        drop(drain);
+        drop(guard);
+        drop(owner);
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::BufferPool;
 use crate::buffer::arena::QuiescentArena;
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
@@ -9,6 +8,7 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
+use crate::buffer::{BufferPool, PoolGuard};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -45,6 +45,8 @@ pub struct EvictableBufferPool {
     io_client: AIOClient<PoolRequest>,
     // IO thread handle.
     io_thread: Mutex<Option<JoinHandle<()>>>,
+    // Startup state held until the pool reaches a stable final address.
+    pending_io: Mutex<Option<PendingIOThread>>,
     // shutdown flag.
     shutdown_flag: Arc<AtomicBool>,
     // In-memory page set.
@@ -58,8 +60,12 @@ pub struct EvictableBufferPool {
 
 impl EvictableBufferPool {
     #[inline]
-    fn try_lock_page_exclusive(&self, page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
-        self.arena.try_lock_page_exclusive(page_id)
+    fn try_lock_page_exclusive(
+        &self,
+        guard: &PoolGuard,
+        page_id: PageID,
+    ) -> Option<PageExclusiveGuard<Page>> {
+        self.arena.try_lock_page_exclusive(guard, page_id)
     }
 
     /// Create a new listener to handle IO events on given file.
@@ -76,9 +82,9 @@ impl EvictableBufferPool {
     }
 
     #[inline]
-    fn new_evictor(&self) -> Evictor<EvictableRuntime> {
+    fn new_evictor(&'static self) -> Evictor<EvictableRuntime> {
         let runtime = EvictableRuntime {
-            arena: self.arena.lease_source(),
+            arena: self.arena.arena_guard(self.guard()),
             in_mem: Arc::clone(&self.in_mem),
             io_client: self.io_client.clone(),
             inflight_io: Arc::clone(&self.inflight_io),
@@ -104,7 +110,7 @@ impl EvictableBufferPool {
     /// Try to dispatch read IO on given page.
     /// This method may not succeed, and client should retry.
     #[inline]
-    async fn try_dispatch_io_read(&self, page_id: PageID) {
+    async fn try_dispatch_io_read(&self, guard: &PoolGuard, page_id: PageID) {
         enum DispatchAction {
             RetryYield,
             Wait(EventListener),
@@ -121,7 +127,7 @@ impl EvictableBufferPool {
             match g.entry(page_id) {
                 Entry::Vacant(vac) => {
                     // First thread to initialize IO read.
-                    match self.try_lock_page_exclusive(page_id) {
+                    match self.try_lock_page_exclusive(guard, page_id) {
                         // Retry path. Yield after lock release to avoid tight spin.
                         None => DispatchAction::RetryYield,
                         Some(page_guard) => {
@@ -242,12 +248,25 @@ impl EvictableBufferPool {
     }
 
     #[inline]
-    fn start_evict_thread(&self) {
+    fn start_evict_thread(&'static self) {
         let handle = self
             .new_evictor()
             .start_thread("EvictableBufferPoolEvictor");
         let mut g = self.in_mem.evict_thread.lock();
         *g = Some(handle);
+    }
+
+    #[inline]
+    fn start_background_workers(&'static self) {
+        let pending = {
+            let mut g = self.pending_io.lock();
+            g.take()
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        self.start_io_thread(pending.event_loop, pending.file_io);
+        self.start_evict_thread();
     }
 
     /// Reserve a page in memory.
@@ -287,7 +306,15 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
+    fn guard(&self) -> PoolGuard {
+        self.arena.sync_guard()
+    }
+
+    #[inline]
+    async fn allocate_page<T: BufferPage>(
+        &'static self,
+        guard: &PoolGuard,
+    ) -> PageExclusiveGuard<T> {
         loop {
             self.reserve_page().await;
 
@@ -295,14 +322,14 @@ impl BufferPool for EvictableBufferPool {
             match self.alloc_map.try_allocate() {
                 Some(page_id) => {
                     self.in_mem.pin(page_id as PageID);
-                    return self.arena.init_page(page_id as PageID);
+                    return self.arena.init_page(guard, page_id as PageID);
                 }
                 None => {
                     listener!(self.alloc_ev => listener);
                     // re-check
                     if let Some(page_id) = self.alloc_map.try_allocate() {
                         self.in_mem.pin(page_id as PageID);
-                        return self.arena.init_page(page_id as PageID);
+                        return self.arena.init_page(guard, page_id as PageID);
                     }
 
                     // Here we cannot find a free page to load, we should cancel reservation of a page
@@ -317,13 +344,14 @@ impl BufferPool for EvictableBufferPool {
     #[inline]
     async fn allocate_page_at<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
         self.reserve_page().await;
 
         if self.alloc_map.allocate_at(page_id as usize) {
             self.in_mem.pin(page_id);
-            Ok(self.arena.init_page(page_id))
+            Ok(self.arena.init_page(guard, page_id))
         } else {
             self.in_mem.dec();
             Err(Error::BufferPageAlreadyAllocated)
@@ -333,6 +361,7 @@ impl BufferPool for EvictableBufferPool {
     #[inline]
     async fn get_page<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
@@ -345,7 +374,7 @@ impl BufferPool for EvictableBufferPool {
                 }
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
-                    return FacadePageGuard::new(self.arena.lease(), bf, g);
+                    return FacadePageGuard::new(guard.clone(), bf, g);
                 }
                 FrameKind::Cool => {
                     // Try to mark this page as HOT.
@@ -356,7 +385,7 @@ impl BufferPool for EvictableBufferPool {
                         continue;
                     }
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
-                    return FacadePageGuard::new(self.arena.lease(), bf, g);
+                    return FacadePageGuard::new(guard.clone(), bf, g);
                 }
                 FrameKind::Evicting => {
                     // The page is marked evicting in order to be evicted to disk in near future.
@@ -370,7 +399,7 @@ impl BufferPool for EvictableBufferPool {
                     // This means we should let one thread to exclusively lock this page
                     // and initiate a IO read.
                     // Other threads can wait for the initiator to finish.
-                    self.try_dispatch_io_read(page_id).await;
+                    self.try_dispatch_io_read(guard, page_id).await;
                 }
             }
         }
@@ -379,6 +408,7 @@ impl BufferPool for EvictableBufferPool {
     #[inline]
     async fn try_get_page_versioned<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
     ) -> Option<FacadePageGuard<T>> {
@@ -392,7 +422,7 @@ impl BufferPool for EvictableBufferPool {
                 FrameKind::Uninitialized => return None,
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
-                    let g = FacadePageGuard::new(self.arena.lease(), bf, g);
+                    let g = FacadePageGuard::new(guard.clone(), bf, g);
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
                         if g.is_exclusive() {
@@ -409,7 +439,7 @@ impl BufferPool for EvictableBufferPool {
                     {
                         continue;
                     }
-                    let g = FacadePageGuard::new(self.arena.lease(), bf, g);
+                    let g = FacadePageGuard::new(guard.clone(), bf, g);
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
                         if g.is_exclusive() {
@@ -423,7 +453,7 @@ impl BufferPool for EvictableBufferPool {
                     self.try_wait_for_io_write(id.page_id).await;
                 }
                 FrameKind::Evicted => {
-                    self.try_dispatch_io_read(id.page_id).await;
+                    self.try_dispatch_io_read(guard, id.page_id).await;
                 }
             }
         }
@@ -445,6 +475,7 @@ impl BufferPool for EvictableBufferPool {
     #[inline]
     async fn get_child_page<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
@@ -462,7 +493,7 @@ impl BufferPool for EvictableBufferPool {
                     // the validation make sure parent page does not change until child
                     // page is acquired.
                     if p_guard.validate_bool() {
-                        return Valid(FacadePageGuard::new(self.arena.lease(), bf, g));
+                        return Valid(FacadePageGuard::new(guard.clone(), bf, g));
                     }
                     if g.state == GuardState::Exclusive {
                         g.rollback_exclusive_bit();
@@ -483,7 +514,7 @@ impl BufferPool for EvictableBufferPool {
                     // page is acquired.
                     return p_guard
                         .validate()
-                        .and_then(|_| Valid(FacadePageGuard::new(self.arena.lease(), bf, g)));
+                        .and_then(|_| Valid(FacadePageGuard::new(guard.clone(), bf, g)));
                 }
                 FrameKind::Evicting => {
                     // The page is being evicted to disk.
@@ -494,7 +525,7 @@ impl BufferPool for EvictableBufferPool {
                     // This means we should let one thread to exclusively lock this page
                     // and initiate a IO read.
                     // Other threads can wait for the initiator to finish.
-                    self.try_dispatch_io_read(page_id).await;
+                    self.try_dispatch_io_read(guard, page_id).await;
                 }
             }
         }
@@ -513,10 +544,12 @@ impl Drop for EvictableBufferPool {
         self.io_client.shutdown();
         {
             let mut g = self.io_thread.lock();
-            let handle = g.take().unwrap();
-            drop(g);
-            handle.join().unwrap();
+            if let Some(handle) = g.take() {
+                drop(g);
+                handle.join().unwrap();
+            }
         }
+        let _ = self.pending_io.lock().take();
     }
 }
 
@@ -687,7 +720,7 @@ impl AIOEventListener for EvictableBufferPoolListener {
 }
 
 struct EvictableRuntime {
-    arena: crate::buffer::arena::ArenaLeaseSource,
+    arena: crate::buffer::arena::ArenaGuard,
     in_mem: Arc<InMemPageSet>,
     inflight_io: Arc<InflightIO>,
     io_client: AIOClient<PoolRequest>,
@@ -981,6 +1014,11 @@ impl SingleFileIO {
     }
 }
 
+struct PendingIOThread {
+    event_loop: AIOEventLoop<PoolRequest>,
+    file_io: SingleFileIO,
+}
+
 const DEFAULT_DATA_SWAP_FILE: &str = "data.bin";
 const DEFAULT_MAX_FILE_SIZE: Byte = Byte::from_u64(2 * 1024 * 1024 * 1024); // by default 2GB
 const DEFAULT_MAX_MEM_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // by default 1GB
@@ -1131,17 +1169,16 @@ impl EvictableBufferPoolConfig {
             alloc_ev: Event::new(),
             io_client,
             io_thread: Mutex::new(None),
+            pending_io: Mutex::new(Some(PendingIOThread {
+                event_loop,
+                file_io,
+            })),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             inflight_io: Arc::new(InflightIO::default()),
             stats: Arc::new(EvictableBufferPoolStats::default()),
             arena,
         };
-
-        // Start background IO thread.
-        pool.start_io_thread(event_loop, file_io);
-        // Start background evictor thread.
-        pool.start_evict_thread();
         Ok(pool)
     }
 
@@ -1150,6 +1187,7 @@ impl EvictableBufferPoolConfig {
     pub fn build_static(self) -> Result<&'static EvictableBufferPool> {
         let pool = self.build()?;
         let pool = StaticLifetime::new_static(pool);
+        pool.start_background_workers();
         Ok(pool)
     }
 }
@@ -1337,50 +1375,63 @@ mod tests {
                     .unwrap(),
             );
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let g = pool.allocate_page::<RowPage>().await;
+                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g = pool.allocate_page::<RowPage>().await;
+                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 assert_eq!(g.page_id(), 1);
                 let stale_versioned = g.bf().versioned_page_id();
                 pool.deallocate_page(g);
-                let g = pool.allocate_page::<RowPage>().await;
+                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 assert_eq!(g.page_id(), 1);
                 assert_eq!(g.bf().generation(), stale_versioned.generation + 2);
                 let current_versioned = g.bf().versioned_page_id();
                 drop(g);
 
                 let g = pool
-                    .try_get_page_versioned::<RowPage>(current_versioned, LatchFallbackMode::Shared)
+                    .try_get_page_versioned::<RowPage>(
+                        &pool_guard,
+                        current_versioned,
+                        LatchFallbackMode::Shared,
+                    )
                     .await;
                 assert!(g.is_some());
 
                 let g = pool
-                    .try_get_page_versioned::<RowPage>(stale_versioned, LatchFallbackMode::Shared)
+                    .try_get_page_versioned::<RowPage>(
+                        &pool_guard,
+                        stale_versioned,
+                        LatchFallbackMode::Shared,
+                    )
                     .await;
                 assert!(g.is_none());
             }
             {
-                let g = pool.allocate_page::<RowPage>().await;
+                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 let page_id = g.page_id();
                 let versioned = g.bf().versioned_page_id();
                 drop(g);
 
                 // Keep an optimistic guard, then reuse the page slot.
                 let stale_guard = pool
-                    .try_get_page_versioned::<RowPage>(versioned, LatchFallbackMode::Shared)
+                    .try_get_page_versioned::<RowPage>(
+                        &pool_guard,
+                        versioned,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .unwrap();
                 let g = pool
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+                    .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
                     .await
                     .lock_exclusive_async()
                     .await
                     .unwrap();
                 pool.deallocate_page(g);
-                let g = pool.allocate_page::<RowPage>().await;
+                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 assert_eq!(g.page_id(), page_id);
                 drop(g);
 
@@ -1388,21 +1439,21 @@ mod tests {
             }
             {
                 let g = pool
-                    .get_page::<RowPage>(0, LatchFallbackMode::Spin)
+                    .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Spin)
                     .await
                     .downgrade();
                 assert_eq!(g.page_id(), 0);
                 let p = g.facade();
                 // test coupling.
                 let c = pool
-                    .get_child_page::<RowPage>(&p, 1, LatchFallbackMode::Exclusive)
+                    .get_child_page::<RowPage>(&pool_guard, &p, 1, LatchFallbackMode::Exclusive)
                     .await;
                 let c = c.unwrap();
                 drop(c);
             }
             {
                 let g = pool
-                    .get_page::<RowPage>(0, LatchFallbackMode::Spin)
+                    .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Spin)
                     .await
                     .downgrade();
                 assert_eq!(g.page_id(), 0);
@@ -1410,7 +1461,7 @@ mod tests {
 
                 // modify page 0.
                 let g = pool
-                    .get_page::<RowPage>(0, LatchFallbackMode::Exclusive)
+                    .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Exclusive)
                     .await
                     .verify_exclusive_async::<false>()
                     .await;
@@ -1418,7 +1469,7 @@ mod tests {
 
                 // test coupling fail.
                 let c = pool
-                    .get_child_page::<RowPage>(&p, 1, LatchFallbackMode::Exclusive)
+                    .get_child_page::<RowPage>(&pool_guard, &p, 1, LatchFallbackMode::Exclusive)
                     .await;
                 assert!(c.is_invalid());
             }
@@ -1440,14 +1491,16 @@ mod tests {
                     .unwrap(),
             )
             .as_static();
+        let pool_guard = pool.guard();
 
         let (tx, rx) = flume::unbounded();
         let handle1 = {
+            let pool_guard = pool_guard.clone();
             thread::spawn(move || {
                 smol::block_on(async move {
                     // allocate more pages than memory limit.
                     for i in 0..160 {
-                        let g = pool.allocate_page::<RowPage>().await;
+                        let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                         let _ = tx.send(g.page_id());
                         println!("allocated page {}", i);
                     }
@@ -1461,7 +1514,7 @@ mod tests {
         smol::block_on(async move {
             while let Ok(page_id) = rx.recv() {
                 let g = pool
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+                    .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
                     .await
                     .lock_exclusive_async()
                     .await
@@ -1488,6 +1541,7 @@ mod tests {
                 .unwrap(),
         );
         let pool = pool.as_static();
+        let pool_guard = pool.guard();
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
@@ -1497,7 +1551,7 @@ mod tests {
         smol::block_on(async {
             let mut pages = vec![];
             for _ in 0..2048 {
-                let g = pool.allocate_page::<RowPage>().await;
+                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 pages.push(g.page_id());
             }
             debug_assert!(pages.len() == 2048);
@@ -1516,7 +1570,10 @@ mod tests {
                     .build()
                     .unwrap(),
             );
-            let guard = pool.allocate_page::<RowPage>().await;
+            let guard = {
+                let pool_guard = pool.guard();
+                pool.allocate_page::<RowPage>(&pool_guard).await
+            };
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
 
@@ -1555,6 +1612,7 @@ mod tests {
                     .unwrap(),
             )
             .as_static();
+        let pool_guard = pool.guard();
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
@@ -1563,6 +1621,7 @@ mod tests {
         );
         let mut handles = vec![];
         for thread_id in 0..10 {
+            let pool_guard = pool_guard.clone();
             let handle = thread::spawn(move || {
                 smol::block_on(async {
                     let mut rng = rand::rng();
@@ -1571,7 +1630,7 @@ mod tests {
                     for _ in 0..200 {
                         // allocate a new page.
                         println!("thread {} alloc page start", thread_id);
-                        let g = pool.allocate_page::<RowPage>().await;
+                        let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                         pages.push(g.page_id());
                         println!(
                             "thread {} alloc page end page_id {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
@@ -1599,7 +1658,11 @@ mod tests {
                                 pool.inflight_io.writes.load(Ordering::Relaxed),
                             );
                             let g = pool
-                                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                                .get_page::<RowPage>(
+                                    &pool_guard,
+                                    page_id,
+                                    LatchFallbackMode::Shared,
+                                )
                                 .await;
                             println!("thread {} read page {} end", thread_id, page_id);
                             drop(g);
@@ -1636,6 +1699,7 @@ mod tests {
                 .unwrap(),
         );
         let pool = pool.as_static();
+        let _pool_guard = pool.guard();
         let arbiter = pool.in_mem.eviction_arbiter;
 
         assert_eq!(arbiter.target_free(), 2);

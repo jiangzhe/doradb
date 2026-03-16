@@ -1,6 +1,5 @@
-use crate::buffer::BufferPool;
 use crate::buffer::ReadonlyFileID;
-use crate::buffer::arena::{ArenaLease, QuiescentArena};
+use crate::buffer::arena::{ArenaGuard, QuiescentArena};
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
     FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
@@ -9,6 +8,7 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
+use crate::buffer::{BufferPool, PoolGuard};
 use crate::engine::StaticHandle;
 use crate::error::Validation::Valid;
 use crate::error::{Error, PersistedFileKind, Result, Validation};
@@ -141,7 +141,6 @@ impl GlobalReadonlyBufferPool {
             evict_thread: Mutex::new(None),
             arena,
         };
-        pool.start_evictor_thread();
         Ok(pool)
     }
 
@@ -149,7 +148,9 @@ impl GlobalReadonlyBufferPool {
     #[inline]
     pub fn with_capacity_static(pool_size: usize) -> Result<&'static Self> {
         let pool = Self::with_capacity(pool_size)?;
-        Ok(StaticLifetime::new_static(pool))
+        let pool = StaticLifetime::new_static(pool);
+        pool.start_evictor_thread();
+        Ok(pool)
     }
 
     /// Creates and leaks a global readonly pool with explicit eviction arbiter builder.
@@ -159,7 +160,9 @@ impl GlobalReadonlyBufferPool {
         eviction_arbiter_builder: EvictionArbiterBuilder,
     ) -> Result<&'static Self> {
         let pool = Self::with_capacity_and_arbiter_builder(pool_size, eviction_arbiter_builder)?;
-        Ok(StaticLifetime::new_static(pool))
+        let pool = StaticLifetime::new_static(pool);
+        pool.start_evictor_thread();
+        Ok(pool)
     }
 
     /// Returns total number of frame slots in this pool.
@@ -175,8 +178,17 @@ impl GlobalReadonlyBufferPool {
     }
 
     #[inline]
-    fn try_lock_page_exclusive(&self, frame_id: PageID) -> Option<PageExclusiveGuard<Page>> {
-        self.arena.try_lock_page_exclusive(frame_id)
+    pub fn guard(&self) -> PoolGuard {
+        self.arena.sync_guard()
+    }
+
+    #[inline]
+    fn try_lock_page_exclusive(
+        &self,
+        guard: &PoolGuard,
+        frame_id: PageID,
+    ) -> Option<PageExclusiveGuard<Page>> {
+        self.arena.try_lock_page_exclusive(guard, frame_id)
     }
 
     #[inline]
@@ -359,9 +371,9 @@ impl GlobalReadonlyBufferPool {
     }
 
     #[inline]
-    fn start_evictor_thread(&self) {
+    fn start_evictor_thread(&'static self) {
         let runtime = ReadonlyRuntime {
-            arena: self.arena.lease_source(),
+            arena: self.arena.arena_guard(self.guard()),
             mappings: Arc::clone(&self.mappings),
             residency: Arc::clone(&self.residency),
         };
@@ -403,7 +415,8 @@ impl GlobalReadonlyBufferPool {
     #[inline]
     fn invalidate_frame_retry(&self, frame_id: PageID, expected_key: Option<ReadonlyCacheKey>) {
         loop {
-            if let Some(page_guard) = self.try_lock_page_exclusive(frame_id) {
+            let guard = self.guard();
+            if let Some(page_guard) = self.try_lock_page_exclusive(&guard, frame_id) {
                 self.invalidate_frame_with_guard(page_guard, expected_key);
                 let _ = self.residency.move_resident_to_free(frame_id);
                 return;
@@ -414,12 +427,15 @@ impl GlobalReadonlyBufferPool {
 
     #[inline]
     fn invalidate_frame_strict(&self, frame_id: PageID, expected_key: Option<ReadonlyCacheKey>) {
-        let page_guard = self.try_lock_page_exclusive(frame_id).unwrap_or_else(|| {
-            panic!(
-                "strict invalidation lock acquisition failed: frame_id={}",
-                frame_id
-            )
-        });
+        let guard = self.guard();
+        let page_guard = self
+            .try_lock_page_exclusive(&guard, frame_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "strict invalidation lock acquisition failed: frame_id={}",
+                    frame_id
+                )
+            });
         self.invalidate_frame_with_guard(page_guard, expected_key);
         let _ = self.residency.move_resident_to_free(frame_id);
     }
@@ -437,12 +453,12 @@ impl GlobalReadonlyBufferPool {
                 vac.insert(Arc::clone(&inflight));
                 let task_state = self.load_task_state();
                 let task_inflight = Arc::clone(&inflight);
-                let task_lease = self.arena.lease();
+                let task_arena = self.arena.arena_guard(self.guard());
                 smol::spawn(async move {
                     let mut completion =
                         InflightLoadCompletion::new(task_state.clone(), key, task_inflight);
                     let load_res = task_state
-                        .run_inflight_load(key, page_source, validation, task_lease)
+                        .run_inflight_load(key, page_source, validation, task_arena)
                         .await;
                     completion.complete(load_res);
                 })
@@ -499,21 +515,22 @@ impl GlobalReadonlyBufferPool {
     #[inline]
     async fn get_page_internal<T: 'static>(
         &'static self,
+        guard: &PoolGuard,
         frame_id: PageID,
         mode: LatchFallbackMode,
     ) -> Result<FacadePageGuard<T>> {
         if frame_id as usize >= self.size {
             return Err(Error::InvalidArgument);
         }
-        let lease = self.arena.lease();
-        let bf = lease.frame_ptr(frame_id);
+        let keepalive = guard.clone();
+        let bf = self.arena.frame_ptr(frame_id);
         let g = self
             .arena
             .frame(frame_id)
             .latch
             .optimistic_fallback_raw(mode)
             .await;
-        Ok(FacadePageGuard::new(lease, bf, g))
+        Ok(FacadePageGuard::new(keepalive, bf, g))
     }
 
     #[inline]
@@ -622,9 +639,9 @@ impl ReadonlyLoadTaskState {
         key: ReadonlyCacheKey,
         page_source: Arc<dyn ReadonlyPageSource>,
         validation: Option<InflightLoadValidation>,
-        lease: ArenaLease,
+        arena: ArenaGuard,
     ) -> Result<PageID> {
-        let mut reserved = ReservedMissFrameGuard::acquire(self.clone(), lease).await?;
+        let mut reserved = ReservedMissFrameGuard::acquire(self.clone(), arena).await?;
         // SAFETY: destination memory is page-sized, aligned, and exclusively owned
         // by the reserved miss-frame guard for the full background miss attempt.
         let dst = UnsafePtr(reserved.page_mut() as *mut Page as *mut u8);
@@ -662,9 +679,9 @@ struct ReservedMissFrameGuard {
 
 impl ReservedMissFrameGuard {
     #[inline]
-    async fn acquire(state: ReadonlyLoadTaskState, lease: ArenaLease) -> Result<Self> {
+    async fn acquire(state: ReadonlyLoadTaskState, arena: ArenaGuard) -> Result<Self> {
         let frame_id = state.reserve_frame_id().await?;
-        let mut page_guard = match lease.try_lock_page_exclusive(frame_id) {
+        let mut page_guard = match arena.try_lock_page_exclusive(frame_id) {
             Some(page_guard) => page_guard,
             None => {
                 state.residency.release_free(frame_id);
@@ -951,7 +968,7 @@ impl ReadonlyResidency {
 }
 
 struct ReadonlyRuntime {
-    arena: crate::buffer::arena::ArenaLeaseSource,
+    arena: ArenaGuard,
     mappings: Arc<DashMap<ReadonlyCacheKey, PageID>>,
     residency: Arc<ReadonlyResidency>,
 }
@@ -1103,6 +1120,7 @@ impl ReadonlyBufferPool {
     #[inline]
     async fn get_page_facade<T: BufferPage>(
         &self,
+        guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> Result<FacadePageGuard<T>> {
@@ -1112,9 +1130,9 @@ impl ReadonlyBufferPool {
             let frame_id = global
                 .get_or_load_frame_id(key, Arc::clone(&self.page_source))
                 .await?;
-            let guard = global.get_page_internal(frame_id, mode).await?;
-            if global.validate_guarded_frame_key(&guard, key) {
-                return Ok(guard);
+            let page_guard = global.get_page_internal(guard, frame_id, mode).await?;
+            if global.validate_guarded_frame_key(&page_guard, key) {
+                return Ok(page_guard);
             }
             global.invalidate_stale_mapping_if_same_frame(key, frame_id);
         }
@@ -1142,8 +1160,9 @@ impl ReadonlyBufferPool {
                     validator,
                 )
                 .await?;
+            let guard = global.guard();
             let guard = global
-                .get_page_internal::<Page>(frame_id, LatchFallbackMode::Shared)
+                .get_page_internal::<Page>(&guard, frame_id, LatchFallbackMode::Shared)
                 .await?;
             if !global.validate_guarded_frame_key(&guard, key) {
                 global.invalidate_stale_mapping_if_same_frame(key, frame_id);
@@ -1186,13 +1205,22 @@ impl BufferPool for ReadonlyBufferPool {
     }
 
     #[inline]
-    async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
+    fn guard(&self) -> PoolGuard {
+        self.global.as_static().guard()
+    }
+
+    #[inline]
+    async fn allocate_page<T: BufferPage>(
+        &'static self,
+        _guard: &PoolGuard,
+    ) -> PageExclusiveGuard<T> {
         panic!("readonly buffer pool does not support page allocation")
     }
 
     #[inline]
     async fn allocate_page_at<T: BufferPage>(
         &'static self,
+        _guard: &PoolGuard,
         _page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
         panic!("readonly buffer pool does not support page allocation")
@@ -1201,10 +1229,11 @@ impl BufferPool for ReadonlyBufferPool {
     #[inline]
     async fn get_page<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
-        match self.get_page_facade(page_id, mode).await {
+        match self.get_page_facade(guard, page_id, mode).await {
             Ok(g) => g,
             Err(err) => {
                 todo!("readonly BufferPool::get_page error policy is deferred: {err}");
@@ -1215,6 +1244,7 @@ impl BufferPool for ReadonlyBufferPool {
     #[inline]
     async fn try_get_page_versioned<T: BufferPage>(
         &'static self,
+        _guard: &PoolGuard,
         _id: VersionedPageID,
         _mode: LatchFallbackMode,
     ) -> Option<FacadePageGuard<T>> {
@@ -1229,11 +1259,12 @@ impl BufferPool for ReadonlyBufferPool {
     #[inline]
     async fn get_child_page<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> Validation<FacadePageGuard<T>> {
-        let g = self.get_page::<T>(page_id, mode).await;
+        let g = <Self as BufferPool>::get_page(self, guard, page_id, mode).await;
         if p_guard.validate_bool() {
             return Valid(g);
         }
@@ -1473,10 +1504,11 @@ mod tests {
         let global =
             scope.adopt(GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
         let global = global.as_static();
+        let global_guard = global.guard();
         let key = ReadonlyCacheKey::new(7, 11);
 
         assert_eq!(global.allocated(), 0);
-        let mut g3 = global.try_lock_page_exclusive(3).unwrap();
+        let mut g3 = global.try_lock_page_exclusive(&global_guard, 3).unwrap();
         global.bind_frame(key, &mut g3).unwrap();
         assert_eq!(global.allocated(), 1);
         assert_eq!(global.try_get_frame_id(&key), Some(3));
@@ -1508,13 +1540,14 @@ mod tests {
         let global =
             scope.adopt(GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
         let global = global.as_static();
+        let global_guard = global.guard();
         let k1 = ReadonlyCacheKey::new(1, 10);
         let k2 = ReadonlyCacheKey::new(1, 11);
         let k3 = ReadonlyCacheKey::new(2, 20);
 
-        let mut g1 = global.try_lock_page_exclusive(1).unwrap();
-        let mut g2 = global.try_lock_page_exclusive(2).unwrap();
-        let mut g3 = global.try_lock_page_exclusive(3).unwrap();
+        let mut g1 = global.try_lock_page_exclusive(&global_guard, 1).unwrap();
+        let mut g2 = global.try_lock_page_exclusive(&global_guard, 2).unwrap();
+        let mut g3 = global.try_lock_page_exclusive(&global_guard, 3).unwrap();
         global.bind_frame(k1, &mut g1).unwrap();
         global.bind_frame(k2, &mut g2).unwrap();
         global.bind_frame(k3, &mut g3).unwrap();
@@ -1534,11 +1567,12 @@ mod tests {
         let global =
             scope.adopt(GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
         let global = global.as_static();
+        let global_guard = global.guard();
         let catalog_key = ReadonlyCacheKey::new(USER_OBJ_ID_START - 1, 42);
         let user_key = ReadonlyCacheKey::new(USER_OBJ_ID_START, 42);
 
-        let mut catalog_frame = global.try_lock_page_exclusive(1).unwrap();
-        let mut user_frame = global.try_lock_page_exclusive(2).unwrap();
+        let mut catalog_frame = global.try_lock_page_exclusive(&global_guard, 1).unwrap();
+        let mut user_frame = global.try_lock_page_exclusive(&global_guard, 2).unwrap();
         global.bind_frame(catalog_key, &mut catalog_frame).unwrap();
         global.bind_frame(user_key, &mut user_frame).unwrap();
         drop(catalog_frame);
@@ -1554,9 +1588,10 @@ mod tests {
         let global =
             scope.adopt(GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
         let global = global.as_static();
+        let global_guard = global.guard();
         let key = ReadonlyCacheKey::new(9, 77);
 
-        let mut g = global.try_lock_page_exclusive(5).unwrap();
+        let mut g = global.try_lock_page_exclusive(&global_guard, 5).unwrap();
         global.bind_frame(key, &mut g).unwrap();
         drop(g);
 
@@ -1572,9 +1607,10 @@ mod tests {
             let global = scope
                 .adopt(GlobalReadonlyBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let global = global.as_static();
+            let global_guard = global.guard();
             let key = ReadonlyCacheKey::new(10, 99);
 
-            let mut g = global.try_lock_page_exclusive(6).unwrap();
+            let mut g = global.try_lock_page_exclusive(&global_guard, 6).unwrap();
             global.bind_frame(key, &mut g).unwrap();
             let shared = g.downgrade_shared();
             let _ = global.invalidate_key_strict(&key);
@@ -1600,9 +1636,10 @@ mod tests {
                 GlobalReadonlyBufferPool::with_capacity_static(frame_page_bytes(2)).unwrap(),
             );
             let global = global.as_static();
+            let global_guard = global.guard();
             let key = ReadonlyCacheKey::new(111, 9);
 
-            let mut g0 = global.try_lock_page_exclusive(0).unwrap();
+            let mut g0 = global.try_lock_page_exclusive(&global_guard, 0).unwrap();
             global.bind_frame(key, &mut g0).unwrap();
             g0.page_mut().zero();
             let frame = g0.bf_mut();
@@ -1617,9 +1654,10 @@ mod tests {
                 Arc::clone(&table_file),
                 global,
             )));
+            let pool = pool.as_static();
+            let pool_guard = pool.guard();
             let page: FacadePageGuard<Page> = pool
-                .as_static()
-                .get_page::<Page>(9, LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                 .await;
             let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..6], b"reload");
@@ -1655,17 +1693,17 @@ mod tests {
                 Arc::clone(&table_file),
                 global.as_static(),
             )));
+            let pool = pool.as_static();
+            let pool_guard = pool.guard();
             let page: FacadePageGuard<Page> = pool
-                .as_static()
-                .get_page::<Page>(3, LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, 3, LatchFallbackMode::Shared)
                 .await;
             let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..5], b"hello");
             drop(page);
 
             let page: FacadePageGuard<Page> = pool
-                .as_static()
-                .get_page::<Page>(3, LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, 3, LatchFallbackMode::Shared)
                 .await;
             let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..5], b"hello");
@@ -1700,12 +1738,15 @@ mod tests {
                 global.as_static(),
             )));
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
 
             let mut tasks = vec![];
             for _ in 0..16 {
+                let pool_guard = pool_guard.clone();
                 tasks.push(smol::spawn(async move {
-                    let g: FacadePageGuard<Page> =
-                        pool.get_page::<Page>(5, LatchFallbackMode::Shared).await;
+                    let g: FacadePageGuard<Page> = pool
+                        .get_page::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
+                        .await;
                     g.lock_shared_async().await.unwrap().page()[0]
                 }));
             }
@@ -1736,11 +1777,12 @@ mod tests {
                 global.as_static(),
             )));
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             let key = ReadonlyCacheKey::new(112, 5);
 
             let loader = smol::spawn(async move {
                 let _ = pool
-                    .get_page_facade::<Page>(5, LatchFallbackMode::Shared)
+                    .get_page_facade::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
                     .await
                     .unwrap();
             });
@@ -1749,9 +1791,10 @@ mod tests {
 
             drop(loader);
 
+            let pool_guard = pool.guard();
             let waiter = smol::spawn(async move {
                 let g = pool
-                    .get_page_facade::<Page>(5, LatchFallbackMode::Shared)
+                    .get_page_facade::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
                     .await
                     .unwrap();
                 let g = g.lock_shared_async().await.unwrap();
@@ -1787,11 +1830,12 @@ mod tests {
                 global.as_static(),
             )));
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             let key = ReadonlyCacheKey::new(113, 9);
 
             let loader = smol::spawn(async move {
                 let _ = pool
-                    .get_page_facade::<Page>(9, LatchFallbackMode::Shared)
+                    .get_page_facade::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                     .await
                     .unwrap();
             });
@@ -1801,6 +1845,7 @@ mod tests {
             drop(loader);
             page_source.release();
 
+            let pool_guard = pool.guard();
             wait_for(|| {
                 !global.as_static().inflight_loads.contains_key(&key)
                     && global.as_static().try_get_frame_id(&key).is_some()
@@ -1810,7 +1855,7 @@ mod tests {
             assert_eq!(page_source.call_count(), 1);
             assert_eq!(global.as_static().allocated(), 1);
             let g = pool
-                .get_page_facade::<Page>(9, LatchFallbackMode::Shared)
+                .get_page_facade::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                 .await
                 .unwrap();
             let g = g.lock_shared_async().await.unwrap();
@@ -1834,12 +1879,13 @@ mod tests {
                 Arc::clone(&page_source),
                 global,
             ));
+            let pool_guard = pool.guard();
             let inflight_loads = Arc::clone(&global.inflight_loads);
             let mappings = Arc::clone(&global.mappings);
 
             let loader = smol::spawn(async move {
                 let _ = pool
-                    .get_page_facade::<Page>(12, LatchFallbackMode::Shared)
+                    .get_page_facade::<Page>(&pool_guard, 12, LatchFallbackMode::Shared)
                     .await
                     .unwrap();
             });
@@ -1929,14 +1975,17 @@ mod tests {
                 global.as_static(),
             )));
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             let key = ReadonlyCacheKey::new(114, 7);
 
+            let pool_guard_1 = pool_guard.clone();
             let waiter1 = smol::spawn(async move {
-                pool.get_page_facade::<Page>(7, LatchFallbackMode::Shared)
+                pool.get_page_facade::<Page>(&pool_guard_1, 7, LatchFallbackMode::Shared)
                     .await
             });
+            let pool_guard_2 = pool_guard.clone();
             let waiter2 = smol::spawn(async move {
-                pool.get_page_facade::<Page>(7, LatchFallbackMode::Shared)
+                pool.get_page_facade::<Page>(&pool_guard_2, 7, LatchFallbackMode::Shared)
                     .await
             });
 
@@ -1972,6 +2021,7 @@ mod tests {
                 global.as_static(),
             )));
             let pool = pool.as_static();
+            let _pool_guard = pool.guard();
             let key = ReadonlyCacheKey::new(115, 8);
 
             let waiter1 = smol::spawn(async move {
@@ -2196,6 +2246,7 @@ mod tests {
                 global.as_static(),
             )));
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             let capacity = global.as_static().capacity();
             let base_page_id = 7u64;
 
@@ -2210,7 +2261,7 @@ mod tests {
                 let page_id = base_page_id + i as u64;
                 let expected = format!("page-{i}");
                 let g: FacadePageGuard<Page> = pool
-                    .get_page::<Page>(page_id, LatchFallbackMode::Shared)
+                    .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
                     .await;
                 let g = g.lock_shared_async().await.unwrap();
                 assert_eq!(&g.page()[..expected.len()], expected.as_bytes());
@@ -2228,7 +2279,7 @@ mod tests {
 
             // Reload the first page after cache pressure; this should still return correct data.
             let g: FacadePageGuard<Page> = pool
-                .get_page::<Page>(base_page_id, LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, base_page_id, LatchFallbackMode::Shared)
                 .await;
             let g = g.lock_shared_async().await.unwrap();
             assert_eq!(&g.page()[..6], b"page-0");
@@ -2265,10 +2316,11 @@ mod tests {
                 Arc::clone(&table_file),
                 global.as_static(),
             )));
+            let pool = pool.as_static();
+            let pool_guard = pool.guard();
 
             let g: FacadePageGuard<Page> = pool
-                .as_static()
-                .get_page::<Page>(9, LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                 .await;
             let g = g.lock_shared_async().await.unwrap();
             assert_eq!(&g.page()[..10], b"drop-order");
@@ -2299,7 +2351,9 @@ mod tests {
                 table_file,
                 global.as_static(),
             )));
-            let _ = pool.as_static().allocate_page::<Page>().await;
+            let pool = pool.as_static();
+            let pool_guard = pool.guard();
+            let _ = pool.allocate_page::<Page>(&pool_guard).await;
         });
     }
 

@@ -73,12 +73,13 @@ fn main() {
             global.as_static(),
         )));
         let pool = pool.as_static();
+        let pool_guard = pool.guard();
 
         let cold_start = Instant::now();
         let mut cold_checksum = 0u64;
         for page_id in 0..args.pages as PageID {
             let g = pool
-                .get_page::<Page>(page_id, LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
                 .await
@@ -97,7 +98,7 @@ fn main() {
         for _ in 0..args.warm_reads {
             let page_id = (rng.next_u64() % args.pages as u64) as PageID;
             let g = pool
-                .get_page::<Page>(page_id, LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
                 .await

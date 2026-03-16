@@ -1,4 +1,4 @@
-use crate::buffer::arena::ArenaLeaseSource;
+use crate::buffer::arena::ArenaGuard;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::{Page, PageID};
@@ -148,7 +148,7 @@ pub(super) fn clock_collect_batch(
 /// is selected for eviction.
 #[inline]
 pub(super) fn clock_sweep_candidate(
-    arena: &ArenaLeaseSource,
+    arena: &ArenaGuard,
     page_id: PageID,
 ) -> Option<PageExclusiveGuard<Page>> {
     match arena.frame_kind(page_id) {

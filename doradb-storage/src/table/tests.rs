@@ -218,7 +218,7 @@ fn test_column_delete_basic() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.new_session();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(1i32);
@@ -248,7 +248,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.new_session();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(1i32);
@@ -285,7 +285,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.new_session();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(1i32);
@@ -336,7 +336,7 @@ fn test_column_delete_rollback() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.new_session();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(2i32);
@@ -378,7 +378,7 @@ fn test_column_delete_rollback_after_checkpoint() {
         assert!(res.is_ok());
         trx_delete = stmt.succeed();
 
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         let mut checkpoint_session = sys.new_session();
         sys.table
             .data_checkpoint(&mut checkpoint_session)
@@ -415,7 +415,7 @@ fn test_column_delete_write_conflict() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.new_session();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(4i32);
@@ -451,7 +451,7 @@ fn test_column_delete_mvcc_visibility() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.new_session();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(5i32);
@@ -490,7 +490,7 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.new_session();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table
             .checkpoint_for_new_data(&mut session)
             .await
@@ -561,7 +561,7 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.new_session();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table
             .checkpoint_for_new_data(&mut session)
             .await
@@ -638,7 +638,15 @@ fn test_row_page_transition_retries_update_delete() {
         let page_guard = sys
             .engine
             .mem_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .get_page::<RowPage>(
+                session
+                    .pool_guards()
+                    .mem
+                    .as_ref()
+                    .expect("missing mem pool guard in table test"),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
             .await
             .lock_shared_async()
             .await
@@ -651,7 +659,15 @@ fn test_row_page_transition_retries_update_delete() {
         let insert_page_guard = sys
             .engine
             .mem_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .get_page::<RowPage>(
+                session
+                    .pool_guards()
+                    .mem
+                    .as_ref()
+                    .expect("missing mem pool guard in table test"),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
             .await
             .lock_shared_async()
             .await
@@ -687,7 +703,15 @@ fn test_row_page_transition_retries_update_delete() {
         let page_guard = sys
             .engine
             .mem_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .get_page::<RowPage>(
+                session
+                    .pool_guards()
+                    .mem
+                    .as_ref()
+                    .expect("missing mem pool guard in table test"),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
             .await
             .lock_shared_async()
             .await
@@ -1160,7 +1184,7 @@ fn test_table_scan_uncommitted() {
             let mut res_len = 0usize;
             sys.table
                 .accessor()
-                .table_scan_uncommitted(|_metadata, _row| {
+                .table_scan_uncommitted(session.pool_guards(), |_metadata, _row| {
                     res_len += 1;
                     true
                 })
@@ -1271,18 +1295,18 @@ fn test_table_freeze() {
             let insert = vec![Val::from(1), Val::from("1")];
             sys.trx_insert(trx, insert).await.commit().await.unwrap();
         }
-        let row_pages = sys.table.total_row_pages().await;
+        let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
         assert!(row_pages == 1);
-        sys.table.freeze(10).await;
+        sys.table.freeze(&session1, 10).await;
         // after freezing, new row should be inserted into second page.
         {
             let trx = session1.begin_trx().unwrap();
             let insert = vec![Val::from(2), Val::from("2")];
             sys.trx_insert(trx, insert).await.commit().await.unwrap();
         }
-        let row_pages = sys.table.total_row_pages().await;
+        let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
         assert!(row_pages == 2);
-        sys.table.freeze(10).await;
+        sys.table.freeze(&session1, 10).await;
 
         // update row 1 will cause new insert into new page.
         {
@@ -1301,7 +1325,7 @@ fn test_table_freeze() {
             assert!(res.is_ok());
             stmt.succeed().commit().await.unwrap();
         }
-        let row_pages = sys.table.total_row_pages().await;
+        let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
         assert!(row_pages == 3);
 
         // update row 1 will just be in-place.
@@ -1321,7 +1345,7 @@ fn test_table_freeze() {
             assert!(res.is_ok());
             stmt.succeed().commit().await.unwrap();
         }
-        let row_pages = sys.table.total_row_pages().await;
+        let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
         assert!(row_pages == 3);
 
         drop(session1);
@@ -1350,7 +1374,15 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let page_guard = sys
             .engine
             .mem_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .get_page::<RowPage>(
+                session
+                    .pool_guards()
+                    .mem
+                    .as_ref()
+                    .expect("missing mem pool guard in table test"),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
             .await
             .lock_shared_async()
             .await
@@ -1375,7 +1407,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         };
         ctx.row_ver().unwrap().set_frozen();
         sys.table
-            .set_frozen_pages_to_transition(&[frozen_page], stmt.trx.sts)
+            .set_frozen_pages_to_transition(session.pool_guards(), &[frozen_page], stmt.trx.sts)
             .await;
 
         let marker = sys.table.deletion_buffer().get(row_id).unwrap();
@@ -1405,8 +1437,8 @@ fn test_data_checkpoint_basic_flow() {
         insert_rows(&sys, &mut session, 0, 200, &name).await;
 
         let old_root = sys.table.file().active_root().clone();
-        sys.table.freeze(usize::MAX).await;
-        let (frozen_pages, _) = sys.table.collect_frozen_pages().await;
+        sys.table.freeze(&session, usize::MAX).await;
+        let (frozen_pages, _) = sys.table.collect_frozen_pages(session.pool_guards()).await;
         assert!(!frozen_pages.is_empty());
 
         sys.table.data_checkpoint(&mut session).await.unwrap();
@@ -1428,7 +1460,7 @@ fn test_data_checkpoint_snapshot_consistency() {
         let name = "y".repeat(256);
         insert_rows(&sys, &mut session, 0, 120, &name).await;
 
-        sys.table.freeze(1).await;
+        sys.table.freeze(&session, 1).await;
 
         let mut read_trx = session.begin_trx().unwrap();
         {
@@ -1487,7 +1519,7 @@ fn test_data_checkpoint_persistence_recovery() {
         let name = "z".repeat(512);
         insert_rows_direct(&table, &mut session, 0, 150, &name).await;
 
-        table.freeze(usize::MAX).await;
+        table.freeze(&session, usize::MAX).await;
         table.data_checkpoint(&mut session).await.unwrap();
 
         let root_before = table.file().active_root().clone();
@@ -1541,7 +1573,7 @@ fn test_data_checkpoint_gc_verification() {
         insert_rows(&sys, &mut session, 0, 200, &name).await;
 
         let allocated_before = sys.engine.mem_pool.allocated();
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         sys.table.data_checkpoint(&mut session).await.unwrap();
         let allocated_after = sys.engine.mem_pool.allocated();
         let mut reclaimed = allocated_after < allocated_before;
@@ -1568,7 +1600,7 @@ fn test_data_checkpoint_error_rollback() {
         let name = "e".repeat(256);
         insert_rows(&sys, &mut session, 0, 80, &name).await;
 
-        sys.table.freeze(usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await;
         let root_before = sys.table.file().active_root().clone();
 
         super::set_test_force_lwc_build_error(true);

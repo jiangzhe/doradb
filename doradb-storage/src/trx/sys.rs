@@ -236,9 +236,19 @@ impl TransactionSystem {
     /// Rollback active transaction.
     #[inline]
     pub async fn rollback(&self, mut trx: ActiveTrx) {
+        let pool_guards = trx
+            .session
+            .as_ref()
+            .expect("transaction rollback requires session pool guards")
+            .pool_guards()
+            .clone();
         let mut table_cache = TableCache::new(&self.catalog);
-        trx.index_undo.rollback(&mut table_cache, trx.sts).await;
-        trx.row_undo.rollback(&mut table_cache, Some(trx.sts)).await;
+        trx.index_undo
+            .rollback(&mut table_cache, &pool_guards, trx.sts)
+            .await;
+        trx.row_undo
+            .rollback(&mut table_cache, &pool_guards, Some(trx.sts))
+            .await;
         trx.redo.clear();
         trx.gc_row_pages.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
@@ -254,13 +264,22 @@ impl TransactionSystem {
     #[inline]
     async fn rollback_prepared(&self, mut trx: PreparedTrx) {
         debug_assert!(trx.redo_bin.is_none());
+        let pool_guards = trx
+            .session
+            .as_ref()
+            .expect("prepared rollback requires session pool guards")
+            .pool_guards()
+            .clone();
         // Note: rollback can only happens to user transaction, so payload is always non-empty.
         let mut payload = trx.payload.take().unwrap();
         let mut table_cache = TableCache::new(&self.catalog);
-        payload.row_undo.rollback(&mut table_cache, trx.sts).await;
+        payload
+            .row_undo
+            .rollback(&mut table_cache, &pool_guards, trx.sts)
+            .await;
         payload
             .index_undo
-            .rollback(&mut table_cache, payload.sts)
+            .rollback(&mut table_cache, &pool_guards, payload.sts)
             .await;
         trx.redo_bin.take();
         self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
@@ -903,6 +922,7 @@ mod tests {
                 trx.commit().await.unwrap();
             }
             drop(session);
+            drop(table);
             drop(engine);
         });
     }

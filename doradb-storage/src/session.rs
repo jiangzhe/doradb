@@ -1,4 +1,5 @@
 use crate::buffer::page::PageID;
+use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
 use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
@@ -28,6 +29,11 @@ impl Session {
     #[inline]
     pub fn engine(&self) -> &EngineRef {
         &self.state.engine_ref
+    }
+
+    #[inline]
+    pub fn pool_guards(&self) -> &PoolGuards {
+        self.state.pool_guards()
     }
 
     #[inline]
@@ -213,6 +219,7 @@ impl Session {
 
 pub struct SessionState {
     engine_ref: EngineRef,
+    pool_guards: PoolGuards,
     in_trx: AtomicBool,
     last_cts: AtomicU64,
     active_insert_pages: Mutex<HashMap<TableID, (PageID, RowID)>>,
@@ -221,8 +228,15 @@ pub struct SessionState {
 impl SessionState {
     #[inline]
     pub fn new(engine_ref: EngineRef) -> Self {
+        let pool_guards = PoolGuards::builder()
+            .meta(engine_ref.meta_pool.guard())
+            .index(engine_ref.index_pool.guard())
+            .mem(engine_ref.mem_pool.guard())
+            .disk(engine_ref.disk_pool.guard())
+            .build();
         SessionState {
             engine_ref,
+            pool_guards,
             in_trx: AtomicBool::new(false),
             last_cts: AtomicU64::new(0),
             active_insert_pages: Mutex::new(HashMap::new()),
@@ -232,6 +246,11 @@ impl SessionState {
     #[inline]
     pub fn engine(&self) -> &EngineRef {
         &self.engine_ref
+    }
+
+    #[inline]
+    pub fn pool_guards(&self) -> &PoolGuards {
+        &self.pool_guards
     }
 
     #[inline]

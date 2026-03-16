@@ -1,3 +1,4 @@
+use crate::buffer::PoolGuards;
 use crate::buffer::page::PageID;
 
 use crate::catalog::{TableCache, TableID, TableSpec};
@@ -63,13 +64,18 @@ impl Statement {
         // rollback row data.
         // todo: group by page level may be better.
         let engine = self.trx.engine().unwrap();
+        let pool_guards = self
+            .trx
+            .pool_guards()
+            .expect("statement rollback requires session pool guards")
+            .clone();
         let mut table_cache = TableCache::new(engine.catalog());
         self.row_undo
-            .rollback(&mut table_cache, Some(self.trx.sts))
+            .rollback(&mut table_cache, &pool_guards, Some(self.trx.sts))
             .await;
         // rollback index data.
         self.index_undo
-            .rollback(&mut table_cache, self.trx.sts)
+            .rollback(&mut table_cache, &pool_guards, self.trx.sts)
             .await;
         // clear redo logs.
         self.redo.clear();
@@ -89,6 +95,13 @@ impl Statement {
         if let Some(session) = self.trx.session.as_mut() {
             session.save_active_insert_page(table_id, page_id, row_id);
         }
+    }
+
+    #[inline]
+    pub fn pool_guards(&self) -> &PoolGuards {
+        self.trx
+            .pool_guards()
+            .expect("statement requires an attached session for pool guards")
     }
 
     /// Insert a row into a table.

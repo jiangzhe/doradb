@@ -1,6 +1,6 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{BufferPage, PageID};
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, FixedBufferPool, PoolGuards};
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
@@ -50,9 +50,10 @@ struct PendingInsertRow {
 }
 
 impl CatalogStorage {
-    pub(super) async fn bootstrap_from_checkpoint(
+    pub(crate) async fn bootstrap_from_checkpoint(
         &self,
         snapshot: &MultiTableFileSnapshot,
+        guards: &PoolGuards,
     ) -> Result<()> {
         for (idx, root) in snapshot.meta.table_roots.iter().copied().enumerate() {
             if idx >= self.tables.len() {
@@ -71,7 +72,10 @@ impl CatalogStorage {
                 .load_visible_rows_from_root(self.tables[idx].metadata(), root)
                 .await?;
             for row in rows {
-                self.tables[idx].accessor().insert_no_trx(&row.vals).await;
+                self.tables[idx]
+                    .accessor()
+                    .insert_no_trx(guards, &row.vals)
+                    .await;
             }
         }
         Ok(())
@@ -475,7 +479,8 @@ impl CatalogStorage {
         let mut builder = LwcBuilder::new(metadata);
         let mut builder_start = None;
         let mut builder_end = 0u64;
-        let mut temp_page = meta_pool.allocate_page::<RowPage>().await;
+        let meta_guard = meta_pool.guard();
+        let mut temp_page = meta_pool.allocate_page::<RowPage>(&meta_guard).await;
 
         for row in rows {
             if builder.is_empty() {
@@ -532,7 +537,8 @@ impl CatalogStorage {
         }
 
         let mut builder = LwcBuilder::new(metadata);
-        let mut temp_page = self.meta_pool.allocate_page::<RowPage>().await;
+        let meta_guard = self.meta_pool.guard();
+        let mut temp_page = self.meta_pool.allocate_page::<RowPage>(&meta_guard).await;
 
         for row in existing_tail_rows {
             if !append_single_row_to_builder(metadata, &mut temp_page, &mut builder, row)? {

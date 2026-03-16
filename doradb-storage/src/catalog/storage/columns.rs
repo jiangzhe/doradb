@@ -1,3 +1,4 @@
+use crate::buffer::PoolGuards;
 use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
@@ -122,11 +123,15 @@ impl Columns<'_> {
     }
 
     /// List all columns of one table from uncommitted-visible catalog rows.
-    pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<ColumnObject> {
+    pub async fn list_uncommitted_by_table_id(
+        &self,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) -> Vec<ColumnObject> {
         let mut res = vec![];
         self.table
             .accessor()
-            .table_scan_uncommitted(|metadata, row| {
+            .table_scan_uncommitted(guards, |metadata, row| {
                 if row.is_deleted() {
                     return true;
                 }
@@ -253,7 +258,7 @@ mod tests {
                 .catalog()
                 .storage
                 .columns()
-                .list_uncommitted_by_table_id(42)
+                .list_uncommitted_by_table_id(session.pool_guards(), 42)
                 .await;
             assert_eq!(cols_42.len(), 1);
             assert_eq!(cols_42[0].column_no, 0);
@@ -262,7 +267,7 @@ mod tests {
                 .catalog()
                 .storage
                 .columns()
-                .list_uncommitted_by_table_id(43)
+                .list_uncommitted_by_table_id(session.pool_guards(), 43)
                 .await;
             assert_eq!(cols_43.len(), 1);
             assert_eq!(cols_43[0].column_no, 0);
@@ -299,7 +304,7 @@ mod tests {
                     .catalog()
                     .storage
                     .columns()
-                    .list_uncommitted_by_table_id(42)
+                    .list_uncommitted_by_table_id(session.pool_guards(), 42)
                     .await
                     .is_empty()
             );
@@ -308,7 +313,7 @@ mod tests {
                     .catalog()
                     .storage
                     .columns()
-                    .list_uncommitted_by_table_id(43)
+                    .list_uncommitted_by_table_id(session.pool_guards(), 43)
                     .await
                     .is_empty()
             );

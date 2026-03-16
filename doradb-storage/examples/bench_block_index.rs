@@ -1,5 +1,5 @@
 use clap::Parser;
-use doradb_storage::buffer::EvictableBufferPoolConfig;
+use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig};
 use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
 };
@@ -47,10 +47,11 @@ fn main() {
             ));
             let blk_idx = RowBlockIndex::new(engine.meta_pool, 0).await;
             let blk_idx = Box::leak(Box::new(blk_idx));
+            let mem_guard = engine.mem_pool.guard();
 
             for _ in 0..args.pages {
                 let _ = blk_idx
-                    .get_insert_page(engine.mem_pool, &metadata, args.rows_per_page)
+                    .get_insert_page(engine.mem_pool, &mem_guard, &metadata, args.rows_per_page)
                     .await;
             }
             let start = Instant::now();

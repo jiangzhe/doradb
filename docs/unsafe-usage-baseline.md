@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-03-15`
+- Generated on: `2026-03-16`
 - Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
 
@@ -8,7 +8,7 @@
 
 | module | files | unsafe | transmute | new_unchecked | assume_init | // SAFETY: |
 |---|---:|---:|---:|---:|---:|---:|
-| buffer | 10 | 68 | 0 | 0 | 0 | 23 |
+| buffer | 10 | 66 | 0 | 0 | 0 | 24 |
 | latch | 4 | 45 | 0 | 0 | 0 | 7 |
 | row | 3 | 5 | 0 | 0 | 0 | 3 |
 | index | 18 | 20 | 0 | 0 | 3 | 7 |
@@ -16,7 +16,7 @@
 | trx | 15 | 7 | 0 | 0 | 0 | 2 |
 | lwc | 2 | 2 | 0 | 0 | 0 | 2 |
 | file | 8 | 30 | 0 | 0 | 2 | 10 |
-| **total** | **63** | **211** | **0** | **0** | **5** | **57** |
+| **total** | **63** | **209** | **0** | **0** | **5** | **58** |
 
 ## File Hotspots (top 40)
 
@@ -27,11 +27,11 @@
 | `doradb-storage/src/latch/mutex.rs` | latch | 18 | 0 |
 | `doradb-storage/src/latch/rwlock.rs` | latch | 18 | 0 |
 | `doradb-storage/src/buffer/readonly.rs` | buffer | 16 | 8 |
-| `doradb-storage/src/buffer/arena.rs` | buffer | 13 | 9 |
-| `doradb-storage/src/buffer/guard.rs` | buffer | 12 | 4 |
+| `doradb-storage/src/buffer/guard.rs` | buffer | 15 | 6 |
 | `doradb-storage/src/buffer/util.rs` | buffer | 12 | 0 |
 | `doradb-storage/src/io/libaio_abi.rs` | io | 11 | 2 |
 | `doradb-storage/src/latch/hybrid.rs` | latch | 9 | 7 |
+| `doradb-storage/src/buffer/arena.rs` | buffer | 8 | 8 |
 | `doradb-storage/src/buffer/evict.rs` | buffer | 8 | 1 |
 | `doradb-storage/src/file/cow_file.rs` | file | 6 | 4 |
 | `doradb-storage/src/index/btree_hint.rs` | index | 6 | 0 |

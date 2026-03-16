@@ -947,6 +947,7 @@ mod tests {
             }
             println!("total log records {}", log_recs);
 
+            drop(table);
             drop(engine);
         });
     }
@@ -1014,6 +1015,7 @@ mod tests {
             }
             println!("total log records {}", log_recs);
 
+            drop(table);
             drop(engine);
 
             // after the first engine is done, we reopen log files to test log merger.

@@ -3,7 +3,7 @@ use crate::buffer::guard::{
     PageExclusiveGuard, PageGuard, PageSharedGuard, SharedLockStrategy,
 };
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
@@ -77,6 +77,7 @@ pub struct GenericBTree<P: 'static> {
     // todo: switch to ShadowBufferPool, which
     // supports CoW operations.
     pool: &'static P,
+    pool_guard: PoolGuard,
 }
 
 /// Compatibility alias for runtime B-Tree backed by `FixedBufferPool`.
@@ -86,7 +87,8 @@ impl<P: BufferPool> GenericBTree<P> {
     /// Create a new B-Tree index.
     #[inline]
     pub async fn new(pool: &'static P, hints_enabled: bool, ts: TrxID) -> Self {
-        let mut g = pool.allocate_page::<BTreeNode>().await;
+        let pool_guard = pool.guard();
+        let mut g = pool.allocate_page::<BTreeNode>(&pool_guard).await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init(0, ts, &[], BTreeU64::INVALID_VALUE, &[], hints_enabled);
@@ -94,7 +96,31 @@ impl<P: BufferPool> GenericBTree<P> {
             root: page_id,
             height: AtomicUsize::new(0),
             pool,
+            pool_guard,
         }
+    }
+
+    #[inline]
+    fn pool_guard(&self) -> &PoolGuard {
+        &self.pool_guard
+    }
+
+    #[inline]
+    async fn allocate_node(&self) -> PageExclusiveGuard<BTreeNode> {
+        self.pool
+            .allocate_page::<BTreeNode>(self.pool_guard())
+            .await
+    }
+
+    #[inline]
+    async fn get_node(
+        &self,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> FacadePageGuard<BTreeNode> {
+        self.pool
+            .get_page::<BTreeNode>(self.pool_guard(), page_id, mode)
+            .await
     }
 
     /// Destroy the tree.
@@ -102,8 +128,7 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     pub async fn destory(self) {
         let g = self
-            .pool
-            .get_page::<BTreeNode>(self.root, LatchFallbackMode::Exclusive)
+            .get_node(self.root, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
             .await
@@ -140,8 +165,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         p_node.value_as_page_id(pos.idx as usize)
                     };
                     let c_guard = self
-                        .pool
-                        .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
+                        .get_node(c_page_id, LatchFallbackMode::Exclusive)
                         .await
                         .lock_exclusive_async()
                         .await
@@ -401,7 +425,7 @@ impl<P: BufferPool> GenericBTree<P> {
         loop {
             let g = self
                 .pool
-                .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
+                .get_page::<BTreeNode>(self.pool_guard(), self.root, LatchFallbackMode::Spin)
                 .await;
             let (height, count) =
                 verify_continue!(g.with_page_ref_validated(|page| (page.height(), page.count())));
@@ -419,7 +443,7 @@ impl<P: BufferPool> GenericBTree<P> {
             let c_page_id = root.lower_fence_value().to_u64();
             let mut c_guard = self
                 .pool
-                .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
+                .get_page::<BTreeNode>(self.pool_guard(), c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -517,7 +541,7 @@ impl<P: BufferPool> GenericBTree<P> {
         };
         // Now parent and child locks are acquired exclusively, and parent has enough
         // space to insert separator key, so to actual split.
-        let r_guard = self.pool.allocate_page::<BTreeNode>().await;
+        let r_guard = self.allocate_node().await;
         self.split_node::<V>(
             p_guard.page_mut(),
             c_guard.page_mut(),
@@ -611,7 +635,11 @@ impl<P: BufferPool> GenericBTree<P> {
                         }
                         let mut c_guard = self
                             .pool
-                            .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
+                            .get_page::<BTreeNode>(
+                                self.pool_guard(),
+                                c_page_id,
+                                LatchFallbackMode::Exclusive,
+                            )
                             .await
                             .lock_exclusive_async()
                             .await
@@ -646,7 +674,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         }
                         // now parent and child nodes are exclusively locked and parent has enough
                         // space to insert separator key, so do actual split.
-                        let r_guard = self.pool.allocate_page::<BTreeNode>().await;
+                        let r_guard = self.allocate_node().await;
                         self.split_node::<BTreeU64>(p_node, c_node, r_guard, sep_idx, &sep_key, ts)
                             .await;
                         BTreeSplit::Ok
@@ -669,11 +697,11 @@ impl<P: BufferPool> GenericBTree<P> {
         // Only truncate separator key if it's leaf.
         let sep_key = root.create_sep_key(sep_idx, is_leaf);
         // Allocate left node.
-        let mut left_page = self.pool.allocate_page::<BTreeNode>().await;
+        let mut left_page = self.allocate_node().await;
         let left_page_id = left_page.page_id();
         let left_node = left_page.page_mut();
         // Allocate right node.
-        let mut right_page = self.pool.allocate_page::<BTreeNode>().await;
+        let mut right_page = self.allocate_node().await;
         let right_page_id = right_page.page_id();
         let right_node = right_page.page_mut();
         // Initialize and copy key values to left node.
@@ -895,7 +923,7 @@ impl<P: BufferPool> GenericBTree<P> {
     ) -> Validation<S::Guard> {
         let mut p_guard = self
             .pool
-            .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
+            .get_page::<BTreeNode>(self.pool_guard(), self.root, LatchFallbackMode::Spin)
             .await;
         // check root page separately.
         let height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
@@ -915,7 +943,10 @@ impl<P: BufferPool> GenericBTree<P> {
                     debug_assert!(height != 0);
                     if height == 1 {
                         // child node is leaf.
-                        let c_guard = self.pool.get_child_page(&p_guard, page_id, S::MODE).await;
+                        let c_guard = self
+                            .pool
+                            .get_child_page(self.pool_guard(), &p_guard, page_id, S::MODE)
+                            .await;
                         let c_guard = verify!(c_guard);
                         let c_guard = S::verify_lock_async::<false>(c_guard).await;
                         let c_guard = verify!(c_guard);
@@ -924,7 +955,12 @@ impl<P: BufferPool> GenericBTree<P> {
                     // child node is branch, continue next iteration.
                     let c_guard = self
                         .pool
-                        .get_child_page(&p_guard, page_id, LatchFallbackMode::Spin)
+                        .get_child_page(
+                            self.pool_guard(),
+                            &p_guard,
+                            page_id,
+                            LatchFallbackMode::Spin,
+                        )
                         .await;
                     let c_guard = verify!(c_guard);
                     p_guard = c_guard;
@@ -943,7 +979,7 @@ impl<P: BufferPool> GenericBTree<P> {
     ) -> Validation<(S::Guard, Option<FacadePageGuard<BTreeNode>>)> {
         let mut p_guard = self
             .pool
-            .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
+            .get_page::<BTreeNode>(self.pool_guard(), self.root, LatchFallbackMode::Spin)
             .await;
         // check root page separately.
         let height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
@@ -963,7 +999,10 @@ impl<P: BufferPool> GenericBTree<P> {
                     debug_assert!(height != 0);
                     if height == 1 {
                         // child node is leaf.
-                        let c_guard = self.pool.get_child_page(&p_guard, page_id, S::MODE).await;
+                        let c_guard = self
+                            .pool
+                            .get_child_page(self.pool_guard(), &p_guard, page_id, S::MODE)
+                            .await;
                         let c_guard = verify!(c_guard);
                         let c_guard = S::verify_lock_async::<false>(c_guard).await;
                         let c_guard = verify!(c_guard);
@@ -972,7 +1011,12 @@ impl<P: BufferPool> GenericBTree<P> {
                     // child node is branch, continue next iteration.
                     let c_guard = self
                         .pool
-                        .get_child_page(&p_guard, page_id, LatchFallbackMode::Spin)
+                        .get_child_page(
+                            self.pool_guard(),
+                            &p_guard,
+                            page_id,
+                            LatchFallbackMode::Spin,
+                        )
                         .await;
                     let c_guard = verify!(c_guard);
                     p_guard = c_guard;
@@ -1007,7 +1051,7 @@ impl<P: BufferPool> GenericBTree<P> {
     ) -> Validation<Option<PageExclusiveGuard<BTreeNode>>> {
         let mut g = self
             .pool
-            .get_page::<BTreeNode>(self.root, LatchFallbackMode::Spin)
+            .get_page::<BTreeNode>(self.pool_guard(), self.root, LatchFallbackMode::Spin)
             .await;
         let mut height = verify!(g.with_page_ref_validated(|page| page.height()));
         if height == 0 {
@@ -1033,7 +1077,7 @@ impl<P: BufferPool> GenericBTree<P> {
                     // Otherwise, go to next level.
                     let c_guard = self
                         .pool
-                        .get_child_page(&g, c_page_id, LatchFallbackMode::Spin)
+                        .get_child_page(self.pool_guard(), &g, c_page_id, LatchFallbackMode::Spin)
                         .await;
                     g = verify!(c_guard);
                 }
@@ -1054,7 +1098,7 @@ impl<P: BufferPool> GenericBTree<P> {
             let c_page_id = p_node.lower_fence_value().to_u64();
             let c_guard = self
                 .pool
-                .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
+                .get_page::<BTreeNode>(self.pool_guard(), c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1066,7 +1110,7 @@ impl<P: BufferPool> GenericBTree<P> {
             let c_page_id = p_node.value_as_page_id(i);
             let c_guard = self
                 .pool
-                .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Exclusive)
+                .get_page::<BTreeNode>(self.pool_guard(), c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1111,7 +1155,7 @@ where
             self.reset();
             let g = tree
                 .pool
-                .get_page::<BTreeNode>(tree.root, LatchFallbackMode::Spin)
+                .get_page::<BTreeNode>(&tree.pool_guard, tree.root, LatchFallbackMode::Spin)
                 .await;
             let res = self.try_seek_and_lock(tree, height, key, g).await;
             verify_continue!(res);
@@ -1156,7 +1200,10 @@ where
                     LookupChild::LowerFence(c_page_id) => (-1, c_page_id),
                     LookupChild::NotFound => unreachable!(),
                 };
-                let c_guard = tree.pool.get_page::<BTreeNode>(c_page_id, S::MODE).await;
+                let c_guard = tree
+                    .pool
+                    .get_page::<BTreeNode>(&tree.pool_guard, c_page_id, S::MODE)
+                    .await;
                 let res = S::verify_lock_async::<false>(c_guard).await;
                 let c_guard = verify!(res);
                 self.parent = Some(ParentPosition { g: p_guard, idx });
@@ -1174,7 +1221,12 @@ where
             // Before access parent node, we always use optimistic spin lock.
             let c_guard = tree
                 .pool
-                .get_child_page::<BTreeNode>(&p_guard, c_page_id, LatchFallbackMode::Spin)
+                .get_child_page::<BTreeNode>(
+                    &tree.pool_guard,
+                    &p_guard,
+                    c_page_id,
+                    LatchFallbackMode::Spin,
+                )
                 .await;
             p_guard = verify!(c_guard);
         }
@@ -1310,7 +1362,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
             let c_guard = self
                 .tree
                 .pool
-                .get_page::<BTreeNode>(c_page_id, LatchFallbackMode::Shared)
+                .get_page::<BTreeNode>(self.tree.pool_guard(), c_page_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
                 .await
@@ -1593,7 +1645,11 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             let c_guard = self
                 .tree
                 .pool
-                .get_page(c_page_id, LatchFallbackMode::Exclusive)
+                .get_page(
+                    self.tree.pool_guard(),
+                    c_page_id,
+                    LatchFallbackMode::Exclusive,
+                )
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1618,7 +1674,11 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             let c_guard = self
                 .tree
                 .pool
-                .get_page(c_page_id, LatchFallbackMode::Exclusive)
+                .get_page(
+                    self.tree.pool_guard(),
+                    c_page_id,
+                    LatchFallbackMode::Exclusive,
+                )
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1643,7 +1703,11 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             let c_guard = self
                 .tree
                 .pool
-                .get_page(c_page_id, LatchFallbackMode::Exclusive)
+                .get_page(
+                    self.tree.pool_guard(),
+                    c_page_id,
+                    LatchFallbackMode::Exclusive,
+                )
                 .await
                 .lock_exclusive_async()
                 .await

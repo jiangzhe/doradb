@@ -1,3 +1,4 @@
+use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableCache, TableHandle, TableID};
 use crate::row::RowID;
@@ -104,15 +105,25 @@ impl RowUndoLogs {
     }
 
     #[inline]
-    pub async fn rollback(&mut self, table_cache: &mut TableCache<'_>, sts: Option<TrxID>) {
+    pub async fn rollback(
+        &mut self,
+        table_cache: &mut TableCache<'_>,
+        guards: &PoolGuards,
+        sts: Option<TrxID>,
+    ) {
         while let Some(entry) = self.0.pop() {
             let table = table_cache.must_get_table(entry.table_id).await;
-            Self::rollback_entry_in_table(entry, table, sts).await;
+            Self::rollback_entry_in_table(entry, table, guards, sts).await;
         }
     }
 
     #[inline]
-    async fn rollback_entry_in_table(entry: OwnedRowUndo, table: &TableHandle, sts: Option<TrxID>) {
+    async fn rollback_entry_in_table(
+        entry: OwnedRowUndo,
+        table: &TableHandle,
+        guards: &PoolGuards,
+        sts: Option<TrxID>,
+    ) {
         let pivot_row_id = table.pivot_row_id();
         if entry.page_id.is_none() || entry.row_id < pivot_row_id {
             if let Some(deletion_buffer) = table.deletion_buffer() {
@@ -121,7 +132,7 @@ impl RowUndoLogs {
             return;
         }
         let Some(page_guard) = table
-            .try_get_row_page_versioned_shared(entry.page_id.unwrap())
+            .try_get_row_page_versioned_shared(guards, entry.page_id.unwrap())
             .await
         else {
             return;

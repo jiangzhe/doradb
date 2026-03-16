@@ -1595,9 +1595,10 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
 
             {
-                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
                 node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
                 for i in 0u64..10 {
@@ -1625,9 +1626,10 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
 
             {
-                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
                 node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
 
@@ -1674,9 +1676,10 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
 
             {
-                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
                 node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
 
@@ -1727,9 +1730,10 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
 
             {
-                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
                 node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
 
@@ -1784,10 +1788,11 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
 
             {
                 // Create source leaf node with data
-                let mut src_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut src_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let src_node = src_guard.page_mut();
                 src_node.init(0, 1, &[], BTreeU64::INVALID_VALUE, &[], false);
 
@@ -1798,7 +1803,7 @@ mod tests {
                 }
 
                 // Create empty destination node
-                let mut dst_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut dst_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let dst_node = dst_guard.page_mut();
 
                 // Compact source to destination
@@ -1831,15 +1836,16 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
 
             {
                 // Create empty source node
-                let mut src_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut src_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let src_node = src_guard.page_mut();
                 src_node.init(0, 3, &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Create empty destination node
-                let mut dst_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut dst_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let dst_node = dst_guard.page_mut();
 
                 // Compact source to destination
@@ -1876,9 +1882,10 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
 
             {
-                let mut page1_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page1_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node1 = page1_guard.page_mut();
                 node1.init(
                     1,
@@ -1900,7 +1907,7 @@ mod tests {
                     std::mem::size_of::<BTreeHeader>() + 8 + 10 * 24
                 );
 
-                let mut page2_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page2_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node2 = page2_guard.page_mut();
                 node2.init(
                     1,
@@ -1944,9 +1951,10 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
 
             {
-                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
                 node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
 
@@ -2032,8 +2040,9 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
             {
-                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
                 node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], true);
                 for i in 0u64..300 {
@@ -2065,11 +2074,12 @@ mod tests {
             let buf_pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
             let buf_pool = buf_pool.as_static();
+            let buf_pool_guard = buf_pool.guard();
             {
                 let mut rng = ChaCha8Rng::seed_from_u64(0u64);
                 let uniform = Uniform::new(0u64, 1u64 << 63).unwrap();
                 let mut map = BTreeMap::new();
-                let mut page_guard = buf_pool.allocate_page::<BTreeNode>().await;
+                let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
                 node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], true);
                 for _ in 0..COUNT {
