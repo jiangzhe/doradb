@@ -1,7 +1,7 @@
 ---
 id: 000070
 title: Merge Arena View Into Arena Inner And Add Explicit Pool Guards
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-15
 github_issue: 432
 ---
@@ -282,20 +282,49 @@ Reference:
 
 ## Implementation Notes
 
-1. The multi-pool guard aggregator is an interim workaround, not the final
-   capability model.
-2. `BufferPool` methods still take a single `PoolGuard`, so correctness in
-   this task depends on callers passing the guard from the matching pool.
-3. That caller-discipline rule is not only a type-safety limitation today:
-   current pool implementations still retain the caller-supplied guard in
-   page guards and arena keepalive handles, so wrong-pool misuse can keep
-   the wrong pool alive while the target arena tears down.
-4. `ReadonlyBufferPool` should not repeat guard extraction; only
-   `GlobalReadonlyBufferPool` is the extraction boundary for disk-pool use.
-5. Recovery may keep separately named pool guards before engine startup
-   instead of forcing the aggregate path.
-6. `ArenaGuard` is the only retained arena access carrier that should escape
-   pool construction logic or background helper setup.
+1. Implemented the quiescent simplification in
+   `doradb-storage/src/quiescent.rs`: `QuiescentDrain` and the token-specific
+   types were removed, `QuiescentBox<T>` / `QuiescentGuard<T>` are now the
+   only direct owner/guard primitives, and shared/local fan-out uses
+   `SyncQuiescentGuard<T>` plus `UnsyncQuiescentGuard<T>` via
+   `into_sync()` / `into_unsync()`.
+2. Implemented the arena refactor in
+   `doradb-storage/src/buffer/arena.rs`: `ArenaLease`,
+   `ArenaKeepalive`, `ArenaLeaseSource`, and `ArenaView` were removed;
+   `QuiescentArena` now owns `keepalive: QuiescentBox<()>` before
+   `state: ArenaInner`, and `ArenaGuard` is the only retained pool-internal
+   arena access carrier.
+3. Implemented explicit pool-guard plumbing in
+   `doradb-storage/src/buffer/mod.rs` and the concrete pool implementations:
+   `PoolGuard` is `SyncQuiescentGuard<()>`, `PoolGuards` is constructed with
+   `PoolGuards::builder()`, slot lookup goes through `PoolGuardSlot` and
+   `try_guard(...)`, and page-producing/access `BufferPool` methods take an
+   explicit `&PoolGuard`.
+4. Implemented engine/session/runtime threading of `PoolGuards`:
+   `SessionState` owns one aggregate guard set, table/catalog scan paths take
+   explicit `&PoolGuards`, `TablePersistence::freeze` now takes `&Session`,
+   rollback paths pass `&PoolGuards` into row/index undo, recovery stores one
+   aggregate guard set on `LogRecovery`, and purge threads receive startup-built
+   `PoolGuards` instead of minting guards from `TableHandle`.
+5. Removed the cached row-pool guard from `GenericMemTable` and replaced the
+   old pool-type selection shortcut with explicit `RowPoolSlot`, so row-page
+   guard selection is driven by table kind instead of cached guard state or
+   `TypeId` checks.
+6. Fixed several teardown/test lifetime bugs uncovered during implementation:
+   owner-drop tests now release held guards before dropping the owner,
+   session/table/recovery tests release retained session or pool guards before
+   engine teardown, and purge tests no longer keep local `PoolGuards` alive
+   across engine drop.
+7. Worker-start behavior for evictable pools was intentionally left unchanged:
+   `build()` still returns an unstarted pool and `build_static()` remains the
+   only public path that consumes `pending_io` and starts workers. That future
+   startup-contract work is tracked separately in
+   `docs/backlogs/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`.
+8. Verified with:
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+   - `cargo test -p doradb-storage --no-default-features`
+   - `cargo test -p doradb-storage`
+   Both crate test runs passed with `402` tests.
 
 ## Impacts
 
@@ -339,10 +368,10 @@ Reference:
 5. Verify `ArenaGuard` clone keeps arena memory alive until the last
    clone drops.
 6. Verify named multi-pool guard aggregator behavior:
-   - single-slot creation
-   - disjoint-slot merge
-   - duplicate-slot merge panic
-   - missing-slot extraction panic
+   - empty builder returns a partial guard set
+   - explicit slot build populates only the requested slot
+   - duplicate builder slot assignment panics
+   - missing-slot lookup returns `None`
 7. Verify fixed, evictable, and readonly buffer pools operate correctly when
    page-producing/access methods receive the correct single `PoolGuard`.
 8. Verify `GlobalReadonlyBufferPool` performs disk-guard extraction and
@@ -363,12 +392,16 @@ Reference:
 
 ## Open Questions
 
-1. The robust long-term solution still needs an explicit pool/arena identity
-   model so single-guard pool APIs can reject wrong-pool misuse instead of
-   relying on caller discipline and named aggregation only.
-2. The current shared bug is broader than `EvictableBufferPool`: fixed and
-   readonly pools also clone caller-supplied `PoolGuard` values into page
-   guards today, so the eventual fix should be applied consistently across
-   all pool types.
-3. The follow-up task still needs to decide mismatch policy: reject foreign
-   guards, self-brand returned page guards from the target pool, or both.
+1. Pool-guard provenance is still caller-disciplined only: fixed, evictable,
+   and readonly pools retain caller-supplied `PoolGuard` values in page guards
+   and `ArenaGuard` handles, so wrong-pool misuse is still possible until a
+   shared pool-brand identity model is added. Follow-up backlog:
+   `docs/backlogs/000056-add-pool-brand-identity-to-retained-page-guards-and-arena-guards.md`.
+2. Index wrappers still cache `PoolGuard` internally in `GenericBTree` and
+   `GenericRowBlockIndex`, while the rest of the runtime now threads
+   `PoolGuards` explicitly. Follow-up backlog:
+   `docs/backlogs/000057-remove-cached-pool-guard-fields-from-generic-btree-and-generic-row-block-index.md`.
+3. The upcoming removal of `'static` pool startup helpers still has to preserve
+   the current evictable worker-start contract when replacing `build_static()`.
+   Follow-up backlog:
+   `docs/backlogs/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`.
