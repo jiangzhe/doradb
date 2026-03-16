@@ -13,8 +13,8 @@ pub use recover::*;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
-    ReadonlyBufferPool,
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
+    PoolGuards, ReadonlyBufferPool,
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
@@ -119,6 +119,16 @@ pub(crate) enum RowPoolSlot {
     Mem,
 }
 
+impl From<RowPoolSlot> for PoolGuardSlot {
+    #[inline]
+    fn from(value: RowPoolSlot) -> Self {
+        match value {
+            RowPoolSlot::Meta => PoolGuardSlot::Meta,
+            RowPoolSlot::Mem => PoolGuardSlot::Mem,
+        }
+    }
+}
+
 #[inline]
 pub(crate) async fn build_secondary_indexes(
     index_pool: &'static FixedBufferPool,
@@ -200,16 +210,9 @@ impl<P: BufferPool> GenericMemTable<P> {
         guards: &PoolGuards,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
-        let row_pool_guard = match self.row_pool_slot {
-            RowPoolSlot::Mem => guards
-                .mem
-                .as_ref()
-                .expect("missing mem pool guard for user-table row pages"),
-            RowPoolSlot::Meta => guards
-                .meta
-                .as_ref()
-                .expect("missing meta pool guard for catalog-table row pages"),
-        };
+        let row_pool_guard = guards
+            .try_guard(self.row_pool_slot.into())
+            .expect("missing row-page pool guard");
         self.blk_idx
             .get_insert_page(self.mem_pool, row_pool_guard, &self.metadata, count)
             .await
@@ -221,16 +224,9 @@ impl<P: BufferPool> GenericMemTable<P> {
         guards: &PoolGuards,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
-        let row_pool_guard = match self.row_pool_slot {
-            RowPoolSlot::Mem => guards
-                .mem
-                .as_ref()
-                .expect("missing mem pool guard for user-table row pages"),
-            RowPoolSlot::Meta => guards
-                .meta
-                .as_ref()
-                .expect("missing meta pool guard for catalog-table row pages"),
-        };
+        let row_pool_guard = guards
+            .try_guard(self.row_pool_slot.into())
+            .expect("missing row-page pool guard");
         self.blk_idx
             .get_insert_page_exclusive(self.mem_pool, row_pool_guard, &self.metadata, count)
             .await
@@ -243,16 +239,9 @@ impl<P: BufferPool> GenericMemTable<P> {
         count: usize,
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
-        let row_pool_guard = match self.row_pool_slot {
-            RowPoolSlot::Mem => guards
-                .mem
-                .as_ref()
-                .expect("missing mem pool guard for user-table row pages"),
-            RowPoolSlot::Meta => guards
-                .meta
-                .as_ref()
-                .expect("missing meta pool guard for catalog-table row pages"),
-        };
+        let row_pool_guard = guards
+            .try_guard(self.row_pool_slot.into())
+            .expect("missing row-page pool guard");
         self.blk_idx
             .allocate_row_page_at(
                 self.mem_pool,
@@ -273,16 +262,9 @@ impl<P: BufferPool> GenericMemTable<P> {
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
-        let row_pool_guard = match self.row_pool_slot {
-            RowPoolSlot::Mem => guards
-                .mem
-                .as_ref()
-                .expect("missing mem pool guard for user-table row pages"),
-            RowPoolSlot::Meta => guards
-                .meta
-                .as_ref()
-                .expect("missing meta pool guard for catalog-table row pages"),
-        };
+        let row_pool_guard = guards
+            .try_guard(self.row_pool_slot.into())
+            .expect("missing row-page pool guard");
         let mut cursor = self.blk_idx.mem_cursor(guards);
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
@@ -480,8 +462,7 @@ impl Table {
                     .mem_pool()
                     .get_page::<RowPage>(
                         guards
-                            .mem
-                            .as_ref()
+                            .try_guard(PoolGuardSlot::Mem)
                             .expect("missing mem pool guard for user-table persistence"),
                         page_info.page_id,
                         LatchFallbackMode::Shared,
@@ -518,8 +499,7 @@ impl Table {
                 .mem_pool()
                 .get_page::<RowPage>(
                     guards
-                        .mem
-                        .as_ref()
+                        .try_guard(PoolGuardSlot::Mem)
                         .expect("missing mem pool guard for user-table persistence"),
                     page_info.page_id,
                     LatchFallbackMode::Shared,
@@ -557,8 +537,7 @@ impl Table {
                     .mem_pool()
                     .get_page::<RowPage>(
                         guards
-                            .mem
-                            .as_ref()
+                            .try_guard(PoolGuardSlot::Mem)
                             .expect("missing mem pool guard for user-table persistence"),
                         page_info.page_id,
                         LatchFallbackMode::Shared,
@@ -712,8 +691,7 @@ impl Table {
                     .mem_pool()
                     .get_page(
                         guards
-                            .mem
-                            .as_ref()
+                            .try_guard(PoolGuardSlot::Mem)
                             .expect("missing mem pool guard for user-table row pages"),
                         page_entry.page_id,
                         LatchFallbackMode::Shared,
@@ -997,9 +975,8 @@ impl Table {
                     .mem_pool()
                     .get_page::<RowPage>(
                         guards
-                            .mem
-                            .as_ref()
-                            .expect("missing mem pool guard for user-table recovery"),
+                            .try_guard(self.row_pool_slot.into())
+                            .expect("missing row-page pool guard for recovery"),
                         page_id,
                         LatchFallbackMode::Shared,
                     )

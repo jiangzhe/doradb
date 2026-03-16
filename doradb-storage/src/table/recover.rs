@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, PoolGuards};
+use crate::buffer::{BufferPool, PoolGuardSlot, PoolGuards};
 use crate::error::{Error, Result};
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_payload_deletion_deltas,
@@ -87,8 +87,7 @@ impl TableRecover for Table {
             .mem_pool()
             .get_page::<RowPage>(
                 guards
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard for user-table recovery"),
                 page_id,
                 LatchFallbackMode::Exclusive,
@@ -126,8 +125,7 @@ impl TableRecover for Table {
             .mem_pool()
             .get_page::<RowPage>(
                 guards
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard for user-table recovery"),
                 page_id,
                 LatchFallbackMode::Exclusive,
@@ -159,8 +157,7 @@ impl TableRecover for Table {
                     .mem_pool()
                     .get_page::<RowPage>(
                         guards
-                            .mem
-                            .as_ref()
+                            .try_guard(PoolGuardSlot::Mem)
                             .expect("missing mem pool guard for user-table recovery"),
                         page_id,
                         LatchFallbackMode::Shared,
@@ -208,8 +205,7 @@ impl TableRecover for Table {
             .mem_pool()
             .get_page::<RowPage>(
                 guards
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard for user-table recovery"),
                 page_id,
                 LatchFallbackMode::Exclusive,
@@ -258,8 +254,7 @@ impl TableRecover for Table {
             .mem_pool()
             .get_page::<RowPage>(
                 guards
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard for user-table recovery"),
                 page_id,
                 LatchFallbackMode::Shared,

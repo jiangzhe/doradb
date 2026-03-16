@@ -1,6 +1,6 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards};
+use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuardSlot, PoolGuards};
 use crate::catalog::TableMetadata;
 use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
@@ -157,8 +157,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     ) -> GenericRowBlockIndexMemCursor<'a, P> {
         self.row.mem_cursor(
             guards
-                .meta
-                .as_ref()
+                .try_guard(PoolGuardSlot::Meta)
                 .expect("missing meta pool guard for block-index traversal"),
         )
     }

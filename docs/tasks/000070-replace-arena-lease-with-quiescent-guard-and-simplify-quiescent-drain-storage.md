@@ -31,6 +31,14 @@ The result is not the final generalized quiescent design, but it makes the
 current buffer-pool proof explicit enough for engine/session callers while
 keeping the future identity-safe redesign open.
 
+This also leaves one verified safety gap in place for now: fixed,
+evictable, and readonly pool paths still retain the caller-supplied
+`PoolGuard` inside returned page guards and arena keepalive handles. A
+foreign guard can therefore keep the wrong pool alive while allowing the
+target pool arena to tear down. That shared provenance/lifetime bug is
+tracked as deferred follow-up work instead of being patched ad hoc in this
+task.
+
 ## Context
 
 `docs/tasks/000065-quiescent-box-and-guard-primitive.md` introduced the
@@ -52,6 +60,9 @@ lease-source vocabulary, but several design gaps remain:
 5. Recovery runs before normal engine startup, so it cannot rely on the
    engine/session aggregate in the same way and may need separately named
    extracted guards.
+6. The current explicit-guard plumbing still clones caller-supplied guards
+   into page guards, so wrong-pool misuse remains a real lifetime hazard
+   until a shared provenance fix is added.
 
 This task therefore extends the earlier simplification plan in several
 directions:
@@ -115,12 +126,14 @@ Issue Labels:
    arbitrary guards with source identity.
 2. Adding a robust arena/pool identity token or runtime mismatch check in this
    task.
-3. Reworking `HybridLatch` semantics or optimistic hot-path behavior.
-4. Generalizing the multi-pool guard aggregator beyond the current named
+3. Patching individual pools to self-brand or validate `PoolGuard`
+   provenance without a settled shared policy for mismatch handling.
+4. Reworking `HybridLatch` semantics or optimistic hot-path behavior.
+5. Generalizing the multi-pool guard aggregator beyond the current named
    engine pool set.
-5. Making worker-backed by-value pool constructors fully started after this
+6. Making worker-backed by-value pool constructors fully started after this
    task.
-6. Completing broader engine/session capability unification outside buffer
+7. Completing broader engine/session capability unification outside buffer
    pools.
 
 ## Unsafe Considerations (If Applicable)
@@ -273,11 +286,15 @@ Reference:
    capability model.
 2. `BufferPool` methods still take a single `PoolGuard`, so correctness in
    this task depends on callers passing the guard from the matching pool.
-3. `ReadonlyBufferPool` should not repeat guard extraction; only
+3. That caller-discipline rule is not only a type-safety limitation today:
+   current pool implementations still retain the caller-supplied guard in
+   page guards and arena keepalive handles, so wrong-pool misuse can keep
+   the wrong pool alive while the target arena tears down.
+4. `ReadonlyBufferPool` should not repeat guard extraction; only
    `GlobalReadonlyBufferPool` is the extraction boundary for disk-pool use.
-4. Recovery may keep separately named pool guards before engine startup
+5. Recovery may keep separately named pool guards before engine startup
    instead of forcing the aggregate path.
-5. `ArenaGuard` is the only retained arena access carrier that should escape
+6. `ArenaGuard` is the only retained arena access carrier that should escape
    pool construction logic or background helper setup.
 
 ## Impacts
@@ -349,3 +366,9 @@ Reference:
 1. The robust long-term solution still needs an explicit pool/arena identity
    model so single-guard pool APIs can reject wrong-pool misuse instead of
    relying on caller discipline and named aggregation only.
+2. The current shared bug is broader than `EvictableBufferPool`: fixed and
+   readonly pools also clone caller-supplied `PoolGuard` values into page
+   guards today, so the eventual fix should be applied consistently across
+   all pool types.
+3. The follow-up task still needs to decide mismatch policy: reject foreign
+   guards, self-brand returned page guards from the target pool, or both.

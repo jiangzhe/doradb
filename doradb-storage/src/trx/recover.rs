@@ -15,7 +15,8 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
+    PoolGuards,
 };
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
@@ -363,8 +364,7 @@ impl<'a> LogRecovery<'a> {
             .mem_pool
             .get_page::<RowPage>(
                 self.pool_guards
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard for recovery row-page refresh"),
                 page_id,
                 LatchFallbackMode::Exclusive,

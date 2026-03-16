@@ -29,12 +29,21 @@ use std::future::Future;
 
 pub type PoolGuard = SyncQuiescentGuard<()>;
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PoolGuardSlot {
+    Meta,
+    Index,
+    Mem,
+    Disk,
+}
+
 #[derive(Clone, Default)]
 pub struct PoolGuards {
-    pub(crate) meta: Option<PoolGuard>,
-    pub(crate) index: Option<PoolGuard>,
-    pub(crate) mem: Option<PoolGuard>,
-    pub(crate) disk: Option<PoolGuard>,
+    meta: Option<PoolGuard>,
+    index: Option<PoolGuard>,
+    mem: Option<PoolGuard>,
+    disk: Option<PoolGuard>,
 }
 
 #[derive(Default)]
@@ -46,6 +55,16 @@ impl PoolGuards {
     #[inline]
     pub fn builder() -> PoolGuardsBuilder {
         PoolGuardsBuilder::default()
+    }
+
+    #[inline]
+    pub(crate) fn try_guard(&self, slot: PoolGuardSlot) -> Option<&PoolGuard> {
+        match slot {
+            PoolGuardSlot::Meta => self.meta.as_ref(),
+            PoolGuardSlot::Index => self.index.as_ref(),
+            PoolGuardSlot::Mem => self.mem.as_ref(),
+            PoolGuardSlot::Disk => self.disk.as_ref(),
+        }
     }
 }
 
@@ -165,10 +184,10 @@ mod tests {
     #[test]
     fn test_pool_guards_builder_empty_builds_partial() {
         let guards = PoolGuards::builder().build();
-        assert!(guards.meta.is_none());
-        assert!(guards.index.is_none());
-        assert!(guards.mem.is_none());
-        assert!(guards.disk.is_none());
+        assert!(guards.try_guard(PoolGuardSlot::Meta).is_none());
+        assert!(guards.try_guard(PoolGuardSlot::Index).is_none());
+        assert!(guards.try_guard(PoolGuardSlot::Mem).is_none());
+        assert!(guards.try_guard(PoolGuardSlot::Disk).is_none());
     }
 
     #[test]
@@ -190,10 +209,10 @@ mod tests {
         let owner = QuiescentBox::new(());
         let guard = owner.guard().into_sync();
         let guards = PoolGuards::builder().meta(guard).build();
-        assert!(guards.meta.is_some());
-        assert!(guards.index.is_none());
-        assert!(guards.mem.is_none());
-        assert!(guards.disk.is_none());
+        assert!(guards.try_guard(PoolGuardSlot::Meta).is_some());
+        assert!(guards.try_guard(PoolGuardSlot::Index).is_none());
+        assert!(guards.try_guard(PoolGuardSlot::Mem).is_none());
+        assert!(guards.try_guard(PoolGuardSlot::Disk).is_none());
         drop(guards);
         drop(owner);
     }
@@ -201,6 +220,6 @@ mod tests {
     #[test]
     fn test_pool_guards_field_is_none_when_slot_missing() {
         let guards = PoolGuards::builder().build();
-        assert!(guards.meta.is_none());
+        assert!(guards.try_guard(PoolGuardSlot::Meta).is_none());
     }
 }

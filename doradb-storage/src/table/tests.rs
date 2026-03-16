@@ -1,5 +1,5 @@
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
-use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
+use crate::buffer::{BufferPool, EvictableBufferPoolConfig, PoolGuardSlot};
 use crate::engine::{Engine, EngineConfig};
 use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -641,8 +641,7 @@ fn test_row_page_transition_retries_update_delete() {
             .get_page::<RowPage>(
                 session
                     .pool_guards()
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard in table test"),
                 page_id,
                 LatchFallbackMode::Shared,
@@ -662,8 +661,7 @@ fn test_row_page_transition_retries_update_delete() {
             .get_page::<RowPage>(
                 session
                     .pool_guards()
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard in table test"),
                 page_id,
                 LatchFallbackMode::Shared,
@@ -706,8 +704,7 @@ fn test_row_page_transition_retries_update_delete() {
             .get_page::<RowPage>(
                 session
                     .pool_guards()
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard in table test"),
                 page_id,
                 LatchFallbackMode::Shared,
@@ -1377,8 +1374,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             .get_page::<RowPage>(
                 session
                     .pool_guards()
-                    .mem
-                    .as_ref()
+                    .try_guard(PoolGuardSlot::Mem)
                     .expect("missing mem pool guard in table test"),
                 page_id,
                 LatchFallbackMode::Shared,

@@ -12,7 +12,8 @@ pub use table::*;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
+    PoolGuards,
 };
 use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
@@ -388,8 +389,7 @@ impl TableHandle {
                     .mem_pool
                     .try_get_page_versioned::<RowPage>(
                         guards
-                            .mem
-                            .as_ref()
+                            .try_guard(PoolGuardSlot::Mem)
                             .expect("missing mem pool guard for user-table row pages"),
                         page_id,
                         LatchFallbackMode::Shared,
@@ -402,8 +402,7 @@ impl TableHandle {
                     .mem_pool
                     .try_get_page_versioned::<RowPage>(
                         guards
-                            .meta
-                            .as_ref()
+                            .try_guard(PoolGuardSlot::Meta)
                             .expect("missing meta pool guard for catalog-table row pages"),
                         page_id,
                         LatchFallbackMode::Shared,
@@ -426,8 +425,7 @@ impl TableHandle {
                     .mem_pool
                     .get_page::<RowPage>(
                         guards
-                            .mem
-                            .as_ref()
+                            .try_guard(PoolGuardSlot::Mem)
                             .expect("missing mem pool guard for user-table row pages"),
                         page_id,
                         LatchFallbackMode::Shared,
@@ -441,8 +439,7 @@ impl TableHandle {
                     .mem_pool
                     .get_page::<RowPage>(
                         guards
-                            .meta
-                            .as_ref()
+                            .try_guard(PoolGuardSlot::Meta)
                             .expect("missing meta pool guard for catalog-table row pages"),
                         page_id,
                         LatchFallbackMode::Shared,

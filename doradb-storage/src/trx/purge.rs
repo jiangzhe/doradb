@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
+use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuardSlot, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
 use crate::latch::LatchFallbackMode;
 use crate::row::RowPage;
@@ -206,8 +206,7 @@ impl TransactionSystem {
             let page_guard = mem_pool
                 .get_page::<RowPage>(
                     guards
-                        .mem
-                        .as_ref()
+                        .try_guard(PoolGuardSlot::Mem)
                         .expect("missing mem pool guard for purge row-page deallocation"),
                     page_id,
                     LatchFallbackMode::Exclusive,
