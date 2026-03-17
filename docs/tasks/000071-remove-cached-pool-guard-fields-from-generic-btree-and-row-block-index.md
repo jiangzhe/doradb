@@ -3,6 +3,7 @@ id: 000071
 title: Remove Cached Pool Guard Fields From Generic BTree And Row Block Index
 status: proposal
 created: 2026-03-17
+github_issue: 434
 ---
 
 # Task: Remove Cached Pool Guard Fields From Generic BTree And Row Block Index
