@@ -3,6 +3,7 @@ id: 000075
 title: Guard-Owned Engine Components
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-18
+github_issue: 443
 ---
 
 # Task: Guard-Owned Engine Components
