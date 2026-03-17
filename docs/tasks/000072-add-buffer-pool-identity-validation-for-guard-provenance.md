@@ -3,6 +3,7 @@ id: 000072
 title: Add Buffer Pool Identity Validation For Guard Provenance
 status: implemented  # proposal | implemented | superseded
 created: 2026-03-17
+github_issue: 436
 ---
 
 # Task: Add Buffer Pool Identity Validation For Guard Provenance
