@@ -586,6 +586,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
@@ -627,6 +628,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
@@ -850,6 +852,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
@@ -894,6 +897,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )

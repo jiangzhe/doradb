@@ -271,8 +271,13 @@ mod tests {
     fn test_non_unique_index() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool = scope
-                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    1024usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             {
                 let pool_guard = pool.guard();

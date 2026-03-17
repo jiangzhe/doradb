@@ -335,7 +335,9 @@ mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .data_buffer(EvictableBufferPoolConfig::default())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default().identity(crate::buffer::PoolIdentity::Mem),
+                )
                 .trx(
                     TrxSysConfig::default()
                         .log_file_stem("redo_secidx1")
@@ -438,7 +440,9 @@ mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .data_buffer(EvictableBufferPoolConfig::default())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default().identity(crate::buffer::PoolIdentity::Mem),
+                )
                 .trx(
                     TrxSysConfig::default()
                         .log_file_stem("redo_secidx2")

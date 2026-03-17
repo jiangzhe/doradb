@@ -239,10 +239,10 @@ impl TrxSysConfig {
             CatalogStorage::new(meta_pool, index_pool, table_fs, global_disk_pool.clone()).await?;
         let mut catalog = Catalog::new(catalog_storage).await?;
         let pool_guards = PoolGuards::builder()
-            .meta(meta_pool.guard())
-            .index(index_pool.guard())
-            .mem(mem_pool.as_static().guard())
-            .disk(global_disk_pool.guard())
+            .push(meta_pool.guard())
+            .push(index_pool.guard())
+            .push(mem_pool.as_static().guard())
+            .push(global_disk_pool.guard())
             .build();
 
         // Now we have an empty catalog, all log partitions and buffer pool.

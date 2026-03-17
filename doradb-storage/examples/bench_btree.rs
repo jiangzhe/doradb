@@ -1,6 +1,6 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
-use doradb_storage::buffer::{BufferPool, FixedBufferPool};
+use doradb_storage::buffer::{BufferPool, FixedBufferPool, PoolIdentity};
 use doradb_storage::index::{BTree, BTreeCompactConfig, BTreeU64};
 use doradb_storage::lifetime::StaticLifetimeScope;
 use rand_distr::{Distribution, Uniform};
@@ -33,7 +33,8 @@ async fn single_thread(args: &Args) {
 
 async fn single_thread_bench_btree(args: &Args) {
     let scope = StaticLifetimeScope::new();
-    let pool = scope.adopt(FixedBufferPool::with_capacity_static(args.mem_size).unwrap());
+    let pool = scope
+        .adopt(FixedBufferPool::with_capacity_static(PoolIdentity::Index, args.mem_size).unwrap());
     let pool = pool.as_static();
     {
         let pool_guard = pool.guard();

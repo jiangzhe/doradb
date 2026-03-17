@@ -8,7 +8,7 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
-use crate::buffer::{BufferPool, PoolGuard};
+use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, RowPoolIdentity};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -59,6 +59,16 @@ pub struct EvictableBufferPool {
 }
 
 impl EvictableBufferPool {
+    #[inline]
+    pub(crate) fn identity(&self) -> PoolIdentity {
+        self.arena.identity()
+    }
+
+    #[inline]
+    pub(crate) fn row_pool_identity(&self) -> RowPoolIdentity {
+        self.arena.row_pool_identity()
+    }
+
     #[inline]
     fn try_lock_page_exclusive(
         &self,
@@ -111,6 +121,7 @@ impl EvictableBufferPool {
     /// This method may not succeed, and client should retry.
     #[inline]
     async fn try_dispatch_io_read(&self, guard: &PoolGuard, page_id: PageID) {
+        guard.assert_matches(self.identity(), "evictable buffer pool");
         enum DispatchAction {
             RetryYield,
             Wait(EventListener),
@@ -307,7 +318,7 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     fn guard(&self) -> PoolGuard {
-        self.arena.sync_guard()
+        self.arena.guard()
     }
 
     #[inline]
@@ -365,6 +376,7 @@ impl BufferPool for EvictableBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
+        guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(page_id);
             let frame = self.arena.frame(page_id);
@@ -412,6 +424,7 @@ impl BufferPool for EvictableBufferPool {
         id: VersionedPageID,
         mode: LatchFallbackMode,
     ) -> Option<FacadePageGuard<T>> {
+        guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(id.page_id);
             let frame = self.arena.frame(id.page_id);
@@ -480,6 +493,7 @@ impl BufferPool for EvictableBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> Validation<FacadePageGuard<T>> {
+        guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(page_id);
             let frame = self.arena.frame(page_id);
@@ -1030,6 +1044,8 @@ const DEFAULT_MAX_IO_DEPTH: usize = 64;
 /// used to build the background evictor policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvictableBufferPoolConfig {
+    #[serde(default)]
+    identity: PoolIdentity,
     data_swap_file: PathBuf,
     max_file_size: Byte,
     max_mem_size: Byte,
@@ -1041,6 +1057,7 @@ impl Default for EvictableBufferPoolConfig {
     #[inline]
     fn default() -> Self {
         EvictableBufferPoolConfig {
+            identity: PoolIdentity::Invalid,
             data_swap_file: PathBuf::from(DEFAULT_DATA_SWAP_FILE),
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             max_mem_size: DEFAULT_MAX_MEM_SIZE,
@@ -1051,6 +1068,12 @@ impl Default for EvictableBufferPoolConfig {
 }
 
 impl EvictableBufferPoolConfig {
+    #[inline]
+    pub fn identity(mut self, identity: PoolIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
     #[inline]
     pub fn data_swap_file(mut self, data_swap_file: impl Into<PathBuf>) -> Self {
         self.data_swap_file = data_swap_file.into();
@@ -1131,6 +1154,7 @@ impl EvictableBufferPoolConfig {
 
     #[inline]
     pub fn build(self) -> Result<EvictableBufferPool> {
+        self.identity.assert_valid("evictable buffer pool");
         validate_swap_file_path_candidate(&self.data_swap_file)?;
         // 1. Calculate memory usage.
         let max_file_size = self.max_file_size.as_u64() as usize;
@@ -1154,7 +1178,7 @@ impl EvictableBufferPoolConfig {
         let eviction_arbiter = self.eviction_arbiter_builder.build(max_nbr_in_mem);
 
         // 2. Initialize memory of frames and pages.
-        let arena = QuiescentArena::new(max_nbr)?;
+        let arena = QuiescentArena::new(self.identity, max_nbr)?;
 
         // 3. Create file and initialize AIO manager.
         let io_ctx = AIOContext::new(self.max_io_depth)?;
@@ -1368,6 +1392,7 @@ mod tests {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
                 EvictableBufferPoolConfig::default()
+                    .identity(crate::buffer::PoolIdentity::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256)
@@ -1484,6 +1509,7 @@ mod tests {
         let pool: &EvictableBufferPool = scope
             .adopt(
                 EvictableBufferPoolConfig::default()
+                    .identity(crate::buffer::PoolIdentity::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(64u64 * 1024 * 130)
                     .max_file_size(128u64 * 1024 * 130)
@@ -1534,6 +1560,7 @@ mod tests {
         let scope = StaticLifetimeScope::new();
         let pool = scope.adopt(
             EvictableBufferPoolConfig::default()
+                .identity(crate::buffer::PoolIdentity::Mem)
                 .data_swap_file(temp_dir.path().join("data.bin"))
                 .max_mem_size(1024u64 * 1024 * 64)
                 .max_file_size(1024u64 * 1024 * 128)
@@ -1564,6 +1591,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = StaticLifetime::new_static(
                 EvictableBufferPoolConfig::default()
+                    .identity(crate::buffer::PoolIdentity::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64)
@@ -1605,6 +1633,7 @@ mod tests {
         let pool = scope
             .adopt(
                 EvictableBufferPoolConfig::default()
+                    .identity(crate::buffer::PoolIdentity::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(64u64 * 1024 * 2048)
@@ -1684,6 +1713,7 @@ mod tests {
         let scope = StaticLifetimeScope::new();
         let pool = scope.adopt(
             EvictableBufferPoolConfig::default()
+                .identity(crate::buffer::PoolIdentity::Mem)
                 .data_swap_file(temp_dir.path().join("data.bin"))
                 .max_mem_size(1024u64 * 1024 * 10)
                 .max_file_size(1024u64 * 1024 * 16)
@@ -1721,5 +1751,45 @@ mod tests {
             .decide(pool.in_mem.max_count / 2, pool.in_mem.max_count, 0, 0.10, 1)
             .unwrap();
         assert_eq!(decision.batch_size, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "pool guard identity mismatch")]
+    fn test_evictable_buffer_pool_panics_on_foreign_guard() {
+        smol::block_on(async {
+            let temp_dir1 = TempDir::new().unwrap();
+            let temp_dir2 = TempDir::new().unwrap();
+            let scope = StaticLifetimeScope::new();
+            let pool1 = scope.adopt(
+                EvictableBufferPoolConfig::default()
+                    .identity(crate::buffer::PoolIdentity::Mem)
+                    .data_swap_file(temp_dir1.path().join("data1.bin"))
+                    .max_mem_size(1024u64 * 1024 * 32)
+                    .max_file_size(1024u64 * 1024 * 64)
+                    .build_static()
+                    .unwrap(),
+            );
+            let pool2 = scope.adopt(
+                EvictableBufferPoolConfig::default()
+                    .identity(crate::buffer::PoolIdentity::Index)
+                    .data_swap_file(temp_dir2.path().join("data2.bin"))
+                    .max_mem_size(1024u64 * 1024 * 32)
+                    .max_file_size(1024u64 * 1024 * 64)
+                    .build_static()
+                    .unwrap(),
+            );
+            let pool1 = pool1.as_static();
+            let pool2 = pool2.as_static();
+            let pool1_guard = pool1.guard();
+            let pool2_guard = pool2.guard();
+
+            let page = pool1.allocate_page::<RowPage>(&pool1_guard).await;
+            let page_id = page.page_id();
+            drop(page);
+
+            let _ = pool1
+                .get_page::<RowPage>(&pool2_guard, page_id, LatchFallbackMode::Shared)
+                .await;
+        });
     }
 }

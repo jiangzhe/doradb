@@ -104,6 +104,8 @@ tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type impleme
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
+10. Do not run `git commit` or `git push` during `task resolve`.
+11. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
 
 ## Backlog Integration
 

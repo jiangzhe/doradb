@@ -238,7 +238,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                     .mem_pool()
                     .get_page::<RowPage>(
                         stmt.pool_guards()
-                            .try_guard(self.mem.row_pool_slot.into())
+                            .try_row_guard(self.mem.row_pool_identity)
                             .expect("missing row-page pool guard"),
                         page_id,
                         LatchFallbackMode::Shared,
@@ -942,7 +942,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                                 .mem_pool()
                                 .get_page::<RowPage>(
                                     guards
-                                        .try_guard(self.mem.row_pool_slot.into())
+                                        .try_row_guard(self.mem.row_pool_identity)
                                         .expect("missing row-page pool guard"),
                                     page_id,
                                     LatchFallbackMode::Shared,
@@ -1014,7 +1014,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                                 .mem_pool()
                                 .get_page::<RowPage>(
                                     guards
-                                        .try_guard(self.mem.row_pool_slot.into())
+                                        .try_row_guard(self.mem.row_pool_identity)
                                         .expect("missing row-page pool guard"),
                                     page_id,
                                     LatchFallbackMode::Shared,
@@ -1055,7 +1055,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                 .mem_pool()
                 .get_page(
                     stmt.pool_guards()
-                        .try_guard(self.mem.row_pool_slot.into())
+                        .try_row_guard(self.mem.row_pool_identity)
                         .expect("missing row-page pool guard"),
                     page_id,
                     LatchFallbackMode::Shared,
@@ -1174,7 +1174,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         .mem_pool()
                         .get_page::<RowPage>(
                             stmt.pool_guards()
-                                .try_guard(self.mem.row_pool_slot.into())
+                                .try_row_guard(self.mem.row_pool_identity)
                                 .expect("missing row-page pool guard"),
                             page_id,
                             LatchFallbackMode::Shared,
@@ -1936,7 +1936,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                         .mem_pool()
                         .get_page::<RowPage>(
                             guards
-                                .try_guard(self.mem.row_pool_slot.into())
+                                .try_row_guard(self.mem.row_pool_identity)
                                 .expect("missing row-page pool guard"),
                             page_id,
                             LatchFallbackMode::Shared,
@@ -2114,7 +2114,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                             .mem_pool()
                             .get_page::<RowPage>(
                                 stmt.pool_guards()
-                                    .try_guard(self.mem.row_pool_slot.into())
+                                    .try_row_guard(self.mem.row_pool_identity)
                                     .expect("missing row-page pool guard"),
                                 page_id,
                                 LatchFallbackMode::Shared,
@@ -2262,7 +2262,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                             .mem_pool()
                             .get_page::<RowPage>(
                                 stmt.pool_guards()
-                                    .try_guard(self.mem.row_pool_slot.into())
+                                    .try_row_guard(self.mem.row_pool_identity)
                                     .expect("missing row-page pool guard"),
                                 page_id,
                                 LatchFallbackMode::Shared,
@@ -2314,7 +2314,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                         .mem_pool()
                         .get_page::<RowPage>(
                             guards
-                                .try_guard(self.mem.row_pool_slot.into())
+                                .try_row_guard(self.mem.row_pool_identity)
                                 .expect("missing row-page pool guard"),
                             page_id,
                             LatchFallbackMode::Exclusive,

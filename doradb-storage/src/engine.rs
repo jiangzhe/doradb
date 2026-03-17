@@ -4,6 +4,7 @@
 //! including start, stop, recover, and execute commands.
 use crate::buffer::{
     EvictableBufferPool, EvictableBufferPoolConfig, FixedBufferPool, GlobalReadonlyBufferPool,
+    PoolIdentity,
 };
 use crate::catalog::Catalog;
 use crate::error::Result;
@@ -290,22 +291,31 @@ impl EngineConfig {
         let readonly_buffer_size = file.readonly_buffer_size;
         let mut dag = QuiDAG::new();
 
-        let disk_pool = GlobalReadonlyBufferPool::with_capacity_static(readonly_buffer_size)?;
+        let disk_pool = GlobalReadonlyBufferPool::with_capacity_static(
+            PoolIdentity::Disk,
+            readonly_buffer_size,
+        )?;
         let disk_pool_h = insert_static_owner(&mut dag, "disk_pool", disk_pool)?;
 
         let table_fs = StaticLifetime::new_static(file.build()?);
         let table_fs_h = insert_static_owner(&mut dag, "table_fs", table_fs)?;
 
-        let meta_pool = FixedBufferPool::with_capacity_static(self.meta_buffer.as_u64() as usize)?;
+        let meta_pool = FixedBufferPool::with_capacity_static(
+            PoolIdentity::Meta,
+            self.meta_buffer.as_u64() as usize,
+        )?;
         let meta_pool_h = insert_static_owner(&mut dag, "meta_pool", meta_pool)?;
 
         // todo: implement index pool
-        let index_pool =
-            FixedBufferPool::with_capacity_static(self.index_buffer.as_u64() as usize)?;
+        let index_pool = FixedBufferPool::with_capacity_static(
+            PoolIdentity::Index,
+            self.index_buffer.as_u64() as usize,
+        )?;
         let index_pool_h = insert_static_owner(&mut dag, "index_pool", index_pool)?;
 
         let mem_pool = StaticLifetime::new_static(
             self.data_buffer
+                .identity(PoolIdentity::Mem)
                 .data_swap_file(resolved.data_swap_file_path())
                 .build()?,
         );
@@ -382,6 +392,7 @@ mod tests {
             .index_buffer(TEST_POOL_BYTES)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
+                    .identity(PoolIdentity::Mem)
                     .max_mem_size(TEST_POOL_BYTES)
                     .max_file_size(128usize * 1024 * 1024),
             )
@@ -409,6 +420,7 @@ mod tests {
             let engine = test_engine_config_for(root.path())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024)
                         .data_swap_file("alt-data.bin"),
@@ -492,6 +504,7 @@ mod tests {
                 .file(TableFileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(PoolIdentity::Mem)
                         .max_mem_size(1024usize * 1024)
                         .max_file_size(2usize * 1024 * 1024),
                 )
@@ -686,20 +699,26 @@ mod tests {
                     .build()
                     .unwrap(),
             ));
-            let meta_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(TEST_POOL_BYTES).unwrap());
-            let index_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(TEST_POOL_BYTES).unwrap());
+            let meta_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, TEST_POOL_BYTES).unwrap(),
+            );
+            let index_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Index, TEST_POOL_BYTES)
+                    .unwrap(),
+            );
             let mem_pool = scope.adopt(
                 EvictableBufferPoolConfig::default()
+                    .identity(PoolIdentity::Mem)
                     .data_swap_file(&swap_file)
                     .max_mem_size(TEST_POOL_BYTES)
                     .max_file_size(128usize * 1024 * 1024)
                     .build_static()
                     .unwrap(),
             );
-            let disk_pool = scope
-                .adopt(GlobalReadonlyBufferPool::with_capacity_static(TEST_POOL_BYTES).unwrap());
+            let disk_pool = scope.adopt(
+                GlobalReadonlyBufferPool::with_capacity_static(PoolIdentity::Disk, TEST_POOL_BYTES)
+                    .unwrap(),
+            );
 
             let pending = TrxSysConfig::default()
                 .log_dir(&log_dir)

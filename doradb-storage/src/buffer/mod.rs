@@ -4,13 +4,18 @@ mod evictor;
 mod fixed;
 pub mod frame;
 pub mod guard;
+mod identity;
 pub mod page;
+mod pool_guard;
 mod readonly;
 mod util;
 
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
+pub use identity::PoolIdentity;
+pub(crate) use identity::RowPoolIdentity;
+pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
 pub use readonly::{
     GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey, ReadonlyPageSource,
 };
@@ -24,138 +29,7 @@ use crate::error::Result;
 use crate::error::Validation;
 use crate::latch::LatchFallbackMode;
 use crate::lifetime::StaticLifetime;
-use crate::quiescent::SyncQuiescentGuard;
 use std::future::Future;
-
-/// Cloneable quiescent guard tied to one buffer pool instance.
-pub type PoolGuard = SyncQuiescentGuard<()>;
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PoolGuardSlot {
-    Meta,
-    Index,
-    Mem,
-    Disk,
-}
-
-/// Bundle of pool guards used by storage operations that touch multiple pools.
-#[derive(Clone, Default)]
-pub struct PoolGuards {
-    meta: Option<PoolGuard>,
-    index: Option<PoolGuard>,
-    mem: Option<PoolGuard>,
-    disk: Option<PoolGuard>,
-}
-
-/// Builder for assembling a [`PoolGuards`] bundle slot by slot.
-#[derive(Default)]
-pub struct PoolGuardsBuilder {
-    guards: PoolGuards,
-}
-
-impl PoolGuards {
-    /// Create a builder for assembling a pool-guard bundle.
-    #[inline]
-    pub fn builder() -> PoolGuardsBuilder {
-        PoolGuardsBuilder::default()
-    }
-
-    /// Returns the guard for the metadata pool.
-    #[inline]
-    pub fn meta_guard(&self) -> &PoolGuard {
-        require_guard_slot(self.meta.as_ref(), "meta")
-    }
-
-    /// Returns the guard for the secondary-index pool.
-    #[inline]
-    pub fn index_guard(&self) -> &PoolGuard {
-        require_guard_slot(self.index.as_ref(), "index")
-    }
-
-    /// Returns the guard for the in-memory row-page pool.
-    #[inline]
-    pub fn mem_guard(&self) -> &PoolGuard {
-        require_guard_slot(self.mem.as_ref(), "mem")
-    }
-
-    /// Returns the guard for the persisted read-only page pool.
-    #[inline]
-    pub fn disk_guard(&self) -> &PoolGuard {
-        require_guard_slot(self.disk.as_ref(), "disk")
-    }
-
-    #[inline]
-    pub(crate) fn try_guard(&self, slot: PoolGuardSlot) -> Option<&PoolGuard> {
-        match slot {
-            PoolGuardSlot::Meta => self.meta.as_ref(),
-            PoolGuardSlot::Index => self.index.as_ref(),
-            PoolGuardSlot::Mem => self.mem.as_ref(),
-            PoolGuardSlot::Disk => self.disk.as_ref(),
-        }
-    }
-}
-
-impl PoolGuardsBuilder {
-    /// Set the metadata-pool guard slot.
-    #[inline]
-    pub fn meta(mut self, guard: PoolGuard) -> Self {
-        set_guard_slot(&mut self.guards.meta, Some(guard), "meta");
-        self
-    }
-
-    /// Set the secondary-index-pool guard slot.
-    #[inline]
-    pub fn index(mut self, guard: PoolGuard) -> Self {
-        set_guard_slot(&mut self.guards.index, Some(guard), "index");
-        self
-    }
-
-    /// Set the in-memory row-page-pool guard slot.
-    #[inline]
-    pub fn mem(mut self, guard: PoolGuard) -> Self {
-        set_guard_slot(&mut self.guards.mem, Some(guard), "mem");
-        self
-    }
-
-    /// Set the persisted read-only page-pool guard slot.
-    #[inline]
-    pub fn disk(mut self, guard: PoolGuard) -> Self {
-        set_guard_slot(&mut self.guards.disk, Some(guard), "disk");
-        self
-    }
-
-    /// Finalize the builder into a guard bundle.
-    #[inline]
-    pub fn build(self) -> PoolGuards {
-        self.guards
-    }
-}
-
-#[inline]
-fn set_guard_slot(slot: &mut Option<PoolGuard>, incoming: Option<PoolGuard>, name: &'static str) {
-    if slot.is_some() && incoming.is_some() {
-        duplicate_guard_slot(name);
-    }
-    if slot.is_none() {
-        *slot = incoming;
-    }
-}
-
-#[inline]
-fn require_guard_slot<'a>(slot: Option<&'a PoolGuard>, name: &'static str) -> &'a PoolGuard {
-    slot.unwrap_or_else(|| missing_guard_slot(name))
-}
-
-#[cold]
-fn missing_guard_slot(name: &'static str) -> ! {
-    panic!("missing {name} pool guard");
-}
-
-#[cold]
-fn duplicate_guard_slot(name: &'static str) -> ! {
-    panic!("duplicate pool guard slot: {name}");
-}
 
 /// Abstraction of buffer pool.
 /// The implementation should be a static pointer providing
@@ -173,7 +47,7 @@ pub trait BufferPool: Send + Sync + StaticLifetime + 'static {
     /// Allocate a new page.
     ///
     /// Caller must pass the guard from the same pool instance the method is
-    /// invoked on. This task does not add a runtime pool-identity check.
+    /// invoked on. Mismatched pool identities panic.
     fn allocate_page<T: BufferPage>(
         &'static self,
         guard: &PoolGuard,
@@ -217,98 +91,4 @@ pub trait BufferPool: Send + Sync + StaticLifetime + 'static {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::quiescent::QuiescentBox;
-
-    #[test]
-    fn test_pool_guards_builder_empty_builds_partial() {
-        let guards = PoolGuards::builder().build();
-        assert!(guards.try_guard(PoolGuardSlot::Meta).is_none());
-        assert!(guards.try_guard(PoolGuardSlot::Index).is_none());
-        assert!(guards.try_guard(PoolGuardSlot::Mem).is_none());
-        assert!(guards.try_guard(PoolGuardSlot::Disk).is_none());
-    }
-
-    #[test]
-    fn test_pool_guards_builder_duplicate_slot_panics() {
-        let owner = QuiescentBox::new(());
-        let guard = owner.guard().into_sync();
-        let result = std::panic::catch_unwind(|| {
-            let _ = PoolGuards::builder()
-                .meta(guard.clone())
-                .meta(guard)
-                .build();
-        });
-        assert!(result.is_err());
-        drop(owner);
-    }
-
-    #[test]
-    fn test_pool_guards_builder_builds_explicit_slot() {
-        let owner = QuiescentBox::new(());
-        let guard = owner.guard().into_sync();
-        let guards = PoolGuards::builder().meta(guard).build();
-        assert!(guards.try_guard(PoolGuardSlot::Meta).is_some());
-        assert!(guards.try_guard(PoolGuardSlot::Index).is_none());
-        assert!(guards.try_guard(PoolGuardSlot::Mem).is_none());
-        assert!(guards.try_guard(PoolGuardSlot::Disk).is_none());
-        drop(guards);
-        drop(owner);
-    }
-
-    #[test]
-    fn test_pool_guards_field_is_none_when_slot_missing() {
-        let guards = PoolGuards::builder().build();
-        assert!(guards.try_guard(PoolGuardSlot::Meta).is_none());
-    }
-
-    #[test]
-    fn test_pool_guards_named_getters_return_configured_slots() {
-        let owner = QuiescentBox::new(());
-        let guard = owner.guard().into_sync();
-        let guards = PoolGuards::builder()
-            .meta(guard.clone())
-            .index(guard.clone())
-            .mem(guard.clone())
-            .disk(guard)
-            .build();
-        let _ = guards.meta_guard();
-        let _ = guards.index_guard();
-        let _ = guards.mem_guard();
-        let _ = guards.disk_guard();
-        drop(guards);
-        drop(owner);
-    }
-
-    #[test]
-    #[should_panic(expected = "missing meta pool guard")]
-    fn test_pool_guards_meta_guard_panics_when_slot_missing() {
-        let guards = PoolGuards::builder().build();
-        let _ = guards.meta_guard();
-    }
-
-    #[test]
-    #[should_panic(expected = "missing index pool guard")]
-    fn test_pool_guards_index_guard_panics_when_slot_missing() {
-        let guards = PoolGuards::builder().build();
-        let _ = guards.index_guard();
-    }
-
-    #[test]
-    #[should_panic(expected = "missing mem pool guard")]
-    fn test_pool_guards_mem_guard_panics_when_slot_missing() {
-        let guards = PoolGuards::builder().build();
-        let _ = guards.mem_guard();
-    }
-
-    #[test]
-    #[should_panic(expected = "missing disk pool guard")]
-    fn test_pool_guards_disk_guard_panics_when_slot_missing() {
-        let guards = PoolGuards::builder().build();
-        let _ = guards.disk_guard();
-    }
 }

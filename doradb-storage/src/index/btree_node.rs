@@ -1592,8 +1592,13 @@ mod tests {
     fn test_btree_node_insert() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
 
@@ -1623,8 +1628,13 @@ mod tests {
     fn test_btree_node_delete() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
 
@@ -1673,8 +1683,13 @@ mod tests {
     fn test_btree_node_mark_as_deleted() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
 
@@ -1727,8 +1742,13 @@ mod tests {
     fn test_btree_node_update() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
 
@@ -1785,8 +1805,13 @@ mod tests {
     fn test_btree_node_compact_non_empty() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
 
@@ -1833,8 +1858,13 @@ mod tests {
     fn test_btree_node_compact_empty() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
 
@@ -1879,8 +1909,13 @@ mod tests {
     fn test_btree_node_space_estimation() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
 
@@ -1948,8 +1983,13 @@ mod tests {
     fn test_btree_node_update_key() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
 
@@ -2037,8 +2077,13 @@ mod tests {
     fn test_btree_node_enable_hints_seq() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
             {
@@ -2071,8 +2116,13 @@ mod tests {
         const COUNT: usize = 100;
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let buf_pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64usize * 1024 * 1024).unwrap());
+            let buf_pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    64usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let buf_pool = buf_pool.as_static();
             let buf_pool_guard = buf_pool.guard();
             {

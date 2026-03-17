@@ -416,8 +416,13 @@ mod tests {
     fn test_single_key_partition_unique_index() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(1024usize * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    1024usize * 1024,
+                )
+                .unwrap(),
+            );
             let guard = pool.as_static().guard();
             let index = PartitionSingleKeyIndex::<i32, false>::empty();
             run_test_suit_for_single_key_unique_index(&index, &guard).await;
@@ -428,8 +433,13 @@ mod tests {
     fn test_multi_key_partition_unique_index() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(1024usize * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    1024usize * 1024,
+                )
+                .unwrap(),
+            );
             let guard = pool.as_static().guard();
             let encoder = multi_key_encoder(vec![
                 ValType {
@@ -450,8 +460,13 @@ mod tests {
     fn test_single_key_btree_unique_index() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool = scope
-                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    1024usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             {
                 let pool_guard = pool.guard();
@@ -471,8 +486,13 @@ mod tests {
     fn test_multi_key_btree_unique_index() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool = scope
-                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    1024usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             {
                 let pool_guard = pool.guard();

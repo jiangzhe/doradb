@@ -1058,6 +1058,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1100,6 +1101,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1155,6 +1157,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(100usize * 1024 * 1024)
                         .max_file_size(1024usize * 1024 * 1024),
                 )
@@ -1195,8 +1198,13 @@ mod tests {
     fn test_row_block_index_cursor_two_level_tree() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool = scope
-                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    1024usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             let blk_idx = RowBlockIndex::new(pool, &pool_guard, 0).await;
@@ -1259,8 +1267,13 @@ mod tests {
     fn test_row_block_index_search() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(512usize * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    512usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             let blk_idx = RowBlockIndex::new(pool, &pool_guard, 0).await;
@@ -1296,8 +1309,13 @@ mod tests {
     fn test_row_block_index_split() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool = scope
-                .adopt(FixedBufferPool::with_capacity_static(1024usize * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolIdentity::Index,
+                    1024usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             let blk_idx = RowBlockIndex::new(pool, &pool_guard, 0).await;
@@ -1354,6 +1372,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )

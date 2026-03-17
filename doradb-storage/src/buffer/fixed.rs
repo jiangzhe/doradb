@@ -3,7 +3,7 @@ use crate::buffer::arena::QuiescentArena;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
-use crate::buffer::{BufferPool, PoolGuard};
+use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, RowPoolIdentity};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
@@ -27,9 +27,10 @@ impl FixedBufferPool {
     /// We separate pages and frames so that pages are always aligned
     /// to the unit of direct IO and can be flushed via libaio.
     #[inline]
-    pub fn with_capacity(pool_size: usize) -> Result<Self> {
+    pub fn with_capacity(identity: PoolIdentity, pool_size: usize) -> Result<Self> {
+        identity.assert_valid("fixed buffer pool");
         let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
-        let arena = QuiescentArena::new(size)?;
+        let arena = QuiescentArena::new(identity, size)?;
         Ok(FixedBufferPool {
             size,
             alloc_map: AllocMap::new(size),
@@ -40,8 +41,8 @@ impl FixedBufferPool {
     /// Create a buffer pool with given capacity, leak it to heap
     /// and return the static reference.
     #[inline]
-    pub fn with_capacity_static(pool_size: usize) -> Result<&'static Self> {
-        let pool = Self::with_capacity(pool_size)?;
+    pub fn with_capacity_static(identity: PoolIdentity, pool_size: usize) -> Result<&'static Self> {
+        let pool = Self::with_capacity(identity, pool_size)?;
         Ok(StaticLifetime::new_static(pool))
     }
 
@@ -52,12 +53,23 @@ impl FixedBufferPool {
     }
 
     #[inline]
+    pub(crate) fn identity(&self) -> PoolIdentity {
+        self.arena.identity()
+    }
+
+    #[inline]
+    pub(crate) fn row_pool_identity(&self) -> RowPoolIdentity {
+        self.arena.row_pool_identity()
+    }
+
+    #[inline]
     async fn get_page_internal<T: 'static>(
         &'static self,
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
+        guard.assert_matches(self.identity(), "fixed buffer pool");
         let keepalive = guard.clone();
         let bf = self.arena.frame_ptr(page_id);
         let g = self
@@ -90,6 +102,7 @@ impl FixedBufferPool {
         guard: &PoolGuard,
         page_id: PageID,
     ) -> FacadePageGuard<T> {
+        guard.assert_matches(self.identity(), "fixed buffer pool");
         let keepalive = guard.clone();
         let bf = self.arena.frame_ptr(page_id);
         let g = self.arena.frame(page_id).latch.optimistic_spin_raw();
@@ -110,7 +123,7 @@ impl BufferPool for FixedBufferPool {
 
     #[inline]
     fn guard(&self) -> PoolGuard {
-        self.arena.sync_guard()
+        self.arena.guard()
     }
 
     // allocate a new page with exclusive lock.
@@ -239,8 +252,10 @@ mod tests {
     fn test_fixed_buffer_pool() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
+                    .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -348,8 +363,10 @@ mod tests {
     fn test_facade_page_guard_lock_shared_and_try_into_shared() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
+                    .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
@@ -413,8 +430,10 @@ mod tests {
     fn test_facade_page_guard_lock_exclusive_and_try_into_exclusive() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
+                    .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
@@ -483,8 +502,10 @@ mod tests {
     fn test_facade_page_guard_lock_exclusive_async_panics_on_shared_state() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
+                    .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
@@ -508,8 +529,10 @@ mod tests {
     fn test_facade_page_guard_lock_shared_async_panics_on_exclusive_state() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
+                    .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
@@ -532,7 +555,7 @@ mod tests {
     fn test_fixed_buffer_pool_drop_waits_for_outstanding_guard() {
         smol::block_on(async {
             let pool = StaticLifetime::new_static(
-                FixedBufferPool::with_capacity(8 * 1024 * 1024).unwrap(),
+                FixedBufferPool::with_capacity(PoolIdentity::Meta, 8 * 1024 * 1024).unwrap(),
             );
             let guard = {
                 let pool_guard = pool.guard();
@@ -557,6 +580,34 @@ mod tests {
             drop(guard);
             handle.join().unwrap();
             assert!(dropped.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "pool guard identity mismatch")]
+    fn test_fixed_buffer_pool_panics_on_foreign_guard() {
+        smol::block_on(async {
+            let scope = StaticLifetimeScope::new();
+            let pool1 = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
+                    .unwrap(),
+            );
+            let pool2 = scope.adopt(
+                FixedBufferPool::with_capacity_static(PoolIdentity::Index, 64 * 1024 * 1024)
+                    .unwrap(),
+            );
+            let pool1 = pool1.as_static();
+            let pool2 = pool2.as_static();
+            let pool1_guard = pool1.guard();
+            let pool2_guard = pool2.guard();
+
+            let page = pool1.allocate_page::<BlockNode>(&pool1_guard).await;
+            let page_id = page.page_id();
+            drop(page);
+
+            let _ = pool1
+                .get_page::<BlockNode>(&pool2_guard, page_id, LatchFallbackMode::Shared)
+                .await;
         });
     }
 }

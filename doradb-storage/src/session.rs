@@ -242,10 +242,10 @@ impl SessionState {
     #[inline]
     pub fn new(engine_ref: EngineRef) -> Self {
         let pool_guards = PoolGuards::builder()
-            .meta(engine_ref.meta_pool.guard())
-            .index(engine_ref.index_pool.guard())
-            .mem(engine_ref.mem_pool.guard())
-            .disk(engine_ref.disk_pool.guard())
+            .push(engine_ref.meta_pool.guard())
+            .push(engine_ref.index_pool.guard())
+            .push(engine_ref.mem_pool.guard())
+            .push(engine_ref.disk_pool.guard())
             .build();
         SessionState {
             engine_ref,

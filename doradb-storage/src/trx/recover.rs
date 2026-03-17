@@ -207,10 +207,10 @@ impl<'a> LogRecovery<'a> {
         log_merger: LogMerger,
     ) -> Self {
         let pool_guards = PoolGuards::builder()
-            .meta(meta_pool.guard())
-            .index(index_pool.guard())
-            .mem(mem_pool.guard())
-            .disk(global_disk_pool.guard())
+            .push(meta_pool.guard())
+            .push(index_pool.guard())
+            .push(mem_pool.guard())
+            .push(global_disk_pool.guard())
             .build();
         LogRecovery {
             index_pool,
@@ -669,6 +669,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -694,6 +695,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -739,6 +741,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -774,6 +777,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -858,6 +862,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -898,6 +903,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -941,6 +947,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -967,6 +974,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1035,6 +1043,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1073,6 +1082,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1152,6 +1162,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1202,6 +1213,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1329,6 +1341,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1405,6 +1418,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1485,6 +1499,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .identity(crate::buffer::PoolIdentity::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )

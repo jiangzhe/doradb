@@ -63,8 +63,8 @@ impl Catalog {
     #[inline]
     pub async fn new(storage: CatalogStorage) -> Result<Self> {
         let pool_guards = PoolGuards::builder()
-            .meta(storage.meta_pool.guard())
-            .index(storage.index_pool.guard())
+            .push(storage.meta_pool.guard())
+            .push(storage.index_pool.guard())
             .build();
         let snapshot = storage.checkpoint_snapshot()?;
         storage

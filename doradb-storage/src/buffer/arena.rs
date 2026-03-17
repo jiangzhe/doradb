@@ -1,8 +1,8 @@
-use crate::buffer::PoolGuard;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
+use crate::buffer::{PoolGuard, PoolIdentity, RowPoolIdentity};
 use crate::error::Result;
 use crate::ptr::UnsafePtr;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -150,30 +150,49 @@ pub(crate) struct QuiescentArena {
     // `state` so owner teardown waits for all outstanding quiescent guards
     // before the frame/page mappings are reclaimed.
     keepalive: QuiescentBox<()>,
+    identity: PoolIdentity,
     state: ArenaInner,
 }
 
 impl QuiescentArena {
     #[inline]
-    pub(crate) fn new(capacity: usize) -> Result<Self> {
+    pub(crate) fn new(identity: PoolIdentity, capacity: usize) -> Result<Self> {
+        identity.assert_valid("quiescent arena");
+        let keepalive = QuiescentBox::new(());
         Ok(Self {
-            keepalive: QuiescentBox::new(()),
+            identity,
+            keepalive,
             state: ArenaInner::new(capacity)?,
         })
     }
 
     #[inline]
-    pub(crate) fn guard(&self) -> QuiescentGuard<()> {
+    pub(crate) fn identity(&self) -> PoolIdentity {
+        self.identity
+    }
+
+    #[inline]
+    pub(crate) fn row_pool_identity(&self) -> RowPoolIdentity {
+        match self.identity {
+            PoolIdentity::Meta => RowPoolIdentity::Meta,
+            PoolIdentity::Mem => RowPoolIdentity::Mem,
+            _ => panic!("pool identity {:?} is not a row pool", self.identity),
+        }
+    }
+
+    #[inline]
+    fn quiescent_guard(&self) -> QuiescentGuard<()> {
         self.keepalive.guard()
     }
 
     #[inline]
-    pub(crate) fn sync_guard(&self) -> PoolGuard {
-        self.guard().into_sync()
+    pub(crate) fn guard(&self) -> PoolGuard {
+        PoolGuard::new(self.identity, self.quiescent_guard().into_sync())
     }
 
     #[inline]
     pub(crate) fn arena_guard(&'static self, guard: PoolGuard) -> ArenaGuard {
+        guard.assert_matches(self.identity, "arena guard");
         let inner = UnsafePtr(std::ptr::from_ref(&self.state).cast_mut());
         ArenaGuard {
             inner,
@@ -197,6 +216,7 @@ impl QuiescentArena {
         keepalive: &PoolGuard,
         page_id: PageID,
     ) -> PageExclusiveGuard<T> {
+        keepalive.assert_matches(self.identity, "arena init page");
         let keepalive = keepalive.clone();
         let bf = self.frame_ptr(page_id);
         let mut guard = {
@@ -224,6 +244,23 @@ impl QuiescentArena {
         keepalive: &PoolGuard,
         page_id: PageID,
     ) -> Option<PageExclusiveGuard<Page>> {
+        keepalive.assert_matches(self.identity, "arena try_lock_page_exclusive");
         self.state.try_lock_page_exclusive_with(keepalive, page_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "pool guard identity mismatch")]
+    fn test_arena_guard_panics_on_foreign_guard() {
+        let arena1 = Box::leak(Box::new(
+            QuiescentArena::new(PoolIdentity::Meta, 1).unwrap(),
+        ));
+        let arena2 = Box::leak(Box::new(QuiescentArena::new(PoolIdentity::Mem, 1).unwrap()));
+        let foreign_guard = arena2.guard();
+        let _ = arena1.arena_guard(foreign_guard);
     }
 }

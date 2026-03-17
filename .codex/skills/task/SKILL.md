@@ -131,6 +131,9 @@ tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type impleme
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
+8. `task resolve` must not run `git commit` or `git push`.
+   - Resolve updates are limited to document synchronization and related backlog/RFC tooling.
+   - Leave commit/push decisions to an explicit user request or a separate workflow.
 
 ## Output Quality Bar
 
