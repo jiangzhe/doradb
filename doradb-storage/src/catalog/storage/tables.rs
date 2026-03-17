@@ -1,3 +1,4 @@
+use crate::buffer::PoolGuards;
 use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
@@ -55,11 +56,11 @@ pub struct Tables<'a> {
 
 impl Tables<'_> {
     /// List all table rows from uncommitted-visible catalog state.
-    pub async fn list_uncommitted(&self) -> Vec<TableObject> {
+    pub async fn list_uncommitted(&self, guards: &PoolGuards) -> Vec<TableObject> {
         let mut res = vec![];
         self.table
             .accessor()
-            .table_scan_uncommitted(|metadata, row| {
+            .table_scan_uncommitted(guards, |metadata, row| {
                 if row.is_deleted() {
                     return true;
                 }
@@ -72,11 +73,15 @@ impl Tables<'_> {
 
     /// Find a table by id.
     #[inline]
-    pub async fn find_uncommitted_by_id(&self, table_id: TableID) -> Option<TableObject> {
+    pub async fn find_uncommitted_by_id(
+        &self,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) -> Option<TableObject> {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
         self.table
             .accessor()
-            .index_lookup_unique_uncommitted(&key, row_to_table_object)
+            .index_lookup_unique_uncommitted(guards, &key, row_to_table_object)
             .await
     }
 
@@ -162,7 +167,7 @@ mod tests {
                     .catalog()
                     .storage
                     .tables()
-                    .find_uncommitted_by_id(table100.table_id)
+                    .find_uncommitted_by_id(session.pool_guards(), table100.table_id)
                     .await
                     .is_none()
             );
@@ -171,7 +176,7 @@ mod tests {
                     .catalog()
                     .storage
                     .tables()
-                    .find_uncommitted_by_id(table101.table_id)
+                    .find_uncommitted_by_id(session.pool_guards(), table101.table_id)
                     .await
                     .is_some()
             );

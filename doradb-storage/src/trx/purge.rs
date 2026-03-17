@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, EvictableBufferPool};
+use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuardSlot, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
 use crate::latch::LatchFallbackMode;
 use crate::row::RowPage;
@@ -33,6 +33,7 @@ impl TransactionSystem {
     pub(super) fn start_purge_threads(
         &'static self,
         mem_pool: &'static EvictableBufferPool,
+        pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
     ) {
         if self.config.purge_threads == 1 {
@@ -40,19 +41,27 @@ impl TransactionSystem {
             let handle = thread::spawn_named("Purge-Thread", move || {
                 let ex = LocalExecutor::new();
                 let mut purger = PurgeSingleThreaded;
-                smol::block_on(ex.run(purger.purge_loop(mem_pool, &self.catalog, self, purge_chan)))
+                smol::block_on(ex.run(purger.purge_loop(
+                    mem_pool,
+                    &self.catalog,
+                    self,
+                    pool_guards,
+                    purge_chan,
+                )))
             });
             let mut g = self.purge_threads.lock();
             g.push(handle);
         } else {
             // multi-threaded purger
-            let (mut dispatcher, executors) = self.dispatch_purge(&self.catalog);
+            let dispatcher_guards = pool_guards.clone();
+            let (mut dispatcher, executors) = self.dispatch_purge(&self.catalog, pool_guards);
             let handle = thread::spawn_named("Purge-Dispatcher", move || {
                 let ex = LocalExecutor::new();
                 smol::block_on(ex.run(dispatcher.purge_loop(
                     mem_pool,
                     &self.catalog,
                     self,
+                    dispatcher_guards,
                     purge_chan,
                 )));
             });
@@ -82,6 +91,7 @@ impl TransactionSystem {
     pub(super) fn dispatch_purge(
         &'static self,
         catalog: &'static Catalog,
+        pool_guards: PoolGuards,
     ) -> (PurgeDispatcher, Vec<JoinHandle<()>>) {
         let mut handles = vec![];
         let mut chans = vec![];
@@ -89,10 +99,11 @@ impl TransactionSystem {
             let (tx, rx) = flume::unbounded();
             chans.push(tx);
             let thread_name = format!("Purge-Executor-{i}");
+            let pool_guards = pool_guards.clone();
             let handle = thread::spawn_named(thread_name, move || {
                 let mut purger = PurgeExecutor;
                 let ex = LocalExecutor::new();
-                smol::block_on(ex.run(purger.purge_task_loop(catalog, self, rx)));
+                smol::block_on(ex.run(purger.purge_task_loop(catalog, self, pool_guards, rx)));
             });
             handles.push(handle);
         }
@@ -105,6 +116,7 @@ impl TransactionSystem {
     pub(super) async fn purge_trx_list(
         &self,
         catalog: &Catalog,
+        guards: &PoolGuards,
         log_no: usize,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
@@ -123,7 +135,9 @@ impl TransactionSystem {
                         continue;
                     };
                     let page_guard = if let Some(page_id) = undo.page_id {
-                        table.try_get_row_page_versioned_shared(page_id).await
+                        table
+                            .try_get_row_page_versioned_shared(guards, page_id)
+                            .await
                     } else {
                         None
                     };
@@ -146,11 +160,12 @@ impl TransactionSystem {
         for trx in &trx_list {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
-                    if let Some(table) = table_cache.get_table_ref(ip.table_id).await {
-                        // todo: index should stored in index pool, instead of data pool.
-                        if table.delete_index(&ip.key, ip.row_id, ip.unique).await {
-                            purge_index_count += 1;
-                        }
+                    if let Some(table) = table_cache.get_table_ref(ip.table_id).await
+                        && table
+                            .delete_index(guards, &ip.key, ip.row_id, ip.unique)
+                            .await
+                    {
+                        purge_index_count += 1;
                     }
                 }
             }
@@ -184,11 +199,18 @@ impl TransactionSystem {
     async fn deallocate_gc_row_pages(
         &self,
         mem_pool: &'static EvictableBufferPool,
+        guards: &PoolGuards,
         gc_row_pages: HashSet<PageID>,
     ) {
         for page_id in gc_row_pages {
             let page_guard = mem_pool
-                .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+                .get_page::<RowPage>(
+                    guards
+                        .try_guard(PoolGuardSlot::Mem)
+                        .expect("missing mem pool guard for purge row-page deallocation"),
+                    page_id,
+                    LatchFallbackMode::Exclusive,
+                )
                 .await
                 .lock_exclusive_async()
                 .await
@@ -404,6 +426,7 @@ trait PurgeLoop {
         mem_pool: &'static EvictableBufferPool,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
+        pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
     );
 }
@@ -418,6 +441,7 @@ impl PurgeLoop for PurgeSingleThreaded {
         mem_pool: &'static EvictableBufferPool,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
+        pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
     ) {
         // initialize min_active_sts.
@@ -445,12 +469,12 @@ impl PurgeLoop for PurgeSingleThreaded {
                             }
                             let log_no = partition.log_no;
                             let partition_gc_pages = trx_sys
-                                .purge_trx_list(catalog, log_no, trx_list, curr_sts)
+                                .purge_trx_list(catalog, &pool_guards, log_no, trx_list, curr_sts)
                                 .await;
                             gc_row_pages.extend(partition_gc_pages);
                         }
                         trx_sys
-                            .deallocate_gc_row_pages(mem_pool, gc_row_pages)
+                            .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
                             .await;
                     }
                     // Once GC is finished, update global_visible_sts so other threads can use it to
@@ -472,6 +496,7 @@ impl PurgeLoop for PurgeDispatcher {
         mem_pool: &'static EvictableBufferPool,
         _catalog: &Catalog,
         trx_sys: &TransactionSystem,
+        pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
     ) {
         let mut min_sts = trx_sys.global_visible_sts();
@@ -521,7 +546,7 @@ impl PurgeLoop for PurgeDispatcher {
                             g.drain(..).collect::<HashSet<PageID>>()
                         };
                         trx_sys
-                            .deallocate_gc_row_pages(mem_pool, gc_row_pages)
+                            .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
                             .await;
 
                         // Once GC is finished, update global_visible_sts so other threads can use it to
@@ -547,6 +572,7 @@ impl PurgeExecutor {
         &mut self,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
+        pool_guards: PoolGuards,
         purge_chan: Receiver<PurgeTask>,
     ) {
         while let Ok(PurgeTask {
@@ -562,7 +588,7 @@ impl PurgeExecutor {
             partition.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
             // actual purge here
             let gc_pages = trx_sys
-                .purge_trx_list(catalog, log_no, trx_list, min_active_sts)
+                .purge_trx_list(catalog, &pool_guards, log_no, trx_list, min_active_sts)
                 .await;
             if !gc_pages.is_empty() {
                 gc_row_pages.lock().extend(gc_pages);
@@ -575,10 +601,9 @@ impl PurgeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::BufferPool;
-    use crate::buffer::EvictableBufferPoolConfig;
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::VersionedPageID;
+    use crate::buffer::{BufferPool, EvictableBufferPoolConfig, PoolGuards};
     use crate::catalog::tests::table1;
     use crate::engine::EngineConfig;
     use crate::index::{RowLocation, UniqueIndex};
@@ -594,6 +619,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    #[inline]
+    fn full_pool_guards(engine: &crate::engine::Engine) -> PoolGuards {
+        PoolGuards::builder()
+            .meta(engine.meta_pool.guard())
+            .index(engine.index_pool.guard())
+            .mem(engine.mem_pool.guard())
+            .disk(engine.disk_pool.guard())
+            .build()
+    }
 
     #[test]
     fn test_active_sts_list() {
@@ -685,17 +720,26 @@ mod tests {
                     gc_row_pages: vec![],
                 }),
             };
-
-            engine
-                .trx_sys
-                .purge_trx_list(engine.catalog(), 0, vec![trx], MAX_SNAPSHOT_TS)
-                .await;
+            {
+                let pool_guards = full_pool_guards(&engine);
+                engine
+                    .trx_sys
+                    .purge_trx_list(
+                        engine.catalog(),
+                        &pool_guards,
+                        0,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await;
+            }
 
             match table.deletion_buffer().get(row_id) {
                 Some(DeleteMarker::Committed(ts)) => assert_eq!(ts, status.ts()),
                 Some(DeleteMarker::Ref(_)) => panic!("delete marker should be promoted"),
                 None => panic!("delete marker should exist"),
             }
+            drop(table);
             drop(engine);
         });
     }
@@ -763,11 +807,19 @@ mod tests {
                     gc_row_pages: vec![],
                 }),
             };
-
-            engine
-                .trx_sys
-                .purge_trx_list(engine.catalog(), 0, vec![trx], MAX_SNAPSHOT_TS)
-                .await;
+            {
+                let pool_guards = full_pool_guards(&engine);
+                engine
+                    .trx_sys
+                    .purge_trx_list(
+                        engine.catalog(),
+                        &pool_guards,
+                        0,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await;
+            }
 
             match table.deletion_buffer().get(row_id) {
                 Some(DeleteMarker::Ref(actual)) => {
@@ -778,6 +830,7 @@ mod tests {
                 }
                 None => panic!("delete marker should exist"),
             }
+            drop(table);
             drop(engine);
         });
     }
@@ -828,7 +881,11 @@ mod tests {
             };
             let page_guard = table
                 .mem_pool()
-                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                .get_page::<RowPage>(
+                    &table.mem_pool().guard(),
+                    page_id,
+                    LatchFallbackMode::Shared,
+                )
                 .await;
             let stale_page_id = VersionedPageID {
                 page_id,
@@ -858,17 +915,26 @@ mod tests {
                     gc_row_pages: vec![],
                 }),
             };
-
-            engine
-                .trx_sys
-                .purge_trx_list(engine.catalog(), 0, vec![trx], MAX_SNAPSHOT_TS)
-                .await;
+            {
+                let pool_guards = full_pool_guards(&engine);
+                engine
+                    .trx_sys
+                    .purge_trx_list(
+                        engine.catalog(),
+                        &pool_guards,
+                        0,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await;
+            }
 
             match table.deletion_buffer().get(row_id) {
                 Some(DeleteMarker::Committed(ts)) => assert_eq!(ts, status.ts()),
                 Some(DeleteMarker::Ref(_)) => panic!("delete marker should be promoted"),
                 None => panic!("delete marker should exist"),
             }
+            drop(table);
             drop(engine);
         });
     }
@@ -919,7 +985,11 @@ mod tests {
             };
             let page_guard = table
                 .mem_pool()
-                .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                .get_page::<RowPage>(
+                    &table.mem_pool().guard(),
+                    page_id,
+                    LatchFallbackMode::Shared,
+                )
                 .await;
             let stale_page_id = VersionedPageID {
                 page_id,
@@ -949,11 +1019,19 @@ mod tests {
                     gc_row_pages: vec![],
                 }),
             };
-
-            engine
-                .trx_sys
-                .purge_trx_list(engine.catalog(), 0, vec![trx], MAX_SNAPSHOT_TS)
-                .await;
+            {
+                let pool_guards = full_pool_guards(&engine);
+                engine
+                    .trx_sys
+                    .purge_trx_list(
+                        engine.catalog(),
+                        &pool_guards,
+                        0,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await;
+            }
 
             match table.deletion_buffer().get(row_id) {
                 Some(DeleteMarker::Ref(actual)) => {
@@ -964,6 +1042,7 @@ mod tests {
                 }
                 None => panic!("delete marker should exist"),
             }
+            drop(table);
             drop(engine);
         });
     }
@@ -1048,6 +1127,7 @@ mod tests {
                 }
             }
             drop(session);
+            drop(table);
             drop(engine);
         });
     }
@@ -1146,9 +1226,10 @@ mod tests {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
                 };
+                let mem_guard = engine.mem_pool.guard();
                 let page_guard: PageSharedGuard<RowPage> = engine
                     .mem_pool
-                    .get_page(page_id, LatchFallbackMode::Shared)
+                    .get_page(&mem_guard, page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
                     .await
@@ -1163,6 +1244,7 @@ mod tests {
                 engine.trx_sys.global_visible_sts()
             );
             drop(session);
+            drop(table);
             drop(engine);
         });
     }

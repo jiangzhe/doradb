@@ -14,7 +14,7 @@ use std::future::Future;
 
 pub trait TablePersistence {
     /// Freeze row pages and return approximate non-deleted rows visited.
-    fn freeze(&self, max_rows: usize) -> impl Future<Output = usize>;
+    fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = usize>;
 
     /// Convert frozen row pages to LWC pages and persist to table file.
     fn checkpoint_for_new_data(&self, session: &mut Session) -> impl Future<Output = Result<()>>;
@@ -44,24 +44,6 @@ impl Table {
         let trx_sys = session.engine().trx_sys;
         let active_root = table_file.active_root();
         let pivot_row_id = active_root.pivot_row_id;
-        let mut next_heap_redo_start_ts = None;
-
-        // Step 2: for new-data checkpoint, collect frozen pages and move them into
-        // transition state under a refreshed cutoff timestamp.
-        let mut cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
-        let mut frozen_pages = Vec::new();
-        if include_new_data {
-            let (pages, candidate_heap_redo_start_ts) = self.collect_frozen_pages().await;
-            frozen_pages = pages;
-            if !frozen_pages.is_empty() {
-                self.wait_for_frozen_pages_stable(trx_sys, &frozen_pages)
-                    .await;
-                cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
-                self.set_frozen_pages_to_transition(&frozen_pages, cutoff_ts)
-                    .await;
-            }
-            next_heap_redo_start_ts = candidate_heap_redo_start_ts;
-        }
 
         // Step 3: open a checkpoint transaction and prepare per-phase state.
         let mut trx = session
@@ -71,14 +53,32 @@ impl Table {
         let mut new_pivot_row_id = pivot_row_id;
         let mut lwc_pages = Vec::new();
         let mut heap_redo_start_ts = active_root.heap_redo_start_ts;
+
+        // Step 2: for new-data checkpoint, collect frozen pages and move them into
+        // transition state under a refreshed cutoff timestamp.
+        let mut cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
         if include_new_data {
+            let pool_guards = session.pool_guards();
+            let (frozen_pages, next_heap_redo_start_ts) =
+                self.collect_frozen_pages(pool_guards).await;
+            if !frozen_pages.is_empty() {
+                self.wait_for_frozen_pages_stable(pool_guards, trx_sys, &frozen_pages)
+                    .await;
+                cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
+                self.set_frozen_pages_to_transition(pool_guards, &frozen_pages, cutoff_ts)
+                    .await;
+            }
+
             // Step 4: build LWC pages from transition pages using the cutoff snapshot.
             new_pivot_row_id = frozen_pages
                 .last()
                 .map(|page| page.end_row_id)
                 .unwrap_or(pivot_row_id);
 
-            match self.build_lwc_pages(cutoff_ts, &frozen_pages).await {
+            match self
+                .build_lwc_pages(session.pool_guards(), cutoff_ts, &frozen_pages)
+                .await
+            {
                 Ok(pages) => {
                     lwc_pages = pages;
                     heap_redo_start_ts = next_heap_redo_start_ts.unwrap_or(checkpoint_ts);
@@ -245,9 +245,9 @@ impl Table {
 }
 
 impl TablePersistence for Table {
-    async fn freeze(&self, max_rows: usize) -> usize {
+    async fn freeze(&self, session: &Session, max_rows: usize) -> usize {
         let mut rows = 0usize;
-        self.mem_scan(|page_guard| {
+        self.mem_scan(session.pool_guards(), |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let vmap = ctx.row_ver().unwrap();
             rows += page.header.approx_non_deleted();

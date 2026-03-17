@@ -1,29 +1,82 @@
+use crate::buffer::PoolGuard;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
 use crate::error::Result;
 use crate::ptr::UnsafePtr;
-use crate::quiescent::{QuiescentDrain, QuiescentToken, SyncQuiescentToken};
+use crate::quiescent::{QuiescentBox, QuiescentGuard};
 
-pub(crate) struct QuiescentArena {
+#[derive(Clone)]
+pub(crate) struct ArenaGuard {
+    inner: UnsafePtr<ArenaInner>,
+    keepalive: PoolGuard,
+}
+
+impl ArenaGuard {
+    #[inline]
+    fn inner(&self) -> &ArenaInner {
+        // SAFETY: `ArenaGuard` is created only from a stable `QuiescentArena`
+        // address and retains one pool keepalive for the full guard lifetime.
+        unsafe { &*self.inner.0 }
+    }
+
+    #[inline]
+    pub(crate) fn frame_kind(&self, page_id: PageID) -> FrameKind {
+        self.inner().frame_kind(page_id)
+    }
+
+    #[inline]
+    pub(crate) fn compare_exchange_frame_kind(
+        &self,
+        page_id: PageID,
+        old_kind: FrameKind,
+        new_kind: FrameKind,
+    ) -> FrameKind {
+        self.inner()
+            .compare_exchange_frame_kind(page_id, old_kind, new_kind)
+    }
+
+    #[inline]
+    pub(crate) fn try_lock_page_exclusive(
+        &self,
+        page_id: PageID,
+    ) -> Option<PageExclusiveGuard<Page>> {
+        self.inner()
+            .try_lock_page_exclusive_with(&self.keepalive, page_id)
+    }
+}
+
+// SAFETY: `ArenaGuard` only shares a stable raw pointer to `ArenaInner` plus
+// one retained sync keepalive guard. Callers still need external latch/pool
+// synchronization before dereferencing frame/page memory across threads.
+unsafe impl Send for ArenaGuard {}
+
+// SAFETY: see `Send` above.
+unsafe impl Sync for ArenaGuard {}
+
+/// One-shot owner of the mmap-backed frame/page arrays.
+///
+/// The frame/page mappings are installed exactly once during construction and
+/// must never be reallocated, remapped, or replaced for the full lifetime of
+/// this owner. That stable-address invariant is what allows raw frame/page
+/// pointers to remain valid while a paired quiescent guard is retained.
+pub(crate) struct ArenaInner {
     frames: *mut BufferFrame,
     pages: *mut Page,
     capacity: usize,
-    drain: QuiescentDrain,
 }
 
-impl QuiescentArena {
+impl ArenaInner {
     #[inline]
-    pub(crate) fn new(capacity: usize) -> Result<Self> {
-        // SAFETY: the arena owner drops initialized frames and unmaps both
-        // regions exactly once in `Drop`, after outstanding leases drain.
+    fn new(capacity: usize) -> Result<Self> {
+        // SAFETY: `ArenaInner::drop` destroys initialized frames and unmaps
+        // both regions exactly once after the leading keepalive box drains.
         let (frames, pages) = unsafe { initialize_frame_and_page_arrays(capacity)? };
         Ok(Self {
             frames,
             pages,
             capacity,
-            drain: QuiescentDrain::new(),
         })
     }
 
@@ -42,167 +95,11 @@ impl QuiescentArena {
     }
 
     #[inline]
-    pub(crate) fn init_page<T: BufferPage>(&self, page_id: PageID) -> PageExclusiveGuard<T> {
-        self.lease().init_page(page_id)
-    }
-
-    #[inline]
-    pub(crate) fn try_lock_page_exclusive(
-        &self,
-        page_id: PageID,
-    ) -> Option<PageExclusiveGuard<Page>> {
-        self.lease().try_lock_page_exclusive(page_id)
-    }
-
-    #[inline]
-    pub(crate) fn lease(&self) -> ArenaLease {
-        ArenaLease {
-            _keepalive: ArenaKeepalive::Direct(self.drain.token()),
-            frames: self.frames,
-            pages: self.pages,
-            capacity: self.capacity,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn lease_source(&self) -> ArenaLeaseSource {
-        ArenaLeaseSource {
-            keepalive: self.drain.token().into_local(),
-            frames: self.frames,
-            pages: self.pages,
-            capacity: self.capacity,
-        }
-    }
-}
-
-impl Drop for QuiescentArena {
-    #[inline]
-    fn drop(&mut self) {
-        self.drain.wait_for_zero();
-        // SAFETY: all outstanding arena leases have drained before teardown
-        // reaches here, so no raw frame/page access can outlive this reclaim.
-        unsafe {
-            for frame_id in 0..self.capacity {
-                std::ptr::drop_in_place(self.frames.add(frame_id));
-            }
-            deallocate_frame_and_page_arrays(self.frames, self.pages, self.capacity);
-        }
-    }
-}
-
-/// Owns one arena keepalive plus raw arena metadata.
-///
-/// The lease value itself is the keepalive: as long as an `ArenaLease` is
-/// still owned by a guard or background task, arena teardown must wait and the
-/// mmap-backed frame/page regions remain valid. Raw pointer helpers below rely
-/// on lease ownership directly rather than "touching" the keepalive field.
-pub(crate) struct ArenaLease {
-    _keepalive: ArenaKeepalive,
-    frames: *mut BufferFrame,
-    #[allow(dead_code)]
-    pages: *mut Page,
-    capacity: usize,
-}
-
-enum ArenaKeepalive {
-    // Direct keepalive for ordinary guard paths that do not need clone fan-out.
-    Direct(#[allow(dead_code)] QuiescentToken),
-    // Shared keepalive family used by `ArenaLeaseSource` to mint new leases.
-    Shared(#[allow(dead_code)] SyncQuiescentToken),
-}
-
-/// Reusable factory for minting `ArenaLease`s from one shared keepalive family.
-#[derive(Clone)]
-pub(crate) struct ArenaLeaseSource {
-    keepalive: SyncQuiescentToken,
-    frames: *mut BufferFrame,
-    pages: *mut Page,
-    capacity: usize,
-}
-
-impl ArenaLease {
-    #[inline]
-    pub(crate) fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        debug_assert!((page_id as usize) < self.capacity);
-        // SAFETY: frame memory is one contiguous mmap region indexed by page
-        // id, and this lease owns the keepalive that prevents arena teardown.
-        unsafe { UnsafePtr(self.frames.add(page_id as usize)) }
-    }
-
-    #[inline]
-    pub(crate) fn frame(&self, page_id: PageID) -> &BufferFrame {
-        let ptr = self.frame_ptr(page_id);
-        // SAFETY: `ptr` indexes the stable frame mmap guarded by this arena lease.
-        unsafe { &*ptr.0 }
-    }
-
-    #[inline]
     #[allow(dead_code)]
     pub(crate) fn page_ptr(&self, page_id: PageID) -> UnsafePtr<Page> {
         debug_assert!((page_id as usize) < self.capacity);
-        // SAFETY: page memory is one contiguous mmap region indexed by page id,
-        // and this lease owns the keepalive that prevents arena teardown.
+        // SAFETY: page memory is one contiguous mmap region indexed by page id.
         unsafe { UnsafePtr(self.pages.add(page_id as usize)) }
-    }
-
-    #[inline]
-    pub(crate) fn frame_ref(&self, bf: UnsafePtr<BufferFrame>) -> &BufferFrame {
-        debug_assert!(self.contains_frame_ptr(bf.clone()));
-        // SAFETY: `bf` points into the arena-owned frame mmap, and the lease's
-        // ownership guarantees that mapping remains valid for this borrow.
-        unsafe { &*bf.0 }
-    }
-
-    #[inline]
-    pub(crate) fn contains_frame_ptr(&self, bf: UnsafePtr<BufferFrame>) -> bool {
-        let start = self.frames as usize;
-        let end = start + std::mem::size_of::<BufferFrame>() * self.capacity;
-        let ptr = bf.0 as usize;
-        ptr >= start && ptr < end
-    }
-
-    #[inline]
-    pub(crate) fn init_page<T: BufferPage>(self, page_id: PageID) -> PageExclusiveGuard<T> {
-        let bf = self.frame_ptr(page_id);
-        let mut guard = {
-            let frame = self.frame(page_id);
-            let g = frame.latch.try_exclusive_raw().unwrap();
-            frame.bump_generation();
-            FacadePageGuard::<T>::new(self, bf.clone(), g).must_exclusive()
-        };
-        {
-            let frame = guard.bf_mut();
-            debug_assert_eq!(frame as *mut BufferFrame, bf.0);
-            frame.page_id = page_id;
-            frame.ctx = None;
-            T::init_frame(frame);
-            frame.set_dirty(true);
-            frame.clear_readonly_key();
-        }
-        guard.page_mut().zero();
-        guard
-    }
-
-    #[inline]
-    pub(crate) fn try_lock_page_exclusive(
-        self,
-        page_id: PageID,
-    ) -> Option<PageExclusiveGuard<Page>> {
-        let bf = self.frame_ptr(page_id);
-        let g = {
-            let frame = self.frame(page_id);
-            frame.latch.try_exclusive_raw()
-        };
-        g.map(|g| FacadePageGuard::new(self, bf, g).must_exclusive())
-    }
-}
-
-impl ArenaLeaseSource {
-    #[inline]
-    pub(crate) fn frame(&self, page_id: PageID) -> &BufferFrame {
-        debug_assert!((page_id as usize) < self.capacity);
-        // SAFETY: `self.frames` points to the stable arena-backed frame mmap.
-        unsafe { &*self.frames.add(page_id as usize) }
     }
 
     #[inline]
@@ -222,25 +119,111 @@ impl ArenaLeaseSource {
     }
 
     #[inline]
-    pub(crate) fn try_lock_page_exclusive(
+    pub(crate) fn try_lock_page_exclusive_with(
         &self,
+        keepalive: &PoolGuard,
         page_id: PageID,
     ) -> Option<PageExclusiveGuard<Page>> {
-        self.lease().try_lock_page_exclusive(page_id)
+        let bf = self.frame_ptr(page_id);
+        let g = self.frame(page_id).latch.try_exclusive_raw();
+        g.map(|g| FacadePageGuard::new(keepalive.clone(), bf, g).must_exclusive())
     }
+}
 
+impl Drop for ArenaInner {
     #[inline]
-    pub(crate) fn lease(&self) -> ArenaLease {
-        ArenaLease {
-            _keepalive: ArenaKeepalive::Shared(self.keepalive.clone()),
-            frames: self.frames,
-            pages: self.pages,
-            capacity: self.capacity,
+    fn drop(&mut self) {
+        // SAFETY: `QuiescentArena` declares `keepalive` before `state`, so the
+        // keepalive owner waits for all guards before `ArenaInner::drop`
+        // destroys frames and unmaps the backing regions.
+        unsafe {
+            for frame_id in 0..self.capacity {
+                std::ptr::drop_in_place(self.frames.add(frame_id));
+            }
+            deallocate_frame_and_page_arrays(self.frames, self.pages, self.capacity);
         }
     }
 }
 
-unsafe impl Send for ArenaLease {}
-unsafe impl Sync for ArenaLease {}
-unsafe impl Send for ArenaLeaseSource {}
-unsafe impl Sync for ArenaLeaseSource {}
+pub(crate) struct QuiescentArena {
+    // Field order is part of the safety contract. `keepalive` must drop before
+    // `state` so owner teardown waits for all outstanding quiescent guards
+    // before the frame/page mappings are reclaimed.
+    keepalive: QuiescentBox<()>,
+    state: ArenaInner,
+}
+
+impl QuiescentArena {
+    #[inline]
+    pub(crate) fn new(capacity: usize) -> Result<Self> {
+        Ok(Self {
+            keepalive: QuiescentBox::new(()),
+            state: ArenaInner::new(capacity)?,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn guard(&self) -> QuiescentGuard<()> {
+        self.keepalive.guard()
+    }
+
+    #[inline]
+    pub(crate) fn sync_guard(&self) -> PoolGuard {
+        self.guard().into_sync()
+    }
+
+    #[inline]
+    pub(crate) fn arena_guard(&'static self, guard: PoolGuard) -> ArenaGuard {
+        let inner = UnsafePtr(std::ptr::from_ref(&self.state).cast_mut());
+        ArenaGuard {
+            inner,
+            keepalive: guard,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
+        self.state.frame_ptr(page_id)
+    }
+
+    #[inline]
+    pub(crate) fn frame(&self, page_id: PageID) -> &BufferFrame {
+        self.state.frame(page_id)
+    }
+
+    #[inline]
+    pub(crate) fn init_page<T: BufferPage>(
+        &self,
+        keepalive: &PoolGuard,
+        page_id: PageID,
+    ) -> PageExclusiveGuard<T> {
+        let keepalive = keepalive.clone();
+        let bf = self.frame_ptr(page_id);
+        let mut guard = {
+            let frame = self.frame(page_id);
+            let g = frame.latch.try_exclusive_raw().unwrap();
+            frame.bump_generation();
+            FacadePageGuard::<T>::new(keepalive, bf.clone(), g).must_exclusive()
+        };
+        {
+            let frame = guard.bf_mut();
+            debug_assert_eq!(frame as *mut BufferFrame, bf.0);
+            frame.page_id = page_id;
+            frame.ctx = None;
+            T::init_frame(frame);
+            frame.set_dirty(true);
+            frame.clear_readonly_key();
+        }
+        guard.page_mut().zero();
+        guard
+    }
+
+    #[inline]
+    pub(crate) fn try_lock_page_exclusive(
+        &self,
+        keepalive: &PoolGuard,
+        page_id: PageID,
+    ) -> Option<PageExclusiveGuard<Page>> {
+        self.state.try_lock_page_exclusive_with(keepalive, page_id)
+    }
+}

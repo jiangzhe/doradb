@@ -1,3 +1,4 @@
+use crate::buffer::PoolGuards;
 use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::{IndexColumnObject, IndexObject};
@@ -127,11 +128,15 @@ impl Indexes<'_> {
     }
 
     /// List all indexes by given table id.
-    pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<IndexObject> {
+    pub async fn list_uncommitted_by_table_id(
+        &self,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) -> Vec<IndexObject> {
         let mut res = vec![];
         self.table
             .accessor()
-            .table_scan_uncommitted(|metadata, row| {
+            .table_scan_uncommitted(guards, |metadata, row| {
                 if row.is_deleted() {
                     return true;
                 }
@@ -284,11 +289,15 @@ impl IndexColumns<'_> {
     }
 
     /// List all index-column rows of one table from uncommitted-visible rows.
-    pub async fn list_uncommitted_by_table_id(&self, table_id: TableID) -> Vec<IndexColumnObject> {
+    pub async fn list_uncommitted_by_table_id(
+        &self,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) -> Vec<IndexColumnObject> {
         let mut res = vec![];
         self.table
             .accessor()
-            .table_scan_uncommitted(|metadata, row| {
+            .table_scan_uncommitted(guards, |metadata, row| {
                 if row.is_deleted() {
                     return true;
                 }
@@ -396,7 +405,7 @@ mod tests {
                 .catalog()
                 .storage
                 .indexes()
-                .list_uncommitted_by_table_id(42)
+                .list_uncommitted_by_table_id(session.pool_guards(), 42)
                 .await;
             assert_eq!(idx_42.len(), 1);
             assert_eq!(idx_42[0].index_no, 0);
@@ -405,7 +414,7 @@ mod tests {
                 .catalog()
                 .storage
                 .indexes()
-                .list_uncommitted_by_table_id(43)
+                .list_uncommitted_by_table_id(session.pool_guards(), 43)
                 .await;
             assert_eq!(idx_43.len(), 1);
             assert_eq!(idx_43[0].index_no, 0);
@@ -442,7 +451,7 @@ mod tests {
                     .catalog()
                     .storage
                     .indexes()
-                    .list_uncommitted_by_table_id(42)
+                    .list_uncommitted_by_table_id(session.pool_guards(), 42)
                     .await
                     .is_empty()
             );
@@ -451,7 +460,7 @@ mod tests {
                     .catalog()
                     .storage
                     .indexes()
-                    .list_uncommitted_by_table_id(43)
+                    .list_uncommitted_by_table_id(session.pool_guards(), 43)
                     .await
                     .is_empty()
             );

@@ -1,9 +1,9 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::BufferPool;
 use crate::buffer::arena::QuiescentArena;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
+use crate::buffer::{BufferPool, PoolGuard};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
@@ -54,37 +54,46 @@ impl FixedBufferPool {
     #[inline]
     async fn get_page_internal<T: 'static>(
         &'static self,
+        guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
-        let lease = self.arena.lease();
-        let bf = lease.frame_ptr(page_id);
+        let keepalive = guard.clone();
+        let bf = self.arena.frame_ptr(page_id);
         let g = self
             .arena
             .frame(page_id)
             .latch
             .optimistic_fallback_raw(mode)
             .await;
-        FacadePageGuard::new(lease, bf, g)
+        FacadePageGuard::new(keepalive, bf, g)
     }
 
     /// Since all pages are kept in memory, we can use spin mode to eliminate
     /// the cost of async/await calls.
     #[inline]
-    pub fn get_page_spin<T: BufferPage>(&'static self, page_id: PageID) -> FacadePageGuard<T> {
+    pub fn get_page_spin<T: BufferPage>(
+        &'static self,
+        guard: &PoolGuard,
+        page_id: PageID,
+    ) -> FacadePageGuard<T> {
         debug_assert!(
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
         );
-        self.get_page_spin_internal(page_id)
+        self.get_page_spin_internal(guard, page_id)
     }
 
     #[inline]
-    fn get_page_spin_internal<T: 'static>(&'static self, page_id: PageID) -> FacadePageGuard<T> {
-        let lease = self.arena.lease();
-        let bf = lease.frame_ptr(page_id);
+    fn get_page_spin_internal<T: 'static>(
+        &'static self,
+        guard: &PoolGuard,
+        page_id: PageID,
+    ) -> FacadePageGuard<T> {
+        let keepalive = guard.clone();
+        let bf = self.arena.frame_ptr(page_id);
         let g = self.arena.frame(page_id).latch.optimistic_spin_raw();
-        FacadePageGuard::new(lease, bf, g)
+        FacadePageGuard::new(keepalive, bf, g)
     }
 }
 
@@ -99,11 +108,19 @@ impl BufferPool for FixedBufferPool {
         self.alloc_map.allocated()
     }
 
+    #[inline]
+    fn guard(&self) -> PoolGuard {
+        self.arena.sync_guard()
+    }
+
     // allocate a new page with exclusive lock.
     #[inline]
-    async fn allocate_page<T: BufferPage>(&'static self) -> PageExclusiveGuard<T> {
+    async fn allocate_page<T: BufferPage>(
+        &'static self,
+        guard: &PoolGuard,
+    ) -> PageExclusiveGuard<T> {
         match self.alloc_map.try_allocate() {
-            Some(page_id) => self.arena.init_page(page_id as PageID),
+            Some(page_id) => self.arena.init_page(guard, page_id as PageID),
             None => {
                 panic!("buffer pool full");
             }
@@ -113,10 +130,11 @@ impl BufferPool for FixedBufferPool {
     #[inline]
     async fn allocate_page_at<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
         if self.alloc_map.allocate_at(page_id as usize) {
-            Ok(self.arena.init_page(page_id as PageID))
+            Ok(self.arena.init_page(guard, page_id as PageID))
         } else {
             Err(Error::BufferPageAlreadyAllocated)
         }
@@ -127,6 +145,7 @@ impl BufferPool for FixedBufferPool {
     #[inline]
     async fn get_page<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
@@ -134,19 +153,20 @@ impl BufferPool for FixedBufferPool {
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
         );
-        self.get_page_internal(page_id, mode).await
+        self.get_page_internal(guard, page_id, mode).await
     }
 
     #[inline]
     async fn try_get_page_versioned<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
     ) -> Option<FacadePageGuard<T>> {
         if !self.alloc_map.is_allocated(id.page_id as usize) {
             return None;
         }
-        let g = self.get_page_internal(id.page_id, mode).await;
+        let g = self.get_page_internal(guard, id.page_id, mode).await;
         let bf = g.bf();
         if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
             if g.is_exclusive() {
@@ -176,6 +196,7 @@ impl BufferPool for FixedBufferPool {
     #[inline]
     async fn get_child_page<T: BufferPage>(
         &'static self,
+        guard: &PoolGuard,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
@@ -184,7 +205,7 @@ impl BufferPool for FixedBufferPool {
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
         );
-        let g = self.get_page_internal::<T>(page_id, mode).await;
+        let g = self.get_page_internal::<T>(guard, page_id, mode).await;
         // apply lock coupling.
         // the validation make sure parent page does not change until child
         // page is acquired.
@@ -221,48 +242,54 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let g = pool.allocate_page::<BlockNode>().await;
+                let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g = pool.allocate_page::<BlockNode>().await;
+                let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 assert_eq!(g.page_id(), 1);
                 pool.deallocate_page(g);
-                let g = pool.allocate_page::<BlockNode>().await;
+                let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 assert_eq!(g.page_id(), 1);
             }
             {
                 let g = pool
-                    .get_page::<BlockNode>(0, LatchFallbackMode::Spin)
+                    .get_page::<BlockNode>(&pool_guard, 0, LatchFallbackMode::Spin)
                     .await
                     .downgrade();
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g = pool.allocate_page::<BlockNode>().await;
+                let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 let page_id = g.page_id();
                 drop(g);
-                let g = pool.get_page_spin::<BlockNode>(page_id);
+                let g = pool.get_page_spin::<BlockNode>(&pool_guard, page_id);
                 assert!(g.page_id() == page_id);
                 drop(g);
 
-                let p = pool.allocate_page::<BlockNode>().await;
+                let p = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 let p = p.downgrade().facade();
                 let c = pool
-                    .get_child_page::<BlockNode>(&p, page_id, LatchFallbackMode::Shared)
+                    .get_child_page::<BlockNode>(
+                        &pool_guard,
+                        &p,
+                        page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await;
                 let c = c.unwrap();
                 drop(c);
             }
             {
-                let g = pool.allocate_page::<BlockNode>().await;
+                let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 let page_id = g.page_id();
                 let stale_versioned = g.bf().versioned_page_id();
                 let first_generation = stale_versioned.generation;
                 pool.deallocate_page(g);
 
-                let g = pool.allocate_page::<BlockNode>().await;
+                let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 assert_eq!(g.page_id(), page_id);
                 assert_eq!(g.bf().generation(), first_generation + 2);
                 let current_versioned = g.bf().versioned_page_id();
@@ -270,6 +297,7 @@ mod tests {
 
                 let g = pool
                     .try_get_page_versioned::<BlockNode>(
+                        &pool_guard,
                         current_versioned,
                         LatchFallbackMode::Shared,
                     )
@@ -277,29 +305,37 @@ mod tests {
                 assert!(g.is_some());
 
                 let g = pool
-                    .try_get_page_versioned::<BlockNode>(stale_versioned, LatchFallbackMode::Shared)
+                    .try_get_page_versioned::<BlockNode>(
+                        &pool_guard,
+                        stale_versioned,
+                        LatchFallbackMode::Shared,
+                    )
                     .await;
                 assert!(g.is_none());
             }
             {
-                let g = pool.allocate_page::<BlockNode>().await;
+                let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 let page_id = g.page_id();
                 let versioned = g.bf().versioned_page_id();
                 drop(g);
 
                 // Keep an optimistic guard, then reuse the page slot.
                 let stale_guard = pool
-                    .try_get_page_versioned::<BlockNode>(versioned, LatchFallbackMode::Shared)
+                    .try_get_page_versioned::<BlockNode>(
+                        &pool_guard,
+                        versioned,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .unwrap();
                 let g = pool
-                    .get_page::<BlockNode>(page_id, LatchFallbackMode::Exclusive)
+                    .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
                     .await
                     .lock_exclusive_async()
                     .await
                     .unwrap();
                 pool.deallocate_page(g);
-                let g = pool.allocate_page::<BlockNode>().await;
+                let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 assert_eq!(g.page_id(), page_id);
                 drop(g);
 
@@ -315,12 +351,13 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
-            let g = pool.allocate_page::<BlockNode>().await;
+            let pool_guard = pool.guard();
+            let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             let page_id = g.page_id();
             drop(g);
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await;
             let g = g.lock_shared_async().await;
             assert!(g.is_some());
@@ -335,12 +372,12 @@ mod tests {
             drop(g);
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await;
             assert!(g.try_into_shared().is_none());
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -349,18 +386,22 @@ mod tests {
             drop(g);
 
             let stale_guard = pool
-                .try_get_page_versioned::<BlockNode>(versioned, LatchFallbackMode::Shared)
+                .try_get_page_versioned::<BlockNode>(
+                    &pool_guard,
+                    versioned,
+                    LatchFallbackMode::Shared,
+                )
                 .await
                 .unwrap();
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
                 .lock_exclusive_async()
                 .await
                 .unwrap();
             pool.deallocate_page(g);
-            let g = pool.allocate_page::<BlockNode>().await;
+            let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             assert_eq!(g.page_id(), page_id);
             drop(g);
 
@@ -375,12 +416,13 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
-            let g = pool.allocate_page::<BlockNode>().await;
+            let pool_guard = pool.guard();
+            let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             let page_id = g.page_id();
             drop(g);
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await;
             let g = g.lock_exclusive_async().await;
             assert!(g.is_some());
@@ -399,12 +441,12 @@ mod tests {
             drop(g);
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await;
             assert!(g.try_into_exclusive().is_none());
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -413,18 +455,22 @@ mod tests {
             drop(g);
 
             let stale_guard = pool
-                .try_get_page_versioned::<BlockNode>(versioned, LatchFallbackMode::Shared)
+                .try_get_page_versioned::<BlockNode>(
+                    &pool_guard,
+                    versioned,
+                    LatchFallbackMode::Shared,
+                )
                 .await
                 .unwrap();
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
                 .lock_exclusive_async()
                 .await
                 .unwrap();
             pool.deallocate_page(g);
-            let g = pool.allocate_page::<BlockNode>().await;
+            let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             assert_eq!(g.page_id(), page_id);
             drop(g);
 
@@ -440,12 +486,13 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
-            let g = pool.allocate_page::<BlockNode>().await;
+            let pool_guard = pool.guard();
+            let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             let page_id = g.page_id();
             drop(g);
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
                 .lock_shared_async()
                 .await
@@ -464,12 +511,13 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
-            let g = pool.allocate_page::<BlockNode>().await;
+            let pool_guard = pool.guard();
+            let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             let page_id = g.page_id();
             drop(g);
 
             let g = pool
-                .get_page::<BlockNode>(page_id, LatchFallbackMode::Spin)
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -486,7 +534,10 @@ mod tests {
             let pool = StaticLifetime::new_static(
                 FixedBufferPool::with_capacity(8 * 1024 * 1024).unwrap(),
             );
-            let guard = pool.allocate_page::<BlockNode>().await;
+            let guard = {
+                let pool_guard = pool.guard();
+                pool.allocate_page::<BlockNode>(&pool_guard).await
+            };
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
 

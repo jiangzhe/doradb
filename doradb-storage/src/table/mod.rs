@@ -13,7 +13,8 @@ pub use recover::*;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool,
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
+    PoolGuards, ReadonlyBufferPool,
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
@@ -90,6 +91,7 @@ pub struct GenericMemTable<P: 'static> {
     pub(crate) table_id: TableID,
     pub(crate) metadata: Arc<TableMetadata>,
     pub(crate) mem_pool: &'static P,
+    pub(crate) row_pool_slot: RowPoolSlot,
     pub(crate) blk_idx: BlockIndex,
     pub(crate) sec_idx: Box<[SecondaryIndex]>,
 }
@@ -111,6 +113,22 @@ struct FrozenPage {
     end_row_id: RowID,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowPoolSlot {
+    Meta,
+    Mem,
+}
+
+impl From<RowPoolSlot> for PoolGuardSlot {
+    #[inline]
+    fn from(value: RowPoolSlot) -> Self {
+        match value {
+            RowPoolSlot::Meta => PoolGuardSlot::Meta,
+            RowPoolSlot::Mem => PoolGuardSlot::Mem,
+        }
+    }
+}
+
 #[inline]
 pub(crate) async fn build_secondary_indexes(
     index_pool: &'static FixedBufferPool,
@@ -130,6 +148,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     #[inline]
     pub(crate) async fn new(
         mem_pool: &'static P,
+        row_pool_slot: RowPoolSlot,
         index_pool: &'static FixedBufferPool,
         table_id: TableID,
         metadata: Arc<TableMetadata>,
@@ -141,6 +160,7 @@ impl<P: BufferPool> GenericMemTable<P> {
             table_id,
             metadata,
             mem_pool,
+            row_pool_slot,
             blk_idx,
             sec_idx,
         }
@@ -185,30 +205,51 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
-    pub(crate) async fn get_insert_page(&self, count: usize) -> PageSharedGuard<RowPage> {
+    pub(crate) async fn get_insert_page(
+        &self,
+        guards: &PoolGuards,
+        count: usize,
+    ) -> PageSharedGuard<RowPage> {
+        let row_pool_guard = guards
+            .try_guard(self.row_pool_slot.into())
+            .expect("missing row-page pool guard");
         self.blk_idx
-            .get_insert_page(self.mem_pool, &self.metadata, count)
+            .get_insert_page(self.mem_pool, row_pool_guard, &self.metadata, count)
             .await
     }
 
     #[inline]
     pub(crate) async fn get_insert_page_exclusive(
         &self,
+        guards: &PoolGuards,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
+        let row_pool_guard = guards
+            .try_guard(self.row_pool_slot.into())
+            .expect("missing row-page pool guard");
         self.blk_idx
-            .get_insert_page_exclusive(self.mem_pool, &self.metadata, count)
+            .get_insert_page_exclusive(self.mem_pool, row_pool_guard, &self.metadata, count)
             .await
     }
 
     #[inline]
     pub(crate) async fn allocate_row_page_at(
         &self,
+        guards: &PoolGuards,
         count: usize,
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
+        let row_pool_guard = guards
+            .try_guard(self.row_pool_slot.into())
+            .expect("missing row-page pool guard");
         self.blk_idx
-            .allocate_row_page_at(self.mem_pool, &self.metadata, count, page_id)
+            .allocate_row_page_at(
+                self.mem_pool,
+                row_pool_guard,
+                &self.metadata,
+                count,
+                page_id,
+            )
             .await
     }
 
@@ -217,11 +258,14 @@ impl<P: BufferPool> GenericMemTable<P> {
         self.blk_idx.cache_exclusive_insert_page(guard)
     }
 
-    pub(crate) async fn mem_scan<F>(&self, mut page_action: F)
+    pub(crate) async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F)
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
-        let mut cursor = self.blk_idx.mem_cursor();
+        let row_pool_guard = guards
+            .try_guard(self.row_pool_slot.into())
+            .expect("missing row-page pool guard");
+        let mut cursor = self.blk_idx.mem_cursor(guards);
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -230,7 +274,11 @@ impl<P: BufferPool> GenericMemTable<P> {
             for page_entry in entries {
                 let page_guard: PageSharedGuard<RowPage> = self
                     .mem_pool
-                    .get_page(page_entry.page_id, LatchFallbackMode::Shared)
+                    .get_page(
+                        row_pool_guard,
+                        page_entry.page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await
@@ -313,6 +361,7 @@ impl Table {
         let metadata = Arc::clone(&active_root.metadata);
         let mem = GenericMemTable::new(
             mem_pool,
+            RowPoolSlot::Mem,
             index_pool,
             table_id,
             metadata,
@@ -357,13 +406,13 @@ impl Table {
         GenericMemTable::enable_page_committer(self, trx_sys)
     }
 
-    async fn collect_frozen_pages(&self) -> (Vec<FrozenPage>, Option<TrxID>) {
+    async fn collect_frozen_pages(&self, guards: &PoolGuards) -> (Vec<FrozenPage>, Option<TrxID>) {
         let mut frozen_pages = Vec::new();
         let pivot_row_id = self.pivot_row_id();
         let mut expected_row_id = pivot_row_id;
         let mut heap_redo_start_ts = None;
         let mut seen_first_page = false;
-        self.mem_scan(|page_guard| {
+        self.mem_scan(guards, |page_guard| {
             let page = page_guard.page();
             if !seen_first_page {
                 seen_first_page = true;
@@ -399,6 +448,7 @@ impl Table {
 
     async fn wait_for_frozen_pages_stable(
         &self,
+        guards: &PoolGuards,
         trx_sys: &'static TransactionSystem,
         frozen_pages: &[FrozenPage],
     ) {
@@ -410,7 +460,13 @@ impl Table {
                 // row page back. This requires interface change of buffer pool.
                 let page_guard = self
                     .mem_pool()
-                    .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                    .get_page::<RowPage>(
+                        guards
+                            .try_guard(PoolGuardSlot::Mem)
+                            .expect("missing mem pool guard for user-table persistence"),
+                        page_info.page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await
@@ -432,11 +488,22 @@ impl Table {
         }
     }
 
-    async fn set_frozen_pages_to_transition(&self, frozen_pages: &[FrozenPage], cutoff_ts: TrxID) {
+    async fn set_frozen_pages_to_transition(
+        &self,
+        guards: &PoolGuards,
+        frozen_pages: &[FrozenPage],
+        cutoff_ts: TrxID,
+    ) {
         for page_info in frozen_pages {
             let page_guard = self
                 .mem_pool()
-                .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                .get_page::<RowPage>(
+                    guards
+                        .try_guard(PoolGuardSlot::Mem)
+                        .expect("missing mem pool guard for user-table persistence"),
+                    page_info.page_id,
+                    LatchFallbackMode::Shared,
+                )
                 .await
                 .lock_shared_async()
                 .await
@@ -449,6 +516,7 @@ impl Table {
 
     async fn build_lwc_pages(
         &self,
+        guards: &PoolGuards,
         cutoff_ts: TrxID,
         frozen_pages: &[FrozenPage],
     ) -> Result<Vec<LwcPagePersist>> {
@@ -467,7 +535,13 @@ impl Table {
             for page_info in frozen_pages {
                 let page_guard = self
                     .mem_pool()
-                    .get_page::<RowPage>(page_info.page_id, LatchFallbackMode::Shared)
+                    .get_page::<RowPage>(
+                        guards
+                            .try_guard(PoolGuardSlot::Mem)
+                            .expect("missing mem pool guard for user-table persistence"),
+                        page_info.page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await
@@ -588,9 +662,9 @@ impl Table {
 
     /// Returns total number of row pages.
     #[inline]
-    pub async fn total_row_pages(&self) -> usize {
+    pub async fn total_row_pages(&self, guards: &PoolGuards) -> usize {
         let mut res = 0usize;
-        let mut cursor = self.blk_idx().mem_cursor();
+        let mut cursor = self.blk_idx().mem_cursor(guards);
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -600,13 +674,13 @@ impl Table {
         res
     }
 
-    async fn mem_scan<F>(&self, mut page_action: F)
+    async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F)
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let mut cursor = self.blk_idx().mem_cursor();
+        let mut cursor = self.blk_idx().mem_cursor(guards);
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -615,7 +689,13 @@ impl Table {
             for page_entry in entries {
                 let page_guard: PageSharedGuard<RowPage> = self
                     .mem_pool()
-                    .get_page(page_entry.page_id, LatchFallbackMode::Shared)
+                    .get_page(
+                        guards
+                            .try_guard(PoolGuardSlot::Mem)
+                            .expect("missing mem pool guard for user-table row pages"),
+                        page_entry.page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await
@@ -664,12 +744,14 @@ impl Table {
     #[inline]
     async fn recover_index_insert(
         &self,
+        guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
     ) -> RecoverIndex {
         if self.metadata().index_specs[key.index_no].unique() {
-            self.recover_unique_index_insert(key, row_id, cts).await
+            self.recover_unique_index_insert(guards, key, row_id, cts)
+                .await
         } else {
             self.recover_non_unique_index_insert(key, row_id).await
         }
@@ -789,6 +871,7 @@ impl Table {
     #[inline]
     async fn recover_unique_index_insert(
         &self,
+        guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
@@ -806,7 +889,7 @@ impl Table {
                 IndexInsert::DuplicateKey(old_row_id, deleted) => {
                     debug_assert!(old_row_id != row_id);
                     // Find CTS of old row.
-                    match self.find_recover_cts_for_row_id(old_row_id).await {
+                    match self.find_recover_cts_for_row_id(guards, old_row_id).await {
                         Some(old_cts) => {
                             if cts < old_cts {
                                 // Current row has smaller CTS, that means this insert
@@ -879,14 +962,24 @@ impl Table {
     }
 
     #[inline]
-    async fn find_recover_cts_for_row_id(&self, row_id: RowID) -> Option<TrxID> {
+    async fn find_recover_cts_for_row_id(
+        &self,
+        guards: &PoolGuards,
+        row_id: RowID,
+    ) -> Option<TrxID> {
         match self.find_row(row_id).await {
             RowLocation::NotFound => None,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
                 let page_guard = self
                     .mem_pool()
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .get_page::<RowPage>(
+                        guards
+                            .try_guard(self.row_pool_slot.into())
+                            .expect("missing row-page pool guard for recovery"),
+                        page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await

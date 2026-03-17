@@ -78,7 +78,6 @@ impl CatalogStorage {
             mtb,
             disk_pool,
         };
-        storage.bootstrap_from_checkpoint(&mtb_snapshot).await?;
         Ok(storage)
     }
 

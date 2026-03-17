@@ -1,4 +1,6 @@
-use crate::buffer::{EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::{
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
+};
 use crate::catalog::Catalog;
 use crate::catalog::storage::CatalogStorage;
 use crate::engine::StaticHandle;
@@ -67,6 +69,7 @@ pub(crate) struct PendingTransactionSystem {
     gc_rxs: Vec<Receiver<GC>>,
     purge_rx: Receiver<Purge>,
     mem_pool: StaticHandle<EvictableBufferPool>,
+    pool_guards: PoolGuards,
 }
 
 impl PendingTransactionSystem {
@@ -79,7 +82,7 @@ impl PendingTransactionSystem {
             .await;
         trx_sys.start_io_threads();
         trx_sys.start_gc_threads(self.gc_rxs);
-        trx_sys.start_purge_threads(self.mem_pool.as_static(), self.purge_rx);
+        trx_sys.start_purge_threads(self.mem_pool.as_static(), self.pool_guards, self.purge_rx);
         trx_sys
     }
 }
@@ -234,15 +237,24 @@ impl TrxSysConfig {
 
         let catalog_storage =
             CatalogStorage::new(meta_pool, index_pool, table_fs, global_disk_pool.clone()).await?;
-        let mut catalog = Catalog::new(catalog_storage);
+        let mut catalog = Catalog::new(catalog_storage).await?;
+        let pool_guards = PoolGuards::builder()
+            .meta(meta_pool.guard())
+            .index(index_pool.guard())
+            .mem(mem_pool.as_static().guard())
+            .disk(global_disk_pool.guard())
+            .build();
 
         // Now we have an empty catalog, all log partitions and buffer pool.
         // Recover all committed data if required.
         let (log_partitions, gc_rxs) = log_recover(
-            index_pool,
-            mem_pool.as_static(),
-            table_fs,
-            global_disk_pool,
+            crate::trx::recover::RecoveryDeps {
+                meta_pool,
+                index_pool,
+                mem_pool: mem_pool.as_static(),
+                table_fs,
+                global_disk_pool,
+            },
             &mut catalog,
             log_partition_initializers,
             self.skip_recovery,
@@ -257,6 +269,7 @@ impl TrxSysConfig {
             gc_rxs,
             purge_rx,
             mem_pool,
+            pool_guards,
         })
     }
 }

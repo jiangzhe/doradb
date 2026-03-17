@@ -1,7 +1,7 @@
 ---
 id: 0008
 title: Quiescent Component Migration Program
-status: proposal
+status: superseded
 tags: [storage-engine, lifetime, quiescent, teardown, buffer-pool]
 created: 2026-03-14
 github_issue: 425
@@ -9,9 +9,21 @@ github_issue: 425
 
 # RFC-0008: Quiescent Component Migration Program
 
+Superseded after phase 3. Phases 1-3 were implemented, while phases 4 and 5
+are closed without implementation and replaced by follow-up planning for a
+generalized quiescent abstraction that unifies `QuiescentBox`/`QuiescentGuard`
+with arena drain/lease and supports composition of multiple quiescent
+guards/leases [U5].
+
 ## Summary
 
 This RFC defines the engine-wide migration from leaked `&'static` components to quiescent ownership. The selected direction is a phased program: adopt `QuiDAG` as the engine ownership and teardown layer, migrate long-lived component dependencies to `QuiDep`/quiescent guards, and refactor buffer pools around a `QuiescentArena` plus explicit pool-level leases. The buffer-pool design explicitly preserves the current `HybridLatch` optimistic hot path by keeping page-latch optimistic acquire/drop load-only; keepalive moves to the pool/arena layer rather than the page latch.
+
+That plan landed through phase 3. The remaining work described in the original
+phase 4 and phase 5 design is now superseded by a different direction:
+generalize the quiescent concept and interface so ordinary quiescent guards and
+arena leases can be composed, then refactor buffer-pool APIs around that
+composition model rather than the original explicit pool-lease API [U5].
 
 ## Context
 
@@ -21,7 +33,12 @@ The static lifetime assumption is also structural. `BufferPool` methods require 
 
 Buffer pools need a separate ownership model from ordinary `QuiescentBox<T>`. Buffer frame/page memory already lives in stable arenas, which makes arena-level lifetime management natural [C8]. But page access also sits on the B+Tree lookup hot path, where `HybridLatch` intentionally keeps optimistic access to version loads and validation instead of reader-count writes [C6] [C7] [U3]. A latch-level keepalive counter on optimistic acquire/drop would directly violate that design goal.
 
-This RFC is needed now because the quiescent primitives are already in place, the next buffer-pool refactors depend on lifetime-free guards, and the engine still carries manual teardown and leaked-static ownership through core runtime paths [D5] [D6] [U1] [U2].
+This RFC was needed because the quiescent primitives were already in place, the
+next buffer-pool refactors depended on lifetime-free guards, and the engine
+still carried manual teardown and leaked-static ownership through core runtime
+paths [D5] [D6] [U1] [U2]. That motivation was satisfied through phase 3. The
+remaining API design has since changed materially and moved to follow-up
+planning [U5].
 
 Issue Labels:
 - `type:epic`
@@ -62,6 +79,7 @@ Issue Labels:
 - [U2] User requested phased buffer-pool migration centered on `QuiescentArena`, a `QuiHybridGuard`-style lifetime-free page-guard story, and a safety contract that likely uses pool-level guards; compatibility is low priority.
 - [U3] User clarified that `HybridLatch` exists to minimize hot-path cache pollution for optimistic latch coupling in B+Tree lookup, so optimistic acquire/drop must not gain shared-memory writes.
 - [U4] User approved the phased direction, prefers pool-level leases as the end state, and is fine with keeping `Catalog` nested under `TransactionSystem` in the initial engine DAG.
+- [U5] User closed RFC-0008 phases 4 and 5 without implementation because the remaining work should instead unify `QuiescentBox`/`QuiescentGuard` with arena drain/lease, generalize quiescent interfaces to compose multiple guards/leases, and then redesign buffer-pool APIs around that composition model.
 
 ### Source Backlogs
 
@@ -69,7 +87,15 @@ Issue Labels:
 
 ## Decision
 
-We will migrate engine ownership in phases, using one quiescent model for ordinary long-lived components and a separate arena-based model for buffer pools. Compatibility layers that preserve current leaked-static APIs are not a goal; the end state is explicit quiescent ownership and explicit lease-based access contracts [C1] [C2] [C3] [C4] [U1] [U2] [U4].
+RFC-0008 migrated engine ownership through phase 3 using one quiescent model
+for ordinary long-lived components and a separate arena-based model for buffer
+pools. Compatibility layers that preserve current leaked-static APIs were never
+a goal [C1] [C2] [C3] [C4] [U1] [U2] [U4].
+
+That remaining end-state is no longer authoritative for post-phase-3 work. The
+follow-up design will replace the original separate-model phase 4/5 plan with a
+generalized quiescent abstraction and composed guard/lease model [C3] [C8]
+[U5].
 
 ### 1. `Engine` ownership will move to `QuiDAG`
 
@@ -89,21 +115,24 @@ Buffer pools will not embed quiescent keepalive into `HybridLatch` or its optimi
 
 `QuiHybridGuard` is the intended page-level guard shape for this migration: a lifetime-free guard carrying raw stable pointers to frame/page/latch state plus captured generation/version state, but not its own owner keepalive counter [C5] [C8] [U2]. A distinct `QuiHybridLatch` type is not a required architectural goal of this RFC. If implementation needs a buffer-pool-specific latch wrapper later, it must preserve the same hot-path constraint and remain subordinate to the arena/lease contract [C6] [U2] [U3].
 
-### 4. Pool-level leases are the buffer-pool safety contract
+### 4. Remaining buffer-pool API design is superseded after phase 3
 
-The end-state buffer-pool API will require an explicit pool-level lease or an object that semantically contains one, rather than relying on `&'static self` and leaked page guards [C4] [C5] [C10] [C11] [U2] [U4]. That lease keeps the arena allocation alive across async page access, page-guard storage, table/index traversal, reload, recovery, and purge flows [C8] [C9] [C10] [C11].
+The original phase-4 direction was to make explicit pool-level leases the
+buffer-pool safety contract across `BufferPool`, table/index access,
+catalog reload, recovery, and purge [C4] [C5] [C10] [C11] [U2] [U4]. That
+specific API direction is now superseded. Follow-up planning will instead
+generalize quiescent interfaces so quiescent guards and arena leases can be
+composed and passed through higher-level runtime boundaries as one capability
+[C3] [C8] [U5].
 
-The precise API surface may use direct lease parameters in lower-level pool methods and lease-carrying wrappers at higher layers, but the contract is fixed:
+### 5. Post-phase-3 cleanup moves to follow-up planning
 
-1. page guards are only sound while the relevant pool lease is live;
-2. dropping a pool waits on arena/lease keepalive, not on per-page optimistic guards;
-3. page-latch optimistic acquire/drop must not perform additional keepalive writes [C5] [C6] [C8] [U3] [U4].
-
-### 5. Buffer-pool migration is a phased program across all pools and their consumers
-
-`FixedBufferPool`, `EvictableBufferPool`, and `GlobalReadonlyBufferPool` will all migrate to the quiescent ownership model, but buffer internals and API consumers will move in stages [C4] [C8] [C10] [C11] [U1] [U2]. The initial buffer-pool phases will focus on arena ownership and lifetime-free guards; later phases will remove `&'static self` from buffer-pool consumers such as tables, indexes, catalog reload, recovery, and purge [C4] [C9] [C10] [C11].
-
-Manual teardown ordering that is not a real runtime dependency may still be represented as explicit DAG ordering edges, for example where thread shutdown must precede arena reclamation [D6] [C8] [C12] [U1].
+The original phase-5 direction was to finish `StaticLifetime` removal and final
+cleanup under the phase-4 explicit pool-lease contract. Because the ownership
+model for the remaining work has changed, that cleanup is also superseded and
+must be replanned together with the generalized quiescent composition design
+instead of being implemented as the old final polish pass [C1] [C2] [C3]
+[U5].
 
 ## Alternatives Considered
 
@@ -211,8 +240,8 @@ Targeted performance regression checks for optimistic B+Tree lookup should accom
   - Non-goals: No compatibility adapter layer that preserves old leaked-static semantics as a long-term API.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: `superseded`
+  - Implementation Summary: Closed without implementation on 2026-03-15. The original explicit pool-lease API plan was intentionally abandoned after later design discussion converged on a generalized quiescent abstraction that composes quiescent guards and arena leases; replacement work will be tracked in new follow-up task docs instead of this RFC phase. [U5]
 
 - **Phase 5: StaticLifetime Removal, Hardening, And Cleanup**
   - Scope: Remove residual `StaticLifetime` usage from engine-owned components, finalize DAG ordering edges, refresh unsafe inventory/documentation, and close remaining teardown gaps revealed by earlier phases.
@@ -220,8 +249,8 @@ Targeted performance regression checks for optimistic B+Tree lookup should accom
   - Non-goals: No broader graceful-shutdown policy or session-drain lifecycle work.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: `superseded`
+  - Implementation Summary: Closed without implementation on 2026-03-15. This cleanup phase depended on the original phase-4 explicit pool-lease design, so it is superseded as well and will be replanned after the generalized quiescent composition model is written down in new follow-up tasks or RFC work. [U5]
   - Related Backlogs:
     - `docs/backlogs/000042-graceful-storage-engine-shutdown-lifecycle-for-sessions-and-system-components.md`
 
@@ -229,29 +258,27 @@ Targeted performance regression checks for optimistic B+Tree lookup should accom
 
 ### Positive
 
-- The engine gets one explicit ownership and teardown model instead of a mix of leaked-static allocation and manual drop order [C1] [C2] [C3].
-- Buffer pools gain a sound path to lifetime-free page guards without regressing the optimistic latch-coupling hot path [C5] [C6] [C7] [U3].
-- Future component additions can declare dependencies in the DAG rather than relying on undocumented shutdown sequencing [D6] [C12].
-- The end-state API becomes easier to reason about because leases and dependency handles are explicit instead of being encoded as `&'static` assumptions [C4] [C10] [C11] [U4].
+- The engine now has explicit quiescent ownership, ordered teardown, and arena-backed lifetime-free page guards through phases 1-3 instead of the earlier leaked-static/manual-drop mix [C1] [C2] [C3] [C5].
+- Closing phases 4 and 5 avoids implementing an interface direction that is no longer considered the right end state for buffer-pool and runtime ownership APIs [U5].
+- Follow-up work can now be replanned directly around generalized quiescent composition instead of carrying forward the split quiescent-owner versus arena-lease model from this RFC [C3] [C8] [U5].
 
 ### Negative
 
-- The migration is wide and will touch constructors, async access paths, background workers, and buffer internals across multiple phases [C4] [C9] [C10] [C11].
-- Compatibility is intentionally de-emphasized, so API churn is expected in buffer-pool and table/index call sites [U2] [U4].
-- Buffer-pool safety becomes more explicit but also more demanding: callers will need to hold the right leases or wrappers at the right boundaries [U2] [U4].
-- Unsafe review burden increases during the arena and guard phases because raw-pointer lifetime reasoning moves from leaked-static assumptions into explicit contracts [D7] [D8].
+- RFC-0008 no longer defines the authoritative end-state API for post-phase-3 buffer-pool, table/index, recovery, and purge refactors; new planning docs are required before implementation resumes [U5].
+- Residual `StaticLifetime` cleanup and broader API simplification remain unfinished until the replacement design is documented [C1] [C2] [U5].
+- The graceful-shutdown backlog remains open because it was intentionally out of scope for both the completed phases and the superseded remainder [B1].
 
 ## Open Questions
 
-1. Should higher-level APIs surface raw pool leases directly, or should the dominant public shape be table-/engine-level wrappers that internally carry the required pool leases while still exposing the same quiescent contract?
-2. Should `Catalog` remain nested under `TransactionSystem` permanently, or should a later RFC split it into its own DAG node once the broader migration is complete?
-3. Should `QuiescentArena` support future growable/segmented arenas, or is fixed-capacity pinned allocation the only supported contract for the first migration?
+1. How should the follow-up design unify `QuiescentBox`/`QuiescentGuard` with arena drain/lease without losing the hot-path constraints that drove the original arena split? [C3] [C6] [C8] [U5]
+2. What composite capability type should carry multiple quiescent guards and arena leases, and how should buffer-pool APIs extract the specific lease they need from that composed value? [C4] [C8] [U5]
+3. Should the post-RFC-0008 redesign remain task-driven, or is a new RFC needed before continuing buffer-pool API migration and final `StaticLifetime` cleanup? [U5]
 
 ## Future Work
 
+- Write new planning docs for the generalized quiescent abstraction, composed guard/lease capability model, and the replacement buffer-pool API migration program [U5].
 - Define graceful engine shutdown phases, work rejection, and session draining as a separate lifecycle program rather than mixing them into this ownership RFC [B1].
-- Revisit whether any components besides buffer pools need specialized quiescent owners beyond `QuiescentBox<T>`.
-- Add focused performance benchmarks for latch-coupled lookup paths once the buffer-pool lease phases are implemented.
+- Add focused performance benchmarks for latch-coupled lookup paths once the follow-up buffer-pool API design is implemented.
 - Consider later separation of `Catalog` from `TransactionSystem` if independent ownership becomes valuable after the core migration.
 
 ## References

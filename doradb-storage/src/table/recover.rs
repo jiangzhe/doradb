@@ -1,5 +1,5 @@
-use crate::buffer::BufferPool;
 use crate::buffer::page::PageID;
+use crate::buffer::{BufferPool, PoolGuardSlot, PoolGuards};
 use crate::error::{Error, Result};
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_payload_deletion_deltas,
@@ -22,6 +22,7 @@ pub trait TableRecover {
     /// Recover row insert from redo log.
     fn recover_row_insert(
         &self,
+        guards: &PoolGuards,
         page_id: PageID,
         row_id: RowID,
         cols: &[Val],
@@ -32,6 +33,7 @@ pub trait TableRecover {
     /// Recover row update from redo log.
     fn recover_row_update(
         &self,
+        guards: &PoolGuards,
         page_id: PageID,
         row_id: RowID,
         update: &[UpdateCol],
@@ -42,6 +44,7 @@ pub trait TableRecover {
     /// Recover row delete from redo log.
     fn recover_row_delete(
         &self,
+        guards: &PoolGuards,
         page_id: PageID,
         row_id: RowID,
         cts: TrxID,
@@ -49,15 +52,23 @@ pub trait TableRecover {
     ) -> impl Future<Output = ()>;
 
     /// Populate index using data on row page.
-    fn populate_index_via_row_page(&self, page_id: PageID) -> impl Future<Output = Result<()>>;
+    fn populate_index_via_row_page(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> impl Future<Output = Result<()>>;
 
     /// Populate indexes using persisted LWC pages below the current pivot boundary.
-    fn populate_index_via_persisted_data(&self) -> impl Future<Output = Result<()>>;
+    fn populate_index_via_persisted_data(
+        &self,
+        guards: &PoolGuards,
+    ) -> impl Future<Output = Result<()>>;
 }
 
 impl TableRecover for Table {
     async fn recover_row_insert(
         &self,
+        guards: &PoolGuards,
         page_id: PageID,
         row_id: RowID,
         cols: &[Val],
@@ -74,7 +85,13 @@ impl TableRecover for Table {
         // we can just hold exclusive lock on this page and process all rows in it.
         let mut page_guard = self
             .mem_pool()
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+            .get_page::<RowPage>(
+                guards
+                    .try_guard(PoolGuardSlot::Mem)
+                    .expect("missing mem pool guard for user-table recovery"),
+                page_id,
+                LatchFallbackMode::Exclusive,
+            )
             .await
             .lock_exclusive_async()
             .await
@@ -87,7 +104,7 @@ impl TableRecover for Table {
         if !disable_index {
             let keys = self.metadata().keys_for_insert(cols);
             for key in keys {
-                match self.recover_index_insert(key, row_id, cts).await {
+                match self.recover_index_insert(guards, key, row_id, cts).await {
                     RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
                     RecoverIndex::DeleteOutdated => unreachable!(),
                 }
@@ -97,6 +114,7 @@ impl TableRecover for Table {
 
     async fn recover_row_update(
         &self,
+        guards: &PoolGuards,
         page_id: PageID,
         row_id: RowID,
         update: &[UpdateCol],
@@ -105,7 +123,13 @@ impl TableRecover for Table {
     ) {
         let mut page_guard = self
             .mem_pool()
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+            .get_page::<RowPage>(
+                guards
+                    .try_guard(PoolGuardSlot::Mem)
+                    .expect("missing mem pool guard for user-table recovery"),
+                page_id,
+                LatchFallbackMode::Exclusive,
+            )
             .await
             .lock_exclusive_async()
             .await
@@ -131,7 +155,13 @@ impl TableRecover for Table {
                 // There is index change, we need to update index.
                 let page_guard = self
                     .mem_pool()
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .get_page::<RowPage>(
+                        guards
+                            .try_guard(PoolGuardSlot::Mem)
+                            .expect("missing mem pool guard for user-table recovery"),
+                        page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await
@@ -145,7 +175,10 @@ impl TableRecover for Table {
                             read_latest_index_key(metadata, index.index_no, &page_guard, row_id);
                         let old_key = index_key_replace(index_schema, &new_key, &index_change_cols);
                         // insert new index entry.
-                        match self.recover_index_insert(new_key, row_id, cts).await {
+                        match self
+                            .recover_index_insert(guards, new_key, row_id, cts)
+                            .await
+                        {
                             RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
                             RecoverIndex::DeleteOutdated => unreachable!(),
                         }
@@ -162,6 +195,7 @@ impl TableRecover for Table {
 
     async fn recover_row_delete(
         &self,
+        guards: &PoolGuards,
         page_id: PageID,
         row_id: RowID,
         cts: TrxID,
@@ -169,7 +203,13 @@ impl TableRecover for Table {
     ) {
         let mut page_guard = self
             .mem_pool()
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+            .get_page::<RowPage>(
+                guards
+                    .try_guard(PoolGuardSlot::Mem)
+                    .expect("missing mem pool guard for user-table recovery"),
+                page_id,
+                LatchFallbackMode::Exclusive,
+            )
             .await
             .lock_exclusive_async()
             .await
@@ -205,10 +245,20 @@ impl TableRecover for Table {
         }
     }
 
-    async fn populate_index_via_row_page(&self, page_id: PageID) -> Result<()> {
+    async fn populate_index_via_row_page(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> Result<()> {
         let page_guard = self
             .mem_pool()
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+            .get_page::<RowPage>(
+                guards
+                    .try_guard(PoolGuardSlot::Mem)
+                    .expect("missing mem pool guard for user-table recovery"),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
             .await
             .lock_shared_async()
             .await
@@ -247,7 +297,7 @@ impl TableRecover for Table {
         Ok(())
     }
 
-    async fn populate_index_via_persisted_data(&self) -> Result<()> {
+    async fn populate_index_via_persisted_data(&self, _guards: &PoolGuards) -> Result<()> {
         if self.sec_idx().is_empty() {
             return Ok(());
         }

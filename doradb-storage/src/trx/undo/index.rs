@@ -1,3 +1,4 @@
+use crate::buffer::PoolGuards;
 use crate::catalog::{TableCache, TableHandle, TableID};
 use crate::index::util::Maskable;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
@@ -40,15 +41,25 @@ impl IndexUndoLogs {
     /// because other transaction can not update the same index entry
     /// concurrently.
     #[inline]
-    pub async fn rollback(&mut self, table_cache: &mut TableCache<'_>, ts: TrxID) {
+    pub async fn rollback(
+        &mut self,
+        table_cache: &mut TableCache<'_>,
+        guards: &PoolGuards,
+        ts: TrxID,
+    ) {
         while let Some(entry) = self.0.pop() {
             let table = table_cache.must_get_table(entry.table_id).await;
-            Self::rollback_entry_in_table(entry, table, ts).await;
+            Self::rollback_entry_in_table(entry, table, guards, ts).await;
         }
     }
 
     #[inline]
-    async fn rollback_entry_in_table(entry: IndexUndo, table: &TableHandle, ts: TrxID) {
+    async fn rollback_entry_in_table(
+        entry: IndexUndo,
+        table: &TableHandle,
+        guards: &PoolGuards,
+        ts: TrxID,
+    ) {
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
                 let index = table.sec_idx()[key.index_no].unique().unwrap();
@@ -105,7 +116,8 @@ impl IndexUndoLogs {
                         RowLocation::NotFound => unreachable!(),
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let Some(page_guard) = table.get_row_page_shared(page_id).await else {
+                            let Some(page_guard) = table.get_row_page_shared(guards, page_id).await
+                            else {
                                 return;
                             };
                             // acquire row latch to avoid race condition.

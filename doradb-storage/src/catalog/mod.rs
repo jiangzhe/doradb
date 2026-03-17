@@ -11,7 +11,10 @@ pub use table::*;
 
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::{PageID, VersionedPageID};
-use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::{
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
+    PoolGuards,
+};
 use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
@@ -59,13 +62,20 @@ pub struct Catalog {
 impl Catalog {
     /// Create a catalog runtime from persisted catalog storage.
     #[inline]
-    pub fn new(storage: CatalogStorage) -> Self {
+    pub async fn new(storage: CatalogStorage) -> Result<Self> {
+        let pool_guards = PoolGuards::builder()
+            .meta(storage.meta_pool.guard())
+            .build();
+        let snapshot = storage.checkpoint_snapshot()?;
+        storage
+            .bootstrap_from_checkpoint(&snapshot, &pool_guards)
+            .await?;
         let next_user_obj_id = storage.next_user_obj_id();
-        Catalog {
+        Ok(Catalog {
             next_user_obj_id: AtomicU64::new(next_user_obj_id),
             user_tables: DashMap::new(),
             storage,
-        }
+        })
     }
 
     /// Allocate and return the next user object id.
@@ -164,13 +174,18 @@ impl Catalog {
         index_pool: &'static FixedBufferPool,
         table_fs: &'static TableFileSystem,
         global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+        guards: &PoolGuards,
         table_id: TableID,
     ) -> Result<()> {
         let global_disk_pool = global_disk_pool.into();
         if self.user_tables.contains_key(&table_id) {
             return Err(Error::TableAlreadyExists);
         }
-        let res = self.storage.tables().find_uncommitted_by_id(table_id).await;
+        let res = self
+            .storage
+            .tables()
+            .find_uncommitted_by_id(guards, table_id)
+            .await;
         match res {
             Some(table) => {
                 // Phase 2 allocator semantics: only table ids consume global user object ids.
@@ -182,7 +197,7 @@ impl Catalog {
                 let mut columns = self
                     .storage
                     .columns()
-                    .list_uncommitted_by_table_id(table_id)
+                    .list_uncommitted_by_table_id(guards, table_id)
                     .await;
                 debug_assert!(!columns.is_empty());
                 columns.sort_by_key(|c| c.column_no);
@@ -195,14 +210,14 @@ impl Catalog {
                 let mut indexes = self
                     .storage
                     .indexes()
-                    .list_uncommitted_by_table_id(table_id)
+                    .list_uncommitted_by_table_id(guards, table_id)
                     .await;
                 indexes.sort_by_key(|index| index.index_no);
 
                 let mut index_columns = self
                     .storage
                     .index_columns()
-                    .list_uncommitted_by_table_id(table_id)
+                    .list_uncommitted_by_table_id(guards, table_id)
                     .await;
                 index_columns.sort_by_key(|ic| (ic.index_no, ic.index_column_no));
                 let mut index_columns_by_index_no: BTreeMap<u16, Vec<IndexColumnObject>> =
@@ -365,20 +380,33 @@ impl TableHandle {
     #[inline]
     pub async fn try_get_row_page_versioned_shared(
         &self,
+        guards: &PoolGuards,
         page_id: VersionedPageID,
     ) -> Option<PageSharedGuard<RowPage>> {
         match self {
             TableHandle::User(table) => {
                 let page_guard = table
                     .mem_pool
-                    .try_get_page_versioned::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .try_get_page_versioned::<RowPage>(
+                        guards
+                            .try_guard(PoolGuardSlot::Mem)
+                            .expect("missing mem pool guard for user-table row pages"),
+                        page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await?;
                 page_guard.lock_shared_async().await
             }
             TableHandle::Catalog(table) => {
                 let page_guard = table
                     .mem_pool
-                    .try_get_page_versioned::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .try_get_page_versioned::<RowPage>(
+                        guards
+                            .try_guard(PoolGuardSlot::Meta)
+                            .expect("missing meta pool guard for catalog-table row pages"),
+                        page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await?;
                 page_guard.lock_shared_async().await
             }
@@ -386,12 +414,22 @@ impl TableHandle {
     }
 
     #[inline]
-    pub async fn get_row_page_shared(&self, page_id: PageID) -> Option<PageSharedGuard<RowPage>> {
+    pub async fn get_row_page_shared(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> Option<PageSharedGuard<RowPage>> {
         match self {
             TableHandle::User(table) => {
                 table
                     .mem_pool
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .get_page::<RowPage>(
+                        guards
+                            .try_guard(PoolGuardSlot::Mem)
+                            .expect("missing mem pool guard for user-table row pages"),
+                        page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await
@@ -399,7 +437,13 @@ impl TableHandle {
             TableHandle::Catalog(table) => {
                 table
                     .mem_pool
-                    .get_page::<RowPage>(page_id, LatchFallbackMode::Shared)
+                    .get_page::<RowPage>(
+                        guards
+                            .try_guard(PoolGuardSlot::Meta)
+                            .expect("missing meta pool guard for catalog-table row pages"),
+                        page_id,
+                        LatchFallbackMode::Shared,
+                    )
                     .await
                     .lock_shared_async()
                     .await
@@ -408,10 +452,26 @@ impl TableHandle {
     }
 
     #[inline]
-    pub async fn delete_index(&self, key: &SelectKey, row_id: RowID, unique: bool) -> bool {
+    pub async fn delete_index(
+        &self,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        row_id: RowID,
+        unique: bool,
+    ) -> bool {
         match self {
-            TableHandle::User(table) => table.accessor().delete_index(key, row_id, unique).await,
-            TableHandle::Catalog(table) => table.accessor().delete_index(key, row_id, unique).await,
+            TableHandle::User(table) => {
+                table
+                    .accessor()
+                    .delete_index(guards, key, row_id, unique)
+                    .await
+            }
+            TableHandle::Catalog(table) => {
+                table
+                    .accessor()
+                    .delete_index(guards, key, row_id, unique)
+                    .await
+            }
         }
     }
 }
@@ -1050,7 +1110,7 @@ pub mod tests {
             assert!(res.is_ok());
             stmt.succeed().commit().await.unwrap();
 
-            checkpointed_table.freeze(usize::MAX).await;
+            checkpointed_table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.new_session();
             checkpointed_table
                 .data_checkpoint(&mut checkpoint_session)

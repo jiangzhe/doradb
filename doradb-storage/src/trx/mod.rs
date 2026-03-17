@@ -28,6 +28,7 @@ pub mod sys_trx;
 pub mod undo;
 pub mod ver_map;
 
+use crate::buffer::PoolGuards;
 use crate::buffer::page::PageID;
 use crate::engine::EngineRef;
 use crate::error::Result;
@@ -181,6 +182,11 @@ impl ActiveTrx {
     #[inline]
     pub fn engine(&self) -> Option<&EngineRef> {
         self.session.as_ref().map(|s| s.engine())
+    }
+
+    #[inline]
+    pub fn pool_guards(&self) -> Option<&PoolGuards> {
+        self.session.as_ref().map(|s| s.pool_guards())
     }
 
     #[inline]

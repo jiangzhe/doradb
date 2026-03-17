@@ -14,7 +14,10 @@
 //! 2. DML-only transactions
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::{
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
+    PoolGuards,
+};
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
 };
@@ -114,15 +117,18 @@ mod basic_tests {
 }
 
 pub(super) async fn log_recover(
-    index_pool: &'static FixedBufferPool,
-    mem_pool: &'static EvictableBufferPool,
-    table_fs: &'static TableFileSystem,
-    global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+    deps: RecoveryDeps,
     catalog: &mut Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
 ) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>)> {
-    let global_disk_pool = global_disk_pool.into();
+    let RecoveryDeps {
+        meta_pool,
+        index_pool,
+        mem_pool,
+        table_fs,
+        global_disk_pool,
+    } = deps;
     // In recovery, we disable GC and redo logging.
     // All data are purely processed in memory and if
     // any failure occurs, we abort the whole process.
@@ -134,6 +140,7 @@ pub(super) async fn log_recover(
             log_merger.add_stream(stream)?;
         }
         let log_recovery = LogRecovery::new(
+            meta_pool,
             index_pool,
             mem_pool,
             table_fs,
@@ -159,6 +166,14 @@ pub(super) async fn log_recover(
     Ok((partitions, gc_rxs))
 }
 
+pub(super) struct RecoveryDeps {
+    pub(super) meta_pool: &'static FixedBufferPool,
+    pub(super) index_pool: &'static FixedBufferPool,
+    pub(super) mem_pool: &'static EvictableBufferPool,
+    pub(super) table_fs: &'static TableFileSystem,
+    pub(super) global_disk_pool: StaticHandle<GlobalReadonlyBufferPool>,
+}
+
 pub struct LogRecovery<'a> {
     index_pool: &'static FixedBufferPool,
     mem_pool: &'static EvictableBufferPool,
@@ -170,6 +185,7 @@ pub struct LogRecovery<'a> {
     replay_floor: TrxID,
     table_states: HashMap<TableID, RecoveryTableState>,
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
+    pool_guards: PoolGuards,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -181,6 +197,7 @@ struct RecoveryTableState {
 impl<'a> LogRecovery<'a> {
     #[inline]
     fn new(
+        meta_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
         mem_pool: &'static EvictableBufferPool,
         table_fs: &'static TableFileSystem,
@@ -188,6 +205,12 @@ impl<'a> LogRecovery<'a> {
         catalog: &'a mut Catalog,
         log_merger: LogMerger,
     ) -> Self {
+        let pool_guards = PoolGuards::builder()
+            .meta(meta_pool.guard())
+            .index(index_pool.guard())
+            .mem(mem_pool.guard())
+            .disk(global_disk_pool.guard())
+            .build();
         LogRecovery {
             index_pool,
             mem_pool,
@@ -199,6 +222,7 @@ impl<'a> LogRecovery<'a> {
             replay_floor: MIN_SNAPSHOT_TS,
             table_states: HashMap::new(),
             recovered_tables: HashMap::new(),
+            pool_guards,
         }
     }
 
@@ -220,7 +244,13 @@ impl<'a> LogRecovery<'a> {
         self.catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
         self.replay_floor = snapshot.catalog_replay_start_ts;
 
-        for table in self.catalog.storage.tables().list_uncommitted().await {
+        for table in self
+            .catalog
+            .storage
+            .tables()
+            .list_uncommitted(&self.pool_guards)
+            .await
+        {
             if !is_user_obj_id(table.table_id) {
                 continue;
             }
@@ -230,6 +260,7 @@ impl<'a> LogRecovery<'a> {
                     self.index_pool,
                     self.table_fs,
                     self.global_disk_pool.clone(),
+                    &self.pool_guards,
                     table.table_id,
                 )
                 .await?;
@@ -309,14 +340,18 @@ impl<'a> LogRecovery<'a> {
                 .get_table(table_id)
                 .await
                 .ok_or(Error::TableNotFound)?;
-            table.populate_index_via_persisted_data().await?;
+            table
+                .populate_index_via_persisted_data(&self.pool_guards)
+                .await?;
         }
         // recover index with all data.
         for (table_id, pages) in &self.recovered_tables {
             if let Some(table) = self.catalog.get_table(*table_id).await {
                 let metadata = Arc::new(table.metadata().clone());
                 for page_id in pages {
-                    table.populate_index_via_row_page(*page_id).await?;
+                    table
+                        .populate_index_via_row_page(&self.pool_guards, *page_id)
+                        .await?;
                     self.refresh_page(Arc::clone(&metadata), *page_id).await;
                 }
             }
@@ -327,7 +362,13 @@ impl<'a> LogRecovery<'a> {
     async fn refresh_page(&self, metadata: Arc<TableMetadata>, page_id: PageID) {
         let mut page_guard = self
             .mem_pool
-            .get_page::<RowPage>(page_id, LatchFallbackMode::Exclusive)
+            .get_page::<RowPage>(
+                self.pool_guards
+                    .try_guard(PoolGuardSlot::Mem)
+                    .expect("missing mem pool guard for recovery row-page refresh"),
+                page_id,
+                LatchFallbackMode::Exclusive,
+            )
             .await
             .lock_exclusive_async()
             .await
@@ -365,6 +406,7 @@ impl<'a> LogRecovery<'a> {
                         self.index_pool,
                         self.table_fs,
                         self.global_disk_pool.clone(),
+                        &self.pool_guards,
                         *table_id,
                     )
                     .await?;
@@ -399,7 +441,9 @@ impl<'a> LogRecovery<'a> {
                     .await
                     .ok_or(Error::TableNotFound)?;
                 let count = end_row_id - start_row_id;
-                let mut page_guard = table.allocate_row_page_at(count as usize, *page_id).await;
+                let mut page_guard = table
+                    .allocate_row_page_at(&self.pool_guards, count as usize, *page_id)
+                    .await;
                 // Here we switch row page to recover mode.
                 page_guard.bf_mut().init_recover_map(cts);
 
@@ -504,10 +548,16 @@ impl<'a> LogRecovery<'a> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
-                    table.accessor().insert_no_trx(vals).await;
+                    table
+                        .accessor()
+                        .insert_no_trx(&self.pool_guards, vals)
+                        .await;
                 }
                 RowRedoKind::DeleteByUniqueKey(key) => {
-                    table.accessor().delete_unique_no_trx(key).await;
+                    table
+                        .accessor()
+                        .delete_unique_no_trx(&self.pool_guards, key)
+                        .await;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     // updates of catalog are implemented as DeleteByUniqueKey and Insert.
@@ -528,17 +578,37 @@ impl<'a> LogRecovery<'a> {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
                     table
-                        .recover_row_insert(row.page_id, row.row_id, vals, cts, disable_index)
+                        .recover_row_insert(
+                            &self.pool_guards,
+                            row.page_id,
+                            row.row_id,
+                            vals,
+                            cts,
+                            disable_index,
+                        )
                         .await;
                 }
                 RowRedoKind::Update(vals) => {
                     table
-                        .recover_row_update(row.page_id, row.row_id, vals, cts, disable_index)
+                        .recover_row_update(
+                            &self.pool_guards,
+                            row.page_id,
+                            row.row_id,
+                            vals,
+                            cts,
+                            disable_index,
+                        )
                         .await;
                 }
                 RowRedoKind::Delete => {
                     table
-                        .recover_row_delete(row.page_id, row.row_id, cts, disable_index)
+                        .recover_row_delete(
+                            &self.pool_guards,
+                            row.page_id,
+                            row.row_id,
+                            cts,
+                            disable_index,
+                        )
                         .await;
                 }
                 RowRedoKind::DeleteByUniqueKey(_) => {
@@ -801,10 +871,11 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
+            let session = engine.new_session();
             let mut rows = 0usize;
             table
                 .accessor()
-                .table_scan_uncommitted(|_metadata, row| {
+                .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
                     rows += if row.is_deleted() { 0 } else { 1 };
                     true
@@ -812,6 +883,7 @@ mod tests {
                 .await;
             assert_eq!(rows, DML_SIZE - (DML_SIZE / DEL_STEP + 1));
 
+            drop(session);
             drop(table);
             drop(engine);
         })
@@ -945,7 +1017,7 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
-            table.freeze(usize::MAX).await;
+            table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.new_session();
             table
                 .data_checkpoint(&mut checkpoint_session)
@@ -976,9 +1048,9 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert_eq!(table.total_row_pages().await, 0);
-
             let mut session = engine.new_session();
+            assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
+
             let trx = session.begin_trx().unwrap();
             let stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
@@ -1053,7 +1125,7 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
-            table.freeze(usize::MAX).await;
+            table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.new_session();
             table
                 .data_checkpoint(&mut checkpoint_session)
@@ -1093,9 +1165,9 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert!(table.total_row_pages().await > 0);
-
             let mut session = engine.new_session();
+            assert!(table.total_row_pages(session.pool_guards()).await > 0);
+
             let trx = session.begin_trx().unwrap();
             let stmt = trx.start_stmt();
 
@@ -1208,7 +1280,7 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
-            checkpointed_table.freeze(usize::MAX).await;
+            checkpointed_table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.new_session();
             checkpointed_table
                 .data_checkpoint(&mut checkpoint_session)
@@ -1280,10 +1352,20 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(checkpointed_table.total_row_pages().await, 0);
-            assert!(replay_only_table.total_row_pages().await > 0);
-
             let mut session = engine.new_session();
+            assert_eq!(
+                checkpointed_table
+                    .total_row_pages(session.pool_guards())
+                    .await,
+                0
+            );
+            assert!(
+                replay_only_table
+                    .total_row_pages(session.pool_guards())
+                    .await
+                    > 0
+            );
+
             let trx = session.begin_trx().unwrap();
             let stmt = trx.start_stmt();
 
@@ -1367,7 +1449,7 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
-            table.freeze(usize::MAX).await;
+            table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.new_session();
             table
                 .data_checkpoint(&mut checkpoint_session)
