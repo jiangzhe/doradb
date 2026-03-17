@@ -224,8 +224,9 @@ fn test_column_delete_basic() {
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(1i32);
-        let trx = session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let mut reader_session = sys.try_new_session().unwrap();
+        let trx = reader_session.try_begin_trx().unwrap().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -254,8 +255,9 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(1i32);
-        let trx = session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let mut reader_session = sys.try_new_session().unwrap();
+        let trx = reader_session.try_begin_trx().unwrap().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let allocated_after_route = sys.engine.disk_pool.allocated();
@@ -342,8 +344,9 @@ fn test_column_delete_rollback() {
         sys.table.data_checkpoint(&mut session).await.unwrap();
 
         let key = single_key(2i32);
-        let trx = session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let mut reader_session = sys.try_new_session().unwrap();
+        let trx = reader_session.try_begin_trx().unwrap().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -387,8 +390,9 @@ fn test_column_delete_rollback_after_checkpoint() {
             .await
             .unwrap();
 
-        let trx = session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let mut reader_session = sys.try_new_session().unwrap();
+        let trx = reader_session.try_begin_trx().unwrap().unwrap();
+        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let stmt = trx_delete.start_stmt();
@@ -405,6 +409,7 @@ fn test_column_delete_rollback_after_checkpoint() {
             .await;
         trx.commit().await.unwrap();
 
+        drop(reader_session);
         drop(checkpoint_session);
         drop(session);
         sys.clean_all();
@@ -461,9 +466,11 @@ fn test_column_delete_mvcc_visibility() {
         let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
-        let mut trx_reader = session.try_begin_trx().unwrap().unwrap();
+        let mut reader_session = sys.try_new_session().unwrap();
+        let mut trx_reader = reader_session.try_begin_trx().unwrap().unwrap();
 
-        let mut trx_delete = session.try_begin_trx().unwrap().unwrap();
+        let mut delete_session = sys.try_new_session().unwrap();
+        let mut trx_delete = delete_session.try_begin_trx().unwrap().unwrap();
         let mut stmt_delete = trx_delete.start_stmt();
         let res = stmt_delete.delete_row(&sys.table, &key).await;
         assert!(res.is_ok());
@@ -481,6 +488,8 @@ fn test_column_delete_mvcc_visibility() {
         trx_new = sys.trx_select_not_found(trx_new, &key).await;
         trx_new.commit().await.unwrap();
 
+        drop(delete_session);
+        drop(reader_session);
         drop(session);
         sys.clean_all();
     });

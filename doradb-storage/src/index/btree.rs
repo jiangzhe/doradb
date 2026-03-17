@@ -2386,10 +2386,15 @@ mod tests {
                         smol::block_on(async {
                             let mut key = [0u8; 1000];
                             key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
+                            let insert_fut =
+                                tree.insert(&pool_guard, &key, BTreeU64::from(90088), false, 202);
+                            futures::pin_mut!(insert_fut);
+                            assert!(matches!(
+                                futures::poll!(insert_fut.as_mut()),
+                                std::task::Poll::Pending
+                            ));
                             insert_started_tx.send(()).unwrap();
-                            let res = tree
-                                .insert(&pool_guard, &key, BTreeU64::from(90088), false, 202)
-                                .await;
+                            let res = insert_fut.await;
                             assert!(res.is_ok());
                         })
                     })
