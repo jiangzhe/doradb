@@ -430,12 +430,12 @@ Reference:
     guard-owned engine migration.
   - Non-goals: No full session-drain state machine; no removal of
     `StaticHandle` yet; no broad `BufferPool` signature migration yet.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000073-engine-shutdown-barrier.md`
+  - Task Issue: `#439`
+  - Phase Status: done
+  - Implementation Summary: Implemented in `doradb-storage` with the phase-1 shutdown barrier selected by [Task Resolve Sync: docs/tasks/000073-engine-shutdown-barrier.md @ 2026-03-17]
   - Related Backlogs:
-    - `docs/backlogs/000042-graceful-storage-engine-shutdown-lifecycle-for-sessions-and-system-components.md`
+    - `docs/backlogs/000059-add-session-drain-and-forced-shutdown-policy-after-engine-shutdown-barrier.md`
 
 - **Phase 2: Guard-Owned Engine Components**
   - Scope: Replace `EngineInner` leaked-static component fields and transitional

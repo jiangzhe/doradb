@@ -240,6 +240,7 @@ fn test_column_delete_basic() {
         trx = sys.trx_select_not_found(trx, &key).await;
         trx.commit().await.unwrap();
 
+        drop(reader_session);
         drop(session);
         sys.clean_all();
     });
@@ -278,6 +279,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         .await;
         assert_eq!(sys.engine.disk_pool.allocated(), allocated_after_first);
 
+        drop(reader_session);
         drop(session);
         sys.clean_all();
     });
@@ -364,6 +366,7 @@ fn test_column_delete_rollback() {
             .await;
         trx.commit().await.unwrap();
 
+        drop(reader_session);
         drop(session);
         sys.clean_all();
     });

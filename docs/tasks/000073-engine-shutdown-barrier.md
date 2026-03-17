@@ -1,7 +1,7 @@
 ---
 id: 000073
 title: Engine Shutdown Barrier
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-17
 github_issue: 439
 ---
@@ -57,7 +57,7 @@ contract required by RFC-0009:
 3. top-level owner drop does not start until worker stop/join hooks complete.
 
 Full graceful session draining, timeouts, and forced-stop policy remain out of
-scope and continue to live under backlog `000042`.
+scope and are now tracked by backlog `000059`.
 
 Issue Labels:
 - `type:task`
@@ -200,6 +200,48 @@ Reference:
 
 ## Implementation Notes
 
+Implemented in `doradb-storage` with the phase-1 shutdown barrier selected by
+RFC-0009.
+
+1. `Engine` now owns explicit lifecycle state and an idempotent
+   `shutdown(&self) -> Result<()>` path that:
+   - closes admission for new work;
+   - returns `Error::StorageEngineShutdownBusy(usize)` while extra
+     `EngineRef`/`Session` holders are still alive;
+   - runs explicit worker shutdown hooks before owner teardown proceeds.
+2. Engine and session admission now use only fallible entry points:
+   - `Engine::try_new_session()`
+   - `EngineRef::try_new_session()`
+   - `Session::try_begin_trx()`
+   The old `new_session()` and `begin_trx()` compatibility entry points were
+   removed.
+3. `Error::TransactionSystemShutdown` was renamed to
+   `Error::StorageEngineShutdown`, and late shutdown rejection sites were
+   updated to the engine-level error naming.
+4. Worker-backed components now expose explicit idempotent shutdown hooks:
+   - `TransactionSystem`
+   - `EvictableBufferPool`
+   - `GlobalReadonlyBufferPool`
+   - `TableFileSystem`
+   Their `Drop` implementations delegate to those hooks instead of being the
+   only shutdown path.
+5. Focused tests were added for:
+   - engine shutdown idempotence and admission rejection;
+   - busy shutdown while extra refs remain, followed by successful retry;
+   - fail-fast `drop(engine)` behavior when leaked refs still exist;
+   - idempotent shutdown on unstarted or partially started worker-backed
+     components.
+6. Additional regression cleanup during follow-up verification fixed two table
+   MVCC tests that incorrectly reused one `Session` for overlapping
+   transactions; those tests now use distinct sessions.
+7. Validation outcomes:
+   - implementation validation completed with:
+     - `cargo test -p doradb-storage`
+     - `cargo test -p doradb-storage --no-default-features`
+   - resolve-time regression verification completed with:
+     - `cargo test -p doradb-storage --no-default-features table::tests::test_column_delete_rollback_after_checkpoint -- --exact`
+     - `cargo test -p doradb-storage --no-default-features table::tests::test_column_delete_mvcc_visibility -- --exact`
+
 ## Impacts
 
 1. `doradb-storage/src/engine.rs`
@@ -241,7 +283,11 @@ Reference:
 
 ## Open Questions
 
-None in this task scope.
+Follow-up work remains outside this task scope:
 
-Full session draining, timeout policy, and forced shutdown behavior remain
-tracked by `docs/backlogs/000042-graceful-storage-engine-shutdown-lifecycle-for-sessions-and-system-components.md`.
+1. graceful session and transaction draining, timeout policy, and forced
+   shutdown behavior are now tracked by
+   `docs/backlogs/000059-add-session-drain-and-forced-shutdown-policy-after-engine-shutdown-barrier.md`;
+2. same-session overlapping-transaction admission is still incorrectly
+   unenforced at runtime and is tracked by
+   `docs/backlogs/000058-fix-session-single-active-transaction-enforcement.md`.
