@@ -273,7 +273,7 @@ mod tests {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
                 FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolIdentity::Index,
+                    crate::buffer::PoolRole::Index,
                     1024usize * 1024 * 1024,
                 )
                 .unwrap(),

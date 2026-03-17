@@ -2,7 +2,7 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
-use crate::buffer::{PoolGuard, PoolIdentity, RowPoolIdentity};
+use crate::buffer::{PoolGuard, PoolIdentity};
 use crate::error::Result;
 use crate::ptr::UnsafePtr;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -156,9 +156,9 @@ pub(crate) struct QuiescentArena {
 
 impl QuiescentArena {
     #[inline]
-    pub(crate) fn new(identity: PoolIdentity, capacity: usize) -> Result<Self> {
-        identity.assert_valid("quiescent arena");
+    pub(crate) fn new(capacity: usize) -> Result<Self> {
         let keepalive = QuiescentBox::new(());
+        let identity = keepalive.owner_identity();
         Ok(Self {
             identity,
             keepalive,
@@ -169,15 +169,6 @@ impl QuiescentArena {
     #[inline]
     pub(crate) fn identity(&self) -> PoolIdentity {
         self.identity
-    }
-
-    #[inline]
-    pub(crate) fn row_pool_identity(&self) -> RowPoolIdentity {
-        match self.identity {
-            PoolIdentity::Meta => RowPoolIdentity::Meta,
-            PoolIdentity::Mem => RowPoolIdentity::Mem,
-            _ => panic!("pool identity {:?} is not a row pool", self.identity),
-        }
     }
 
     #[inline]
@@ -256,10 +247,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_arena_guard_panics_on_foreign_guard() {
-        let arena1 = Box::leak(Box::new(
-            QuiescentArena::new(PoolIdentity::Meta, 1).unwrap(),
-        ));
-        let arena2 = Box::leak(Box::new(QuiescentArena::new(PoolIdentity::Mem, 1).unwrap()));
+        let arena1 = Box::leak(Box::new(QuiescentArena::new(1).unwrap()));
+        let arena2 = Box::leak(Box::new(QuiescentArena::new(1).unwrap()));
         let foreign_guard = arena2.guard();
         let _ = arena1.arena_guard(foreign_guard);
     }

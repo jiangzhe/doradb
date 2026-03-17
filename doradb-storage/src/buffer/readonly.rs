@@ -8,7 +8,7 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
-use crate::buffer::{BufferPool, PoolGuard, PoolIdentity};
+use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, PoolRole};
 use crate::engine::StaticHandle;
 use crate::error::Validation::Valid;
 use crate::error::{Error, PersistedFileKind, Result, Validation};
@@ -108,31 +108,32 @@ pub struct GlobalReadonlyBufferPool {
     eviction_arbiter: EvictionArbiter,
     shutdown_flag: Arc<AtomicBool>,
     evict_thread: Mutex<Option<JoinHandle<()>>>,
+    role: PoolRole,
     arena: QuiescentArena,
 }
 
 impl GlobalReadonlyBufferPool {
     /// Creates a global readonly pool with a target memory budget in bytes.
     #[inline]
-    pub fn with_capacity(identity: PoolIdentity, pool_size: usize) -> Result<Self> {
-        Self::with_capacity_and_arbiter_builder(identity, pool_size, EvictionArbiter::builder())
+    pub fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
+        Self::with_capacity_and_arbiter_builder(role, pool_size, EvictionArbiter::builder())
     }
 
     /// Creates a global readonly pool with explicit eviction arbiter builder.
     #[inline]
     pub fn with_capacity_and_arbiter_builder(
-        identity: PoolIdentity,
+        role: PoolRole,
         pool_size: usize,
         eviction_arbiter_builder: EvictionArbiterBuilder,
     ) -> Result<Self> {
-        identity.assert_valid("global readonly buffer pool");
+        role.assert_valid("global readonly buffer pool");
         let frame_plus_page = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
         let size = pool_size / frame_plus_page;
         if size < MIN_READONLY_POOL_PAGES {
             return Err(Error::BufferPoolSizeTooSmall);
         }
         let eviction_arbiter = eviction_arbiter_builder.build(size);
-        let arena = QuiescentArena::new(identity, size)?;
+        let arena = QuiescentArena::new(size)?;
         let pool = GlobalReadonlyBufferPool {
             size,
             mappings: Arc::new(DashMap::new()),
@@ -141,6 +142,7 @@ impl GlobalReadonlyBufferPool {
             eviction_arbiter,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             evict_thread: Mutex::new(None),
+            role,
             arena,
         };
         Ok(pool)
@@ -148,8 +150,8 @@ impl GlobalReadonlyBufferPool {
 
     /// Creates and leaks a global readonly pool for static-lifetime usage.
     #[inline]
-    pub fn with_capacity_static(identity: PoolIdentity, pool_size: usize) -> Result<&'static Self> {
-        let pool = Self::with_capacity(identity, pool_size)?;
+    pub fn with_capacity_static(role: PoolRole, pool_size: usize) -> Result<&'static Self> {
+        let pool = Self::with_capacity(role, pool_size)?;
         let pool = StaticLifetime::new_static(pool);
         pool.start_evictor_thread();
         Ok(pool)
@@ -158,12 +160,12 @@ impl GlobalReadonlyBufferPool {
     /// Creates and leaks a global readonly pool with explicit eviction arbiter builder.
     #[inline]
     pub fn with_capacity_and_arbiter_builder_static(
-        identity: PoolIdentity,
+        role: PoolRole,
         pool_size: usize,
         eviction_arbiter_builder: EvictionArbiterBuilder,
     ) -> Result<&'static Self> {
         let pool =
-            Self::with_capacity_and_arbiter_builder(identity, pool_size, eviction_arbiter_builder)?;
+            Self::with_capacity_and_arbiter_builder(role, pool_size, eviction_arbiter_builder)?;
         let pool = StaticLifetime::new_static(pool);
         pool.start_evictor_thread();
         Ok(pool)
@@ -183,6 +185,7 @@ impl GlobalReadonlyBufferPool {
 
     #[inline]
     pub fn guard(&self) -> PoolGuard {
+        debug_assert!(!matches!(self.role, PoolRole::Invalid));
         self.arena.guard()
     }
 
@@ -1519,7 +1522,7 @@ mod tests {
     fn test_global_readonly_mapping_and_invalidation() {
         let scope = StaticLifetimeScope::new();
         let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolIdentity::Disk, 64 * 1024 * 1024)
+            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
                 .unwrap(),
         );
         let global = global.as_static();
@@ -1549,7 +1552,7 @@ mod tests {
     fn test_global_readonly_pool_rejects_too_small_capacity() {
         let bytes = (MIN_READONLY_POOL_PAGES - 1)
             * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
-        let res = GlobalReadonlyBufferPool::with_capacity(PoolIdentity::Disk, bytes);
+        let res = GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, bytes);
         assert!(matches!(res, Err(Error::BufferPoolSizeTooSmall)));
     }
 
@@ -1557,7 +1560,7 @@ mod tests {
     fn test_global_invalidate_file() {
         let scope = StaticLifetimeScope::new();
         let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolIdentity::Disk, 64 * 1024 * 1024)
+            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
                 .unwrap(),
         );
         let global = global.as_static();
@@ -1586,7 +1589,7 @@ mod tests {
     fn test_readonly_cache_file_ids_keep_catalog_and_user_pages_isolated() {
         let scope = StaticLifetimeScope::new();
         let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolIdentity::Disk, 64 * 1024 * 1024)
+            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
                 .unwrap(),
         );
         let global = global.as_static();
@@ -1609,7 +1612,7 @@ mod tests {
     fn test_global_invalidate_key_strict() {
         let scope = StaticLifetimeScope::new();
         let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolIdentity::Disk, 64 * 1024 * 1024)
+            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
                 .unwrap(),
         );
         let global = global.as_static();
@@ -1630,11 +1633,8 @@ mod tests {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
+                    .unwrap(),
             );
             let global = global.as_static();
             let global_guard = global.guard();
@@ -1654,18 +1654,12 @@ mod tests {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
             let global1 = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
+                    .unwrap(),
             );
             let global2 = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Meta,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
+                    .unwrap(),
             );
             let global1 = global1.as_static();
             let global2 = global2.as_static();
@@ -1692,11 +1686,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(2),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
+                    .unwrap(),
             );
             let global = global.as_static();
             let global_guard = global.guard();
@@ -1748,11 +1739,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(4),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(4))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 101,
@@ -1796,11 +1784,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(8),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(8))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 102,
@@ -1839,11 +1824,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(2),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 112,
@@ -1896,11 +1878,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(2),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 113,
@@ -1950,11 +1929,9 @@ mod tests {
             let page_source = Arc::new(ControlledPageSource::with_page(page));
             let key = ReadonlyCacheKey::new(116, 12);
 
-            let global = GlobalReadonlyBufferPool::with_capacity_static(
-                PoolIdentity::Disk,
-                frame_page_bytes(2),
-            )
-            .unwrap();
+            let global =
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
+                    .unwrap();
             let pool = StaticLifetime::new_static(ReadonlyBufferPool::new(
                 116,
                 PersistedFileKind::TableFile,
@@ -2004,11 +1981,9 @@ mod tests {
         smol::block_on(async {
             let page_source = Arc::new(ControlledPageSource::with_page([0u8; PAGE_SIZE]));
             let key = ReadonlyCacheKey::new(117, 13);
-            let global = GlobalReadonlyBufferPool::with_capacity_static(
-                PoolIdentity::Disk,
-                frame_page_bytes(1),
-            )
-            .unwrap();
+            let global =
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(1))
+                    .unwrap();
             let inflight_loads = Arc::clone(&global.inflight_loads);
 
             {
@@ -2051,11 +2026,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(2),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 114,
@@ -2101,11 +2073,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(2),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 115,
@@ -2182,11 +2151,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(4),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(4))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 107,
@@ -2237,11 +2203,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(4),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(4))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 108,
@@ -2292,11 +2255,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(4),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(4))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 109,
@@ -2342,11 +2302,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(1),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(1))
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 103,
@@ -2415,11 +2372,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    frame_page_bytes(2),
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
+                    .unwrap(),
             );
             // Adopt filesystem after global, so scope teardown stops file IO thread first.
             let _fs = scope.adopt(fs);
@@ -2457,11 +2411,8 @@ mod tests {
 
             let scope = StaticLifetimeScope::new();
             let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(
-                    PoolIdentity::Disk,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
+                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
+                    .unwrap(),
             );
             let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
                 104,
@@ -2480,7 +2431,7 @@ mod tests {
         let scope = StaticLifetimeScope::new();
         let global = scope.adopt(
             GlobalReadonlyBufferPool::with_capacity_and_arbiter_builder_static(
-                PoolIdentity::Disk,
+                PoolRole::Disk,
                 frame_page_bytes(16),
                 EvictionArbiterBuilder::new()
                     .target_free(4)

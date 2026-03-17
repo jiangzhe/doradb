@@ -3,7 +3,7 @@ use crate::buffer::arena::QuiescentArena;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
-use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, RowPoolIdentity};
+use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, PoolRole, RowPoolRole};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
@@ -16,6 +16,7 @@ pub struct FixedBufferPool {
     size: usize,
     // free_list: Mutex<PageID>,
     alloc_map: AllocMap,
+    role: PoolRole,
     arena: QuiescentArena,
 }
 
@@ -27,13 +28,14 @@ impl FixedBufferPool {
     /// We separate pages and frames so that pages are always aligned
     /// to the unit of direct IO and can be flushed via libaio.
     #[inline]
-    pub fn with_capacity(identity: PoolIdentity, pool_size: usize) -> Result<Self> {
-        identity.assert_valid("fixed buffer pool");
+    pub fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
+        role.assert_valid("fixed buffer pool");
         let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
-        let arena = QuiescentArena::new(identity, size)?;
+        let arena = QuiescentArena::new(size)?;
         Ok(FixedBufferPool {
             size,
             alloc_map: AllocMap::new(size),
+            role,
             arena,
         })
     }
@@ -41,8 +43,8 @@ impl FixedBufferPool {
     /// Create a buffer pool with given capacity, leak it to heap
     /// and return the static reference.
     #[inline]
-    pub fn with_capacity_static(identity: PoolIdentity, pool_size: usize) -> Result<&'static Self> {
-        let pool = Self::with_capacity(identity, pool_size)?;
+    pub fn with_capacity_static(role: PoolRole, pool_size: usize) -> Result<&'static Self> {
+        let pool = Self::with_capacity(role, pool_size)?;
         Ok(StaticLifetime::new_static(pool))
     }
 
@@ -58,8 +60,8 @@ impl FixedBufferPool {
     }
 
     #[inline]
-    pub(crate) fn row_pool_identity(&self) -> RowPoolIdentity {
-        self.arena.row_pool_identity()
+    pub(crate) fn row_pool_role(&self) -> RowPoolRole {
+        self.role.row_pool_role()
     }
 
     #[inline]
@@ -253,8 +255,7 @@ mod tests {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity_static(PoolRole::Meta, 64 * 1024 * 1024).unwrap(),
             );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
@@ -364,8 +365,7 @@ mod tests {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity_static(PoolRole::Meta, 64 * 1024 * 1024).unwrap(),
             );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
@@ -431,8 +431,7 @@ mod tests {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity_static(PoolRole::Meta, 64 * 1024 * 1024).unwrap(),
             );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
@@ -503,8 +502,7 @@ mod tests {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity_static(PoolRole::Meta, 64 * 1024 * 1024).unwrap(),
             );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
@@ -530,8 +528,7 @@ mod tests {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity_static(PoolRole::Meta, 64 * 1024 * 1024).unwrap(),
             );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
@@ -555,7 +552,7 @@ mod tests {
     fn test_fixed_buffer_pool_drop_waits_for_outstanding_guard() {
         smol::block_on(async {
             let pool = StaticLifetime::new_static(
-                FixedBufferPool::with_capacity(PoolIdentity::Meta, 8 * 1024 * 1024).unwrap(),
+                FixedBufferPool::with_capacity(PoolRole::Meta, 8 * 1024 * 1024).unwrap(),
             );
             let guard = {
                 let pool_guard = pool.guard();
@@ -589,12 +586,10 @@ mod tests {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
             let pool1 = scope.adopt(
-                FixedBufferPool::with_capacity_static(PoolIdentity::Meta, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity_static(PoolRole::Meta, 64 * 1024 * 1024).unwrap(),
             );
             let pool2 = scope.adopt(
-                FixedBufferPool::with_capacity_static(PoolIdentity::Index, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity_static(PoolRole::Meta, 64 * 1024 * 1024).unwrap(),
             );
             let pool1 = pool1.as_static();
             let pool2 = pool2.as_static();

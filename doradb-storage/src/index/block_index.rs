@@ -380,11 +380,8 @@ mod tests {
     fn test_try_find_row_returns_error_when_column_route_has_no_storage() {
         let scope = StaticLifetimeScope::new();
         let pool = scope.adopt(
-            FixedBufferPool::with_capacity_static(
-                crate::buffer::PoolIdentity::Index,
-                64 * 1024 * 1024,
-            )
-            .unwrap(),
+            FixedBufferPool::with_capacity_static(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
+                .unwrap(),
         );
         let meta_guard = pool.guard();
         let blk_idx = smol::block_on(BlockIndex::new(pool.as_static(), &meta_guard, 10, 77));
@@ -402,11 +399,8 @@ mod tests {
     fn test_try_find_row_returns_error_when_column_fallback_has_no_storage() {
         let scope = StaticLifetimeScope::new();
         let inner = scope.adopt(
-            FixedBufferPool::with_capacity_static(
-                crate::buffer::PoolIdentity::Index,
-                64 * 1024 * 1024,
-            )
-            .unwrap(),
+            FixedBufferPool::with_capacity_static(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
+                .unwrap(),
         );
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));

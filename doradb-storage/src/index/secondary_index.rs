@@ -336,7 +336,7 @@ mod tests {
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
-                    EvictableBufferPoolConfig::default().identity(crate::buffer::PoolIdentity::Mem),
+                    EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem),
                 )
                 .trx(
                     TrxSysConfig::default()
@@ -441,7 +441,7 @@ mod tests {
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
-                    EvictableBufferPoolConfig::default().identity(crate::buffer::PoolIdentity::Mem),
+                    EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem),
                 )
                 .trx(
                     TrxSysConfig::default()

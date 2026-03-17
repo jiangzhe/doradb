@@ -1,7 +1,7 @@
-use crate::buffer::identity::{PoolIdentity, RowPoolIdentity};
+use crate::buffer::identity::{PoolIdentity, PoolRole, RowPoolRole};
 use crate::quiescent::SyncQuiescentGuard;
 
-/// Cloneable keepalive guard branded with one buffer-pool identity.
+/// Cloneable keepalive guard branded with one exact buffer-pool identity.
 #[derive(Clone)]
 pub struct PoolGuard {
     identity: PoolIdentity,
@@ -24,8 +24,9 @@ impl PoolGuard {
 
     #[inline]
     pub(crate) fn assert_matches(&self, expected: PoolIdentity, context: &'static str) {
-        if self.identity != expected {
-            pool_guard_identity_mismatch(context, expected, self.identity);
+        let actual = self.identity();
+        if actual != expected {
+            pool_guard_identity_mismatch(context, expected, actual);
         }
     }
 }
@@ -33,13 +34,19 @@ impl PoolGuard {
 /// Bundle of pool guards used by storage operations that touch multiple pools.
 #[derive(Clone, Default)]
 pub struct PoolGuards {
-    guards: Box<[PoolGuard]>,
+    meta: Option<PoolGuard>,
+    index: Option<PoolGuard>,
+    mem: Option<PoolGuard>,
+    disk: Option<PoolGuard>,
 }
 
-/// Builder for assembling a [`PoolGuards`] bundle slot by slot.
+/// Builder for assembling a [`PoolGuards`] bundle by named pool role.
 #[derive(Default)]
 pub struct PoolGuardsBuilder {
-    guards: Vec<PoolGuard>,
+    meta: Option<PoolGuard>,
+    index: Option<PoolGuard>,
+    mem: Option<PoolGuard>,
+    disk: Option<PoolGuard>,
 }
 
 impl PoolGuards {
@@ -52,46 +59,50 @@ impl PoolGuards {
     /// Returns the guard for the metadata pool.
     #[inline]
     pub fn meta_guard(&self) -> &PoolGuard {
-        require_guard_slot(self.try_guard(PoolIdentity::Meta), "meta")
+        require_guard_slot(self.meta.as_ref(), "meta")
     }
 
     /// Returns the guard for the secondary-index pool.
     #[inline]
     pub fn index_guard(&self) -> &PoolGuard {
-        require_guard_slot(self.try_guard(PoolIdentity::Index), "index")
+        require_guard_slot(self.index.as_ref(), "index")
     }
 
     /// Returns the guard for the in-memory row-page pool.
     #[inline]
     pub fn mem_guard(&self) -> &PoolGuard {
-        require_guard_slot(self.try_guard(PoolIdentity::Mem), "mem")
+        require_guard_slot(self.mem.as_ref(), "mem")
     }
 
     /// Returns the guard for the persisted read-only page pool.
     #[inline]
     pub fn disk_guard(&self) -> &PoolGuard {
-        require_guard_slot(self.try_guard(PoolIdentity::Disk), "disk")
+        require_guard_slot(self.disk.as_ref(), "disk")
     }
 
     #[inline]
-    pub(crate) fn try_guard(&self, identity: PoolIdentity) -> Option<&PoolGuard> {
-        self.guards
-            .iter()
-            .find(|guard| guard.identity() == identity)
+    pub(crate) fn try_guard(&self, role: PoolRole) -> Option<&PoolGuard> {
+        match role {
+            PoolRole::Invalid => None,
+            PoolRole::Meta => self.meta.as_ref(),
+            PoolRole::Index => self.index.as_ref(),
+            PoolRole::Mem => self.mem.as_ref(),
+            PoolRole::Disk => self.disk.as_ref(),
+        }
     }
 
     #[inline]
-    pub(crate) fn try_row_guard(&self, identity: RowPoolIdentity) -> Option<&PoolGuard> {
-        self.try_guard(identity.into())
+    pub(crate) fn try_row_guard(&self, role: RowPoolRole) -> Option<&PoolGuard> {
+        self.try_guard(role.into())
     }
 }
 
 impl PoolGuardsBuilder {
     /// Add one pool guard to the bundle.
     #[inline]
-    pub fn push(mut self, guard: PoolGuard) -> Self {
-        push_guard_slot(&self.guards, guard.identity());
-        self.guards.push(guard);
+    pub fn push(mut self, role: PoolRole, guard: PoolGuard) -> Self {
+        push_guard_slot(self.slot_mut(role), role);
+        *self.slot_mut(role) = Some(guard);
         self
     }
 
@@ -99,15 +110,29 @@ impl PoolGuardsBuilder {
     #[inline]
     pub fn build(self) -> PoolGuards {
         PoolGuards {
-            guards: self.guards.into_boxed_slice(),
+            meta: self.meta,
+            index: self.index,
+            mem: self.mem,
+            disk: self.disk,
+        }
+    }
+
+    #[inline]
+    fn slot_mut(&mut self, role: PoolRole) -> &mut Option<PoolGuard> {
+        match role {
+            PoolRole::Invalid => invalid_guard_slot(),
+            PoolRole::Meta => &mut self.meta,
+            PoolRole::Index => &mut self.index,
+            PoolRole::Mem => &mut self.mem,
+            PoolRole::Disk => &mut self.disk,
         }
     }
 }
 
 #[inline]
-fn push_guard_slot(slots: &[PoolGuard], identity: PoolIdentity) {
-    if slots.iter().any(|existing| existing.identity() == identity) {
-        duplicate_guard_slot(identity);
+fn push_guard_slot(slot: &mut Option<PoolGuard>, role: PoolRole) {
+    if slot.is_some() {
+        duplicate_guard_slot(role);
     }
 }
 
@@ -122,8 +147,13 @@ fn missing_guard_slot(name: &'static str) -> ! {
 }
 
 #[cold]
-fn duplicate_guard_slot(identity: PoolIdentity) -> ! {
-    panic!("duplicate pool guard identity: {identity:?}");
+fn invalid_guard_slot() -> ! {
+    panic!("invalid pool role in pool guards builder");
+}
+
+#[cold]
+fn duplicate_guard_slot(role: PoolRole) -> ! {
+    panic!("duplicate pool guard role: {role:?}");
 }
 
 #[cold]
@@ -139,71 +169,54 @@ fn pool_guard_identity_mismatch(
 mod tests {
     use super::*;
 
-    fn test_guard(identity: PoolIdentity) -> PoolGuard {
+    fn test_guard() -> PoolGuard {
         let owner = Box::leak(Box::new(crate::quiescent::QuiescentBox::new(())));
-        PoolGuard::new(identity, owner.guard().into_sync())
+        PoolGuard::new(owner.owner_identity(), owner.guard().into_sync())
     }
 
     #[test]
     fn test_pool_guards_builder_empty_builds_partial() {
         let guards = PoolGuards::builder().build();
-        assert!(guards.try_guard(PoolIdentity::Meta).is_none());
+        assert!(guards.try_guard(PoolRole::Meta).is_none());
     }
 
     #[test]
-    fn test_pool_guards_builder_duplicate_slot_panics() {
-        let guard = test_guard(PoolIdentity::Meta);
+    fn test_pool_guards_builder_rejects_duplicate_role() {
         let result = std::panic::catch_unwind(|| {
             let _ = PoolGuards::builder()
-                .push(guard.clone())
-                .push(guard)
+                .push(PoolRole::Meta, test_guard())
+                .push(PoolRole::Meta, test_guard())
                 .build();
         });
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_pool_guards_builder_builds_explicit_slot() {
-        let guard = test_guard(PoolIdentity::Meta);
-        let guard_id = guard.identity();
-        let guards = PoolGuards::builder().push(guard).build();
-        assert!(guards.try_guard(guard_id).is_some());
-    }
-
-    #[test]
-    fn test_pool_guards_try_guard_matches_identity() {
-        let meta_guard = test_guard(PoolIdentity::Meta);
-        let index_guard = test_guard(PoolIdentity::Index);
-        let mem_guard = test_guard(PoolIdentity::Mem);
-        let disk_guard = test_guard(PoolIdentity::Disk);
+    fn test_pool_guards_try_guard_matches_named_role() {
+        let meta_guard = test_guard();
+        let index_guard = test_guard();
+        let mem_guard = test_guard();
+        let disk_guard = test_guard();
         let guards = PoolGuards::builder()
-            .push(meta_guard.clone())
-            .push(index_guard.clone())
-            .push(mem_guard.clone())
-            .push(disk_guard.clone())
+            .push(PoolRole::Meta, meta_guard.clone())
+            .push(PoolRole::Index, index_guard.clone())
+            .push(PoolRole::Mem, mem_guard.clone())
+            .push(PoolRole::Disk, disk_guard.clone())
             .build();
         assert_eq!(
-            guards
-                .try_guard(meta_guard.identity())
-                .map(PoolGuard::identity),
+            guards.try_guard(PoolRole::Meta).map(PoolGuard::identity),
             Some(meta_guard.identity())
         );
         assert_eq!(
-            guards
-                .try_guard(index_guard.identity())
-                .map(PoolGuard::identity),
+            guards.try_guard(PoolRole::Index).map(PoolGuard::identity),
             Some(index_guard.identity())
         );
         assert_eq!(
-            guards
-                .try_guard(mem_guard.identity())
-                .map(PoolGuard::identity),
+            guards.try_guard(PoolRole::Mem).map(PoolGuard::identity),
             Some(mem_guard.identity())
         );
         assert_eq!(
-            guards
-                .try_guard(disk_guard.identity())
-                .map(PoolGuard::identity),
+            guards.try_guard(PoolRole::Disk).map(PoolGuard::identity),
             Some(disk_guard.identity())
         );
     }
@@ -211,15 +224,45 @@ mod tests {
     #[test]
     fn test_pool_guards_named_getters_return_configured_slots() {
         let guards = PoolGuards::builder()
-            .push(test_guard(PoolIdentity::Meta))
-            .push(test_guard(PoolIdentity::Index))
-            .push(test_guard(PoolIdentity::Mem))
-            .push(test_guard(PoolIdentity::Disk))
+            .push(PoolRole::Meta, test_guard())
+            .push(PoolRole::Index, test_guard())
+            .push(PoolRole::Mem, test_guard())
+            .push(PoolRole::Disk, test_guard())
             .build();
         let _ = guards.meta_guard();
         let _ = guards.index_guard();
         let _ = guards.mem_guard();
         let _ = guards.disk_guard();
+    }
+
+    #[test]
+    fn test_pool_guards_try_row_guard_uses_named_row_role() {
+        let meta_guard = test_guard();
+        let mem_guard = test_guard();
+        let guards = PoolGuards::builder()
+            .push(PoolRole::Meta, meta_guard.clone())
+            .push(PoolRole::Mem, mem_guard.clone())
+            .build();
+        assert_eq!(
+            guards
+                .try_row_guard(RowPoolRole::Meta)
+                .map(PoolGuard::identity),
+            Some(meta_guard.identity())
+        );
+        assert_eq!(
+            guards
+                .try_row_guard(RowPoolRole::Mem)
+                .map(PoolGuard::identity),
+            Some(mem_guard.identity())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid pool role in pool guards builder")]
+    fn test_pool_guards_builder_rejects_invalid_role() {
+        let _ = PoolGuards::builder()
+            .push(PoolRole::Invalid, test_guard())
+            .build();
     }
 
     #[test]
@@ -230,30 +273,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "missing index pool guard")]
-    fn test_pool_guards_index_guard_panics_when_slot_missing() {
-        let guards = PoolGuards::builder().build();
-        let _ = guards.index_guard();
-    }
-
-    #[test]
-    #[should_panic(expected = "missing mem pool guard")]
-    fn test_pool_guards_mem_guard_panics_when_slot_missing() {
-        let guards = PoolGuards::builder().build();
-        let _ = guards.mem_guard();
-    }
-
-    #[test]
-    #[should_panic(expected = "missing disk pool guard")]
-    fn test_pool_guards_disk_guard_panics_when_slot_missing() {
-        let guards = PoolGuards::builder().build();
-        let _ = guards.disk_guard();
-    }
-
-    #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_pool_guard_assert_matches_panics_on_identity_mismatch() {
-        let guard = test_guard(PoolIdentity::Meta);
-        guard.assert_matches(PoolIdentity::Index, "test");
+        let guard = test_guard();
+        let foreign_guard = test_guard();
+        guard.assert_matches(foreign_guard.identity(), "test");
     }
 }

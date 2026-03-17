@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, PoolGuards};
+use crate::buffer::{BufferPool, PoolGuards, PoolRole};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
 use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
@@ -242,10 +242,10 @@ impl SessionState {
     #[inline]
     pub fn new(engine_ref: EngineRef) -> Self {
         let pool_guards = PoolGuards::builder()
-            .push(engine_ref.meta_pool.guard())
-            .push(engine_ref.index_pool.guard())
-            .push(engine_ref.mem_pool.guard())
-            .push(engine_ref.disk_pool.guard())
+            .push(PoolRole::Meta, engine_ref.meta_pool.guard())
+            .push(PoolRole::Index, engine_ref.index_pool.guard())
+            .push(PoolRole::Mem, engine_ref.mem_pool.guard())
+            .push(PoolRole::Disk, engine_ref.disk_pool.guard())
             .build();
         SessionState {
             engine_ref,

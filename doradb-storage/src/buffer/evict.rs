@@ -8,7 +8,7 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
-use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, RowPoolIdentity};
+use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, PoolRole, RowPoolRole};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -55,6 +55,7 @@ pub struct EvictableBufferPool {
     inflight_io: Arc<InflightIO>,
     // statistics of IO submit/wait.
     stats: Arc<EvictableBufferPoolStats>,
+    role: PoolRole,
     arena: QuiescentArena,
 }
 
@@ -65,8 +66,8 @@ impl EvictableBufferPool {
     }
 
     #[inline]
-    pub(crate) fn row_pool_identity(&self) -> RowPoolIdentity {
-        self.arena.row_pool_identity()
+    pub(crate) fn row_pool_role(&self) -> RowPoolRole {
+        self.role.row_pool_role()
     }
 
     #[inline]
@@ -1045,7 +1046,7 @@ const DEFAULT_MAX_IO_DEPTH: usize = 64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvictableBufferPoolConfig {
     #[serde(default)]
-    identity: PoolIdentity,
+    role: PoolRole,
     data_swap_file: PathBuf,
     max_file_size: Byte,
     max_mem_size: Byte,
@@ -1057,7 +1058,7 @@ impl Default for EvictableBufferPoolConfig {
     #[inline]
     fn default() -> Self {
         EvictableBufferPoolConfig {
-            identity: PoolIdentity::Invalid,
+            role: PoolRole::Invalid,
             data_swap_file: PathBuf::from(DEFAULT_DATA_SWAP_FILE),
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             max_mem_size: DEFAULT_MAX_MEM_SIZE,
@@ -1069,8 +1070,8 @@ impl Default for EvictableBufferPoolConfig {
 
 impl EvictableBufferPoolConfig {
     #[inline]
-    pub fn identity(mut self, identity: PoolIdentity) -> Self {
-        self.identity = identity;
+    pub fn role(mut self, role: PoolRole) -> Self {
+        self.role = role;
         self
     }
 
@@ -1154,7 +1155,7 @@ impl EvictableBufferPoolConfig {
 
     #[inline]
     pub fn build(self) -> Result<EvictableBufferPool> {
-        self.identity.assert_valid("evictable buffer pool");
+        self.role.assert_valid("evictable buffer pool");
         validate_swap_file_path_candidate(&self.data_swap_file)?;
         // 1. Calculate memory usage.
         let max_file_size = self.max_file_size.as_u64() as usize;
@@ -1178,7 +1179,7 @@ impl EvictableBufferPoolConfig {
         let eviction_arbiter = self.eviction_arbiter_builder.build(max_nbr_in_mem);
 
         // 2. Initialize memory of frames and pages.
-        let arena = QuiescentArena::new(self.identity, max_nbr)?;
+        let arena = QuiescentArena::new(max_nbr)?;
 
         // 3. Create file and initialize AIO manager.
         let io_ctx = AIOContext::new(self.max_io_depth)?;
@@ -1201,6 +1202,7 @@ impl EvictableBufferPoolConfig {
             in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             inflight_io: Arc::new(InflightIO::default()),
             stats: Arc::new(EvictableBufferPoolStats::default()),
+            role: self.role,
             arena,
         };
         Ok(pool)
@@ -1392,7 +1394,7 @@ mod tests {
             let scope = StaticLifetimeScope::new();
             let pool = scope.adopt(
                 EvictableBufferPoolConfig::default()
-                    .identity(crate::buffer::PoolIdentity::Mem)
+                    .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256)
@@ -1509,7 +1511,7 @@ mod tests {
         let pool: &EvictableBufferPool = scope
             .adopt(
                 EvictableBufferPoolConfig::default()
-                    .identity(crate::buffer::PoolIdentity::Mem)
+                    .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(64u64 * 1024 * 130)
                     .max_file_size(128u64 * 1024 * 130)
@@ -1560,7 +1562,7 @@ mod tests {
         let scope = StaticLifetimeScope::new();
         let pool = scope.adopt(
             EvictableBufferPoolConfig::default()
-                .identity(crate::buffer::PoolIdentity::Mem)
+                .role(crate::buffer::PoolRole::Mem)
                 .data_swap_file(temp_dir.path().join("data.bin"))
                 .max_mem_size(1024u64 * 1024 * 64)
                 .max_file_size(1024u64 * 1024 * 128)
@@ -1591,7 +1593,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = StaticLifetime::new_static(
                 EvictableBufferPoolConfig::default()
-                    .identity(crate::buffer::PoolIdentity::Mem)
+                    .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64)
@@ -1633,7 +1635,7 @@ mod tests {
         let pool = scope
             .adopt(
                 EvictableBufferPoolConfig::default()
-                    .identity(crate::buffer::PoolIdentity::Mem)
+                    .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(64u64 * 1024 * 2048)
@@ -1713,7 +1715,7 @@ mod tests {
         let scope = StaticLifetimeScope::new();
         let pool = scope.adopt(
             EvictableBufferPoolConfig::default()
-                .identity(crate::buffer::PoolIdentity::Mem)
+                .role(crate::buffer::PoolRole::Mem)
                 .data_swap_file(temp_dir.path().join("data.bin"))
                 .max_mem_size(1024u64 * 1024 * 10)
                 .max_file_size(1024u64 * 1024 * 16)
@@ -1762,7 +1764,7 @@ mod tests {
             let scope = StaticLifetimeScope::new();
             let pool1 = scope.adopt(
                 EvictableBufferPoolConfig::default()
-                    .identity(crate::buffer::PoolIdentity::Mem)
+                    .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir1.path().join("data1.bin"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64)
@@ -1771,7 +1773,7 @@ mod tests {
             );
             let pool2 = scope.adopt(
                 EvictableBufferPoolConfig::default()
-                    .identity(crate::buffer::PoolIdentity::Index)
+                    .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir2.path().join("data2.bin"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64)

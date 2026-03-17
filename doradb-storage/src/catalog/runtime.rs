@@ -24,7 +24,7 @@ impl CatalogTable {
     ) -> Self {
         let mem = GenericMemTable::new(
             mem_pool,
-            mem_pool.row_pool_identity(),
+            mem_pool.row_pool_role(),
             index_pool,
             index_pool_guard,
             table_id,

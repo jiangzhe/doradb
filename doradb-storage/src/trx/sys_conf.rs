@@ -1,5 +1,6 @@
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
+    PoolRole,
 };
 use crate::catalog::Catalog;
 use crate::catalog::storage::CatalogStorage;
@@ -239,10 +240,10 @@ impl TrxSysConfig {
             CatalogStorage::new(meta_pool, index_pool, table_fs, global_disk_pool.clone()).await?;
         let mut catalog = Catalog::new(catalog_storage).await?;
         let pool_guards = PoolGuards::builder()
-            .push(meta_pool.guard())
-            .push(index_pool.guard())
-            .push(mem_pool.as_static().guard())
-            .push(global_disk_pool.guard())
+            .push(PoolRole::Meta, meta_pool.guard())
+            .push(PoolRole::Index, index_pool.guard())
+            .push(PoolRole::Mem, mem_pool.as_static().guard())
+            .push(PoolRole::Disk, global_disk_pool.guard())
             .build();
 
         // Now we have an empty catalog, all log partitions and buffer pool.

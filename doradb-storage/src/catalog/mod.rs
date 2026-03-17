@@ -13,6 +13,7 @@ use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
+    PoolRole,
 };
 use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
@@ -63,8 +64,8 @@ impl Catalog {
     #[inline]
     pub async fn new(storage: CatalogStorage) -> Result<Self> {
         let pool_guards = PoolGuards::builder()
-            .push(storage.meta_pool.guard())
-            .push(storage.index_pool.guard())
+            .push(PoolRole::Meta, storage.meta_pool.guard())
+            .push(PoolRole::Index, storage.index_pool.guard())
             .build();
         let snapshot = storage.checkpoint_snapshot()?;
         storage

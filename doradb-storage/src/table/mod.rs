@@ -14,7 +14,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuard,
-    PoolGuards, ReadonlyBufferPool, RowPoolIdentity,
+    PoolGuards, ReadonlyBufferPool, RowPoolRole,
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
@@ -91,7 +91,7 @@ pub struct GenericMemTable<P: 'static> {
     pub(crate) table_id: TableID,
     pub(crate) metadata: Arc<TableMetadata>,
     pub(crate) mem_pool: &'static P,
-    pub(crate) row_pool_identity: RowPoolIdentity,
+    pub(crate) row_pool_role: RowPoolRole,
     pub(crate) blk_idx: BlockIndex,
     pub(crate) sec_idx: Box<[SecondaryIndex]>,
 }
@@ -144,7 +144,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         mem_pool: &'static P,
-        row_pool_identity: RowPoolIdentity,
+        row_pool_role: RowPoolRole,
         index_pool: &'static FixedBufferPool,
         index_pool_guard: &crate::buffer::PoolGuard,
         table_id: TableID,
@@ -158,7 +158,7 @@ impl<P: BufferPool> GenericMemTable<P> {
             table_id,
             metadata,
             mem_pool,
-            row_pool_identity,
+            row_pool_role,
             blk_idx,
             sec_idx,
         }
@@ -216,7 +216,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     ) -> PageSharedGuard<RowPage> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = guards
-            .try_row_guard(self.row_pool_identity)
+            .try_row_guard(self.row_pool_role)
             .expect("missing row-page pool guard");
         self.blk_idx
             .get_insert_page(
@@ -237,7 +237,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     ) -> PageExclusiveGuard<RowPage> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = guards
-            .try_row_guard(self.row_pool_identity)
+            .try_row_guard(self.row_pool_role)
             .expect("missing row-page pool guard");
         self.blk_idx
             .get_insert_page_exclusive(
@@ -259,7 +259,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     ) -> PageExclusiveGuard<RowPage> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = guards
-            .try_row_guard(self.row_pool_identity)
+            .try_row_guard(self.row_pool_role)
             .expect("missing row-page pool guard");
         self.blk_idx
             .allocate_row_page_at(
@@ -283,7 +283,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         let row_pool_guard = guards
-            .try_row_guard(self.row_pool_identity)
+            .try_row_guard(self.row_pool_role)
             .expect("missing row-page pool guard");
         let meta_pool_guard = guards.meta_guard();
         let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
@@ -394,7 +394,7 @@ impl Table {
         let metadata = Arc::clone(&active_root.metadata);
         let mem = GenericMemTable::new(
             mem_pool,
-            mem_pool.row_pool_identity(),
+            mem_pool.row_pool_role(),
             index_pool,
             index_pool_guard,
             table_id,
@@ -1037,7 +1037,7 @@ impl Table {
                     .mem_pool()
                     .get_page::<RowPage>(
                         guards
-                            .try_row_guard(self.row_pool_identity)
+                            .try_row_guard(self.row_pool_role)
                             .expect("missing row-page pool guard for recovery"),
                         page_id,
                         LatchFallbackMode::Shared,

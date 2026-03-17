@@ -13,8 +13,8 @@ mod util;
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
-pub use identity::PoolIdentity;
-pub(crate) use identity::RowPoolIdentity;
+pub use identity::PoolRole;
+pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
 pub use readonly::{
     GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey, ReadonlyPageSource,

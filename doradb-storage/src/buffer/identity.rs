@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
-/// Stable identity assigned to one predefined buffer pool.
+/// Predefined selector of one logical buffer-pool role.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PoolIdentity {
+pub enum PoolRole {
     #[default]
     Invalid = 0,
     Meta = 1,
@@ -12,29 +13,57 @@ pub enum PoolIdentity {
     Disk = 4,
 }
 
-impl PoolIdentity {
+impl PoolRole {
     #[inline]
     pub(crate) fn assert_valid(self, context: &'static str) {
         if matches!(self, Self::Invalid) {
-            panic!("invalid pool identity in {context}");
+            panic!("invalid pool role in {context}");
+        }
+    }
+
+    #[inline]
+    pub(crate) fn row_pool_role(self) -> RowPoolRole {
+        match self {
+            Self::Meta => RowPoolRole::Meta,
+            Self::Mem => RowPoolRole::Mem,
+            _ => panic!("pool role {:?} is not a row pool", self),
         }
     }
 }
 
-/// Identity of the row-page pool assigned to one table runtime.
+/// Runtime-only provenance token for one exact buffer-pool instance.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PoolIdentity(usize);
+
+impl PoolIdentity {
+    #[inline]
+    pub(crate) fn from_owner_addr(owner_addr: usize) -> Self {
+        debug_assert_ne!(owner_addr, 0);
+        Self(owner_addr)
+    }
+}
+
+impl fmt::Debug for PoolIdentity {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PoolIdentity({:#x})", self.0)
+    }
+}
+
+/// Selector of the row-page pool assigned to one table runtime.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum RowPoolIdentity {
+pub(crate) enum RowPoolRole {
     Meta = 1,
     Mem = 2,
 }
 
-impl From<RowPoolIdentity> for PoolIdentity {
+impl From<RowPoolRole> for PoolRole {
     #[inline]
-    fn from(value: RowPoolIdentity) -> Self {
+    fn from(value: RowPoolRole) -> Self {
         match value {
-            RowPoolIdentity::Meta => PoolIdentity::Meta,
-            RowPoolIdentity::Mem => PoolIdentity::Mem,
+            RowPoolRole::Meta => PoolRole::Meta,
+            RowPoolRole::Mem => PoolRole::Mem,
         }
     }
 }
