@@ -163,7 +163,7 @@ async fn worker(
     wg: WaitGroup,
 ) {
     let table = engine.catalog().get_table(table_id).await.unwrap();
-    let mut session = engine.new_session();
+    let mut session = engine.try_new_session().unwrap();
     let stop = &*stop;
     let mut id = id_start;
     let mut c = [0u8; 120];
@@ -176,7 +176,7 @@ async fn worker(
         pad.iter_mut().for_each(|b| {
             *b = fastrand::alphabetic() as u8;
         });
-        let trx = session.begin_trx().unwrap();
+        let trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let res = stmt
             .insert_row(
@@ -253,7 +253,7 @@ fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
 /// Sbtest is target table of sysbench.
 #[inline]
 pub async fn sbtest(engine: &Engine) -> TableID {
-    let mut session = engine.new_session();
+    let mut session = engine.try_new_session().unwrap();
 
     let table_id = session
         .create_table(

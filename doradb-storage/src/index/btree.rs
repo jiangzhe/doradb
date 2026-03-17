@@ -1777,10 +1777,9 @@ enum BTreeCompact {
 mod tests {
     use super::*;
     use crate::lifetime::StaticLifetimeScope;
-    use event_listener::Event;
     use rand_distr::{Distribution, Uniform};
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier, mpsc};
     use std::time::{Duration, Instant};
 
     #[derive(Debug, Default)]
@@ -2352,9 +2351,10 @@ mod tests {
                         .await;
                     assert!(res.is_ok());
                 }
-                let event = Event::new();
-                let listener = event.listen();
-                {
+                let (parent_locked_tx, parent_locked_rx) = mpsc::channel();
+                let (insert_started_tx, insert_started_rx) = mpsc::channel();
+                let (release_parent_tx, release_parent_rx) = mpsc::channel();
+                let shared_lock_handle = {
                     let tree = Arc::clone(&tree);
                     let pool_guard = pool_guard.clone();
                     std::thread::spawn(move || {
@@ -2370,21 +2370,34 @@ mod tests {
                             drop(c_guard);
                             let p_guard = p_guard.unwrap();
                             let shared_guard = p_guard.lock_shared_async().await.unwrap();
-                            event.notify(1);
-                            smol::Timer::after(Duration::from_millis(1000)).await;
-                            println!("going to drop");
+                            parent_locked_tx.send(()).unwrap();
+                            release_parent_rx.recv().unwrap();
                             drop(shared_guard);
                         })
-                    });
-                }
-                // wait for another thread to acquire parent's shared lock.
-                listener.await;
+                    })
+                };
+                // Wait for the worker to hold the parent shared lock before starting insert.
+                parent_locked_rx.recv().unwrap();
                 println!("tree height {}", tree.height());
-                key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
-                let res = tree
-                    .insert(&pool_guard, &key, BTreeU64::from(90088), false, 202)
-                    .await;
-                assert!(res.is_ok());
+                let insert_handle = {
+                    let tree = Arc::clone(&tree);
+                    let pool_guard = pool_guard.clone();
+                    std::thread::spawn(move || {
+                        smol::block_on(async {
+                            let mut key = [0u8; 1000];
+                            key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
+                            insert_started_tx.send(()).unwrap();
+                            let res = tree
+                                .insert(&pool_guard, &key, BTreeU64::from(90088), false, 202)
+                                .await;
+                            assert!(res.is_ok());
+                        })
+                    })
+                };
+                insert_started_rx.recv().unwrap();
+                release_parent_tx.send(()).unwrap();
+                shared_lock_handle.join().unwrap();
+                insert_handle.join().unwrap();
                 println!("insert ok");
                 println!("tree height {}", tree.height());
                 let stat = tree.collect_space_statistics(&pool_guard).await;
@@ -2422,19 +2435,17 @@ mod tests {
                         .await;
                     assert!(res.is_ok());
                 }
-                let event = Event::new();
+                let start = Arc::new(Barrier::new((90098u64 - 90088u64) as usize + 1));
                 let mut handles = Vec::with_capacity(10);
                 for j in 90088u64..90098 {
                     let tree = Arc::clone(&tree);
                     let pool_guard = pool_guard.clone();
-                    let listener = event.listen();
+                    let start = Arc::clone(&start);
                     let handle = std::thread::spawn(move || {
+                        start.wait();
                         smol::block_on(async {
                             let mut key = vec![0u8; 1000];
                             key[..8].copy_from_slice(&j.to_be_bytes()[..]);
-
-                            listener.await;
-
                             let res = tree
                                 .insert(&pool_guard, &key, BTreeU64::from(90088), false, 202)
                                 .await;
@@ -2443,9 +2454,10 @@ mod tests {
                     });
                     handles.push(handle);
                 }
-                // wait for another thread to acquire parent's shared lock.
-                event.notify(usize::MAX);
-                smol::Timer::after(Duration::from_millis(500)).await;
+                start.wait();
+                for handle in handles {
+                    handle.join().unwrap();
+                }
                 println!("tree height {}", tree.height());
                 let stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("tree space statistics: {:?}", stat)

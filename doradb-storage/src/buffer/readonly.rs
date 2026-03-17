@@ -402,6 +402,19 @@ impl GlobalReadonlyBufferPool {
     }
 
     #[inline]
+    pub(crate) fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.residency.free_ev.notify(usize::MAX);
+        self.residency.evict_ev.notify(1);
+        {
+            let mut g = self.evict_thread.lock();
+            if let Some(handle) = g.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    #[inline]
     fn invalidate_frame_with_guard(
         &self,
         mut page_guard: PageExclusiveGuard<Page>,
@@ -574,15 +587,7 @@ impl GlobalReadonlyBufferPool {
 
 impl Drop for GlobalReadonlyBufferPool {
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::SeqCst);
-        self.residency.free_ev.notify(usize::MAX);
-        self.residency.evict_ev.notify(1);
-        {
-            let mut g = self.evict_thread.lock();
-            if let Some(handle) = g.take() {
-                handle.join().unwrap();
-            }
-        }
+        self.shutdown();
     }
 }
 
@@ -1328,6 +1333,15 @@ mod tests {
 
     fn frame_page_bytes(cap: usize) -> usize {
         cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
+    }
+
+    #[test]
+    fn test_global_readonly_pool_shutdown_is_idempotent_before_worker_start() {
+        let pool =
+            GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, frame_page_bytes(2)).unwrap();
+
+        pool.shutdown();
+        pool.shutdown();
     }
 
     fn make_metadata() -> Arc<TableMetadata> {

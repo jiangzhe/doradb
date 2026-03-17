@@ -637,7 +637,11 @@ mod tests {
     #[test]
     fn test_table_file() {
         smol::block_on(async {
-            let fs = TableFileSystemConfig::default().build().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .data_dir(temp_dir.path())
+                .build()
+                .unwrap();
             let metadata = Arc::new(TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
@@ -681,7 +685,6 @@ mod tests {
             drop(table_file3);
 
             drop(fs);
-            let _ = std::fs::remove_file("41.tbl");
         });
     }
 
@@ -719,7 +722,11 @@ mod tests {
     #[test]
     fn test_table_file_system() {
         smol::block_on(async {
-            let fs = TableFileSystemConfig::default().build().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let fs = TableFileSystemConfig::default()
+                .data_dir(temp_dir.path())
+                .build()
+                .unwrap();
             let metadata = Arc::new(TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),

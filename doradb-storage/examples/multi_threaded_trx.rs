@@ -121,10 +121,10 @@ fn main() {
 
 #[inline]
 async fn worker(engine: EngineRef, stop: Arc<AtomicBool>, wg: WaitGroup) {
-    let mut session = engine.new_session();
+    let mut session = engine.try_new_session().unwrap();
     let stop = &*stop;
     while !stop.load(Ordering::Relaxed) {
-        let mut trx = session.begin_trx().unwrap();
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx.add_pseudo_redo_log_entry();
         trx.commit().await.unwrap();
     }

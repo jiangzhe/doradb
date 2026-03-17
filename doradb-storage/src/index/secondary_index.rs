@@ -350,11 +350,11 @@ mod tests {
             {
                 let table = engine.catalog().get_table(table_id).await.unwrap();
 
-                let mut session = engine.new_session();
+                let mut session = engine.try_new_session().unwrap();
                 let user_read_set = &[0usize, 1];
                 // insert row.
                 // 0,0; 1,1; 2,2; 3,3; 4,4
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 for i in 0i32..5i32 {
                     let res = table
@@ -365,7 +365,7 @@ mod tests {
                 }
                 stmt.succeed().commit().await.unwrap();
                 // select ... where id = 1
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let res = table
@@ -375,7 +375,7 @@ mod tests {
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
                 // select ... where val = 1
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(1i32)]);
                 let res = table
@@ -385,7 +385,7 @@ mod tests {
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.unwrap().len() == 1);
                 // update val = 0 where id = 1
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let update = vec![UpdateCol {
@@ -399,7 +399,7 @@ mod tests {
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
                 // select ... where val = 0
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
                 let res = table
@@ -409,7 +409,7 @@ mod tests {
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.unwrap().len() == 2);
                 // delete where id = 0
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
                 let res = table
@@ -419,7 +419,7 @@ mod tests {
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.is_ok());
                 // select ... where val = 0
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
                 let res = table
@@ -455,11 +455,11 @@ mod tests {
             {
                 let table = engine.catalog().get_table(table_id).await.unwrap();
 
-                let mut session = engine.new_session();
+                let mut session = engine.try_new_session().unwrap();
                 let user_read_set = &[0usize, 1];
                 // insert row.
                 // 0,0; 1,1; 2,2; 3,3; 4,4
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 for i in 0i32..5i32 {
                     let res = table
@@ -470,7 +470,7 @@ mod tests {
                 }
                 stmt.succeed().commit().await.unwrap();
                 // insert 5,5 and rollback
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let res = table
                     .accessor()
@@ -479,7 +479,7 @@ mod tests {
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;
                 // select ... where id = 5
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(5i32)]);
                 let res = table
@@ -489,7 +489,7 @@ mod tests {
                 stmt.succeed().commit().await.unwrap();
                 assert!(res.not_found());
                 // update val = 0 where id = 1
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let update = vec![UpdateCol {
@@ -503,7 +503,7 @@ mod tests {
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;
                 // select ... where id = 1
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let res = table
@@ -515,7 +515,7 @@ mod tests {
                 let vals = res.unwrap();
                 assert!(vals[0] == Val::from(1i32) && vals[1] == Val::from(1i32));
                 // delete where id = 0
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
                 let res = table
@@ -525,7 +525,7 @@ mod tests {
                 assert!(res.is_ok());
                 stmt.succeed().rollback().await;
                 // select ... where val = 0
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
                 let res = table
@@ -538,7 +538,7 @@ mod tests {
                 assert!(vals[0] == Val::from(0i32) && vals[1] == Val::from(0i32));
 
                 // delete where id = 3, then insert 3,3, then rollback
-                let mut trx = session.begin_trx().unwrap();
+                let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(3i32)]);
                 let mut stmt = trx.start_stmt();
                 let res = table
@@ -557,7 +557,7 @@ mod tests {
                 // manual rollback.
                 trx.rollback().await;
                 // select ... where id = 3
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(3i32)]);
                 let res = table

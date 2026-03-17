@@ -281,6 +281,22 @@ impl EvictableBufferPool {
         self.start_evict_thread();
     }
 
+    #[inline]
+    pub(crate) fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+
+        self.in_mem.close();
+        self.io_client.shutdown();
+        {
+            let mut g = self.io_thread.lock();
+            if let Some(handle) = g.take() {
+                drop(g);
+                handle.join().unwrap();
+            }
+        }
+        let _ = self.pending_io.lock().take();
+    }
+
     /// Reserve a page in memory.
     /// If this function returns true, in-mem page counter is incremented.
     /// Caller should handle the failure of add a page into memory and decrease this number.
@@ -550,21 +566,7 @@ impl BufferPool for EvictableBufferPool {
 impl Drop for EvictableBufferPool {
     #[inline]
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::SeqCst);
-
-        // Close in-mem page set and stop evictor thread.
-        self.in_mem.close();
-
-        // Stop IO thread.
-        self.io_client.shutdown();
-        {
-            let mut g = self.io_thread.lock();
-            if let Some(handle) = g.take() {
-                drop(g);
-                handle.join().unwrap();
-            }
-        }
-        let _ = self.pending_io.lock().take();
+        self.shutdown();
     }
 }
 
@@ -1386,6 +1388,21 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_evictable_buffer_pool_shutdown_is_idempotent_before_workers_start() {
+        let temp_dir = TempDir::new().unwrap();
+        let pool = EvictableBufferPoolConfig::default()
+            .role(crate::buffer::PoolRole::Mem)
+            .data_swap_file(temp_dir.path().join("data.bin"))
+            .max_mem_size(64u64 * 1024 * 1024)
+            .max_file_size(128u64 * 1024 * 1024)
+            .build()
+            .unwrap();
+
+        pool.shutdown();
+        pool.shutdown();
+    }
 
     #[test]
     fn test_evict_buffer_pool_simple() {

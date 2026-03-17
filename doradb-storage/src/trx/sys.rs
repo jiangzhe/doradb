@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::mem;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 pub const GC_BUCKETS: usize = 64;
 
@@ -88,6 +88,7 @@ pub struct TransactionSystem {
     purge_chan: Sender<Purge>,
     /// Purge threads purge unused undo logs, row pages and index entries.
     pub(super) purge_threads: Mutex<Vec<JoinHandle<()>>>,
+    shutdown_started: AtomicBool,
 }
 
 /// One catalog-row redo operation extracted from persisted logs.
@@ -139,6 +140,7 @@ impl TransactionSystem {
             catalog: CachePadded::new(catalog),
             purge_chan,
             purge_threads: Mutex::new(vec![]),
+            shutdown_started: AtomicBool::new(false),
         }
     }
 
@@ -481,6 +483,48 @@ impl TransactionSystem {
         }
         Ok(batch)
     }
+
+    #[inline]
+    pub(crate) fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let log_partitions = &*self.log_partitions;
+        for partition in log_partitions {
+            {
+                let mut group_commit_g = partition.group_commit.lock();
+                group_commit_g.queue.push_back(Commit::Shutdown);
+                if group_commit_g.queue.len() == 1 {
+                    partition.group_commit.notify_one();
+                }
+            }
+            let _ = partition.gc_chan.send(GC::Stop);
+        }
+
+        for partition in log_partitions {
+            if let Some(sync_thread) = partition.io_thread.lock().take() {
+                sync_thread.join().unwrap();
+            }
+            if let Some(gc_thread) = partition.gc_thread.lock().take() {
+                gc_thread.join().unwrap();
+            }
+        }
+
+        let _ = self.purge_chan.send(Purge::Stop);
+        let purge_threads = { mem::take(&mut *self.purge_threads.lock()) };
+        for handle in purge_threads {
+            handle.join().unwrap();
+        }
+
+        for partition in log_partitions {
+            let mut group_commit_g = partition.group_commit.lock();
+            let Some(log_file) = group_commit_g.log_file.take() else {
+                continue;
+            };
+            drop(log_file);
+        }
+    }
 }
 
 #[inline]
@@ -501,42 +545,7 @@ unsafe impl StaticLifetime for TransactionSystem {}
 impl Drop for TransactionSystem {
     #[inline]
     fn drop(&mut self) {
-        let log_partitions = &*self.log_partitions;
-        for partition in log_partitions {
-            // notify sync thread to quit.
-            {
-                let mut group_commit_g = partition.group_commit.lock();
-                group_commit_g.queue.push_back(Commit::Shutdown);
-                if group_commit_g.queue.len() == 1 {
-                    partition.group_commit.notify_one(); // notify sync thread to quit.
-                }
-            }
-            // notify gc thread to quit.
-            let _ = partition.gc_chan.send(GC::Stop);
-        }
-        // wait for sync thread and GC thread to quit.
-        for partition in log_partitions {
-            if let Some(sync_thread) = partition.io_thread.lock().take() {
-                sync_thread.join().unwrap();
-            }
-            if let Some(gc_thread) = partition.gc_thread.lock().take() {
-                gc_thread.join().unwrap();
-            }
-        }
-        // notify purge threads and wait for them to quit.
-        {
-            let _ = self.purge_chan.send(Purge::Stop);
-            let purge_threads = { mem::take(&mut *self.purge_threads.lock()) };
-            for handle in purge_threads {
-                handle.join().unwrap();
-            }
-        }
-        // finally close log files
-        for partition in log_partitions {
-            let mut group_commit_g = partition.group_commit.lock();
-            let log_file = group_commit_g.log_file.take().unwrap();
-            drop(log_file);
-        }
+        self.shutdown();
     }
 }
 
@@ -598,16 +607,16 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             {
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let _ = smol::block_on(trx.commit());
             }
             {
                 let engine = engine.new_ref();
                 std::thread::spawn(move || {
-                    let mut session = engine.new_session();
-                    let trx = session.begin_trx().unwrap();
+                    let mut session = engine.try_new_session().unwrap();
+                    let trx = session.try_begin_trx().unwrap().unwrap();
                     let _ = smol::block_on(trx.commit());
                 })
                 .join()
@@ -864,10 +873,10 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let start = Instant::now();
             for _ in 0..COUNT {
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
             }
@@ -914,10 +923,10 @@ mod tests {
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let s = [1u8; 196];
             for i in 0..COUNT {
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let insert = vec![Val::from(i as i32), Val::from(&s[..])];
                 let res = stmt.insert_row(&table, insert).await;
