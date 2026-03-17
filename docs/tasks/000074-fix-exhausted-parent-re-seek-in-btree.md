@@ -1,7 +1,7 @@
 ---
 id: 000074
 title: Fix Exhausted-Parent Re-seek in BTree Traversal
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-17
 github_issue: 441
 ---
@@ -123,6 +123,37 @@ test module.
 
 ## Implementation Notes
 
+1. Implemented the exhausted-parent strict-successor resume helper in
+   `doradb-storage/src/index/btree.rs` and applied it to all affected resume
+   paths:
+   - `BTreeNodeCursor::next` now resumes an exhausted parent with a key
+     strictly greater than the parent's exclusive upper fence;
+   - `BTreeCompactor::step` now caches the strict-successor form for
+     `ParentDone` resume;
+   - `BTreeCompactor::skip` now also resumes with the strict-successor form;
+   - no changes were made to `BTreeNode` fence semantics or `lookup_child`.
+2. Added a synthetic manual-tree reproducer in the `btree.rs` test module:
+   - introduced `ExhaustedParentResumeFixture` to build the targeted height-2
+     `b"ab"` / `b"ab\0"` boundary layout;
+   - added `test_btree_cursor_advances_past_exhausted_parent_upper_fence`;
+   - added `test_btree_compactor_parent_done_uses_strict_successor_resume_key`.
+3. Verified that the new tests reproduce the old bug under a temporary local
+   revert of the helper behavior:
+   - the cursor regression failed because the second `next()` returned the
+     left leaf again instead of advancing to the right leaf;
+   - the compactor regression failed because it rebuilt `b"ab"` instead of the
+     required strict-successor key `b"ab\0"`;
+   - in this synthetic reproducer the bug manifests as immediate test failure
+     rather than a hang, while larger natural trees can still exhibit the
+     long/apparently-stalled traversal originally reported.
+4. Verification executed for the implemented state:
+   - `cargo test -p doradb-storage --no-default-features test_btree_cursor_advances_past_exhausted_parent_upper_fence -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features test_btree_compactor_parent_done_uses_strict_successor_resume_key -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features btree -- --nocapture`
+5. Delivery tracking:
+   - implementation tracked by GitHub issue `#441`;
+   - pull request opened as `#442` (`fix: exhausted-parent re-seek in btree traversal`);
+   - task resolve checked RFC linkage and found no parent RFC to update.
 
 ## Impacts
 
