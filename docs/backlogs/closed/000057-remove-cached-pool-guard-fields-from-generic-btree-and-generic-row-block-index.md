@@ -32,3 +32,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000071-remove-cached-pool-guard-fields-from-generic-btree-and-row-block-index.md and PR #435
+- Closed By: backlog close
+- Reference: docs/tasks/000071-remove-cached-pool-guard-fields-from-generic-btree-and-row-block-index.md
+- Closed At: 2026-03-17

@@ -1,7 +1,7 @@
 ---
 id: 000071
 title: Remove Cached Pool Guard Fields From Generic BTree And Row Block Index
-status: proposal
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-17
 github_issue: 434
 ---
@@ -115,6 +115,59 @@ against:
    threading rather than cached internal guards.
 
 ## Implementation Notes
+
+1. Removed cached `PoolGuard` ownership from the index cores:
+   - `doradb-storage/src/index/btree.rs` no longer stores a retained guard on
+     `GenericBTree`;
+   - `new`, lookup/update/delete paths, cursor and prefix-scan builders,
+     compaction, shrink, statistics, and destroy flows now take an explicit
+     `&PoolGuard`;
+   - helper layers including `BTreeCoupling`, `BTreeNodeCursor`,
+     `BTreePrefixScan`, `BTreeCompactor`, and `btree_scan.rs` now thread the
+     caller-supplied guard instead of reading `tree.pool_guard`.
+2. Removed cached guard state from the row-block index path and separated pool
+   responsibilities explicitly:
+   - `doradb-storage/src/index/row_block_index.rs` no longer stores
+     `pool_guard: PoolGuard`;
+   - block-index root creation, traversal, `find_row`, and `mem_cursor` now
+     take an explicit meta-pool guard;
+   - row-page allocation and fetch paths continue to take the mem-pool guard
+     explicitly, with `doradb-storage/src/index/block_index.rs` forwarding both
+     guard types where needed.
+3. Threaded explicit index-pool guards through secondary-index wrappers and
+   runtime construction:
+   - `doradb-storage/src/index/unique_index.rs`,
+     `doradb-storage/src/index/non_unique_index.rs`, and
+     `doradb-storage/src/index/secondary_index.rs` now accept explicit index
+     guards for construction and operations;
+   - examples, analysis tools, and index tests were updated to pass explicit
+     guards instead of relying on cached internal state.
+4. Updated runtime call paths to extract fixed-slot guards from `PoolGuards`
+   before touching index structures:
+   - table, catalog, recovery, purge, undo, and session-facing access paths now
+     pass explicit `meta`, `index`, and `mem` guards down to index APIs;
+   - `Table::find_row` and `TableHandle::find_row` now require the caller's
+     guard context;
+   - follow-up cleanup added named `PoolGuards` getters in
+     `doradb-storage/src/buffer/mod.rs` and removed
+     `TableAccessor::index_pool_guard`.
+5. Fixed regressions exposed while landing the refactor:
+   - `test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_with_missing_page_id`
+     was hanging because local `PoolGuards` outlived `engine` teardown in the
+     test; the purge tests now rely on normal reverse drop order instead of
+     manually dropping `engine` while guards are still alive;
+   - final cleanup made the touched public API surface rustdoc-complete and
+     restored a clean `clippy -D warnings` run.
+6. Verification executed for this implementation:
+   - `cargo test -p doradb-storage --no-default-features trx::purge::tests::test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_with_missing_page_id -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features trx::purge::tests:: -- --nocapture`
+   - `cargo test -p doradb-storage --no-default-features -q`
+   - `cargo test -p doradb-storage -q`
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+7. Delivery tracking:
+   - task issue: `#434`
+   - implementation PR: `#435`
+   - source backlog `000057` is closed during this resolve pass
 
 ## Impacts
 
