@@ -15,8 +15,7 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
-    PoolGuards,
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
 };
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
@@ -37,6 +36,7 @@ use flume::Receiver;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+/// Per-row recovery map used while rebuilding one row page from redo.
 pub struct RecoverMap {
     create_cts: TrxID,
     entries: Vec<Option<TrxID>>,
@@ -174,6 +174,7 @@ pub(super) struct RecoveryDeps {
     pub(super) global_disk_pool: StaticHandle<GlobalReadonlyBufferPool>,
 }
 
+/// Redo-log recovery coordinator for catalog metadata and user tables.
 pub struct LogRecovery<'a> {
     index_pool: &'static FixedBufferPool,
     mem_pool: &'static EvictableBufferPool,
@@ -226,6 +227,7 @@ impl<'a> LogRecovery<'a> {
         }
     }
 
+    /// Replay all redo streams, rebuild indexes, and return reopened partition streams.
     #[inline]
     pub async fn recover_all(mut self) -> Result<Vec<LogPartitionStream>> {
         self.bootstrap_checkpointed_user_tables().await?;
@@ -363,9 +365,7 @@ impl<'a> LogRecovery<'a> {
         let mut page_guard = self
             .mem_pool
             .get_page::<RowPage>(
-                self.pool_guards
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard for recovery row-page refresh"),
+                self.pool_guards.mem_guard(),
                 page_id,
                 LatchFallbackMode::Exclusive,
             )

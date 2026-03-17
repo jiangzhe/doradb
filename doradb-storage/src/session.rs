@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Per-client execution context bound to one engine instance.
 pub struct Session {
     state: Arc<SessionState>,
 }
@@ -26,32 +27,38 @@ impl Session {
         }
     }
 
+    /// Returns the engine handle bound to this session.
     #[inline]
     pub fn engine(&self) -> &EngineRef {
         &self.state.engine_ref
     }
 
+    /// Returns the reusable pool guards owned by this session.
     #[inline]
     pub fn pool_guards(&self) -> &PoolGuards {
         self.state.pool_guards()
     }
 
+    /// Returns whether the session currently owns an active transaction.
     #[inline]
     pub fn in_trx(&self) -> bool {
         self.state.in_trx.load(Ordering::Relaxed)
     }
 
+    /// Remove and return the cached insert page for a table, if present.
     #[inline]
     pub fn load_active_insert_page(&mut self, table_id: TableID) -> Option<(PageID, RowID)> {
         self.state.load_active_insert_page(table_id)
     }
 
+    /// Cache the current insert page for a table.
     #[inline]
     pub fn save_active_insert_page(&mut self, table_id: TableID, page_id: PageID, row_id: RowID) {
         self.state
             .save_active_insert_page(table_id, page_id, row_id);
     }
 
+    /// Begin a new transaction if the session is currently idle.
     #[inline]
     pub fn begin_trx(&mut self) -> Option<ActiveTrx> {
         if self.state.in_trx.load(Ordering::Relaxed) {
@@ -191,8 +198,11 @@ impl Session {
         debug_assert!(old_root.is_none());
 
         // 8. Prepare in-memory representation of new table
+        let meta_pool_guard = self.pool_guards().meta_guard();
+        let index_pool_guard = self.pool_guards().index_guard();
         let blk_idx = BlockIndex::new(
             engine.meta_pool,
+            meta_pool_guard,
             table_file.active_root().pivot_row_id,
             table_file.active_root().column_block_index_root,
         )
@@ -201,6 +211,7 @@ impl Session {
             Table::new(
                 engine.mem_pool,
                 engine.index_pool,
+                index_pool_guard,
                 engine.disk_pool,
                 table_id,
                 blk_idx,
@@ -217,6 +228,7 @@ impl Session {
     }
 }
 
+/// Shared mutable state referenced by transactions started from one [`Session`].
 pub struct SessionState {
     engine_ref: EngineRef,
     pool_guards: PoolGuards,
@@ -226,6 +238,7 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Create a new session state and populate its default pool guards.
     #[inline]
     pub fn new(engine_ref: EngineRef) -> Self {
         let pool_guards = PoolGuards::builder()
@@ -243,16 +256,19 @@ impl SessionState {
         }
     }
 
+    /// Returns the engine handle for this session state.
     #[inline]
     pub fn engine(&self) -> &EngineRef {
         &self.engine_ref
     }
 
+    /// Returns the guard bundle owned by this session state.
     #[inline]
     pub fn pool_guards(&self) -> &PoolGuards {
         &self.pool_guards
     }
 
+    /// Returns the last committed transaction timestamp observed by this session.
     #[inline]
     pub fn last_cts(&self) -> Option<TrxID> {
         let trx_id = self.last_cts.load(Ordering::Relaxed);
@@ -262,23 +278,27 @@ impl SessionState {
         Some(trx_id)
     }
 
+    /// Mark the session transaction as committed at the given CTS.
     #[inline]
     pub fn commit(&self, cts: TrxID) {
         self.last_cts.store(cts, Ordering::SeqCst);
         self.in_trx.store(false, Ordering::SeqCst);
     }
 
+    /// Mark the session transaction as rolled back.
     #[inline]
     pub fn rollback(&self) {
         self.in_trx.store(false, Ordering::SeqCst);
     }
 
+    /// Remove and return the cached insert page for a table, if present.
     #[inline]
     pub fn load_active_insert_page(&self, table_id: TableID) -> Option<(PageID, RowID)> {
         let mut g = self.active_insert_pages.lock();
         g.remove(&table_id)
     }
 
+    /// Cache the active insert page for a table.
     #[inline]
     pub fn save_active_insert_page(&self, table_id: TableID, page_id: PageID, row_id: RowID) {
         let mut g = self.active_insert_pages.lock();

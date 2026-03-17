@@ -195,7 +195,10 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         user_read_set: &[usize],
         row_id: RowID,
     ) -> SelectMvcc {
-        let location = match self.try_find_row(row_id, self.storage).await {
+        let location = match self
+            .try_find_row(stmt.pool_guards(), row_id, self.storage)
+            .await
+        {
             Ok(location) => location,
             Err(err) => return SelectMvcc::Err(err),
         };
@@ -277,19 +280,20 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
     }
 
     #[inline]
-    async fn insert_index_no_trx(&self, key: SelectKey, row_id: RowID) {
+    async fn insert_index_no_trx(&self, guards: &PoolGuards, key: SelectKey, row_id: RowID) {
+        let index_pool_guard = guards.index_guard();
         if self.metadata().index_specs[key.index_no].unique() {
             let res = self.sec_idx()[key.index_no]
                 .unique()
                 .unwrap()
-                .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                .insert_if_not_exists(index_pool_guard, &key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
             assert!(res.is_ok());
         } else {
             self.sec_idx()[key.index_no]
                 .non_unique()
                 .unwrap()
-                .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                .insert_if_not_exists(index_pool_guard, &key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
     }
@@ -875,17 +879,23 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
     }
 
     #[inline]
-    async fn delete_index_directly(&self, key: &SelectKey, row_id: RowID) -> bool {
+    async fn delete_index_directly(
+        &self,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        row_id: RowID,
+    ) -> bool {
         let index_schema = &self.metadata().index_specs[key.index_no];
+        let index_pool_guard = guards.index_guard();
         if index_schema.unique() {
             let index = self.sec_idx()[key.index_no].unique().unwrap();
             index
-                .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+                .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await
         } else {
             let index = self.sec_idx()[key.index_no].non_unique().unwrap();
             index
-                .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+                .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await
         }
     }
@@ -898,8 +908,12 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         key: &SelectKey,
         row_id: RowID,
     ) -> bool {
+        let index_pool_guard = guards.index_guard();
         let (page_guard, row_id) = loop {
-            match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await {
+            match index
+                .lookup(index_pool_guard, &key.vals, MIN_SNAPSHOT_TS)
+                .await
+            {
                 None => return false, // Another thread deleted this entry.
                 Some((index_row_id, deleted)) => {
                     if !deleted || index_row_id != row_id {
@@ -910,10 +924,16 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         // So we skip to delete it.
                         return false;
                     }
-                    match self.find_row(row_id, self.storage).await {
+                    match self.find_row(guards, row_id, self.storage).await {
                         RowLocation::NotFound => {
                             return index
-                                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                                .compare_delete(
+                                    index_pool_guard,
+                                    &key.vals,
+                                    row_id,
+                                    false,
+                                    MIN_SNAPSHOT_TS,
+                                )
                                 .await;
                         }
                         RowLocation::LwcPage(..) => todo!("lwc page"),
@@ -946,7 +966,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         // data or version chain.
         if !access.any_version_matches_key(self.metadata(), key) {
             return index
-                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                .compare_delete(index_pool_guard, &key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         false
@@ -960,9 +980,10 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         key: &SelectKey,
         row_id: RowID,
     ) -> bool {
+        let index_pool_guard = guards.index_guard();
         let (page_guard, row_id) = loop {
             match index
-                .lookup_unique(&key.vals, row_id, MIN_SNAPSHOT_TS)
+                .lookup_unique(index_pool_guard, &key.vals, row_id, MIN_SNAPSHOT_TS)
                 .await
             {
                 None => return false, // Another thread deleted this entry.
@@ -975,10 +996,16 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         // So we skip to delete it.
                         return false;
                     }
-                    match self.find_row(row_id, self.storage).await {
+                    match self.find_row(guards, row_id, self.storage).await {
                         RowLocation::NotFound => {
                             return index
-                                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                                .compare_delete(
+                                    index_pool_guard,
+                                    &key.vals,
+                                    row_id,
+                                    false,
+                                    MIN_SNAPSHOT_TS,
+                                )
                                 .await;
                         }
                         RowLocation::LwcPage(..) => todo!("lwc page"),
@@ -1011,7 +1038,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         // data or version chain.
         if !access.any_version_matches_key(self.metadata(), key) {
             return index
-                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                .compare_delete(index_pool_guard, &key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         false
@@ -1136,7 +1163,10 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
     ) -> LinkForUniqueIndex {
         debug_assert!(old_id != new_id);
         let (old_guard, old_id) = loop {
-            match self.find_row(old_id, self.storage).await {
+            match self
+                .find_row(stmt.pool_guards(), old_id, self.storage)
+                .await
+            {
                 RowLocation::NotFound => return LinkForUniqueIndex::None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
@@ -1189,9 +1219,10 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> InsertIndex {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
+        let index_pool_guard = stmt.pool_guards().index_guard();
         loop {
             match index
-                .insert_if_not_exists(&key.vals, row_id, false, stmt.trx.sts)
+                .insert_if_not_exists(index_pool_guard, &key.vals, row_id, false, stmt.trx.sts)
                 .await
             {
                 IndexInsert::Ok(merged) => {
@@ -1224,6 +1255,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                             // so our update can fail.
                             match index
                                 .compare_exchange(
+                                    index_pool_guard,
                                     &key.vals,
                                     old_row_id.deleted(),
                                     row_id,
@@ -1259,6 +1291,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                             // update the index. Only one should succeed and the other will fail.
                             match index
                                 .compare_exchange(
+                                    index_pool_guard,
                                     &key.vals,
                                     old_row_id.deleted(),
                                     row_id,
@@ -1300,9 +1333,10 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
     ) -> InsertIndex {
         let index = self.sec_idx()[key.index_no].non_unique().unwrap();
+        let index_pool_guard = stmt.pool_guards().index_guard();
         // For non-unique index, it's guaranteed to be success.
         match index
-            .insert_if_not_exists(&key.vals, row_id, false, stmt.trx.sts)
+            .insert_if_not_exists(index_pool_guard, &key.vals, row_id, false, stmt.trx.sts)
             .await
         {
             IndexInsert::Ok(merged) => {
@@ -1322,7 +1356,10 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
         key: SelectKey,
     ) {
-        let res = index.mask_as_deleted(&key.vals, row_id, stmt.trx.sts).await;
+        let index_pool_guard = stmt.pool_guards().index_guard();
+        let res = index
+            .mask_as_deleted(index_pool_guard, &key.vals, row_id, stmt.trx.sts)
+            .await;
         debug_assert!(res); // should always succeed.
         stmt.push_delete_index_undo(self.table_id(), row_id, key, true);
     }
@@ -1335,7 +1372,10 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
         key: SelectKey,
     ) {
-        let res = index.mask_as_deleted(&key.vals, row_id, stmt.trx.sts).await;
+        let index_pool_guard = stmt.pool_guards().index_guard();
+        let res = index
+            .mask_as_deleted(index_pool_guard, &key.vals, row_id, stmt.trx.sts)
+            .await;
         debug_assert!(res);
         stmt.push_delete_index_undo(self.table_id(), row_id, key, false);
     }
@@ -1353,10 +1393,17 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
+        let index_pool_guard = stmt.pool_guards().index_guard();
         loop {
             // new_row_id is guaranteed to be not in the index.
             match index
-                .insert_if_not_exists(&new_key.vals, new_row_id, false, stmt.trx.sts)
+                .insert_if_not_exists(
+                    index_pool_guard,
+                    &new_key.vals,
+                    new_row_id,
+                    false,
+                    stmt.trx.sts,
+                )
                 .await
             {
                 IndexInsert::Ok(merged) => {
@@ -1399,6 +1446,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         // But I think the case is rare so keep as is.
                         match index
                             .compare_exchange(
+                                index_pool_guard,
                                 &new_key.vals,
                                 old_row_id.deleted(),
                                 new_row_id,
@@ -1443,6 +1491,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                             // so we can update index to point to self
                             match index
                                 .compare_exchange(
+                                    index_pool_guard,
                                     &new_key.vals,
                                     index_row_id,
                                     new_row_id,
@@ -1485,6 +1534,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                             // So below operation must succeed.
                             match index
                                 .compare_exchange(
+                                    index_pool_guard,
                                     &new_key.vals,
                                     index_row_id,
                                     new_row_id,
@@ -1531,9 +1581,16 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_row_id: RowID,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
+        let index_pool_guard = stmt.pool_guards().index_guard();
         // new_row_id is guaranteed to be not in the index.
         match index
-            .insert_if_not_exists(&new_key.vals, new_row_id, false, stmt.trx.sts)
+            .insert_if_not_exists(
+                index_pool_guard,
+                &new_key.vals,
+                new_row_id,
+                false,
+                stmt.trx.sts,
+            )
             .await
         {
             IndexInsert::Ok(merged) => {
@@ -1559,8 +1616,15 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_row_id: RowID,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
+        let index_pool_guard = stmt.pool_guards().index_guard();
         match index
-            .compare_exchange(&key.vals, old_row_id, new_row_id, stmt.trx.sts)
+            .compare_exchange(
+                index_pool_guard,
+                &key.vals,
+                old_row_id,
+                new_row_id,
+                stmt.trx.sts,
+            )
             .await
         {
             IndexCompareExchange::Ok => {
@@ -1589,9 +1653,10 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_row_id: RowID,
     ) -> UpdateIndex {
         debug_assert!(old_row_id != new_row_id);
+        let index_pool_guard = stmt.pool_guards().index_guard();
         // insert new entry.
         let res = index
-            .insert_if_not_exists(&key.vals, new_row_id, false, stmt.trx.sts)
+            .insert_if_not_exists(index_pool_guard, &key.vals, new_row_id, false, stmt.trx.sts)
             .await;
         debug_assert!(res.is_ok());
         stmt.push_insert_non_unique_index_undo(self.table_id(), new_row_id, key.clone(), false);
@@ -1615,6 +1680,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> UpdateIndex {
+        let index_pool_guard = stmt.pool_guards().index_guard();
         loop {
             // This is case for one transaction or multiple transactions to update
             // key of the same row back and forth.
@@ -1627,7 +1693,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
             // the delete flag) if key and row id all match.
             // So we set merge_if_match_deleted to true.
             match index
-                .insert_if_not_exists(&new_key.vals, row_id, true, stmt.trx.sts)
+                .insert_if_not_exists(index_pool_guard, &new_key.vals, row_id, true, stmt.trx.sts)
                 .await
             {
                 IndexInsert::Ok(merged) => {
@@ -1655,6 +1721,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                             // no old row found.
                             match index
                                 .compare_exchange(
+                                    index_pool_guard,
                                     &new_key.vals,
                                     index_row_id.deleted(),
                                     row_id,
@@ -1689,6 +1756,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                             // we must succeed on updating index.
                             match index
                                 .compare_exchange(
+                                    index_pool_guard,
                                     &new_key.vals,
                                     index_row_id.deleted(),
                                     row_id,
@@ -1733,6 +1801,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_key: SelectKey,
         row_id: RowID,
     ) -> UpdateIndex {
+        let index_pool_guard = stmt.pool_guards().index_guard();
         // This is case for one transaction or multiple transactions to update
         // key of the same row back and forth.
         // e.g. update k=1 to k=2, then update k=2 to k=1, ...
@@ -1744,7 +1813,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         // the delete flag) if key and row id all match.
         // So we set merge_if_match_deleted to true.
         match index
-            .insert_if_not_exists(&new_key.vals, row_id, true, stmt.trx.sts)
+            .insert_if_not_exists(index_pool_guard, &new_key.vals, row_id, true, stmt.trx.sts)
             .await
         {
             IndexInsert::Ok(merged) => {
@@ -1829,7 +1898,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         match self.sec_idx()[key.index_no]
             .unique()
             .unwrap()
-            .lookup(&key.vals, stmt.trx.sts)
+            .lookup(stmt.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
             .await
         {
             None => SelectMvcc::NotFound,
@@ -1855,11 +1924,11 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         let (page_guard, row_id) = match self.sec_idx()[key.index_no]
             .unique()
             .unwrap()
-            .lookup(&key.vals, MIN_SNAPSHOT_TS)
+            .lookup(guards.index_guard(), &key.vals, MIN_SNAPSHOT_TS)
             .await
         {
             None => return None,
-            Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
+            Some((row_id, _)) => match self.find_row(guards, row_id, self.storage).await {
                 RowLocation::NotFound => return None,
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
@@ -1920,7 +1989,12 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         self.sec_idx()[key.index_no]
             .non_unique()
             .unwrap()
-            .lookup(&key.vals, &mut row_ids, stmt.trx.sts)
+            .lookup(
+                stmt.pool_guards().index_guard(),
+                &key.vals,
+                &mut row_ids,
+                stmt.trx.sts,
+            )
             .await;
         let mut res = vec![];
         for row_id in row_ids {
@@ -2004,7 +2078,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
             }
             // update index
             for key in keys {
-                self.insert_index_no_trx(key, row_id).await;
+                self.insert_index_no_trx(guards, key, row_id).await;
             }
             row.finish_insert();
             // Cache insert page.
@@ -2024,9 +2098,15 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
-            let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
+            let (page_guard, row_id) = match index
+                .lookup(stmt.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+                .await
+            {
                 None => return UpdateMvcc::NotFound,
-                Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
+                Some((row_id, _)) => match self
+                    .find_row(stmt.pool_guards(), row_id, self.storage)
+                    .await
+                {
                     RowLocation::NotFound => return UpdateMvcc::NotFound,
                     RowLocation::LwcPage(..) => todo!("lwc page"),
                     RowLocation::RowPage(page_id) => {
@@ -2133,9 +2213,15 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
-            let (page_guard, row_id) = match index.lookup(&key.vals, stmt.trx.sts).await {
+            let (page_guard, row_id) = match index
+                .lookup(stmt.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+                .await
+            {
                 None => return DeleteMvcc::NotFound,
-                Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
+                Some((row_id, _)) => match self
+                    .find_row(stmt.pool_guards(), row_id, self.storage)
+                    .await
+                {
                     RowLocation::NotFound => return DeleteMvcc::NotFound,
                     RowLocation::LwcPage(..) => {
                         let deletion_buffer = self
@@ -2214,9 +2300,13 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx()[key.index_no].unique().unwrap();
-        let (mut page_guard, row_id) = match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await {
+        let index_pool_guard = guards.index_guard();
+        let (mut page_guard, row_id) = match index
+            .lookup(index_pool_guard, &key.vals, MIN_SNAPSHOT_TS)
+            .await
+        {
             None => unreachable!(),
-            Some((row_id, _)) => match self.find_row(row_id, self.storage).await {
+            Some((row_id, _)) => match self.find_row(guards, row_id, self.storage).await {
                 RowLocation::NotFound => unreachable!(),
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
@@ -2244,7 +2334,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         let keys = self.metadata().keys_for_delete(row);
         // delete index immediately.
         for key in keys {
-            let res = self.delete_index_directly(&key, row_id).await;
+            let res = self.delete_index_directly(guards, &key, row_id).await;
             assert!(res);
         }
         page.set_deleted_exclusive(row_idx, true);

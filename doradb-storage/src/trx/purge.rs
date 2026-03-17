@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuardSlot, PoolGuards};
+use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
 use crate::latch::LatchFallbackMode;
 use crate::row::RowPage;
@@ -204,13 +204,7 @@ impl TransactionSystem {
     ) {
         for page_id in gc_row_pages {
             let page_guard = mem_pool
-                .get_page::<RowPage>(
-                    guards
-                        .try_guard(PoolGuardSlot::Mem)
-                        .expect("missing mem pool guard for purge row-page deallocation"),
-                    page_id,
-                    LatchFallbackMode::Exclusive,
-                )
+                .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -401,12 +395,14 @@ impl GCBucket {
     }
 }
 
+/// Messages sent from commit processing to GC analyzers.
 pub enum GC {
     Stop,
     // transaction list per gc bucket.
     Commit(HashMap<usize, Vec<CommittedTrx>>),
 }
 
+/// Commands sent from GC analyzers to purge workers.
 pub enum Purge {
     Stop,
     Next,
@@ -431,6 +427,7 @@ trait PurgeLoop {
     );
 }
 
+/// Single-threaded purge-loop implementation.
 #[derive(Default)]
 pub struct PurgeSingleThreaded;
 
@@ -487,6 +484,7 @@ impl PurgeLoop for PurgeSingleThreaded {
     }
 }
 
+/// Dispatcher that fans purge tasks out to executor threads.
 pub struct PurgeDispatcher(Vec<Sender<PurgeTask>>);
 
 impl PurgeLoop for PurgeDispatcher {
@@ -563,6 +561,7 @@ impl PurgeLoop for PurgeDispatcher {
     }
 }
 
+/// Worker that executes dispatched purge tasks.
 #[derive(Default)]
 pub struct PurgeExecutor;
 
@@ -690,11 +689,12 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
             drop(session);
+            let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1001i32)];
             let (row_id, _) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
-                .lookup(&key, MAX_SNAPSHOT_TS)
+                .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             let status = Arc::new(SharedTrxStatus::global_visible());
@@ -739,8 +739,6 @@ mod tests {
                 Some(DeleteMarker::Ref(_)) => panic!("delete marker should be promoted"),
                 None => panic!("delete marker should exist"),
             }
-            drop(table);
-            drop(engine);
         });
     }
 
@@ -777,11 +775,12 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
             drop(session);
+            let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1002i32)];
             let (row_id, _) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
-                .lookup(&key, MAX_SNAPSHOT_TS)
+                .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
@@ -830,8 +829,6 @@ mod tests {
                 }
                 None => panic!("delete marker should exist"),
             }
-            drop(table);
-            drop(engine);
         });
     }
 
@@ -868,14 +865,15 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
             drop(session);
+            let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1003i32)];
             let (row_id, _) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
-                .lookup(&key, MAX_SNAPSHOT_TS)
+                .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
-            let page_id = match table.find_row(row_id).await {
+            let page_id = match table.find_row(&pool_guards, row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcPage(..) | RowLocation::NotFound => unreachable!(),
             };
@@ -934,8 +932,6 @@ mod tests {
                 Some(DeleteMarker::Ref(_)) => panic!("delete marker should be promoted"),
                 None => panic!("delete marker should exist"),
             }
-            drop(table);
-            drop(engine);
         });
     }
 
@@ -972,14 +968,15 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
             drop(session);
+            let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1004i32)];
             let (row_id, _) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
-                .lookup(&key, MAX_SNAPSHOT_TS)
+                .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
-            let page_id = match table.find_row(row_id).await {
+            let page_id = match table.find_row(&pool_guards, row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcPage(..) | RowLocation::NotFound => unreachable!(),
             };
@@ -1042,8 +1039,6 @@ mod tests {
                 }
                 None => panic!("delete marker should exist"),
             }
-            drop(table);
-            drop(engine);
         });
     }
 
@@ -1127,8 +1122,6 @@ mod tests {
                 }
             }
             drop(session);
-            drop(table);
-            drop(engine);
         });
     }
 
@@ -1216,12 +1209,15 @@ mod tests {
             }
             if gc_timeout {
                 // see which one is not purged, and its cts.
+                let pool_guards = full_pool_guards(&engine);
                 let index = table.sec_idx()[0].unique().unwrap();
                 let mut remained_row_ids = vec![];
-                index.scan_values(&mut remained_row_ids, 100).await;
+                index
+                    .scan_values(pool_guards.index_guard(), &mut remained_row_ids, 100)
+                    .await;
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
-                let location = table.find_row(row_id).await;
+                let location = table.find_row(&pool_guards, row_id).await;
                 let page_id = match location {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
@@ -1244,8 +1240,6 @@ mod tests {
                 engine.trx_sys.global_visible_sts()
             );
             drop(session);
-            drop(table);
-            drop(engine);
         });
     }
 }

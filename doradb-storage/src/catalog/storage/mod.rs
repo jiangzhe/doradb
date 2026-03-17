@@ -5,7 +5,7 @@ mod object;
 mod tables;
 
 use crate::buffer::{
-    FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyFileID,
+    BufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyFileID,
 };
 use crate::catalog::runtime::CatalogTable;
 use crate::catalog::storage::columns::*;
@@ -30,6 +30,7 @@ pub(crate) const CATALOG_MTB_READONLY_FILE_ID: ReadonlyFileID = USER_OBJ_ID_STAR
 /// Runtime storage container for all catalog logical tables.
 pub struct CatalogStorage {
     pub(super) meta_pool: &'static FixedBufferPool,
+    pub(super) index_pool: &'static FixedBufferPool,
     tables: Box<[Arc<CatalogTable>]>,
     next_user_obj_id: ObjID,
     mtb: Arc<MultiTableFile>,
@@ -46,6 +47,8 @@ impl CatalogStorage {
         global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
     ) -> Result<Self> {
         let global_disk_pool = global_disk_pool.into();
+        let meta_pool_guard = meta_pool.guard();
+        let index_pool_guard = index_pool.guard();
         let mtb = table_fs.open_or_create_multi_table_file().await?;
         let mtb_snapshot = mtb.load_snapshot()?;
         let disk_pool = ReadonlyBufferPool::new_with_handle(
@@ -65,14 +68,23 @@ impl CatalogStorage {
             // make sure table id matches.
             assert_eq!(cat.len(), *table_id as usize);
             let metadata = Arc::new(metadata.clone());
-            let blk_idx = BlockIndex::new_catalog(meta_pool).await;
+            let blk_idx = BlockIndex::new_catalog(meta_pool, &meta_pool_guard).await;
             let table = Arc::new(
-                CatalogTable::new(meta_pool, index_pool, *table_id, blk_idx, metadata).await,
+                CatalogTable::new(
+                    meta_pool,
+                    index_pool,
+                    &index_pool_guard,
+                    *table_id,
+                    blk_idx,
+                    metadata,
+                )
+                .await,
             );
             cat.push(table);
         }
         let storage = CatalogStorage {
             meta_pool,
+            index_pool,
             tables: cat.into_boxed_slice(),
             next_user_obj_id: mtb_snapshot.meta.next_user_obj_id,
             mtb,

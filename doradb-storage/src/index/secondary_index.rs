@@ -1,4 +1,4 @@
-use crate::buffer::{BufferPool, FixedBufferPool};
+use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
 use crate::index::btree::GenericBTree;
 use crate::index::btree_key::{BTreeKey, BTreeKeyEncoder};
@@ -28,6 +28,7 @@ impl<P: BufferPool> GenericSecondaryIndex<P> {
     #[inline]
     pub async fn new<F: Fn(usize) -> ValType>(
         index_pool: &'static P,
+        index_pool_guard: &PoolGuard,
         index_no: usize,
         index_spec: &IndexSpec,
         ty_infer: F,
@@ -41,7 +42,7 @@ impl<P: BufferPool> GenericSecondaryIndex<P> {
             .collect();
         if index_spec.unique() {
             let encoder = BTreeKeyEncoder::new(types);
-            let tree = GenericBTree::new(index_pool, true, ts).await;
+            let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await;
             let kind = GenericIndexKind::Unique(GenericUniqueBTreeIndex::new(tree, encoder));
             GenericSecondaryIndex { index_no, kind }
         } else {
@@ -49,7 +50,7 @@ impl<P: BufferPool> GenericSecondaryIndex<P> {
             // ensure uniqueness(which is required by BTree implementation).
             types.push(ValType::new(ValKind::U64, false));
             let encoder = BTreeKeyEncoder::new(types);
-            let tree = GenericBTree::new(index_pool, true, ts).await;
+            let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await;
             let kind = GenericIndexKind::NonUnique(GenericNonUniqueBTreeIndex::new(tree, encoder));
             GenericSecondaryIndex { index_no, kind }
         }

@@ -13,8 +13,8 @@ pub use recover::*;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
-    PoolGuards, ReadonlyBufferPool,
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuard,
+    PoolGuardSlot, PoolGuards, ReadonlyBufferPool,
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
@@ -96,12 +96,14 @@ pub struct GenericMemTable<P: 'static> {
     pub(crate) sec_idx: Box<[SecondaryIndex]>,
 }
 
+/// Persisted column-store attachments associated with a user table runtime.
 pub struct ColumnStorage {
     pub(crate) file: Arc<TableFile>,
     pub(crate) disk_pool: ReadonlyBufferPool,
     pub(crate) deletion_buffer: ColumnDeletionBuffer,
 }
 
+/// Runtime handle for a user table, combining in-memory and persisted storage.
 pub struct Table {
     pub(crate) mem: GenericMemTable<EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
@@ -132,13 +134,22 @@ impl From<RowPoolSlot> for PoolGuardSlot {
 #[inline]
 pub(crate) async fn build_secondary_indexes(
     index_pool: &'static FixedBufferPool,
+    index_pool_guard: &PoolGuard,
     metadata: &TableMetadata,
     index_ts: TrxID,
 ) -> Box<[SecondaryIndex]> {
     let mut sec_idx = Vec::with_capacity(metadata.index_specs.len());
     for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
         let ty_infer = |col_no: usize| metadata.col_type(col_no);
-        let si = SecondaryIndex::new(index_pool, index_no, index_spec, ty_infer, index_ts).await;
+        let si = SecondaryIndex::new(
+            index_pool,
+            index_pool_guard,
+            index_no,
+            index_spec,
+            ty_infer,
+            index_ts,
+        )
+        .await;
         sec_idx.push(si);
     }
     sec_idx.into_boxed_slice()
@@ -146,16 +157,19 @@ pub(crate) async fn build_secondary_indexes(
 
 impl<P: BufferPool> GenericMemTable<P> {
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         mem_pool: &'static P,
         row_pool_slot: RowPoolSlot,
         index_pool: &'static FixedBufferPool,
+        index_pool_guard: &crate::buffer::PoolGuard,
         table_id: TableID,
         metadata: Arc<TableMetadata>,
         blk_idx: BlockIndex,
         index_ts: TrxID,
     ) -> Self {
-        let sec_idx = build_secondary_indexes(index_pool, &metadata, index_ts).await;
+        let sec_idx =
+            build_secondary_indexes(index_pool, index_pool_guard, &metadata, index_ts).await;
         GenericMemTable {
             table_id,
             metadata,
@@ -166,31 +180,37 @@ impl<P: BufferPool> GenericMemTable<P> {
         }
     }
 
+    /// Returns the logical table id of this runtime.
     #[inline]
     pub fn table_id(&self) -> TableID {
         self.table_id
     }
 
+    /// Returns the immutable metadata for this table.
     #[inline]
     pub fn metadata(&self) -> &TableMetadata {
         &self.metadata
     }
 
+    /// Returns the buffer pool used for in-memory row pages.
     #[inline]
     pub fn mem_pool(&self) -> &'static P {
         self.mem_pool
     }
 
+    /// Returns the row block index used by this table.
     #[inline]
     pub fn blk_idx(&self) -> &BlockIndex {
         &self.blk_idx
     }
 
+    /// Returns the secondary-index array owned by this table.
     #[inline]
     pub fn sec_idx(&self) -> &[SecondaryIndex] {
         &self.sec_idx
     }
 
+    /// Returns the row-id boundary between persisted and in-memory rows.
     #[inline]
     pub fn pivot_row_id(&self) -> RowID {
         self.blk_idx.pivot_row_id()
@@ -210,11 +230,18 @@ impl<P: BufferPool> GenericMemTable<P> {
         guards: &PoolGuards,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
+        let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = guards
             .try_guard(self.row_pool_slot.into())
             .expect("missing row-page pool guard");
         self.blk_idx
-            .get_insert_page(self.mem_pool, row_pool_guard, &self.metadata, count)
+            .get_insert_page(
+                meta_pool_guard,
+                self.mem_pool,
+                row_pool_guard,
+                &self.metadata,
+                count,
+            )
             .await
     }
 
@@ -224,11 +251,18 @@ impl<P: BufferPool> GenericMemTable<P> {
         guards: &PoolGuards,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
+        let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = guards
             .try_guard(self.row_pool_slot.into())
             .expect("missing row-page pool guard");
         self.blk_idx
-            .get_insert_page_exclusive(self.mem_pool, row_pool_guard, &self.metadata, count)
+            .get_insert_page_exclusive(
+                meta_pool_guard,
+                self.mem_pool,
+                row_pool_guard,
+                &self.metadata,
+                count,
+            )
             .await
     }
 
@@ -239,11 +273,13 @@ impl<P: BufferPool> GenericMemTable<P> {
         count: usize,
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
+        let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = guards
             .try_guard(self.row_pool_slot.into())
             .expect("missing row-page pool guard");
         self.blk_idx
             .allocate_row_page_at(
+                meta_pool_guard,
                 self.mem_pool,
                 row_pool_guard,
                 &self.metadata,
@@ -265,7 +301,8 @@ impl<P: BufferPool> GenericMemTable<P> {
         let row_pool_guard = guards
             .try_guard(self.row_pool_slot.into())
             .expect("missing row-page pool guard");
-        let mut cursor = self.blk_idx.mem_cursor(guards);
+        let meta_pool_guard = guards.meta_guard();
+        let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -293,19 +330,27 @@ impl<P: BufferPool> GenericMemTable<P> {
     #[inline]
     pub(crate) async fn find_row(
         &self,
+        guards: &PoolGuards,
         row_id: RowID,
         storage: Option<&ColumnStorage>,
     ) -> RowLocation {
-        self.blk_idx.find_row(row_id, storage).await
+        let meta_pool_guard = guards.meta_guard();
+        self.blk_idx
+            .find_row(meta_pool_guard, row_id, storage)
+            .await
     }
 
     #[inline]
     pub(crate) async fn try_find_row(
         &self,
+        guards: &PoolGuards,
         row_id: RowID,
         storage: Option<&ColumnStorage>,
     ) -> Result<RowLocation> {
-        self.blk_idx.try_find_row(row_id, storage).await
+        let meta_pool_guard = guards.meta_guard();
+        self.blk_idx
+            .try_find_row(meta_pool_guard, row_id, storage)
+            .await
     }
 }
 
@@ -329,16 +374,19 @@ impl ColumnStorage {
         }
     }
 
+    /// Returns the underlying table file for persisted column data.
     #[inline]
     pub fn file(&self) -> &Arc<TableFile> {
         &self.file
     }
 
+    /// Returns the read-only buffer pool used for persisted pages.
     #[inline]
     pub fn disk_pool(&self) -> &ReadonlyBufferPool {
         &self.disk_pool
     }
 
+    /// Returns the deletion buffer tracking persisted-row tombstones.
     #[inline]
     pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
         &self.deletion_buffer
@@ -351,6 +399,7 @@ impl Table {
     pub(crate) async fn new(
         mem_pool: &'static EvictableBufferPool,
         index_pool: &'static FixedBufferPool,
+        index_pool_guard: &crate::buffer::PoolGuard,
         global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
         table_id: TableID,
         blk_idx: BlockIndex,
@@ -363,6 +412,7 @@ impl Table {
             mem_pool,
             RowPoolSlot::Mem,
             index_pool,
+            index_pool_guard,
             table_id,
             metadata,
             blk_idx,
@@ -379,6 +429,7 @@ impl Table {
         HybridTableAccessor::from(self)
     }
 
+    /// Returns the deletion buffer tracking persisted-row tombstones.
     #[inline]
     pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
         self.storage.deletion_buffer()
@@ -389,14 +440,15 @@ impl Table {
         self.storage.disk_pool()
     }
 
+    /// Returns the backing table file for this user table.
     #[inline]
     pub fn file(&self) -> &Arc<TableFile> {
         self.storage.file()
     }
 
     #[inline]
-    pub(crate) async fn find_row(&self, row_id: RowID) -> RowLocation {
-        GenericMemTable::find_row(self, row_id, Some(&self.storage)).await
+    pub(crate) async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> RowLocation {
+        GenericMemTable::find_row(self, guards, row_id, Some(&self.storage)).await
     }
     #[inline]
     pub(crate) fn enable_page_committer(
@@ -461,9 +513,7 @@ impl Table {
                 let page_guard = self
                     .mem_pool()
                     .get_page::<RowPage>(
-                        guards
-                            .try_guard(PoolGuardSlot::Mem)
-                            .expect("missing mem pool guard for user-table persistence"),
+                        guards.mem_guard(),
                         page_info.page_id,
                         LatchFallbackMode::Shared,
                     )
@@ -498,9 +548,7 @@ impl Table {
             let page_guard = self
                 .mem_pool()
                 .get_page::<RowPage>(
-                    guards
-                        .try_guard(PoolGuardSlot::Mem)
-                        .expect("missing mem pool guard for user-table persistence"),
+                    guards.mem_guard(),
                     page_info.page_id,
                     LatchFallbackMode::Shared,
                 )
@@ -536,9 +584,7 @@ impl Table {
                 let page_guard = self
                     .mem_pool()
                     .get_page::<RowPage>(
-                        guards
-                            .try_guard(PoolGuardSlot::Mem)
-                            .expect("missing mem pool guard for user-table persistence"),
+                        guards.mem_guard(),
                         page_info.page_id,
                         LatchFallbackMode::Shared,
                     )
@@ -664,7 +710,8 @@ impl Table {
     #[inline]
     pub async fn total_row_pages(&self, guards: &PoolGuards) -> usize {
         let mut res = 0usize;
-        let mut cursor = self.blk_idx().mem_cursor(guards);
+        let meta_pool_guard = guards.meta_guard();
+        let mut cursor = self.blk_idx().mem_cursor(meta_pool_guard);
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -680,7 +727,8 @@ impl Table {
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let mut cursor = self.blk_idx().mem_cursor(guards);
+        let meta_pool_guard = guards.meta_guard();
+        let mut cursor = self.blk_idx().mem_cursor(meta_pool_guard);
         cursor.seek(0).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -690,9 +738,7 @@ impl Table {
                 let page_guard: PageSharedGuard<RowPage> = self
                     .mem_pool()
                     .get_page(
-                        guards
-                            .try_guard(PoolGuardSlot::Mem)
-                            .expect("missing mem pool guard for user-table row pages"),
+                        guards.mem_guard(),
                         page_entry.page_id,
                         LatchFallbackMode::Shared,
                     )
@@ -753,16 +799,23 @@ impl Table {
             self.recover_unique_index_insert(guards, key, row_id, cts)
                 .await
         } else {
-            self.recover_non_unique_index_insert(key, row_id).await
+            self.recover_non_unique_index_insert(guards, key, row_id)
+                .await
         }
     }
 
     #[inline]
-    async fn recover_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+    async fn recover_index_delete(
+        &self,
+        guards: &PoolGuards,
+        key: SelectKey,
+        row_id: RowID,
+    ) -> RecoverIndex {
         if self.metadata().index_specs[key.index_no].unique() {
-            self.recover_unique_index_delete(key, row_id).await
+            self.recover_unique_index_delete(guards, key, row_id).await
         } else {
-            self.recover_non_unique_index_delete(key, row_id).await
+            self.recover_non_unique_index_delete(guards, key, row_id)
+                .await
         }
     }
 
@@ -877,9 +930,10 @@ impl Table {
         cts: TrxID,
     ) -> RecoverIndex {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
+        let index_pool_guard = guards.index_guard();
         loop {
             match index
-                .insert_if_not_exists(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+                .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await
             {
                 IndexInsert::Ok(_) => {
@@ -904,7 +958,13 @@ impl Table {
                                 old_row_id
                             };
                             match index
-                                .compare_exchange(&key.vals, old_row_id, row_id, MIN_SNAPSHOT_TS)
+                                .compare_exchange(
+                                    index_pool_guard,
+                                    &key.vals,
+                                    old_row_id,
+                                    row_id,
+                                    MIN_SNAPSHOT_TS,
+                                )
                                 .await
                             {
                                 IndexCompareExchange::Ok => {
@@ -925,21 +985,33 @@ impl Table {
     }
 
     #[inline]
-    async fn recover_non_unique_index_insert(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+    async fn recover_non_unique_index_insert(
+        &self,
+        guards: &PoolGuards,
+        key: SelectKey,
+        row_id: RowID,
+    ) -> RecoverIndex {
         let index = self.sec_idx()[key.index_no].non_unique().unwrap();
+        let index_pool_guard = guards.index_guard();
         // The recovery should make sure no duplicate key.
         let res = index
-            .insert_if_not_exists(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+            .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await;
         debug_assert!(matches!(res, IndexInsert::Ok(_)));
         RecoverIndex::Ok
     }
 
     #[inline]
-    async fn recover_unique_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+    async fn recover_unique_index_delete(
+        &self,
+        guards: &PoolGuards,
+        key: SelectKey,
+        row_id: RowID,
+    ) -> RecoverIndex {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
+        let index_pool_guard = guards.index_guard();
         if !index
-            .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+            .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await
         {
             // Another recover thread concurrently insert index entry with same key, probably with greater CTS.
@@ -950,10 +1022,16 @@ impl Table {
     }
 
     #[inline]
-    async fn recover_non_unique_index_delete(&self, key: SelectKey, row_id: RowID) -> RecoverIndex {
+    async fn recover_non_unique_index_delete(
+        &self,
+        guards: &PoolGuards,
+        key: SelectKey,
+        row_id: RowID,
+    ) -> RecoverIndex {
         let index = self.sec_idx()[key.index_no].non_unique().unwrap();
+        let index_pool_guard = guards.index_guard();
         if !index
-            .compare_delete(&key.vals, row_id, true, MIN_SNAPSHOT_TS)
+            .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await
         {
             return RecoverIndex::DeleteOutdated;
@@ -967,7 +1045,7 @@ impl Table {
         guards: &PoolGuards,
         row_id: RowID,
     ) -> Option<TrxID> {
-        match self.find_row(row_id).await {
+        match self.find_row(guards, row_id).await {
             RowLocation::NotFound => None,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
