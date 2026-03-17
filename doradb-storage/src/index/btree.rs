@@ -1341,6 +1341,20 @@ pub struct NodePurgeList {
     pub nodes: Vec<PageExclusiveGuard<BTreeNode>>,
 }
 
+#[inline]
+fn build_exhausted_parent_seek_key(node: &BTreeNode, key_buffer: &mut Vec<u8>) {
+    key_buffer.clear();
+    if node.has_no_upper_fence() {
+        return;
+    }
+    node.extend_upper_fence_key(key_buffer);
+}
+
+#[inline]
+fn make_strict_successor(key_buffer: &mut Vec<u8>) {
+    key_buffer.push(0);
+}
+
 /// Shared cursor of nodes at given height.
 /// At most two locks are held at the same time.
 ///
@@ -1353,9 +1367,19 @@ pub struct BTreeNodeCursor<'a, P: 'static> {
     pool_guard: &'a PoolGuard,
     height: usize,
     coupling: BTreeCoupling<SharedStrategy>,
+    resume_key_buffer: Vec<u8>,
 }
 
 impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
+    #[inline]
+    fn resumed_same_parent(&self, exhausted_parent_page_id: PageID) -> bool {
+        self.coupling
+            .parent
+            .as_ref()
+            .map(|parent| parent.g.page_id())
+            == Some(exhausted_parent_page_id)
+    }
+
     /// Create a new cursor.
     #[inline]
     pub fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, height: usize) -> Self {
@@ -1364,6 +1388,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
             pool_guard,
             height,
             coupling: BTreeCoupling::<SharedStrategy>::new(),
+            resume_key_buffer: Vec::new(),
         }
     }
 
@@ -1381,37 +1406,58 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
             return Some(g);
         }
         if let Some(parent) = self.coupling.parent.as_ref() {
-            let p_node = parent.g.page();
-            let next_idx = (parent.idx + 1) as usize;
-            if next_idx == p_node.count() {
-                // current parent exhausted.
-                if p_node.has_no_upper_fence() {
-                    // The tree exhausted.
-                    self.coupling.reset();
-                    return None;
+            let exhausted_parent_page_id = {
+                let p_node = parent.g.page();
+                let next_idx = (parent.idx + 1) as usize;
+                if next_idx == p_node.count() {
+                    // current parent exhausted.
+                    if p_node.has_no_upper_fence() {
+                        // The tree exhausted.
+                        self.coupling.reset();
+                        return None;
+                    }
+                    build_exhausted_parent_seek_key(p_node, &mut self.resume_key_buffer);
+                    Some(parent.g.page_id())
+                } else {
+                    let c_page_id = p_node.value_as_page_id(next_idx);
+                    self.coupling.parent.as_mut().unwrap().idx = next_idx as isize;
+                    let c_guard = self
+                        .tree
+                        .pool
+                        .get_page::<BTreeNode>(
+                            self.pool_guard,
+                            c_page_id,
+                            LatchFallbackMode::Shared,
+                        )
+                        .await
+                        .lock_shared_async()
+                        .await
+                        .unwrap();
+                    return Some(c_guard);
                 }
-                let upper_fence_key = p_node.upper_fence_key();
-                // reach next key.
+            };
+            self.coupling
+                .seek_and_lock(
+                    self.tree,
+                    self.pool_guard,
+                    self.height,
+                    &self.resume_key_buffer,
+                )
+                .await;
+            if let Some(exhausted_parent_page_id) = exhausted_parent_page_id
+                && self.resumed_same_parent(exhausted_parent_page_id)
+            {
+                make_strict_successor(&mut self.resume_key_buffer);
                 self.coupling
-                    .seek_and_lock(self.tree, self.pool_guard, self.height, &upper_fence_key)
+                    .seek_and_lock(
+                        self.tree,
+                        self.pool_guard,
+                        self.height,
+                        &self.resume_key_buffer,
+                    )
                     .await;
-                if let Some(g) = self.coupling.node.take() {
-                    return Some(g);
-                }
-                return None;
             }
-            // Get next slot value, then child node
-            let c_page_id = p_node.value_as_page_id(next_idx);
-            self.coupling.parent.as_mut().unwrap().idx = next_idx as isize;
-            let c_guard = self
-                .tree
-                .pool
-                .get_page::<BTreeNode>(self.pool_guard, c_page_id, LatchFallbackMode::Shared)
-                .await
-                .lock_shared_async()
-                .await
-                .unwrap();
-            return Some(c_guard);
+            return self.coupling.node.take();
         }
         None
     }
@@ -1474,6 +1520,15 @@ pub struct BTreeCompactor<'a, V: BTreeValue, P: 'static> {
 
 impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     #[inline]
+    fn resumed_same_parent(&self, exhausted_parent_page_id: PageID) -> bool {
+        self.coupling
+            .parent
+            .as_ref()
+            .map(|parent| parent.g.page_id())
+            == Some(exhausted_parent_page_id)
+    }
+
+    #[inline]
     pub fn new(
         tree: &'a GenericBTree<P>,
         pool_guard: &'a PoolGuard,
@@ -1517,11 +1572,15 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                 .await;
             match res {
                 BTreeCompact::Skip | BTreeCompact::OutOfSpace | BTreeCompact::ChildDone => (),
-                BTreeCompact::ParentDone => {
+                BTreeCompact::ParentDone(exhausted_parent_page_id) => {
                     if upper_fence_key_buffer.is_empty() {
                         return;
                     }
                     self.seek(&upper_fence_key_buffer).await;
+                    if self.resumed_same_parent(exhausted_parent_page_id) {
+                        make_strict_successor(&mut upper_fence_key_buffer);
+                        self.seek(&upper_fence_key_buffer).await;
+                    }
                 }
                 BTreeCompact::AllDone => {
                     // release all locks.
@@ -1663,13 +1722,12 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                 }
                 None => {
                     // Current parent done.
-                    // We cache parent's upper fence key into buffer
-                    // in order to search next parent node.
+                    let exhausted_parent_page_id =
+                        self.coupling.parent.as_ref().unwrap().g.page_id();
                     let p_node = self.coupling.parent.as_mut().unwrap().g.page_mut();
-                    upper_fence_key_buffer.clear();
-                    p_node.extend_upper_fence_key(upper_fence_key_buffer);
+                    build_exhausted_parent_seek_key(p_node, upper_fence_key_buffer);
                     self.coupling.reset();
-                    return BTreeCompact::ParentDone;
+                    return BTreeCompact::ParentDone(exhausted_parent_page_id);
                 }
             }
         }
@@ -1688,9 +1746,15 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                     self.coupling.parent.take();
                     return false;
                 }
-                let upper_fence = p_node.upper_fence_key();
-                self.seek(&upper_fence).await;
-                return true;
+                let exhausted_parent_page_id = parent.g.page_id();
+                let mut upper_fence_key_buffer = Vec::new();
+                build_exhausted_parent_seek_key(p_node, &mut upper_fence_key_buffer);
+                self.seek(&upper_fence_key_buffer).await;
+                if self.resumed_same_parent(exhausted_parent_page_id) {
+                    make_strict_successor(&mut upper_fence_key_buffer);
+                    self.seek(&upper_fence_key_buffer).await;
+                }
+                return self.coupling.node.is_some();
             }
             let c_page_id = p_node.value_as_page_id(next_idx);
             let c_guard = self
@@ -1770,7 +1834,7 @@ enum BTreeCompact {
     // nodes are merged into current one.
     ChildDone,
     // parent is done.
-    ParentDone,
+    ParentDone(PageID),
 }
 
 #[cfg(test)]
@@ -1788,6 +1852,192 @@ mod tests {
         keys: usize,
         first_key_len: usize,
         prefix_len: usize,
+    }
+
+    struct ExactBoundaryResumeFixture {
+        tree: BTree,
+        left_branch_page_id: PageID,
+        right_branch_page_id: PageID,
+        left_leaf_page_id: PageID,
+        first_right_leaf_page_id: PageID,
+        second_right_leaf_page_id: PageID,
+    }
+
+    async fn build_exact_boundary_resume_fixture(
+        pool: &'static FixedBufferPool,
+        pool_guard: &PoolGuard,
+    ) -> ExactBoundaryResumeFixture {
+        let tree = BTree::new(pool, pool_guard, false, 200).await;
+
+        let mut left_leaf_guard = tree.allocate_node(pool_guard).await;
+        let left_leaf_page_id = left_leaf_guard.page_id();
+        let left_leaf = left_leaf_guard.page_mut();
+        left_leaf.init(0, 200, &[], BTreeU64::INVALID_VALUE, b"ab", false);
+        left_leaf.insert(b"aa", BTreeU64::from(1));
+        drop(left_leaf_guard);
+
+        let mut first_right_leaf_guard = tree.allocate_node(pool_guard).await;
+        let first_right_leaf_page_id = first_right_leaf_guard.page_id();
+        let first_right_leaf = first_right_leaf_guard.page_mut();
+        first_right_leaf.init(0, 200, b"ab", BTreeU64::INVALID_VALUE, b"ab\0", false);
+        first_right_leaf.insert(b"ab", BTreeU64::from(2));
+        drop(first_right_leaf_guard);
+
+        let mut second_right_leaf_guard = tree.allocate_node(pool_guard).await;
+        let second_right_leaf_page_id = second_right_leaf_guard.page_id();
+        let second_right_leaf = second_right_leaf_guard.page_mut();
+        second_right_leaf.init(0, 200, b"ab\0", BTreeU64::INVALID_VALUE, &[], false);
+        second_right_leaf.insert(b"ab\0", BTreeU64::from(3));
+        drop(second_right_leaf_guard);
+
+        let mut left_branch_guard = tree.allocate_node(pool_guard).await;
+        let left_branch_page_id = left_branch_guard.page_id();
+        let left_branch = left_branch_guard.page_mut();
+        left_branch.init(1, 200, &[], BTreeU64::from(left_leaf_page_id), b"ab", false);
+        drop(left_branch_guard);
+
+        let mut right_branch_guard = tree.allocate_node(pool_guard).await;
+        let right_branch_page_id = right_branch_guard.page_id();
+        let right_branch = right_branch_guard.page_mut();
+        right_branch.init(1, 200, b"ab", BTreeU64::INVALID_VALUE, &[], false);
+        right_branch.insert(b"ab", BTreeU64::from(first_right_leaf_page_id));
+        right_branch.insert(b"ab\0", BTreeU64::from(second_right_leaf_page_id));
+        drop(right_branch_guard);
+
+        let mut root_guard = tree
+            .get_node(pool_guard, tree.root, LatchFallbackMode::Exclusive)
+            .await
+            .lock_exclusive_async()
+            .await
+            .unwrap();
+        let root = root_guard.page_mut();
+        root.init(2, 200, &[], BTreeU64::from(left_branch_page_id), &[], false);
+        root.insert(b"ab", BTreeU64::from(right_branch_page_id));
+        drop(root_guard);
+
+        tree.height.store(2, Ordering::Release);
+
+        ExactBoundaryResumeFixture {
+            tree,
+            left_branch_page_id,
+            right_branch_page_id,
+            left_leaf_page_id,
+            first_right_leaf_page_id,
+            second_right_leaf_page_id,
+        }
+    }
+
+    #[test]
+    fn test_btree_cursor_resumes_with_raw_upper_fence_before_strict_successor() {
+        smol::block_on(async {
+            let scope = StaticLifetimeScope::new();
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    64 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
+            let pool = pool.as_static();
+            let pool_guard = pool.guard();
+            {
+                let fixture = build_exact_boundary_resume_fixture(pool, &pool_guard).await;
+
+                let root_guard = fixture
+                    .tree
+                    .get_node(&pool_guard, fixture.tree.root, LatchFallbackMode::Shared)
+                    .await
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
+                let root = root_guard.page();
+                assert_eq!(
+                    root.lookup_child(b"ab"),
+                    LookupChild::Slot(0, fixture.right_branch_page_id)
+                );
+                assert_eq!(
+                    root.lookup_child(b"ab\0"),
+                    LookupChild::Slot(0, fixture.right_branch_page_id)
+                );
+                drop(root_guard);
+
+                let right_branch_guard = fixture
+                    .tree
+                    .get_node(
+                        &pool_guard,
+                        fixture.right_branch_page_id,
+                        LatchFallbackMode::Shared,
+                    )
+                    .await
+                    .lock_shared_async()
+                    .await
+                    .unwrap();
+                let right_branch = right_branch_guard.page();
+                assert_eq!(
+                    right_branch.lookup_child(b"ab"),
+                    LookupChild::Slot(0, fixture.first_right_leaf_page_id)
+                );
+                assert_eq!(
+                    right_branch.lookup_child(b"ab\0"),
+                    LookupChild::Slot(1, fixture.second_right_leaf_page_id)
+                );
+                drop(right_branch_guard);
+
+                let mut cursor = fixture.tree.cursor(&pool_guard, 0);
+                cursor.seek(&[]).await;
+
+                let first = cursor.next().await.unwrap();
+                assert_eq!(first.page_id(), fixture.left_leaf_page_id);
+                drop(first);
+
+                let second = cursor.next().await.unwrap();
+                assert_eq!(second.page_id(), fixture.first_right_leaf_page_id);
+                assert_ne!(second.page_id(), fixture.left_leaf_page_id);
+            }
+        })
+    }
+
+    #[test]
+    fn test_btree_compactor_parent_done_buffers_raw_upper_fence() {
+        smol::block_on(async {
+            let scope = StaticLifetimeScope::new();
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    64 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
+            let pool = pool.as_static();
+            let pool_guard = pool.guard();
+            {
+                let fixture = build_exact_boundary_resume_fixture(pool, &pool_guard).await;
+                let mut compactor =
+                    fixture
+                        .tree
+                        .compact::<BTreeU64>(&pool_guard, 0, BTreeCompactConfig::default());
+                let mut lower_fence_key_buffer = Vec::new();
+                let mut upper_fence_key_buffer = Vec::new();
+                let mut purge_list = Vec::new();
+
+                compactor.seek(&[]).await;
+                let res = compactor
+                    .step(
+                        &mut lower_fence_key_buffer,
+                        &mut upper_fence_key_buffer,
+                        &mut purge_list,
+                    )
+                    .await;
+                assert!(
+                    matches!(res, BTreeCompact::ParentDone(page_id) if page_id == fixture.left_branch_page_id)
+                );
+                assert_eq!(upper_fence_key_buffer, b"ab");
+
+                compactor.seek(&upper_fence_key_buffer).await;
+                let node = compactor.coupling.node.as_ref().unwrap();
+                assert_eq!(node.page_id(), fixture.first_right_leaf_page_id);
+            }
+        })
     }
 
     #[test]
