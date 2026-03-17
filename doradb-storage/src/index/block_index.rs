@@ -1,6 +1,6 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuardSlot, PoolGuards};
+use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableMetadata;
 use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
@@ -36,16 +36,21 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     /// `pivot_row_id` and `column_root_page_id` define the boundary and root of
     /// persisted columnar data at startup.
     #[inline]
-    pub async fn new(pool: &'static P, pivot_row_id: RowID, column_root_page_id: PageID) -> Self {
-        let row = GenericRowBlockIndex::new(pool, pivot_row_id).await;
+    pub async fn new(
+        pool: &'static P,
+        meta_pool_guard: &PoolGuard,
+        pivot_row_id: RowID,
+        column_root_page_id: PageID,
+    ) -> Self {
+        let row = GenericRowBlockIndex::new(pool, meta_pool_guard, pivot_row_id).await;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_page_id);
         GenericBlockIndex { root, row }
     }
 
     /// Creates block index for catalog-table runtime without table-file backing.
     #[inline]
-    pub async fn new_catalog(pool: &'static P) -> Self {
-        Self::new(pool, 0, 0).await
+    pub async fn new_catalog(pool: &'static P, meta_pool_guard: &PoolGuard) -> Self {
+        Self::new(pool, meta_pool_guard, 0, 0).await
     }
 
     /// Returns the in-memory row index height.
@@ -102,13 +107,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     #[inline]
     pub async fn get_insert_page<B: BufferPool>(
         &self,
+        meta_pool_guard: &PoolGuard,
         mem_pool: &'static B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
         self.row
-            .get_insert_page(mem_pool, mem_pool_guard, metadata, count)
+            .get_insert_page(meta_pool_guard, mem_pool, mem_pool_guard, metadata, count)
             .await
     }
 
@@ -116,13 +122,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     #[inline]
     pub async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
+        meta_pool_guard: &PoolGuard,
         mem_pool: &'static B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
         self.row
-            .get_insert_page_exclusive(mem_pool, mem_pool_guard, metadata, count)
+            .get_insert_page_exclusive(meta_pool_guard, mem_pool, mem_pool_guard, metadata, count)
             .await
     }
 
@@ -132,6 +139,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     #[inline]
     pub async fn allocate_row_page_at<B: BufferPool>(
         &self,
+        meta_pool_guard: &PoolGuard,
         mem_pool: &'static B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
@@ -139,7 +147,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
         self.row
-            .allocate_row_page_at(mem_pool, mem_pool_guard, metadata, count, page_id)
+            .allocate_row_page_at(
+                meta_pool_guard,
+                mem_pool,
+                mem_pool_guard,
+                metadata,
+                count,
+                page_id,
+            )
             .await
     }
 
@@ -153,13 +168,9 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     #[inline]
     pub fn mem_cursor<'a>(
         &'a self,
-        guards: &'a PoolGuards,
+        meta_pool_guard: &'a PoolGuard,
     ) -> GenericRowBlockIndexMemCursor<'a, P> {
-        self.row.mem_cursor(
-            guards
-                .try_guard(PoolGuardSlot::Meta)
-                .expect("missing meta pool guard for block-index traversal"),
-        )
+        self.row.mem_cursor(meta_pool_guard)
     }
 
     /// Finds the physical location of one row id.
@@ -169,10 +180,11 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     #[inline]
     pub(crate) async fn find_row(
         &self,
+        meta_pool_guard: &PoolGuard,
         row_id: RowID,
         storage: Option<&ColumnStorage>,
     ) -> RowLocation {
-        match self.try_find_row(row_id, storage).await {
+        match self.try_find_row(meta_pool_guard, row_id, storage).await {
             Ok(location) => location,
             Err(err) => todo!(
                 "block-index column-path error policy is deferred (row_id={}, err={})",
@@ -186,6 +198,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     #[inline]
     pub(crate) async fn try_find_row(
         &self,
+        meta_pool_guard: &PoolGuard,
         row_id: RowID,
         storage: Option<&ColumnStorage>,
     ) -> Result<RowLocation> {
@@ -199,7 +212,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                     .await
             }
             BlockIndexRoute::Row => {
-                let found = self.row.find_row(row_id).await;
+                let found = self.row.find_row(meta_pool_guard, row_id).await;
                 if !matches!(found, RowLocation::NotFound) {
                     return Ok(found);
                 }
@@ -367,11 +380,12 @@ mod tests {
     fn test_try_find_row_returns_error_when_column_route_has_no_storage() {
         let scope = StaticLifetimeScope::new();
         let pool = scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
-        let blk_idx = smol::block_on(BlockIndex::new(pool.as_static(), 10, 77));
+        let meta_guard = pool.guard();
+        let blk_idx = smol::block_on(BlockIndex::new(pool.as_static(), &meta_guard, 10, 77));
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
         // Without column storage this must surface as an error, not as "not found".
-        let err = match smol::block_on(blk_idx.try_find_row(9, None)) {
+        let err = match smol::block_on(blk_idx.try_find_row(&meta_guard, 9, None)) {
             Ok(_location) => panic!("expected missing-column-storage error, got row location"),
             Err(err) => err,
         };
@@ -391,12 +405,22 @@ mod tests {
                 Arc::clone(&release),
             ),
         ));
-        let blk_idx = smol::block_on(GenericBlockIndex::new(pool.as_static(), 10, 77));
+        let meta_guard = pool.guard();
+        let blk_idx = smol::block_on(GenericBlockIndex::new(
+            pool.as_static(),
+            &meta_guard,
+            10,
+            77,
+        ));
         pool.set_stall_page_id(blk_idx.row.root_page_id());
 
         std::thread::scope(|s| {
             // Start with row_id == pivot so the first route decision picks the row path.
-            let handle = s.spawn(|| smol::block_on(async { blk_idx.try_find_row(10, None).await }));
+            let blk_idx = &blk_idx;
+            let meta_guard = meta_guard.clone();
+            let handle = s.spawn(move || {
+                smol::block_on(async { blk_idx.try_find_row(&meta_guard, 10, None).await })
+            });
 
             // Wait until the row-store root fetch is paused, then move the pivot past
             // row_id so the subsequent `try_column()` fallback becomes eligible.

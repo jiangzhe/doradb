@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::buffer::{BufferPool, PoolGuardSlot, PoolGuards};
+use crate::buffer::{BufferPool, PoolGuards};
 use crate::error::{Error, Result};
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_payload_deletion_deltas,
@@ -18,6 +18,7 @@ use crate::value::Val;
 use std::collections::HashMap;
 use std::future::Future;
 
+/// Redo-recovery hooks implemented by table runtimes.
 pub trait TableRecover {
     /// Recover row insert from redo log.
     fn recover_row_insert(
@@ -85,13 +86,7 @@ impl TableRecover for Table {
         // we can just hold exclusive lock on this page and process all rows in it.
         let mut page_guard = self
             .mem_pool()
-            .get_page::<RowPage>(
-                guards
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard for user-table recovery"),
-                page_id,
-                LatchFallbackMode::Exclusive,
-            )
+            .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
             .await
@@ -123,13 +118,7 @@ impl TableRecover for Table {
     ) {
         let mut page_guard = self
             .mem_pool()
-            .get_page::<RowPage>(
-                guards
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard for user-table recovery"),
-                page_id,
-                LatchFallbackMode::Exclusive,
-            )
+            .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
             .await
@@ -155,13 +144,7 @@ impl TableRecover for Table {
                 // There is index change, we need to update index.
                 let page_guard = self
                     .mem_pool()
-                    .get_page::<RowPage>(
-                        guards
-                            .try_guard(PoolGuardSlot::Mem)
-                            .expect("missing mem pool guard for user-table recovery"),
-                        page_id,
-                        LatchFallbackMode::Shared,
-                    )
+                    .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
                     .await
@@ -183,7 +166,7 @@ impl TableRecover for Table {
                             RecoverIndex::DeleteOutdated => unreachable!(),
                         }
                         // delete old index entry.
-                        match self.recover_index_delete(old_key, row_id).await {
+                        match self.recover_index_delete(guards, old_key, row_id).await {
                             RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
                             RecoverIndex::InsertOutdated => unreachable!(),
                         }
@@ -203,13 +186,7 @@ impl TableRecover for Table {
     ) {
         let mut page_guard = self
             .mem_pool()
-            .get_page::<RowPage>(
-                guards
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard for user-table recovery"),
-                page_id,
-                LatchFallbackMode::Exclusive,
-            )
+            .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
             .await
@@ -237,7 +214,7 @@ impl TableRecover for Table {
                     .map(|ik| index_cols[&(ik.col_no as usize)].clone())
                     .collect();
                 let key = SelectKey::new(index.index_no, vals);
-                match self.recover_index_delete(key, row_id).await {
+                match self.recover_index_delete(guards, key, row_id).await {
                     RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
                     RecoverIndex::InsertOutdated => unreachable!(),
                 }
@@ -252,18 +229,13 @@ impl TableRecover for Table {
     ) -> Result<()> {
         let page_guard = self
             .mem_pool()
-            .get_page::<RowPage>(
-                guards
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard for user-table recovery"),
-                page_id,
-                LatchFallbackMode::Shared,
-            )
+            .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Shared)
             .await
             .lock_shared_async()
             .await
             .unwrap();
         let metadata = self.metadata();
+        let index_pool_guard = guards.index_guard();
         let (ctx, page) = page_guard.ctx_and_page();
         for (index_spec, sec_idx) in metadata.index_specs.iter().zip(self.sec_idx()) {
             let read_set: Vec<_> = index_spec
@@ -278,13 +250,25 @@ impl TableRecover for Table {
                         if index_spec.unique() {
                             let index = sec_idx.unique().unwrap();
                             let res = index
-                                .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
+                                .insert_if_not_exists(
+                                    index_pool_guard,
+                                    &vals,
+                                    row_id,
+                                    false,
+                                    MIN_SNAPSHOT_TS,
+                                )
                                 .await;
                             ensure_recovery_index_insert(sec_idx.index_no, res)?;
                         } else {
                             let index = sec_idx.non_unique().unwrap();
                             let res = index
-                                .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
+                                .insert_if_not_exists(
+                                    index_pool_guard,
+                                    &vals,
+                                    row_id,
+                                    false,
+                                    MIN_SNAPSHOT_TS,
+                                )
                                 .await;
                             ensure_recovery_index_insert(sec_idx.index_no, res)?;
                         }
@@ -298,6 +282,7 @@ impl TableRecover for Table {
     }
 
     async fn populate_index_via_persisted_data(&self, _guards: &PoolGuards) -> Result<()> {
+        let index_pool_guard = _guards.index_guard();
         if self.sec_idx().is_empty() {
             return Ok(());
         }
@@ -334,14 +319,26 @@ impl TableRecover for Table {
                         let res = self.sec_idx()[key.index_no]
                             .unique()
                             .unwrap()
-                            .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                            .insert_if_not_exists(
+                                index_pool_guard,
+                                &key.vals,
+                                row_id,
+                                false,
+                                MIN_SNAPSHOT_TS,
+                            )
                             .await;
                         ensure_recovery_index_insert(key.index_no, res)?;
                     } else {
                         let res = self.sec_idx()[key.index_no]
                             .non_unique()
                             .unwrap()
-                            .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
+                            .insert_if_not_exists(
+                                index_pool_guard,
+                                &key.vals,
+                                row_id,
+                                false,
+                                MIN_SNAPSHOT_TS,
+                            )
                             .await;
                         ensure_recovery_index_insert(key.index_no, res)?;
                     }

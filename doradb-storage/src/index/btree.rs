@@ -77,7 +77,6 @@ pub struct GenericBTree<P: 'static> {
     // todo: switch to ShadowBufferPool, which
     // supports CoW operations.
     pool: &'static P,
-    pool_guard: PoolGuard,
 }
 
 /// Compatibility alias for runtime B-Tree backed by `FixedBufferPool`.
@@ -86,9 +85,13 @@ pub type BTree = GenericBTree<FixedBufferPool>;
 impl<P: BufferPool> GenericBTree<P> {
     /// Create a new B-Tree index.
     #[inline]
-    pub async fn new(pool: &'static P, hints_enabled: bool, ts: TrxID) -> Self {
-        let pool_guard = pool.guard();
-        let mut g = pool.allocate_page::<BTreeNode>(&pool_guard).await;
+    pub async fn new(
+        pool: &'static P,
+        pool_guard: &PoolGuard,
+        hints_enabled: bool,
+        ts: TrxID,
+    ) -> Self {
+        let mut g = pool.allocate_page::<BTreeNode>(pool_guard).await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init(0, ts, &[], BTreeU64::INVALID_VALUE, &[], hints_enabled);
@@ -96,39 +99,32 @@ impl<P: BufferPool> GenericBTree<P> {
             root: page_id,
             height: AtomicUsize::new(0),
             pool,
-            pool_guard,
         }
     }
 
     #[inline]
-    fn pool_guard(&self) -> &PoolGuard {
-        &self.pool_guard
-    }
-
-    #[inline]
-    async fn allocate_node(&self) -> PageExclusiveGuard<BTreeNode> {
-        self.pool
-            .allocate_page::<BTreeNode>(self.pool_guard())
-            .await
+    async fn allocate_node(&self, pool_guard: &PoolGuard) -> PageExclusiveGuard<BTreeNode> {
+        self.pool.allocate_page::<BTreeNode>(pool_guard).await
     }
 
     #[inline]
     async fn get_node(
         &self,
+        pool_guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<BTreeNode> {
         self.pool
-            .get_page::<BTreeNode>(self.pool_guard(), page_id, mode)
+            .get_page::<BTreeNode>(pool_guard, page_id, mode)
             .await
     }
 
     /// Destroy the tree.
     /// This method will traverse the tree and deallocate all the nodes recursively.
     #[inline]
-    pub async fn destory(self) {
+    pub async fn destory(self, pool_guard: &PoolGuard) {
         let g = self
-            .get_node(self.root, LatchFallbackMode::Exclusive)
+            .get_node(pool_guard, self.root, LatchFallbackMode::Exclusive)
             .await
             .lock_exclusive_async()
             .await
@@ -140,7 +136,7 @@ impl<P: BufferPool> GenericBTree<P> {
                 self.pool.deallocate_page::<BTreeNode>(g);
             }
             1 => {
-                self.deallocate_h1(g).await;
+                self.deallocate_h1(pool_guard, g).await;
             }
             _ => {
                 let mut stack = vec![];
@@ -150,7 +146,7 @@ impl<P: BufferPool> GenericBTree<P> {
                     let p_node = pos.g.page();
                     if p_node.height() == 1 {
                         let g = stack.pop().unwrap().g;
-                        self.deallocate_h1(g).await;
+                        self.deallocate_h1(pool_guard, g).await;
                         continue;
                     }
                     if pos.idx == p_node.count() as isize {
@@ -165,7 +161,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         p_node.value_as_page_id(pos.idx as usize)
                     };
                     let c_guard = self
-                        .get_node(c_page_id, LatchFallbackMode::Exclusive)
+                        .get_node(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                         .await
                         .lock_exclusive_async()
                         .await
@@ -191,9 +187,13 @@ impl<P: BufferPool> GenericBTree<P> {
     /// This method does not care about delete bit, so a marked deleted value
     /// can also be returned and caller need to take care of it.
     #[inline]
-    pub async fn lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Option<V> {
+    pub async fn lookup_optimistic<V: BTreeValue>(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[u8],
+    ) -> Option<V> {
         loop {
-            let res = self.try_lookup_optimistic(key).await;
+            let res = self.try_lookup_optimistic(pool_guard, key).await;
             let res = verify_continue!(res);
             return res;
         }
@@ -204,6 +204,7 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     pub async fn insert<V: BTreeValue>(
         &self,
+        pool_guard: &PoolGuard,
         key: &[u8],
         value: V,
         merge_if_match_deleted: bool,
@@ -212,7 +213,7 @@ impl<P: BufferPool> GenericBTree<P> {
         // Stack holds the path from root to leaf.
         loop {
             let res = self
-                .try_find_leaf_with_optimistic_parent::<ExclusiveStrategy>(key)
+                .try_find_leaf_with_optimistic_parent::<ExclusiveStrategy>(pool_guard, key)
                 .await;
             let (mut c_guard, p_guard) = verify_continue!(res);
             let node = c_guard.page_mut();
@@ -237,11 +238,11 @@ impl<P: BufferPool> GenericBTree<P> {
                 debug_assert!(node.count() > 1);
                 if p_guard.is_none() {
                     // Root is leaf and full, should split.
-                    self.split_root::<V>(node, true, ts).await;
+                    self.split_root::<V>(pool_guard, node, true, ts).await;
                     continue;
                 }
                 match self
-                    .try_split_bottom_up::<V>(p_guard.unwrap(), c_guard, ts)
+                    .try_split_bottom_up::<V>(pool_guard, p_guard.unwrap(), c_guard, ts)
                     .await
                 {
                     // If split is done or tree structure has been changed by other thread,
@@ -250,6 +251,7 @@ impl<P: BufferPool> GenericBTree<P> {
                     BTreeSplit::FullBranch(mut split) => loop {
                         match self
                             .try_split_top_down(
+                                pool_guard,
                                 split.lower_fence_key(),
                                 split.page_id,
                                 split.sep_key(),
@@ -278,12 +280,13 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     pub async fn mark_as_deleted<V: BTreeValue>(
         &self,
+        pool_guard: &PoolGuard,
         key: &[u8],
         value: V,
         ts: TrxID,
     ) -> BTreeUpdate<V> {
         debug_assert!(!value.is_deleted());
-        let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
+        let mut g = self.find_leaf::<ExclusiveStrategy>(pool_guard, key).await;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
         let res = node.mark_as_deleted(key, value);
@@ -303,13 +306,14 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     pub async fn delete<V: BTreeValue>(
         &self,
+        pool_guard: &PoolGuard,
         key: &[u8],
         value: V,
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> BTreeDelete {
         debug_assert!(!value.is_deleted());
-        let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
+        let mut g = self.find_leaf::<ExclusiveStrategy>(pool_guard, key).await;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
         let res = node.delete(key, value, ignore_del_mask);
@@ -324,12 +328,13 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     pub async fn update<V: BTreeValue>(
         &self,
+        pool_guard: &PoolGuard,
         key: &[u8],
         old_value: V,
         new_value: V,
         ts: TrxID,
     ) -> BTreeUpdate<V> {
-        let mut g = self.find_leaf::<ExclusiveStrategy>(key).await;
+        let mut g = self.find_leaf::<ExclusiveStrategy>(pool_guard, key).await;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
         let res = node.update(key, old_value, new_value);
@@ -342,20 +347,32 @@ impl<P: BufferPool> GenericBTree<P> {
     /// Create a cursor to iterator over nodes at given height.
     /// Height equals to 0 means iterating over all leaf nodes.
     #[inline]
-    pub fn cursor(&self, height: usize) -> BTreeNodeCursor<'_, P> {
-        BTreeNodeCursor::new(self, height)
+    pub fn cursor<'a>(
+        &'a self,
+        pool_guard: &'a PoolGuard,
+        height: usize,
+    ) -> BTreeNodeCursor<'a, P> {
+        BTreeNodeCursor::new(self, pool_guard, height)
     }
 
     /// Create a prefix scanner to scan keys.
     #[inline]
-    pub fn prefix_scanner<C: BTreeSlotCallback>(&self, callback: C) -> BTreePrefixScan<'_, C, P> {
-        BTreePrefixScan::new(self, callback)
+    pub fn prefix_scanner<'a, C: BTreeSlotCallback>(
+        &'a self,
+        pool_guard: &'a PoolGuard,
+        callback: C,
+    ) -> BTreePrefixScan<'a, C, P> {
+        BTreePrefixScan::new(self, pool_guard, callback)
     }
 
     /// Collect space statistics at given height.
     #[inline]
-    pub async fn collect_space_statistics_at(&self, height: usize) -> SpaceStatistics {
-        let mut cursor = self.cursor(height);
+    pub async fn collect_space_statistics_at(
+        &self,
+        pool_guard: &PoolGuard,
+        height: usize,
+    ) -> SpaceStatistics {
+        let mut cursor = self.cursor(pool_guard, height);
         cursor.seek(&[]).await;
         let mut preview = SpaceStatistics::default();
         while let Some(g) = cursor.next().await {
@@ -370,11 +387,11 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Collect space statistics of the whole tree.
     #[inline]
-    pub async fn collect_space_statistics(&self) -> SpaceStatistics {
+    pub async fn collect_space_statistics(&self, pool_guard: &PoolGuard) -> SpaceStatistics {
         let height = self.height();
         let mut res = SpaceStatistics::default();
         for h in 0..height + 1 {
-            let s = self.collect_space_statistics_at(h).await;
+            let s = self.collect_space_statistics_at(pool_guard, h).await;
             res.nodes += s.nodes;
             res.total_space += s.total_space;
             res.used_space += s.used_space;
@@ -385,47 +402,53 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Create a compactor for all nodes at given height.
     #[inline]
-    pub fn compact<V: BTreeValue>(
-        &self,
+    pub fn compact<'a, V: BTreeValue>(
+        &'a self,
+        pool_guard: &'a PoolGuard,
         height: usize,
         config: BTreeCompactConfig,
-    ) -> BTreeCompactor<'_, V, P> {
-        BTreeCompactor::new(self, height, config)
+    ) -> BTreeCompactor<'a, V, P> {
+        BTreeCompactor::new(self, pool_guard, height, config)
     }
 
     /// Compact the whole tree.
     #[inline]
     pub async fn compact_all<V: BTreeValue>(
         &self,
+        pool_guard: &PoolGuard,
         config: BTreeCompactConfig,
     ) -> Vec<PageExclusiveGuard<BTreeNode>> {
         let height = self.height();
         let mut purge_list = vec![];
         // leaf compaction.
-        self.compact::<V>(0, config)
+        self.compact::<V>(pool_guard, 0, config)
             .run_to_end(&mut purge_list)
             .await;
         // branch-to-root compaction.
         let mut h = 1usize;
         while h <= height {
-            self.compact::<BTreeU64>(h, config)
+            self.compact::<BTreeU64>(pool_guard, h, config)
                 .run_to_end(&mut purge_list)
                 .await;
             h += 1;
         }
-        self.shrink(&mut purge_list).await;
+        self.shrink(pool_guard, &mut purge_list).await;
         purge_list
     }
 
     /// Try to shrink the tree height if root node has only one child.
     #[inline]
-    pub async fn shrink(&self, purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>) {
+    pub async fn shrink(
+        &self,
+        pool_guard: &PoolGuard,
+        purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>,
+    ) {
         // test if root has only one child with optimistic lock,
         // to avoid block concurrent operations.
         loop {
             let g = self
                 .pool
-                .get_page::<BTreeNode>(self.pool_guard(), self.root, LatchFallbackMode::Spin)
+                .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
                 .await;
             let (height, count) =
                 verify_continue!(g.with_page_ref_validated(|page| (page.height(), page.count())));
@@ -443,7 +466,7 @@ impl<P: BufferPool> GenericBTree<P> {
             let c_page_id = root.lower_fence_value().to_u64();
             let mut c_guard = self
                 .pool
-                .get_page::<BTreeNode>(self.pool_guard(), c_page_id, LatchFallbackMode::Exclusive)
+                .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -467,8 +490,12 @@ impl<P: BufferPool> GenericBTree<P> {
     /// We convert such stale observations to `Validation::Invalid`, then rely on
     /// final guard validation in `with_page_ref_validated` to retry safely.
     #[inline]
-    async fn try_lookup_optimistic<V: BTreeValue>(&self, key: &[u8]) -> Validation<Option<V>> {
-        let g = self.find_leaf::<OptimisticStrategy>(key).await;
+    async fn try_lookup_optimistic<V: BTreeValue>(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[u8],
+    ) -> Validation<Option<V>> {
+        let g = self.find_leaf::<OptimisticStrategy>(pool_guard, key).await;
         let value = verify!(
             g.with_page_ref_validated(|leaf| match leaf.search_key(key) {
                 Ok(idx) => {
@@ -489,6 +516,7 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     async fn try_split_bottom_up<V: BTreeValue>(
         &self,
+        pool_guard: &PoolGuard,
         mut p_guard: FacadePageGuard<BTreeNode>,
         mut c_guard: PageExclusiveGuard<BTreeNode>,
         ts: TrxID,
@@ -514,7 +542,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         return BTreeSplit::full_branch(&lower_fence_key, page_id, &sep_key);
                     }
                     // Parent is root and full, just split.
-                    self.split_root::<BTreeU64>(p_guard.page_mut(), false, ts)
+                    self.split_root::<BTreeU64>(pool_guard, p_guard.page_mut(), false, ts)
                         .await;
                     return BTreeSplit::Ok;
                 }
@@ -527,7 +555,7 @@ impl<P: BufferPool> GenericBTree<P> {
                 // tree structure and split condition still remain the same.
                 let res = self
                     .try_acquire_parent_and_child_locks_for_split(
-                        p_guard, c_guard, sep_idx, &sep_key, ts,
+                        pool_guard, p_guard, c_guard, sep_idx, &sep_key, ts,
                     )
                     .await;
                 match res {
@@ -541,7 +569,7 @@ impl<P: BufferPool> GenericBTree<P> {
         };
         // Now parent and child locks are acquired exclusively, and parent has enough
         // space to insert separator key, so to actual split.
-        let r_guard = self.allocate_node().await;
+        let r_guard = self.allocate_node(pool_guard).await;
         self.split_node::<V>(
             p_guard.page_mut(),
             c_guard.page_mut(),
@@ -559,6 +587,7 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     async fn try_acquire_parent_and_child_locks_for_split(
         &self,
+        pool_guard: &PoolGuard,
         p_guard: FacadePageGuard<BTreeNode>,
         mut c_guard: PageExclusiveGuard<BTreeNode>,
         sep_idx: usize,
@@ -588,7 +617,7 @@ impl<P: BufferPool> GenericBTree<P> {
                             ));
                         }
                         // Parent is root and full, just split.
-                        self.split_root::<BTreeU64>(p_guard.page_mut(), false, ts)
+                        self.split_root::<BTreeU64>(pool_guard, p_guard.page_mut(), false, ts)
                             .await;
                         return Either::Right(BTreeSplit::Ok);
                     }
@@ -616,13 +645,17 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     async fn try_split_top_down(
         &self,
+        pool_guard: &PoolGuard,
         lower_fence_key: &[u8],
         page_id: PageID,
         sep_key: &[u8],
         ts: TrxID,
     ) -> BTreeSplit {
         debug_assert!(page_id != self.root);
-        match self.find_branch_for_split(lower_fence_key, page_id).await {
+        match self
+            .find_branch_for_split(pool_guard, lower_fence_key, page_id)
+            .await
+        {
             None => BTreeSplit::Inconsistent,
             Some(mut p_guard) => {
                 let p_page_id = p_guard.page_id();
@@ -636,7 +669,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         let mut c_guard = self
                             .pool
                             .get_page::<BTreeNode>(
-                                self.pool_guard(),
+                                pool_guard,
                                 c_page_id,
                                 LatchFallbackMode::Exclusive,
                             )
@@ -667,14 +700,15 @@ impl<P: BufferPool> GenericBTree<P> {
                                 );
                             }
                             // split root.
-                            self.split_root::<BTreeU64>(p_node, false, ts).await;
+                            self.split_root::<BTreeU64>(pool_guard, p_node, false, ts)
+                                .await;
                             if !p_node.can_insert(&sep_key) {
                                 return BTreeSplit::Inconsistent;
                             }
                         }
                         // now parent and child nodes are exclusively locked and parent has enough
                         // space to insert separator key, so do actual split.
-                        let r_guard = self.allocate_node().await;
+                        let r_guard = self.allocate_node(pool_guard).await;
                         self.split_node::<BTreeU64>(p_node, c_node, r_guard, sep_idx, &sep_key, ts)
                             .await;
                         BTreeSplit::Ok
@@ -686,7 +720,13 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Split root node.
     #[inline]
-    async fn split_root<V: BTreeValue>(&self, root: &mut BTreeNode, is_leaf: bool, ts: TrxID) {
+    async fn split_root<V: BTreeValue>(
+        &self,
+        pool_guard: &PoolGuard,
+        root: &mut BTreeNode,
+        is_leaf: bool,
+        ts: TrxID,
+    ) {
         debug_assert!(root.is_leaf() == is_leaf);
         let ts = root.ts().max(ts);
         let height = root.height() as u16;
@@ -697,11 +737,11 @@ impl<P: BufferPool> GenericBTree<P> {
         // Only truncate separator key if it's leaf.
         let sep_key = root.create_sep_key(sep_idx, is_leaf);
         // Allocate left node.
-        let mut left_page = self.allocate_node().await;
+        let mut left_page = self.allocate_node(pool_guard).await;
         let left_page_id = left_page.page_id();
         let left_node = left_page.page_mut();
         // Allocate right node.
-        let mut right_page = self.allocate_node().await;
+        let mut right_page = self.allocate_node(pool_guard).await;
         let right_page_id = right_page.page_id();
         let right_node = right_page.page_mut();
         // Initialize and copy key values to left node.
@@ -797,9 +837,13 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Find leaf by given key.
     #[inline]
-    async fn find_leaf<S: LockStrategy<Page = BTreeNode>>(&self, key: &[u8]) -> S::Guard {
+    async fn find_leaf<S: LockStrategy<Page = BTreeNode>>(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[u8],
+    ) -> S::Guard {
         loop {
-            let res = self.try_find_leaf::<S>(key).await;
+            let res = self.try_find_leaf::<S>(pool_guard, key).await;
             let res = verify_continue!(res);
             return res;
         }
@@ -919,11 +963,12 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     async fn try_find_leaf<S: LockStrategy<Page = BTreeNode>>(
         &self,
+        pool_guard: &PoolGuard,
         key: &[u8],
     ) -> Validation<S::Guard> {
         let mut p_guard = self
             .pool
-            .get_page::<BTreeNode>(self.pool_guard(), self.root, LatchFallbackMode::Spin)
+            .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
             .await;
         // check root page separately.
         let height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
@@ -945,7 +990,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         // child node is leaf.
                         let c_guard = self
                             .pool
-                            .get_child_page(self.pool_guard(), &p_guard, page_id, S::MODE)
+                            .get_child_page(pool_guard, &p_guard, page_id, S::MODE)
                             .await;
                         let c_guard = verify!(c_guard);
                         let c_guard = S::verify_lock_async::<false>(c_guard).await;
@@ -955,12 +1000,7 @@ impl<P: BufferPool> GenericBTree<P> {
                     // child node is branch, continue next iteration.
                     let c_guard = self
                         .pool
-                        .get_child_page(
-                            self.pool_guard(),
-                            &p_guard,
-                            page_id,
-                            LatchFallbackMode::Spin,
-                        )
+                        .get_child_page(pool_guard, &p_guard, page_id, LatchFallbackMode::Spin)
                         .await;
                     let c_guard = verify!(c_guard);
                     p_guard = c_guard;
@@ -975,11 +1015,12 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     async fn try_find_leaf_with_optimistic_parent<S: LockStrategy<Page = BTreeNode>>(
         &self,
+        pool_guard: &PoolGuard,
         key: &[u8],
     ) -> Validation<(S::Guard, Option<FacadePageGuard<BTreeNode>>)> {
         let mut p_guard = self
             .pool
-            .get_page::<BTreeNode>(self.pool_guard(), self.root, LatchFallbackMode::Spin)
+            .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
             .await;
         // check root page separately.
         let height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
@@ -1001,7 +1042,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         // child node is leaf.
                         let c_guard = self
                             .pool
-                            .get_child_page(self.pool_guard(), &p_guard, page_id, S::MODE)
+                            .get_child_page(pool_guard, &p_guard, page_id, S::MODE)
                             .await;
                         let c_guard = verify!(c_guard);
                         let c_guard = S::verify_lock_async::<false>(c_guard).await;
@@ -1011,12 +1052,7 @@ impl<P: BufferPool> GenericBTree<P> {
                     // child node is branch, continue next iteration.
                     let c_guard = self
                         .pool
-                        .get_child_page(
-                            self.pool_guard(),
-                            &p_guard,
-                            page_id,
-                            LatchFallbackMode::Spin,
-                        )
+                        .get_child_page(pool_guard, &p_guard, page_id, LatchFallbackMode::Spin)
                         .await;
                     let c_guard = verify!(c_guard);
                     p_guard = c_guard;
@@ -1031,12 +1067,13 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     async fn find_branch_for_split(
         &self,
+        pool_guard: &PoolGuard,
         lower_fence_key: &[u8],
         page_id: PageID,
     ) -> Option<PageExclusiveGuard<BTreeNode>> {
         loop {
             let res = self
-                .try_find_branch_for_split(lower_fence_key, page_id)
+                .try_find_branch_for_split(pool_guard, lower_fence_key, page_id)
                 .await;
             let res = verify_continue!(res);
             return res;
@@ -1046,12 +1083,13 @@ impl<P: BufferPool> GenericBTree<P> {
     #[inline]
     async fn try_find_branch_for_split(
         &self,
+        pool_guard: &PoolGuard,
         lower_fence_key: &[u8],
         page_id: PageID,
     ) -> Validation<Option<PageExclusiveGuard<BTreeNode>>> {
         let mut g = self
             .pool
-            .get_page::<BTreeNode>(self.pool_guard(), self.root, LatchFallbackMode::Spin)
+            .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
             .await;
         let mut height = verify!(g.with_page_ref_validated(|page| page.height()));
         if height == 0 {
@@ -1077,7 +1115,7 @@ impl<P: BufferPool> GenericBTree<P> {
                     // Otherwise, go to next level.
                     let c_guard = self
                         .pool
-                        .get_child_page(self.pool_guard(), &g, c_page_id, LatchFallbackMode::Spin)
+                        .get_child_page(pool_guard, &g, c_page_id, LatchFallbackMode::Spin)
                         .await;
                     g = verify!(c_guard);
                 }
@@ -1089,7 +1127,7 @@ impl<P: BufferPool> GenericBTree<P> {
     }
 
     #[inline]
-    async fn deallocate_h1(&self, g: PageExclusiveGuard<BTreeNode>) {
+    async fn deallocate_h1(&self, pool_guard: &PoolGuard, g: PageExclusiveGuard<BTreeNode>) {
         let p_node = g.page();
         debug_assert!(p_node.height() == 1);
         // Deallocate child associated with lower fence key.
@@ -1098,7 +1136,7 @@ impl<P: BufferPool> GenericBTree<P> {
             let c_page_id = p_node.lower_fence_value().to_u64();
             let c_guard = self
                 .pool
-                .get_page::<BTreeNode>(self.pool_guard(), c_page_id, LatchFallbackMode::Exclusive)
+                .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1110,7 +1148,7 @@ impl<P: BufferPool> GenericBTree<P> {
             let c_page_id = p_node.value_as_page_id(i);
             let c_guard = self
                 .pool
-                .get_page::<BTreeNode>(self.pool_guard(), c_page_id, LatchFallbackMode::Exclusive)
+                .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1148,6 +1186,7 @@ where
     pub async fn seek_and_lock<P: BufferPool>(
         &mut self,
         tree: &GenericBTree<P>,
+        pool_guard: &PoolGuard,
         height: usize,
         key: &[u8],
     ) {
@@ -1155,9 +1194,11 @@ where
             self.reset();
             let g = tree
                 .pool
-                .get_page::<BTreeNode>(&tree.pool_guard, tree.root, LatchFallbackMode::Spin)
+                .get_page::<BTreeNode>(pool_guard, tree.root, LatchFallbackMode::Spin)
                 .await;
-            let res = self.try_seek_and_lock(tree, height, key, g).await;
+            let res = self
+                .try_seek_and_lock(tree, pool_guard, height, key, g)
+                .await;
             verify_continue!(res);
             return;
         }
@@ -1174,6 +1215,7 @@ where
     async fn try_seek_and_lock<P: BufferPool>(
         &mut self,
         tree: &GenericBTree<P>,
+        pool_guard: &PoolGuard,
         height: usize,
         key: &[u8],
         mut p_guard: FacadePageGuard<BTreeNode>,
@@ -1202,7 +1244,7 @@ where
                 };
                 let c_guard = tree
                     .pool
-                    .get_page::<BTreeNode>(&tree.pool_guard, c_page_id, S::MODE)
+                    .get_page::<BTreeNode>(pool_guard, c_page_id, S::MODE)
                     .await;
                 let res = S::verify_lock_async::<false>(c_guard).await;
                 let c_guard = verify!(res);
@@ -1222,7 +1264,7 @@ where
             let c_guard = tree
                 .pool
                 .get_child_page::<BTreeNode>(
-                    &tree.pool_guard,
+                    pool_guard,
                     &p_guard,
                     c_page_id,
                     LatchFallbackMode::Spin,
@@ -1308,6 +1350,7 @@ pub struct NodePurgeList {
 /// it will be always visited.
 pub struct BTreeNodeCursor<'a, P: 'static> {
     tree: &'a GenericBTree<P>,
+    pool_guard: &'a PoolGuard,
     height: usize,
     coupling: BTreeCoupling<SharedStrategy>,
 }
@@ -1315,9 +1358,10 @@ pub struct BTreeNodeCursor<'a, P: 'static> {
 impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
     /// Create a new cursor.
     #[inline]
-    pub fn new(tree: &'a GenericBTree<P>, height: usize) -> Self {
+    pub fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, height: usize) -> Self {
         BTreeNodeCursor {
             tree,
+            pool_guard,
             height,
             coupling: BTreeCoupling::<SharedStrategy>::new(),
         }
@@ -1326,7 +1370,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
     #[inline]
     pub async fn seek(&mut self, key: &[u8]) {
         self.coupling
-            .seek_and_lock(self.tree, self.height, key)
+            .seek_and_lock(self.tree, self.pool_guard, self.height, key)
             .await
     }
 
@@ -1349,7 +1393,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
                 let upper_fence_key = p_node.upper_fence_key();
                 // reach next key.
                 self.coupling
-                    .seek_and_lock(self.tree, self.height, &upper_fence_key)
+                    .seek_and_lock(self.tree, self.pool_guard, self.height, &upper_fence_key)
                     .await;
                 if let Some(g) = self.coupling.node.take() {
                     return Some(g);
@@ -1362,7 +1406,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
             let c_guard = self
                 .tree
                 .pool
-                .get_page::<BTreeNode>(self.tree.pool_guard(), c_page_id, LatchFallbackMode::Shared)
+                .get_page::<BTreeNode>(self.pool_guard, c_page_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
                 .await
@@ -1418,6 +1462,7 @@ impl Default for BTreeCompactConfig {
 /// It will try to merge right node into left.
 pub struct BTreeCompactor<'a, V: BTreeValue, P: 'static> {
     tree: &'a GenericBTree<P>,
+    pool_guard: &'a PoolGuard,
     // height of nodes to be compacted.
     // If height is greater than 0, V should always be PageID.
     height: usize,
@@ -1429,13 +1474,19 @@ pub struct BTreeCompactor<'a, V: BTreeValue, P: 'static> {
 
 impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     #[inline]
-    pub fn new(tree: &'a GenericBTree<P>, height: usize, config: BTreeCompactConfig) -> Self {
+    pub fn new(
+        tree: &'a GenericBTree<P>,
+        pool_guard: &'a PoolGuard,
+        height: usize,
+        config: BTreeCompactConfig,
+    ) -> Self {
         let low_space = ((mem::size_of::<BTreeNode>() as f64 * config.low_ratio) as usize)
             .min(mem::size_of::<BTreeNode>());
         let high_space = ((mem::size_of::<BTreeNode>() as f64 * config.high_ratio) as usize)
             .min(mem::size_of::<BTreeNode>());
         BTreeCompactor {
             tree,
+            pool_guard,
             height,
             low_space,
             high_space,
@@ -1447,7 +1498,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     #[inline]
     pub async fn seek(&mut self, key: &[u8]) {
         self.coupling
-            .seek_and_lock(self.tree, self.height, key)
+            .seek_and_lock(self.tree, self.pool_guard, self.height, key)
             .await
     }
 
@@ -1645,11 +1696,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             let c_guard = self
                 .tree
                 .pool
-                .get_page(
-                    self.tree.pool_guard(),
-                    c_page_id,
-                    LatchFallbackMode::Exclusive,
-                )
+                .get_page(self.pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1674,11 +1721,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             let c_guard = self
                 .tree
                 .pool
-                .get_page(
-                    self.tree.pool_guard(),
-                    c_page_id,
-                    LatchFallbackMode::Exclusive,
-                )
+                .get_page(self.pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1703,11 +1746,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             let c_guard = self
                 .tree
                 .pool
-                .get_page(
-                    self.tree.pool_guard(),
-                    c_page_id,
-                    LatchFallbackMode::Exclusive,
-                )
+                .get_page(self.pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
                 .lock_exclusive_async()
                 .await
@@ -1759,8 +1798,9 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
                 // insert 1, 2, 3.
                 let one = BTreeU64::from(1);
                 let three = BTreeU64::from(3);
@@ -1768,49 +1808,73 @@ mod tests {
                 let seven = BTreeU64::from(7);
                 let fifty = BTreeU64::from(50);
                 let seventy = BTreeU64::from(70);
-                let res = tree.insert(&1u64.to_be_bytes(), one, false, 210).await;
+                let res = tree
+                    .insert(&pool_guard, &1u64.to_be_bytes(), one, false, 210)
+                    .await;
                 assert!(res.is_ok());
-                let res = tree.insert(&3u64.to_be_bytes(), three, false, 220).await;
+                let res = tree
+                    .insert(&pool_guard, &3u64.to_be_bytes(), three, false, 220)
+                    .await;
                 assert!(res.is_ok());
-                let res = tree.insert(&5u64.to_be_bytes(), five, false, 205).await;
+                let res = tree
+                    .insert(&pool_guard, &5u64.to_be_bytes(), five, false, 205)
+                    .await;
                 assert!(res.is_ok());
 
-                let res = tree.insert(&5u64.to_be_bytes(), five, false, 230).await;
+                let res = tree
+                    .insert(&pool_guard, &5u64.to_be_bytes(), five, false, 230)
+                    .await;
                 assert!(res == BTreeInsert::DuplicateKey(five));
 
                 // look up
                 let res = tree
-                    .lookup_optimistic::<BTreeU64>(&1u64.to_be_bytes())
+                    .lookup_optimistic::<BTreeU64>(&pool_guard, &1u64.to_be_bytes())
                     .await;
                 assert!(res.is_some());
                 let res = tree
-                    .lookup_optimistic::<BTreeU64>(&4u64.to_be_bytes())
+                    .lookup_optimistic::<BTreeU64>(&pool_guard, &4u64.to_be_bytes())
                     .await;
                 assert!(res.is_none());
                 // mark as deleted
-                let res = tree.mark_as_deleted(&3u64.to_be_bytes(), three, 230).await;
+                let res = tree
+                    .mark_as_deleted(&pool_guard, &3u64.to_be_bytes(), three, 230)
+                    .await;
                 assert!(res.is_ok());
-                let res = tree.mark_as_deleted(&5u64.to_be_bytes(), five, 230).await;
+                let res = tree
+                    .mark_as_deleted(&pool_guard, &5u64.to_be_bytes(), five, 230)
+                    .await;
                 assert!(res.is_ok());
-                let res = tree.mark_as_deleted(&7u64.to_be_bytes(), seven, 235).await;
+                let res = tree
+                    .mark_as_deleted(&pool_guard, &7u64.to_be_bytes(), seven, 235)
+                    .await;
                 assert_eq!(res, BTreeUpdate::NotFound);
                 let res = tree
-                    .lookup_optimistic::<BTreeU64>(&5u64.to_be_bytes())
+                    .lookup_optimistic::<BTreeU64>(&pool_guard, &5u64.to_be_bytes())
                     .await;
                 assert_eq!(res, Some(five.deleted()));
                 // update
                 let res = tree
-                    .update(&5u64.to_be_bytes(), five.deleted(), fifty, 240)
+                    .update(&pool_guard, &5u64.to_be_bytes(), five.deleted(), fifty, 240)
                     .await;
                 assert!(res.is_ok());
                 let res = tree
-                    .update(&5u64.to_be_bytes(), five.deleted(), seventy, 245)
+                    .update(
+                        &pool_guard,
+                        &5u64.to_be_bytes(),
+                        five.deleted(),
+                        seventy,
+                        245,
+                    )
                     .await;
                 assert_eq!(res, BTreeUpdate::ValueMismatch(fifty));
                 // delete
-                let res = tree.delete(&3u64.to_be_bytes(), three, true, 250).await;
+                let res = tree
+                    .delete(&pool_guard, &3u64.to_be_bytes(), three, true, 250)
+                    .await;
                 assert!(res.is_ok());
-                let res = tree.delete(&5u64.to_be_bytes(), five, true, 255).await;
+                let res = tree
+                    .delete(&pool_guard, &5u64.to_be_bytes(), five, true, 255)
+                    .await;
                 assert_eq!(res, BTreeDelete::ValueMismatch);
             }
         })
@@ -1825,8 +1889,9 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -1836,7 +1901,9 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
+                    let res = tree
+                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
+                        .await;
                     assert!(res.is_ok());
                     if !printed1 && tree.height() == 1 {
                         printed1 = true;
@@ -1849,13 +1916,13 @@ mod tests {
                     }
                 }
                 println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics().await;
+                let space_stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("tree space statistics: {:?}", space_stat);
 
                 let mut map: HashMap<usize, LevelStat> = HashMap::new();
                 for height in 0usize..3 {
                     let mut stat = LevelStat::default();
-                    let mut cursor = tree.cursor(height);
+                    let mut cursor = tree.cursor(&pool_guard, height);
                     cursor.seek(&[]).await;
                     while let Some(g) = cursor.next().await {
                         let node = g.page();
@@ -1897,8 +1964,9 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -1906,25 +1974,29 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
+                    let res = tree
+                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
+                        .await;
                     assert!(res.is_ok());
                 }
 
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.delete(&key, BTreeU64::from(i), true, 202).await;
+                    let res = tree
+                        .delete(&pool_guard, &key, BTreeU64::from(i), true, 202)
+                        .await;
                     assert!(res.is_ok());
                 }
 
                 println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics().await;
+                let space_stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("tree space statistics: {:?}", space_stat);
 
                 let mut map: HashMap<usize, LevelStat> = HashMap::new();
                 for height in 0usize..3 {
                     let mut stat = LevelStat::default();
-                    let mut cursor = tree.cursor(height);
+                    let mut cursor = tree.cursor(&pool_guard, height);
                     cursor.seek(&[]).await;
                     while let Some(g) = cursor.next().await {
                         let node = g.page();
@@ -1967,8 +2039,9 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -1976,24 +2049,28 @@ mod tests {
                 for i in 0u64..ROWS {
                     // let k = i.to_be_bytes();
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
+                    let res = tree
+                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
+                        .await;
                     assert!(res.is_ok());
                 }
 
                 for i in 0u64..ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.delete(&key, BTreeU64::from(i), true, 202).await;
+                    let res = tree
+                        .delete(&pool_guard, &key, BTreeU64::from(i), true, 202)
+                        .await;
                     assert!(res.is_ok());
                 }
 
                 println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics().await;
+                let space_stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("Before compaction, tree space statistics: {:?}", space_stat);
 
                 let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
-                let purge_list = tree.compact_all::<BTreeU64>(config).await;
+                let purge_list = tree.compact_all::<BTreeU64>(&pool_guard, config).await;
 
-                let space_stat = tree.collect_space_statistics().await;
+                let space_stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("After compaction, tree space statistics: {:?}", space_stat);
 
                 println!("{} pages have been removed from the tree", purge_list.len());
@@ -2006,7 +2083,7 @@ mod tests {
                 let mut map: HashMap<usize, LevelStat> = HashMap::new();
                 for height in 0usize..=tree.height() {
                     let mut stat = LevelStat::default();
-                    let mut cursor = tree.cursor(height);
+                    let mut cursor = tree.cursor(&pool_guard, height);
                     cursor.seek(&[]).await;
                     while let Some(g) = cursor.next().await {
                         let node = g.page();
@@ -2048,8 +2125,9 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
                 let mut map = BTreeMap::new();
 
                 // number less than 10 million
@@ -2058,18 +2136,26 @@ mod tests {
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
                     let res1 = tree
-                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), false, 201)
+                        .insert(
+                            &pool_guard,
+                            &k.to_be_bytes(),
+                            BTreeU64::from(i as u64),
+                            false,
+                            201,
+                        )
                         .await;
                     let res2 = map.entry(k).or_insert_with(|| i as u64);
                     assert!(res1.is_ok() == (*res2 == i as u64));
                 }
                 println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics().await;
+                let space_stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("tree space statistics: {:?}", space_stat);
 
                 for _ in 0..ROWS {
                     let k = between.sample(&mut rng);
-                    let res1 = tree.lookup_optimistic::<BTreeU64>(&k.to_be_bytes()).await;
+                    let res1 = tree
+                        .lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
+                        .await;
                     let res2 = map.get(&k);
                     if let Some(v) = res2 {
                         assert!(res1 == Some(BTreeU64::from(*v)));
@@ -2093,8 +2179,9 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = BTree::new(pool, true, 200).await;
+                let tree = BTree::new(pool, &pool_guard, true, 200).await;
                 let mut map = BTreeMap::new();
 
                 // number less than 10 million
@@ -2104,19 +2191,27 @@ mod tests {
                     let k = between.sample(&mut rng);
                     // println!("row k={}, i={} sampled", k, i);
                     let res1 = tree
-                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), false, 201)
+                        .insert(
+                            &pool_guard,
+                            &k.to_be_bytes(),
+                            BTreeU64::from(i as u64),
+                            false,
+                            201,
+                        )
                         .await;
                     let res2 = map.entry(k).or_insert_with(|| i as u64);
                     assert!(res1.is_ok() == (*res2 == i as u64));
                     // println!("row k={}, i={} inserted", k, i);
                 }
                 println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics().await;
+                let space_stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("tree space statistics: {:?}", space_stat);
 
                 for _ in 0..ROWS {
                     let k = between.sample(&mut rng);
-                    let res1 = tree.lookup_optimistic::<BTreeU64>(&k.to_be_bytes()).await;
+                    let res1 = tree
+                        .lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
+                        .await;
                     let res2 = map.get(&k);
                     if let Some(v) = res2 {
                         assert!(res1 == Some(BTreeU64::from(*v)));
@@ -2138,8 +2233,9 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(20 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = BTree::new(pool, false, 1).await;
+                let tree = BTree::new(pool, &pool_guard, false, 1).await;
 
                 let start = Instant::now();
                 // insert with random distribution.
@@ -2148,7 +2244,7 @@ mod tests {
                     let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
-                        tree.insert(&k.to_be_bytes(), BTreeU64::from(i), false, 100)
+                        tree.insert(&pool_guard, &k.to_be_bytes(), BTreeU64::from(i), false, 100)
                             .await;
                     }
                 }
@@ -2172,7 +2268,7 @@ mod tests {
                     let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
-                        tree.insert(&k.to_be_bytes(), BTreeU64::from(i), false, 100)
+                        tree.insert(&pool_guard, &k.to_be_bytes(), BTreeU64::from(i), false, 100)
                             .await;
                     }
                 }
@@ -2202,26 +2298,33 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = Arc::new(BTree::new(pool, false, 200).await);
+                let tree = Arc::new(BTree::new(pool, &pool_guard, false, 200).await);
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
                 let mut key = [0u8; 1000];
                 for i in 0u64..ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
+                    let res = tree
+                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
+                        .await;
                     assert!(res.is_ok());
                 }
                 let event = Event::new();
                 let listener = event.listen();
                 {
                     let tree = Arc::clone(&tree);
+                    let pool_guard = pool_guard.clone();
                     std::thread::spawn(move || {
                         smol::block_on(async {
                             let k = 90088u64.to_be_bytes();
                             let res = tree
-                                .try_find_leaf_with_optimistic_parent::<SharedStrategy>(&k)
+                                .try_find_leaf_with_optimistic_parent::<SharedStrategy>(
+                                    &pool_guard,
+                                    &k,
+                                )
                                 .await;
                             let (c_guard, p_guard) = res.unwrap();
                             drop(c_guard);
@@ -2238,11 +2341,13 @@ mod tests {
                 listener.await;
                 println!("tree height {}", tree.height());
                 key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
-                let res = tree.insert(&key, BTreeU64::from(90088), false, 202).await;
+                let res = tree
+                    .insert(&pool_guard, &key, BTreeU64::from(90088), false, 202)
+                    .await;
                 assert!(res.is_ok());
                 println!("insert ok");
                 println!("tree height {}", tree.height());
-                let stat = tree.collect_space_statistics().await;
+                let stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("tree space statistics: {:?}", stat)
             }
         })
@@ -2258,21 +2363,25 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = Arc::new(BTree::new(pool, false, 200).await);
+                let tree = Arc::new(BTree::new(pool, &pool_guard, false, 200).await);
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
                 let mut key = [0u8; 1000];
                 for i in 0u64..ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree.insert(&key, BTreeU64::from(i), false, 201).await;
+                    let res = tree
+                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
+                        .await;
                     assert!(res.is_ok());
                 }
                 let event = Event::new();
                 let mut handles = Vec::with_capacity(10);
                 for j in 90088u64..90098 {
                     let tree = Arc::clone(&tree);
+                    let pool_guard = pool_guard.clone();
                     let listener = event.listen();
                     let handle = std::thread::spawn(move || {
                         smol::block_on(async {
@@ -2281,7 +2390,9 @@ mod tests {
 
                             listener.await;
 
-                            let res = tree.insert(&key, BTreeU64::from(90088), false, 202).await;
+                            let res = tree
+                                .insert(&pool_guard, &key, BTreeU64::from(90088), false, 202)
+                                .await;
                             assert!(res.is_ok());
                         })
                     });
@@ -2291,7 +2402,7 @@ mod tests {
                 event.notify(usize::MAX);
                 smol::Timer::after(Duration::from_millis(500)).await;
                 println!("tree height {}", tree.height());
-                let stat = tree.collect_space_statistics().await;
+                let stat = tree.collect_space_statistics(&pool_guard).await;
                 println!("tree space statistics: {:?}", stat)
             }
         })
@@ -2306,18 +2417,25 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
                 // number less than 10 million
                 let between = Uniform::new(0u64, 10_000_000).unwrap();
                 let mut rng = rand::rng();
                 for i in 0..ROWS {
                     let k = between.sample(&mut rng);
                     let _ = tree
-                        .insert(&k.to_be_bytes(), BTreeU64::from(i as u64), false, 201)
+                        .insert(
+                            &pool_guard,
+                            &k.to_be_bytes(),
+                            BTreeU64::from(i as u64),
+                            false,
+                            201,
+                        )
                         .await;
                 }
-                let space_stat = tree.collect_space_statistics().await;
+                let space_stat = tree.collect_space_statistics(&pool_guard).await;
                 println!(
                     "before compaction, tree height {}, space statistics: {:?}",
                     tree.height(),
@@ -2325,9 +2443,9 @@ mod tests {
                 );
 
                 let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
-                tree.compact_all::<BTreeU64>(config).await;
+                tree.compact_all::<BTreeU64>(&pool_guard, config).await;
 
-                let space_stat = tree.collect_space_statistics().await;
+                let space_stat = tree.collect_space_statistics(&pool_guard).await;
                 println!(
                     "after compaction, tree height {}, space statistics: {:?}",
                     tree.height(),
@@ -2348,53 +2466,57 @@ mod tests {
             let pool =
                 scope.adopt(FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
+            let pool_guard = pool.guard();
             assert!(pool.allocated() == 0);
             // height=0
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H0_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, BTreeU64::from(i), false, 201).await;
+                    tree.insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
+                        .await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",
                     H2_ROWS,
                     pool.allocated()
                 );
-                tree.destory().await;
+                tree.destory(&pool_guard).await;
                 assert!(pool.allocated() == 0);
             }
             // height=1
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H1_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, BTreeU64::from(i), false, 201).await;
+                    tree.insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
+                        .await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",
                     H2_ROWS,
                     pool.allocated()
                 );
-                tree.destory().await;
+                tree.destory(&pool_guard).await;
                 assert!(pool.allocated() == 0);
             }
             // height=2
             {
-                let tree = BTree::new(pool, false, 200).await;
+                let tree = BTree::new(pool, &pool_guard, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H2_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&key, BTreeU64::from(i), false, 201).await;
+                    tree.insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
+                        .await;
                 }
                 println!(
                     "BTree with {} keys occupies {} pages",
                     H2_ROWS,
                     pool.allocated()
                 );
-                tree.destory().await;
+                tree.destory(&pool_guard).await;
                 assert!(pool.allocated() == 0);
             }
         })

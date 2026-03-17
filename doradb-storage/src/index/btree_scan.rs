@@ -1,5 +1,5 @@
-use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
+use crate::buffer::{BufferPool, PoolGuard};
 use crate::index::btree::{BTreeNodeCursor, GenericBTree};
 use crate::index::btree_node::{BTreeNode, BTreeSlot};
 use std::ops::{Deref, DerefMut};
@@ -61,9 +61,9 @@ impl<C, P: BufferPool> BTreePrefixScan<'_, C, P> {
 
 impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
     #[inline]
-    pub(super) fn new(tree: &'a GenericBTree<P>, callback: C) -> Self {
+    pub(super) fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, callback: C) -> Self {
         BTreePrefixScan {
-            cursor: BTreeNodeCursor::new(tree, 0),
+            cursor: BTreeNodeCursor::new(tree, pool_guard, 0),
             callback,
         }
     }
@@ -158,17 +158,24 @@ mod tests {
                 scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
             let pool = pool.as_static();
             {
-                let tree = BTree::new(pool, true, 200).await;
+                let pool_guard = pool.guard();
+                let tree = BTree::new(pool, &pool_guard, true, 200).await;
                 let keys = vec![
                     "a", "b", "c", "d", "aa", "bb", "cc", "dd", "aaa", "bbb", "ccc", "ddd",
                 ];
                 for (idx, k) in keys.iter().enumerate() {
                     let res = tree
-                        .insert(k.as_bytes(), BTreeU64::from(idx as u64), false, 100)
+                        .insert(
+                            &pool_guard,
+                            k.as_bytes(),
+                            BTreeU64::from(idx as u64),
+                            false,
+                            100,
+                        )
                         .await;
                     assert!(res.is_ok());
                 }
-                let mut scanner = tree.prefix_scanner(Count(0));
+                let mut scanner = tree.prefix_scanner(&pool_guard, Count(0));
                 scanner.scan_prefix(b"a").await;
                 assert!(scanner.count() == 3);
 
@@ -180,14 +187,18 @@ mod tests {
                 scanner.scan_prefix(b"bb").await;
                 assert!(scanner.count() == 2);
 
-                let res = tree.mark_as_deleted(b"a", BTreeU64::from(0u64), 101).await;
+                let res = tree
+                    .mark_as_deleted(&pool_guard, b"a", BTreeU64::from(0u64), 101)
+                    .await;
                 assert!(res.is_ok());
                 scanner.reset();
                 scanner.scan_prefix(b"a").await;
                 // because the counter does not check delete flag, we still get 3 keys.
                 assert!(scanner.count() == 3);
 
-                let res = tree.delete(b"a", BTreeU64::from(0u64), false, 102).await;
+                let res = tree
+                    .delete(&pool_guard, b"a", BTreeU64::from(0u64), false, 102)
+                    .await;
                 assert!(res.is_ok()); // actual deletion.
                 scanner.reset();
                 scanner.scan_prefix(b"a").await;
@@ -207,7 +218,8 @@ mod tests {
             let pool = pool.as_static();
             {
                 // generate random data
-                let tree = BTree::new(pool, true, 200).await;
+                let pool_guard = pool.guard();
+                let tree = BTree::new(pool, &pool_guard, true, 200).await;
                 let mut data = Vec::with_capacity(COUNT);
                 let mut rng = rand::rng();
                 for i in 0..COUNT {
@@ -225,11 +237,11 @@ mod tests {
                 for (idx, elem) in data.iter().enumerate() {
                     *map.entry(elem[0]).or_default() += 1;
                     let res = tree
-                        .insert(elem, BTreeU64::from(idx as u64), false, 210)
+                        .insert(&pool_guard, elem, BTreeU64::from(idx as u64), false, 210)
                         .await;
                     assert!(res.is_ok());
                 }
-                let mut scanner = tree.prefix_scanner(Count(0));
+                let mut scanner = tree.prefix_scanner(&pool_guard, Count(0));
                 for b in ALPHABETA {
                     let k = std::slice::from_ref(b);
                     scanner.reset();

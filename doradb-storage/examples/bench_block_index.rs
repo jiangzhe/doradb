@@ -45,13 +45,20 @@ fn main() {
                     IndexAttributes::PK,
                 )],
             ));
-            let blk_idx = RowBlockIndex::new(engine.meta_pool, 0).await;
+            let meta_guard = engine.meta_pool.guard();
+            let blk_idx = RowBlockIndex::new(engine.meta_pool, &meta_guard, 0).await;
             let blk_idx = Box::leak(Box::new(blk_idx));
             let mem_guard = engine.mem_pool.guard();
 
             for _ in 0..args.pages {
                 let _ = blk_idx
-                    .get_insert_page(engine.mem_pool, &mem_guard, &metadata, args.rows_per_page)
+                    .get_insert_page(
+                        &meta_guard,
+                        engine.mem_pool,
+                        &mem_guard,
+                        &metadata,
+                        args.rows_per_page,
+                    )
                     .await;
             }
             let start = Instant::now();
@@ -62,9 +69,10 @@ fn main() {
                 let args = args.clone();
                 let stop = Arc::clone(&stop);
                 let blk_idx = &*blk_idx;
+                let meta_guard = meta_guard.clone();
                 let handle = std::thread::spawn(move || {
                     let ex = smol::LocalExecutor::new();
-                    smol::block_on(ex.run(worker(args, blk_idx, stop)))
+                    smol::block_on(ex.run(worker(args, blk_idx, meta_guard, stop)))
                 });
                 handles.push(handle);
             }
@@ -147,6 +155,7 @@ fn bench_btreemap(args: Args) {
 async fn worker(
     args: Args,
     blk_idx: &'static RowBlockIndex,
+    meta_guard: doradb_storage::buffer::PoolGuard,
     stop: Arc<AtomicBool>,
 ) -> (usize, u64) {
     let max_row_id = (args.pages * args.rows_per_page) as u64;
@@ -156,7 +165,7 @@ async fn worker(
     let mut sum_page_id = 0u64;
     for _ in 0..args.count {
         let row_id = rng.next_u64() % max_row_id;
-        let res = blk_idx.find_row(row_id).await;
+        let res = blk_idx.find_row(&meta_guard, row_id).await;
         match res {
             RowLocation::RowPage(page_id) => {
                 count += 1;

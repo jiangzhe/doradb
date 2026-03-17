@@ -1,5 +1,5 @@
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
-use crate::buffer::{BufferPool, EvictableBufferPoolConfig, PoolGuardSlot};
+use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
 use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -223,7 +223,7 @@ fn test_column_delete_basic() {
 
         let key = single_key(1i32);
         let trx = session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
@@ -253,7 +253,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
 
         let key = single_key(1i32);
         let trx = session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let allocated_after_route = sys.engine.disk_pool.allocated();
@@ -290,7 +290,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
 
         let key = single_key(1i32);
         let trx = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let active_root = sys.table.file().active_root();
@@ -341,7 +341,7 @@ fn test_column_delete_rollback() {
 
         let key = single_key(2i32);
         let trx = session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
@@ -386,7 +386,7 @@ fn test_column_delete_rollback_after_checkpoint() {
             .unwrap();
 
         let trx = session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let stmt = trx_delete.start_stmt();
@@ -420,7 +420,7 @@ fn test_column_delete_write_conflict() {
 
         let key = single_key(4i32);
         let trx = session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let mut trx1 = session.begin_trx().unwrap();
@@ -456,7 +456,7 @@ fn test_column_delete_mvcc_visibility() {
 
         let key = single_key(5i32);
         let trx = session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let mut trx_reader = session.begin_trx().unwrap();
@@ -498,7 +498,7 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
 
         let key = single_key(6i32);
         let reader = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, &key, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
         reader.commit().await.unwrap();
 
         sys.new_trx_delete(&mut session, &key).await;
@@ -569,7 +569,7 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
 
         let key = single_key(7i32);
         let reader = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, &key, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
         reader.commit().await.unwrap();
 
         let mut hold_session = sys.new_session();
@@ -629,8 +629,11 @@ fn test_row_page_transition_retries_update_delete() {
         let mut trx = session.begin_trx().unwrap();
         let mut stmt = trx.start_stmt();
         let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
-        let (row_id, _) = index.lookup(&key.vals, stmt.trx.sts).await.unwrap();
-        let page_id = match sys.table.find_row(row_id).await {
+        let (row_id, _) = index
+            .lookup(session.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+            .await
+            .unwrap();
+        let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
             RowLocation::LwcPage(..) => unreachable!("lwc page"),
@@ -639,10 +642,7 @@ fn test_row_page_transition_retries_update_delete() {
             .engine
             .mem_pool
             .get_page::<RowPage>(
-                session
-                    .pool_guards()
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard in table test"),
+                session.pool_guards().mem_guard(),
                 page_id,
                 LatchFallbackMode::Shared,
             )
@@ -659,10 +659,7 @@ fn test_row_page_transition_retries_update_delete() {
             .engine
             .mem_pool
             .get_page::<RowPage>(
-                session
-                    .pool_guards()
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard in table test"),
+                session.pool_guards().mem_guard(),
                 page_id,
                 LatchFallbackMode::Shared,
             )
@@ -702,10 +699,7 @@ fn test_row_page_transition_retries_update_delete() {
             .engine
             .mem_pool
             .get_page::<RowPage>(
-                session
-                    .pool_guards()
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard in table test"),
+                session.pool_guards().mem_guard(),
                 page_id,
                 LatchFallbackMode::Shared,
             )
@@ -1361,8 +1355,11 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let mut trx = session.begin_trx().unwrap();
         let mut stmt = trx.start_stmt();
         let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
-        let (row_id, _) = index.lookup(&key.vals, stmt.trx.sts).await.unwrap();
-        let page_id = match sys.table.find_row(row_id).await {
+        let (row_id, _) = index
+            .lookup(session.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+            .await
+            .unwrap();
+        let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
             RowLocation::LwcPage(..) => unreachable!("row page expected"),
@@ -1372,10 +1369,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             .engine
             .mem_pool
             .get_page::<RowPage>(
-                session
-                    .pool_guards()
-                    .try_guard(PoolGuardSlot::Mem)
-                    .expect("missing mem pool guard in table test"),
+                session.pool_guards().mem_guard(),
                 page_id,
                 LatchFallbackMode::Shared,
             )
@@ -1786,13 +1780,18 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
     }
 }
 
-async fn assert_row_in_lwc(table: &Table, key: &SelectKey, sts: TrxID) -> RowID {
+async fn assert_row_in_lwc(
+    table: &Table,
+    guards: &crate::buffer::PoolGuards,
+    key: &SelectKey,
+    sts: TrxID,
+) -> RowID {
     let index = table.sec_idx()[key.index_no].unique().unwrap();
     let (row_id, _) = index
-        .lookup(&key.vals, sts)
+        .lookup(guards.index_guard(), &key.vals, sts)
         .await
         .expect("row should exist");
-    match table.find_row(row_id).await {
+    match table.find_row(guards, row_id).await {
         RowLocation::LwcPage(..) => row_id,
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),

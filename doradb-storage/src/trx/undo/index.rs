@@ -7,6 +7,7 @@ use crate::row::{RowID, RowRead};
 use crate::trx::TrxID;
 use crate::trx::row::RowReadAccess;
 
+/// Buffer of index undo entries accumulated for rollback and GC handoff.
 #[derive(Default)]
 pub struct IndexUndoLogs(Vec<IndexUndo>);
 
@@ -60,17 +61,20 @@ impl IndexUndoLogs {
         guards: &PoolGuards,
         ts: TrxID,
     ) {
+        let index_pool_guard = guards.index_guard();
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
                 let index = table.sec_idx()[key.index_no].unique().unwrap();
                 if merge_old_deleted {
                     // this is actually a update from deleted to non-deleted.
                     // so we just mask it back to deleted.
-                    let res = index.mask_as_deleted(&key.vals, entry.row_id, ts).await;
+                    let res = index
+                        .mask_as_deleted(index_pool_guard, &key.vals, entry.row_id, ts)
+                        .await;
                     assert!(res);
                 } else {
                     let res = index
-                        .compare_delete(&key.vals, entry.row_id, true, ts)
+                        .compare_delete(index_pool_guard, &key.vals, entry.row_id, true, ts)
                         .await;
                     assert!(res);
                 }
@@ -78,11 +82,13 @@ impl IndexUndoLogs {
             IndexUndoKind::InsertNonUnique(key, merge_old_deleted) => {
                 let index = table.sec_idx()[key.index_no].non_unique().unwrap();
                 if merge_old_deleted {
-                    let res = index.mask_as_deleted(&key.vals, entry.row_id, ts).await;
+                    let res = index
+                        .mask_as_deleted(index_pool_guard, &key.vals, entry.row_id, ts)
+                        .await;
                     assert!(res);
                 } else {
                     let res = index
-                        .compare_delete(&key.vals, entry.row_id, true, ts)
+                        .compare_delete(index_pool_guard, &key.vals, entry.row_id, true, ts)
                         .await;
                     assert!(res);
                 }
@@ -95,7 +101,7 @@ impl IndexUndoLogs {
                     let new_row_id = entry.row_id;
                     let index = table.sec_idx()[key.index_no].unique().unwrap();
                     let res = index
-                        .compare_exchange(&key.vals, new_row_id, old_row_id, ts)
+                        .compare_exchange(index_pool_guard, &key.vals, new_row_id, old_row_id, ts)
                         .await;
                     debug_assert!(res.is_ok());
                 } else {
@@ -112,7 +118,7 @@ impl IndexUndoLogs {
                     //
                     // To solve this, we need to re-check original row with row latch and delete
                     // index entry if it is deleted and does not have any old version (already GCed).
-                    match table.find_row(old_row_id).await {
+                    match table.find_row(guards, old_row_id).await {
                         RowLocation::NotFound => unreachable!(),
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
@@ -127,8 +133,15 @@ impl IndexUndoLogs {
                                 // old row is invisible to all transactions.
                                 let new_row_id = entry.row_id;
                                 let index = table.sec_idx()[key.index_no].unique().unwrap();
-                                let res =
-                                    index.compare_delete(&key.vals, new_row_id, true, ts).await;
+                                let res = index
+                                    .compare_delete(
+                                        index_pool_guard,
+                                        &key.vals,
+                                        new_row_id,
+                                        true,
+                                        ts,
+                                    )
+                                    .await;
                                 assert!(res);
                             } else {
                                 // old row must be seen for one transaction.
@@ -138,6 +151,7 @@ impl IndexUndoLogs {
                                 let index = table.sec_idx()[key.index_no].unique().unwrap();
                                 let res = index
                                     .compare_exchange(
+                                        index_pool_guard,
                                         &key.vals,
                                         new_row_id,
                                         old_row_id.deleted(),
@@ -156,12 +170,20 @@ impl IndexUndoLogs {
                 if unique {
                     let index = table.sec_idx()[key.index_no].unique().unwrap();
                     let res = index
-                        .compare_exchange(&key.vals, entry.row_id.deleted(), entry.row_id, ts)
+                        .compare_exchange(
+                            index_pool_guard,
+                            &key.vals,
+                            entry.row_id.deleted(),
+                            entry.row_id,
+                            ts,
+                        )
                         .await;
                     assert!(res.is_ok());
                 } else {
                     let index = table.sec_idx()[key.index_no].non_unique().unwrap();
-                    let res = index.mask_as_active(&key.vals, entry.row_id, ts).await;
+                    let res = index
+                        .mask_as_active(index_pool_guard, &key.vals, entry.row_id, ts)
+                        .await;
                     assert!(res);
                 }
             }
@@ -199,7 +221,7 @@ impl IndexUndoLogs {
     }
 }
 
-/// IndexUndo represent the undo operation of a index.
+/// One reversible index change recorded for rollback.
 pub struct IndexUndo {
     pub table_id: TableID,
     // The new row id of index change.
@@ -207,6 +229,7 @@ pub struct IndexUndo {
     pub kind: IndexUndoKind,
 }
 
+/// Kinds of index changes that can be rolled back.
 pub enum IndexUndoKind {
     /// Insert unique key, merge flag(if overwrite delete flag)
     InsertUnique(SelectKey, bool),
@@ -223,6 +246,7 @@ pub enum IndexUndoKind {
     DeferDelete(SelectKey, bool),
 }
 
+/// Index entry scheduled for deferred GC-time deletion.
 pub struct IndexPurgeEntry {
     pub table_id: TableID,
     pub row_id: RowID,

@@ -1,4 +1,4 @@
-use crate::buffer::FixedBufferPool;
+use crate::buffer::{FixedBufferPool, PoolGuard};
 use crate::catalog::{TableID, TableMetadata};
 use crate::index::{BlockIndex, RowLocation};
 use crate::table::{GenericMemTable, MemTableAccessor, RowPoolSlot};
@@ -17,6 +17,7 @@ impl CatalogTable {
     pub async fn new(
         mem_pool: &'static FixedBufferPool,
         index_pool: &'static FixedBufferPool,
+        index_pool_guard: &PoolGuard,
         table_id: TableID,
         blk_idx: BlockIndex,
         metadata: Arc<TableMetadata>,
@@ -25,6 +26,7 @@ impl CatalogTable {
             mem_pool,
             RowPoolSlot::Meta,
             index_pool,
+            index_pool_guard,
             table_id,
             metadata,
             blk_idx,
@@ -41,8 +43,12 @@ impl CatalogTable {
     }
 
     #[inline]
-    pub(crate) async fn find_row(&self, row_id: crate::row::RowID) -> RowLocation {
-        GenericMemTable::find_row(self, row_id, None).await
+    pub(crate) async fn find_row(
+        &self,
+        guards: &crate::buffer::PoolGuards,
+        row_id: crate::row::RowID,
+    ) -> RowLocation {
+        GenericMemTable::find_row(self, guards, row_id, None).await
     }
 }
 

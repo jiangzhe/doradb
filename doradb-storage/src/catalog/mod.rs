@@ -12,8 +12,7 @@ pub use table::*;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuardSlot,
-    PoolGuards,
+    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
 };
 use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
@@ -65,6 +64,7 @@ impl Catalog {
     pub async fn new(storage: CatalogStorage) -> Result<Self> {
         let pool_guards = PoolGuards::builder()
             .meta(storage.meta_pool.guard())
+            .index(storage.index_pool.guard())
             .build();
         let snapshot = storage.checkpoint_snapshot()?;
         storage
@@ -256,9 +256,12 @@ impl Catalog {
                     return Err(Error::InvalidState);
                 }
                 let row_id_bound = active_root.pivot_row_id;
+                let meta_pool_guard = guards.meta_guard();
+                let index_pool_guard = guards.index_guard();
 
                 let blk_idx = BlockIndex::new(
                     self.storage.meta_pool,
+                    meta_pool_guard,
                     row_id_bound,
                     active_root.column_block_index_root,
                 )
@@ -267,6 +270,7 @@ impl Catalog {
                     Table::new(
                         mem_pool,
                         index_pool,
+                        index_pool_guard,
                         global_disk_pool.clone(),
                         table.table_id,
                         blk_idx,
@@ -340,6 +344,7 @@ pub enum TableHandle {
 }
 
 impl TableHandle {
+    /// Returns the row block index for this table handle.
     #[inline]
     pub fn blk_idx(&self) -> &BlockIndex {
         match self {
@@ -348,6 +353,7 @@ impl TableHandle {
         }
     }
 
+    /// Returns the secondary indexes exposed by this table handle.
     #[inline]
     pub fn sec_idx(&self) -> &[SecondaryIndex] {
         match self {
@@ -356,11 +362,13 @@ impl TableHandle {
         }
     }
 
+    /// Returns the row-id boundary between persisted and in-memory data.
     #[inline]
     pub fn pivot_row_id(&self) -> RowID {
         self.blk_idx().pivot_row_id()
     }
 
+    /// Returns the deletion buffer if this handle refers to a user table.
     #[inline]
     pub fn deletion_buffer(&self) -> Option<&ColumnDeletionBuffer> {
         match self {
@@ -369,14 +377,16 @@ impl TableHandle {
         }
     }
 
+    /// Resolve a row id to its current storage location.
     #[inline]
-    pub async fn find_row(&self, row_id: RowID) -> crate::index::RowLocation {
+    pub async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> crate::index::RowLocation {
         match self {
-            TableHandle::User(table) => table.find_row(row_id).await,
-            TableHandle::Catalog(table) => table.find_row(row_id).await,
+            TableHandle::User(table) => table.find_row(guards, row_id).await,
+            TableHandle::Catalog(table) => table.find_row(guards, row_id).await,
         }
     }
 
+    /// Load a versioned row page in shared mode if the requested generation still matches.
     #[inline]
     pub async fn try_get_row_page_versioned_shared(
         &self,
@@ -388,9 +398,7 @@ impl TableHandle {
                 let page_guard = table
                     .mem_pool
                     .try_get_page_versioned::<RowPage>(
-                        guards
-                            .try_guard(PoolGuardSlot::Mem)
-                            .expect("missing mem pool guard for user-table row pages"),
+                        guards.mem_guard(),
                         page_id,
                         LatchFallbackMode::Shared,
                     )
@@ -401,9 +409,7 @@ impl TableHandle {
                 let page_guard = table
                     .mem_pool
                     .try_get_page_versioned::<RowPage>(
-                        guards
-                            .try_guard(PoolGuardSlot::Meta)
-                            .expect("missing meta pool guard for catalog-table row pages"),
+                        guards.meta_guard(),
                         page_id,
                         LatchFallbackMode::Shared,
                     )
@@ -413,6 +419,7 @@ impl TableHandle {
         }
     }
 
+    /// Load a row page in shared mode through the appropriate pool slot.
     #[inline]
     pub async fn get_row_page_shared(
         &self,
@@ -423,13 +430,7 @@ impl TableHandle {
             TableHandle::User(table) => {
                 table
                     .mem_pool
-                    .get_page::<RowPage>(
-                        guards
-                            .try_guard(PoolGuardSlot::Mem)
-                            .expect("missing mem pool guard for user-table row pages"),
-                        page_id,
-                        LatchFallbackMode::Shared,
-                    )
+                    .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
                     .await
@@ -437,13 +438,7 @@ impl TableHandle {
             TableHandle::Catalog(table) => {
                 table
                     .mem_pool
-                    .get_page::<RowPage>(
-                        guards
-                            .try_guard(PoolGuardSlot::Meta)
-                            .expect("missing meta pool guard for catalog-table row pages"),
-                        page_id,
-                        LatchFallbackMode::Shared,
-                    )
+                    .get_page::<RowPage>(guards.meta_guard(), page_id, LatchFallbackMode::Shared)
                     .await
                     .lock_shared_async()
                     .await
@@ -451,6 +446,7 @@ impl TableHandle {
         }
     }
 
+    /// Delete one secondary-index entry if it is no longer needed.
     #[inline]
     pub async fn delete_index(
         &self,

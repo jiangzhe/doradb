@@ -36,14 +36,15 @@ async fn single_thread_bench_btree(args: &Args) {
     let pool = scope.adopt(FixedBufferPool::with_capacity_static(args.mem_size).unwrap());
     let pool = pool.as_static();
     {
-        let tree = BTree::new(pool, args.hints_enabled, 1).await;
+        let pool_guard = pool.guard();
+        let tree = BTree::new(pool, &pool_guard, args.hints_enabled, 1).await;
 
         let start = Instant::now();
         match &args.mode[..] {
             "seq" => {
                 for i in 0..args.total_rows {
                     // trick to use lower 4 bytes as head
-                    tree.insert(&i.to_be_bytes(), BTreeU64::from(i), false, 100)
+                    tree.insert(&pool_guard, &i.to_be_bytes(), BTreeU64::from(i), false, 100)
                         .await;
                 }
             }
@@ -52,7 +53,7 @@ async fn single_thread_bench_btree(args: &Args) {
                 let mut thd_rng = rand::rng();
                 for i in 0..args.total_rows {
                     let k = between.sample(&mut thd_rng);
-                    tree.insert(&k.to_be_bytes(), BTreeU64::from(i), false, 100)
+                    tree.insert(&pool_guard, &k.to_be_bytes(), BTreeU64::from(i), false, 100)
                         .await;
                 }
             }
@@ -75,7 +76,7 @@ async fn single_thread_bench_btree(args: &Args) {
 
         if args.compact {
             let purge_list = tree
-                .compact_all::<BTreeU64>(BTreeCompactConfig::new(1.0, 1.0).unwrap())
+                .compact_all::<BTreeU64>(&pool_guard, BTreeCompactConfig::new(1.0, 1.0).unwrap())
                 .await;
             for g in purge_list {
                 pool.deallocate_page(g);
@@ -93,7 +94,8 @@ async fn single_thread_bench_btree(args: &Args) {
         match &args.search_mode[..] {
             "seq" => {
                 for i in 0..args.total_rows {
-                    tree.lookup_optimistic::<BTreeU64>(&i.to_be_bytes()).await;
+                    tree.lookup_optimistic::<BTreeU64>(&pool_guard, &i.to_be_bytes())
+                        .await;
                 }
             }
             "rand" => {
@@ -101,7 +103,8 @@ async fn single_thread_bench_btree(args: &Args) {
                 let mut thd_rng = rand::rng();
                 for _ in 0..args.total_rows {
                     let k = between.sample(&mut thd_rng);
-                    tree.lookup_optimistic::<BTreeU64>(&k.to_be_bytes()).await;
+                    tree.lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
+                        .await;
                 }
             }
             _ => panic!("unknown search mode"),
