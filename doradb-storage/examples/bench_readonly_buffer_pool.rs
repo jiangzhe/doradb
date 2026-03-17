@@ -1,7 +1,7 @@
 use clap::Parser;
 use doradb_storage::buffer::guard::PageGuard;
 use doradb_storage::buffer::page::{PAGE_SIZE, Page, PageID};
-use doradb_storage::buffer::{BufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool};
+use doradb_storage::buffer::{BufferPool, GlobalReadonlyBufferPool, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
 use doradb_storage::error::PersistedFileKind;
 use doradb_storage::file::table_fs::TableFileSystemConfig;
@@ -64,8 +64,10 @@ fn main() {
         write_pages(&table_file, args.pages).await;
 
         let scope = StaticLifetimeScope::new();
-        let global =
-            scope.adopt(GlobalReadonlyBufferPool::with_capacity_static(args.cache_bytes).unwrap());
+        let global = scope.adopt(
+            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, args.cache_bytes)
+                .unwrap(),
+        );
         let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
             901,
             PersistedFileKind::TableFile,

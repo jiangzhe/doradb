@@ -1,7 +1,7 @@
 use crate::buffer::{FixedBufferPool, PoolGuard};
 use crate::catalog::{TableID, TableMetadata};
 use crate::index::{BlockIndex, RowLocation};
-use crate::table::{GenericMemTable, MemTableAccessor, RowPoolSlot};
+use crate::table::{GenericMemTable, MemTableAccessor};
 use crate::trx::MIN_SNAPSHOT_TS;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ impl CatalogTable {
     ) -> Self {
         let mem = GenericMemTable::new(
             mem_pool,
-            RowPoolSlot::Meta,
+            mem_pool.row_pool_role(),
             index_pool,
             index_pool_guard,
             table_id,

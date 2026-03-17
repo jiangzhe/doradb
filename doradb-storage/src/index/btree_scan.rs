@@ -154,8 +154,13 @@ mod tests {
     fn test_btree_scan_single_node() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    64 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             {
                 let pool_guard = pool.guard();
@@ -213,8 +218,13 @@ mod tests {
         const COUNT: usize = 100000;
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    64 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             {
                 // generate random data

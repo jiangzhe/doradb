@@ -16,6 +16,7 @@ use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
+    PoolRole,
 };
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
@@ -207,10 +208,10 @@ impl<'a> LogRecovery<'a> {
         log_merger: LogMerger,
     ) -> Self {
         let pool_guards = PoolGuards::builder()
-            .meta(meta_pool.guard())
-            .index(index_pool.guard())
-            .mem(mem_pool.guard())
-            .disk(global_disk_pool.guard())
+            .push(PoolRole::Meta, meta_pool.guard())
+            .push(PoolRole::Index, index_pool.guard())
+            .push(PoolRole::Mem, mem_pool.guard())
+            .push(PoolRole::Disk, global_disk_pool.guard())
             .build();
         LogRecovery {
             index_pool,
@@ -669,6 +670,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -694,6 +696,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -739,6 +742,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -774,6 +778,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -858,6 +863,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -898,6 +904,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -941,6 +948,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -967,6 +975,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1035,6 +1044,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1073,6 +1083,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1152,6 +1163,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1202,6 +1214,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1329,6 +1342,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1405,6 +1419,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1485,6 +1500,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )

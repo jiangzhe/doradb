@@ -898,6 +898,7 @@ mod tests {
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64u64 * 1024 * 1024)
                         .max_file_size(128u64 * 1024 * 1024),
                 )
@@ -970,6 +971,7 @@ mod tests {
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
                         .max_mem_size(64u64 * 1024 * 1024)
                         .max_file_size(128u64 * 1024 * 1024),
                 )

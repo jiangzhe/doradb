@@ -1795,8 +1795,13 @@ mod tests {
     fn test_btree_single_node() {
         smol::block_on(async {
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(64 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    64 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -1886,8 +1891,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    3 * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -1961,8 +1971,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    3 * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -2036,8 +2051,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    3 * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -2122,8 +2142,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    100 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -2176,8 +2201,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    100 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -2230,8 +2260,13 @@ mod tests {
             const ROWS: u64 = 10_000;
             const MAX_VALUE: u64 = 100_000;
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(20 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    20 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -2295,8 +2330,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    3 * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -2360,8 +2400,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(3 * 1024 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    3 * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -2414,8 +2459,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(100 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    100 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
@@ -2463,8 +2513,13 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let scope = StaticLifetimeScope::new();
-            let pool =
-                scope.adopt(FixedBufferPool::with_capacity_static(2 * 1024 * 1024 * 1024).unwrap());
+            let pool = scope.adopt(
+                FixedBufferPool::with_capacity_static(
+                    crate::buffer::PoolRole::Index,
+                    2 * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
             let pool = pool.as_static();
             let pool_guard = pool.guard();
             assert!(pool.allocated() == 0);

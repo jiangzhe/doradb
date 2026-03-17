@@ -1,3 +1,4 @@
+use crate::buffer::PoolIdentity;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
@@ -183,6 +184,11 @@ impl<T> QuiescentBox<T> {
     #[inline]
     fn inner_ptr(&self) -> NonNull<QuiescentInner<T>> {
         NonNull::from(self.inner.as_ref().get_ref())
+    }
+
+    #[inline]
+    pub(crate) fn owner_identity(&self) -> PoolIdentity {
+        PoolIdentity::from_owner_addr(self.inner_ptr().as_ptr() as usize)
     }
 
     /// Creates a shared keepalive guard to the owned value.
