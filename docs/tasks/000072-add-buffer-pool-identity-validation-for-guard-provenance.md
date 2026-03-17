@@ -46,7 +46,7 @@ Issue Labels:
 - `codex`
 
 Source Backlogs:
-- `docs/backlogs/000056-add-pool-brand-identity-to-retained-page-guards-and-arena-guards.md`
+- `docs/backlogs/closed/000056-add-pool-brand-identity-to-retained-page-guards-and-arena-guards.md`
 
 ## Goals
 
@@ -142,21 +142,30 @@ Reference:
 
 ## Implementation Notes
 
-- `PoolIdentity` is now a runtime-only provenance token derived from
-  `QuiescentBox::owner_identity()`.
-- `PoolRole` and `RowPoolRole` are the only selector enums exposed to engine,
-  table, and config wiring.
-- `PoolGuard` now carries only the exact `PoolIdentity` and the quiescent
-  keepalive.
+- Implemented in `doradb-storage/src/buffer/{identity,pool_guard,arena}.rs`
+  and the concrete pool modules, with follow-on wiring in engine, session,
+  catalog, table, and transaction call sites.
+- `PoolIdentity` is a runtime-only provenance token derived from
+  `QuiescentBox::owner_identity()`, while `PoolRole` / `RowPoolRole` remain the
+  selector enums used by config, bundle assembly, and table runtime lookup.
+- `PoolGuard` now carries only exact `PoolIdentity` plus keepalive, and all
+  pool/arena retained-guard paths validate exact identity before reuse.
 - `PoolGuards` and `PoolGuardsBuilder` use named `Option<PoolGuard>` fields and
-  `push(PoolRole, PoolGuard)` instead of slice storage.
-- `FixedBufferPool`, `EvictableBufferPool`, and `GlobalReadonlyBufferPool`
-  now own `PoolRole`, while `QuiescentArena` owns only exact identity and arena
-  lifetime state.
-- All pool and arena paths validate exact guard identity before retaining or
-  reusing a guard.
-- Stale cross-role mismatch tests were reduced to same-role provenance
-  regressions to cover the bug this task actually targets.
+  `push(PoolRole, PoolGuard)` so bundle lookup remains deterministic by role.
+- `PoolRole` ownership ended up on `FixedBufferPool`, `EvictableBufferPool`,
+  and `GlobalReadonlyBufferPool`; `QuiescentArena` now owns only exact
+  identity and arena lifetime state.
+- Review surfaced that a role-only identity still allowed same-role foreign
+  guards. The final implementation resolved that by splitting `PoolRole` from
+  exact `PoolIdentity` and adding same-role mismatch regression tests.
+- Follow-up cleanup completed during implementation:
+  `PoolGuard::identity()` is available in non-test builds, and
+  `EvictableBufferPoolConfig` no longer accepts the old serde `identity` alias.
+- Verification completed:
+  - `cargo fmt --all`
+  - `cargo test -p doradb-storage --no-default-features`
+  - `cargo test -p doradb-storage`
+  - `cargo clippy --all-features --all-targets -- -D warnings`
 
 ## Impacts
 
