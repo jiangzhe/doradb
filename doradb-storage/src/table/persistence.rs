@@ -47,7 +47,7 @@ impl Table {
 
         // Step 3: open a checkpoint transaction and prepare per-phase state.
         let mut trx = session
-            .begin_trx()
+            .try_begin_trx()?
             .ok_or(Error::NotSupported("checkpoint requires idle session"))?;
         let checkpoint_ts = trx.sts;
         let mut new_pivot_row_id = pivot_row_id;

@@ -120,11 +120,11 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
 
             let table100 = TableObject { table_id: 100 };
             let table101 = TableObject { table_id: 101 };
-            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
             assert!(
                 engine
                     .catalog()
@@ -143,7 +143,7 @@ mod tests {
             );
             stmt.succeed().commit().await.unwrap();
 
-            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
             assert!(
                 engine
                     .catalog()

@@ -116,8 +116,10 @@ pub enum Error {
     RowNotFound,
     #[error("insufficient free space for in-place update")]
     InsufficientFreeSpaceForInplaceUpdate,
-    #[error("Transaction system shutdown")]
-    TransactionSystemShutdown,
+    #[error("storage engine shutdown")]
+    StorageEngineShutdown,
+    #[error("storage engine shutdown is waiting for {0} extra engine refs to drop")]
+    StorageEngineShutdownBusy(usize),
     #[error("{0}")]
     AIOError(#[from] AIOError),
     #[error("table not found")]

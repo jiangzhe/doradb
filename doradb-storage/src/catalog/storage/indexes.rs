@@ -334,7 +334,7 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
 
             let idx_42_0 = IndexObject {
                 table_id: 42,
@@ -355,7 +355,7 @@ mod tests {
                 index_attributes: IndexAttributes::PK,
             };
 
-            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
             assert!(
                 engine
                     .catalog()
@@ -382,7 +382,7 @@ mod tests {
             );
             stmt.succeed().commit().await.unwrap();
 
-            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
             assert!(
                 engine
                     .catalog()
@@ -419,7 +419,7 @@ mod tests {
             assert_eq!(idx_43.len(), 1);
             assert_eq!(idx_43[0].index_no, 0);
 
-            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
             assert!(
                 !engine
                     .catalog()

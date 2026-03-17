@@ -35,3 +35,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: replaced
+- Detail: Task 000073 implemented the phase-1 engine shutdown barrier; remaining graceful drain, timeout, and forced-shutdown policy moved to docs/backlogs/000059-add-session-drain-and-forced-shutdown-policy-after-engine-shutdown-barrier.md.
+- Closed By: task resolve
+- Reference: docs/tasks/000073-engine-shutdown-barrier.md
+- Closed At: 2026-03-17

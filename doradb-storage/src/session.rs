@@ -60,16 +60,17 @@ impl Session {
 
     /// Begin a new transaction if the session is currently idle.
     #[inline]
-    pub fn begin_trx(&mut self) -> Option<ActiveTrx> {
+    pub fn try_begin_trx(&mut self) -> Result<Option<ActiveTrx>> {
         if self.state.in_trx.load(Ordering::Relaxed) {
-            return None;
+            return Ok(None);
         }
-        let trx = self
-            .state
-            .engine_ref
-            .trx_sys
-            .begin_trx(Arc::clone(&self.state));
-        Some(trx)
+        let trx = self.state.engine_ref.with_running_admission(|| {
+            self.state
+                .engine_ref
+                .trx_sys
+                .begin_trx(Arc::clone(&self.state))
+        })?;
+        Ok(Some(trx))
     }
 
     /// Create a new table.
@@ -134,7 +135,14 @@ impl Session {
         }
 
         // 3. begin transaction
-        let mut stmt = self.begin_trx().unwrap().start_stmt();
+        let mut stmt = match self.try_begin_trx() {
+            Ok(Some(trx)) => trx.start_stmt(),
+            Ok(None) => unreachable!("create_table requires idle session"),
+            Err(err) => {
+                uninit_table_file.try_delete();
+                return Err(err);
+            }
+        };
 
         // 4. insert catalog related objects.
         let inserted = engine

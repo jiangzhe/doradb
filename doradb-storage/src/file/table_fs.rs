@@ -9,6 +9,7 @@ use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
 use crate::io::{AIOClient, AIOContext};
 use crate::lifetime::StaticLifetime;
 use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use std::thread::JoinHandle;
 /// creating, opening, closing and removing table files.
 pub struct TableFileSystem {
     io_client: AIOClient<FileIO>,
-    handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
     buf_list: FixedSizeBufferFreeList,
     data_dir: PathBuf,
     // Catalog multi-table file name.
@@ -39,7 +40,7 @@ impl TableFileSystem {
         let handle = event_loop.start_thread(listener);
         Ok(TableFileSystem {
             io_client,
-            handle: Some(handle),
+            handle: Mutex::new(Some(handle)),
             buf_list,
             data_dir,
             catalog_file_name,
@@ -114,13 +115,20 @@ impl TableFileSystem {
         )
         .await
     }
+
+    #[inline]
+    pub(crate) fn shutdown(&self) {
+        self.io_client.shutdown();
+        if let Some(handle) = self.handle.lock().take() {
+            handle.join().unwrap();
+        }
+    }
 }
 
 impl Drop for TableFileSystem {
     #[inline]
     fn drop(&mut self) {
-        self.io_client.shutdown();
-        self.handle.take().unwrap().join().unwrap();
+        self.shutdown();
     }
 }
 
@@ -235,6 +243,18 @@ mod tests {
     use crate::value::ValKind;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_table_file_system_shutdown_is_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let fs = TableFileSystemConfig::default()
+            .data_dir(temp_dir.path())
+            .build()
+            .unwrap();
+
+        fs.shutdown();
+        fs.shutdown();
+    }
 
     #[test]
     fn test_user_table_file_uses_hex_name() {

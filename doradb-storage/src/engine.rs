@@ -7,7 +7,7 @@ use crate::buffer::{
     PoolRole,
 };
 use crate::catalog::Catalog;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
 use crate::lifetime::StaticLifetime;
 use crate::quiescent::{QuiDAG, QuiDep, QuiHandle};
@@ -16,10 +16,54 @@ use crate::storage_path::ResolvedStoragePaths;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::sys_conf::TrxSysConfig;
 use byte_unit::Byte;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineLifecycleState {
+    Running = 0,
+    ShuttingDown = 1,
+    Shutdown = 2,
+}
+
+struct EngineLifecycle {
+    state: AtomicU8,
+    admission_gate: RwLock<()>,
+    finalize_lock: Mutex<()>,
+}
+
+impl EngineLifecycle {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(EngineLifecycleState::Running as u8),
+            admission_gate: RwLock::new(()),
+            finalize_lock: Mutex::new(()),
+        }
+    }
+
+    #[inline]
+    fn state(&self) -> EngineLifecycleState {
+        match self.state.load(Ordering::Acquire) {
+            x if x == EngineLifecycleState::Running as u8 => EngineLifecycleState::Running,
+            x if x == EngineLifecycleState::ShuttingDown as u8 => {
+                EngineLifecycleState::ShuttingDown
+            }
+            x if x == EngineLifecycleState::Shutdown as u8 => EngineLifecycleState::Shutdown,
+            x => panic!("invalid engine lifecycle state: {x}"),
+        }
+    }
+
+    #[inline]
+    fn set_state(&self, state: EngineLifecycleState) {
+        self.state.store(state as u8, Ordering::Release);
+    }
+}
 
 /// Storage engine of DoraDB.
 pub struct Engine(Arc<EngineInner>);
@@ -34,8 +78,9 @@ impl Deref for Engine {
 
 impl Engine {
     #[inline]
-    pub fn new_session(&self) -> Session {
-        Session::new(self.new_ref())
+    pub fn try_new_session(&self) -> Result<Session> {
+        self.0
+            .with_running_admission(|| Session::new(self.new_ref()))
     }
 
     #[inline]
@@ -47,6 +92,37 @@ impl Engine {
     pub fn new_ref(&self) -> EngineRef {
         EngineRef(Arc::clone(&self.0))
     }
+
+    #[inline]
+    pub fn shutdown(&self) -> Result<()> {
+        self.finalize_shutdown()
+    }
+
+    #[inline]
+    fn finalize_shutdown(&self) -> Result<()> {
+        let _finalize = self.0.lifecycle.finalize_lock.lock();
+        if self.0.lifecycle.state() == EngineLifecycleState::Shutdown {
+            return Ok(());
+        }
+
+        {
+            let _gate = self.0.lifecycle.admission_gate.write();
+            if self.0.lifecycle.state() == EngineLifecycleState::Running {
+                self.0
+                    .lifecycle
+                    .set_state(EngineLifecycleState::ShuttingDown);
+            }
+        }
+
+        let strong_count = Arc::strong_count(&self.0);
+        if strong_count != 1 {
+            return Err(Error::StorageEngineShutdownBusy(strong_count - 1));
+        }
+
+        self.0.shutdown_components();
+        self.0.lifecycle.set_state(EngineLifecycleState::Shutdown);
+        Ok(())
+    }
 }
 
 impl Drop for Engine {
@@ -55,6 +131,9 @@ impl Drop for Engine {
         // Engine is supposed to be last one to drop.
         if Arc::strong_count(&self.0) != 1 {
             panic!("fatal: engine ref is leaked");
+        }
+        if let Err(err) = self.finalize_shutdown() {
+            panic!("fatal: engine shutdown failed: {err}");
         }
     }
 }
@@ -72,8 +151,8 @@ impl Deref for EngineRef {
 
 impl EngineRef {
     #[inline]
-    pub fn new_session(&self) -> Session {
-        Session::new(self.clone())
+    pub fn try_new_session(&self) -> Result<Session> {
+        self.0.with_running_admission(|| Session::new(self.clone()))
     }
 
     #[inline]
@@ -191,7 +270,27 @@ pub struct EngineInner {
     pub table_fs: &'static TableFileSystem,
     // Global readonly buffer pool for table-file page reads.
     pub disk_pool: &'static GlobalReadonlyBufferPool,
+    lifecycle: EngineLifecycle,
     _owners: EngineOwners,
+}
+
+impl EngineInner {
+    #[inline]
+    pub(crate) fn with_running_admission<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
+        let _gate = self.lifecycle.admission_gate.read();
+        if self.lifecycle.state() != EngineLifecycleState::Running {
+            return Err(Error::StorageEngineShutdown);
+        }
+        Ok(f())
+    }
+
+    #[inline]
+    fn shutdown_components(&self) {
+        self.trx_sys.shutdown();
+        self.mem_pool.shutdown();
+        self.table_fs.shutdown();
+        self.disk_pool.shutdown();
+    }
 }
 
 unsafe impl Send for Engine {}
@@ -366,6 +465,7 @@ impl EngineConfig {
             mem_pool,
             table_fs,
             disk_pool,
+            lifecycle: EngineLifecycle::new(),
             _owners: EngineOwners::new(dag),
         })))
     }
@@ -378,6 +478,7 @@ mod tests {
     use crate::lifetime::StaticLifetimeScope;
     use crate::storage_path::STORAGE_LAYOUT_FILE_NAME;
     use std::fs;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -527,6 +628,75 @@ mod tests {
                 .unwrap();
             drop(engine);
             assert!(marker_path.exists());
+        });
+    }
+
+    #[test]
+    fn test_engine_shutdown_is_idempotent_and_rejects_new_work() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+
+            engine.shutdown().unwrap();
+            engine.shutdown().unwrap();
+
+            let err = match engine.try_new_session() {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageEngineShutdown));
+
+            let engine_ref = engine.new_ref();
+            let err = match engine_ref.try_new_session() {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageEngineShutdown));
+            drop(engine_ref);
+        });
+    }
+
+    #[test]
+    fn test_engine_shutdown_busy_until_refs_drop() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            let err = match engine.shutdown() {
+                Ok(_) => panic!("expected busy shutdown error"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageEngineShutdownBusy(1)));
+
+            let err = match engine.try_new_session() {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageEngineShutdown));
+
+            let err = match session.try_begin_trx() {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageEngineShutdown));
+
+            drop(session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_drop_engine_panics_when_extra_refs_exist() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let leaked_ref = engine.new_ref();
+
+            let res = catch_unwind(AssertUnwindSafe(|| drop(engine)));
+            assert!(res.is_err());
+
+            drop(leaked_ref);
         });
     }
 
@@ -682,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unstarted_transaction_system_drop_is_safe() {
+    fn test_unstarted_transaction_system_shutdown_is_safe() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let data_dir = temp_dir.path().join("data");
@@ -730,6 +900,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
+
+            pending.trx_sys.shutdown();
+            pending.trx_sys.shutdown();
 
             // SAFETY: this test exercises the failed-startup cleanup path where
             // the leaked transaction system is dropped before `start()` runs.

@@ -709,7 +709,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let table_spec = TableSpec::new(vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
@@ -791,7 +791,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let table_spec = TableSpec::new(vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::VarByte, ColumnAttributes::empty()),
@@ -819,7 +819,7 @@ mod tests {
             let s: String = std::iter::repeat_n('0', 100).collect();
             // insert
             for i in (0..DML_SIZE).step_by(INS_STEP) {
-                let mut trx = session.begin_trx().unwrap();
+                let mut trx = session.try_begin_trx().unwrap().unwrap();
                 for j in i..i + INS_STEP {
                     let mut stmt = trx.start_stmt();
                     let res = stmt
@@ -833,7 +833,7 @@ mod tests {
             // update
             let s2: String = std::iter::repeat_n('2', 100).collect();
             for i in (0..DML_SIZE).step_by(UPD_STEP) {
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as u32)]);
                 let uc = UpdateCol {
@@ -846,7 +846,7 @@ mod tests {
             }
             // delete
             for i in (0..DML_SIZE).step_by(DEL_STEP) {
-                let trx = session.begin_trx().unwrap();
+                let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as u32)]);
                 let res = stmt.delete_row(&table, &key).await;
@@ -877,7 +877,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let session = engine.new_session();
+            let session = engine.try_new_session().unwrap();
             let mut rows = 0usize;
             table
                 .accessor()
@@ -917,7 +917,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![ColumnSpec::new(
@@ -988,7 +988,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -1017,7 +1017,7 @@ mod tests {
                 .catalog_replay_start_ts;
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut trx = session.begin_trx().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let insert = stmt
                 .insert_row(&table, vec![Val::from(7u32), Val::from("cold-row")])
@@ -1027,7 +1027,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await;
-            let mut checkpoint_session = engine.new_session();
+            let mut checkpoint_session = engine.try_new_session().unwrap();
             table
                 .data_checkpoint(&mut checkpoint_session)
                 .await
@@ -1058,10 +1058,10 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
 
-            let trx = session.begin_trx().unwrap();
+            let trx = session.try_begin_trx().unwrap().unwrap();
             let stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
             let row = stmt.select_row_mvcc(&table, &key, &[0, 1]).await;
@@ -1096,7 +1096,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -1127,7 +1127,7 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            let mut trx = session.begin_trx().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let insert = stmt
                 .insert_row(&table, vec![Val::from(7u32), Val::from("cold-row")])
@@ -1137,7 +1137,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await;
-            let mut checkpoint_session = engine.new_session();
+            let mut checkpoint_session = engine.try_new_session().unwrap();
             table
                 .data_checkpoint(&mut checkpoint_session)
                 .await
@@ -1145,7 +1145,7 @@ mod tests {
             let root_after_checkpoint = table.file().active_root();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
-            let mut trx = session.begin_trx().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let insert = stmt
                 .insert_row(&table, vec![Val::from(8u32), Val::from("hot-row")])
@@ -1177,10 +1177,10 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             assert!(table.total_row_pages(session.pool_guards()).await > 0);
 
-            let trx = session.begin_trx().unwrap();
+            let trx = session.try_begin_trx().unwrap().unwrap();
             let stmt = trx.start_stmt();
 
             let cold_key = SelectKey::new(0, vec![Val::from(7u32)]);
@@ -1227,7 +1227,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let checkpointed_table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -1281,7 +1281,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut trx = session.begin_trx().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let insert = stmt
                 .insert_row(
@@ -1294,13 +1294,13 @@ mod tests {
             trx.commit().await.unwrap();
 
             checkpointed_table.freeze(&session, usize::MAX).await;
-            let mut checkpoint_session = engine.new_session();
+            let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpointed_table
                 .data_checkpoint(&mut checkpoint_session)
                 .await
                 .unwrap();
 
-            let mut trx = session.begin_trx().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let insert = stmt
                 .insert_row(
@@ -1366,7 +1366,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             assert_eq!(
                 checkpointed_table
                     .total_row_pages(session.pool_guards())
@@ -1380,7 +1380,7 @@ mod tests {
                     > 0
             );
 
-            let trx = session.begin_trx().unwrap();
+            let trx = session.try_begin_trx().unwrap().unwrap();
             let stmt = trx.start_stmt();
 
             let checkpointed_key = SelectKey::new(0, vec![Val::from(7u32)]);
@@ -1432,7 +1432,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -1455,7 +1455,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut trx = session.begin_trx().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let insert = stmt
                 .insert_row(&table, vec![Val::from(7u32), Val::from("persisted-row")])
@@ -1465,7 +1465,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await;
-            let mut checkpoint_session = engine.new_session();
+            let mut checkpoint_session = engine.try_new_session().unwrap();
             table
                 .data_checkpoint(&mut checkpoint_session)
                 .await

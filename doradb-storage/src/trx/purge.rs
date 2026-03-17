@@ -681,8 +681,8 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.new_session();
-            let mut trx = session.begin_trx().unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             stmt.insert_row(&table, vec![Val::from(1001i32)])
                 .await
@@ -768,8 +768,8 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.new_session();
-            let mut trx = session.begin_trx().unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             stmt.insert_row(&table, vec![Val::from(1002i32)])
                 .await
@@ -859,8 +859,8 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.new_session();
-            let mut trx = session.begin_trx().unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             stmt.insert_row(&table, vec![Val::from(1003i32)])
                 .await
@@ -963,8 +963,8 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.new_session();
-            let mut trx = session.begin_trx().unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             stmt.insert_row(&table, vec![Val::from(1004i32)])
                 .await
@@ -1080,10 +1080,10 @@ mod tests {
             smol::Timer::after(Duration::from_millis(1000)).await;
             let init_stats = engine.trx_sys.trx_sys_stats();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             // insert
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx().unwrap();
+                let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let res = stmt.insert_row(&table, vec![Val::from(i as i32)]).await;
                 assert!(res.is_ok());
@@ -1093,7 +1093,7 @@ mod tests {
             }
             // delete
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx().unwrap();
+                let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = stmt.delete_row(&table, &key).await;
@@ -1164,10 +1164,10 @@ mod tests {
             smol::Timer::after(Duration::from_millis(100)).await;
             let init_stats = engine.trx_sys.trx_sys_stats();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             // insert
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx().unwrap();
+                let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let res = stmt.insert_row(&table, vec![Val::from(i as i32)]).await;
                 assert!(res.is_ok());
@@ -1177,7 +1177,7 @@ mod tests {
             }
             // delete
             for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx().unwrap();
+                let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = stmt.delete_row(&table, &key).await;

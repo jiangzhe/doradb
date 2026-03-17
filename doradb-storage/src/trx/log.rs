@@ -298,7 +298,7 @@ impl LogPartition {
             return Ok((cts, session, listener));
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
-            Commit::Shutdown => return Err(Error::TransactionSystemShutdown),
+            Commit::Shutdown => return Err(Error::StorageEngineShutdown),
             Commit::Group(group) => group,
             Commit::Switch(_) => {
                 // Impossible, switch always has one group followed.
@@ -908,10 +908,10 @@ mod tests {
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             {
                 for i in 0..SIZE {
-                    let mut trx = session.begin_trx().unwrap();
+                    let mut trx = session.try_begin_trx().unwrap().unwrap();
                     let mut stmt = trx.start_stmt();
                     let s = format!("{}", i);
                     let insert = vec![Val::from(i), Val::from(&s[..])];
@@ -981,10 +981,10 @@ mod tests {
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             {
                 for i in 0..SIZE {
-                    let mut trx = session.begin_trx().unwrap();
+                    let mut trx = session.try_begin_trx().unwrap().unwrap();
                     let mut stmt = trx.start_stmt();
                     let s = format!("{}", i);
                     let insert = vec![Val::from(i), Val::from(&s[..])];

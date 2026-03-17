@@ -550,7 +550,7 @@ pub mod tests {
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
     pub(crate) async fn table1(engine: &Engine) -> TableID {
-        let mut session = engine.new_session();
+        let mut session = engine.try_new_session().unwrap();
         let table_id = session
             .create_table(
                 TableSpec {
@@ -576,7 +576,7 @@ pub mod tests {
     /// Table2 has i32(unique key) and string column.
     #[inline]
     pub(crate) async fn table2(engine: &Engine) -> TableID {
-        let mut session = engine.new_session();
+        let mut session = engine.try_new_session().unwrap();
         let table_id = session
             .create_table(
                 TableSpec {
@@ -609,7 +609,7 @@ pub mod tests {
     /// Table3 has single string key column.
     #[inline]
     pub(crate) async fn table3(engine: &Engine) -> TableID {
-        let mut session = engine.new_session();
+        let mut session = engine.try_new_session().unwrap();
 
         let table_id = session
             .create_table(
@@ -638,7 +638,7 @@ pub mod tests {
     /// Second is non-unique index.
     #[inline]
     pub(crate) async fn table4(engine: &Engine) -> TableID {
-        let mut session = engine.new_session();
+        let mut session = engine.try_new_session().unwrap();
 
         let table_id = session
             .create_table(
@@ -740,7 +740,7 @@ pub mod tests {
                 .await
                 .unwrap();
             assert_eq!(engine.catalog().curr_next_user_obj_id(), USER_OBJ_ID_START);
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
             let table_spec = TableSpec {
                 columns: vec![
                     ColumnSpec {
@@ -962,8 +962,8 @@ pub mod tests {
             let roots_before = snap1.meta.table_roots;
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.new_session();
-            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let mut session = engine.try_new_session().unwrap();
+            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
             let res = stmt.insert_row(&table, vec![Val::I32(7)]).await;
             assert!(res.is_ok());
             stmt.succeed().commit().await.unwrap();
@@ -1074,16 +1074,16 @@ pub mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.new_session();
+            let mut session = engine.try_new_session().unwrap();
 
-            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
             let res = stmt
                 .insert_row(&checkpointed_table, vec![Val::I32(7)])
                 .await;
             assert!(res.is_ok());
             stmt.succeed().commit().await.unwrap();
 
-            let mut stmt = session.begin_trx().unwrap().start_stmt();
+            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
             let res = stmt
                 .insert_row(
                     &replay_only_table,
@@ -1094,7 +1094,7 @@ pub mod tests {
             stmt.succeed().commit().await.unwrap();
 
             checkpointed_table.freeze(&session, usize::MAX).await;
-            let mut checkpoint_session = engine.new_session();
+            let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpointed_table
                 .data_checkpoint(&mut checkpoint_session)
                 .await
