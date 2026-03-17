@@ -428,22 +428,8 @@ impl TableHandle {
         page_id: PageID,
     ) -> Option<PageSharedGuard<RowPage>> {
         match self {
-            TableHandle::User(table) => {
-                table
-                    .mem_pool
-                    .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Shared)
-                    .await
-                    .lock_shared_async()
-                    .await
-            }
-            TableHandle::Catalog(table) => {
-                table
-                    .mem_pool
-                    .get_page::<RowPage>(guards.meta_guard(), page_id, LatchFallbackMode::Shared)
-                    .await
-                    .lock_shared_async()
-                    .await
-            }
+            TableHandle::User(table) => table.get_row_page_shared(guards, page_id).await,
+            TableHandle::Catalog(table) => table.get_row_page_shared(guards, page_id).await,
         }
     }
 

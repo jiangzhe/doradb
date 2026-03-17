@@ -209,15 +209,76 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
+    fn row_pool_guard<'a>(&self, guards: &'a PoolGuards) -> &'a PoolGuard {
+        guards
+            .try_row_guard(self.row_pool_role)
+            .expect("missing row-page pool guard")
+    }
+
+    #[inline]
+    pub(crate) async fn get_row_page_shared(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> Option<PageSharedGuard<RowPage>> {
+        self.mem_pool()
+            .get_page::<RowPage>(
+                self.row_pool_guard(guards),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
+            .await
+            .lock_shared_async()
+            .await
+    }
+
+    #[inline]
+    pub(crate) async fn get_row_page_exclusive(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> Option<PageExclusiveGuard<RowPage>> {
+        self.mem_pool()
+            .get_page::<RowPage>(
+                self.row_pool_guard(guards),
+                page_id,
+                LatchFallbackMode::Exclusive,
+            )
+            .await
+            .lock_exclusive_async()
+            .await
+    }
+
+    #[inline]
+    async fn must_get_row_page_shared(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> PageSharedGuard<RowPage> {
+        self.get_row_page_shared(guards, page_id)
+            .await
+            .expect("failed to lock shared row page")
+    }
+
+    #[inline]
+    async fn must_get_row_page_exclusive(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> PageExclusiveGuard<RowPage> {
+        self.get_row_page_exclusive(guards, page_id)
+            .await
+            .expect("failed to lock exclusive row page")
+    }
+
+    #[inline]
     pub(crate) async fn get_insert_page(
         &self,
         guards: &PoolGuards,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
         let meta_pool_guard = guards.meta_guard();
-        let row_pool_guard = guards
-            .try_row_guard(self.row_pool_role)
-            .expect("missing row-page pool guard");
+        let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
             .get_insert_page(
                 meta_pool_guard,
@@ -236,9 +297,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
         let meta_pool_guard = guards.meta_guard();
-        let row_pool_guard = guards
-            .try_row_guard(self.row_pool_role)
-            .expect("missing row-page pool guard");
+        let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
             .get_insert_page_exclusive(
                 meta_pool_guard,
@@ -258,9 +317,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         page_id: PageID,
     ) -> PageExclusiveGuard<RowPage> {
         let meta_pool_guard = guards.meta_guard();
-        let row_pool_guard = guards
-            .try_row_guard(self.row_pool_role)
-            .expect("missing row-page pool guard");
+        let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
             .allocate_row_page_at(
                 meta_pool_guard,
@@ -282,9 +339,6 @@ impl<P: BufferPool> GenericMemTable<P> {
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
-        let row_pool_guard = guards
-            .try_row_guard(self.row_pool_role)
-            .expect("missing row-page pool guard");
         let meta_pool_guard = guards.meta_guard();
         let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
         cursor.seek(0).await;
@@ -293,17 +347,9 @@ impl<P: BufferPool> GenericMemTable<P> {
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
             for page_entry in entries {
-                let page_guard: PageSharedGuard<RowPage> = self
-                    .mem_pool
-                    .get_page(
-                        row_pool_guard,
-                        page_entry.page_id,
-                        LatchFallbackMode::Shared,
-                    )
-                    .await
-                    .lock_shared_async()
-                    .await
-                    .unwrap();
+                let page_guard = self
+                    .must_get_row_page_shared(guards, page_entry.page_id)
+                    .await;
                 if !page_action(page_guard) {
                     return;
                 }
@@ -495,16 +541,8 @@ impl Table {
                 // A potential optimization is to check row version map without loading
                 // row page back. This requires interface change of buffer pool.
                 let page_guard = self
-                    .mem_pool()
-                    .get_page::<RowPage>(
-                        guards.mem_guard(),
-                        page_info.page_id,
-                        LatchFallbackMode::Shared,
-                    )
-                    .await
-                    .lock_shared_async()
-                    .await
-                    .unwrap();
+                    .must_get_row_page_shared(guards, page_info.page_id)
+                    .await;
                 let (ctx, _) = page_guard.ctx_and_page();
                 let row_ver = ctx.row_ver().unwrap();
                 // Check whether all insert and updates on this page are committed.
@@ -530,16 +568,8 @@ impl Table {
     ) {
         for page_info in frozen_pages {
             let page_guard = self
-                .mem_pool()
-                .get_page::<RowPage>(
-                    guards.mem_guard(),
-                    page_info.page_id,
-                    LatchFallbackMode::Shared,
-                )
-                .await
-                .lock_shared_async()
-                .await
-                .unwrap();
+                .must_get_row_page_shared(guards, page_info.page_id)
+                .await;
             let (ctx, page) = page_guard.ctx_and_page();
             ctx.row_ver().unwrap().set_transition();
             self.capture_delete_markers_for_transition(page, ctx, cutoff_ts);
@@ -566,16 +596,8 @@ impl Table {
             let mut current_end: RowID = 0;
             for page_info in frozen_pages {
                 let page_guard = self
-                    .mem_pool()
-                    .get_page::<RowPage>(
-                        guards.mem_guard(),
-                        page_info.page_id,
-                        LatchFallbackMode::Shared,
-                    )
-                    .await
-                    .lock_shared_async()
-                    .await
-                    .unwrap();
+                    .must_get_row_page_shared(guards, page_info.page_id)
+                    .await;
                 let (ctx, page) = page_guard.ctx_and_page();
                 let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                 if view.rows_non_deleted() == 0 {
@@ -719,17 +741,9 @@ impl Table {
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
             for page_entry in entries {
-                let page_guard: PageSharedGuard<RowPage> = self
-                    .mem_pool()
-                    .get_page(
-                        guards.mem_guard(),
-                        page_entry.page_id,
-                        LatchFallbackMode::Shared,
-                    )
-                    .await
-                    .lock_shared_async()
-                    .await
-                    .unwrap();
+                let page_guard = self
+                    .must_get_row_page_shared(guards, page_entry.page_id)
+                    .await;
                 if !page_action(page_guard) {
                     return;
                 }
@@ -1033,19 +1047,7 @@ impl Table {
             RowLocation::NotFound => None,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
-                let page_guard = self
-                    .mem_pool()
-                    .get_page::<RowPage>(
-                        guards
-                            .try_row_guard(self.row_pool_role)
-                            .expect("missing row-page pool guard for recovery"),
-                        page_id,
-                        LatchFallbackMode::Shared,
-                    )
-                    .await
-                    .lock_shared_async()
-                    .await
-                    .unwrap();
+                let page_guard = self.must_get_row_page_shared(guards, page_id).await;
                 debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));
                 let (ctx, page) = page_guard.ctx_and_page();
                 let row_idx = page.row_idx(row_id);
