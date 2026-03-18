@@ -1,7 +1,7 @@
 ---
 id: 000077
 title: Component-Oriented Engine Lifecycle
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-19
 github_issue: 447
 ---
@@ -241,7 +241,78 @@ Reference:
      drops owners in reverse order.
 
 ## Implementation Notes
-
+1. Replaced engine-local `QuiDAG` lifecycle orchestration with the new
+   crate-private `ComponentRegistry` in
+   `doradb-storage/src/component.rs` and `doradb-storage/src/engine.rs`:
+   - `ComponentRegistry` now stores typed singleton access values in a
+     `TypeId` map and component owners in a reverse-drop `Vec`;
+   - registry shutdown is explicit and idempotent through
+     `shutdown_all()`;
+   - registry `Drop` clears runtime access first and then drops owners in
+     reverse registration order.
+2. Implemented the phase-3 `Component` trait and moved component
+   implementations into their owning modules instead of centralizing them in
+   `component.rs`:
+   - buffer-pool component impls live in `doradb-storage/src/buffer/mod.rs`;
+   - `TableFileSystem` component impl lives in
+     `doradb-storage/src/file/table_fs.rs`;
+   - `TransactionSystem` component impl lives in
+     `doradb-storage/src/trx/sys.rs`.
+3. Refactored `EngineConfig::build()` to assemble top-level components in one
+   fixed order through `Component::build(...)`:
+   - `disk_pool`
+   - `table_fs`
+   - `meta_pool`
+   - `index_pool`
+   - `mem_pool`
+   - `trx_sys`
+   Later components now fetch earlier dependencies through
+   `registry.dependency::<T>()`, and failed startup uses registry-backed
+   reverse shutdown instead of the old engine-local DAG cleanup path.
+4. Added typed buffer-pool access newtypes at the engine/component boundary in
+   `doradb-storage/src/component.rs`:
+   - `MetaPool`
+   - `IndexPool`
+   - `MemPool`
+   - `DiskPool`
+   These wrap `QuiescentGuard<T>`, implement `Deref` to the underlying pool,
+   and provide `clone_inner()` / `into_inner()` so existing runtime code can
+   keep using the underlying pool types where needed.
+5. Kept the current runtime access surface on `EngineInner` while moving
+   lifecycle ownership behind the registry:
+   - `EngineInner` still exposes direct top-level fields for runtime callers;
+   - pool fields now use the new access newtypes;
+   - `trx_sys` and `table_fs` remain direct quiescent guards.
+6. Folded worker startup into component build flows and preserved explicit
+   shutdown behavior:
+   - readonly evictor startup now happens from the `DiskPool` component build;
+   - evictable-pool worker startup now happens from the `MemPool` component
+     build;
+   - transaction-system prepare/start wiring now runs from the
+     `TransactionSystem` component build;
+   - normal engine shutdown dispatches through `ComponentRegistry::shutdown_all()`.
+7. Follow-up cleanup completed during implementation:
+   - removed the temporary delegating buffer-pool macro and relied on `Deref`
+     for pool access newtypes;
+   - renamed `BufferPool::guard()` and the concrete pool methods to
+     `pool_guard()` for consistency with quiescent guard APIs.
+8. Validation completed for the implemented lifecycle path:
+```bash
+cargo fmt --all
+git diff --check
+cargo check -p doradb-storage --no-default-features --all-targets
+cargo check -p doradb-storage --all-targets
+cargo test -p doradb-storage --no-default-features component::tests:: -- --nocapture
+cargo test -p doradb-storage --no-default-features engine::tests::test_engine_shutdown_is_idempotent_and_rejects_new_work -- --nocapture
+cargo test -p doradb-storage --no-default-features engine::tests::test_unstarted_transaction_system_shutdown_is_safe -- --nocapture
+cargo test -p doradb-storage --no-default-features engine::tests::test_failed_startup_does_not_persist_storage_layout_marker -- --nocapture
+cargo test -p doradb-storage --no-default-features engine::tests::test_drop_engine_panics_when_extra_refs_exist -- --nocapture
+cargo test -p doradb-storage --no-default-features engine::tests::test_engine_shutdown_keeps_external_table_refs_valid -- --nocapture
+cargo test -p doradb-storage --no-default-features buffer::fixed::tests::test_fixed_buffer_pool -- --nocapture
+cargo test -p doradb-storage --no-default-features buffer::readonly::tests::test_readonly_pool_drop_only_eviction_and_reload -- --nocapture
+cargo test -p doradb-storage --no-default-features index::row_block_index::tests::test_row_block_index_free_list_shared -- --nocapture
+cargo clippy --all-features --all-targets -- -D warnings
+```
 
 ## Impacts
 

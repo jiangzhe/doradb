@@ -496,10 +496,17 @@ Reference:
     orchestration.
   - Non-goals: No worker extraction yet; no session-drain redesign; no catalog
     split in this phase.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000077-component-oriented-engine-lifecycle.md`
+  - Task Issue: `#447`
+  - Phase Status: done
+  - Implementation Summary: Implemented in `doradb-storage` by task 000077:
+    replaced engine-local `QuiDAG` lifecycle orchestration with the
+    crate-private `ComponentRegistry`, moved top-level component lifecycle
+    ownership into component-local `Component::build(...)` / `shutdown(...)`
+    implementations, and introduced engine-boundary buffer-pool access
+    newtypes while preserving the existing `EngineInner` runtime access surface.
+    [Task Resolve Sync:
+    docs/tasks/000077-component-oriented-engine-lifecycle.md @ 2026-03-19]
 
 - **Phase 4: Catalog Separation And Background-Worker Extraction**
   - Scope: Split `Catalog` from `TransactionSystem` and move background-thread
