@@ -1,6 +1,5 @@
 use crate::buffer::page::PageID;
 use crate::catalog::TableID;
-use crate::quiescent::QuiescentGuard;
 use crate::row::{INVALID_ROW_ID, RowID};
 use crate::trx::TrxID;
 use crate::trx::sys::TransactionSystem;
@@ -55,25 +54,16 @@ pub(super) struct ParentPosition<G> {
     pub(super) idx: isize,
 }
 
-pub(super) struct RedoLogPageCommitter {
-    trx_sys: QuiescentGuard<TransactionSystem>,
+#[derive(Clone, Copy)]
+pub(crate) struct RowPageCreateRedoCtx<'a> {
+    trx_sys: &'a TransactionSystem,
     table_id: TableID,
 }
 
-impl Clone for RedoLogPageCommitter {
+impl RowPageCreateRedoCtx<'_> {
     #[inline]
-    fn clone(&self) -> Self {
-        RedoLogPageCommitter {
-            trx_sys: self.trx_sys.clone(),
-            table_id: self.table_id,
-        }
-    }
-}
-
-impl RedoLogPageCommitter {
-    #[inline]
-    pub fn new(trx_sys: QuiescentGuard<TransactionSystem>, table_id: TableID) -> Self {
-        RedoLogPageCommitter { trx_sys, table_id }
+    pub fn new<'a>(trx_sys: &'a TransactionSystem, table_id: TableID) -> RowPageCreateRedoCtx<'a> {
+        RowPageCreateRedoCtx { trx_sys, table_id }
     }
 
     #[inline]
@@ -85,8 +75,9 @@ impl RedoLogPageCommitter {
     ) -> TrxID {
         let mut trx = self.trx_sys.begin_sys_trx();
         let table_id = self.table_id;
-        // Once a row page is added to block index, we start
-        // a new internal transaction and log its information.
+        // Safety currently relies on single-stream redo ordering plus
+        // commit_no_wait: later user redo that reuses this page must not
+        // persist ahead of the earlier CreateRowPage record.
         trx.create_row_page(table_id, page_id, start_row_id, end_row_id);
         self.trx_sys
             .commit_sys(trx)

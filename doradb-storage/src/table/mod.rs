@@ -20,7 +20,7 @@ use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
 use crate::error::{PersistedFileKind, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
-use crate::index::util::Maskable;
+use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BlockIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, SecondaryIndex,
     UniqueIndex,
@@ -201,16 +201,6 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
-    pub(crate) fn enable_page_committer(&self, trx_sys: QuiescentGuard<TransactionSystem>) {
-        self.blk_idx.enable_page_committer(self.table_id, trx_sys)
-    }
-
-    #[inline]
-    pub(crate) fn disable_page_committer(&self) {
-        self.blk_idx.disable_page_committer()
-    }
-
-    #[inline]
     fn row_pool_guard<'a>(&self, guards: &'a PoolGuards) -> &'a PoolGuard {
         guards
             .try_row_guard(self.row_pool_role)
@@ -278,16 +268,18 @@ impl<P: BufferPool> GenericMemTable<P> {
         &self,
         guards: &PoolGuards,
         count: usize,
+        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> PageSharedGuard<RowPage> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
-            .get_insert_page(
+            .get_insert_page_with_redo(
                 meta_pool_guard,
                 &self.mem_pool,
                 row_pool_guard,
                 &self.metadata,
                 count,
+                redo_ctx,
             )
             .await
     }
@@ -297,16 +289,18 @@ impl<P: BufferPool> GenericMemTable<P> {
         &self,
         guards: &PoolGuards,
         count: usize,
+        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> PageExclusiveGuard<RowPage> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
-            .get_insert_page_exclusive(
+            .get_insert_page_exclusive_with_redo(
                 meta_pool_guard,
                 &self.mem_pool,
                 row_pool_guard,
                 &self.metadata,
                 count,
+                redo_ctx,
             )
             .await
     }
@@ -480,15 +474,6 @@ impl Table {
     #[inline]
     pub(crate) async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> RowLocation {
         GenericMemTable::find_row(self, guards, row_id, Some(&self.storage)).await
-    }
-    #[inline]
-    pub(crate) fn enable_page_committer(&self, trx_sys: QuiescentGuard<TransactionSystem>) {
-        GenericMemTable::enable_page_committer(self, trx_sys)
-    }
-
-    #[inline]
-    pub(crate) fn disable_page_committer(&self) {
-        GenericMemTable::disable_page_committer(self)
     }
 
     async fn collect_frozen_pages(&self, guards: &PoolGuards) -> (Vec<FrozenPage>, Option<TrxID>) {

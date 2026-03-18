@@ -89,10 +89,6 @@ impl PendingTransactionSystemStartup {
         self,
         trx_sys: QuiescentGuard<TransactionSystem>,
     ) -> QuiescentGuard<TransactionSystem> {
-        trx_sys
-            .catalog
-            .enable_page_committer_for_tables(trx_sys.clone())
-            .await;
         TransactionSystem::start_io_threads(trx_sys.clone());
         TransactionSystem::start_gc_threads(trx_sys.clone(), self.gc_rxs);
         TransactionSystem::start_purge_threads(
