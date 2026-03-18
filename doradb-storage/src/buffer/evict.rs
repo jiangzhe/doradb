@@ -1168,7 +1168,7 @@ impl EvictableBufferPoolConfig {
     /// Builds a raw evictable buffer pool without starting background workers.
     ///
     /// Worker startup must happen only after the pool has reached a stable
-    /// owner address in [`QuiescentBox`] or [`crate::quiescent::QuiDAG`].
+    /// owner address in [`QuiescentBox`].
     #[inline]
     pub fn build(self) -> Result<EvictableBufferPool> {
         self.role.assert_valid("evictable buffer pool");

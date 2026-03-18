@@ -358,12 +358,9 @@ cargo test -p doradb-storage --no-default-features
 
 ## Open Questions
 
-1. This task intentionally leaves generic `QuiDAG` in `quiescent.rs` intact
-   while removing engine dependence on it. A later follow-up can decide whether
-   that generic DAG remains useful outside tests or should be retired.
-2. Buffer-pool access newtypes remain an engine-boundary feature in this task.
+1. Buffer-pool access newtypes remain an engine-boundary feature in this task.
    If a later phase wants to propagate those distinct pool types through
    generic runtime data structures, that should be a separate focused refactor.
-3. Public config ownership remains mostly on `EngineConfig` in this phase. A
+2. Public config ownership remains mostly on `EngineConfig` in this phase. A
    later follow-up can decide whether to expose per-component config setters
    more explicitly once phase 3 and 4 architecture settles.

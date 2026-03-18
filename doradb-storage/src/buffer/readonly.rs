@@ -116,8 +116,7 @@ impl GlobalReadonlyBufferPool {
     ///
     /// This constructor intentionally does not start the eviction worker.
     /// Callers must first place the pool into a stable owner such as
-    /// [`QuiescentBox`] or [`crate::quiescent::QuiDAG`] before starting guarded
-    /// worker threads.
+    /// [`QuiescentBox`] before starting guarded worker threads.
     #[inline]
     pub fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
         Self::with_capacity_and_arbiter_builder(role, pool_size, EvictionArbiter::builder())

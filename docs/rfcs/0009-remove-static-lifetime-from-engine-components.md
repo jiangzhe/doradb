@@ -13,34 +13,31 @@ github_issue: 438
 
 This RFC removes leaked-static ownership from engine components and replaces it
 with quiescent guard ownership plus an explicit engine shutdown phase.
-`Engine` will own a sealed `QuiDAG` together with `Arc<EngineInner>`,
 `EngineInner` will store quiescent guards to the top-level components,
 `EngineRef` will remain an `Arc<EngineInner>`, and `BufferPool` APIs will drop
 `&'static self` in favor of ordinary shared borrows with the existing
-`PoolGuard` provenance model. The current implementation phase now combines the
-original engine-ownership migration, the `BufferPool: &self` runtime call-path
-cleanup, guard-based worker startup, and the production removal of the static
-compatibility bridge while preserving explicit started-vs-unstarted startup
-contracts. Later phases will refactor engine lifecycle orchestration around a
-crate-private `Component` trait, split `Catalog` from `TransactionSystem`, and
-extract background-thread ownership behind existing component seams. The final
-phase covers dedicated lifetime-management documentation, optional
-quiescent-drop timeout diagnostics for debug/test use, and stale-test cleanup
-after the runtime migration is complete. [D1] [D2]
+`PoolGuard` provenance model. The implemented phases now cover the
+engine-ownership migration, the `BufferPool: &self` runtime call-path cleanup,
+guard-based worker startup, production removal of the static compatibility
+bridge, and the move from engine-local `QuiDAG` orchestration to the
+crate-private `ComponentRegistry`. Later phases will split `Catalog` from
+`TransactionSystem` and extract background-thread ownership behind existing
+component seams. The final phase covers dedicated lifetime-management
+documentation, optional quiescent-drop timeout diagnostics for debug/test use,
+and stale-test cleanup after the runtime migration is complete. [D1] [D2]
 [D4] [D7] [D8] [D9] [D10] [D11] [D12] [D13] [D14] [C1] [C2] [C3] [C7] [C8]
 [C9] [C10] [C16] [U1] [U2] [U3] [U4]
 
 ## Context
 
-The engine no longer needs leaked-static ownership for page safety, but it
-still depends on leaked-static ownership for top-level component reachability
-and worker startup. `QuiDAG` already owns engine teardown order, buffer page
-guards already carry `PoolGuard` instead of borrowing from `&'static self`, and
-pool identity validation is already explicit. The remaining `StaticLifetime`
-layer is therefore mostly a compatibility bridge around engine construction,
-worker startup, recovery wiring, and old helper constructors rather than a
-fundamental memory-safety requirement. [D7] [D8] [D10] [D11] [C1] [C2] [C12]
-[C13]
+The engine no longer needs leaked-static ownership for page safety, but it did
+depend on leaked-static ownership for top-level component reachability and
+worker startup. Buffer page guards already carried `PoolGuard` instead of
+borrowing from `&'static self`, and pool identity validation was already
+explicit. The remaining `StaticLifetime` layer was therefore mostly a
+compatibility bridge around engine construction, worker startup, recovery
+wiring, and old helper constructors rather than a fundamental memory-safety
+requirement. [D7] [D8] [D10] [D11] [C1] [C2] [C12] [C13]
 
 That bridge is now the main obstacle to the requested end state:
 `EngineInner` should hold quiescent guards to all components, `EngineRef`
@@ -192,12 +189,12 @@ existing component seams. [D7] [C1] [C3] [C7] [C8] [C9] [C10] [U4]
 
 ### 1. Engine teardown will become a two-step process: shutdown, then owner drop
 
-`Engine` will gain an explicit shutdown phase that runs before `QuiDAG` owner
-drop. Shutdown is responsible for transitioning engine lifecycle state away
-from normal operation, rejecting new work, invoking component-specific stop/join
-hooks for worker-backed subsystems, and only then allowing quiescent owner drop
-to wait for remaining guards to drain. Quiescent owner drop is therefore a
-memory-reclamation barrier, not a worker-stop mechanism. [D2] [D4] [D7] [C1]
+`Engine` will gain an explicit shutdown phase that runs before final component
+owner drop. Shutdown is responsible for transitioning engine lifecycle state
+away from normal operation, rejecting new work, invoking component-specific
+stop/join hooks for worker-backed subsystems, and only then allowing quiescent
+owner drop to wait for remaining guards to drain. Quiescent owner drop is
+therefore a memory-reclamation barrier, not a worker-stop mechanism. [D2] [D4] [D7] [C1]
 [C3] [C7] [C8] [C9] [C10] [C14] [U4] [B1]
 
 This RFC does not require a full graceful session-drain state machine in its
@@ -212,7 +209,7 @@ More advanced drain/wait/timeout policy stays future work. [C1] [C7] [C14]
 
 `Engine` will own:
 1. one `Arc<EngineInner>` for shared runtime access, and
-2. one sealed `QuiDAG` owner container for top-level component ownership.
+2. one private lifecycle owner container for top-level component ownership.
 
 `EngineInner` will store quiescent guards to the top-level components instead of
 `&'static` references. `EngineRef` will remain a thin wrapper around
@@ -228,9 +225,10 @@ plus engine lifecycle state used by shutdown. [D1] [D7] [D8] [D9] [C1] [C3]
 
 The transitional bridge types `StaticOwner`, `StaticHandle`, and the
 `as_static()` conversion pattern will be removed from production paths. Stored
-runtime dependencies will use `QuiescentGuard<T>` or `QuiDep<T>` directly,
-depending on whether the dependency is engine-root shared state or a declared
-component edge. [D8] [D9] [C1] [C3] [C4] [C5] [C6] [C11] [U1] [U2]
+runtime dependencies will use `QuiescentGuard<T>` directly, with later
+component lifecycle orchestration managed by the crate-private registry rather
+than the earlier generic DAG layer. [D8] [D9] [C1] [C3] [C4] [C5] [C6] [C11]
+[U1] [U2]
 
 ### 3. The current phase keeps the existing worker model as the near-term migration boundary
 
@@ -477,8 +475,8 @@ Reference:
   - Phase Status: done
   - Implementation Summary: Implemented in `doradb-storage` by task 000075:
     replaced leaked-static engine/component ownership with direct
-    `QuiDAG`-owned values plus `QuiescentGuard<T>` runtime access, migrated the
-    affected runtime path to `BufferPool: &self`, moved worker startup to
+    quiescent-owned values plus `QuiescentGuard<T>` runtime access, migrated
+    the affected runtime path to `BufferPool: &self`, moved worker startup to
     guarded helpers, and removed the remaining `StaticLifetime` /
     `StaticLifetimeScope` / static-builder surface. [Task Resolve Sync:
     docs/tasks/000075-guard-owned-engine-components.md @ 2026-03-18]
