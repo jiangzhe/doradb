@@ -63,9 +63,11 @@ fn main() {
 
         write_pages(&table_file, args.pages).await;
 
-        let global = QuiescentBox::new(
-            GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, args.cache_bytes).unwrap(),
-        );
+        // The cold scan can exceed cache capacity, so the benchmark must use a
+        // started standalone readonly pool with its eviction worker running.
+        let global =
+            GlobalReadonlyBufferPool::with_capacity_owned(PoolRole::Disk, args.cache_bytes)
+                .unwrap();
         let pool = QuiescentBox::new(ReadonlyBufferPool::new(
             901,
             PersistedFileKind::TableFile,
@@ -123,6 +125,10 @@ fn main() {
             warm_checksum
         );
 
+        drop(pool_guard);
+        drop(pool);
+        global.shutdown();
+        drop(global);
         drop(table_file);
         drop(fs);
     });

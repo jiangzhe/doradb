@@ -417,8 +417,13 @@ impl GlobalReadonlyBufferPool {
         *g = Some(handle);
     }
 
+    /// Stops the eviction worker for a started standalone readonly pool.
+    ///
+    /// This method is idempotent and is required before dropping owners
+    /// created by [`Self::with_capacity_owned`] or
+    /// [`Self::with_capacity_and_arbiter_builder_owned`].
     #[inline]
-    pub(crate) fn shutdown(&self) {
+    pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
         self.residency.free_ev.notify(usize::MAX);
         self.residency.evict_ev.notify(1);
