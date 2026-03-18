@@ -255,8 +255,8 @@ impl TrxSysConfig {
         // Now we have an empty catalog, all log partitions and buffer pool.
         // Recover all committed data if required.
         let (log_partitions, gc_rxs) = log_recover(
+            &meta_pool,
             crate::trx::recover::RecoveryDeps {
-                meta_pool,
                 index_pool,
                 mem_pool: mem_pool.clone(),
                 table_fs,

@@ -118,13 +118,13 @@ mod basic_tests {
 }
 
 pub(super) async fn log_recover(
+    meta_pool: &FixedBufferPool,
     deps: RecoveryDeps,
     catalog: &mut Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
 ) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>)> {
     let RecoveryDeps {
-        meta_pool,
         index_pool,
         mem_pool,
         table_fs,
@@ -168,7 +168,6 @@ pub(super) async fn log_recover(
 }
 
 pub(super) struct RecoveryDeps {
-    pub(super) meta_pool: QuiescentGuard<FixedBufferPool>,
     pub(super) index_pool: QuiescentGuard<FixedBufferPool>,
     pub(super) mem_pool: QuiescentGuard<EvictableBufferPool>,
     pub(super) table_fs: QuiescentGuard<TableFileSystem>,
@@ -199,7 +198,7 @@ struct RecoveryTableState {
 impl<'a> LogRecovery<'a> {
     #[inline]
     fn new(
-        meta_pool: QuiescentGuard<FixedBufferPool>,
+        meta_pool: &FixedBufferPool,
         index_pool: QuiescentGuard<FixedBufferPool>,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: QuiescentGuard<TableFileSystem>,
