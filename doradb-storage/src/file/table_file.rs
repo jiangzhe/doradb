@@ -595,12 +595,11 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::page_integrity::PAGE_INTEGRITY_TRAILER_SIZE;
-    use crate::file::table_fs::TableFileSystemConfig;
+    use crate::file::{build_test_fs, build_test_fs_in};
     use crate::io::AIOBuf;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
-    use tempfile::TempDir;
 
     async fn read_page_for_test(table_file: &TableFile, page_id: PageID) -> Result<DirectBuf> {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
@@ -616,11 +615,7 @@ mod tests {
     #[test]
     fn test_table_file() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let metadata = Arc::new(TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
@@ -670,11 +665,7 @@ mod tests {
     #[test]
     fn test_read_page_into_ptr_validates_byte_count() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs
                 .create_table_file(145, build_test_metadata(), false)
                 .unwrap();
@@ -701,11 +692,7 @@ mod tests {
     #[test]
     fn test_table_file_system() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let metadata = Arc::new(TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
@@ -785,11 +772,7 @@ mod tests {
     #[test]
     fn test_table_file_rejects_meta_checksum_corruption() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (temp_dir, fs) = build_test_fs();
             let table_id = 146;
             let path = fs.table_file_path(table_id);
             let table_file = fs
@@ -805,10 +788,7 @@ mod tests {
                 + (COW_FILE_PAGE_SIZE - PAGE_INTEGRITY_TRAILER_SIZE) as u64;
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(temp_dir.path());
             let err = match fs.open_table_file(table_id).await {
                 Ok(_) => panic!("expected table meta checksum corruption"),
                 Err(err) => err,
@@ -824,11 +804,7 @@ mod tests {
     #[test]
     fn test_table_file_rejects_meta_version_mismatch() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (temp_dir, fs) = build_test_fs();
             let table_id = 147;
             let path = fs.table_file_path(table_id);
             let table_file = fs
@@ -848,10 +824,7 @@ mod tests {
                 &(TABLE_META_VERSION + 1).to_le_bytes(),
             );
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(temp_dir.path());
             let err = match fs.open_table_file(table_id).await {
                 Ok(_) => panic!("expected table meta version corruption"),
                 Err(err) => err,
@@ -867,11 +840,7 @@ mod tests {
     #[test]
     fn test_persist_lwc_pages_appends_entries() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(43, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
@@ -930,11 +899,7 @@ mod tests {
     #[test]
     fn test_persist_lwc_pages_rejects_overlapping_ranges() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(44, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
@@ -974,11 +939,7 @@ mod tests {
     #[should_panic(expected = "concurrent mutable CoW file modification is not allowed")]
     fn test_mutable_table_file_rejects_concurrent_fork() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(45, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
@@ -992,11 +953,7 @@ mod tests {
     #[test]
     fn test_mutable_table_file_allows_fork_after_drop() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(46, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();

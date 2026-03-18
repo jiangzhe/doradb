@@ -515,12 +515,11 @@ mod tests {
     use super::*;
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::page_integrity::PAGE_INTEGRITY_TRAILER_SIZE;
-    use crate::file::table_fs::TableFileSystemConfig;
+    use crate::file::{build_test_fs, build_test_fs_in};
     use crate::io::AIOBuf;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
     use std::num::NonZeroU64;
-    use tempfile::TempDir;
 
     fn overwrite_file_bytes(path: &str, offset: u64, bytes: &[u8]) {
         let mut file = OpenOptions::new()
@@ -552,11 +551,7 @@ mod tests {
     #[test]
     fn test_multi_table_file_open_publish_and_reload() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (_dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
 
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
@@ -594,11 +589,7 @@ mod tests {
     #[test]
     fn test_multi_table_file_meta_page_copy_on_write() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (_dir, fs) = build_test_fs();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
@@ -626,11 +617,7 @@ mod tests {
     #[test]
     fn test_multi_table_file_rejects_super_page_version_mismatch() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
             drop(mtb);
@@ -652,10 +639,7 @@ mod tests {
             file.write_all(&2u64.to_le_bytes()).unwrap();
             file.sync_all().unwrap();
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(dir.path());
             let res = fs.open_or_create_multi_table_file().await;
             assert!(res.is_err());
         });
@@ -664,11 +648,7 @@ mod tests {
     #[test]
     fn test_multi_table_file_rejects_meta_version_mismatch() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
             let active_meta_page_id = mtb.active_root().meta_page_id;
@@ -690,10 +670,7 @@ mod tests {
                 .unwrap();
             file.sync_all().unwrap();
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(dir.path());
             let err = match fs.open_or_create_multi_table_file().await {
                 Ok(_) => panic!("expected multi-table meta version corruption"),
                 Err(err) => err,
@@ -709,11 +686,7 @@ mod tests {
     #[test]
     fn test_multi_table_file_rejects_meta_checksum_corruption() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
             let active_meta_page_id = mtb.active_root().meta_page_id;
@@ -724,10 +697,7 @@ mod tests {
                 + (COW_FILE_PAGE_SIZE - PAGE_INTEGRITY_TRAILER_SIZE) as u64;
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(dir.path());
             let err = match fs.open_or_create_multi_table_file().await {
                 Ok(_) => panic!("expected multi-table meta checksum corruption"),
                 Err(err) => err,
@@ -743,11 +713,7 @@ mod tests {
     #[test]
     fn test_multi_table_file_falls_back_to_older_valid_super_slot() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
 
@@ -776,10 +742,7 @@ mod tests {
                 + MULTI_TABLE_FILE_MAGIC_WORD.len() as u64;
             overwrite_file_bytes(&path, version_offset, &2u64.to_le_bytes());
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(dir.path());
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
             let snapshot = mtb.load_snapshot().unwrap();
             assert_eq!(
@@ -793,11 +756,7 @@ mod tests {
     #[test]
     fn test_multi_table_file_does_not_fall_back_when_newest_meta_root_is_invalid() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
 
@@ -849,10 +808,7 @@ mod tests {
                 invalid_meta_buf.as_bytes(),
             );
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(dir.path());
             let err = match fs.open_or_create_multi_table_file().await {
                 Ok(_) => panic!("expected newest multi-table root invariant failure"),
                 Err(err) => err,
@@ -869,11 +825,7 @@ mod tests {
     #[should_panic(expected = "concurrent mutable CoW file modification is not allowed")]
     fn test_multi_table_file_rejects_concurrent_fork() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (_dir, fs) = build_test_fs();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
 
             let _first = MutableMultiTableFile::fork(&mtb);
@@ -884,11 +836,7 @@ mod tests {
     #[test]
     fn test_multi_table_file_allows_fork_after_drop() {
         smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(dir.path())
-                .build()
-                .unwrap();
+            let (_dir, fs) = build_test_fs();
             let mtb = fs.open_or_create_multi_table_file().await.unwrap();
 
             let first = MutableMultiTableFile::fork(&mtb);

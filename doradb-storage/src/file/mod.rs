@@ -6,6 +6,9 @@ pub mod super_page;
 pub mod table_file;
 pub mod table_fs;
 
+#[cfg(test)]
+pub(crate) use self::table_fs::tests::{build_test_fs, build_test_fs_in};
+
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::io_iocb_cmd;
@@ -762,15 +765,18 @@ pub unsafe fn pwrite_unchecked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_sparse_file_open_and_create() {
-        let res = SparseFile::open("sparsefile1.bin");
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("sparsefile1.bin");
+        let file_path = file_path.to_string_lossy().into_owned();
+        let res = SparseFile::open(&file_path);
         assert!(res.is_err());
-        let file = SparseFile::create_or_trunc("sparsefile1.bin", 1024 * 1024).unwrap();
+        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
         drop(file);
-        let file = SparseFile::open("sparsefile1.bin").unwrap();
+        let file = SparseFile::open(&file_path).unwrap();
         drop(file);
-        let _ = std::fs::remove_file("sparsefile1.bin");
     }
 }

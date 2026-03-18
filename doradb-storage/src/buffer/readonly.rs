@@ -1316,13 +1316,13 @@ pub(crate) mod tests {
     use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::error::{PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::build_test_fs;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::page_integrity::{
         COLUMN_BLOCK_INDEX_PAGE_SPEC, COLUMN_DELETION_BLOB_PAGE_SPEC, LWC_PAGE_SPEC,
         max_payload_len, write_page_checksum, write_page_header,
     };
     use crate::file::table_file::TableFile;
-    use crate::file::table_fs::TableFileSystemConfig;
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
         COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockNodeHeader, validate_persisted_blob_page,
@@ -1337,7 +1337,6 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
-    use tempfile::TempDir;
 
     fn frame_page_bytes(cap: usize) -> usize {
         cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
@@ -1736,11 +1735,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_reloads_when_mapping_points_to_uninitialized_frame() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(111, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -1783,11 +1778,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_miss_load_and_hit() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(101, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -1823,11 +1814,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_dedup_concurrent_miss() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(102, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2161,11 +2148,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_validated_lwc_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(107, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2208,11 +2191,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_validated_column_index_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(108, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2255,11 +2234,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_validated_blob_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(109, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2302,11 +2277,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_drop_only_eviction_and_reload() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(103, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2368,12 +2339,8 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_lifecycle_drop_order_with_table_fs() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
             let global = owned_global_pool(frame_page_bytes(2));
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(105, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2401,11 +2368,7 @@ pub(crate) mod tests {
     #[should_panic(expected = "readonly buffer pool does not support page allocation")]
     fn test_readonly_pool_allocate_page_panics() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(104, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);

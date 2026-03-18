@@ -1,7 +1,7 @@
 ---
 id: 000075
 title: Guard-Owned Engine Components
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-18
 github_issue: 443
 ---
@@ -239,6 +239,72 @@ Reference:
 
 ## Implementation Notes
 
+1. Replaced leaked-static engine/component ownership with direct
+   `QuiDAG`-owned values plus `QuiescentGuard<T>`-backed runtime access:
+   - `EngineInner` / `EngineRef` now retain top-level components through
+     direct guards instead of `StaticOwner` / `StaticHandle`;
+   - engine build inserts owned components directly into `QuiDAG`;
+   - production `as_static()` / `insert_static_owner` / leaked-static
+     ownership paths were removed.
+2. Removed the remaining static-lifetime surface from code and test setup:
+   - deleted `doradb-storage/src/lifetime.rs`;
+   - removed `StaticLifetime`, `StaticLifetimeScope`, static builders, and
+     other leaked-static constructors from the active storage/runtime path;
+   - updated tests, examples, and standalone helper code to use owned or
+     guard-backed construction instead.
+3. Completed the `BufferPool: &self` migration on the directly affected
+   runtime path and kept pool provenance enforcement in place:
+   - buffer-pool traits and dependent table/catalog/recovery/index code no
+     longer require `&'static self`;
+   - runtime holders such as `ReadonlyBufferPool`, recovery deps, and
+     page-committer plumbing now use direct guard-backed ownership.
+4. Moved worker startup off leaked-static reachability and onto the guarded
+   startup pattern selected in this task:
+   - `TransactionSystem`, `EvictableBufferPool`, and
+     `GlobalReadonlyBufferPool` now start workers from explicit guarded
+     helpers that convert one `QuiescentGuard<T>` into `SyncQuiescentGuard<T>`
+     and clone that wrapper into spawned threads;
+   - standalone started-owner constructors were added for readonly and
+     evictable pools so tests/examples do not accidentally construct
+     worker-free owners.
+5. Fixed lifecycle regressions discovered during implementation:
+   - shutdown now disables user-table page committers only after
+     transaction-system workers stop, then clears catalog-owned tables to
+     avoid guard cycles during DAG teardown;
+   - failed engine startup explicitly shuts down partially started workers
+     before local owner drop;
+   - standalone readonly-owner shutdown is now public so examples can stop
+     the evictor before dropping local owners;
+   - the recovery path now uses `&FixedBufferPool` for the operational
+     `meta_pool` dependency instead of carrying an unnecessary
+     `QuiescentGuard<FixedBufferPool>`.
+6. Review outcome:
+   - the readonly benchmark hang from constructing an unstarted global
+     readonly pool was fixed in this task;
+   - one shutdown follow-up remains open: external `Arc<Table>` /
+     `Arc<CatalogTable>` handles can still outlive the engine shutdown busy
+     check. That follow-up is tracked in
+     `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`.
+7. Focused validation completed during implementation:
+```bash
+cargo check -p doradb-storage --no-default-features --all-targets
+cargo check -p doradb-storage --all-targets
+cargo test -p doradb-storage --no-default-features --no-run
+cargo test -p doradb-storage --no-default-features engine::tests::test_engine_shutdown_disables_external_table_page_committer_and_clears_catalog -- --nocapture
+cargo test -p doradb-storage --no-default-features table::tests::test_checkpoint_for_deletion_persists_committed_markers -- --nocapture
+cargo test -p doradb-storage --no-default-features index::secondary_index::tests::test_secondary_index_common -- --nocapture
+cargo test -p doradb-storage --no-default-features catalog::storage::checkpoint::tests::test_catalog_checkpoint_collect_index_entries_uses_readonly_cache -- --nocapture
+cargo test -p doradb-storage --no-default-features buffer::readonly::tests::test_readonly_pool_drop_only_eviction_and_reload -- --nocapture
+cargo test -p doradb-storage --no-default-features buffer::evict::tests::test_evictable_buffer_pool_build_owned_starts_workers_for_eviction_and_reload -- --nocapture
+cargo test -p doradb-storage --no-default-features index::btree_node::tests -- --nocapture
+cargo test -p doradb-storage --no-default-features engine::tests::test_engine_owner_dag_enforces_runtime_and_order_only_edges -- --nocapture
+cargo test -p doradb-storage --no-default-features engine::tests::test_engine_owner_dag_unsealed_cleanup_uses_reverse_insertion_order -- --nocapture
+cargo test -p doradb-storage --no-default-features trx::recover::tests::test_log_recover_empty -- --nocapture
+cargo test -p doradb-storage --no-default-features trx::recover::tests::test_log_recover_bootstraps_catalog_from_checkpoint -- --nocapture
+cargo test -p doradb-storage --no-default-features engine::tests::test_failed_startup_does_not_persist_storage_layout_marker -- --nocapture
+cargo run -p doradb-storage --example bench_readonly_buffer_pool -- --pages 8192 --cache-bytes 268435456 --warm-reads 1000
+```
+
 ## Impacts
 
 1. `doradb-storage/src/engine.rs`
@@ -296,9 +362,9 @@ cargo test -p doradb-storage --no-default-features
 
 ## Open Questions
 
-1. No design-blocking open question remains for this task: it assumes direct
-   `BufferPool: &self` migration on the affected runtime path and forbids a new
-   compatibility layer.
-2. After this task lands, a later cleanup may still decide whether repeated
+1. Follow-up backlog `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
+   tracks the remaining shutdown-busy gap for externally held
+   `Arc<Table>` / `Arc<CatalogTable>` handles.
+2. After this task landed, a later cleanup may still decide whether repeated
    guard-to-thread startup helpers should be consolidated, but that is not part
-   of the implementation decision for this task.
+   of this task’s implementation outcome.

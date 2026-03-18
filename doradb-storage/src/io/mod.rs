@@ -950,11 +950,15 @@ mod tests {
     use super::*;
     use crate::file::{FixedSizeBufferFreeList, SparseFile};
     use std::collections::HashMap;
+    use tempfile::TempDir;
 
     #[test]
     fn test_aio_file_ops() {
         let ctx = AIOContext::try_default().unwrap();
-        let file = SparseFile::create_or_trunc("aio_file1.txt", 1024 * 1024).unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("aio_file1.txt");
+        let file_path = file_path.to_string_lossy().into_owned();
+        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
         let buf = DirectBuf::with_data(b"hello, world");
         let (offset, _) = file.alloc(buf.capacity()).unwrap();
         let aio = file.pwrite_direct(100, offset, buf);
@@ -968,13 +972,14 @@ mod tests {
             AIOKind::Write
         });
         drop(file);
-        // for test, we just remove this file
-        let _ = std::fs::remove_file("aio_file1.txt");
     }
 
     #[test]
     fn test_aio_file_extend() {
-        let file = SparseFile::create_or_trunc("aio_file2.txt", 1024 * 1024).unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("aio_file2.txt");
+        let file_path = file_path.to_string_lossy().into_owned();
+        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
         let (logical_size, allocated_size) = file.size().unwrap();
         println!("file created, logical size={logical_size}, allocated size={allocated_size}");
         assert_eq!(logical_size, 1024 * 1024);
@@ -985,15 +990,15 @@ mod tests {
         assert_eq!(logical_size, 2 * 1024 * 1024);
         assert_eq!(allocated_size, 0);
         drop(file);
-        // for test, we just remove this file
-        let _ = std::fs::remove_file("aio_file2.txt");
     }
 
     #[test]
     fn test_aio_event_loop() {
         let ctx = AIOContext::new(16).unwrap();
-
-        let file = SparseFile::create_or_trunc("aio_file3.txt", 1024 * 1024).unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("aio_file3.txt");
+        let file_path = file_path.to_string_lossy().into_owned();
+        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
 
         let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
         let listener = SimpleListener {
@@ -1029,8 +1034,6 @@ mod tests {
         client.shutdown();
         // wait for executor to quit.
         handle.join().unwrap();
-
-        let _ = std::fs::remove_file("aio_file3.txt");
     }
 
     #[test]

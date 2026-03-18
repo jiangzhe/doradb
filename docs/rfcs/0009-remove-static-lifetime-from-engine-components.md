@@ -474,13 +474,17 @@ Reference:
     outside the engine/component ownership path.
   - Task Doc: `docs/tasks/000075-guard-owned-engine-components.md`
   - Task Issue: `#443`
-  - Phase Status: `in_progress`
-  - Implementation Summary: In progress through task 000075, which already
-    absorbs the original RFC phase-3 `BufferPool: &self` migration together
-    with the remaining `StaticLifetime` / `StaticLifetimeScope` / static-builder
-    cleanup required to finish the runtime ownership transition.
+  - Phase Status: done
+  - Implementation Summary: Implemented in `doradb-storage` by task 000075:
+    replaced leaked-static engine/component ownership with direct
+    `QuiDAG`-owned values plus `QuiescentGuard<T>` runtime access, migrated the
+    affected runtime path to `BufferPool: &self`, moved worker startup to
+    guarded helpers, and removed the remaining `StaticLifetime` /
+    `StaticLifetimeScope` / static-builder surface. [Task Resolve Sync:
+    docs/tasks/000075-guard-owned-engine-components.md @ 2026-03-18]
   - Related Backlogs:
     - `docs/backlogs/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
+    - `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
 
 - **Phase 3: Component-Oriented Engine Lifecycle**
   - Scope: Introduce a crate-private `Component` trait that defines dependency

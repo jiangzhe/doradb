@@ -46,8 +46,8 @@ fn main() {
                 )],
             ));
             let meta_guard = engine.meta_pool.guard();
-            let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
-            let blk_idx = Box::leak(Box::new(blk_idx));
+            let blk_idx =
+                Arc::new(RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await);
             let mem_guard = engine.mem_pool.guard();
 
             for _ in 0..args.pages {
@@ -68,7 +68,7 @@ fn main() {
             for _ in 0..args.threads {
                 let args = args.clone();
                 let stop = Arc::clone(&stop);
-                let blk_idx = &*blk_idx;
+                let blk_idx = Arc::clone(&blk_idx);
                 let meta_guard = meta_guard.clone();
                 let handle = std::thread::spawn(move || {
                     let ex = smol::LocalExecutor::new();
@@ -94,6 +94,10 @@ fn main() {
                 total_sum_page_id,
                 op_nanos
             );
+
+            drop(blk_idx);
+            drop(mem_guard);
+            drop(meta_guard);
         }
         drop(engine);
 
@@ -154,7 +158,7 @@ fn bench_btreemap(args: Args) {
 
 async fn worker(
     args: Args,
-    blk_idx: &'static RowBlockIndex,
+    blk_idx: Arc<RowBlockIndex>,
     meta_guard: doradb_storage::buffer::PoolGuard,
     stop: Arc<AtomicBool>,
 ) -> (usize, u64) {

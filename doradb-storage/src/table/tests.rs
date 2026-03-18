@@ -4,6 +4,7 @@ use crate::engine::{Engine, EngineConfig};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
+use crate::file::build_test_fs_in;
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::table_fs::TableFileSystemConfig;
 use crate::index::{ColumnBlockIndex, RowLocation, UniqueIndex};
@@ -307,10 +308,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         );
         let entry = index.find_entry(row_id).await.unwrap().unwrap();
 
-        let fs = TableFileSystemConfig::default()
-            .data_dir(sys._temp_dir.path())
-            .build()
-            .unwrap();
+        let fs = build_test_fs_in(sys._temp_dir.path());
         corrupt_page_checksum(
             fs.table_file_path(sys.table.table_id()),
             entry.payload.block_id,

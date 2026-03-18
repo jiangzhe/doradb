@@ -301,8 +301,8 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
-    use crate::file::table_fs::TableFileSystemConfig;
     use crate::index::column_payload::BlobRef;
     use crate::value::ValKind;
     use std::sync::Arc;
@@ -348,8 +348,7 @@ mod tests {
     fn test_blob_writer_reader_shared_page() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("251.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(251, build_test_metadata(), false)
                     .unwrap();
@@ -377,9 +376,10 @@ mod tests {
                 assert_eq!(reader.read(ref_a).await.unwrap(), blob_a);
                 assert_eq!(reader.read(ref_b).await.unwrap(), blob_b);
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("251.tbl");
             })
         });
     }
@@ -388,8 +388,7 @@ mod tests {
     fn test_blob_writer_reader_cross_page() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("252.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(252, build_test_metadata(), false)
                     .unwrap();
@@ -417,9 +416,10 @@ mod tests {
                 let reader = ColumnDeletionBlobReader::new(&disk_pool);
                 assert_eq!(reader.read(blob_ref).await.unwrap(), blob);
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("252.tbl");
             })
         });
     }

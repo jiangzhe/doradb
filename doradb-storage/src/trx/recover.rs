@@ -630,8 +630,8 @@ mod tests {
     };
     use crate::engine::EngineConfig;
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::build_test_fs_in;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::file::table_fs::TableFileSystemConfig;
     use crate::index::ColumnBlockIndex;
     use crate::row::RowRead;
     use crate::row::ops::{SelectKey, UpdateCol};
@@ -1489,10 +1489,7 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(temp_dir.path());
             corrupt_page_checksum(fs.table_file_path(table_id), entry.payload.block_id);
 
             let err = match EngineConfig::default()
