@@ -74,7 +74,7 @@ fn main() {
             Arc::clone(&table_file),
             global.guard(),
         ));
-        let pool_guard = (*pool).guard();
+        let pool_guard = (*pool).pool_guard();
 
         let cold_start = Instant::now();
         let mut cold_checksum = 0u64;

@@ -278,7 +278,7 @@ mod tests {
                 .unwrap(),
             );
             {
-                let pool_guard = (*pool).guard();
+                let pool_guard = (*pool).pool_guard();
                 // i32 column and row id
                 let index = NonUniqueBTreeIndex {
                     tree: BTree::new(pool.guard(), &pool_guard, true, 100).await,

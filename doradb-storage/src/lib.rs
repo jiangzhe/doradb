@@ -6,6 +6,7 @@ pub mod io;
 pub mod error;
 pub mod buffer;
 pub mod catalog;
+mod component;
 pub mod compression;
 pub mod engine;
 pub mod file;
@@ -26,3 +27,5 @@ pub mod table;
 pub mod thread;
 pub mod trx;
 pub mod value;
+
+pub use component::{DiskPool, IndexPool, MemPool, MetaPool};

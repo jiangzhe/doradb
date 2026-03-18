@@ -280,7 +280,7 @@ impl EvictableBufferPool {
     #[inline]
     fn start_evict_thread_guarded(pool: SyncQuiescentGuard<Self>) {
         let runtime = EvictableRuntime {
-            arena: pool.arena.arena_guard(pool.guard()),
+            arena: pool.arena.arena_guard(pool.pool_guard()),
             in_mem: Arc::clone(&pool.in_mem),
             io_client: pool.io_client.clone(),
             inflight_io: Arc::clone(&pool.inflight_io),
@@ -347,7 +347,7 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    fn guard(&self) -> PoolGuard {
+    fn pool_guard(&self) -> PoolGuard {
         self.arena.guard()
     }
 
@@ -1479,7 +1479,7 @@ mod tests {
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256),
             );
-            let pool_guard = pool.guard();
+            let pool_guard = pool.pool_guard();
             {
                 let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 assert_eq!(g.page_id(), 0);
@@ -1592,7 +1592,7 @@ mod tests {
                 .max_file_size(128u64 * 1024 * 130),
         );
         let pool_ref = pool.owner_guard();
-        let pool_guard = pool.guard();
+        let pool_guard = pool.pool_guard();
 
         let (tx, rx) = flume::unbounded();
         let handle1 = {
@@ -1640,7 +1640,7 @@ mod tests {
                 .max_mem_size(1024u64 * 1024 * 64)
                 .max_file_size(1024u64 * 1024 * 128),
         );
-        let pool_guard = pool.guard();
+        let pool_guard = pool.pool_guard();
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
@@ -1668,7 +1668,7 @@ mod tests {
                 .max_file_size(128u64 * 1024 * 130)
                 .build_owned()
                 .unwrap();
-            let pool_guard = EvictableBufferPool::guard(&pool);
+            let pool_guard = EvictableBufferPool::pool_guard(&pool);
             let total_pages = pool.in_mem.max_count + 64;
 
             for i in 0..total_pages {
@@ -1707,7 +1707,7 @@ mod tests {
                     .unwrap(),
             );
             let guard = {
-                let pool_guard = EvictableBufferPool::guard(&pool);
+                let pool_guard = EvictableBufferPool::pool_guard(&pool);
                 pool.allocate_page::<RowPage>(&pool_guard).await
             };
             let dropped = Arc::new(AtomicBool::new(false));
@@ -1740,7 +1740,7 @@ mod tests {
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(64u64 * 1024 * 2048),
         );
-        let pool_guard = pool.guard();
+        let pool_guard = pool.pool_guard();
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
@@ -1825,7 +1825,7 @@ mod tests {
                         .dynamic_batch_bounds(3, 3),
                 ),
         );
-        let _pool_guard = pool.guard();
+        let _pool_guard = pool.pool_guard();
         let arbiter = pool.in_mem.eviction_arbiter;
 
         assert_eq!(arbiter.target_free(), 2);
@@ -1869,8 +1869,8 @@ mod tests {
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64),
             );
-            let pool1_guard = pool1.guard();
-            let pool2_guard = pool2.guard();
+            let pool1_guard = pool1.pool_guard();
+            let pool2_guard = pool2.pool_guard();
 
             let page = pool1.allocate_page::<RowPage>(&pool1_guard).await;
             let page_id = page.page_id();

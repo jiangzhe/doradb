@@ -634,10 +634,10 @@ mod tests {
     #[inline]
     fn full_pool_guards(engine: &crate::engine::Engine) -> PoolGuards {
         PoolGuards::builder()
-            .push(PoolRole::Meta, engine.meta_pool.guard())
-            .push(PoolRole::Index, engine.index_pool.guard())
-            .push(PoolRole::Mem, engine.mem_pool.guard())
-            .push(PoolRole::Disk, engine.disk_pool.guard())
+            .push(PoolRole::Meta, engine.meta_pool.pool_guard())
+            .push(PoolRole::Index, engine.index_pool.pool_guard())
+            .push(PoolRole::Mem, engine.mem_pool.pool_guard())
+            .push(PoolRole::Disk, engine.disk_pool.pool_guard())
             .build()
     }
 
@@ -895,7 +895,7 @@ mod tests {
             let page_guard = table
                 .mem_pool()
                 .get_page::<RowPage>(
-                    &table.mem_pool().guard(),
+                    &table.mem_pool().pool_guard(),
                     page_id,
                     LatchFallbackMode::Shared,
                 )
@@ -999,7 +999,7 @@ mod tests {
             let page_guard = table
                 .mem_pool()
                 .get_page::<RowPage>(
-                    &table.mem_pool().guard(),
+                    &table.mem_pool().pool_guard(),
                     page_id,
                     LatchFallbackMode::Shared,
                 )
@@ -1240,7 +1240,7 @@ mod tests {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
                 };
-                let mem_guard = engine.mem_pool.guard();
+                let mem_guard = engine.mem_pool.pool_guard();
                 let page_guard: PageSharedGuard<RowPage> = engine
                     .mem_pool
                     .get_page(&mem_guard, page_id, LatchFallbackMode::Shared)

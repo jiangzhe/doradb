@@ -207,10 +207,10 @@ impl<'a> LogRecovery<'a> {
         log_merger: LogMerger,
     ) -> Self {
         let pool_guards = PoolGuards::builder()
-            .push(PoolRole::Meta, meta_pool.guard())
-            .push(PoolRole::Index, index_pool.guard())
-            .push(PoolRole::Mem, mem_pool.guard())
-            .push(PoolRole::Disk, global_disk_pool.guard())
+            .push(PoolRole::Meta, meta_pool.pool_guard())
+            .push(PoolRole::Index, index_pool.pool_guard())
+            .push(PoolRole::Mem, mem_pool.pool_guard())
+            .push(PoolRole::Disk, global_disk_pool.pool_guard())
             .build();
         LogRecovery {
             index_pool,

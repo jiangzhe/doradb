@@ -1098,18 +1098,19 @@ mod tests {
                 .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.meta_pool.guard();
-                let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
-                let mem_guard = engine.mem_pool.guard();
+                let meta_guard = engine.meta_pool.pool_guard();
+                let blk_idx =
+                    RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                let mem_guard = engine.mem_pool.pool_guard();
                 let p1 = blk_idx
-                    .get_insert_page(&meta_guard, &engine.mem_pool, &mem_guard, &metadata, 100)
+                    .get_insert_page(&meta_guard, &*engine.mem_pool, &mem_guard, &metadata, 100)
                     .await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.cache_exclusive_insert_page(p1);
                 assert_eq!(blk_idx.insert_free_list.lock().len(), 1);
                 let p2 = blk_idx
-                    .get_insert_page(&meta_guard, &engine.mem_pool, &mem_guard, &metadata, 100)
+                    .get_insert_page(&meta_guard, &*engine.mem_pool, &mem_guard, &metadata, 100)
                     .await;
                 assert_eq!(pid1, p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
@@ -1141,13 +1142,14 @@ mod tests {
                 .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.meta_pool.guard();
-                let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
-                let mem_guard = engine.mem_pool.guard();
+                let meta_guard = engine.meta_pool.pool_guard();
+                let blk_idx =
+                    RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                let mem_guard = engine.mem_pool.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page_exclusive(
                         &meta_guard,
-                        &engine.mem_pool,
+                        &*engine.mem_pool,
                         &mem_guard,
                         &metadata,
                         100,
@@ -1159,7 +1161,7 @@ mod tests {
                 let p2 = blk_idx
                     .get_insert_page_exclusive(
                         &meta_guard,
-                        &engine.mem_pool,
+                        &*engine.mem_pool,
                         &mem_guard,
                         &metadata,
                         100,
@@ -1197,12 +1199,13 @@ mod tests {
                 .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.meta_pool.guard();
-                let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
-                let mem_guard = engine.mem_pool.guard();
+                let meta_guard = engine.meta_pool.pool_guard();
+                let blk_idx =
+                    RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                let mem_guard = engine.mem_pool.pool_guard();
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(&meta_guard, &engine.mem_pool, &mem_guard, &metadata, 100)
+                        .get_insert_page(&meta_guard, &*engine.mem_pool, &mem_guard, &metadata, 100)
                         .await;
                 }
                 let mut count = 0usize;
@@ -1224,7 +1227,7 @@ mod tests {
     fn test_row_block_index_cursor_two_level_tree() {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
 
             let overflow_entries = 3usize;
@@ -1285,7 +1288,7 @@ mod tests {
     fn test_row_block_index_search() {
         smol::block_on(async {
             let pool = owned_index_pool(512usize * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
             let row_pages = 5000usize;
             let rows_per_page = 100usize;
@@ -1319,7 +1322,7 @@ mod tests {
     fn test_row_block_index_split() {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
             assert_eq!(blk_idx.height(), 0);
 
@@ -1387,14 +1390,15 @@ mod tests {
                 .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.meta_pool.guard();
-                let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
-                let mem_guard = engine.mem_pool.guard();
+                let meta_guard = engine.meta_pool.pool_guard();
+                let blk_idx =
+                    RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                let mem_guard = engine.mem_pool.pool_guard();
                 let redo_ctx = RowPageCreateRedoCtx::new(&engine.trx_sys, 104);
                 let page_guard = blk_idx
                     .get_insert_page_with_redo(
                         &meta_guard,
-                        &engine.mem_pool,
+                        &*engine.mem_pool,
                         &mem_guard,
                         &metadata,
                         100,
@@ -1417,7 +1421,7 @@ mod tests {
                 let reused_page = blk_idx
                     .get_insert_page_with_redo(
                         &meta_guard,
-                        &engine.mem_pool,
+                        &*engine.mem_pool,
                         &mem_guard,
                         &metadata,
                         100,

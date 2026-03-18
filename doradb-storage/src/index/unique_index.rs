@@ -419,7 +419,7 @@ mod tests {
                 FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 1024usize * 1024)
                     .unwrap(),
             );
-            let guard = (*pool).guard();
+            let guard = (*pool).pool_guard();
             let index = PartitionSingleKeyIndex::<i32, false>::empty();
             run_test_suit_for_single_key_unique_index(&index, &guard).await;
         });
@@ -432,7 +432,7 @@ mod tests {
                 FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 1024usize * 1024)
                     .unwrap(),
             );
-            let guard = (*pool).guard();
+            let guard = (*pool).pool_guard();
             let encoder = multi_key_encoder(vec![
                 ValType {
                     kind: ValKind::VarByte,
@@ -459,7 +459,7 @@ mod tests {
                 .unwrap(),
             );
             {
-                let pool_guard = (*pool).guard();
+                let pool_guard = (*pool).pool_guard();
                 let index = UniqueBTreeIndex {
                     tree: BTree::new(pool.guard(), &pool_guard, false, 100).await,
                     encoder: BTreeKeyEncoder::new(vec![ValType {
@@ -483,7 +483,7 @@ mod tests {
                 .unwrap(),
             );
             {
-                let pool_guard = (*pool).guard();
+                let pool_guard = (*pool).pool_guard();
                 let index = UniqueBTreeIndex {
                     tree: BTree::new(pool.guard(), &pool_guard, false, 100).await,
                     encoder: BTreeKeyEncoder::new(vec![

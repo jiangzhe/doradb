@@ -163,6 +163,10 @@ pub enum Error {
         row_id: RowID,
         deleted: bool,
     },
+    #[error("engine component already registered")]
+    EngineComponentAlreadyRegistered,
+    #[error("engine component missing dependency")]
+    EngineComponentMissingDependency,
 }
 
 impl From<TryFromSliceError> for Error {

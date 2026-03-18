@@ -115,7 +115,7 @@ impl BufferPool for FixedBufferPool {
     }
 
     #[inline]
-    fn guard(&self) -> PoolGuard {
+    fn pool_guard(&self) -> PoolGuard {
         self.arena.guard()
     }
 
@@ -244,7 +244,7 @@ mod tests {
     fn test_fixed_buffer_pool() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::guard(&pool);
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
             {
                 let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 assert_eq!(g.page_id(), 0);
@@ -350,7 +350,7 @@ mod tests {
     fn test_facade_page_guard_lock_shared_and_try_into_shared() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::guard(&pool);
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
             let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             let page_id = g.page_id();
             drop(g);
@@ -412,7 +412,7 @@ mod tests {
     fn test_facade_page_guard_lock_exclusive_and_try_into_exclusive() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::guard(&pool);
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
             let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             let page_id = g.page_id();
             drop(g);
@@ -479,7 +479,7 @@ mod tests {
     fn test_facade_page_guard_lock_exclusive_async_panics_on_shared_state() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::guard(&pool);
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
             let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             let page_id = g.page_id();
             drop(g);
@@ -501,7 +501,7 @@ mod tests {
     fn test_facade_page_guard_lock_shared_async_panics_on_exclusive_state() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::guard(&pool);
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
             let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
             let page_id = g.page_id();
             drop(g);
@@ -525,7 +525,7 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Meta, 8 * 1024 * 1024).unwrap(),
             );
             let guard = {
-                let pool_guard = FixedBufferPool::guard(&pool);
+                let pool_guard = FixedBufferPool::pool_guard(&pool);
                 pool.allocate_page::<BlockNode>(&pool_guard).await
             };
             let dropped = Arc::new(AtomicBool::new(false));
@@ -552,8 +552,8 @@ mod tests {
         smol::block_on(async {
             let pool1 = test_pool();
             let pool2 = test_pool();
-            let pool1_guard = FixedBufferPool::guard(&pool1);
-            let pool2_guard = FixedBufferPool::guard(&pool2);
+            let pool1_guard = FixedBufferPool::pool_guard(&pool1);
+            let pool2_guard = FixedBufferPool::pool_guard(&pool2);
 
             let page = pool1.allocate_page::<BlockNode>(&pool1_guard).await;
             let page_id = page.page_id();

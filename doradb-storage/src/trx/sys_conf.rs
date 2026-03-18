@@ -85,10 +85,7 @@ impl PendingTransactionSystem {
 
 impl PendingTransactionSystemStartup {
     #[inline]
-    pub(crate) async fn start(
-        self,
-        trx_sys: QuiescentGuard<TransactionSystem>,
-    ) -> QuiescentGuard<TransactionSystem> {
+    pub(crate) async fn start(self, trx_sys: QuiescentGuard<TransactionSystem>) {
         TransactionSystem::start_io_threads(trx_sys.clone());
         TransactionSystem::start_gc_threads(trx_sys.clone(), self.gc_rxs);
         TransactionSystem::start_purge_threads(
@@ -97,7 +94,6 @@ impl PendingTransactionSystemStartup {
             self.pool_guards,
             self.purge_rx,
         );
-        trx_sys
     }
 }
 
@@ -242,10 +238,10 @@ impl TrxSysConfig {
         .await?;
         let mut catalog = Catalog::new(catalog_storage).await?;
         let pool_guards = PoolGuards::builder()
-            .push(PoolRole::Meta, meta_pool.guard())
-            .push(PoolRole::Index, index_pool.guard())
-            .push(PoolRole::Mem, mem_pool.guard())
-            .push(PoolRole::Disk, global_disk_pool.guard())
+            .push(PoolRole::Meta, meta_pool.pool_guard())
+            .push(PoolRole::Index, index_pool.pool_guard())
+            .push(PoolRole::Mem, mem_pool.pool_guard())
+            .push(PoolRole::Disk, global_disk_pool.pool_guard())
             .build();
 
         // Now we have an empty catalog, all log partitions and buffer pool.
