@@ -12,6 +12,7 @@ use crate::index::btree_scan::{BTreePrefixScan, BTreeSlotCallback};
 use crate::index::btree_value::{BTreeU64, BTreeValue};
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
+use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
 use either::Either;
 use std::marker::PhantomData;
@@ -76,7 +77,7 @@ pub struct GenericBTree<P: 'static> {
     // buffer pool to hold this index structure.
     // todo: switch to ShadowBufferPool, which
     // supports CoW operations.
-    pool: &'static P,
+    pool: QuiescentGuard<P>,
 }
 
 /// Compatibility alias for runtime B-Tree backed by `FixedBufferPool`.
@@ -86,7 +87,7 @@ impl<P: BufferPool> GenericBTree<P> {
     /// Create a new B-Tree index.
     #[inline]
     pub async fn new(
-        pool: &'static P,
+        pool: QuiescentGuard<P>,
         pool_guard: &PoolGuard,
         hints_enabled: bool,
         ts: TrxID,
@@ -1840,7 +1841,7 @@ enum BTreeCompact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifetime::StaticLifetimeScope;
+    use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use rand_distr::{Distribution, Uniform};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Barrier, mpsc};
@@ -1863,8 +1864,14 @@ mod tests {
         second_right_leaf_page_id: PageID,
     }
 
+    fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(
+            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, pool_size).unwrap(),
+        )
+    }
+
     async fn build_exact_boundary_resume_fixture(
-        pool: &'static FixedBufferPool,
+        pool: QuiescentGuard<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> ExactBoundaryResumeFixture {
         let tree = BTree::new(pool, pool_guard, false, 200).await;
@@ -1930,18 +1937,10 @@ mod tests {
     #[test]
     fn test_btree_cursor_resumes_with_raw_upper_fence_before_strict_successor() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let fixture = build_exact_boundary_resume_fixture(pool, &pool_guard).await;
+                let fixture = build_exact_boundary_resume_fixture(pool.guard(), &pool_guard).await;
 
                 let root_guard = fixture
                     .tree
@@ -2000,18 +1999,10 @@ mod tests {
     #[test]
     fn test_btree_compactor_parent_done_buffers_raw_upper_fence() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let fixture = build_exact_boundary_resume_fixture(pool, &pool_guard).await;
+                let fixture = build_exact_boundary_resume_fixture(pool.guard(), &pool_guard).await;
                 let mut compactor =
                     fixture
                         .tree
@@ -2043,18 +2034,10 @@ mod tests {
     #[test]
     fn test_btree_single_node() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 // insert 1, 2, 3.
                 let one = BTreeU64::from(1);
                 let three = BTreeU64::from(3);
@@ -2139,18 +2122,10 @@ mod tests {
         const ROWS: u64 = 90089;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    3 * 1024 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2219,18 +2194,10 @@ mod tests {
         const ROWS: u64 = 90122;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    3 * 1024 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2299,18 +2266,10 @@ mod tests {
         const ROWS: u64 = 90089;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    3 * 1024 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2390,18 +2349,10 @@ mod tests {
         const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    100 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(100 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 let mut map = BTreeMap::new();
 
                 // number less than 10 million
@@ -2449,18 +2400,10 @@ mod tests {
         const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    100 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(100 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = BTree::new(pool, &pool_guard, true, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, true, 200).await;
                 let mut map = BTreeMap::new();
 
                 // number less than 10 million
@@ -2508,18 +2451,10 @@ mod tests {
         smol::block_on(async {
             const ROWS: u64 = 10_000;
             const MAX_VALUE: u64 = 100_000;
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    20 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(20 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = BTree::new(pool, &pool_guard, false, 1).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 1).await;
 
                 let start = Instant::now();
                 // insert with random distribution.
@@ -2578,18 +2513,10 @@ mod tests {
         const ROWS: u64 = 90088;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    3 * 1024 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = Arc::new(BTree::new(pool, &pool_guard, false, 200).await);
+                let tree = Arc::new(BTree::new(pool.guard(), &pool_guard, false, 200).await);
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2667,18 +2594,10 @@ mod tests {
         const ROWS: u64 = 90088;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    3 * 1024 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = Arc::new(BTree::new(pool, &pool_guard, false, 200).await);
+                let tree = Arc::new(BTree::new(pool.guard(), &pool_guard, false, 200).await);
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2725,18 +2644,10 @@ mod tests {
         const ROWS: usize = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    100 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(100 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 // number less than 10 million
                 let between = Uniform::new(0u64, 10_000_000).unwrap();
                 let mut rng = rand::rng();
@@ -2779,20 +2690,12 @@ mod tests {
         const H2_ROWS: u64 = 100000;
         smol::block_on(async {
             // 1GB buffer pool.
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    2 * 1024 * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let pool = owned_index_pool(2 * 1024 * 1024 * 1024);
+            let pool_guard = (*pool).guard();
             assert!(pool.allocated() == 0);
             // height=0
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H0_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
@@ -2809,7 +2712,7 @@ mod tests {
             }
             // height=1
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H1_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
@@ -2826,7 +2729,7 @@ mod tests {
             }
             // height=2
             {
-                let tree = BTree::new(pool, &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 let mut key = vec![0u8; 1000];
                 for i in 0..H2_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());

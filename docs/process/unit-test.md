@@ -24,6 +24,14 @@ To accommodate this, there is a feature gate for `libaio`. When the `libaio` fea
     cargo test --no-default-features
     ```
 
+## Parallel Execution and Timeout Guidance
+
+-   `cargo test` uses Rust's built-in test harness, which executes tests in parallel by default.
+-   This project expects unit tests to provide fast feedback, but plain `cargo test` does not provide built-in timeout configuration or automatic hang detection.
+-   Do not assume a universal 10-second timeout for crate-wide test runs when invoking plain `cargo test`.
+-   If timeout-based enforcement or hang detection is required, treat that as explicit test-runner/tooling work rather than an ad hoc `cargo test` flag.
+-   Future evaluation of `cargo-nextest` for timeout policy is tracked in `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md`.
+
 ## Test Policy
 
 -   When making code changes, you must ensure that all existing tests continue to pass.

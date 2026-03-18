@@ -14,13 +14,13 @@ pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::engine::StaticHandle;
 use crate::error::{PersistedFileKind, Result};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
 };
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
+use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -29,8 +29,8 @@ pub(crate) const CATALOG_MTB_READONLY_FILE_ID: ReadonlyFileID = USER_OBJ_ID_STAR
 
 /// Runtime storage container for all catalog logical tables.
 pub struct CatalogStorage {
-    pub(super) meta_pool: &'static FixedBufferPool,
-    pub(super) index_pool: &'static FixedBufferPool,
+    pub(super) meta_pool: QuiescentGuard<FixedBufferPool>,
+    pub(super) index_pool: QuiescentGuard<FixedBufferPool>,
     tables: Box<[Arc<CatalogTable>]>,
     next_user_obj_id: ObjID,
     mtb: Arc<MultiTableFile>,
@@ -41,17 +41,16 @@ impl CatalogStorage {
     /// Open or initialize catalog storage and bootstrap catalog table runtimes.
     #[inline]
     pub(crate) async fn new(
-        meta_pool: &'static FixedBufferPool,
-        index_pool: &'static FixedBufferPool,
-        table_fs: &'static TableFileSystem,
-        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+        meta_pool: QuiescentGuard<FixedBufferPool>,
+        index_pool: QuiescentGuard<FixedBufferPool>,
+        table_fs: &TableFileSystem,
+        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<Self> {
-        let global_disk_pool = global_disk_pool.into();
         let meta_pool_guard = meta_pool.guard();
         let index_pool_guard = index_pool.guard();
         let mtb = table_fs.open_or_create_multi_table_file().await?;
         let mtb_snapshot = mtb.load_snapshot()?;
-        let disk_pool = ReadonlyBufferPool::new_with_handle(
+        let disk_pool = ReadonlyBufferPool::new(
             CATALOG_MTB_READONLY_FILE_ID,
             PersistedFileKind::CatalogMultiTableFile,
             Arc::clone(&mtb),
@@ -68,11 +67,11 @@ impl CatalogStorage {
             // make sure table id matches.
             assert_eq!(cat.len(), *table_id as usize);
             let metadata = Arc::new(metadata.clone());
-            let blk_idx = BlockIndex::new_catalog(meta_pool, &meta_pool_guard).await;
+            let blk_idx = BlockIndex::new_catalog(meta_pool.clone(), &meta_pool_guard).await;
             let table = Arc::new(
                 CatalogTable::new(
-                    meta_pool,
-                    index_pool,
+                    meta_pool.clone(),
+                    index_pool.clone(),
                     &index_pool_guard,
                     *table_id,
                     blk_idx,

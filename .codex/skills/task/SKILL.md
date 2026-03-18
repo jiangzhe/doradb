@@ -80,6 +80,14 @@ Resolve disagreements, tighten scope, and finalize:
 
 Round 2 must complete before any write to `docs/tasks/`.
 
+## Test Runner Constraint
+
+Use `docs/process/unit-test.md` as the source of truth for current test workflow constraints.
+- `cargo test` runs tests in parallel by default, but plain `cargo test` has no built-in timeout setting.
+- Do not invent timeout flags or promise a universal 10-second timeout for crate-wide runs.
+- If the request needs enforced timeouts or hang detection, scope explicit runner/tooling work instead of assuming `cargo test` can provide it.
+- Current follow-up for evaluating `cargo-nextest` is tracked in `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md`.
+
 ## Step 5: Require Explicit Approval Before Writing
 
 Ask for explicit approval to write the task document after Round 2.

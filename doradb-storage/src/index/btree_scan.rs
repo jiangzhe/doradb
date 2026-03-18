@@ -146,25 +146,20 @@ mod tests {
     use crate::buffer::FixedBufferPool;
     use crate::index::btree::BTree;
     use crate::index::btree_value::BTreeU64;
-    use crate::lifetime::StaticLifetimeScope;
+    use crate::quiescent::QuiescentBox;
     use rand::prelude::IndexedRandom;
     use std::collections::HashMap;
 
     #[test]
     fn test_btree_scan_single_node() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
+                    .unwrap(),
             );
-            let pool = pool.as_static();
             {
-                let pool_guard = pool.guard();
-                let tree = BTree::new(pool, &pool_guard, true, 200).await;
+                let pool_guard = (*pool).guard();
+                let tree = BTree::new(pool.guard(), &pool_guard, true, 200).await;
                 let keys = vec![
                     "a", "b", "c", "d", "aa", "bb", "cc", "dd", "aaa", "bbb", "ccc", "ddd",
                 ];
@@ -217,19 +212,14 @@ mod tests {
         const ALPHABETA: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
         const COUNT: usize = 100000;
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64 * 1024 * 1024,
-                )
-                .unwrap(),
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
+                    .unwrap(),
             );
-            let pool = pool.as_static();
             {
                 // generate random data
-                let pool_guard = pool.guard();
-                let tree = BTree::new(pool, &pool_guard, true, 200).await;
+                let pool_guard = (*pool).guard();
+                let tree = BTree::new(pool.guard(), &pool_guard, true, 200).await;
                 let mut data = Vec::with_capacity(COUNT);
                 let mut rng = rand::rng();
                 for i in 0..COUNT {

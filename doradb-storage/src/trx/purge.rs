@@ -2,6 +2,7 @@ use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
 use crate::latch::LatchFallbackMode;
+use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
 use crate::thread;
 use crate::trx::log::LogPartition;
@@ -31,41 +32,47 @@ fn promote_delete_marker_if_needed(table: &TableHandle, undo: &OwnedRowUndo) {
 impl TransactionSystem {
     #[inline]
     pub(super) fn start_purge_threads(
-        &'static self,
-        mem_pool: &'static EvictableBufferPool,
+        trx_sys: QuiescentGuard<Self>,
+        mem_pool: QuiescentGuard<EvictableBufferPool>,
         pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
     ) {
-        if self.config.purge_threads == 1 {
+        let trx_sys = trx_sys.into_sync();
+        let mem_pool = mem_pool.into_sync();
+        if trx_sys.config.purge_threads == 1 {
             // single-threaded purger
+            let task_trx_sys = trx_sys.clone();
+            let task_mem_pool = mem_pool.clone();
             let handle = thread::spawn_named("Purge-Thread", move || {
                 let ex = LocalExecutor::new();
                 let mut purger = PurgeSingleThreaded;
                 smol::block_on(ex.run(purger.purge_loop(
-                    mem_pool,
-                    &self.catalog,
-                    self,
+                    &task_mem_pool,
+                    &task_trx_sys.catalog,
+                    &task_trx_sys,
                     pool_guards,
                     purge_chan,
                 )))
             });
-            let mut g = self.purge_threads.lock();
+            let mut g = trx_sys.purge_threads.lock();
             g.push(handle);
         } else {
             // multi-threaded purger
             let dispatcher_guards = pool_guards.clone();
-            let (mut dispatcher, executors) = self.dispatch_purge(&self.catalog, pool_guards);
+            let (mut dispatcher, executors) = Self::dispatch_purge(trx_sys.clone(), pool_guards);
+            let task_trx_sys = trx_sys.clone();
+            let task_mem_pool = mem_pool.clone();
             let handle = thread::spawn_named("Purge-Dispatcher", move || {
                 let ex = LocalExecutor::new();
                 smol::block_on(ex.run(dispatcher.purge_loop(
-                    mem_pool,
-                    &self.catalog,
-                    self,
+                    &task_mem_pool,
+                    &task_trx_sys.catalog,
+                    &task_trx_sys,
                     dispatcher_guards,
                     purge_chan,
                 )));
             });
-            let mut g = self.purge_threads.lock();
+            let mut g = trx_sys.purge_threads.lock();
             g.push(handle);
             g.extend(executors);
         }
@@ -89,21 +96,26 @@ impl TransactionSystem {
 
     #[inline]
     pub(super) fn dispatch_purge(
-        &'static self,
-        catalog: &'static Catalog,
+        trx_sys: SyncQuiescentGuard<Self>,
         pool_guards: PoolGuards,
     ) -> (PurgeDispatcher, Vec<JoinHandle<()>>) {
         let mut handles = vec![];
         let mut chans = vec![];
-        for i in 0..self.config.purge_threads {
+        for i in 0..trx_sys.config.purge_threads {
             let (tx, rx) = flume::unbounded();
             chans.push(tx);
             let thread_name = format!("Purge-Executor-{i}");
             let pool_guards = pool_guards.clone();
+            let task_trx_sys = trx_sys.clone();
             let handle = thread::spawn_named(thread_name, move || {
                 let mut purger = PurgeExecutor;
                 let ex = LocalExecutor::new();
-                smol::block_on(ex.run(purger.purge_task_loop(catalog, self, pool_guards, rx)));
+                smol::block_on(ex.run(purger.purge_task_loop(
+                    &task_trx_sys.catalog,
+                    &task_trx_sys,
+                    pool_guards,
+                    rx,
+                )));
             });
             handles.push(handle);
         }
@@ -198,7 +210,7 @@ impl TransactionSystem {
     #[inline]
     async fn deallocate_gc_row_pages(
         &self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &EvictableBufferPool,
         guards: &PoolGuards,
         gc_row_pages: HashSet<PageID>,
     ) {
@@ -419,7 +431,7 @@ struct PurgeTask {
 trait PurgeLoop {
     async fn purge_loop(
         &mut self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &EvictableBufferPool,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
         pool_guards: PoolGuards,
@@ -435,7 +447,7 @@ impl PurgeLoop for PurgeSingleThreaded {
     #[inline]
     async fn purge_loop(
         &mut self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &EvictableBufferPool,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
         pool_guards: PoolGuards,
@@ -491,7 +503,7 @@ impl PurgeLoop for PurgeDispatcher {
     #[inline]
     async fn purge_loop(
         &mut self,
-        mem_pool: &'static EvictableBufferPool,
+        mem_pool: &EvictableBufferPool,
         _catalog: &Catalog,
         trx_sys: &TransactionSystem,
         pool_guards: PoolGuards,

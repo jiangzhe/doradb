@@ -182,7 +182,7 @@ impl QuiescentArena {
     }
 
     #[inline]
-    pub(crate) fn arena_guard(&'static self, guard: PoolGuard) -> ArenaGuard {
+    pub(crate) fn arena_guard(&self, guard: PoolGuard) -> ArenaGuard {
         guard.assert_matches(self.identity, "arena guard");
         let inner = UnsafePtr(std::ptr::from_ref(&self.state).cast_mut());
         ArenaGuard {

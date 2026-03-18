@@ -298,7 +298,7 @@ impl CatalogStorage {
         // Step 6: Persist any remaining inserts as new LWC pages and append index entries.
         if !live_inserts.is_empty() {
             let new_pages = self
-                .build_lwc_pages_from_row_records(self.meta_pool, metadata, &live_inserts)
+                .build_lwc_pages_from_row_records(&self.meta_pool, metadata, &live_inserts)
                 .await?;
             let mut new_entries = Vec::with_capacity(new_pages.len());
             for page in new_pages {
@@ -462,7 +462,7 @@ impl CatalogStorage {
 
     async fn build_lwc_pages_from_row_records(
         &self,
-        meta_pool: &'static FixedBufferPool,
+        meta_pool: &FixedBufferPool,
         metadata: &TableMetadata,
         rows: &[RowRecord],
     ) -> Result<Vec<PendingLwcPage>> {
@@ -627,7 +627,7 @@ mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
 
@@ -680,7 +680,7 @@ mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
 
@@ -698,7 +698,7 @@ mod tests {
             let _ = table2(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
 

@@ -1141,18 +1141,18 @@ fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey};
+    use crate::buffer::{ReadonlyCacheKey, global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableMetadata,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::build_test_fs;
     use crate::file::table_file::{MutableTableFile, TableFile};
-    use crate::file::table_fs::TableFileSystemConfig;
     use crate::index::load_payload_deletion_deltas;
     use crate::io::AIOBuf;
     use crate::ptr::UnsafePtr;
     use crate::value::ValKind;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     fn copy_persisted_node(
         page: &[u8],
@@ -1337,36 +1337,17 @@ mod tests {
             .expect("join test thread");
     }
 
-    fn global_readonly_pool() -> &'static GlobalReadonlyBufferPool {
-        static GLOBAL: OnceLock<&'static GlobalReadonlyBufferPool> = OnceLock::new();
-        GLOBAL.get_or_init(|| {
-            GlobalReadonlyBufferPool::with_capacity_static(
-                crate::buffer::PoolRole::Disk,
-                64 * 1024 * 1024,
-            )
-            .unwrap()
-        })
-    }
-
-    fn readonly_pool(table_id: TableID, table_file: &Arc<TableFile>) -> ReadonlyBufferPool {
-        ReadonlyBufferPool::new(
-            table_id,
-            PersistedFileKind::TableFile,
-            Arc::clone(table_file),
-            global_readonly_pool(),
-        )
-    }
-
     #[test]
     fn test_batch_insert_into_empty_tree_and_find() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
+                let (_temp_dir, fs) = build_test_fs();
                 let metadata = build_test_metadata();
                 let table_file = fs.create_table_file(200, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(200, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 200, &table_file);
 
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
                 let entries = vec![(10, 100), (20, 200), (30, 300)];
@@ -1386,9 +1367,10 @@ mod tests {
                 assert_eq!(index.find(39).await.unwrap().unwrap().block_id, 300);
                 assert_eq!(index.find(40).await.unwrap(), None);
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("200.tbl");
             })
         });
     }
@@ -1397,13 +1379,13 @@ mod tests {
     fn test_index_accessors_and_find() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
+                let (_temp_dir, fs) = build_test_fs();
                 let metadata = build_test_metadata();
-                let _ = std::fs::remove_file("203.tbl");
                 let table_file = fs.create_table_file(203, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(203, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 203, &table_file);
 
                 let entries = vec![(5, 500), (15, 600)];
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
@@ -1422,9 +1404,10 @@ mod tests {
                 assert_eq!(index.find(19).await.unwrap().unwrap().block_id, 600);
                 assert_eq!(index.find(4).await.unwrap(), None);
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("203.tbl");
             })
         });
     }
@@ -1433,12 +1416,13 @@ mod tests {
     fn test_batch_insert_appends_within_leaf() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
+                let (_temp_dir, fs) = build_test_fs();
                 let metadata = build_test_metadata();
                 let table_file = fs.create_table_file(201, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(201, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 201, &table_file);
 
                 let entries = build_entries(0, 8, 1000);
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
@@ -1466,9 +1450,10 @@ mod tests {
                 assert_eq!(index.find(8).await.unwrap().unwrap().block_id, 2000);
                 assert_eq!(index.find(11).await.unwrap().unwrap().block_id, 2003);
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("201.tbl");
             })
         });
     }
@@ -1477,9 +1462,8 @@ mod tests {
     fn test_build_branch_levels_multiple_layers() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
+                let (_temp_dir, fs) = build_test_fs();
                 let metadata = build_test_metadata();
-                let _ = std::fs::remove_file("204.tbl");
                 let table_file = fs.create_table_file(204, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
@@ -1492,7 +1476,8 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
 
-                let disk_pool = readonly_pool(204, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 204, &table_file);
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
                 let mut mutable = MutableTableFile::fork(&table_file);
                 let root_page = index
@@ -1512,9 +1497,10 @@ mod tests {
                     COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID
                 );
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("204.tbl");
             })
         });
     }
@@ -1523,12 +1509,13 @@ mod tests {
     fn test_batch_insert_creates_new_leaf_nodes() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
+                let (_temp_dir, fs) = build_test_fs();
                 let metadata = build_test_metadata();
                 let table_file = fs.create_table_file(202, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(202, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 202, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES - 1;
                 let entries = build_entries(0, initial_count, 1);
@@ -1572,9 +1559,10 @@ mod tests {
                     9001
                 );
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("202.tbl");
             })
         });
     }
@@ -1583,64 +1571,70 @@ mod tests {
     fn test_append_to_branch_with_child_splits() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
+                let (_temp_dir, fs) = build_test_fs();
                 let metadata = build_test_metadata();
-                let _ = std::fs::remove_file("205.tbl");
                 let table_file = fs.create_table_file(205, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
 
-                let disk_pool = readonly_pool(205, &table_file);
-                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let mut setup_mutable = MutableTableFile::fork(&table_file);
-                let obsolete_page_id = setup_mutable.allocate_page_id().unwrap();
-                let mut node = ColumnBlockNode::new_boxed(1, 0, 0);
-                let mut entries = Vec::with_capacity(COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-                for idx in 0..COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
-                    entries.push(ColumnBlockBranchEntry {
-                        start_row_id: idx as RowID,
-                        page_id: (2000 + idx) as PageID,
-                    });
-                }
-                node.header.count = entries.len() as u32;
-                node.branch_entries_mut().copy_from_slice(&entries);
-                index
-                    .write_node(&setup_mutable, obsolete_page_id, &node)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = setup_mutable.commit(2, false).await.unwrap();
-                drop(old_root);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let (table_file, obsolete_page_id) = {
+                    let disk_pool = table_readonly_pool(&global, 205, &table_file);
+                    let index = ColumnBlockIndex::new(0, 0, &disk_pool);
+                    let mut setup_mutable = MutableTableFile::fork(&table_file);
+                    let obsolete_page_id = setup_mutable.allocate_page_id().unwrap();
+                    let mut node = ColumnBlockNode::new_boxed(1, 0, 0);
+                    let mut entries = Vec::with_capacity(COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
+                    for idx in 0..COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
+                        entries.push(ColumnBlockBranchEntry {
+                            start_row_id: idx as RowID,
+                            page_id: (2000 + idx) as PageID,
+                        });
+                    }
+                    node.header.count = entries.len() as u32;
+                    node.branch_entries_mut().copy_from_slice(&entries);
+                    index
+                        .write_node(&setup_mutable, obsolete_page_id, &node)
+                        .await
+                        .unwrap();
+                    let (table_file, old_root) = setup_mutable.commit(2, false).await.unwrap();
+                    drop(old_root);
+                    (table_file, obsolete_page_id)
+                };
 
-                let disk_pool = readonly_pool(205, &table_file);
-                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let child_page_id = mutable.allocate_page_id().unwrap();
-                let extra_entries = vec![
-                    ColumnBlockBranchEntry {
-                        start_row_id: COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID,
-                        page_id: mutable.allocate_page_id().unwrap(),
-                    },
-                    ColumnBlockBranchEntry {
-                        start_row_id: COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID + 1,
-                        page_id: mutable.allocate_page_id().unwrap(),
-                    },
-                ];
-
-                let result = index
-                    .append_to_branch_with_child(
-                        &mut mutable,
-                        obsolete_page_id,
-                        NodeAppendResult {
-                            new_page_id: child_page_id,
-                            start_row_id: 0,
-                            extra_entries,
+                let (table_file, child_page_id, result) = {
+                    let disk_pool = table_readonly_pool(&global, 205, &table_file);
+                    let index = ColumnBlockIndex::new(0, 0, &disk_pool);
+                    let mut mutable = MutableTableFile::fork(&table_file);
+                    let child_page_id = mutable.allocate_page_id().unwrap();
+                    let extra_entries = vec![
+                        ColumnBlockBranchEntry {
+                            start_row_id: COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID,
+                            page_id: mutable.allocate_page_id().unwrap(),
                         },
-                        2,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
+                        ColumnBlockBranchEntry {
+                            start_row_id: COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID + 1,
+                            page_id: mutable.allocate_page_id().unwrap(),
+                        },
+                    ];
+
+                    let result = index
+                        .append_to_branch_with_child(
+                            &mut mutable,
+                            obsolete_page_id,
+                            NodeAppendResult {
+                                new_page_id: child_page_id,
+                                start_row_id: 0,
+                                extra_entries,
+                            },
+                            2,
+                        )
+                        .await
+                        .unwrap();
+                    let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
+                    drop(old_root);
+                    (table_file, child_page_id, result)
+                };
 
                 let new_root = read_node_from_file(&table_file, result.new_page_id)
                     .await
@@ -1657,9 +1651,9 @@ mod tests {
                     COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID
                 );
 
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("205.tbl");
             })
         });
     }
@@ -1668,14 +1662,14 @@ mod tests {
     fn test_batch_update_offloaded_bitmaps_cow_snapshot() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("207.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(207, build_test_metadata(), false)
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(207, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 207, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
                 let entries = build_entries(0, initial_count, 7000);
@@ -1747,9 +1741,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(untouched.offloaded_ref(), None);
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("207.tbl");
             })
         });
     }
@@ -1758,14 +1753,14 @@ mod tests {
     fn test_batch_update_offloaded_bitmaps_multi_leaf() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("208.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(208, build_test_metadata(), false)
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(208, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 208, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
                 let entries = build_entries(0, initial_count, 8000);
@@ -1824,9 +1819,10 @@ mod tests {
                     right_bytes
                 );
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("208.tbl");
             })
         });
     }
@@ -1835,14 +1831,14 @@ mod tests {
     fn test_batch_update_offloaded_bitmaps_sticky() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("209.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(209, build_test_metadata(), false)
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(209, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 209, &table_file);
 
                 let entries = build_entries(0, 4, 9000);
                 let mut mutable = MutableTableFile::fork(&table_file);
@@ -1909,9 +1905,10 @@ mod tests {
                     second
                 );
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("209.tbl");
             })
         });
     }
@@ -1920,14 +1917,14 @@ mod tests {
     fn test_batch_replace_payloads_cow_snapshot() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("211.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(211, build_test_metadata(), false)
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(211, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 211, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
                 let entries = build_entries(0, initial_count, 11_000);
@@ -1973,9 +1970,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(untouched.block_id, 11_000 + COLUMN_BLOCK_MAX_ENTRIES as u64);
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("211.tbl");
             })
         });
     }
@@ -1984,14 +1982,14 @@ mod tests {
     fn test_batch_replace_payloads_multi_leaf() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("212.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(212, build_test_metadata(), false)
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(212, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 212, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
                 let entries = build_entries(0, initial_count, 12_000);
@@ -2045,9 +2043,10 @@ mod tests {
                     88_002
                 );
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("212.tbl");
             })
         });
     }
@@ -2056,14 +2055,14 @@ mod tests {
     fn test_batch_replace_payloads_rejects_invalid_patches() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("213.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(213, build_test_metadata(), false)
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(213, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 213, &table_file);
 
                 let entries = build_entries(0, COLUMN_BLOCK_MAX_ENTRIES + 8, 13_000);
                 let mut mutable = MutableTableFile::fork(&table_file);
@@ -2106,9 +2105,10 @@ mod tests {
                     .unwrap_err();
                 assert!(matches!(err, Error::InvalidArgument));
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("213.tbl");
             })
         });
     }
@@ -2117,14 +2117,14 @@ mod tests {
     fn test_read_offloaded_bitmap_invalid_ref() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("210.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(210, build_test_metadata(), false)
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(210, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 210, &table_file);
 
                 let mut payload = build_deletion_payload();
                 payload.set_offloaded_ref(BlobRef {
@@ -2149,9 +2149,10 @@ mod tests {
                     })
                 ));
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("210.tbl");
             })
         });
     }
@@ -2160,14 +2161,14 @@ mod tests {
     fn test_load_payload_deletion_deltas_maps_invalid_blob_contents_to_corruption() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
-                let _ = std::fs::remove_file("214.tbl");
+                let (_temp_dir, fs) = build_test_fs();
                 let table_file = fs
                     .create_table_file(214, build_test_metadata(), false)
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(214, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 214, &table_file);
 
                 let entries = build_entries(0, 1, 9100);
                 let mut mutable = MutableTableFile::fork(&table_file);
@@ -2206,9 +2207,10 @@ mod tests {
                     } if page_id == blob_ref.start_page_id
                 ));
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("214.tbl");
             })
         });
     }
@@ -2217,14 +2219,13 @@ mod tests {
     fn test_cache_reuse_for_unchanged_leaf_across_root_swap() {
         run_with_large_stack(|| {
             smol::block_on(async {
-                let fs = TableFileSystemConfig::default().build().unwrap();
+                let (_temp_dir, fs) = build_test_fs();
                 let metadata = build_test_metadata();
-                let _ = std::fs::remove_file("206.tbl");
                 let table_file = fs.create_table_file(206, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(206, &table_file);
-                let global = global_readonly_pool();
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 206, &table_file);
 
                 // Build at least two leaves so right-most append can preserve left leaf pages.
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
@@ -2275,9 +2276,10 @@ mod tests {
                     .expect("left leaf cache entry should remain valid");
                 assert_eq!(frame_before, frame_after);
 
+                drop(disk_pool);
+                drop(global);
                 drop(table_file);
                 drop(fs);
-                let _ = std::fs::remove_file("206.tbl");
             })
         });
     }

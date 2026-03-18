@@ -41,7 +41,7 @@ impl Table {
         let table_file = self.file();
         let disk_pool = self.disk_pool();
         // Step 1: snapshot current table root and initialize checkpoint boundaries.
-        let trx_sys = session.engine().trx_sys;
+        let trx_sys = session.engine().trx_sys.clone();
         let active_root = table_file.active_root();
         let pivot_row_id = active_root.pivot_row_id;
 
@@ -62,7 +62,7 @@ impl Table {
             let (frozen_pages, next_heap_redo_start_ts) =
                 self.collect_frozen_pages(pool_guards).await;
             if !frozen_pages.is_empty() {
-                self.wait_for_frozen_pages_stable(pool_guards, trx_sys, &frozen_pages)
+                self.wait_for_frozen_pages_stable(pool_guards, &trx_sys, &frozen_pages)
                     .await;
                 cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
                 self.set_frozen_pages_to_transition(pool_guards, &frozen_pages, cutoff_ts)

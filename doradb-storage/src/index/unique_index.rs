@@ -409,21 +409,17 @@ mod tests {
     use crate::buffer::FixedBufferPool;
     use crate::index::btree::BTree;
     use crate::index::secondary_index::multi_key_encoder;
-    use crate::lifetime::StaticLifetimeScope;
+    use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
 
     #[test]
     fn test_single_key_partition_unique_index() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    1024usize * 1024,
-                )
-                .unwrap(),
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 1024usize * 1024)
+                    .unwrap(),
             );
-            let guard = pool.as_static().guard();
+            let guard = (*pool).guard();
             let index = PartitionSingleKeyIndex::<i32, false>::empty();
             run_test_suit_for_single_key_unique_index(&index, &guard).await;
         });
@@ -432,15 +428,11 @@ mod tests {
     #[test]
     fn test_multi_key_partition_unique_index() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    1024usize * 1024,
-                )
-                .unwrap(),
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 1024usize * 1024)
+                    .unwrap(),
             );
-            let guard = pool.as_static().guard();
+            let guard = (*pool).guard();
             let encoder = multi_key_encoder(vec![
                 ValType {
                     kind: ValKind::VarByte,
@@ -459,19 +451,17 @@ mod tests {
     #[test]
     fn test_single_key_btree_unique_index() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(
                     crate::buffer::PoolRole::Index,
                     1024usize * 1024 * 1024,
                 )
                 .unwrap(),
             );
-            let pool = pool.as_static();
             {
-                let pool_guard = pool.guard();
+                let pool_guard = (*pool).guard();
                 let index = UniqueBTreeIndex {
-                    tree: BTree::new(pool, &pool_guard, false, 100).await,
+                    tree: BTree::new(pool.guard(), &pool_guard, false, 100).await,
                     encoder: BTreeKeyEncoder::new(vec![ValType {
                         kind: ValKind::I32,
                         nullable: false,
@@ -485,19 +475,17 @@ mod tests {
     #[test]
     fn test_multi_key_btree_unique_index() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(
                     crate::buffer::PoolRole::Index,
                     1024usize * 1024 * 1024,
                 )
                 .unwrap(),
             );
-            let pool = pool.as_static();
             {
-                let pool_guard = pool.guard();
+                let pool_guard = (*pool).guard();
                 let index = UniqueBTreeIndex {
-                    tree: BTree::new(pool, &pool_guard, false, 100).await,
+                    tree: BTree::new(pool.guard(), &pool_guard, false, 100).await,
                     encoder: BTreeKeyEncoder::new(vec![
                         ValType {
                             kind: ValKind::VarByte,

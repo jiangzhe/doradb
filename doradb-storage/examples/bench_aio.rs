@@ -1,7 +1,6 @@
 use clap::Parser;
 use doradb_storage::file::SparseFile;
 use doradb_storage::io::{AIOContext, AIOKind, DirectBuf};
-use doradb_storage::lifetime::{StaticLifetime, StaticLifetimeScope};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,15 +11,13 @@ use std::time::{Duration, Instant};
 fn main() {
     let args = Args::parse();
     let stop = Arc::new(AtomicBool::new(false));
-    let scope = StaticLifetimeScope::new();
-    let ctx = AIOContext::new(args.io_depth).unwrap();
-    let ctx = scope.adopt(StaticLifetime::new_static(ctx));
-    let ctx = ctx.as_static();
+    let ctx = Arc::new(AIOContext::new(args.io_depth).unwrap());
     let mut handles = vec![];
     let start = Instant::now();
     for id in 0..args.log_partitions {
         let args = args.clone();
         let stop = Arc::clone(&stop);
+        let ctx = Arc::clone(&ctx);
         let handle = thread::spawn(move || worker(id, ctx, args, stop));
         handles.push(handle);
     }
@@ -41,7 +38,7 @@ fn main() {
     );
 }
 
-fn worker(id: usize, aio_mgr: &'static AIOContext, args: Args, stop: Arc<AtomicBool>) -> usize {
+fn worker(id: usize, aio_mgr: Arc<AIOContext>, args: Args, stop: Arc<AtomicBool>) -> usize {
     let file_name = format!("{}.{}", &args.log_file_prefix, id);
 
     let file = SparseFile::create_or_trunc(&file_name, args.log_file_max_size).unwrap();

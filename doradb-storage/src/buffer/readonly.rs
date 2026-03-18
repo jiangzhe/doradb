@@ -9,14 +9,13 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageS
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, PoolRole};
-use crate::engine::StaticHandle;
 use crate::error::Validation::Valid;
 use crate::error::{Error, PersistedFileKind, Result, Validation};
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
 use crate::latch::LatchFallbackMode;
-use crate::lifetime::StaticLifetime;
 use crate::ptr::UnsafePtr;
+use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use event_listener::{Event, EventListener, listener};
@@ -113,13 +112,20 @@ pub struct GlobalReadonlyBufferPool {
 }
 
 impl GlobalReadonlyBufferPool {
-    /// Creates a global readonly pool with a target memory budget in bytes.
+    /// Creates a raw global readonly pool with a target memory budget in bytes.
+    ///
+    /// This constructor intentionally does not start the eviction worker.
+    /// Callers must first place the pool into a stable owner such as
+    /// [`QuiescentBox`] or [`crate::quiescent::QuiDAG`] before starting guarded
+    /// worker threads.
     #[inline]
     pub fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
         Self::with_capacity_and_arbiter_builder(role, pool_size, EvictionArbiter::builder())
     }
 
-    /// Creates a global readonly pool with explicit eviction arbiter builder.
+    /// Creates a raw global readonly pool with explicit eviction arbiter builder.
+    ///
+    /// This constructor intentionally does not start the eviction worker.
     #[inline]
     pub fn with_capacity_and_arbiter_builder(
         role: PoolRole,
@@ -148,26 +154,30 @@ impl GlobalReadonlyBufferPool {
         Ok(pool)
     }
 
-    /// Creates and leaks a global readonly pool for static-lifetime usage.
+    /// Creates a started quiescent owner for standalone readonly-pool usage.
+    ///
+    /// The returned owner already has its eviction worker running through the
+    /// guarded startup path. Call [`Self::shutdown`] before dropping
+    /// non-process-lifetime owners, otherwise [`QuiescentBox`] teardown will
+    /// wait forever on the worker's keepalive guard.
     #[inline]
-    pub fn with_capacity_static(role: PoolRole, pool_size: usize) -> Result<&'static Self> {
-        let pool = Self::with_capacity(role, pool_size)?;
-        let pool = StaticLifetime::new_static(pool);
-        pool.start_evictor_thread();
-        Ok(pool)
+    pub fn with_capacity_owned(role: PoolRole, pool_size: usize) -> Result<QuiescentBox<Self>> {
+        Self::with_capacity_and_arbiter_builder_owned(role, pool_size, EvictionArbiter::builder())
     }
 
-    /// Creates and leaks a global readonly pool with explicit eviction arbiter builder.
+    /// Creates a started quiescent owner with explicit eviction arbiter builder.
     #[inline]
-    pub fn with_capacity_and_arbiter_builder_static(
+    pub fn with_capacity_and_arbiter_builder_owned(
         role: PoolRole,
         pool_size: usize,
         eviction_arbiter_builder: EvictionArbiterBuilder,
-    ) -> Result<&'static Self> {
-        let pool =
-            Self::with_capacity_and_arbiter_builder(role, pool_size, eviction_arbiter_builder)?;
-        let pool = StaticLifetime::new_static(pool);
-        pool.start_evictor_thread();
+    ) -> Result<QuiescentBox<Self>> {
+        let pool = QuiescentBox::new(Self::with_capacity_and_arbiter_builder(
+            role,
+            pool_size,
+            eviction_arbiter_builder,
+        )?);
+        Self::start_evictor_thread_guarded(pool.guard());
         Ok(pool)
     }
 
@@ -388,21 +398,32 @@ impl GlobalReadonlyBufferPool {
     }
 
     #[inline]
-    fn start_evictor_thread(&'static self) {
+    pub(crate) fn start_evictor_thread_guarded(pool: QuiescentGuard<Self>) {
+        // Acquire one direct guard from the stable owner, convert it once to
+        // `SyncQuiescentGuard`, then clone that wrapper into the spawned
+        // thread/runtime. This keeps worker startup on the guard side without
+        // rebuilding a static-ownership compatibility layer.
+        let pool = pool.into_sync();
         let runtime = ReadonlyRuntime {
-            arena: self.arena.arena_guard(self.guard()),
-            mappings: Arc::clone(&self.mappings),
-            residency: Arc::clone(&self.residency),
+            arena: pool.arena.arena_guard(pool.guard()),
+            mappings: Arc::clone(&pool.mappings),
+            residency: Arc::clone(&pool.residency),
+            _pool: Some(pool.clone()),
         };
-        let policy = PressureDeltaClockPolicy::new(self.eviction_arbiter, 1);
-        let evictor = Evictor::new(runtime, policy, Arc::clone(&self.shutdown_flag));
+        let policy = PressureDeltaClockPolicy::new(pool.eviction_arbiter, 1);
+        let evictor = Evictor::new(runtime, policy, Arc::clone(&pool.shutdown_flag));
         let handle = evictor.start_thread("ReadonlyBufferPoolEvictor");
-        let mut g = self.evict_thread.lock();
+        let mut g = pool.evict_thread.lock();
         *g = Some(handle);
     }
 
+    /// Stops the eviction worker for a started standalone readonly pool.
+    ///
+    /// This method is idempotent and is required before dropping owners
+    /// created by [`Self::with_capacity_owned`] or
+    /// [`Self::with_capacity_and_arbiter_builder_owned`].
     #[inline]
-    pub(crate) fn shutdown(&self) {
+    pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
         self.residency.free_ev.notify(usize::MAX);
         self.residency.evict_ev.notify(1);
@@ -472,7 +493,7 @@ impl GlobalReadonlyBufferPool {
 
     #[inline]
     fn join_or_start_inflight_load(
-        &'static self,
+        &self,
         key: ReadonlyCacheKey,
         page_source: Arc<dyn ReadonlyPageSource>,
         validation: Option<InflightLoadValidation>,
@@ -503,7 +524,7 @@ impl GlobalReadonlyBufferPool {
 
     #[inline]
     async fn get_or_load_frame_id(
-        &'static self,
+        &self,
         key: ReadonlyCacheKey,
         page_source: Arc<dyn ReadonlyPageSource>,
     ) -> Result<PageID> {
@@ -519,7 +540,7 @@ impl GlobalReadonlyBufferPool {
 
     #[inline]
     async fn get_or_load_frame_id_validated(
-        &'static self,
+        &self,
         key: ReadonlyCacheKey,
         page_source: Arc<dyn ReadonlyPageSource>,
         file_kind: PersistedFileKind,
@@ -544,7 +565,7 @@ impl GlobalReadonlyBufferPool {
 
     #[inline]
     async fn get_page_internal<T: 'static>(
-        &'static self,
+        &self,
         guard: &PoolGuard,
         frame_id: PageID,
         mode: LatchFallbackMode,
@@ -593,7 +614,6 @@ impl Drop for GlobalReadonlyBufferPool {
 
 unsafe impl Send for GlobalReadonlyBufferPool {}
 unsafe impl Sync for GlobalReadonlyBufferPool {}
-unsafe impl StaticLifetime for GlobalReadonlyBufferPool {}
 
 #[derive(Clone, Copy)]
 struct InflightLoadValidation {
@@ -994,6 +1014,7 @@ struct ReadonlyRuntime {
     arena: ArenaGuard,
     mappings: Arc<DashMap<ReadonlyCacheKey, PageID>>,
     residency: Arc<ReadonlyResidency>,
+    _pool: Option<SyncQuiescentGuard<GlobalReadonlyBufferPool>>,
 }
 
 impl ReadonlyRuntime {
@@ -1093,7 +1114,7 @@ pub struct ReadonlyBufferPool {
     file_id: ReadonlyFileID,
     file_kind: PersistedFileKind,
     page_source: Arc<dyn ReadonlyPageSource>,
-    global: StaticHandle<GlobalReadonlyBufferPool>,
+    global: QuiescentGuard<GlobalReadonlyBufferPool>,
 }
 
 impl ReadonlyBufferPool {
@@ -1103,20 +1124,7 @@ impl ReadonlyBufferPool {
         file_id: ReadonlyFileID,
         file_kind: PersistedFileKind,
         page_source: Arc<S>,
-        global: &'static GlobalReadonlyBufferPool,
-    ) -> Self
-    where
-        S: ReadonlyPageSource + 'static,
-    {
-        Self::new_with_handle(file_id, file_kind, page_source, global)
-    }
-
-    #[inline]
-    pub(crate) fn new_with_handle<S>(
-        file_id: ReadonlyFileID,
-        file_kind: PersistedFileKind,
-        page_source: Arc<S>,
-        global: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+        global: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Self
     where
         S: ReadonlyPageSource + 'static,
@@ -1125,7 +1133,7 @@ impl ReadonlyBufferPool {
             file_id,
             file_kind,
             page_source,
-            global: global.into(),
+            global,
         }
     }
 
@@ -1148,7 +1156,7 @@ impl ReadonlyBufferPool {
         mode: LatchFallbackMode,
     ) -> Result<FacadePageGuard<T>> {
         let key = self.cache_key(page_id);
-        let global = self.global.as_static();
+        let global = &self.global;
         global.validate_guard(guard);
         loop {
             let frame_id = global
@@ -1174,7 +1182,7 @@ impl ReadonlyBufferPool {
         validator: ReadonlyPageValidator,
     ) -> Result<PageSharedGuard<Page>> {
         let key = self.cache_key(page_id);
-        let global = self.global.as_static();
+        let global = &self.global;
         loop {
             let frame_id = global
                 .get_or_load_frame_id_validated(
@@ -1230,20 +1238,17 @@ impl BufferPool for ReadonlyBufferPool {
 
     #[inline]
     fn guard(&self) -> PoolGuard {
-        self.global.as_static().guard()
+        self.global.guard()
     }
 
     #[inline]
-    async fn allocate_page<T: BufferPage>(
-        &'static self,
-        _guard: &PoolGuard,
-    ) -> PageExclusiveGuard<T> {
+    async fn allocate_page<T: BufferPage>(&self, _guard: &PoolGuard) -> PageExclusiveGuard<T> {
         panic!("readonly buffer pool does not support page allocation")
     }
 
     #[inline]
     async fn allocate_page_at<T: BufferPage>(
-        &'static self,
+        &self,
         _guard: &PoolGuard,
         _page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
@@ -1252,7 +1257,7 @@ impl BufferPool for ReadonlyBufferPool {
 
     #[inline]
     async fn get_page<T: BufferPage>(
-        &'static self,
+        &self,
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
@@ -1267,23 +1272,23 @@ impl BufferPool for ReadonlyBufferPool {
 
     #[inline]
     async fn try_get_page_versioned<T: BufferPage>(
-        &'static self,
+        &self,
         guard: &PoolGuard,
         _id: VersionedPageID,
         _mode: LatchFallbackMode,
     ) -> Option<FacadePageGuard<T>> {
-        self.global.as_static().validate_guard(guard);
+        self.global.validate_guard(guard);
         None
     }
 
     #[inline]
-    fn deallocate_page<T: BufferPage>(&'static self, _g: PageExclusiveGuard<T>) {
+    fn deallocate_page<T: BufferPage>(&self, _g: PageExclusiveGuard<T>) {
         panic!("readonly buffer pool does not support page deallocation")
     }
 
     #[inline]
     async fn get_child_page<T: BufferPage>(
-        &'static self,
+        &self,
         guard: &PoolGuard,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
@@ -1302,37 +1307,113 @@ impl BufferPool for ReadonlyBufferPool {
 
 unsafe impl Send for ReadonlyBufferPool {}
 unsafe impl Sync for ReadonlyBufferPool {}
-unsafe impl StaticLifetime for ReadonlyBufferPool {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::buffer::guard::{FacadePageGuard, PageGuard};
     use crate::buffer::page::Page;
+    use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::error::{PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::build_test_fs;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::page_integrity::{
         COLUMN_BLOCK_INDEX_PAGE_SPEC, COLUMN_DELETION_BLOB_PAGE_SPEC, LWC_PAGE_SPEC,
         max_payload_len, write_page_checksum, write_page_header,
     };
-    use crate::file::table_fs::TableFileSystemConfig;
+    use crate::file::table_file::TableFile;
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
         COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockNodeHeader, validate_persisted_blob_page,
         validate_persisted_column_block_index_page,
     };
     use crate::io::AIOBuf;
-    use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
     use crate::lwc::{LWC_PAGE_PAYLOAD_SIZE, LwcPage, LwcPageHeader, validate_persisted_lwc_page};
+    use crate::quiescent::QuiescentBox;
     use crate::value::ValKind;
+    use std::ops::Deref;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
-    use tempfile::TempDir;
 
     fn frame_page_bytes(cap: usize) -> usize {
         cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
+    }
+
+    fn owned_global_pool(pool_size: usize) -> QuiescentBox<GlobalReadonlyBufferPool> {
+        QuiescentBox::new(
+            GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, pool_size).unwrap(),
+        )
+    }
+
+    fn started_global_pool(pool_size: usize) -> QuiescentBox<GlobalReadonlyBufferPool> {
+        GlobalReadonlyBufferPool::with_capacity_owned(PoolRole::Disk, pool_size).unwrap()
+    }
+
+    /// Test-only owner wrapper for a started global readonly pool.
+    ///
+    /// Local started pools must shut down their evictor thread before owner
+    /// drop, otherwise `QuiescentBox` waits forever on the worker keepalive
+    /// guard. This scope centralizes that shutdown ordering for other test
+    /// modules that need a reusable readonly cache.
+    pub(crate) struct GlobalReadOnlyPoolScope {
+        owner: QuiescentBox<GlobalReadonlyBufferPool>,
+    }
+
+    impl Deref for GlobalReadOnlyPoolScope {
+        type Target = GlobalReadonlyBufferPool;
+
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            &self.owner
+        }
+    }
+
+    impl Drop for GlobalReadOnlyPoolScope {
+        #[inline]
+        fn drop(&mut self) {
+            self.owner.shutdown();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn global_readonly_pool_scope(pool_size: usize) -> GlobalReadOnlyPoolScope {
+        GlobalReadOnlyPoolScope {
+            owner: started_global_pool(pool_size),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn table_readonly_pool(
+        scope: &GlobalReadOnlyPoolScope,
+        table_id: TableID,
+        table_file: &Arc<TableFile>,
+    ) -> ReadonlyBufferPool {
+        ReadonlyBufferPool::new(
+            table_id,
+            PersistedFileKind::TableFile,
+            Arc::clone(table_file),
+            scope.owner.guard(),
+        )
+    }
+
+    fn owned_readonly_pool<S>(
+        file_id: ReadonlyFileID,
+        file_kind: PersistedFileKind,
+        page_source: Arc<S>,
+        global: &QuiescentBox<GlobalReadonlyBufferPool>,
+    ) -> QuiescentBox<ReadonlyBufferPool>
+    where
+        S: ReadonlyPageSource + 'static,
+    {
+        QuiescentBox::new(ReadonlyBufferPool::new(
+            file_id,
+            file_kind,
+            page_source,
+            global.guard(),
+        ))
     }
 
     #[test]
@@ -1534,13 +1615,8 @@ mod tests {
 
     #[test]
     fn test_global_readonly_mapping_and_invalidation() {
-        let scope = StaticLifetimeScope::new();
-        let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
-                .unwrap(),
-        );
-        let global = global.as_static();
-        let global_guard = global.guard();
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let global_guard = (*global).guard();
         let key = ReadonlyCacheKey::new(7, 11);
 
         assert_eq!(global.allocated(), 0);
@@ -1572,13 +1648,8 @@ mod tests {
 
     #[test]
     fn test_global_invalidate_file() {
-        let scope = StaticLifetimeScope::new();
-        let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
-                .unwrap(),
-        );
-        let global = global.as_static();
-        let global_guard = global.guard();
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let global_guard = (*global).guard();
         let k1 = ReadonlyCacheKey::new(1, 10);
         let k2 = ReadonlyCacheKey::new(1, 11);
         let k3 = ReadonlyCacheKey::new(2, 20);
@@ -1601,13 +1672,8 @@ mod tests {
 
     #[test]
     fn test_readonly_cache_file_ids_keep_catalog_and_user_pages_isolated() {
-        let scope = StaticLifetimeScope::new();
-        let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
-                .unwrap(),
-        );
-        let global = global.as_static();
-        let global_guard = global.guard();
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let global_guard = (*global).guard();
         let catalog_key = ReadonlyCacheKey::new(USER_OBJ_ID_START - 1, 42);
         let user_key = ReadonlyCacheKey::new(USER_OBJ_ID_START, 42);
 
@@ -1624,13 +1690,8 @@ mod tests {
 
     #[test]
     fn test_global_invalidate_key_strict() {
-        let scope = StaticLifetimeScope::new();
-        let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
-                .unwrap(),
-        );
-        let global = global.as_static();
-        let global_guard = global.guard();
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let global_guard = (*global).guard();
         let key = ReadonlyCacheKey::new(9, 77);
 
         let mut g = global.try_lock_page_exclusive(&global_guard, 5).unwrap();
@@ -1645,13 +1706,8 @@ mod tests {
     #[should_panic(expected = "strict invalidation lock acquisition failed")]
     fn test_global_invalidate_key_strict_panics_when_latch_held() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
-                    .unwrap(),
-            );
-            let global = global.as_static();
-            let global_guard = global.guard();
+            let global = owned_global_pool(64 * 1024 * 1024);
+            let global_guard = (*global).guard();
             let key = ReadonlyCacheKey::new(10, 99);
 
             let mut g = global.try_lock_page_exclusive(&global_guard, 6).unwrap();
@@ -1666,18 +1722,9 @@ mod tests {
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_global_readonly_pool_panics_on_foreign_guard() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let global1 = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
-                    .unwrap(),
-            );
-            let global2 = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
-                    .unwrap(),
-            );
-            let global1 = global1.as_static();
-            let global2 = global2.as_static();
-            let foreign_guard = global2.guard();
+            let global1 = owned_global_pool(64 * 1024 * 1024);
+            let global2 = owned_global_pool(64 * 1024 * 1024);
+            let foreign_guard = (*global2).guard();
             let _ = global1
                 .get_page_internal::<Page>(&foreign_guard, 0, LatchFallbackMode::Shared)
                 .await
@@ -1688,23 +1735,14 @@ mod tests {
     #[test]
     fn test_readonly_pool_reloads_when_mapping_points_to_uninitialized_frame() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(111, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
             write_payload(&table_file, 9, b"reload").await;
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
-                    .unwrap(),
-            );
-            let global = global.as_static();
-            let global_guard = global.guard();
+            let global = owned_global_pool(frame_page_bytes(2));
+            let global_guard = (*global).guard();
             let key = ReadonlyCacheKey::new(111, 9);
 
             let mut g0 = global.try_lock_page_exclusive(&global_guard, 0).unwrap();
@@ -1716,14 +1754,13 @@ mod tests {
             frame.set_kind(FrameKind::Uninitialized);
             drop(g0);
 
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let pool = owned_readonly_pool(
                 111,
                 PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
-                global,
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
             let page: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                 .await;
@@ -1741,29 +1778,20 @@ mod tests {
     #[test]
     fn test_readonly_pool_miss_load_and_hit() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(101, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
             write_payload(&table_file, 3, b"hello").await;
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(4))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(4));
+            let pool = owned_readonly_pool(
                 101,
                 PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
             let page: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 3, LatchFallbackMode::Shared)
                 .await;
@@ -1776,7 +1804,7 @@ mod tests {
                 .await;
             let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..5], b"hello");
-            assert_eq!(global.as_static().allocated(), 1);
+            assert_eq!(global.allocated(), 1);
             drop(page);
             drop(table_file);
             drop(fs);
@@ -1786,32 +1814,24 @@ mod tests {
     #[test]
     fn test_readonly_pool_dedup_concurrent_miss() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(102, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
             write_payload(&table_file, 5, b"world").await;
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(8))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(8));
+            let pool = owned_readonly_pool(
                 102,
                 PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
 
             let mut tasks = vec![];
             for _ in 0..16 {
+                let pool = (*pool).clone();
                 let pool_guard = pool_guard.clone();
                 tasks.push(smol::spawn(async move {
                     let g: FacadePageGuard<Page> = pool
@@ -1823,7 +1843,7 @@ mod tests {
             for task in tasks {
                 assert_eq!(task.await, b'w');
             }
-            assert_eq!(global.as_static().allocated(), 1);
+            assert_eq!(global.allocated(), 1);
             drop(table_file);
             drop(fs);
         });
@@ -1836,35 +1856,32 @@ mod tests {
             page[..5].copy_from_slice(b"hello");
             let page_source = Arc::new(ControlledPageSource::with_page(page));
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
                 112,
                 PersistedFileKind::TableFile,
                 Arc::clone(&page_source),
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
             let key = ReadonlyCacheKey::new(112, 5);
 
+            let pool_for_loader = (*pool).clone();
             let loader = smol::spawn(async move {
-                let _ = pool
+                let _ = pool_for_loader
                     .get_page_facade::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
                     .await
                     .unwrap();
             });
             page_source.wait_started(1).await;
-            assert!(global.as_static().inflight_loads.contains_key(&key));
+            assert!(global.inflight_loads.contains_key(&key));
 
             drop(loader);
 
-            let pool_guard = pool.guard();
+            let pool_guard = (*pool).guard();
+            let pool_for_waiter = (*pool).clone();
             let waiter = smol::spawn(async move {
-                let g = pool
+                let g = pool_for_waiter
                     .get_page_facade::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
                     .await
                     .unwrap();
@@ -1877,9 +1894,9 @@ mod tests {
 
             assert_eq!(waiter.await, b"hello");
             assert_eq!(page_source.call_count(), 1);
-            assert_eq!(global.as_static().allocated(), 1);
-            assert!(global.as_static().try_get_frame_id(&key).is_some());
-            assert!(!global.as_static().inflight_loads.contains_key(&key));
+            assert_eq!(global.allocated(), 1);
+            assert!(global.try_get_frame_id(&key).is_some());
+            assert!(!global.inflight_loads.contains_key(&key));
         });
     }
 
@@ -1890,42 +1907,37 @@ mod tests {
             page[..4].copy_from_slice(b"solo");
             let page_source = Arc::new(ControlledPageSource::with_page(page));
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
                 113,
                 PersistedFileKind::TableFile,
                 Arc::clone(&page_source),
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
             let key = ReadonlyCacheKey::new(113, 9);
 
+            let pool_for_loader = (*pool).clone();
             let loader = smol::spawn(async move {
-                let _ = pool
+                let _ = pool_for_loader
                     .get_page_facade::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                     .await
                     .unwrap();
             });
             page_source.wait_started(1).await;
-            assert!(global.as_static().inflight_loads.contains_key(&key));
+            assert!(global.inflight_loads.contains_key(&key));
 
             drop(loader);
             page_source.release();
 
-            let pool_guard = pool.guard();
+            let pool_guard = (*pool).guard();
             wait_for(|| {
-                !global.as_static().inflight_loads.contains_key(&key)
-                    && global.as_static().try_get_frame_id(&key).is_some()
+                !global.inflight_loads.contains_key(&key) && global.try_get_frame_id(&key).is_some()
             })
             .await;
 
             assert_eq!(page_source.call_count(), 1);
-            assert_eq!(global.as_static().allocated(), 1);
+            assert_eq!(global.allocated(), 1);
             let g = pool
                 .get_page_facade::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                 .await
@@ -1943,21 +1955,20 @@ mod tests {
             let page_source = Arc::new(ControlledPageSource::with_page(page));
             let key = ReadonlyCacheKey::new(116, 12);
 
-            let global =
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
-                    .unwrap();
-            let pool = StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
                 116,
                 PersistedFileKind::TableFile,
                 Arc::clone(&page_source),
-                global,
-            ));
-            let pool_guard = pool.guard();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
             let inflight_loads = Arc::clone(&global.inflight_loads);
             let mappings = Arc::clone(&global.mappings);
 
+            let pool_for_loader = (*pool).clone();
             let loader = smol::spawn(async move {
-                let _ = pool
+                let _ = pool_for_loader
                     .get_page_facade::<Page>(&pool_guard, 12, LatchFallbackMode::Shared)
                     .await
                     .unwrap();
@@ -1969,12 +1980,8 @@ mod tests {
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
             let teardown = thread::spawn(move || {
-                // SAFETY: this test stops using the leaked static refs after
-                // spawning teardown and only keeps cloned detached-load state.
-                unsafe {
-                    StaticLifetime::drop_static(pool);
-                    StaticLifetime::drop_static(global);
-                }
+                drop(pool);
+                drop(global);
                 dropped_flag.store(true, Ordering::SeqCst);
             });
 
@@ -1995,9 +2002,7 @@ mod tests {
         smol::block_on(async {
             let page_source = Arc::new(ControlledPageSource::with_page([0u8; PAGE_SIZE]));
             let key = ReadonlyCacheKey::new(117, 13);
-            let global =
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(1))
-                    .unwrap();
+            let global = owned_global_pool(frame_page_bytes(1));
             let inflight_loads = Arc::clone(&global.inflight_loads);
 
             {
@@ -2017,11 +2022,7 @@ mod tests {
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
             let teardown = thread::spawn(move || {
-                // SAFETY: this test stops using the leaked static ref after
-                // spawning teardown and only keeps cloned detached state.
-                unsafe {
-                    StaticLifetime::drop_static(global);
-                }
+                drop(global);
                 dropped_flag.store(true, Ordering::SeqCst);
             });
 
@@ -2038,29 +2039,28 @@ mod tests {
         smol::block_on(async {
             let page_source = Arc::new(ControlledPageSource::with_error(Error::IOError));
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
                 114,
                 PersistedFileKind::TableFile,
                 Arc::clone(&page_source),
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
             let key = ReadonlyCacheKey::new(114, 7);
 
             let pool_guard_1 = pool_guard.clone();
+            let pool_1 = (*pool).clone();
             let waiter1 = smol::spawn(async move {
-                pool.get_page_facade::<Page>(&pool_guard_1, 7, LatchFallbackMode::Shared)
+                pool_1
+                    .get_page_facade::<Page>(&pool_guard_1, 7, LatchFallbackMode::Shared)
                     .await
             });
             let pool_guard_2 = pool_guard.clone();
+            let pool_2 = (*pool).clone();
             let waiter2 = smol::spawn(async move {
-                pool.get_page_facade::<Page>(&pool_guard_2, 7, LatchFallbackMode::Shared)
+                pool_2
+                    .get_page_facade::<Page>(&pool_guard_2, 7, LatchFallbackMode::Shared)
                     .await
             });
 
@@ -2071,9 +2071,9 @@ mod tests {
             assert!(matches!(waiter1.await, Err(Error::IOError)));
             assert!(matches!(waiter2.await, Err(Error::IOError)));
             assert_eq!(page_source.call_count(), 1);
-            assert_eq!(global.as_static().allocated(), 0);
-            assert_eq!(global.as_static().try_get_frame_id(&key), None);
-            assert!(!global.as_static().inflight_loads.contains_key(&key));
+            assert_eq!(global.allocated(), 0);
+            assert_eq!(global.try_get_frame_id(&key), None);
+            assert!(!global.inflight_loads.contains_key(&key));
         });
     }
 
@@ -2085,27 +2085,26 @@ mod tests {
             page[last_idx] ^= 0xFF;
             let page_source = Arc::new(ControlledPageSource::with_page(page_from_bytes(&page)));
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
                 115,
                 PersistedFileKind::TableFile,
                 Arc::clone(&page_source),
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let _pool_guard = pool.guard();
+                &global,
+            );
+            let _pool_guard = (*pool).guard();
             let key = ReadonlyCacheKey::new(115, 8);
 
+            let pool_1 = (*pool).clone();
             let waiter1 = smol::spawn(async move {
-                pool.try_get_validated_page_shared(8, validate_persisted_lwc_page)
+                pool_1
+                    .try_get_validated_page_shared(8, validate_persisted_lwc_page)
                     .await
             });
+            let pool_2 = (*pool).clone();
             let waiter2 = smol::spawn(async move {
-                pool.try_get_validated_page_shared(8, validate_persisted_lwc_page)
+                pool_2
+                    .try_get_validated_page_shared(8, validate_persisted_lwc_page)
                     .await
             });
 
@@ -2140,20 +2139,16 @@ mod tests {
                 }
             ));
             assert_eq!(page_source.call_count(), 1);
-            assert_eq!(global.as_static().allocated(), 0);
-            assert_eq!(global.as_static().try_get_frame_id(&key), None);
-            assert!(!global.as_static().inflight_loads.contains_key(&key));
+            assert_eq!(global.allocated(), 0);
+            assert_eq!(global.try_get_frame_id(&key), None);
+            assert!(!global.inflight_loads.contains_key(&key));
         });
     }
 
     #[test]
     fn test_readonly_pool_validated_lwc_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(107, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2163,21 +2158,16 @@ mod tests {
             page[last_idx] ^= 0xFF;
             write_page_bytes(&table_file, 9, &page).await;
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(4))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(4));
+            let pool = owned_readonly_pool(
                 107,
                 PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
-                global.as_static(),
-            )));
+                &global,
+            );
             let key = ReadonlyCacheKey::new(107, 9);
 
             let err = match pool
-                .as_static()
                 .try_get_validated_page_shared(9, validate_persisted_lwc_page)
                 .await
             {
@@ -2193,19 +2183,15 @@ mod tests {
                     cause: PersistedPageCorruptionCause::ChecksumMismatch,
                 }
             ));
-            assert_eq!(global.as_static().try_get_frame_id(&key), None);
-            assert_eq!(global.as_static().allocated(), 0);
+            assert_eq!(global.try_get_frame_id(&key), None);
+            assert_eq!(global.allocated(), 0);
         });
     }
 
     #[test]
     fn test_readonly_pool_validated_column_index_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(108, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2215,21 +2201,16 @@ mod tests {
             page[last_idx] ^= 0xFF;
             write_page_bytes(&table_file, 10, &page).await;
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(4))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(4));
+            let pool = owned_readonly_pool(
                 108,
                 PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
-                global.as_static(),
-            )));
+                &global,
+            );
             let key = ReadonlyCacheKey::new(108, 10);
 
             let err = match pool
-                .as_static()
                 .try_get_validated_page_shared(10, validate_persisted_column_block_index_page)
                 .await
             {
@@ -2245,19 +2226,15 @@ mod tests {
                     cause: PersistedPageCorruptionCause::ChecksumMismatch,
                 }
             ));
-            assert_eq!(global.as_static().try_get_frame_id(&key), None);
-            assert_eq!(global.as_static().allocated(), 0);
+            assert_eq!(global.try_get_frame_id(&key), None);
+            assert_eq!(global.allocated(), 0);
         });
     }
 
     #[test]
     fn test_readonly_pool_validated_blob_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(109, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
@@ -2267,21 +2244,16 @@ mod tests {
             page[last_idx] ^= 0xFF;
             write_page_bytes(&table_file, 11, &page).await;
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(4))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = owned_global_pool(frame_page_bytes(4));
+            let pool = owned_readonly_pool(
                 109,
                 PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
-                global.as_static(),
-            )));
+                &global,
+            );
             let key = ReadonlyCacheKey::new(109, 11);
 
             let err = match pool
-                .as_static()
                 .try_get_validated_page_shared(11, validate_persisted_blob_page)
                 .await
             {
@@ -2297,37 +2269,28 @@ mod tests {
                     cause: PersistedPageCorruptionCause::ChecksumMismatch,
                 }
             ));
-            assert_eq!(global.as_static().try_get_frame_id(&key), None);
-            assert_eq!(global.as_static().allocated(), 0);
+            assert_eq!(global.try_get_frame_id(&key), None);
+            assert_eq!(global.allocated(), 0);
         });
     }
 
     #[test]
     fn test_readonly_pool_drop_only_eviction_and_reload() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(103, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(1))
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let global = started_global_pool(frame_page_bytes(1));
+            let pool = owned_readonly_pool(
                 103,
                 PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
-            let capacity = global.as_static().capacity();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
+            let capacity = global.capacity();
             let base_page_id = 7u64;
 
             // Prepare one more block than cache capacity to force drop-only eviction.
@@ -2352,7 +2315,7 @@ mod tests {
             let mapped_count = (0..=capacity)
                 .filter(|i| {
                     let key = ReadonlyCacheKey::new(103, base_page_id + *i as u64);
-                    global.as_static().try_get_frame_id(&key).is_some()
+                    global.try_get_frame_id(&key).is_some()
                 })
                 .count();
             assert!(mapped_count < loaded_count);
@@ -2364,6 +2327,10 @@ mod tests {
             let g = g.lock_shared_async().await.unwrap();
             assert_eq!(&g.page()[..6], b"page-0");
             drop(g);
+            drop(pool_guard);
+            drop(pool);
+            global.shutdown();
+            drop(global);
             drop(table_file);
             drop(fs);
         });
@@ -2372,33 +2339,20 @@ mod tests {
     #[test]
     fn test_readonly_pool_lifecycle_drop_order_with_table_fs() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = StaticLifetime::new_static(
-                TableFileSystemConfig::default()
-                    .data_dir(temp_dir.path())
-                    .build()
-                    .unwrap(),
-            );
+            let global = owned_global_pool(frame_page_bytes(2));
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(105, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
             write_payload(&table_file, 9, b"drop-order").await;
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, frame_page_bytes(2))
-                    .unwrap(),
-            );
-            // Adopt filesystem after global, so scope teardown stops file IO thread first.
-            let _fs = scope.adopt(fs);
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+            let pool = owned_readonly_pool(
                 105,
                 PersistedFileKind::TableFile,
                 Arc::clone(&table_file),
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+                &global,
+            );
+            let pool_guard = (*pool).guard();
 
             let g: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
@@ -2414,37 +2368,22 @@ mod tests {
     #[should_panic(expected = "readonly buffer pool does not support page allocation")]
     fn test_readonly_pool_allocate_page_panics() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(104, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let scope = StaticLifetimeScope::new();
-            let global = scope.adopt(
-                GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, 64 * 1024 * 1024)
-                    .unwrap(),
-            );
-            let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
-                104,
-                PersistedFileKind::TableFile,
-                table_file,
-                global.as_static(),
-            )));
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
+            let global = owned_global_pool(64 * 1024 * 1024);
+            let pool = owned_readonly_pool(104, PersistedFileKind::TableFile, table_file, &global);
+            let pool_guard = (*pool).guard();
             let _ = pool.allocate_page::<Page>(&pool_guard).await;
         });
     }
 
     #[test]
     fn test_global_readonly_pool_uses_custom_arbiter_builder() {
-        let scope = StaticLifetimeScope::new();
-        let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_and_arbiter_builder_static(
+        let global = QuiescentBox::new(
+            GlobalReadonlyBufferPool::with_capacity_and_arbiter_builder(
                 PoolRole::Disk,
                 frame_page_bytes(16),
                 EvictionArbiterBuilder::new()
@@ -2456,7 +2395,6 @@ mod tests {
             )
             .unwrap(),
         );
-        let global = global.as_static();
         let arbiter = global.eviction_arbiter;
 
         assert_eq!(arbiter.target_free(), 4);

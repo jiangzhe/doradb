@@ -7,7 +7,6 @@ use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
 use crate::io::{AIOClient, AIOContext};
-use crate::lifetime::StaticLifetime;
 use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -132,8 +131,6 @@ impl Drop for TableFileSystem {
     }
 }
 
-unsafe impl StaticLifetime for TableFileSystem {}
-
 const DEFAULT_TABLE_FILE_IO_DEPTH: usize = 64;
 const DEFAULT_TABLE_FILE_DATA_DIR: &str = ".";
 const DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -234,7 +231,7 @@ impl Default for TableFileSystemConfig {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
@@ -244,13 +241,24 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    #[inline]
+    pub(crate) fn build_test_fs() -> (TempDir, TableFileSystem) {
+        let temp_dir = TempDir::new().unwrap();
+        let fs = build_test_fs_in(temp_dir.path());
+        (temp_dir, fs)
+    }
+
+    #[inline]
+    pub(crate) fn build_test_fs_in(data_dir: &Path) -> TableFileSystem {
+        TableFileSystemConfig::default()
+            .data_dir(data_dir)
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn test_table_file_system_shutdown_is_idempotent() {
-        let temp_dir = TempDir::new().unwrap();
-        let fs = TableFileSystemConfig::default()
-            .data_dir(temp_dir.path())
-            .build()
-            .unwrap();
+        let (_temp_dir, fs) = build_test_fs();
 
         fs.shutdown();
         fs.shutdown();
@@ -259,11 +267,7 @@ mod tests {
     #[test]
     fn test_user_table_file_uses_hex_name() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let (_temp_dir, fs) = build_test_fs();
 
             let metadata = Arc::new(TableMetadata::new(
                 vec![ColumnSpec::new(
@@ -297,11 +301,7 @@ mod tests {
 
     #[test]
     fn test_catalog_file_name_default_and_custom_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let fs = TableFileSystemConfig::default()
-            .data_dir(temp_dir.path())
-            .build()
-            .unwrap();
+        let (temp_dir, fs) = build_test_fs();
         assert!(fs.catalog_mtb_file_path().ends_with("catalog.mtb"));
         drop(fs);
 

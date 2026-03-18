@@ -1,6 +1,7 @@
 use crate::buffer::{FixedBufferPool, PoolGuard};
 use crate::catalog::{TableID, TableMetadata};
 use crate::index::{BlockIndex, RowLocation};
+use crate::quiescent::QuiescentGuard;
 use crate::table::{GenericMemTable, MemTableAccessor};
 use crate::trx::MIN_SNAPSHOT_TS;
 use std::ops::Deref;
@@ -15,15 +16,15 @@ impl CatalogTable {
     /// Build a catalog table runtime from catalog-specific construction inputs.
     #[inline]
     pub async fn new(
-        mem_pool: &'static FixedBufferPool,
-        index_pool: &'static FixedBufferPool,
+        mem_pool: QuiescentGuard<FixedBufferPool>,
+        index_pool: QuiescentGuard<FixedBufferPool>,
         index_pool_guard: &PoolGuard,
         table_id: TableID,
         blk_idx: BlockIndex,
         metadata: Arc<TableMetadata>,
     ) -> Self {
         let mem = GenericMemTable::new(
-            mem_pool,
+            mem_pool.clone(),
             mem_pool.row_pool_role(),
             index_pool,
             index_pool_guard,

@@ -101,6 +101,10 @@ impl RawRwLock {
         // Waiting for writer to quit.
         loop {
             listener!(self.no_writer => no_writer);
+            // `no_writer` must only be notified after the releasing writer has
+            // both cleared `WRITER_BIT` and unlocked `mu`. Otherwise this
+            // retry can observe the old mutex state, fail `try_lock()`, and go
+            // back to sleep after consuming the only wakeup.
             if self.mu.try_lock() {
                 let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
                 if new_state & !WRITER_BIT == 0 {
@@ -130,10 +134,14 @@ impl Drop for WriteGuardRollback<'_> {
         unsafe {
             // rollback writer bit.
             self.0.state.fetch_and(!WRITER_BIT, Ordering::SeqCst);
-            // notify other writer
-            self.0.no_writer.notify(1);
-            // release mutex
+            // Release `mu` before notifying `no_writer`.
+            //
+            // Waiters retry `mu.try_lock()` immediately after a wake. If we
+            // notify first, one waiter can consume the event, still observe
+            // the mutex as locked, and then sleep forever waiting for another
+            // writer release that never comes.
             self.0.mu.unlock();
+            self.0.no_writer.notify(1);
         }
     }
 }
@@ -170,6 +178,10 @@ unsafe impl RawRwLockApi for RawRwLock {
         if !self.mu.try_lock() {
             return false;
         }
+        // `try_lock_exclusive()` must leave `mu` unlocked on every false
+        // return. Callers pair failed try-locks with a wait on `no_writer`,
+        // so they rely on the unlock side to notify only after the mutex is
+        // actually available again.
         if self
             .state
             .compare_exchange(0, WRITER_BIT, Ordering::AcqRel, Ordering::Acquire)
@@ -215,10 +227,14 @@ unsafe impl RawRwLockApi for RawRwLock {
     #[inline]
     unsafe fn unlock_exclusive(&self) {
         self.state.fetch_and(!WRITER_BIT, Ordering::SeqCst);
-        self.no_writer.notify(1);
         unsafe {
+            // Publish the writer-free state before waking waiters, then unlock
+            // `mu` before notifying. This guarantees the waiter-side
+            // `mu.try_lock()` retry cannot consume a wakeup while the mutex is
+            // still locked by the releasing writer.
             self.mu.unlock();
         }
+        self.no_writer.notify(1);
     }
 
     #[inline]
@@ -330,6 +346,52 @@ mod tests {
         }
         println!("val={:?}", counter.val());
         assert!(counter.val() == 100);
+    }
+
+    #[test]
+    fn test_raw_rwlock_async_waiting_writers_progress_after_single_unlock() {
+        const ITERS: usize = 128;
+        smol::block_on(async {
+            for _ in 0..ITERS {
+                let rw = Arc::new(RawRwLock::new());
+                rw.lock_exclusive();
+                let waiter1 = {
+                    let rw = Arc::clone(&rw);
+                    async move {
+                        rw.lock_exclusive_async().await;
+                        unsafe {
+                            rw.unlock_exclusive();
+                        }
+                    }
+                };
+                let waiter2 = {
+                    let rw = Arc::clone(&rw);
+                    async move {
+                        rw.lock_exclusive_async().await;
+                        unsafe {
+                            rw.unlock_exclusive();
+                        }
+                    }
+                };
+                let release = {
+                    let rw = Arc::clone(&rw);
+                    async move {
+                        smol::Timer::after(Duration::from_millis(1)).await;
+                        unsafe {
+                            rw.unlock_exclusive();
+                        }
+                    }
+                };
+                let all = async {
+                    futures::future::join3(waiter1, waiter2, release).await;
+                };
+                smol::future::or(all, async {
+                    smol::Timer::after(Duration::from_secs(1)).await;
+                    panic!("waiting writers failed to make progress after writer unlock");
+                })
+                .await;
+            }
+        });
     }
 
     #[test]

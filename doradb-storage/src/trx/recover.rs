@@ -21,10 +21,10 @@ use crate::buffer::{
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
 };
-use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
+use crate::quiescent::QuiescentGuard;
 use crate::row::{RowID, RowPage};
 use crate::table::{Table, TableAccess, TableRecover};
 use crate::trx::log::{LogPartition, LogPartitionInitializer};
@@ -118,13 +118,13 @@ mod basic_tests {
 }
 
 pub(super) async fn log_recover(
+    meta_pool: &FixedBufferPool,
     deps: RecoveryDeps,
     catalog: &mut Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
 ) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>)> {
     let RecoveryDeps {
-        meta_pool,
         index_pool,
         mem_pool,
         table_fs,
@@ -168,19 +168,18 @@ pub(super) async fn log_recover(
 }
 
 pub(super) struct RecoveryDeps {
-    pub(super) meta_pool: &'static FixedBufferPool,
-    pub(super) index_pool: &'static FixedBufferPool,
-    pub(super) mem_pool: &'static EvictableBufferPool,
-    pub(super) table_fs: &'static TableFileSystem,
-    pub(super) global_disk_pool: StaticHandle<GlobalReadonlyBufferPool>,
+    pub(super) index_pool: QuiescentGuard<FixedBufferPool>,
+    pub(super) mem_pool: QuiescentGuard<EvictableBufferPool>,
+    pub(super) table_fs: QuiescentGuard<TableFileSystem>,
+    pub(super) global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
 }
 
 /// Redo-log recovery coordinator for catalog metadata and user tables.
 pub struct LogRecovery<'a> {
-    index_pool: &'static FixedBufferPool,
-    mem_pool: &'static EvictableBufferPool,
-    table_fs: &'static TableFileSystem,
-    global_disk_pool: StaticHandle<GlobalReadonlyBufferPool>,
+    index_pool: QuiescentGuard<FixedBufferPool>,
+    mem_pool: QuiescentGuard<EvictableBufferPool>,
+    table_fs: QuiescentGuard<TableFileSystem>,
+    global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     catalog: &'a mut Catalog,
     log_merger: LogMerger,
     catalog_replay_start_ts: TrxID,
@@ -199,11 +198,11 @@ struct RecoveryTableState {
 impl<'a> LogRecovery<'a> {
     #[inline]
     fn new(
-        meta_pool: &'static FixedBufferPool,
-        index_pool: &'static FixedBufferPool,
-        mem_pool: &'static EvictableBufferPool,
-        table_fs: &'static TableFileSystem,
-        global_disk_pool: StaticHandle<GlobalReadonlyBufferPool>,
+        meta_pool: &FixedBufferPool,
+        index_pool: QuiescentGuard<FixedBufferPool>,
+        mem_pool: QuiescentGuard<EvictableBufferPool>,
+        table_fs: QuiescentGuard<TableFileSystem>,
+        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         catalog: &'a mut Catalog,
         log_merger: LogMerger,
     ) -> Self {
@@ -259,9 +258,9 @@ impl<'a> LogRecovery<'a> {
             }
             self.catalog
                 .reload_create_table(
-                    self.mem_pool,
-                    self.index_pool,
-                    self.table_fs,
+                    self.mem_pool.clone(),
+                    self.index_pool.clone(),
+                    &self.table_fs,
                     self.global_disk_pool.clone(),
                     &self.pool_guards,
                     table.table_id,
@@ -403,9 +402,9 @@ impl<'a> LogRecovery<'a> {
                 self.replay_catalog_modifications(dml).await?;
                 self.catalog
                     .reload_create_table(
-                        self.mem_pool,
-                        self.index_pool,
-                        self.table_fs,
+                        self.mem_pool.clone(),
+                        self.index_pool.clone(),
+                        &self.table_fs,
                         self.global_disk_pool.clone(),
                         &self.pool_guards,
                         *table_id,
@@ -631,8 +630,8 @@ mod tests {
     };
     use crate::engine::EngineConfig;
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::build_test_fs_in;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::file::table_fs::TableFileSystemConfig;
     use crate::index::ColumnBlockIndex;
     use crate::row::RowRead;
     use crate::row::ops::{SelectKey, UpdateCol};
@@ -935,7 +934,7 @@ mod tests {
                 .unwrap();
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1006,7 +1005,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let catalog_replay_start_ts = engine
@@ -1114,7 +1113,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let catalog_replay_start_ts = engine
@@ -1259,7 +1258,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let baseline_catalog_replay_start_ts = engine
@@ -1321,7 +1320,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let final_catalog_replay_start_ts = engine
@@ -1450,7 +1449,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
 
@@ -1490,10 +1489,7 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let fs = TableFileSystemConfig::default()
-                .data_dir(temp_dir.path())
-                .build()
-                .unwrap();
+            let fs = build_test_fs_in(temp_dir.path());
             corrupt_page_checksum(fs.table_file_path(table_id), entry.payload.block_id);
 
             let err = match EngineConfig::default()
