@@ -1599,7 +1599,7 @@ mod tests {
     fn test_btree_node_insert() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1627,7 +1627,7 @@ mod tests {
     fn test_btree_node_delete() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1674,7 +1674,7 @@ mod tests {
     fn test_btree_node_mark_as_deleted() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1725,7 +1725,7 @@ mod tests {
     fn test_btree_node_update() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1780,7 +1780,7 @@ mod tests {
     fn test_btree_node_compact_non_empty() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
 
             {
                 // Create source leaf node with data
@@ -1825,7 +1825,7 @@ mod tests {
     fn test_btree_node_compact_empty() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
 
             {
                 // Create empty source node
@@ -1868,7 +1868,7 @@ mod tests {
     fn test_btree_node_space_estimation() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
 
             {
                 let mut page1_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1934,7 +1934,7 @@ mod tests {
     fn test_btree_node_update_key() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -2020,7 +2020,7 @@ mod tests {
     fn test_btree_node_enable_hints_seq() {
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
@@ -2051,7 +2051,7 @@ mod tests {
         const COUNT: usize = 100;
         smol::block_on(async {
             let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
             {
                 let mut rng = ChaCha8Rng::seed_from_u64(0u64);
                 let uniform = Uniform::new(0u64, 1u64 << 63).unwrap();

@@ -1,5 +1,7 @@
 use crate::catalog::{Catalog, TableCache, TableID, is_catalog_obj_id, is_user_obj_id};
+use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool};
 use crate::error::Result;
+use crate::file::table_fs::TableFileSystem;
 use crate::io::AIOContext;
 use crate::quiescent::QuiescentGuard;
 use crate::session::SessionState;
@@ -579,6 +581,48 @@ pub struct TrxSysStartContext {
     pub purge_rx: Receiver<Purge>,
     // Receiver side of GC requests, used by purge thread.
     pub gc_chans: Vec<Receiver<GC>>,
+}
+
+impl Component for TransactionSystem {
+    type Config = TrxSysConfig;
+    type Owned = Self;
+    type Access = QuiescentGuard<Self>;
+
+    const NAME: &'static str = "trx_sys";
+
+    #[inline]
+    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+        let meta_pool = registry.dependency::<MetaPool>()?;
+        let index_pool = registry.dependency::<IndexPool>()?;
+        let mem_pool = registry.dependency::<MemPool>()?;
+        let table_fs = registry.dependency::<TableFileSystem>()?;
+        let disk_pool = registry.dependency::<crate::DiskPool>()?;
+
+        let pending = config
+            .prepare(
+                meta_pool.clone_inner(),
+                index_pool.clone_inner(),
+                mem_pool.clone_inner(),
+                table_fs,
+                disk_pool.clone_inner(),
+            )
+            .await?;
+        let (trx_sys, startup) = pending.into_parts();
+        registry.register::<Self>(trx_sys)?;
+        let trx_sys = registry.dependency::<Self>()?;
+        startup.start(trx_sys).await;
+        Ok(())
+    }
+
+    #[inline]
+    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+        owner.guard()
+    }
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.shutdown();
+    }
 }
 
 #[cfg(test)]

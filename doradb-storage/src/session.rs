@@ -209,7 +209,7 @@ impl Session {
         let meta_pool_guard = self.pool_guards().meta_guard();
         let index_pool_guard = self.pool_guards().index_guard();
         let blk_idx = BlockIndex::new(
-            engine.meta_pool.clone(),
+            engine.meta_pool.clone_inner(),
             meta_pool_guard,
             table_file.active_root().pivot_row_id,
             table_file.active_root().column_block_index_root,
@@ -217,10 +217,10 @@ impl Session {
         .await;
         let table = Arc::new(
             Table::new(
-                engine.mem_pool.clone(),
-                engine.index_pool.clone(),
+                engine.mem_pool.clone_inner(),
+                engine.index_pool.clone_inner(),
                 index_pool_guard,
-                engine.disk_pool.clone(),
+                engine.disk_pool.clone_inner(),
                 table_id,
                 blk_idx,
                 table_file,
@@ -248,10 +248,10 @@ impl SessionState {
     #[inline]
     pub fn new(engine_ref: EngineRef) -> Self {
         let pool_guards = PoolGuards::builder()
-            .push(PoolRole::Meta, engine_ref.meta_pool.guard())
-            .push(PoolRole::Index, engine_ref.index_pool.guard())
-            .push(PoolRole::Mem, engine_ref.mem_pool.guard())
-            .push(PoolRole::Disk, engine_ref.disk_pool.guard())
+            .push(PoolRole::Meta, engine_ref.meta_pool.pool_guard())
+            .push(PoolRole::Index, engine_ref.index_pool.pool_guard())
+            .push(PoolRole::Mem, engine_ref.mem_pool.pool_guard())
+            .push(PoolRole::Disk, engine_ref.disk_pool.pool_guard())
             .build();
         SessionState {
             engine_ref,

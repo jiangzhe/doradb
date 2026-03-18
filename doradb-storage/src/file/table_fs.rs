@@ -1,5 +1,6 @@
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
+use crate::component::{Component, ComponentRegistry};
 use crate::error::{Error, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::MultiTableFile;
@@ -10,7 +11,7 @@ use crate::io::{AIOClient, AIOContext};
 use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component as PathComponent, Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -131,6 +132,29 @@ impl Drop for TableFileSystem {
     }
 }
 
+impl Component for TableFileSystem {
+    type Config = TableFileSystemConfig;
+    type Owned = Self;
+    type Access = crate::quiescent::QuiescentGuard<Self>;
+
+    const NAME: &'static str = "table_fs";
+
+    #[inline]
+    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+        registry.register::<Self>(config.build()?)
+    }
+
+    #[inline]
+    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+        owner.guard()
+    }
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.shutdown();
+    }
+}
+
 const DEFAULT_TABLE_FILE_IO_DEPTH: usize = 64;
 const DEFAULT_TABLE_FILE_DATA_DIR: &str = ".";
 const DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -201,7 +225,7 @@ fn validate_data_dir(data_dir: &Path) -> Result<PathBuf> {
     path_to_utf8(data_dir, "data_dir")?;
     if data_dir
         .components()
-        .any(|component| matches!(component, Component::ParentDir))
+        .any(|component| matches!(component, PathComponent::ParentDir))
     {
         return Err(Error::InvalidStoragePath(format!(
             "data_dir must not contain parent traversal: {}",

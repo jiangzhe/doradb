@@ -45,16 +45,16 @@ fn main() {
                     IndexAttributes::PK,
                 )],
             ));
-            let meta_guard = engine.meta_pool.guard();
+            let meta_guard = engine.meta_pool.pool_guard();
             let blk_idx =
-                Arc::new(RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await);
-            let mem_guard = engine.mem_pool.guard();
+                Arc::new(RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await);
+            let mem_guard = engine.mem_pool.pool_guard();
 
             for _ in 0..args.pages {
                 let _ = blk_idx
                     .get_insert_page(
                         &meta_guard,
-                        &engine.mem_pool,
+                        &*engine.mem_pool,
                         &mem_guard,
                         &metadata,
                         args.rows_per_page,

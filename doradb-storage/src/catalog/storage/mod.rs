@@ -46,8 +46,8 @@ impl CatalogStorage {
         table_fs: &TableFileSystem,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<Self> {
-        let meta_pool_guard = meta_pool.guard();
-        let index_pool_guard = index_pool.guard();
+        let meta_pool_guard = meta_pool.pool_guard();
+        let index_pool_guard = index_pool.pool_guard();
         let mtb = table_fs.open_or_create_multi_table_file().await?;
         let mtb_snapshot = mtb.load_snapshot()?;
         let disk_pool = ReadonlyBufferPool::new(

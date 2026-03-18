@@ -116,8 +116,7 @@ impl GlobalReadonlyBufferPool {
     ///
     /// This constructor intentionally does not start the eviction worker.
     /// Callers must first place the pool into a stable owner such as
-    /// [`QuiescentBox`] or [`crate::quiescent::QuiDAG`] before starting guarded
-    /// worker threads.
+    /// [`QuiescentBox`] before starting guarded worker threads.
     #[inline]
     pub fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
         Self::with_capacity_and_arbiter_builder(role, pool_size, EvictionArbiter::builder())
@@ -194,7 +193,7 @@ impl GlobalReadonlyBufferPool {
     }
 
     #[inline]
-    pub fn guard(&self) -> PoolGuard {
+    pub fn pool_guard(&self) -> PoolGuard {
         debug_assert!(!matches!(self.role, PoolRole::Invalid));
         self.arena.guard()
     }
@@ -405,7 +404,7 @@ impl GlobalReadonlyBufferPool {
         // rebuilding a static-ownership compatibility layer.
         let pool = pool.into_sync();
         let runtime = ReadonlyRuntime {
-            arena: pool.arena.arena_guard(pool.guard()),
+            arena: pool.arena.arena_guard(pool.pool_guard()),
             mappings: Arc::clone(&pool.mappings),
             residency: Arc::clone(&pool.residency),
             _pool: Some(pool.clone()),
@@ -466,7 +465,7 @@ impl GlobalReadonlyBufferPool {
     #[inline]
     fn invalidate_frame_retry(&self, frame_id: PageID, expected_key: Option<ReadonlyCacheKey>) {
         loop {
-            let guard = self.guard();
+            let guard = self.pool_guard();
             if let Some(page_guard) = self.try_lock_page_exclusive(&guard, frame_id) {
                 self.invalidate_frame_with_guard(page_guard, expected_key);
                 let _ = self.residency.move_resident_to_free(frame_id);
@@ -478,7 +477,7 @@ impl GlobalReadonlyBufferPool {
 
     #[inline]
     fn invalidate_frame_strict(&self, frame_id: PageID, expected_key: Option<ReadonlyCacheKey>) {
-        let guard = self.guard();
+        let guard = self.pool_guard();
         let page_guard = self
             .try_lock_page_exclusive(&guard, frame_id)
             .unwrap_or_else(|| {
@@ -504,7 +503,7 @@ impl GlobalReadonlyBufferPool {
                 vac.insert(Arc::clone(&inflight));
                 let task_state = self.load_task_state();
                 let task_inflight = Arc::clone(&inflight);
-                let task_arena = self.arena.arena_guard(self.guard());
+                let task_arena = self.arena.arena_guard(self.pool_guard());
                 smol::spawn(async move {
                     let mut completion =
                         InflightLoadCompletion::new(task_state.clone(), key, task_inflight);
@@ -1192,7 +1191,7 @@ impl ReadonlyBufferPool {
                     validator,
                 )
                 .await?;
-            let guard = global.guard();
+            let guard = global.pool_guard();
             let guard = global
                 .get_page_internal::<Page>(&guard, frame_id, LatchFallbackMode::Shared)
                 .await?;
@@ -1237,8 +1236,8 @@ impl BufferPool for ReadonlyBufferPool {
     }
 
     #[inline]
-    fn guard(&self) -> PoolGuard {
-        self.global.guard()
+    fn pool_guard(&self) -> PoolGuard {
+        self.global.pool_guard()
     }
 
     #[inline]
@@ -1616,7 +1615,7 @@ pub(crate) mod tests {
     #[test]
     fn test_global_readonly_mapping_and_invalidation() {
         let global = owned_global_pool(64 * 1024 * 1024);
-        let global_guard = (*global).guard();
+        let global_guard = (*global).pool_guard();
         let key = ReadonlyCacheKey::new(7, 11);
 
         assert_eq!(global.allocated(), 0);
@@ -1649,7 +1648,7 @@ pub(crate) mod tests {
     #[test]
     fn test_global_invalidate_file() {
         let global = owned_global_pool(64 * 1024 * 1024);
-        let global_guard = (*global).guard();
+        let global_guard = (*global).pool_guard();
         let k1 = ReadonlyCacheKey::new(1, 10);
         let k2 = ReadonlyCacheKey::new(1, 11);
         let k3 = ReadonlyCacheKey::new(2, 20);
@@ -1673,7 +1672,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_cache_file_ids_keep_catalog_and_user_pages_isolated() {
         let global = owned_global_pool(64 * 1024 * 1024);
-        let global_guard = (*global).guard();
+        let global_guard = (*global).pool_guard();
         let catalog_key = ReadonlyCacheKey::new(USER_OBJ_ID_START - 1, 42);
         let user_key = ReadonlyCacheKey::new(USER_OBJ_ID_START, 42);
 
@@ -1691,7 +1690,7 @@ pub(crate) mod tests {
     #[test]
     fn test_global_invalidate_key_strict() {
         let global = owned_global_pool(64 * 1024 * 1024);
-        let global_guard = (*global).guard();
+        let global_guard = (*global).pool_guard();
         let key = ReadonlyCacheKey::new(9, 77);
 
         let mut g = global.try_lock_page_exclusive(&global_guard, 5).unwrap();
@@ -1707,7 +1706,7 @@ pub(crate) mod tests {
     fn test_global_invalidate_key_strict_panics_when_latch_held() {
         smol::block_on(async {
             let global = owned_global_pool(64 * 1024 * 1024);
-            let global_guard = (*global).guard();
+            let global_guard = (*global).pool_guard();
             let key = ReadonlyCacheKey::new(10, 99);
 
             let mut g = global.try_lock_page_exclusive(&global_guard, 6).unwrap();
@@ -1724,7 +1723,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let global1 = owned_global_pool(64 * 1024 * 1024);
             let global2 = owned_global_pool(64 * 1024 * 1024);
-            let foreign_guard = (*global2).guard();
+            let foreign_guard = (*global2).pool_guard();
             let _ = global1
                 .get_page_internal::<Page>(&foreign_guard, 0, LatchFallbackMode::Shared)
                 .await
@@ -1742,7 +1741,7 @@ pub(crate) mod tests {
             write_payload(&table_file, 9, b"reload").await;
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let global_guard = (*global).guard();
+            let global_guard = (*global).pool_guard();
             let key = ReadonlyCacheKey::new(111, 9);
 
             let mut g0 = global.try_lock_page_exclusive(&global_guard, 0).unwrap();
@@ -1760,7 +1759,7 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let page: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                 .await;
@@ -1791,7 +1790,7 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let page: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 3, LatchFallbackMode::Shared)
                 .await;
@@ -1827,7 +1826,7 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
 
             let mut tasks = vec![];
             for _ in 0..16 {
@@ -1863,7 +1862,7 @@ pub(crate) mod tests {
                 Arc::clone(&page_source),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let key = ReadonlyCacheKey::new(112, 5);
 
             let pool_for_loader = (*pool).clone();
@@ -1878,7 +1877,7 @@ pub(crate) mod tests {
 
             drop(loader);
 
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let pool_for_waiter = (*pool).clone();
             let waiter = smol::spawn(async move {
                 let g = pool_for_waiter
@@ -1914,7 +1913,7 @@ pub(crate) mod tests {
                 Arc::clone(&page_source),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let key = ReadonlyCacheKey::new(113, 9);
 
             let pool_for_loader = (*pool).clone();
@@ -1930,7 +1929,7 @@ pub(crate) mod tests {
             drop(loader);
             page_source.release();
 
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             wait_for(|| {
                 !global.inflight_loads.contains_key(&key) && global.try_get_frame_id(&key).is_some()
             })
@@ -1962,7 +1961,7 @@ pub(crate) mod tests {
                 Arc::clone(&page_source),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let inflight_loads = Arc::clone(&global.inflight_loads);
             let mappings = Arc::clone(&global.mappings);
 
@@ -2046,7 +2045,7 @@ pub(crate) mod tests {
                 Arc::clone(&page_source),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let key = ReadonlyCacheKey::new(114, 7);
 
             let pool_guard_1 = pool_guard.clone();
@@ -2092,7 +2091,7 @@ pub(crate) mod tests {
                 Arc::clone(&page_source),
                 &global,
             );
-            let _pool_guard = (*pool).guard();
+            let _pool_guard = (*pool).pool_guard();
             let key = ReadonlyCacheKey::new(115, 8);
 
             let pool_1 = (*pool).clone();
@@ -2289,7 +2288,7 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let capacity = global.capacity();
             let base_page_id = 7u64;
 
@@ -2352,7 +2351,7 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
 
             let g: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
@@ -2375,7 +2374,7 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(64 * 1024 * 1024);
             let pool = owned_readonly_pool(104, PersistedFileKind::TableFile, table_file, &global);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             let _ = pool.allocate_page::<Page>(&pool_guard).await;
         });
     }

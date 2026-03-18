@@ -347,8 +347,8 @@ mod tests {
         }
 
         #[inline]
-        fn guard(&self) -> PoolGuard {
-            self.inner.guard()
+        fn pool_guard(&self) -> PoolGuard {
+            self.inner.pool_guard()
         }
 
         #[inline]
@@ -419,7 +419,7 @@ mod tests {
             FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
                 .unwrap(),
         );
-        let meta_guard = (*pool).guard();
+        let meta_guard = (*pool).pool_guard();
         let blk_idx = smol::block_on(BlockIndex::new(pool.guard(), &meta_guard, 10, 77));
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
@@ -444,7 +444,7 @@ mod tests {
             Arc::clone(&entered),
             Arc::clone(&release),
         ));
-        let meta_guard = (*pool).guard();
+        let meta_guard = (*pool).pool_guard();
         let blk_idx = smol::block_on(GenericBlockIndex::new(pool.guard(), &meta_guard, 10, 77));
         pool.set_stall_page_id(blk_idx.row.root_page_id());
 

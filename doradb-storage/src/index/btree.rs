@@ -1938,7 +1938,7 @@ mod tests {
     fn test_btree_cursor_resumes_with_raw_upper_fence_before_strict_successor() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let fixture = build_exact_boundary_resume_fixture(pool.guard(), &pool_guard).await;
 
@@ -2000,7 +2000,7 @@ mod tests {
     fn test_btree_compactor_parent_done_buffers_raw_upper_fence() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let fixture = build_exact_boundary_resume_fixture(pool.guard(), &pool_guard).await;
                 let mut compactor =
@@ -2035,7 +2035,7 @@ mod tests {
     fn test_btree_single_node() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 // insert 1, 2, 3.
@@ -2123,7 +2123,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
 
@@ -2195,7 +2195,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
 
@@ -2267,7 +2267,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
 
@@ -2350,7 +2350,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(100 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 let mut map = BTreeMap::new();
@@ -2401,7 +2401,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(100 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, true, 200).await;
                 let mut map = BTreeMap::new();
@@ -2452,7 +2452,7 @@ mod tests {
             const ROWS: u64 = 10_000;
             const MAX_VALUE: u64 = 100_000;
             let pool = owned_index_pool(20 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 1).await;
 
@@ -2514,7 +2514,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = Arc::new(BTree::new(pool.guard(), &pool_guard, false, 200).await);
 
@@ -2595,7 +2595,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = Arc::new(BTree::new(pool.guard(), &pool_guard, false, 200).await);
 
@@ -2645,7 +2645,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(100 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
                 // number less than 10 million
@@ -2691,7 +2691,7 @@ mod tests {
         smol::block_on(async {
             // 1GB buffer pool.
             let pool = owned_index_pool(2 * 1024 * 1024 * 1024);
-            let pool_guard = (*pool).guard();
+            let pool_guard = (*pool).pool_guard();
             assert!(pool.allocated() == 0);
             // height=0
             {

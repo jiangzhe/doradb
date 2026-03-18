@@ -27,6 +27,10 @@ pub type ReadonlyFileID = u64;
 
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, PageID, VersionedPageID};
+use crate::component::{
+    Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
+    MetaPoolConfig,
+};
 use crate::error::Result;
 use crate::error::Validation;
 use crate::latch::LatchFallbackMode;
@@ -42,7 +46,7 @@ pub trait BufferPool: Send + Sync {
     fn allocated(&self) -> usize;
 
     /// Returns a cloneable keepalive guard for this pool.
-    fn guard(&self) -> PoolGuard;
+    fn pool_guard(&self) -> PoolGuard;
 
     /// Allocate a new page.
     ///
@@ -105,8 +109,8 @@ impl<T: BufferPool + ?Sized> BufferPool for &T {
     }
 
     #[inline]
-    fn guard(&self) -> PoolGuard {
-        T::guard(*self)
+    fn pool_guard(&self) -> PoolGuard {
+        T::pool_guard(*self)
     }
 
     #[inline]
@@ -175,8 +179,8 @@ impl<T: BufferPool> BufferPool for QuiescentGuard<T> {
     }
 
     #[inline]
-    fn guard(&self) -> PoolGuard {
-        T::guard(&**self)
+    fn pool_guard(&self) -> PoolGuard {
+        T::pool_guard(&**self)
     }
 
     #[inline]
@@ -230,5 +234,114 @@ impl<T: BufferPool> BufferPool for QuiescentGuard<T> {
         mode: LatchFallbackMode,
     ) -> impl Future<Output = Validation<FacadePageGuard<U>>> + Send {
         T::get_child_page(&**self, guard, p_guard, page_id, mode)
+    }
+}
+
+impl Component for MetaPool {
+    type Config = MetaPoolConfig;
+    type Owned = FixedBufferPool;
+    type Access = Self;
+
+    const NAME: &'static str = "meta_pool";
+
+    #[inline]
+    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+        registry.register::<Self>(FixedBufferPool::with_capacity(
+            PoolRole::Meta,
+            config.bytes,
+        )?)
+    }
+
+    #[inline]
+    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+        Self::from(owner.guard())
+    }
+
+    #[inline]
+    fn shutdown(_component: &Self::Owned) {}
+}
+
+impl Component for IndexPool {
+    type Config = IndexPoolConfig;
+    type Owned = FixedBufferPool;
+    type Access = Self;
+
+    const NAME: &'static str = "index_pool";
+
+    #[inline]
+    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+        registry.register::<Self>(FixedBufferPool::with_capacity(
+            PoolRole::Index,
+            config.bytes,
+        )?)
+    }
+
+    #[inline]
+    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+        Self::from(owner.guard())
+    }
+
+    #[inline]
+    fn shutdown(_component: &Self::Owned) {}
+}
+
+impl Component for MemPool {
+    type Config = EvictableBufferPoolConfig;
+    type Owned = EvictableBufferPool;
+    type Access = Self;
+
+    const NAME: &'static str = "mem_pool";
+
+    #[inline]
+    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+        registry.register::<Self>(config.role(PoolRole::Mem).build()?)?;
+        let pool = registry.dependency::<Self>()?;
+        // The pool must already live in its quiescent owner before worker
+        // startup so the background threads hold cloned guards instead of any
+        // leaked static owner.
+        EvictableBufferPool::start_background_workers_guarded(pool.clone_inner());
+        Ok(())
+    }
+
+    #[inline]
+    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+        Self::from(owner.guard())
+    }
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.shutdown();
+    }
+}
+
+impl Component for crate::DiskPool {
+    type Config = DiskPoolConfig;
+    type Owned = GlobalReadonlyBufferPool;
+    type Access = Self;
+
+    const NAME: &'static str = "disk_pool";
+
+    #[inline]
+    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+        registry.register::<Self>(GlobalReadonlyBufferPool::with_capacity(
+            PoolRole::Disk,
+            config.bytes,
+        )?)?;
+        let pool = registry.dependency::<Self>()?;
+        // The readonly evictor needs one keepalive guard cloned into the
+        // thread runtime, so startup must happen after stable owner
+        // registration.
+        GlobalReadonlyBufferPool::start_evictor_thread_guarded(pool.clone_inner());
+        Ok(())
+    }
+
+    #[inline]
+    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+        Self::from(owner.guard())
+    }
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.shutdown();
     }
 }
