@@ -8,11 +8,10 @@ use crate::index::column_block_index::ColumnBlockIndex;
 use crate::index::row_block_index::{
     GenericRowBlockIndex, GenericRowBlockIndexMemCursor, RowLocation,
 };
-use crate::index::util::Maskable;
+use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
 use crate::row::{RowID, RowPage};
 use crate::table::ColumnStorage;
-use crate::trx::sys::TransactionSystem;
 use std::sync::Arc;
 
 /// Facade of the hybrid block index.
@@ -59,27 +58,6 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         self.row.height()
     }
 
-    /// Enables redo logging for newly allocated row pages.
-    #[inline]
-    pub(crate) fn enable_page_committer(
-        &self,
-        table_id: crate::catalog::TableID,
-        trx_sys: QuiescentGuard<TransactionSystem>,
-    ) {
-        self.row.enable_page_committer(table_id, trx_sys)
-    }
-
-    #[inline]
-    pub(crate) fn disable_page_committer(&self) {
-        self.row.disable_page_committer()
-    }
-
-    /// Returns whether row-page redo logging is enabled.
-    #[inline]
-    pub fn is_page_committer_enabled(&self) -> bool {
-        self.row.is_page_committer_enabled()
-    }
-
     /// Atomically updates the persisted column index boundary and root page.
     ///
     /// Called after checkpoint/persist updates the column block index.
@@ -118,8 +96,36 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
+        self.get_insert_page_with_redo(
+            meta_pool_guard,
+            mem_pool,
+            mem_pool_guard,
+            metadata,
+            count,
+            None,
+        )
+        .await
+    }
+
+    #[inline]
+    pub(crate) async fn get_insert_page_with_redo<B: BufferPool>(
+        &self,
+        meta_pool_guard: &PoolGuard,
+        mem_pool: &B,
+        mem_pool_guard: &PoolGuard,
+        metadata: &Arc<TableMetadata>,
+        count: usize,
+        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
+    ) -> PageSharedGuard<RowPage> {
         self.row
-            .get_insert_page(meta_pool_guard, mem_pool, mem_pool_guard, metadata, count)
+            .get_insert_page_with_redo(
+                meta_pool_guard,
+                mem_pool,
+                mem_pool_guard,
+                metadata,
+                count,
+                redo_ctx,
+            )
             .await
     }
 
@@ -133,8 +139,36 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
+        self.get_insert_page_exclusive_with_redo(
+            meta_pool_guard,
+            mem_pool,
+            mem_pool_guard,
+            metadata,
+            count,
+            None,
+        )
+        .await
+    }
+
+    #[inline]
+    pub(crate) async fn get_insert_page_exclusive_with_redo<B: BufferPool>(
+        &self,
+        meta_pool_guard: &PoolGuard,
+        mem_pool: &B,
+        mem_pool_guard: &PoolGuard,
+        metadata: &Arc<TableMetadata>,
+        count: usize,
+        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
+    ) -> PageExclusiveGuard<RowPage> {
         self.row
-            .get_insert_page_exclusive(meta_pool_guard, mem_pool, mem_pool_guard, metadata, count)
+            .get_insert_page_exclusive_with_redo(
+                meta_pool_guard,
+                mem_pool,
+                mem_pool_guard,
+                metadata,
+                count,
+                redo_ctx,
+            )
             .await
     }
 

@@ -3,7 +3,7 @@ use crate::buffer::page::{INVALID_PAGE_ID, PageID};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards};
 use crate::catalog::{CatalogTable, TableMetadata};
 use crate::error::{Error, Result};
-use crate::index::util::Maskable;
+use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::lwc::PersistedLwcPage;
 use crate::row::ops::{
@@ -1027,7 +1027,21 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                 return page_guard;
             }
         }
-        GenericMemTable::get_insert_page(self, stmt.pool_guards(), row_count).await
+        let redo_ctx = self.row_page_create_redo_ctx(stmt);
+        GenericMemTable::get_insert_page(self, stmt.pool_guards(), row_count, redo_ctx).await
+    }
+
+    #[inline]
+    fn row_page_create_redo_ctx<'b>(
+        &self,
+        stmt: &'b Statement,
+    ) -> Option<RowPageCreateRedoCtx<'b>> {
+        self.storage?;
+        let engine = stmt
+            .trx
+            .engine()
+            .expect("user-table insert requires an attached engine");
+        Some(RowPageCreateRedoCtx::new(&engine.trx_sys, self.table_id()))
     }
 
     // lock row will check write conflict on given row and lock it.
@@ -1991,7 +2005,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         loop {
             // acquire insert page from block index.
             let mut page_guard =
-                GenericMemTable::get_insert_page_exclusive(self, guards, row_count).await;
+                GenericMemTable::get_insert_page_exclusive(self, guards, row_count, None).await;
             let page = page_guard.page_mut();
             debug_assert!(metadata.col_count() == page.header.col_count as usize);
             debug_assert!(cols.len() == page.header.col_count as usize);

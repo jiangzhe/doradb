@@ -718,7 +718,6 @@ mod tests {
             assert!(res.is_err());
 
             drop(table_file);
-            let _ = std::fs::remove_file("42.tbl");
         });
     }
 
@@ -892,7 +891,6 @@ mod tests {
 
             drop(table_file);
             drop(fs);
-            let _ = std::fs::remove_file("43.tbl");
         });
     }
 
@@ -931,7 +929,6 @@ mod tests {
 
             drop(table_file);
             drop(fs);
-            let _ = std::fs::remove_file("44.tbl");
         });
     }
 

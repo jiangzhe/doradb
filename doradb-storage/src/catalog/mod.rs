@@ -155,40 +155,6 @@ impl Catalog {
         is_user_obj_id(table_id)
     }
 
-    /// Enable page committer for tables, excluding catalog tables.
-    /// No page creation should be persisted in redo log for catalog tables.
-    #[inline]
-    pub(crate) async fn enable_page_committer_for_tables(
-        &self,
-        trx_sys: QuiescentGuard<TransactionSystem>,
-    ) {
-        for entry in &self.user_tables {
-            entry.value().enable_page_committer(trx_sys.clone());
-        }
-    }
-
-    /// Release shutdown-time back-references from user tables to the
-    /// transaction system and then drop the catalog's table cache.
-    ///
-    /// User-table page committers retain `QuiescentGuard<TransactionSystem>`.
-    /// If the catalog keeps those tables alive until `QuiDAG` starts dropping
-    /// owners, transaction-system teardown waits forever on its own guard
-    /// count. The caller must therefore invoke this only after engine
-    /// admission is closed and all transaction-system worker threads have
-    /// already stopped creating or replaying row pages.
-    #[inline]
-    pub(crate) fn shutdown_user_tables(&self) {
-        let tables = self
-            .user_tables
-            .iter()
-            .map(|entry| Arc::clone(entry.value()))
-            .collect::<Vec<_>>();
-        for table in &tables {
-            table.disable_page_committer();
-        }
-        self.user_tables.clear();
-    }
-
     /// Reload one user table runtime from catalog metadata and table file.
     pub(crate) async fn reload_create_table(
         &self,

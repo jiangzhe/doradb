@@ -528,14 +528,6 @@ impl TransactionSystem {
             handle.join().unwrap();
         }
 
-        // User-table page committers hold `QuiescentGuard<TransactionSystem>`.
-        // We must drop those guards before `QuiDAG` starts owner teardown, but
-        // only after all log/GC/purge workers have stopped. Earlier cleanup
-        // would risk skipping create-row-page redo for late row-page
-        // allocations, while later cleanup deadlocks owner drop on
-        // `TransactionSystem`'s own guard count.
-        self.catalog.shutdown_user_tables();
-
         for partition in log_partitions {
             let mut group_commit_g = partition.group_commit.lock();
             let Some(log_file) = group_commit_g.log_file.take() else {

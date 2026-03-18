@@ -264,9 +264,8 @@ impl EngineInner {
 
     #[inline]
     fn shutdown_components(&self) {
-        // `trx_sys` owns the worker threads and performs shutdown-time catalog
-        // cleanup, so it must quiesce before the lower-level pools and table
-        // filesystem begin tearing down.
+        // `trx_sys` owns the worker threads and must quiesce before the
+        // lower-level pools and table filesystem begin tearing down.
         self.trx_sys.shutdown();
         self.mem_pool.shutdown();
         self.table_fs.shutdown();
@@ -662,19 +661,17 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_shutdown_disables_external_table_page_committer_and_clears_catalog() {
+    fn test_engine_shutdown_keeps_external_table_refs_valid() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            assert!(table.blk_idx().is_page_committer_enabled());
-
             engine.shutdown().unwrap();
 
-            assert!(!table.blk_idx().is_page_committer_enabled());
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_eq!(table.table_id(), table_id);
+            assert!(engine.catalog().get_table(table_id).await.is_some());
         });
     }
 

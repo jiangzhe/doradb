@@ -3,16 +3,15 @@ use crate::buffer::guard::{
 };
 use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
-use crate::catalog::{TableID, TableMetadata};
+use crate::catalog::TableMetadata;
 use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
 };
-use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
+use crate::index::util::{Maskable, ParentPosition, RowPageCreateRedoCtx};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
 use crate::row::{INVALID_ROW_ID, RowID, RowPage};
-use crate::trx::sys::TransactionSystem;
 use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use either::Either::{Left, Right};
 use parking_lot::Mutex;
@@ -298,9 +297,6 @@ pub struct GenericRowBlockIndex<P: 'static> {
     insert_free_list: Mutex<Vec<PageID>>,
     // Fixed buffer pool to hold block nodes.
     pool: QuiescentGuard<P>,
-    // Reference to storage engine,
-    // used for committing new page.
-    page_committer: Mutex<Option<RedoLogPageCommitter>>,
 }
 
 /// Compatibility alias for runtime row-block index backed by `FixedBufferPool`.
@@ -319,7 +315,6 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
             height: AtomicUsize::new(0),
             pool,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
-            page_committer: Mutex::new(None),
         }
     }
 
@@ -340,34 +335,6 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         self.root_page_id
     }
 
-    /// Enable page committer by injecting transaction system for redo logging
-    #[inline]
-    pub(crate) fn enable_page_committer(
-        &self,
-        table_id: TableID,
-        trx_sys: QuiescentGuard<TransactionSystem>,
-    ) {
-        let mut g = self.page_committer.lock();
-        *g = Some(RedoLogPageCommitter::new(trx_sys, table_id))
-    }
-
-    /// Disable page committer during final engine shutdown.
-    ///
-    /// This is intentionally only safe once engine admission is closed and all
-    /// transaction-system worker threads have stopped. Clearing the committer
-    /// earlier could let newly allocated row pages miss their create-row-page
-    /// redo log and leave recovery with a corrupted view of table state.
-    #[inline]
-    pub(crate) fn disable_page_committer(&self) {
-        let _ = self.page_committer.lock().take();
-    }
-
-    /// Returns true if page committer is enabled.
-    #[inline]
-    pub fn is_page_committer_enabled(&self) -> bool {
-        self.page_committer.lock().is_some()
-    }
-
     /// Get row page for insertion.
     /// Caller should cache insert page id to avoid invoking this method frequently.
     #[inline]
@@ -379,6 +346,27 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
+        self.get_insert_page_with_redo(
+            meta_pool_guard,
+            mem_pool,
+            mem_pool_guard,
+            metadata,
+            count,
+            None,
+        )
+        .await
+    }
+
+    #[inline]
+    pub(crate) async fn get_insert_page_with_redo<B: BufferPool>(
+        &self,
+        meta_pool_guard: &PoolGuard,
+        mem_pool: &B,
+        mem_pool_guard: &PoolGuard,
+        metadata: &Arc<TableMetadata>,
+        count: usize,
+        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
+    ) -> PageSharedGuard<RowPage> {
         if let Ok(free_page) = self
             .get_insert_page_from_free_list(mem_pool, mem_pool_guard)
             .await
@@ -387,7 +375,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         }
         // we just ignore the free list error and latch error, and continue to get new page.
         let mut new_page = mem_pool.allocate_page::<RowPage>(mem_pool_guard).await;
-        self.insert_page_guard(meta_pool_guard, metadata, count, &mut new_page)
+        self.insert_page_guard(meta_pool_guard, metadata, count, redo_ctx, &mut new_page)
             .await;
         new_page.downgrade_shared()
     }
@@ -402,6 +390,27 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageExclusiveGuard<RowPage> {
+        self.get_insert_page_exclusive_with_redo(
+            meta_pool_guard,
+            mem_pool,
+            mem_pool_guard,
+            metadata,
+            count,
+            None,
+        )
+        .await
+    }
+
+    #[inline]
+    pub(crate) async fn get_insert_page_exclusive_with_redo<B: BufferPool>(
+        &self,
+        meta_pool_guard: &PoolGuard,
+        mem_pool: &B,
+        mem_pool_guard: &PoolGuard,
+        metadata: &Arc<TableMetadata>,
+        count: usize,
+        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
+    ) -> PageExclusiveGuard<RowPage> {
         if let Ok(free_page) = self
             .get_insert_page_exclusive_from_free_list(mem_pool, mem_pool_guard)
             .await
@@ -410,7 +419,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         }
         // we just ignore the free list error and latch error, and continue to get new page.
         let mut new_page = mem_pool.allocate_page::<RowPage>(mem_pool_guard).await;
-        self.insert_page_guard(meta_pool_guard, metadata, count, &mut new_page)
+        self.insert_page_guard(meta_pool_guard, metadata, count, redo_ctx, &mut new_page)
             .await;
         new_page
     }
@@ -431,7 +440,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
             .allocate_page_at::<RowPage>(mem_pool_guard, page_id)
             .await
             .expect("allocate page with specific page id failed");
-        self.insert_page_guard(meta_pool_guard, metadata, count, &mut new_page)
+        self.insert_page_guard(meta_pool_guard, metadata, count, None, &mut new_page)
             .await;
         new_page
     }
@@ -442,6 +451,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
+        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
         new_page: &mut PageExclusiveGuard<RowPage>,
     ) {
         let new_page_id = new_page.page_id();
@@ -459,13 +469,9 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
                     // create and attach a new empty undo map.
                     new_page.bf_mut().init_undo_map(metadata, count);
 
-                    // persist log to commit this page.
-                    if let Some(page_committer) = {
-                        let page_committer_guard = self.page_committer.lock();
-                        page_committer_guard.as_ref().cloned()
-                    } {
+                    if let Some(redo_ctx) = redo_ctx {
                         let create_cts =
-                            page_committer.commit_row_page(new_page_id, start_row_id, end_row_id);
+                            redo_ctx.commit_row_page(new_page_id, start_row_id, end_row_id);
                         if let Some(row_ver) =
                             new_page.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver())
                         {
@@ -1055,6 +1061,9 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::QuiescentBox;
+    use crate::trx::log::list_log_files;
+    use crate::trx::log_replay::ReadLog;
+    use crate::trx::redo::DDLRedo;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::ValKind;
     use semistr::SemiStr;
@@ -1312,7 +1321,6 @@ mod tests {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
             let pool_guard = (*pool).guard();
             let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
-            assert!(!blk_idx.is_page_committer_enabled());
             assert_eq!(blk_idx.height(), 0);
 
             for row_page_id in 0..10000 {
@@ -1357,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_block_index_enable_page_committer() {
+    fn test_row_block_index_inline_redo_ctx_commits_create_row_page_once() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1381,15 +1389,68 @@ mod tests {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.guard();
                 let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
-                assert!(!blk_idx.is_page_committer_enabled());
-                blk_idx.enable_page_committer(104, engine.trx_sys.clone());
-                assert!(blk_idx.is_page_committer_enabled());
                 let mem_guard = engine.mem_pool.guard();
-                let _ = blk_idx
-                    .get_insert_page(&meta_guard, &engine.mem_pool, &mem_guard, &metadata, 100)
+                let redo_ctx = RowPageCreateRedoCtx::new(&engine.trx_sys, 104);
+                let page_guard = blk_idx
+                    .get_insert_page_with_redo(
+                        &meta_guard,
+                        &engine.mem_pool,
+                        &mem_guard,
+                        &metadata,
+                        100,
+                        Some(redo_ctx),
+                    )
                     .await;
+                let create_cts = page_guard
+                    .bf()
+                    .ctx
+                    .as_ref()
+                    .and_then(|ctx| ctx.row_ver())
+                    .map(|row_ver| row_ver.create_cts())
+                    .unwrap();
+                assert!(create_cts > 0);
+
+                let page_id = page_guard.page_id();
+                let page_guard = page_guard.downgrade().exclusive_async().await;
+                blk_idx.cache_exclusive_insert_page(page_guard);
+
+                let reused_page = blk_idx
+                    .get_insert_page_with_redo(
+                        &meta_guard,
+                        &engine.mem_pool,
+                        &mem_guard,
+                        &metadata,
+                        100,
+                        Some(redo_ctx),
+                    )
+                    .await;
+                assert_eq!(reused_page.page_id(), page_id);
             }
-            drop(engine);
+            engine.shutdown().unwrap();
+
+            let mut create_row_page_logs = 0usize;
+            let file_prefix = temp_dir.path().join("redo_row_blk_idx");
+            let file_prefix = file_prefix.to_str().unwrap();
+            let logs = list_log_files(file_prefix, 0, false).unwrap();
+            for log in logs {
+                let mut reader = engine.trx_sys.log_reader(&log).unwrap();
+                loop {
+                    match reader.read() {
+                        ReadLog::SizeLimit | ReadLog::DataCorrupted => panic!("invalid log data"),
+                        ReadLog::DataEnd => break,
+                        ReadLog::Some(mut group) => {
+                            while let Some(log) = group.try_next().unwrap() {
+                                if let Some(ddl) = log.payload.ddl.as_deref()
+                                    && matches!(ddl, DDLRedo::CreateRowPage { table_id: 104, .. })
+                                {
+                                    create_row_page_logs += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(create_row_page_logs, 1);
         })
     }
 

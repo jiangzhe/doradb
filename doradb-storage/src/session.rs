@@ -227,8 +227,6 @@ impl Session {
             )
             .await,
         );
-        // Enable page committer so all row pages can be recovered.
-        table.enable_page_committer(engine.trx_sys.clone());
 
         engine.catalog().insert_user_table(table);
 
