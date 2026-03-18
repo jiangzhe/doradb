@@ -14,8 +14,11 @@ Implement phase 2 of RFC-0009 by replacing leaked-static top-level engine
 component ownership and the `StaticOwner`/`StaticHandle` bridge with direct
 `QuiDAG`-owned components plus `QuiescentGuard<T>`-backed runtime access.
 Keep the explicit phase-1 shutdown barrier, preserve the current worker model,
-and limit compatibility work to narrow crate-private seams needed while
-`BufferPool` and related runtime APIs still require `&'static self`.
+remove `&'static` from `BufferPool` and the minimal dependent runtime APIs up
+front, and do not introduce any replacement compatibility layer. Worker-start
+paths should move to guard-based helpers that accept `QuiescentGuard<T>`,
+convert once with `into_sync()`, and clone the wrapped guard into spawned
+threads.
 
 ## Context
 
@@ -37,12 +40,22 @@ leaked statics:
 4. worker startup in `TransactionSystem`, `EvictableBufferPool`, and
    `GlobalReadonlyBufferPool` still assumes leaked-static reachability.
 
-RFC-0009 selected direct guard-owned engine state as the phase-2 target while
-deferring the broad `BufferPool: &self` migration to phase 3 and final
-`StaticLifetime` cleanup to later phases. This task therefore removes the
-ownership bridge now, updates worker-start paths that still require leaked
-statics, and keeps any remaining compatibility logic narrowly scoped and
-clearly temporary.
+RFC-0009 now treats this task as the merged runtime migration phase: direct
+guard-owned engine state, `BufferPool: &self`, guard-based worker startup, and
+the production removal of the static compatibility bridge all belong here.
+Repo inspection for this task showed that a bridge-free phase 2 is not feasible
+while `BufferPool` and core runtime types still encode `&'static` in their
+signatures and stored fields. This task therefore removes the ownership bridge
+and folds in the minimal `&self` migration needed for engine/component
+ownership now, rather than creating a new temporary layer or preserving the old
+phase split.
+
+The worker-start pattern is also now explicit: methods shaped like
+`start_*_thread(&'static self, ...)` should move to separate helpers that take
+`QuiescentGuard<T>` for the owned component, convert that guard to
+`SyncQuiescentGuard<T>` once, and clone the wrapped guard into spawned thread
+closures. This preserves the current worker model without relying on leaked
+statics.
 
 Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 Issue Labels:
@@ -67,33 +80,39 @@ Parent RFC:
 3. Refactor engine assembly so top-level components are constructed as owned
    values, inserted directly into `QuiDAG`, and started without leaking static
    references.
-4. Migrate production runtime holders that still store `StaticHandle` to
+4. Remove `&'static` from the `BufferPool` trait first, then propagate that
+   receiver change through the minimal runtime ownership path required to
+   compile the bridge-free engine/component refactor.
+5. Move worker-start entrypoints that currently rely on `&'static self` into
+   separate guard-based helpers:
+   - accept `QuiescentGuard<T>` for the worker-owning component;
+   - convert the acquired guard to `SyncQuiescentGuard<T>` once;
+   - clone the wrapped guard into each spawned thread closure;
+   - pass dependency guards the same way when a worker needs long-lived access
+     beyond the startup call.
+6. Migrate production runtime holders that still store `StaticHandle` to
    direct guard-backed storage, including:
    - `PendingTransactionSystem`
    - `ReadonlyBufferPool`
    - recovery deps / `LogRecovery`
    - row-page redo page-committer plumbing
-5. Keep `EngineRef = Arc<EngineInner>` and preserve the phase-1 shutdown and
+7. Remove the remaining `StaticLifetime`, `StaticLifetimeScope`, and static
+   builders/constructors, including the test-side helper surface that exists
+   only to preserve leaked-static ownership.
+8. Keep `EngineRef = Arc<EngineInner>` and preserve the phase-1 shutdown and
    teardown semantics.
-6. Constrain any temporary compatibility helper to crate-private phase-2
-   hotspots that still cross legacy `&'static self` pool APIs, with an
-   explicit delete target in phase 3.
-7. Validate both default-feature and `--no-default-features` test passes.
+9. Validate both default-feature and `--no-default-features` test passes.
 
 ## Non-Goals
 
-1. Change the public `BufferPool` trait or broad runtime call paths from
-   `&'static self` to `&self`; that belongs to RFC-0009 phase 3.
-2. Remove `StaticLifetime`, `StaticLifetimeScope`, static builders, or
-   repository-wide test helpers that still depend on leaked-static ownership;
-   that cleanup is for later phases.
-3. Extract worker threads into separate DAG nodes or redesign the current
+1. Extract worker threads into separate DAG nodes or redesign the current
    explicit shutdown policy introduced in phase 1.
-4. Redesign page-guard or pool-provenance safety beyond the existing
+2. Redesign page-guard or pool-provenance safety beyond the existing
    `PoolGuard` model.
-5. Move `Catalog` out of `TransactionSystem`.
-6. Expand this task into broad public API cleanup unrelated to engine/component
-   ownership.
+3. Move `Catalog` out of `TransactionSystem`.
+4. Expand this task into broad stale-test cleanup or unrelated public API
+   cleanup outside the work required to remove the remaining static-lifetime
+   surface from engine/component ownership.
 
 ## Unsafe Considerations (If Applicable)
 
@@ -106,18 +125,25 @@ ownership, buffer pools, and worker startup.
      direct DAG-owned components.
    - `doradb-storage/src/trx/sys_conf.rs`
    - `doradb-storage/src/trx/sys.rs`
+   - `doradb-storage/src/buffer/mod.rs`
    - `doradb-storage/src/buffer/evict.rs`
    - `doradb-storage/src/buffer/readonly.rs`
-     These modules still rely on leaked-static startup assumptions and may need
-     small compatibility shims while the wider `BufferPool` API remains in its
-     phase-2 transitional state.
+   - `doradb-storage/src/table/mod.rs`
+   - `doradb-storage/src/index/{btree,block_index,row_block_index,secondary_index}.rs`
+     These modules currently encode `&'static` in production pool/runtime APIs
+     and must be updated directly because this task does not permit a
+     compatibility shim.
 2. Required invariants and checks:
    - no production path may reconstruct ownership or teardown ordering through
      leaked-static references;
-   - any temporary phase-2 compatibility helper must be guard-backed,
-     crate-private, and must not outlive the guard that proves reachability;
+   - `BufferPool` receiver migration from `&'static self` to `&self` must not
+     weaken the existing `PoolGuard` provenance checks or page-guard drop
+     ordering guarantees;
    - worker startup must retain whichever self/dependency guards are required
      until explicit shutdown joins the worker threads;
+   - worker-start helpers must acquire one direct `QuiescentGuard<T>`, convert
+     it to `SyncQuiescentGuard<T>` once, and clone the wrapped guard for thread
+     fan-out rather than rebuilding a new bridge type;
    - `Engine::shutdown` must still finish worker stop/join before DAG owner
      drop begins;
    - all new unsafe blocks or unsafe impls must keep adjacent `// SAFETY:`
@@ -143,7 +169,15 @@ Reference:
    - keep `EngineRef = Arc<EngineInner>` and the existing lifecycle state;
    - update `catalog()`, `shutdown_components()`, and other engine-local access
      sites to use the guard-held components directly.
-2. Refactor engine build into owned component assembly:
+2. Remove `&'static` from `BufferPool` first and propagate the receiver change
+   through the minimal runtime ownership path touched by engine/component
+   lifetime:
+   - change `BufferPool` methods to take `&self`;
+   - update stored/runtime pool references in table, catalog, recovery, purge,
+     and index code that currently require `&'static`;
+   - keep the change scoped to the engine/component ownership path rather than
+     broad unrelated cleanup.
+3. Refactor engine build into owned component assembly:
    - build `disk_pool`, `table_fs`, `meta_pool`, `index_pool`, and `mem_pool`
      with owned constructors (`with_capacity`, `build`, etc.) instead of
      `*_static(...)`;
@@ -152,7 +186,7 @@ Reference:
      `table_fs -> disk_pool` ordering edge;
    - keep startup-failure cleanup dependent on DAG reverse-insertion behavior
      before seal and sealed graph drop order after seal.
-3. Replace transaction-system startup with an owned construction flow in
+4. Replace transaction-system startup with an owned construction flow in
    `doradb-storage/src/trx/sys_conf.rs`:
    - replace `prepare_static(...)` with an owned-construction path that no
      longer leaks `TransactionSystem`;
@@ -160,17 +194,16 @@ Reference:
      threads through guard-backed startup hooks;
    - keep `Catalog` embedded in `TransactionSystem` and preserve current log,
      recovery, and purge structure.
-4. Update worker-backed component start paths so they no longer require leaked
+5. Update worker-backed component start paths so they no longer require leaked
    statics:
-   - `TransactionSystem::start_io_threads`
-   - `TransactionSystem::start_gc_threads`
-   - `TransactionSystem::start_purge_threads`
-   - `EvictableBufferPool::start_background_workers`
-   - `GlobalReadonlyBufferPool::start_evictor_thread`
-   - if a narrow phase-2 compatibility shim is still required at legacy
-     `BufferPool` call sites, keep it local and crate-private rather than
-     turning it into a new general ownership abstraction.
-5. Replace guard-bridge storage in runtime state:
+   - move `start_*_thread(&'static self, ...)` entrypoints to separate helpers
+     that accept `QuiescentGuard<T>`;
+   - inside each helper, convert the acquired guard to
+     `SyncQuiescentGuard<T>` once and clone it into spawned thread closures;
+   - apply this pattern to `TransactionSystem`, `EvictableBufferPool`, and
+     `GlobalReadonlyBufferPool`;
+   - keep `TableFileSystem` on the same explicit stop/join lifecycle contract.
+6. Replace guard-bridge storage in runtime state:
    - `ReadonlyBufferPool` stores `QuiescentGuard<GlobalReadonlyBufferPool>`;
    - recovery/bootstrap state stores direct guards instead of `StaticHandle`;
    - `RedoLogPageCommitter`, block-index page-committer plumbing, and related
@@ -178,18 +211,31 @@ Reference:
      `StaticHandle<TransactionSystem>`;
    - session and runtime helper code clones guards from `EngineInner` instead
      of relying on leaked-static fields.
-6. Keep the phase boundary explicit:
-   - do not change the public `BufferPool` trait in this task;
+7. Delete the remaining static-lifetime surface rather than deferring it:
+   - remove `doradb-storage/src/lifetime.rs` once all call sites are migrated;
+   - delete `StaticLifetime`, `StaticLifetimeScope`, and remaining
+     `*_static(...)` constructors/builders instead of preserving test-only
+     escape hatches;
+   - update tests and helper setup paths to use the owned/guard-backed
+     constructors introduced by this phase.
+8. Keep the phase boundary explicit:
    - do not introduce a new crate-wide replacement for `StaticHandle`;
-   - document every remaining phase-2-only compatibility seam as a direct
-     delete candidate for the phase-3 `&self` migration.
-7. Update tests and focused regressions for:
+   - do not add a crate-private compatibility seam around legacy `&'static`
+     pool APIs;
+   - keep the migration focused on engine/component ownership, required test
+     migrations, and the directly affected runtime path.
+9. Update tests and focused regressions for:
    - engine build/drop ordering and failed-startup cleanup with owned
      components;
    - shutdown and retry behavior remaining unchanged from phase 1;
    - runtime keepalive cases for `Arc<Table>`, catalog storage, readonly pool,
      and recovery;
-   - worker start/stop on owned components in both feature configurations.
+   - worker start/stop on owned components in both feature configurations;
+   - deletion of `StaticLifetime`/`StaticLifetimeScope` and static builders
+     does not leave any remaining leaked-static test setup path in this task
+     scope;
+   - guard-backed thread fan-out using `QuiescentGuard<T> -> into_sync() ->
+     clone`.
 
 ## Implementation Notes
 
@@ -199,15 +245,19 @@ Reference:
 2. `doradb-storage/src/trx/sys_conf.rs`
 3. `doradb-storage/src/trx/sys.rs`
 4. `doradb-storage/src/trx/purge.rs`
-5. `doradb-storage/src/buffer/evict.rs`
-6. `doradb-storage/src/buffer/readonly.rs`
-7. `doradb-storage/src/table/mod.rs`
-8. `doradb-storage/src/catalog/mod.rs`
-9. `doradb-storage/src/catalog/storage/mod.rs`
-10. `doradb-storage/src/trx/recover.rs`
-11. `doradb-storage/src/index/util.rs`
-12. `doradb-storage/src/index/row_block_index.rs`
-13. engine ownership/runtime access behavior for:
+5. `doradb-storage/src/buffer/mod.rs`
+6. `doradb-storage/src/buffer/evict.rs`
+7. `doradb-storage/src/buffer/readonly.rs`
+8. `doradb-storage/src/table/mod.rs`
+9. `doradb-storage/src/catalog/mod.rs`
+10. `doradb-storage/src/catalog/storage/mod.rs`
+11. `doradb-storage/src/trx/recover.rs`
+12. `doradb-storage/src/index/util.rs`
+13. `doradb-storage/src/index/row_block_index.rs`
+14. `doradb-storage/src/index/block_index.rs`
+15. `doradb-storage/src/index/btree.rs`
+16. `doradb-storage/src/index/secondary_index.rs`
+17. engine ownership/runtime access behavior for:
     - `Engine`
     - `EngineInner`
     - `EngineRef`
@@ -235,7 +285,10 @@ Reference:
 6. Worker-backed components (`TransactionSystem`, `EvictableBufferPool`,
    `GlobalReadonlyBufferPool`, and `TableFileSystem`) can start and stop
    safely without leaked-static ownership.
-7. Full crate validation:
+7. Guard-based worker-start helpers retain one acquired component guard,
+   convert it to `SyncQuiescentGuard<T>`, and clone that wrapper into spawned
+   thread closures without reintroducing another ownership bridge.
+8. Full crate validation:
 ```bash
 cargo test -p doradb-storage
 cargo test -p doradb-storage --no-default-features
@@ -243,11 +296,9 @@ cargo test -p doradb-storage --no-default-features
 
 ## Open Questions
 
-1. If phase 2 still needs a narrow guard-backed compatibility helper for
-   legacy `BufferPool` call sites, how much of that helper can be deleted
-   immediately during implementation without collapsing the task into the full
-   phase-3 trait migration?
-2. Once worker startup no longer depends on leaked statics, should a later
-   cleanup consolidate repeated worker-start keepalive plumbing into one shared
-   internal helper, or should phase 3 simply delete the remaining compatibility
-   seams as part of the `&self` migration?
+1. No design-blocking open question remains for this task: it assumes direct
+   `BufferPool: &self` migration on the affected runtime path and forbids a new
+   compatibility layer.
+2. After this task lands, a later cleanup may still decide whether repeated
+   guard-to-thread startup helpers should be consolidated, but that is not part
+   of the implementation decision for this task.

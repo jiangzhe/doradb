@@ -28,6 +28,13 @@ Complete all items:
 6. Include source references (docs/code/conversation/backlog as applicable).
 7. Ask user feedback.
 
+## Test Strategy Constraint
+
+If an RFC proposes enforced test timeouts or automated hang detection:
+1. Read and cite `docs/process/unit-test.md`.
+2. Do not assume plain `cargo test` has built-in timeout support.
+3. Define the runner/tooling change explicitly, or defer that work to `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md`.
+
 ## Draft Requirements (`status: draft`)
 
 Draft RFC must include:

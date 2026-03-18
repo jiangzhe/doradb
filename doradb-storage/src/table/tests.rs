@@ -521,7 +521,7 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
             DeleteMarker::Committed(ts) => ts,
             DeleteMarker::Ref(status) => status.ts(),
         };
-        let trx_sys = session.engine().trx_sys;
+        let trx_sys = session.engine().trx_sys.clone();
         // `checkpoint_for_deletion` selects markers with `cts < cutoff_ts`.
         // `cutoff_ts` comes from GC-visible min-active STS and can lag right after delete commit,
         // so we wait until this marker becomes eligible to avoid timing flakes.
@@ -564,6 +564,7 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
         let expected_delta = (row_id - entry.start_row_id) as u32;
         assert!(deltas.binary_search(&expected_delta).is_ok());
 
+        drop(trx_sys);
         drop(session);
         sys.clean_all();
     });

@@ -4,6 +4,7 @@ use crate::index::btree::GenericBTree;
 use crate::index::btree_key::{BTreeKey, BTreeKeyEncoder};
 use crate::index::non_unique_index::GenericNonUniqueBTreeIndex;
 use crate::index::unique_index::GenericUniqueBTreeIndex;
+use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use crate::value::{Val, ValKind, ValType};
@@ -27,7 +28,7 @@ impl<P: BufferPool> GenericSecondaryIndex<P> {
     /// Build a secondary index from catalog `IndexSpec`.
     #[inline]
     pub async fn new<F: Fn(usize) -> ValType>(
-        index_pool: &'static P,
+        index_pool: QuiescentGuard<P>,
         index_pool_guard: &PoolGuard,
         index_no: usize,
         index_spec: &IndexSpec,

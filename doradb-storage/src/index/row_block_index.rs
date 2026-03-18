@@ -4,13 +4,13 @@ use crate::buffer::guard::{
 use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::{TableID, TableMetadata};
-use crate::engine::StaticHandle;
 use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
 };
 use crate::index::util::{Maskable, ParentPosition, RedoLogPageCommitter};
 use crate::latch::LatchFallbackMode;
+use crate::quiescent::QuiescentGuard;
 use crate::row::{INVALID_ROW_ID, RowID, RowPage};
 use crate::trx::sys::TransactionSystem;
 use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
@@ -297,7 +297,7 @@ pub struct GenericRowBlockIndex<P: 'static> {
     height: AtomicUsize,
     insert_free_list: Mutex<Vec<PageID>>,
     // Fixed buffer pool to hold block nodes.
-    pool: &'static P,
+    pool: QuiescentGuard<P>,
     // Reference to storage engine,
     // used for committing new page.
     page_committer: Mutex<Option<RedoLogPageCommitter>>,
@@ -309,7 +309,7 @@ pub type RowBlockIndex = GenericRowBlockIndex<FixedBufferPool>;
 impl<P: BufferPool> GenericRowBlockIndex<P> {
     /// Create a new block index backed by buffer pool.
     #[inline]
-    pub async fn new(pool: &'static P, pool_guard: &PoolGuard, start_row_id: RowID) -> Self {
+    pub async fn new(pool: QuiescentGuard<P>, pool_guard: &PoolGuard, start_row_id: RowID) -> Self {
         let mut g = pool.allocate_page::<BlockNode>(pool_guard).await;
         let page_id = g.page_id();
         let page = g.page_mut();
@@ -345,10 +345,21 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     pub(crate) fn enable_page_committer(
         &self,
         table_id: TableID,
-        trx_sys: impl Into<StaticHandle<TransactionSystem>>,
+        trx_sys: QuiescentGuard<TransactionSystem>,
     ) {
         let mut g = self.page_committer.lock();
         *g = Some(RedoLogPageCommitter::new(trx_sys, table_id))
+    }
+
+    /// Disable page committer during final engine shutdown.
+    ///
+    /// This is intentionally only safe once engine admission is closed and all
+    /// transaction-system worker threads have stopped. Clearing the committer
+    /// earlier could let newly allocated row pages miss their create-row-page
+    /// redo log and leave recovery with a corrupted view of table state.
+    #[inline]
+    pub(crate) fn disable_page_committer(&self) {
+        let _ = self.page_committer.lock().take();
     }
 
     /// Returns true if page committer is enabled.
@@ -363,7 +374,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     pub async fn get_insert_page<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
-        mem_pool: &'static B,
+        mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
@@ -386,7 +397,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     pub async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
-        mem_pool: &'static B,
+        mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
@@ -410,7 +421,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     pub async fn allocate_row_page_at<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
-        mem_pool: &'static B,
+        mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
@@ -505,7 +516,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     #[inline]
     async fn get_insert_page_from_free_list<B: BufferPool>(
         &self,
-        mem_pool: &'static B,
+        mem_pool: &B,
         mem_pool_guard: &PoolGuard,
     ) -> Result<PageSharedGuard<RowPage>> {
         let page_id = {
@@ -527,7 +538,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     #[inline]
     async fn get_insert_page_exclusive_from_free_list<B: BufferPool>(
         &self,
-        mem_pool: &'static B,
+        mem_pool: &B,
         mem_pool_guard: &PoolGuard,
     ) -> Result<PageExclusiveGuard<RowPage>> {
         let page_id = {
@@ -1043,11 +1054,17 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::engine::EngineConfig;
     use crate::latch::LatchFallbackMode;
-    use crate::lifetime::StaticLifetimeScope;
+    use crate::quiescent::QuiescentBox;
     use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::ValKind;
     use semistr::SemiStr;
     use tempfile::TempDir;
+
+    fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(
+            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, pool_size).unwrap(),
+        )
+    }
 
     #[test]
     fn test_row_block_index_free_list_shared() {
@@ -1073,17 +1090,17 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.guard();
-                let blk_idx = RowBlockIndex::new(engine.meta_pool, &meta_guard, 0).await;
+                let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
                 let mem_guard = engine.mem_pool.guard();
                 let p1 = blk_idx
-                    .get_insert_page(&meta_guard, engine.mem_pool, &mem_guard, &metadata, 100)
+                    .get_insert_page(&meta_guard, &engine.mem_pool, &mem_guard, &metadata, 100)
                     .await;
                 let pid1 = p1.page_id();
                 let p1 = p1.downgrade().exclusive_async().await;
                 blk_idx.cache_exclusive_insert_page(p1);
                 assert_eq!(blk_idx.insert_free_list.lock().len(), 1);
                 let p2 = blk_idx
-                    .get_insert_page(&meta_guard, engine.mem_pool, &mem_guard, &metadata, 100)
+                    .get_insert_page(&meta_guard, &engine.mem_pool, &mem_guard, &metadata, 100)
                     .await;
                 assert_eq!(pid1, p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
@@ -1116,12 +1133,12 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.guard();
-                let blk_idx = RowBlockIndex::new(engine.meta_pool, &meta_guard, 0).await;
+                let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
                 let mem_guard = engine.mem_pool.guard();
                 let p1 = blk_idx
                     .get_insert_page_exclusive(
                         &meta_guard,
-                        engine.mem_pool,
+                        &engine.mem_pool,
                         &mem_guard,
                         &metadata,
                         100,
@@ -1133,7 +1150,7 @@ mod tests {
                 let p2 = blk_idx
                     .get_insert_page_exclusive(
                         &meta_guard,
-                        engine.mem_pool,
+                        &engine.mem_pool,
                         &mem_guard,
                         &metadata,
                         100,
@@ -1172,11 +1189,11 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.guard();
-                let blk_idx = RowBlockIndex::new(engine.meta_pool, &meta_guard, 0).await;
+                let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
                 let mem_guard = engine.mem_pool.guard();
                 for _ in 0..row_pages {
                     let _ = blk_idx
-                        .get_insert_page(&meta_guard, engine.mem_pool, &mem_guard, &metadata, 100)
+                        .get_insert_page(&meta_guard, &engine.mem_pool, &mem_guard, &metadata, 100)
                         .await;
                 }
                 let mut count = 0usize;
@@ -1197,17 +1214,9 @@ mod tests {
     #[test]
     fn test_row_block_index_cursor_two_level_tree() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    1024usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
-            let blk_idx = RowBlockIndex::new(pool, &pool_guard, 0).await;
+            let pool = owned_index_pool(1024usize * 1024 * 1024);
+            let pool_guard = (*pool).guard();
+            let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
 
             let overflow_entries = 3usize;
             let row_pages = NBR_PAGE_ENTRIES_IN_LEAF + overflow_entries;
@@ -1266,17 +1275,9 @@ mod tests {
     #[test]
     fn test_row_block_index_search() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    512usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
-            let blk_idx = RowBlockIndex::new(pool, &pool_guard, 0).await;
+            let pool = owned_index_pool(512usize * 1024 * 1024);
+            let pool_guard = (*pool).guard();
+            let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
             let row_pages = 5000usize;
             let rows_per_page = 100usize;
             for i in 0..row_pages {
@@ -1308,17 +1309,9 @@ mod tests {
     #[test]
     fn test_row_block_index_split() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    1024usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let pool = pool.as_static();
-            let pool_guard = pool.guard();
-            let blk_idx = RowBlockIndex::new(pool, &pool_guard, 0).await;
+            let pool = owned_index_pool(1024usize * 1024 * 1024);
+            let pool_guard = (*pool).guard();
+            let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
             assert!(!blk_idx.is_page_committer_enabled());
             assert_eq!(blk_idx.height(), 0);
 
@@ -1387,13 +1380,13 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.guard();
-                let blk_idx = RowBlockIndex::new(engine.meta_pool, &meta_guard, 0).await;
+                let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
                 assert!(!blk_idx.is_page_committer_enabled());
-                blk_idx.enable_page_committer(104, engine.trx_sys);
+                blk_idx.enable_page_committer(104, engine.trx_sys.clone());
                 assert!(blk_idx.is_page_committer_enabled());
                 let mem_guard = engine.mem_pool.guard();
                 let _ = blk_idx
-                    .get_insert_page(&meta_guard, engine.mem_pool, &mem_guard, &metadata, 100)
+                    .get_insert_page(&meta_guard, &engine.mem_pool, &mem_guard, &metadata, 100)
                     .await;
             }
             drop(engine);

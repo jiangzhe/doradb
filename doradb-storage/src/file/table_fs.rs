@@ -7,7 +7,6 @@ use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
 use crate::io::{AIOClient, AIOContext};
-use crate::lifetime::StaticLifetime;
 use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -131,8 +130,6 @@ impl Drop for TableFileSystem {
         self.shutdown();
     }
 }
-
-unsafe impl StaticLifetime for TableFileSystem {}
 
 const DEFAULT_TABLE_FILE_IO_DEPTH: usize = 64;
 const DEFAULT_TABLE_FILE_DATA_DIR: &str = ".";

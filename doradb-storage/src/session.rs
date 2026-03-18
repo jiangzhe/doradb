@@ -209,7 +209,7 @@ impl Session {
         let meta_pool_guard = self.pool_guards().meta_guard();
         let index_pool_guard = self.pool_guards().index_guard();
         let blk_idx = BlockIndex::new(
-            engine.meta_pool,
+            engine.meta_pool.clone(),
             meta_pool_guard,
             table_file.active_root().pivot_row_id,
             table_file.active_root().column_block_index_root,
@@ -217,10 +217,10 @@ impl Session {
         .await;
         let table = Arc::new(
             Table::new(
-                engine.mem_pool,
-                engine.index_pool,
+                engine.mem_pool.clone(),
+                engine.index_pool.clone(),
                 index_pool_guard,
-                engine.disk_pool,
+                engine.disk_pool.clone(),
                 table_id,
                 blk_idx,
                 table_file,
@@ -228,7 +228,7 @@ impl Session {
             .await,
         );
         // Enable page committer so all row pages can be recovered.
-        table.enable_page_committer(engine.trx_sys);
+        table.enable_page_committer(engine.trx_sys.clone());
 
         engine.catalog().insert_user_table(table);
 

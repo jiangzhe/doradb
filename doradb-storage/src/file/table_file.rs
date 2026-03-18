@@ -591,7 +591,7 @@ pub type OldRoot = OldCowRoot<TableMeta>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool};
+    use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::page_integrity::PAGE_INTEGRITY_TRAILER_SIZE;
@@ -600,28 +600,7 @@ mod tests {
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-
-    fn global_readonly_pool() -> &'static GlobalReadonlyBufferPool {
-        static GLOBAL: OnceLock<&'static GlobalReadonlyBufferPool> = OnceLock::new();
-        GLOBAL.get_or_init(|| {
-            GlobalReadonlyBufferPool::with_capacity_static(
-                crate::buffer::PoolRole::Disk,
-                64 * 1024 * 1024,
-            )
-            .unwrap()
-        })
-    }
-
-    fn readonly_pool(table_id: u64, table_file: &Arc<TableFile>) -> ReadonlyBufferPool {
-        ReadonlyBufferPool::new(
-            table_id,
-            PersistedFileKind::TableFile,
-            Arc::clone(table_file),
-            global_readonly_pool(),
-        )
-    }
 
     async fn read_page_for_test(table_file: &TableFile, page_id: PageID) -> Result<DirectBuf> {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
@@ -911,7 +890,8 @@ mod tests {
                 },
             ];
 
-            let disk_pool = readonly_pool(43, &table_file);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 43, &table_file);
             let (table_file, old_root) = MutableTableFile::fork(&table_file)
                 .persist_lwc_pages(lwc_pages, 7, 2, &disk_pool)
                 .await
@@ -923,7 +903,7 @@ mod tests {
             assert_eq!(active_root.pivot_row_id, 20);
             assert_eq!(active_root.heap_redo_start_ts, 7);
             assert_ne!(active_root.column_block_index_root, 0);
-            let disk_pool = readonly_pool(43, &table_file);
+            let disk_pool = table_readonly_pool(&global, 43, &table_file);
 
             let column_index = crate::index::ColumnBlockIndex::new(
                 active_root.column_block_index_root,
@@ -973,7 +953,8 @@ mod tests {
                 },
             ];
 
-            let disk_pool = readonly_pool(44, &table_file);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 44, &table_file);
             let result = MutableTableFile::fork(&table_file)
                 .persist_lwc_pages(lwc_pages, 7, 2, &disk_pool)
                 .await;

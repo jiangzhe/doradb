@@ -296,16 +296,16 @@ impl<'a> ColumnDeletionBlobReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool};
+    use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableMetadata,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
-    use crate::file::table_file::{MutableTableFile, TableFile};
+    use crate::file::table_file::MutableTableFile;
     use crate::file::table_fs::TableFileSystemConfig;
     use crate::index::column_payload::BlobRef;
     use crate::value::ValKind;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     fn build_test_metadata() -> Arc<TableMetadata> {
         Arc::new(TableMetadata::new(
@@ -333,26 +333,6 @@ mod tests {
             .expect("join test thread");
     }
 
-    fn global_readonly_pool() -> &'static GlobalReadonlyBufferPool {
-        static GLOBAL: OnceLock<&'static GlobalReadonlyBufferPool> = OnceLock::new();
-        GLOBAL.get_or_init(|| {
-            GlobalReadonlyBufferPool::with_capacity_static(
-                crate::buffer::PoolRole::Disk,
-                64 * 1024 * 1024,
-            )
-            .unwrap()
-        })
-    }
-
-    fn readonly_pool(table_id: TableID, table_file: &Arc<TableFile>) -> ReadonlyBufferPool {
-        ReadonlyBufferPool::new(
-            table_id,
-            PersistedFileKind::TableFile,
-            Arc::clone(table_file),
-            global_readonly_pool(),
-        )
-    }
-
     fn build_persisted_blob_page() -> DirectBuf {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let payload_start = write_page_header(buf.data_mut(), COLUMN_DELETION_BLOB_PAGE_SPEC);
@@ -375,7 +355,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(251, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 251, &table_file);
 
                 let blob_a = b"aaaa-bitmap-bytes".to_vec();
                 let blob_b = b"bbbb-bitmap-bytes".to_vec();
@@ -414,7 +395,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(252, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 252, &table_file);
 
                 let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE + 257];
                 let mut mutable = MutableTableFile::fork(&table_file);

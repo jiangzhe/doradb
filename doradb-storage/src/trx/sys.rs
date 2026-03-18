@@ -1,7 +1,7 @@
 use crate::catalog::{Catalog, TableCache, TableID, is_catalog_obj_id, is_user_obj_id};
 use crate::error::Result;
 use crate::io::AIOContext;
-use crate::lifetime::StaticLifetime;
+use crate::quiescent::QuiescentGuard;
 use crate::session::SessionState;
 use crate::thread;
 use crate::trx::group::Commit;
@@ -330,25 +330,33 @@ impl TransactionSystem {
 
     /// Start background GC threads.
     #[inline]
-    pub(super) fn start_gc_threads(&'static self, gc_rxs: Vec<Receiver<GC>>) {
-        for ((idx, partition), gc_rx) in self.log_partitions.iter().enumerate().zip(gc_rxs) {
+    pub(super) fn start_gc_threads(trx_sys: QuiescentGuard<Self>, gc_rxs: Vec<Receiver<GC>>) {
+        let trx_sys = trx_sys.into_sync();
+        for (idx, gc_rx) in gc_rxs.into_iter().enumerate() {
             let thread_name = format!("GC-Thread-{idx}");
-            let partition = &**partition;
-            let purge_chan = self.purge_chan.clone();
-            let handle =
-                thread::spawn_named(thread_name, move || partition.gc_loop(gc_rx, purge_chan));
+            let partition = &*trx_sys.log_partitions[idx];
+            let purge_chan = trx_sys.purge_chan.clone();
+            let task_trx_sys = trx_sys.clone();
+            let handle = thread::spawn_named(thread_name, move || {
+                let partition = &*task_trx_sys.log_partitions[idx];
+                partition.gc_loop(gc_rx, purge_chan);
+            });
             *partition.gc_thread.lock() = Some(handle);
         }
     }
 
     /// Start background IO threads.
     #[inline]
-    pub(super) fn start_io_threads(&'static self) {
-        // Start threads for all log partitions
-        for (idx, partition) in self.log_partitions.iter().enumerate() {
+    pub(super) fn start_io_threads(trx_sys: QuiescentGuard<Self>) {
+        let trx_sys = trx_sys.into_sync();
+        for idx in 0..trx_sys.log_partitions.len() {
             let thread_name = format!("IO-Thread-{idx}");
-            let partition = &**partition;
-            let handle = thread::spawn_named(thread_name, move || partition.io_loop(&self.config));
+            let partition = &*trx_sys.log_partitions[idx];
+            let task_trx_sys = trx_sys.clone();
+            let handle = thread::spawn_named(thread_name, move || {
+                let partition = &*task_trx_sys.log_partitions[idx];
+                partition.io_loop(&task_trx_sys.config);
+            });
             *partition.io_thread.lock() = Some(handle);
         }
     }
@@ -491,6 +499,9 @@ impl TransactionSystem {
         }
 
         let log_partitions = &*self.log_partitions;
+        // Stop log and GC workers first so no background transaction path can
+        // enqueue more redo or retain references into the catalog while we are
+        // dismantling transaction-system state.
         for partition in log_partitions {
             {
                 let mut group_commit_g = partition.group_commit.lock();
@@ -517,6 +528,14 @@ impl TransactionSystem {
             handle.join().unwrap();
         }
 
+        // User-table page committers hold `QuiescentGuard<TransactionSystem>`.
+        // We must drop those guards before `QuiDAG` starts owner teardown, but
+        // only after all log/GC/purge workers have stopped. Earlier cleanup
+        // would risk skipping create-row-page redo for late row-page
+        // allocations, while later cleanup deadlocks owner drop on
+        // `TransactionSystem`'s own guard count.
+        self.catalog.shutdown_user_tables();
+
         for partition in log_partitions {
             let mut group_commit_g = partition.group_commit.lock();
             let Some(log_file) = group_commit_g.log_file.take() else {
@@ -539,8 +558,6 @@ fn blocking_table_ddl(ddl: &DDLRedo) -> Option<(TableID, CatalogCheckpointBlocki
 fn is_catalog_ddl(ddl: &DDLRedo) -> bool {
     matches!(ddl, DDLRedo::CreateTable(_) | DDLRedo::DropTable(_))
 }
-
-unsafe impl StaticLifetime for TransactionSystem {}
 
 impl Drop for TransactionSystem {
     #[inline]

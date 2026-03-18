@@ -4,11 +4,10 @@ use crate::buffer::{
 };
 use crate::catalog::Catalog;
 use crate::catalog::storage::CatalogStorage;
-use crate::engine::StaticHandle;
 use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
 use crate::io::{AIOContext, align_to_sector_size};
-use crate::lifetime::StaticLifetime;
+use crate::quiescent::QuiescentGuard;
 use crate::storage_path::{path_to_utf8, validate_log_file_stem};
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
 use crate::trx::purge::{GC, Purge};
@@ -66,24 +65,42 @@ pub struct TrxSysConfig {
 }
 
 pub(crate) struct PendingTransactionSystem {
-    pub(crate) trx_sys: StaticHandle<TransactionSystem>,
+    pub(crate) trx_sys: TransactionSystem,
+    startup: PendingTransactionSystemStartup,
+}
+
+pub(crate) struct PendingTransactionSystemStartup {
     gc_rxs: Vec<Receiver<GC>>,
     purge_rx: Receiver<Purge>,
-    mem_pool: StaticHandle<EvictableBufferPool>,
+    mem_pool: QuiescentGuard<EvictableBufferPool>,
     pool_guards: PoolGuards,
 }
 
 impl PendingTransactionSystem {
     #[inline]
-    pub(crate) async fn start(self) -> &'static TransactionSystem {
-        let trx_sys = self.trx_sys.as_static();
+    pub(crate) fn into_parts(self) -> (TransactionSystem, PendingTransactionSystemStartup) {
+        (self.trx_sys, self.startup)
+    }
+}
+
+impl PendingTransactionSystemStartup {
+    #[inline]
+    pub(crate) async fn start(
+        self,
+        trx_sys: QuiescentGuard<TransactionSystem>,
+    ) -> QuiescentGuard<TransactionSystem> {
         trx_sys
             .catalog
-            .enable_page_committer_for_tables(self.trx_sys.clone())
+            .enable_page_committer_for_tables(trx_sys.clone())
             .await;
-        trx_sys.start_io_threads();
-        trx_sys.start_gc_threads(self.gc_rxs);
-        trx_sys.start_purge_threads(self.mem_pool.as_static(), self.pool_guards, self.purge_rx);
+        TransactionSystem::start_io_threads(trx_sys.clone());
+        TransactionSystem::start_gc_threads(trx_sys.clone(), self.gc_rxs);
+        TransactionSystem::start_purge_threads(
+            trx_sys.clone(),
+            self.mem_pool,
+            self.pool_guards,
+            self.purge_rx,
+        );
         trx_sys
     }
 }
@@ -206,43 +223,32 @@ impl TrxSysConfig {
         Ok(path_to_utf8(&file_prefix, "redo log path")?.to_owned())
     }
 
-    pub async fn build_static(
+    pub(crate) async fn prepare(
         self,
-        meta_pool: &'static FixedBufferPool,
-        index_pool: &'static FixedBufferPool,
-        mem_pool: &'static EvictableBufferPool,
-        table_fs: &'static TableFileSystem,
-        global_disk_pool: &'static GlobalReadonlyBufferPool,
-    ) -> Result<&'static TransactionSystem> {
-        let pending = self
-            .prepare_static(meta_pool, index_pool, mem_pool, table_fs, global_disk_pool)
-            .await?;
-        Ok(pending.start().await)
-    }
-
-    pub(crate) async fn prepare_static(
-        self,
-        meta_pool: &'static FixedBufferPool,
-        index_pool: &'static FixedBufferPool,
-        mem_pool: impl Into<StaticHandle<EvictableBufferPool>>,
-        table_fs: &'static TableFileSystem,
-        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+        meta_pool: QuiescentGuard<FixedBufferPool>,
+        index_pool: QuiescentGuard<FixedBufferPool>,
+        mem_pool: QuiescentGuard<EvictableBufferPool>,
+        table_fs: QuiescentGuard<TableFileSystem>,
+        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<PendingTransactionSystem> {
-        let mem_pool = mem_pool.into();
-        let global_disk_pool = global_disk_pool.into();
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
             let initializer = self.log_partition_initializer(idx)?;
             log_partition_initializers.push(initializer);
         }
 
-        let catalog_storage =
-            CatalogStorage::new(meta_pool, index_pool, table_fs, global_disk_pool.clone()).await?;
+        let catalog_storage = CatalogStorage::new(
+            meta_pool.clone(),
+            index_pool.clone(),
+            &table_fs,
+            global_disk_pool.clone(),
+        )
+        .await?;
         let mut catalog = Catalog::new(catalog_storage).await?;
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, meta_pool.guard())
             .push(PoolRole::Index, index_pool.guard())
-            .push(PoolRole::Mem, mem_pool.as_static().guard())
+            .push(PoolRole::Mem, mem_pool.guard())
             .push(PoolRole::Disk, global_disk_pool.guard())
             .build();
 
@@ -252,7 +258,7 @@ impl TrxSysConfig {
             crate::trx::recover::RecoveryDeps {
                 meta_pool,
                 index_pool,
-                mem_pool: mem_pool.as_static(),
+                mem_pool: mem_pool.clone(),
                 table_fs,
                 global_disk_pool,
             },
@@ -264,13 +270,14 @@ impl TrxSysConfig {
 
         let (purge_chan, purge_rx) = flume::unbounded();
         let trx_sys = TransactionSystem::new(self, catalog, log_partitions, purge_chan);
-        let trx_sys = StaticLifetime::new_static(trx_sys);
         Ok(PendingTransactionSystem {
-            trx_sys: trx_sys.into(),
-            gc_rxs,
-            purge_rx,
-            mem_pool,
-            pool_guards,
+            trx_sys,
+            startup: PendingTransactionSystemStartup {
+                gc_rxs,
+                purge_rx,
+                mem_pool,
+                pool_guards,
+            },
         })
     }
 }

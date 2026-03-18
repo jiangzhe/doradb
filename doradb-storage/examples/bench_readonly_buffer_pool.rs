@@ -7,7 +7,7 @@ use doradb_storage::error::PersistedFileKind;
 use doradb_storage::file::table_fs::TableFileSystemConfig;
 use doradb_storage::io::AIOBuf;
 use doradb_storage::latch::LatchFallbackMode;
-use doradb_storage::lifetime::{StaticLifetime, StaticLifetimeScope};
+use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::value::ValKind;
 use rand::RngCore;
 use std::sync::Arc;
@@ -63,19 +63,16 @@ fn main() {
 
         write_pages(&table_file, args.pages).await;
 
-        let scope = StaticLifetimeScope::new();
-        let global = scope.adopt(
-            GlobalReadonlyBufferPool::with_capacity_static(PoolRole::Disk, args.cache_bytes)
-                .unwrap(),
+        let global = QuiescentBox::new(
+            GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, args.cache_bytes).unwrap(),
         );
-        let pool = scope.adopt(StaticLifetime::new_static(ReadonlyBufferPool::new(
+        let pool = QuiescentBox::new(ReadonlyBufferPool::new(
             901,
             PersistedFileKind::TableFile,
             Arc::clone(&table_file),
-            global.as_static(),
-        )));
-        let pool = pool.as_static();
-        let pool_guard = pool.guard();
+            global.guard(),
+        ));
+        let pool_guard = (*pool).guard();
 
         let cold_start = Instant::now();
         let mut cold_checksum = 0u64;

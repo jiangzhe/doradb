@@ -2,7 +2,7 @@ use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use doradb_storage::buffer::{BufferPool, FixedBufferPool, PoolRole};
 use doradb_storage::index::{BTree, BTreeCompactConfig, BTreeU64};
-use doradb_storage::lifetime::StaticLifetimeScope;
+use doradb_storage::quiescent::QuiescentBox;
 use rand_distr::{Distribution, Uniform};
 use std::collections::BTreeMap;
 
@@ -32,13 +32,11 @@ async fn single_thread(args: &Args) {
 }
 
 async fn single_thread_bench_btree(args: &Args) {
-    let scope = StaticLifetimeScope::new();
     let pool =
-        scope.adopt(FixedBufferPool::with_capacity_static(PoolRole::Index, args.mem_size).unwrap());
-    let pool = pool.as_static();
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Index, args.mem_size).unwrap());
     {
-        let pool_guard = pool.guard();
-        let tree = BTree::new(pool, &pool_guard, args.hints_enabled, 1).await;
+        let pool_guard = (*pool).guard();
+        let tree = BTree::new(pool.guard(), &pool_guard, args.hints_enabled, 1).await;
 
         let start = Instant::now();
         match &args.mode[..] {

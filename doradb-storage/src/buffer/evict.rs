@@ -17,8 +17,8 @@ use crate::io::{
     UnsafeAIO,
 };
 use crate::latch::{GuardState, LatchFallbackMode};
-use crate::lifetime::StaticLifetime;
 use crate::notify::EventNotifyOnDrop;
+use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::storage_path::{path_to_utf8, validate_swap_file_path_candidate};
 use byte_unit::Byte;
 use event_listener::{Event, EventListener, listener};
@@ -89,20 +89,8 @@ impl EvictableBufferPool {
             file_io,
             prev_queuing: 0,
             prev_running: 0,
+            _pool: None,
         }
-    }
-
-    #[inline]
-    fn new_evictor(&'static self) -> Evictor<EvictableRuntime> {
-        let runtime = EvictableRuntime {
-            arena: self.arena.arena_guard(self.guard()),
-            in_mem: Arc::clone(&self.in_mem),
-            io_client: self.io_client.clone(),
-            inflight_io: Arc::clone(&self.inflight_io),
-        };
-        let policy =
-            PressureDeltaClockPolicy::new(self.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
-        Evictor::new(runtime, policy, Arc::clone(&self.shutdown_flag))
     }
 
     /// Returns AIO statistics.
@@ -252,33 +240,58 @@ impl EvictableBufferPool {
     }
 
     #[inline]
-    fn start_io_thread(&self, event_loop: AIOEventLoop<PoolRequest>, file_io: SingleFileIO) {
-        let listener = self.new_listener(file_io);
-        let io_thread = event_loop.start_thread(listener);
-        let mut g = self.io_thread.lock();
-        *g = Some(io_thread);
-    }
-
-    #[inline]
-    fn start_evict_thread(&'static self) {
-        let handle = self
-            .new_evictor()
-            .start_thread("EvictableBufferPoolEvictor");
-        let mut g = self.in_mem.evict_thread.lock();
-        *g = Some(handle);
-    }
-
-    #[inline]
-    fn start_background_workers(&'static self) {
+    pub(crate) fn start_background_workers_guarded(pool: QuiescentGuard<Self>) {
+        // Acquire one direct guard from the stable owner, convert it once to
+        // `SyncQuiescentGuard`, then clone that wrapper into the IO and
+        // eviction workers. This keeps spawned threads on the guard side
+        // without recreating static-lifetime owners or handles.
         let pending = {
-            let mut g = self.pending_io.lock();
+            let mut g = pool.pending_io.lock();
             g.take()
         };
         let Some(pending) = pending else {
             return;
         };
-        self.start_io_thread(pending.event_loop, pending.file_io);
-        self.start_evict_thread();
+        let pool = pool.into_sync();
+        Self::start_io_thread_guarded(pool.clone(), pending.event_loop, pending.file_io);
+        Self::start_evict_thread_guarded(pool);
+    }
+
+    #[inline]
+    fn start_io_thread_guarded(
+        pool: SyncQuiescentGuard<Self>,
+        event_loop: AIOEventLoop<PoolRequest>,
+        file_io: SingleFileIO,
+    ) {
+        let listener = EvictableBufferPoolListener {
+            inflight_io: Arc::clone(&pool.inflight_io),
+            in_mem: Arc::clone(&pool.in_mem),
+            stats: Arc::clone(&pool.stats),
+            file_io,
+            prev_queuing: 0,
+            prev_running: 0,
+            _pool: Some(pool.clone()),
+        };
+        let io_thread = event_loop.start_thread(listener);
+        let mut g = pool.io_thread.lock();
+        *g = Some(io_thread);
+    }
+
+    #[inline]
+    fn start_evict_thread_guarded(pool: SyncQuiescentGuard<Self>) {
+        let runtime = EvictableRuntime {
+            arena: pool.arena.arena_guard(pool.guard()),
+            in_mem: Arc::clone(&pool.in_mem),
+            io_client: pool.io_client.clone(),
+            inflight_io: Arc::clone(&pool.inflight_io),
+            _pool: Some(pool.clone()),
+        };
+        let policy =
+            PressureDeltaClockPolicy::new(pool.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
+        let handle = Evictor::new(runtime, policy, Arc::clone(&pool.shutdown_flag))
+            .start_thread("EvictableBufferPoolEvictor");
+        let mut g = pool.in_mem.evict_thread.lock();
+        *g = Some(handle);
     }
 
     #[inline]
@@ -339,10 +352,7 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    async fn allocate_page<T: BufferPage>(
-        &'static self,
-        guard: &PoolGuard,
-    ) -> PageExclusiveGuard<T> {
+    async fn allocate_page<T: BufferPage>(&self, guard: &PoolGuard) -> PageExclusiveGuard<T> {
         loop {
             self.reserve_page().await;
 
@@ -371,7 +381,7 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     async fn allocate_page_at<T: BufferPage>(
-        &'static self,
+        &self,
         guard: &PoolGuard,
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
@@ -388,7 +398,7 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     async fn get_page<T: BufferPage>(
-        &'static self,
+        &self,
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
@@ -436,7 +446,7 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     async fn try_get_page_versioned<T: BufferPage>(
-        &'static self,
+        &self,
         guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
@@ -490,7 +500,7 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    fn deallocate_page<T: BufferPage>(&'static self, mut g: PageExclusiveGuard<T>) {
+    fn deallocate_page<T: BufferPage>(&self, mut g: PageExclusiveGuard<T>) {
         let page_id = g.page_id();
         g.page_mut().zero(); // zero the page
         g.bf_mut().ctx = None;
@@ -504,7 +514,7 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     async fn get_child_page<T: BufferPage>(
-        &'static self,
+        &self,
         guard: &PoolGuard,
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
@@ -574,8 +584,6 @@ unsafe impl Send for EvictableBufferPool {}
 
 unsafe impl Sync for EvictableBufferPool {}
 
-unsafe impl StaticLifetime for EvictableBufferPool {}
-
 /// IO event-loop adapter for [`EvictableBufferPool`].
 ///
 /// It translates high-level pool requests into concrete page IO submissions and
@@ -587,6 +595,7 @@ pub struct EvictableBufferPoolListener {
     file_io: SingleFileIO,
     prev_queuing: usize,
     prev_running: usize,
+    _pool: Option<SyncQuiescentGuard<EvictableBufferPool>>,
 }
 
 impl AIOEventListener for EvictableBufferPoolListener {
@@ -741,6 +750,7 @@ struct EvictableRuntime {
     in_mem: Arc<InMemPageSet>,
     inflight_io: Arc<InflightIO>,
     io_client: AIOClient<PoolRequest>,
+    _pool: Option<SyncQuiescentGuard<EvictableBufferPool>>,
 }
 
 impl EvictableRuntime {
@@ -1155,6 +1165,10 @@ impl EvictableBufferPoolConfig {
         self
     }
 
+    /// Builds a raw evictable buffer pool without starting background workers.
+    ///
+    /// Worker startup must happen only after the pool has reached a stable
+    /// owner address in [`QuiescentBox`] or [`crate::quiescent::QuiDAG`].
     #[inline]
     pub fn build(self) -> Result<EvictableBufferPool> {
         self.role.assert_valid("evictable buffer pool");
@@ -1210,12 +1224,17 @@ impl EvictableBufferPoolConfig {
         Ok(pool)
     }
 
-    /// Create a new evictable buffer pool with given capacity.
+    /// Builds a started quiescent owner for standalone evictable-pool usage.
+    ///
+    /// The returned owner already has its IO and eviction workers running
+    /// through the guarded startup path. Call [`EvictableBufferPool::shutdown`]
+    /// before dropping non-process-lifetime owners, otherwise
+    /// [`QuiescentBox`] teardown will wait forever on the workers' keepalive
+    /// guards.
     #[inline]
-    pub fn build_static(self) -> Result<&'static EvictableBufferPool> {
-        let pool = self.build()?;
-        let pool = StaticLifetime::new_static(pool);
-        pool.start_background_workers();
+    pub fn build_owned(self) -> Result<QuiescentBox<EvictableBufferPool>> {
+        let pool = QuiescentBox::new(self.build()?);
+        EvictableBufferPool::start_background_workers_guarded(pool.guard());
         Ok(pool)
     }
 }
@@ -1381,13 +1400,58 @@ pub enum PoolRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
+    use crate::buffer::guard::PageGuard;
+    use crate::quiescent::QuiescentBox;
     use crate::row::RowPage;
+    use std::ops::Deref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    struct StartedEvictPool {
+        owner: QuiescentBox<EvictableBufferPool>,
+    }
+
+    impl StartedEvictPool {
+        fn new(config: EvictableBufferPoolConfig) -> Self {
+            Self {
+                owner: config.build_owned().unwrap(),
+            }
+        }
+
+        fn owner_guard(&self) -> QuiescentGuard<EvictableBufferPool> {
+            self.owner.guard()
+        }
+    }
+
+    impl Deref for StartedEvictPool {
+        type Target = EvictableBufferPool;
+
+        fn deref(&self) -> &Self::Target {
+            &self.owner
+        }
+    }
+
+    impl Drop for StartedEvictPool {
+        fn drop(&mut self) {
+            self.owner.shutdown();
+        }
+    }
+
+    fn wait_for<F>(mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..100 {
+            if predicate() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("condition was not satisfied before timeout");
+    }
 
     #[test]
     fn test_evictable_buffer_pool_shutdown_is_idempotent_before_workers_start() {
@@ -1408,17 +1472,13 @@ mod tests {
     fn test_evict_buffer_pool_simple() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
+            let pool = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
                     .max_mem_size(1024u64 * 1024 * 128)
-                    .max_file_size(1024u64 * 1024 * 256)
-                    .build_static()
-                    .unwrap(),
+                    .max_file_size(1024u64 * 1024 * 256),
             );
-            let pool = pool.as_static();
             let pool_guard = pool.guard();
             {
                 let g = pool.allocate_page::<RowPage>(&pool_guard).await;
@@ -1524,28 +1584,25 @@ mod tests {
     fn test_evict_buffer_pool_full() {
         // 100 in-mem pages and 200 total pages.
         let temp_dir = TempDir::new().unwrap();
-        let scope = StaticLifetimeScope::new();
-        let pool: &EvictableBufferPool = scope
-            .adopt(
-                EvictableBufferPoolConfig::default()
-                    .role(crate::buffer::PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.bin"))
-                    .max_mem_size(64u64 * 1024 * 130)
-                    .max_file_size(128u64 * 1024 * 130)
-                    .build_static()
-                    .unwrap(),
-            )
-            .as_static();
+        let pool = StartedEvictPool::new(
+            EvictableBufferPoolConfig::default()
+                .role(crate::buffer::PoolRole::Mem)
+                .data_swap_file(temp_dir.path().join("data.bin"))
+                .max_mem_size(64u64 * 1024 * 130)
+                .max_file_size(128u64 * 1024 * 130),
+        );
+        let pool_ref = pool.owner_guard();
         let pool_guard = pool.guard();
 
         let (tx, rx) = flume::unbounded();
         let handle1 = {
             let pool_guard = pool_guard.clone();
+            let pool_ref = pool_ref.clone();
             thread::spawn(move || {
                 smol::block_on(async move {
                     // allocate more pages than memory limit.
                     for i in 0..160 {
-                        let g = pool.allocate_page::<RowPage>(&pool_guard).await;
+                        let g = pool_ref.allocate_page::<RowPage>(&pool_guard).await;
                         let _ = tx.send(g.page_id());
                         println!("allocated page {}", i);
                     }
@@ -1556,7 +1613,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(50));
         println!("wait sometime");
-        smol::block_on(async move {
+        smol::block_on(async {
             while let Ok(page_id) = rx.recv() {
                 let g = pool
                     .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
@@ -1576,17 +1633,13 @@ mod tests {
     fn test_evict_buffer_pool_alloc() {
         // max pages 16k, max in-mem 1k
         let temp_dir = TempDir::new().unwrap();
-        let scope = StaticLifetimeScope::new();
-        let pool = scope.adopt(
+        let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
                 .data_swap_file(temp_dir.path().join("data.bin"))
                 .max_mem_size(1024u64 * 1024 * 64)
-                .max_file_size(1024u64 * 1024 * 128)
-                .build_static()
-                .unwrap(),
+                .max_file_size(1024u64 * 1024 * 128),
         );
-        let pool = pool.as_static();
         let pool_guard = pool.guard();
 
         println!(
@@ -1605,10 +1658,46 @@ mod tests {
     }
 
     #[test]
+    fn test_evictable_buffer_pool_build_owned_starts_workers_for_eviction_and_reload() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = EvictableBufferPoolConfig::default()
+                .role(crate::buffer::PoolRole::Mem)
+                .data_swap_file(temp_dir.path().join("data.bin"))
+                .max_mem_size(64u64 * 1024 * 130)
+                .max_file_size(128u64 * 1024 * 130)
+                .build_owned()
+                .unwrap();
+            let pool_guard = EvictableBufferPool::guard(&pool);
+            let total_pages = pool.in_mem.max_count + 64;
+
+            for i in 0..total_pages {
+                let mut g = pool.allocate_page::<Page>(&pool_guard).await;
+                let payload = format!("page-{i}");
+                g.page_mut()[..payload.len()].copy_from_slice(payload.as_bytes());
+                drop(g);
+            }
+
+            wait_for(|| pool.arena.frame(0).kind() == FrameKind::Evicted);
+
+            let g = pool
+                .get_page::<Page>(&pool_guard, 0, LatchFallbackMode::Shared)
+                .await;
+            let g = g.lock_shared_async().await.unwrap();
+            assert_eq!(&g.page()[..6], b"page-0");
+            drop(g);
+
+            pool.shutdown();
+            drop(pool_guard);
+            drop(pool);
+        });
+    }
+
+    #[test]
     fn test_evictable_buffer_pool_drop_waits_for_outstanding_guard() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let pool = StaticLifetime::new_static(
+            let pool = QuiescentBox::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir.path().join("data.bin"))
@@ -1618,18 +1707,14 @@ mod tests {
                     .unwrap(),
             );
             let guard = {
-                let pool_guard = pool.guard();
+                let pool_guard = EvictableBufferPool::guard(&pool);
                 pool.allocate_page::<RowPage>(&pool_guard).await
             };
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
 
             let handle = thread::spawn(move || {
-                // SAFETY: this test stops using `pool` after spawning teardown
-                // and only keeps the page guard alive to validate arena drain.
-                unsafe {
-                    StaticLifetime::drop_static(pool);
-                }
+                drop(pool);
                 dropped_flag.store(true, Ordering::SeqCst);
             });
 
@@ -1648,18 +1733,13 @@ mod tests {
         use rand::{Rng, prelude::IndexedRandom};
         // max pages 2k, max in-mem 1k
         let temp_dir = TempDir::new().unwrap();
-        let scope = StaticLifetimeScope::new();
-        let pool = scope
-            .adopt(
-                EvictableBufferPoolConfig::default()
-                    .role(crate::buffer::PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.bin"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(64u64 * 1024 * 2048)
-                    .build_static()
-                    .unwrap(),
-            )
-            .as_static();
+        let pool = StartedEvictPool::new(
+            EvictableBufferPoolConfig::default()
+                .role(crate::buffer::PoolRole::Mem)
+                .data_swap_file(temp_dir.path().join("data.bin"))
+                .max_mem_size(64u64 * 1024 * 1024)
+                .max_file_size(64u64 * 1024 * 2048),
+        );
         let pool_guard = pool.guard();
 
         println!(
@@ -1670,6 +1750,7 @@ mod tests {
         let mut handles = vec![];
         for thread_id in 0..10 {
             let pool_guard = pool_guard.clone();
+            let pool_ref = pool.owner_guard();
             let handle = thread::spawn(move || {
                 smol::block_on(async {
                     let mut rng = rand::rng();
@@ -1678,17 +1759,17 @@ mod tests {
                     for _ in 0..200 {
                         // allocate a new page.
                         println!("thread {} alloc page start", thread_id);
-                        let g = pool.allocate_page::<RowPage>(&pool_guard).await;
+                        let g = pool_ref.allocate_page::<RowPage>(&pool_guard).await;
                         pages.push(g.page_id());
                         println!(
                             "thread {} alloc page end page_id {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
                             thread_id,
                             g.page_id(),
-                            pool.allocated(),
-                            pool.in_mem.count.load(Ordering::Relaxed),
-                            pool.in_mem.eviction_arbiter.target_free(),
-                            pool.inflight_io.reads.load(Ordering::Relaxed),
-                            pool.inflight_io.writes.load(Ordering::Relaxed),
+                            pool_ref.allocated(),
+                            pool_ref.in_mem.count.load(Ordering::Relaxed),
+                            pool_ref.in_mem.eviction_arbiter.target_free(),
+                            pool_ref.inflight_io.reads.load(Ordering::Relaxed),
+                            pool_ref.inflight_io.writes.load(Ordering::Relaxed),
                         );
                         // unlock the page.
                         drop(g);
@@ -1699,13 +1780,13 @@ mod tests {
                                 "thread {} read page {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
                                 thread_id,
                                 page_id,
-                                pool.allocated(),
-                                pool.in_mem.count.load(Ordering::Relaxed),
-                                pool.in_mem.eviction_arbiter.target_free(),
-                                pool.inflight_io.reads.load(Ordering::Relaxed),
-                                pool.inflight_io.writes.load(Ordering::Relaxed),
+                                pool_ref.allocated(),
+                                pool_ref.in_mem.count.load(Ordering::Relaxed),
+                                pool_ref.in_mem.eviction_arbiter.target_free(),
+                                pool_ref.inflight_io.reads.load(Ordering::Relaxed),
+                                pool_ref.inflight_io.writes.load(Ordering::Relaxed),
                             );
-                            let g = pool
+                            let g = pool_ref
                                 .get_page::<RowPage>(
                                     &pool_guard,
                                     page_id,
@@ -1729,8 +1810,7 @@ mod tests {
     #[test]
     fn test_evict_buffer_pool_uses_custom_arbiter_builder() {
         let temp_dir = TempDir::new().unwrap();
-        let scope = StaticLifetimeScope::new();
-        let pool = scope.adopt(
+        let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
                 .data_swap_file(temp_dir.path().join("data.bin"))
@@ -1743,11 +1823,8 @@ mod tests {
                         .failure_rate_threshold(0.05)
                         .failure_window(5)
                         .dynamic_batch_bounds(3, 3),
-                )
-                .build_static()
-                .unwrap(),
+                ),
         );
-        let pool = pool.as_static();
         let _pool_guard = pool.guard();
         let arbiter = pool.in_mem.eviction_arbiter;
 
@@ -1778,27 +1855,20 @@ mod tests {
         smol::block_on(async {
             let temp_dir1 = TempDir::new().unwrap();
             let temp_dir2 = TempDir::new().unwrap();
-            let scope = StaticLifetimeScope::new();
-            let pool1 = scope.adopt(
+            let pool1 = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir1.path().join("data1.bin"))
                     .max_mem_size(1024u64 * 1024 * 32)
-                    .max_file_size(1024u64 * 1024 * 64)
-                    .build_static()
-                    .unwrap(),
+                    .max_file_size(1024u64 * 1024 * 64),
             );
-            let pool2 = scope.adopt(
+            let pool2 = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
                     .data_swap_file(temp_dir2.path().join("data2.bin"))
                     .max_mem_size(1024u64 * 1024 * 32)
-                    .max_file_size(1024u64 * 1024 * 64)
-                    .build_static()
-                    .unwrap(),
+                    .max_file_size(1024u64 * 1024 * 64),
             );
-            let pool1 = pool1.as_static();
-            let pool2 = pool2.as_static();
             let pool1_guard = pool1.guard();
             let pool2_guard = pool2.guard();
 

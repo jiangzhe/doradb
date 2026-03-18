@@ -36,6 +36,7 @@ At minimum, evaluate relevant files from:
 
 Then inspect impacted modules and call paths in `doradb-storage/src/`.
 Ground design decisions in concrete file-level impacts.
+If the RFC touches test strategy, timeout policy, or validation workflow, also read `docs/process/unit-test.md`.
 
 ## Step 2: Enforce Evidence Gate
 
@@ -91,6 +92,11 @@ Revise the draft with user feedback and finalize:
 - implementation phases
 - alternatives considered (with rejection rationale)
 - risks and test strategy
+
+When test strategy includes enforced timeouts or hang detection:
+- do not assume plain `cargo test` can provide it;
+- define the required runner/tooling change explicitly; and
+- use `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md` as the current follow-up when the RFC is not itself implementing test-runner changes.
 
 Validate structure before formalization:
 ```bash

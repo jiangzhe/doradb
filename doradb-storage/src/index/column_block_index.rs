@@ -1141,9 +1141,9 @@ fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey};
+    use crate::buffer::{ReadonlyCacheKey, global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableMetadata,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::table_file::{MutableTableFile, TableFile};
@@ -1152,7 +1152,7 @@ mod tests {
     use crate::io::AIOBuf;
     use crate::ptr::UnsafePtr;
     use crate::value::ValKind;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     fn copy_persisted_node(
         page: &[u8],
@@ -1337,26 +1337,6 @@ mod tests {
             .expect("join test thread");
     }
 
-    fn global_readonly_pool() -> &'static GlobalReadonlyBufferPool {
-        static GLOBAL: OnceLock<&'static GlobalReadonlyBufferPool> = OnceLock::new();
-        GLOBAL.get_or_init(|| {
-            GlobalReadonlyBufferPool::with_capacity_static(
-                crate::buffer::PoolRole::Disk,
-                64 * 1024 * 1024,
-            )
-            .unwrap()
-        })
-    }
-
-    fn readonly_pool(table_id: TableID, table_file: &Arc<TableFile>) -> ReadonlyBufferPool {
-        ReadonlyBufferPool::new(
-            table_id,
-            PersistedFileKind::TableFile,
-            Arc::clone(table_file),
-            global_readonly_pool(),
-        )
-    }
-
     #[test]
     fn test_batch_insert_into_empty_tree_and_find() {
         run_with_large_stack(|| {
@@ -1366,7 +1346,8 @@ mod tests {
                 let table_file = fs.create_table_file(200, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(200, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 200, &table_file);
 
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
                 let entries = vec![(10, 100), (20, 200), (30, 300)];
@@ -1403,7 +1384,8 @@ mod tests {
                 let table_file = fs.create_table_file(203, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(203, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 203, &table_file);
 
                 let entries = vec![(5, 500), (15, 600)];
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
@@ -1438,7 +1420,8 @@ mod tests {
                 let table_file = fs.create_table_file(201, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(201, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 201, &table_file);
 
                 let entries = build_entries(0, 8, 1000);
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
@@ -1492,7 +1475,8 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
 
-                let disk_pool = readonly_pool(204, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 204, &table_file);
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
                 let mut mutable = MutableTableFile::fork(&table_file);
                 let root_page = index
@@ -1528,7 +1512,8 @@ mod tests {
                 let table_file = fs.create_table_file(202, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(202, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 202, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES - 1;
                 let entries = build_entries(0, initial_count, 1);
@@ -1590,7 +1575,8 @@ mod tests {
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
 
-                let disk_pool = readonly_pool(205, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 205, &table_file);
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
                 let mut setup_mutable = MutableTableFile::fork(&table_file);
                 let obsolete_page_id = setup_mutable.allocate_page_id().unwrap();
@@ -1611,7 +1597,7 @@ mod tests {
                 let (table_file, old_root) = setup_mutable.commit(2, false).await.unwrap();
                 drop(old_root);
 
-                let disk_pool = readonly_pool(205, &table_file);
+                let disk_pool = table_readonly_pool(&global, 205, &table_file);
                 let index = ColumnBlockIndex::new(0, 0, &disk_pool);
                 let mut mutable = MutableTableFile::fork(&table_file);
                 let child_page_id = mutable.allocate_page_id().unwrap();
@@ -1675,7 +1661,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(207, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 207, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
                 let entries = build_entries(0, initial_count, 7000);
@@ -1765,7 +1752,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(208, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 208, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
                 let entries = build_entries(0, initial_count, 8000);
@@ -1842,7 +1830,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(209, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 209, &table_file);
 
                 let entries = build_entries(0, 4, 9000);
                 let mut mutable = MutableTableFile::fork(&table_file);
@@ -1927,7 +1916,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(211, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 211, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
                 let entries = build_entries(0, initial_count, 11_000);
@@ -1991,7 +1981,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(212, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 212, &table_file);
 
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
                 let entries = build_entries(0, initial_count, 12_000);
@@ -2063,7 +2054,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(213, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 213, &table_file);
 
                 let entries = build_entries(0, COLUMN_BLOCK_MAX_ENTRIES + 8, 13_000);
                 let mut mutable = MutableTableFile::fork(&table_file);
@@ -2124,7 +2116,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(210, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 210, &table_file);
 
                 let mut payload = build_deletion_payload();
                 payload.set_offloaded_ref(BlobRef {
@@ -2167,7 +2160,8 @@ mod tests {
                     .unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(214, &table_file);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 214, &table_file);
 
                 let entries = build_entries(0, 1, 9100);
                 let mut mutable = MutableTableFile::fork(&table_file);
@@ -2223,8 +2217,8 @@ mod tests {
                 let table_file = fs.create_table_file(206, metadata, false).unwrap();
                 let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
                 drop(old_root);
-                let disk_pool = readonly_pool(206, &table_file);
-                let global = global_readonly_pool();
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, 206, &table_file);
 
                 // Build at least two leaves so right-most append can preserve left leaf pages.
                 let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;

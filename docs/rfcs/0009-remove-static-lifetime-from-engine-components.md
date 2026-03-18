@@ -17,18 +17,18 @@ with quiescent guard ownership plus an explicit engine shutdown phase.
 `EngineInner` will store quiescent guards to the top-level components,
 `EngineRef` will remain an `Arc<EngineInner>`, and `BufferPool` APIs will drop
 `&'static self` in favor of ordinary shared borrows with the existing
-`PoolGuard` provenance model. Worker-backed components such as
-`TransactionSystem`, `TableFileSystem`, `EvictableBufferPool`, and
-`GlobalReadonlyBufferPool` will keep their current internal worker model with
-only minor changes: they must expose explicit stop/join hooks so engine
-shutdown can drain workers before quiescent owner drop begins. The final phase
-also adds dedicated documentation for lifetime management and guard patterns,
-plans an opt-in quiescent-drop timeout for debug and test diagnosis, and cleans
-up stale or duplicated tests after the compatibility layer is gone. The final
-state removes `StaticLifetime`, `StaticOwner`, `StaticHandle`, `as_static`, and
-the remaining static constructors from production code and, by the end of the
-program, from tests as well. [D1] [D2] [D4] [D7] [D8] [D9] [D10] [D11] [D12]
-[D13] [D14] [C1] [C2] [C3] [C7] [C8] [C9] [C10] [C16] [U1] [U2] [U3] [U4]
+`PoolGuard` provenance model. The current implementation phase now combines the
+original engine-ownership migration, the `BufferPool: &self` runtime call-path
+cleanup, guard-based worker startup, and the production removal of the static
+compatibility bridge while preserving explicit started-vs-unstarted startup
+contracts. Later phases will refactor engine lifecycle orchestration around a
+crate-private `Component` trait, split `Catalog` from `TransactionSystem`, and
+extract background-thread ownership behind existing component seams. The final
+phase covers dedicated lifetime-management documentation, optional
+quiescent-drop timeout diagnostics for debug/test use, and stale-test cleanup
+after the runtime migration is complete. [D1] [D2]
+[D4] [D7] [D8] [D9] [D10] [D11] [D12] [D13] [D14] [C1] [C2] [C3] [C7] [C8]
+[C9] [C10] [C16] [U1] [U2] [U3] [U4]
 
 ## Context
 
@@ -62,9 +62,12 @@ guard drain. [D2] [D4] [D5] [D7] [C3] [C7] [C8] [C9] [C10] [B1] [U4]
 
 This RFC is needed now because RFC-0008 intentionally stopped after the first
 three quiescent phases and marked the original final phases superseded.
-The repository now needs a new architecture-level decision for the real end
-state instead of extending the transitional `StaticLifetime` bridge
-indefinitely. [D7] [D8] [D9] [D10] [D11] [U1]
+Implementation since then has also shown that the original separation between
+guard-owned engine migration and the `BufferPool: &self` runtime cleanup is too
+narrow. The repository now needs a phase plan that matches the actual runtime
+refactor boundary instead of extending the transitional `StaticLifetime`
+bridge indefinitely or preserving an artificial split between closely coupled
+changes. [D7] [D8] [D9] [D10] [D11] [U1]
 
 The migration also has one explicit startup-contract constraint already tracked
 in backlog `000055`: removing `build_static()` for `EvictableBufferPool` must
@@ -115,8 +118,8 @@ Issue Labels:
   - `QuiDAG` and `QuiDep` design constraints, including explicit non-goals
   around graceful shutdown and `QuiescentBox` contract changes.
 - [D14] `docs/tasks/000029-static-lifetime-test-teardown-safety-phase-6.md` -
-  existing static-lifetime test helper surface that should disappear after the
-  final migration and test cleanup.
+  existing static-lifetime test helper surface that should disappear during the
+  current runtime migration rather than in the final cleanup phase.
 
 ### Code References
 
@@ -155,7 +158,7 @@ Issue Labels:
 - [C15] `doradb-storage/src/trx/mod.rs` - transaction/session state still
   expects `EngineRef` to remain the shared engine access handle.
 - [C16] `doradb-storage/src/lifetime.rs` - remaining static-lifetime trait and
-  scoped test teardown helper that become cleanup targets in the final phase.
+  scoped test teardown helper that now become cleanup targets in phase 2.
 
 ### Conversation References
 
@@ -178,10 +181,14 @@ Issue Labels:
 ## Decision
 
 RFC-0009 adopts a quiescent-ownership end state with an explicit engine
-shutdown barrier. The design is intentionally different from RFC-0008's old
-superseded final phases: worker-backed components remain mostly internally
-structured as they are today, but they must no longer depend on destructor
-entry to stop their workers. [D7] [C3] [C7] [C8] [C9] [C10] [U4]
+shutdown barrier. The implementation program is intentionally staged around the
+actual runtime boundaries now visible in the repository: the current phase
+combines guard-owned engine migration, `BufferPool: &self`, guard-based worker
+startup, and production bridge removal; a later internal refactor will unify
+component dependency/startup/shutdown logic behind a crate-private
+`Component` trait; and only after that will the architecture split `Catalog`
+out of `TransactionSystem` and extract background-thread ownership behind the
+existing component seams. [D7] [C1] [C3] [C7] [C8] [C9] [C10] [U4]
 
 ### 1. Engine teardown will become a two-step process: shutdown, then owner drop
 
@@ -225,23 +232,26 @@ runtime dependencies will use `QuiescentGuard<T>` or `QuiDep<T>` directly,
 depending on whether the dependency is engine-root shared state or a declared
 component edge. [D8] [D9] [C1] [C3] [C4] [C5] [C6] [C11] [U1] [U2]
 
-### 3. Worker-backed components will keep their current internal worker model
+### 3. The current phase keeps the existing worker model as the near-term migration boundary
 
 `TransactionSystem`, `TableFileSystem`, `EvictableBufferPool`, and
 `GlobalReadonlyBufferPool` will not be split into separate DAG worker nodes by
-default. Instead, each will add explicit shutdown/startup hooks or equivalent
-minor internal seams so engine shutdown can stop and join workers before owner
-drop begins. Their internal channels, thread names, event loops, and worker
-ownership can remain otherwise largely unchanged. [D2] [D5] [C7] [C8] [C9]
-[C10] [U4]
+default during the current phase. Instead, each will add explicit
+shutdown/startup hooks or equivalent minor internal seams so engine shutdown
+can stop and join workers before owner drop begins. Their internal channels,
+thread names, event loops, and worker ownership can remain otherwise largely
+unchanged while the production static bridge is removed. [D2] [D5] [C7] [C8]
+[C9] [C10] [U4]
 
 Worker threads may retain the component guards they need while the engine is
 running, but the shutdown contract must ensure those guards are no longer
 needed once the component-specific stop/join hook returns. This prevents
-self-pinning and drop-entry deadlocks while keeping the component internals
-close to the current design. [C3] [C7] [C8] [C9] [C10] [U3] [U4]
+self-pinning and drop-entry deadlocks while keeping the current migration
+phase close to the existing design. Later phases may further reorganize worker
+ownership once component lifecycle orchestration is declarative. [C3] [C7]
+[C8] [C9] [C10] [U3] [U4]
 
-### 4. `BufferPool` and downstream runtime APIs will remove `&'static self`
+### 4. `BufferPool: &self` and the dependent runtime migration belong to the current phase
 
 `BufferPool` will stop inheriting `StaticLifetime`, and all page-producing or
 page-access methods will move from `&'static self` to `&self`. The existing
@@ -258,7 +268,7 @@ That API change will propagate through:
 6. engine/session helpers that construct multi-pool guard bundles.
 [D1] [D2] [D3] [D4] [C4] [C5] [C6] [C11] [C14] [C15] [U3]
 
-### 5. Removing static builders must preserve explicit startup contracts
+### 5. Removing static builders must preserve explicit startup contracts in the current phase
 
 The migration will not silently fold worker startup into plain constructors when
 static builders disappear. In particular, replacing
@@ -269,9 +279,9 @@ startup, using a staged or typed startup contract rather than changing
 worker-backed component that currently couples startup to a static constructor.
 [C8] [C9] [B2] [U4]
 
-### 6. The compatibility layer is temporary and will be deleted
+### 6. Phase 2 removes the remaining static-lifetime compatibility layer
 
-The end state of this RFC removes the remaining static-lifetime compatibility
+The current runtime phase removes the remaining static-lifetime compatibility
 machinery:
 1. `StaticLifetime`
 2. `StaticLifetimeScope`
@@ -281,15 +291,24 @@ machinery:
    `build_static(...)`, and similar helpers
 6. production and test uses of `as_static()`
 
-The migration may use temporary compatibility shims between implementation
-phases, but the final RFC outcome is deletion rather than preservation of two
-parallel ownership systems. [D7] [D8] [D9] [C1] [C2] [C4] [C7] [C8] [C9]
-[C10] [U1] [U3]
+This RFC no longer permits a replacement compatibility layer between phases.
+The phase-2 end state is one runtime ownership system, with test code updated
+alongside production code where that is required to delete the remaining
+static-lifetime surface. [D7] [D8] [D9] [C1] [C2] [C4] [C7] [C8] [C9] [C10]
+[C16] [U1] [U3]
 
-### 7. Final cleanup includes documentation, diagnostics, and test review
+### 7. Later phases add declarative component lifecycle and then split catalog and worker ownership
 
-The final phase of the RFC will do more than delete compatibility code. It will
-also:
+After the current phase finishes the runtime migration, the next internal
+architecture phase will introduce a crate-private `Component` trait that
+defines dependency declaration plus startup and shutdown hooks for engine
+components. That phase will refactor engine-local DAG build and teardown logic
+to use component-declared lifecycle orchestration instead of ad hoc engine
+wiring. A following phase will then:
+1. split `Catalog` from `TransactionSystem`; and
+2. extract background-thread ownership behind the existing component seams.
+
+The final phase of the RFC will then:
 1. add a dedicated design document under `docs/` describing engine-component
    lifetime management, buffer-pool lifetime rules, and the guard patterns used
    across engine, pool, and page access paths;
@@ -297,7 +316,7 @@ also:
    leaked guards fail faster and produce clearer signals, while keeping the
    default production drop contract blocking and safe;
 3. audit the affected test matrix and remove stale, redundant, or duplicated
-   cases after the static-lifetime helpers are gone.
+   cases after the phase-2 static-lifetime cleanup is complete.
 [D12] [D13] [D14] [C3] [C16] [U4]
 
 ## Alternatives Considered
@@ -437,46 +456,67 @@ Reference:
   - Related Backlogs:
     - `docs/backlogs/000059-add-session-drain-and-forced-shutdown-policy-after-engine-shutdown-barrier.md`
 
-- **Phase 2: Guard-Owned Engine Components**
+- **Phase 2: Guard-Owned Engine Components And Runtime Static-Lifetime Removal**
   - Scope: Replace `EngineInner` leaked-static component fields and transitional
-    handle storage with direct `QuiescentGuard<T>` / `QuiDep<T>` ownership.
-    Refactor engine assembly to build owned components directly into `QuiDAG`
-    and store guards in `EngineInner`.
-  - Goals: Eliminate `StaticOwner`, `StaticHandle`, and `as_static()` from
-    production engine/component ownership.
-  - Non-goals: No final deletion of `lifetime.rs` test helpers yet; no broad
-    public API cleanup outside the engine/component ownership path.
+    handle storage with direct `QuiescentGuard<T>` / `QuiDep<T>` ownership;
+    change `BufferPool` to `&self`; propagate that runtime change through the
+    directly affected table, catalog, recovery, purge, index, and
+    session/runtime paths; replace worker startup that depends on `&'static
+    self` with guard-based startup helpers; remove the remaining
+    `StaticLifetime` / `StaticLifetimeScope` / static-constructor surface; and
+    preserve explicit started-vs-unstarted startup contracts while doing so.
+  - Goals: Eliminate `StaticLifetime`, `StaticLifetimeScope`, `StaticOwner`,
+    `StaticHandle`, static constructors, and `as_static()` usage; reach the
+    intended non-static pool contract; and finish the runtime migration boundary
+    without introducing a replacement compatibility layer.
+  - Non-goals: No `Component` trait yet; no catalog split; no worker
+    extraction yet; no broad stale-test audit or unrelated public API cleanup
+    outside the engine/component ownership path.
+  - Task Doc: `docs/tasks/000075-guard-owned-engine-components.md`
+  - Task Issue: `#443`
+  - Phase Status: `in_progress`
+  - Implementation Summary: In progress through task 000075, which already
+    absorbs the original RFC phase-3 `BufferPool: &self` migration together
+    with the remaining `StaticLifetime` / `StaticLifetimeScope` / static-builder
+    cleanup required to finish the runtime ownership transition.
+  - Related Backlogs:
+    - `docs/backlogs/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
+
+- **Phase 3: Component-Oriented Engine Lifecycle**
+  - Scope: Introduce a crate-private `Component` trait that defines dependency
+    declaration plus startup and shutdown hooks for engine components, and
+    refactor engine/DAG lifecycle orchestration to use that interface instead of
+    ad hoc engine-local wiring.
+  - Goals: Make dependency, startup, and shutdown logic declarative at the
+    component boundary and simplify the current engine-local DAG-based
+    orchestration.
+  - Non-goals: No worker extraction yet; no session-drain redesign; no catalog
+    split in this phase.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 3: Remove `&'static self` From Buffer Pools And Runtime Call Paths**
-  - Scope: Change `BufferPool` to use `&self`, remove the `StaticLifetime`
-    supertrait requirement, and propagate the change through table, catalog,
-    recovery, purge, index, and session/runtime helper code.
-  - Goals: Reach the intended non-static pool contract while preserving the
-    existing `PoolGuard` provenance and page-guard safety model.
-  - Non-goals: No new general capability framework beyond `PoolGuard`;
-    no redesign of buffer page guard internals.
+- **Phase 4: Catalog Separation And Background-Worker Extraction**
+  - Scope: Split `Catalog` from `TransactionSystem` and move background-thread
+    ownership behind the existing component seams after phase-3 lifecycle
+    orchestration is in place.
+  - Goals: Reduce `TransactionSystem` scope, clarify long-lived ownership
+    boundaries, and prepare cleaner component-level lifecycle management.
+  - Non-goals: No broader user-facing graceful-shutdown policy beyond the
+    explicit shutdown barrier and later follow-up backlog work.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 4: Final Cleanup, Documentation, And Test Hardening**
-  - Scope: Remove `StaticLifetime`, `StaticLifetimeScope`, static builders, and
-    remaining test or helper uses of leaked-static ownership once all runtime
-    call paths are migrated; preserve the evictable-pool started-vs-unstarted
-    startup contract when replacing `build_static()`; add one dedicated document
-    under `docs/` for component lifetime management and guard patterns; add
-    opt-in quiescent-drop timeout support for debug/test diagnosis without
-    changing default production blocking semantics; audit and clean stale or
-    duplicated tests.
-  - Goals: Leave one ownership model in the repository, document the final
-    lifetime/guard design, keep worker-start semantics explicit, improve
-    deadlock diagnosis in tests, and finish the static-lifetime cleanup
-    requested by the user.
+- **Phase 5: Hardening, Cleanup, Diagnostics, And Documentation**
+  - Scope: Add one dedicated document under `docs/` for component lifetime
+    management and guard patterns; add opt-in quiescent-drop timeout support
+    for debug/test diagnosis without changing default production blocking
+    semantics; and audit and clean stale or duplicated tests.
+  - Goals: Document the final lifetime/guard design, improve deadlock
+    diagnosis in tests, and harden the post-migration test matrix.
   - Non-goals: No broader graceful-shutdown policy beyond what earlier phases
     already introduced; no default production timeout that weakens
     `QuiescentBox` safety semantics.
@@ -484,8 +524,6 @@ Reference:
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
-  - Related Backlogs:
-    - `docs/backlogs/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
 
 ## Consequences
 
@@ -495,8 +533,13 @@ Reference:
   component references in steady-state runtime code. [C1] [C3] [U1] [U2]
 - Buffer-pool APIs align with the existing page-guard model instead of carrying
   obsolete `&'static self` requirements. [C2] [C12] [C13] [U3]
-- Worker-backed components keep their current internal worker structure with
-  only modest lifecycle-hook additions. [C7] [C8] [C9] [C10] [U4]
+- The broad runtime migration boundary is clearer: engine ownership, pool API
+  cleanup, guard-based worker startup, and production bridge removal now land
+  in one coordinated phase instead of being split across artificial seams.
+  [C1] [C2] [C4] [C5] [C6] [C11]
+- The architecture now has an explicit next step after runtime migration:
+  component-declared lifecycle orchestration before catalog and worker
+  ownership are further split. [C1] [C3] [C7] [C8] [C9] [C10]
 - Shutdown safety becomes explicit and reviewable instead of being spread across
   destructor comments and static-lifetime assumptions. [C3] [C7] [C8] [C9]
   [C10] [B1]
@@ -512,12 +555,13 @@ Reference:
   shutdown, startup ordering, and work rejection. [C1] [C7] [C14] [C15] [B1]
 - Several broad but mechanical API migrations are still required across table,
   catalog, recovery, purge, and index code. [C4] [C5] [C6] [C11]
-- During the migration there may be short-lived compatibility shims between
-  phases, which increases temporary complexity until the final cleanup phase is
-  complete. [D8] [D9] [C1]
-- The final phase expands beyond mechanical deletion into docs and test review,
-  so it carries some cleanup cost that is not directly user-visible behavior.
-  [D14] [U4]
+- The remaining implementation program is more explicitly architectural after
+  phase 2: a lifecycle-trait refactor and later catalog/worker boundary changes
+  still add internal churn after the runtime migration is done. [C1] [C3]
+  [C7] [C8] [C9] [C10]
+- The final phase still expands beyond mechanical deletion into docs,
+  diagnostics, and test review, so it carries cleanup cost that is not directly
+  user-visible behavior. [D14] [U4]
 
 ## Open Questions
 
@@ -525,10 +569,7 @@ Reference:
    external `EngineRef` / `Session` / active transaction handles still exist at
    the point of final teardown, or should that wait policy be introduced only
    in the future graceful-shutdown follow-up? [C14] [C15] [B1]
-2. Should component shutdown hooks share a common internal trait/interface, or
-   should each worker-backed component expose its own crate-private stop API in
-   the first implementation wave? [C7] [C8] [C9] [C10]
-3. What is the best opt-in surface for quiescent-drop timeout diagnostics in the
+2. What is the best opt-in surface for quiescent-drop timeout diagnostics in the
    final phase: explicit test helper API, cfg-gated debug hook, environment
    variable, or a combination of those? The default production behavior remains
    blocking either way. [D12] [D13] [C3] [U4]

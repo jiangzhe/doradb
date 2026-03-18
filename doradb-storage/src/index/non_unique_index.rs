@@ -264,26 +264,24 @@ mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
     use crate::index::btree::BTree;
-    use crate::lifetime::StaticLifetimeScope;
+    use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
 
     #[test]
     fn test_non_unique_index() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(
                     crate::buffer::PoolRole::Index,
                     1024usize * 1024 * 1024,
                 )
                 .unwrap(),
             );
-            let pool = pool.as_static();
             {
-                let pool_guard = pool.guard();
+                let pool_guard = (*pool).guard();
                 // i32 column and row id
                 let index = NonUniqueBTreeIndex {
-                    tree: BTree::new(pool, &pool_guard, true, 100).await,
+                    tree: BTree::new(pool.guard(), &pool_guard, true, 100).await,
                     encoder: BTreeKeyEncoder::new(vec![
                         ValType {
                             kind: ValKind::I32,

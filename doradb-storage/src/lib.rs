@@ -12,7 +12,6 @@ pub mod file;
 pub mod free_list;
 pub mod index;
 pub mod latch;
-pub mod lifetime;
 pub mod lwc;
 pub mod memcmp;
 pub mod notify;

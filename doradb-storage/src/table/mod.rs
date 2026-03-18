@@ -18,7 +18,6 @@ use crate::buffer::{
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
-use crate::engine::StaticHandle;
 use crate::error::{PersistedFileKind, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::Maskable;
@@ -28,6 +27,7 @@ use crate::index::{
 };
 use crate::latch::LatchFallbackMode;
 use crate::lwc::LwcBuilder;
+use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{Recover, RecoverIndex, SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
@@ -90,7 +90,7 @@ pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
 pub struct GenericMemTable<P: 'static> {
     pub(crate) table_id: TableID,
     pub(crate) metadata: Arc<TableMetadata>,
-    pub(crate) mem_pool: &'static P,
+    pub(crate) mem_pool: QuiescentGuard<P>,
     pub(crate) row_pool_role: RowPoolRole,
     pub(crate) blk_idx: BlockIndex,
     pub(crate) sec_idx: Box<[SecondaryIndex]>,
@@ -117,7 +117,7 @@ struct FrozenPage {
 
 #[inline]
 pub(crate) async fn build_secondary_indexes(
-    index_pool: &'static FixedBufferPool,
+    index_pool: QuiescentGuard<FixedBufferPool>,
     index_pool_guard: &PoolGuard,
     metadata: &TableMetadata,
     index_ts: TrxID,
@@ -126,7 +126,7 @@ pub(crate) async fn build_secondary_indexes(
     for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
         let ty_infer = |col_no: usize| metadata.col_type(col_no);
         let si = SecondaryIndex::new(
-            index_pool,
+            index_pool.clone(),
             index_pool_guard,
             index_no,
             index_spec,
@@ -143,9 +143,9 @@ impl<P: BufferPool> GenericMemTable<P> {
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
-        mem_pool: &'static P,
+        mem_pool: QuiescentGuard<P>,
         row_pool_role: RowPoolRole,
-        index_pool: &'static FixedBufferPool,
+        index_pool: QuiescentGuard<FixedBufferPool>,
         index_pool_guard: &crate::buffer::PoolGuard,
         table_id: TableID,
         metadata: Arc<TableMetadata>,
@@ -178,8 +178,8 @@ impl<P: BufferPool> GenericMemTable<P> {
 
     /// Returns the buffer pool used for in-memory row pages.
     #[inline]
-    pub fn mem_pool(&self) -> &'static P {
-        self.mem_pool
+    pub fn mem_pool(&self) -> &P {
+        &self.mem_pool
     }
 
     /// Returns the row block index used by this table.
@@ -201,11 +201,13 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
-    pub(crate) fn enable_page_committer(
-        &self,
-        trx_sys: impl Into<StaticHandle<TransactionSystem>>,
-    ) {
+    pub(crate) fn enable_page_committer(&self, trx_sys: QuiescentGuard<TransactionSystem>) {
         self.blk_idx.enable_page_committer(self.table_id, trx_sys)
+    }
+
+    #[inline]
+    pub(crate) fn disable_page_committer(&self) {
+        self.blk_idx.disable_page_committer()
     }
 
     #[inline]
@@ -282,7 +284,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         self.blk_idx
             .get_insert_page(
                 meta_pool_guard,
-                self.mem_pool,
+                &self.mem_pool,
                 row_pool_guard,
                 &self.metadata,
                 count,
@@ -301,7 +303,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         self.blk_idx
             .get_insert_page_exclusive(
                 meta_pool_guard,
-                self.mem_pool,
+                &self.mem_pool,
                 row_pool_guard,
                 &self.metadata,
                 count,
@@ -321,7 +323,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         self.blk_idx
             .allocate_row_page_at(
                 meta_pool_guard,
-                self.mem_pool,
+                &self.mem_pool,
                 row_pool_guard,
                 &self.metadata,
                 count,
@@ -389,9 +391,9 @@ impl ColumnStorage {
     pub(crate) fn new(
         table_id: TableID,
         file: Arc<TableFile>,
-        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Self {
-        let disk_pool = ReadonlyBufferPool::new_with_handle(
+        let disk_pool = ReadonlyBufferPool::new(
             table_id,
             PersistedFileKind::TableFile,
             Arc::clone(&file),
@@ -427,19 +429,18 @@ impl Table {
     /// Create a new table.
     #[inline]
     pub(crate) async fn new(
-        mem_pool: &'static EvictableBufferPool,
-        index_pool: &'static FixedBufferPool,
+        mem_pool: QuiescentGuard<EvictableBufferPool>,
+        index_pool: QuiescentGuard<FixedBufferPool>,
         index_pool_guard: &crate::buffer::PoolGuard,
-        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         table_id: TableID,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
     ) -> Self {
-        let global_disk_pool = global_disk_pool.into();
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
         let mem = GenericMemTable::new(
-            mem_pool,
+            mem_pool.clone(),
             mem_pool.row_pool_role(),
             index_pool,
             index_pool_guard,
@@ -481,11 +482,13 @@ impl Table {
         GenericMemTable::find_row(self, guards, row_id, Some(&self.storage)).await
     }
     #[inline]
-    pub(crate) fn enable_page_committer(
-        &self,
-        trx_sys: impl Into<StaticHandle<TransactionSystem>>,
-    ) {
+    pub(crate) fn enable_page_committer(&self, trx_sys: QuiescentGuard<TransactionSystem>) {
         GenericMemTable::enable_page_committer(self, trx_sys)
+    }
+
+    #[inline]
+    pub(crate) fn disable_page_committer(&self) {
+        GenericMemTable::disable_page_committer(self)
     }
 
     async fn collect_frozen_pages(&self, guards: &PoolGuards) -> (Vec<FrozenPage>, Option<TrxID>) {
@@ -531,7 +534,7 @@ impl Table {
     async fn wait_for_frozen_pages_stable(
         &self,
         guards: &PoolGuards,
-        trx_sys: &'static TransactionSystem,
+        trx_sys: &TransactionSystem,
         frozen_pages: &[FrozenPage],
     ) {
         loop {

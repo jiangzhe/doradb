@@ -43,8 +43,11 @@ Complete all items:
 2. Refine scope, goals, and non-goals.
 3. Finalize impacted interfaces/modules/files.
 4. Finalize test plan and acceptance criteria.
-5. List unresolved open questions, if any.
-6. Ask for explicit approval to write the task document.
+5. Follow `docs/process/unit-test.md` for current test-runner constraints.
+6. Do not assume plain `cargo test` can enforce timeouts; if timeout policy or hang detection is required, scope explicit runner/tooling work instead of inventing unsupported flags.
+7. Treat `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md` as the current follow-up for `cargo-nextest` timeout evaluation unless the task itself is changing test tooling.
+8. List unresolved open questions, if any.
+9. Ask for explicit approval to write the task document.
 
 ## Strict RFC Escalation Gate
 

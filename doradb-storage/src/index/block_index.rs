@@ -2,7 +2,6 @@ use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableMetadata;
-use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
@@ -10,6 +9,7 @@ use crate::index::row_block_index::{
     GenericRowBlockIndex, GenericRowBlockIndexMemCursor, RowLocation,
 };
 use crate::index::util::Maskable;
+use crate::quiescent::QuiescentGuard;
 use crate::row::{RowID, RowPage};
 use crate::table::ColumnStorage;
 use crate::trx::sys::TransactionSystem;
@@ -37,7 +37,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     /// persisted columnar data at startup.
     #[inline]
     pub async fn new(
-        pool: &'static P,
+        pool: QuiescentGuard<P>,
         meta_pool_guard: &PoolGuard,
         pivot_row_id: RowID,
         column_root_page_id: PageID,
@@ -49,7 +49,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
     /// Creates block index for catalog-table runtime without table-file backing.
     #[inline]
-    pub async fn new_catalog(pool: &'static P, meta_pool_guard: &PoolGuard) -> Self {
+    pub async fn new_catalog(pool: QuiescentGuard<P>, meta_pool_guard: &PoolGuard) -> Self {
         Self::new(pool, meta_pool_guard, 0, 0).await
     }
 
@@ -64,9 +64,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub(crate) fn enable_page_committer(
         &self,
         table_id: crate::catalog::TableID,
-        trx_sys: impl Into<StaticHandle<TransactionSystem>>,
+        trx_sys: QuiescentGuard<TransactionSystem>,
     ) {
         self.row.enable_page_committer(table_id, trx_sys)
+    }
+
+    #[inline]
+    pub(crate) fn disable_page_committer(&self) {
+        self.row.disable_page_committer()
     }
 
     /// Returns whether row-page redo logging is enabled.
@@ -108,7 +113,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn get_insert_page<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
-        mem_pool: &'static B,
+        mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
@@ -123,7 +128,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
-        mem_pool: &'static B,
+        mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
@@ -140,7 +145,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub async fn allocate_row_page_at<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
-        mem_pool: &'static B,
+        mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
@@ -258,7 +263,7 @@ mod tests {
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::error::Validation;
     use crate::latch::LatchFallbackMode;
-    use crate::lifetime::{StaticLifetime, StaticLifetimeScope};
+    use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use std::future::Future;
     use std::sync::Arc;
     use std::sync::Barrier;
@@ -269,7 +274,7 @@ mod tests {
     // decision but before the row-store lookup completes, so we can move the pivot
     // and force the fallback-to-column path deterministically.
     struct StallingBufferPool {
-        inner: &'static FixedBufferPool,
+        inner: QuiescentGuard<FixedBufferPool>,
         stall_page_id: AtomicU64,
         entered: Arc<Barrier>,
         release: Arc<Barrier>,
@@ -278,7 +283,7 @@ mod tests {
     impl StallingBufferPool {
         #[inline]
         fn new(
-            inner: &'static FixedBufferPool,
+            inner: QuiescentGuard<FixedBufferPool>,
             entered: Arc<Barrier>,
             release: Arc<Barrier>,
         ) -> Self {
@@ -295,8 +300,6 @@ mod tests {
             self.stall_page_id.store(page_id, Ordering::Release);
         }
     }
-
-    unsafe impl StaticLifetime for StallingBufferPool {}
 
     impl BufferPool for StallingBufferPool {
         #[inline]
@@ -316,7 +319,7 @@ mod tests {
 
         #[inline]
         fn allocate_page<T: BufferPage>(
-            &'static self,
+            &self,
             guard: &PoolGuard,
         ) -> impl Future<Output = PageExclusiveGuard<T>> + Send {
             self.inner.allocate_page(guard)
@@ -324,7 +327,7 @@ mod tests {
 
         #[inline]
         fn allocate_page_at<T: BufferPage>(
-            &'static self,
+            &self,
             guard: &PoolGuard,
             page_id: PageID,
         ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
@@ -333,7 +336,7 @@ mod tests {
 
         #[inline]
         async fn get_page<T: BufferPage>(
-            &'static self,
+            &self,
             guard: &PoolGuard,
             page_id: PageID,
             mode: LatchFallbackMode,
@@ -351,7 +354,7 @@ mod tests {
 
         #[inline]
         fn try_get_page_versioned<T: BufferPage>(
-            &'static self,
+            &self,
             guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
@@ -360,13 +363,13 @@ mod tests {
         }
 
         #[inline]
-        fn deallocate_page<T: BufferPage>(&'static self, g: PageExclusiveGuard<T>) {
+        fn deallocate_page<T: BufferPage>(&self, g: PageExclusiveGuard<T>) {
             self.inner.deallocate_page(g)
         }
 
         #[inline]
         fn get_child_page<T: BufferPage>(
-            &'static self,
+            &self,
             guard: &PoolGuard,
             p_guard: &FacadePageGuard<T>,
             page_id: PageID,
@@ -378,13 +381,12 @@ mod tests {
 
     #[test]
     fn test_try_find_row_returns_error_when_column_route_has_no_storage() {
-        let scope = StaticLifetimeScope::new();
-        let pool = scope.adopt(
-            FixedBufferPool::with_capacity_static(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
+        let pool = QuiescentBox::new(
+            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
                 .unwrap(),
         );
-        let meta_guard = pool.guard();
-        let blk_idx = smol::block_on(BlockIndex::new(pool.as_static(), &meta_guard, 10, 77));
+        let meta_guard = (*pool).guard();
+        let blk_idx = smol::block_on(BlockIndex::new(pool.guard(), &meta_guard, 10, 77));
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
         // Without column storage this must surface as an error, not as "not found".
@@ -397,27 +399,19 @@ mod tests {
 
     #[test]
     fn test_try_find_row_returns_error_when_column_fallback_has_no_storage() {
-        let scope = StaticLifetimeScope::new();
-        let inner = scope.adopt(
-            FixedBufferPool::with_capacity_static(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
+        let inner = QuiescentBox::new(
+            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
                 .unwrap(),
         );
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
-        let pool = scope.adopt(<StallingBufferPool as StaticLifetime>::new_static(
-            StallingBufferPool::new(
-                inner.as_static(),
-                Arc::clone(&entered),
-                Arc::clone(&release),
-            ),
+        let pool = QuiescentBox::new(StallingBufferPool::new(
+            inner.guard(),
+            Arc::clone(&entered),
+            Arc::clone(&release),
         ));
-        let meta_guard = pool.guard();
-        let blk_idx = smol::block_on(GenericBlockIndex::new(
-            pool.as_static(),
-            &meta_guard,
-            10,
-            77,
-        ));
+        let meta_guard = (*pool).guard();
+        let blk_idx = smol::block_on(GenericBlockIndex::new(pool.guard(), &meta_guard, 10, 77));
         pool.set_stall_page_id(blk_idx.row.root_page_id());
 
         std::thread::scope(|s| {

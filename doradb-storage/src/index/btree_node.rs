@@ -1584,23 +1584,22 @@ fn head_int(k: &[u8]) -> KeyHeadInt {
 mod tests {
     use super::*;
     use crate::buffer::{BufferPool, FixedBufferPool};
-    use crate::lifetime::StaticLifetimeScope;
+    use crate::quiescent::QuiescentBox;
     use rand_distr::{Distribution, Uniform};
     use std::collections::BTreeMap;
+
+    fn test_buf_pool() -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(
+            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64usize * 1024 * 1024)
+                .unwrap(),
+        )
+    }
 
     #[test]
     fn test_btree_node_insert() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1627,16 +1626,8 @@ mod tests {
     #[test]
     fn test_btree_node_delete() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1682,16 +1673,8 @@ mod tests {
     #[test]
     fn test_btree_node_mark_as_deleted() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1741,16 +1724,8 @@ mod tests {
     #[test]
     fn test_btree_node_update() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1804,16 +1779,8 @@ mod tests {
     #[test]
     fn test_btree_node_compact_non_empty() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
 
             {
                 // Create source leaf node with data
@@ -1857,16 +1824,8 @@ mod tests {
     #[test]
     fn test_btree_node_compact_empty() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
 
             {
                 // Create empty source node
@@ -1908,16 +1867,8 @@ mod tests {
     #[test]
     fn test_btree_node_space_estimation() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
 
             {
                 let mut page1_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -1982,16 +1933,8 @@ mod tests {
     #[test]
     fn test_btree_node_update_key() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
 
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
@@ -2076,16 +2019,8 @@ mod tests {
     #[test]
     fn test_btree_node_enable_hints_seq() {
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
             {
                 let mut page_guard = buf_pool.allocate_page::<BTreeNode>(&buf_pool_guard).await;
                 let node = page_guard.page_mut();
@@ -2115,16 +2050,8 @@ mod tests {
         use rand_chacha::ChaCha8Rng;
         const COUNT: usize = 100;
         smol::block_on(async {
-            let scope = StaticLifetimeScope::new();
-            let buf_pool = scope.adopt(
-                FixedBufferPool::with_capacity_static(
-                    crate::buffer::PoolRole::Index,
-                    64usize * 1024 * 1024,
-                )
-                .unwrap(),
-            );
-            let buf_pool = buf_pool.as_static();
-            let buf_pool_guard = buf_pool.guard();
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::guard(&buf_pool);
             {
                 let mut rng = ChaCha8Rng::seed_from_u64(0u64);
                 let uniform = Uniform::new(0u64, 1u64 << 63).unwrap();

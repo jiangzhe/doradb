@@ -15,13 +15,12 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
     PoolRole,
 };
-use crate::engine::StaticHandle;
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::index::SecondaryIndex;
 use crate::latch::LatchFallbackMode;
-use crate::lifetime::StaticLifetime;
+use crate::quiescent::QuiescentGuard;
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage};
 use crate::table::{ColumnDeletionBuffer, Table, TableAccess};
@@ -161,24 +160,45 @@ impl Catalog {
     #[inline]
     pub(crate) async fn enable_page_committer_for_tables(
         &self,
-        trx_sys: StaticHandle<TransactionSystem>,
+        trx_sys: QuiescentGuard<TransactionSystem>,
     ) {
         for entry in &self.user_tables {
             entry.value().enable_page_committer(trx_sys.clone());
         }
     }
 
+    /// Release shutdown-time back-references from user tables to the
+    /// transaction system and then drop the catalog's table cache.
+    ///
+    /// User-table page committers retain `QuiescentGuard<TransactionSystem>`.
+    /// If the catalog keeps those tables alive until `QuiDAG` starts dropping
+    /// owners, transaction-system teardown waits forever on its own guard
+    /// count. The caller must therefore invoke this only after engine
+    /// admission is closed and all transaction-system worker threads have
+    /// already stopped creating or replaying row pages.
+    #[inline]
+    pub(crate) fn shutdown_user_tables(&self) {
+        let tables = self
+            .user_tables
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect::<Vec<_>>();
+        for table in &tables {
+            table.disable_page_committer();
+        }
+        self.user_tables.clear();
+    }
+
     /// Reload one user table runtime from catalog metadata and table file.
     pub(crate) async fn reload_create_table(
         &self,
-        mem_pool: &'static EvictableBufferPool,
-        index_pool: &'static FixedBufferPool,
-        table_fs: &'static TableFileSystem,
-        global_disk_pool: impl Into<StaticHandle<GlobalReadonlyBufferPool>>,
+        mem_pool: QuiescentGuard<EvictableBufferPool>,
+        index_pool: QuiescentGuard<FixedBufferPool>,
+        table_fs: &TableFileSystem,
+        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         guards: &PoolGuards,
         table_id: TableID,
     ) -> Result<()> {
-        let global_disk_pool = global_disk_pool.into();
         if self.user_tables.contains_key(&table_id) {
             return Err(Error::TableAlreadyExists);
         }
@@ -261,7 +281,7 @@ impl Catalog {
                 let index_pool_guard = guards.index_guard();
 
                 let blk_idx = BlockIndex::new(
-                    self.storage.meta_pool,
+                    self.storage.meta_pool.clone(),
                     meta_pool_guard,
                     row_id_bound,
                     active_root.column_block_index_root,
@@ -269,8 +289,8 @@ impl Catalog {
                 .await;
                 let table = Arc::new(
                     Table::new(
-                        mem_pool,
-                        index_pool,
+                        mem_pool.clone(),
+                        index_pool.clone(),
                         index_pool_guard,
                         global_disk_pool.clone(),
                         table.table_id,
@@ -322,8 +342,8 @@ impl Catalog {
 
     /// Return the metadata buffer pool used by catalog/index metadata pages.
     #[inline]
-    pub fn meta_pool(&self) -> &'static FixedBufferPool {
-        self.storage.meta_pool
+    pub fn meta_pool(&self) -> &FixedBufferPool {
+        &self.storage.meta_pool
     }
 
     #[inline]
@@ -336,7 +356,6 @@ impl Catalog {
 
 unsafe impl Send for Catalog {}
 unsafe impl Sync for Catalog {}
-unsafe impl StaticLifetime for Catalog {}
 
 /// Unified runtime handle for either user table or catalog table.
 pub enum TableHandle {
@@ -825,7 +844,7 @@ pub mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -851,7 +870,7 @@ pub mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -880,7 +899,7 @@ pub mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
 
@@ -954,7 +973,7 @@ pub mod tests {
             let table_id = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -970,7 +989,7 @@ pub mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1002,7 +1021,7 @@ pub mod tests {
 
             let batch1 = engine
                 .catalog()
-                .scan_checkpoint_batch(engine.trx_sys)
+                .scan_checkpoint_batch(&engine.trx_sys)
                 .unwrap();
             assert_eq!(batch1.catalog_ddl_txn_count, 2);
             assert_eq!(
@@ -1020,7 +1039,7 @@ pub mod tests {
 
             let batch2 = engine
                 .catalog()
-                .scan_checkpoint_batch(engine.trx_sys)
+                .scan_checkpoint_batch(&engine.trx_sys)
                 .unwrap();
             assert_eq!(batch2.catalog_ddl_txn_count, 0);
             assert_eq!(batch2.safe_cts, safe_cts_1);
@@ -1056,7 +1075,7 @@ pub mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1109,7 +1128,7 @@ pub mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(engine.trx_sys)
+                .checkpoint_now(&engine.trx_sys)
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();

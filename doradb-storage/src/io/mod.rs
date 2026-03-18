@@ -1,7 +1,6 @@
 mod buf;
 mod libaio_abi;
 
-use crate::lifetime::StaticLifetime;
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
 use libc::EINTR;
@@ -374,8 +373,6 @@ fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
     let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
     std::mem::replace(&mut *guard, hook)
 }
-
-unsafe impl StaticLifetime for AIOContext {}
 
 impl Drop for AIOContext {
     #[inline]

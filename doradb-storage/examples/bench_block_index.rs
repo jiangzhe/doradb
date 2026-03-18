@@ -46,7 +46,7 @@ fn main() {
                 )],
             ));
             let meta_guard = engine.meta_pool.guard();
-            let blk_idx = RowBlockIndex::new(engine.meta_pool, &meta_guard, 0).await;
+            let blk_idx = RowBlockIndex::new(engine.meta_pool.clone(), &meta_guard, 0).await;
             let blk_idx = Box::leak(Box::new(blk_idx));
             let mem_guard = engine.mem_pool.guard();
 
@@ -54,7 +54,7 @@ fn main() {
                 let _ = blk_idx
                     .get_insert_page(
                         &meta_guard,
-                        engine.mem_pool,
+                        &engine.mem_pool,
                         &mem_guard,
                         &metadata,
                         args.rows_per_page,
