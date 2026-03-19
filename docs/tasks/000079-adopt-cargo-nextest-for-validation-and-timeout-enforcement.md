@@ -1,8 +1,9 @@
 ---
 id: 000079
 title: Adopt cargo-nextest for validation and timeout enforcement
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-19
+github_issue: 451
 ---
 
 # Task: Adopt cargo-nextest for validation and timeout enforcement
@@ -127,6 +128,42 @@ Reference:
    point future coverage-tooling work at backlog `000064`.
 
 ## Implementation Notes
+
+1. Added repository-level nextest configuration in `.config/nextest.toml`:
+   - required nextest version `0.9.100`;
+   - default profile with `10s` slow-timeout enforcement, `15s`
+     global test-execution timeout, and fail-fast behavior;
+   - dedicated CI profiles for default-feature and
+     `--no-default-features` runs with JUnit report names.
+2. Switched CI validation to sequential `cargo nextest run` passes in
+   `.github/workflows/build.yml`:
+   - install `cargo-nextest` in CI;
+   - run default-feature and `--no-default-features` validation
+     sequentially with separate coverage target directories;
+   - upload nextest JUnit XML artifacts.
+3. Updated local/process guidance to make nextest the standard validation
+   runner and to state explicitly that this project currently has no doctests
+   and does not run `cargo test --doc` as part of routine validation:
+   - `docs/process/unit-test.md`
+   - `docs/process/lint.md`
+   - `docs/process/unsafe-review-checklist.md`
+   - `docs/unsafe-usage-principles.md`
+   - `docs/process/coding-guidance.md`
+   - `AGENTS.md`
+4. Verification executed for the implemented state:
+   - `cargo nextest run -p doradb-storage`
+     - result: `408/408` passed in `2.990s`
+   - `cargo nextest run -p doradb-storage --no-default-features`
+     - result: `408/408` passed in `2.138s`
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000079-adopt-cargo-nextest-for-validation-and-timeout-enforcement.md`
+     - result: local `docs/tasks/next-id` was already aligned at `000080`
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000079-adopt-cargo-nextest-for-validation-and-timeout-enforcement.md`
+     - result: no parent RFC reference found
+5. Resolve-time tracking updates:
+   - source backlog `000060` was archived as implemented:
+     `docs/backlogs/closed/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md`
+   - implementation tracked in GitHub issue `#451`
+   - pull request opened as `#452`
 
 ## Impacts
 

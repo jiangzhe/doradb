@@ -8,12 +8,12 @@
 
 ## `task create` Formal Round Definition
 
-Use exactly two mandatory rounds before writing any file in `docs/tasks/`:
+Use exactly two mandatory rounds before writing any file in the task worktree under `worktrees/<task-id>/docs/tasks/`:
 
 1. `Round 1`: deep research + initial design alternatives.
 2. `Round 2`: revised design after user feedback from Round 1.
 
-Require explicit user approval after Round 2 before creating a task doc file.
+Require explicit user approval after Round 2 before creating a task doc file in the task worktree.
 
 ## `task create` Round 1 Checklist
 
@@ -82,6 +82,34 @@ Ensure content is decision-complete and ready for implementation.
 
 `Implementation Notes` must stay blank during design phase, and is filled during `task resolve`.
 
+## Post-Approval Task Create Sequence
+
+After explicit approval, use this exact dispatch flow from the main/root checkout:
+
+1. Refresh the remote base branch:
+```bash
+git fetch origin main
+```
+2. Reserve the task id in the dispatch root:
+```bash
+tools/doc-id.rs alloc-id --kind task
+```
+3. Create the isolated task worktree:
+```bash
+git worktree add worktrees/<task-id> origin/main
+```
+4. Create the task doc inside the worktree:
+```bash
+tools/task.rs create-task-doc \
+  --title "Task title" \
+  --slug "task-title" \
+  --id <task-id> \
+  --output-dir worktrees/<task-id>/docs/tasks
+```
+5. Continue writing and later implementation work inside `worktrees/<task-id>/...`.
+
+Stop if `worktrees/<task-id>` already exists or if `git worktree add` fails. Do not fall back to writing task docs in the dispatch root.
+
 ## `task resolve` Checklist
 
 Complete all items:
@@ -101,14 +129,18 @@ tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
 ```bash
 tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
-8. Always check whether resolved task is an RFC sub-task.
-9. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
+8. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
+```bash
+tools/task.rs resolve-task-next-id --task docs/tasks/000042-example.md
+```
+9. Always check whether resolved task is an RFC sub-task.
+10. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
    - Use:
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
-10. Do not run `git commit` or `git push` during `task resolve`.
-11. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
+11. Do not run `git commit` or `git push` during `task resolve`.
+12. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
 
 ## Backlog Integration
 
@@ -119,7 +151,7 @@ tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 5. A backlog doc is input context for `task create`, not a shortcut for design quality gates.
 6. If one or more source backlog docs are already under `docs/backlogs/closed/`, prompt user before continuing task creation from closed item(s).
 7. If task creation proceeds from backlog, record `Source Backlogs:` list in task doc to enable resolve-time closure tracking.
-8. Even when backlog exists, still run deep research, proposals, and two formal rounds before writing `docs/tasks/`.
+8. Even when backlog exists, still run deep research, proposals, and two formal rounds before writing `worktrees/<task-id>/docs/tasks/`.
 9. Manual backlog create/close workflow is owned by `$backlog` skill:
 ```bash
 tools/backlog.rs create-doc ...

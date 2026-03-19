@@ -14,6 +14,7 @@ use std::process::Command;
 const BACKLOG_DIR: &str = "docs/backlogs";
 const BACKLOG_CLOSED_DIR: &str = "docs/backlogs/closed";
 const BACKLOG_NEXT_ID_FILE: &str = "docs/backlogs/next-id";
+const TASK_NEXT_ID_FILE: &str = "docs/tasks/next-id";
 const RFC_DIR: &str = "docs/rfcs";
 const DOC_ID_TOOL: &str = "tools/doc-id.rs";
 
@@ -22,6 +23,7 @@ fn usage() -> &'static str {
 Subcommands:\n\
   next-task-id          Print the next task id from docs/tasks/next-id\n\
   create-task-doc       Create a docs/tasks task document from template with validated id and slug\n\
+  resolve-task-next-id  Refresh docs/tasks/next-id during task resolve\n\
   resolve-task-rfc      Sync task resolve outcome into parent RFC Implementation Phases\n"
 }
 
@@ -57,6 +59,10 @@ fn resolve_task_rfc_usage() -> &'static str {
     "Usage: tools/task.rs resolve-task-rfc --task <docs/tasks/<id>-<slug>.md> [--date <YYYY-MM-DD>] [--summary <text>] [--rfc <docs/rfcs/<id>-<slug>.md>]"
 }
 
+fn resolve_task_next_id_usage() -> &'static str {
+    "Usage: tools/task.rs resolve-task-next-id --task <docs/tasks/<id>-<slug>.md>"
+}
+
 #[derive(Clone)]
 struct CloseReason {
     reason_type: String,
@@ -84,6 +90,15 @@ struct RfcSyncSummary {
     detail: Option<String>,
 }
 
+struct NextIdSyncSummary {
+    task: String,
+    task_id: String,
+    local_before: String,
+    origin_main: String,
+    local_after: String,
+    updated: bool,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -104,6 +119,7 @@ fn run() -> Result<(), String> {
         }
         "next-task-id" => run_next_task_id(args),
         "create-task-doc" => run_create_task_doc(args),
+        "resolve-task-next-id" => run_resolve_task_next_id(args),
         "resolve-task-rfc" => run_resolve_task_rfc(args),
         _ => Err(format!("unknown subcommand: {subcommand}\n{}", usage())),
     }
@@ -265,7 +281,12 @@ fn run_init_backlog_next_id(mut args: impl Iterator<Item = String>) -> Result<()
                 println!("{}", init_backlog_next_id_usage());
                 return Ok(());
             }
-            _ => return Err(format!("unknown arg: {arg}\n{}", init_backlog_next_id_usage())),
+            _ => {
+                return Err(format!(
+                    "unknown arg: {arg}\n{}",
+                    init_backlog_next_id_usage()
+                ));
+            }
         }
     }
 
@@ -279,7 +300,8 @@ fn run_init_backlog_next_id(mut args: impl Iterator<Item = String>) -> Result<()
     let next = match value {
         Some(v) => v,
         None => {
-            let max_id = detect_max_backlog_id(Path::new(BACKLOG_DIR), Path::new(BACKLOG_CLOSED_DIR))?;
+            let max_id =
+                detect_max_backlog_id(Path::new(BACKLOG_DIR), Path::new(BACKLOG_CLOSED_DIR))?;
             format!("{:06}", max_id + 1)
         }
     };
@@ -405,10 +427,18 @@ fn run_close_backlog_doc(mut args: impl Iterator<Item = String>) -> Result<(), S
 
     let open_path = resolve_open_backlog_path(path, backlog_id, close_backlog_doc_usage())?;
     let reason = CloseReason {
-        reason_type: reason_type
-            .ok_or_else(|| format!("missing required arg: --type\n{}", close_backlog_doc_usage()))?,
-        detail: detail
-            .ok_or_else(|| format!("missing required arg: --detail\n{}", close_backlog_doc_usage()))?,
+        reason_type: reason_type.ok_or_else(|| {
+            format!(
+                "missing required arg: --type\n{}",
+                close_backlog_doc_usage()
+            )
+        })?,
+        detail: detail.ok_or_else(|| {
+            format!(
+                "missing required arg: --detail\n{}",
+                close_backlog_doc_usage()
+            )
+        })?,
         closed_by: "task close".to_string(),
         reference: reference.unwrap_or_else(|| "User decision".to_string()),
         closed_at: date.unwrap_or_else(today_yyyy_mm_dd),
@@ -481,13 +511,22 @@ fn run_complete_backlog_doc(mut args: impl Iterator<Item = String>) -> Result<()
                 println!("{}", complete_backlog_doc_usage());
                 return Ok(());
             }
-            _ => return Err(format!("unknown arg: {arg}\n{}", complete_backlog_doc_usage())),
+            _ => {
+                return Err(format!(
+                    "unknown arg: {arg}\n{}",
+                    complete_backlog_doc_usage()
+                ));
+            }
         }
     }
 
     let open_path = resolve_open_backlog_path(path, backlog_id, complete_backlog_doc_usage())?;
-    let task_path = task_path
-        .ok_or_else(|| format!("missing required arg: --task\n{}", complete_backlog_doc_usage()))?;
+    let task_path = task_path.ok_or_else(|| {
+        format!(
+            "missing required arg: --task\n{}",
+            complete_backlog_doc_usage()
+        )
+    })?;
     validate_task_doc_path(&task_path)?;
 
     let task_ref = normalize_path(&task_path);
@@ -536,12 +575,21 @@ fn run_resolve_task_backlogs(mut args: impl Iterator<Item = String>) -> Result<(
                 println!("{}", resolve_task_backlogs_usage());
                 return Ok(());
             }
-            _ => return Err(format!("unknown arg: {arg}\n{}", resolve_task_backlogs_usage())),
+            _ => {
+                return Err(format!(
+                    "unknown arg: {arg}\n{}",
+                    resolve_task_backlogs_usage()
+                ));
+            }
         }
     }
 
-    let task_path = task_path
-        .ok_or_else(|| format!("missing required arg: --task\n{}", resolve_task_backlogs_usage()))?;
+    let task_path = task_path.ok_or_else(|| {
+        format!(
+            "missing required arg: --task\n{}",
+            resolve_task_backlogs_usage()
+        )
+    })?;
     validate_task_doc_path(&task_path)?;
 
     let task_text = fs::read_to_string(&task_path)
@@ -661,6 +709,44 @@ fn run_resolve_task_rfc(mut args: impl Iterator<Item = String>) -> Result<(), St
     Ok(())
 }
 
+fn run_resolve_task_next_id(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut task_path: Option<PathBuf> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--task" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --task\n{}",
+                        resolve_task_next_id_usage()
+                    ));
+                };
+                task_path = Some(PathBuf::from(v));
+            }
+            "-h" | "--help" => {
+                println!("{}", resolve_task_next_id_usage());
+                return Ok(());
+            }
+            _ => {
+                return Err(format!(
+                    "unknown arg: {arg}\n{}",
+                    resolve_task_next_id_usage()
+                ));
+            }
+        }
+    }
+
+    let task_path = task_path.ok_or_else(|| {
+        format!(
+            "missing required arg: --task\n{}",
+            resolve_task_next_id_usage()
+        )
+    })?;
+    let summary = sync_task_next_id(&task_path)?;
+    println!("{}", next_id_sync_summary_json(&summary));
+    Ok(())
+}
+
 fn validate_task_doc_path(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("task doc not found: {}", normalize_path(path)));
@@ -692,6 +778,117 @@ fn validate_task_doc_path(path: &Path) -> Result<(), String> {
         ));
     }
 
+    Ok(())
+}
+
+fn sync_task_next_id(task_path: &Path) -> Result<NextIdSyncSummary, String> {
+    let task_path = normalize_reference_path(task_path);
+    validate_task_doc_path(&task_path)?;
+
+    let task_ref = normalize_path(&task_path);
+    let task_id = extract_task_id_from_task_path(&task_path)?;
+    let task_id_num = task_id
+        .parse::<u32>()
+        .map_err(|_| format!("invalid task id in task path: {task_ref}"))?;
+    if task_id_num >= 999_999 {
+        return Err(format!(
+            "task id overflow while updating {} from {}",
+            TASK_NEXT_ID_FILE, task_ref
+        ));
+    }
+
+    run_git(["fetch", "origin", "main"])?;
+
+    let local_before = read_task_next_id(Path::new(TASK_NEXT_ID_FILE))?;
+    let local_before_num = local_before
+        .parse::<u32>()
+        .map_err(|_| format!("invalid next-id content in {TASK_NEXT_ID_FILE}"))?;
+
+    let origin_main = git_show_task_next_id()?;
+    let origin_main_num = origin_main
+        .parse::<u32>()
+        .map_err(|_| format!("invalid next-id content in origin/main:{TASK_NEXT_ID_FILE}"))?;
+
+    let required_next = task_id_num + 1;
+    let local_after_num = local_before_num.max(origin_main_num).max(required_next);
+    let local_after = format!("{local_after_num:06}");
+    let updated = local_after_num > local_before_num;
+
+    if updated {
+        fs::write(TASK_NEXT_ID_FILE, format!("{local_after}\n"))
+            .map_err(|e| format!("failed to update {TASK_NEXT_ID_FILE}: {e}"))?;
+    }
+
+    Ok(NextIdSyncSummary {
+        task: task_ref,
+        task_id,
+        local_before,
+        origin_main,
+        local_after,
+        updated,
+    })
+}
+
+fn extract_task_id_from_task_path(task_path: &Path) -> Result<String, String> {
+    let name = task_path
+        .file_name()
+        .ok_or_else(|| format!("invalid task doc path: {}", normalize_path(task_path)))?
+        .to_string_lossy()
+        .to_string();
+    let task_id = parse_strict_six_digit_task_name(&name)
+        .ok_or_else(|| format!("invalid task doc name: {}", normalize_path(task_path)))?;
+    Ok(format!("{task_id:06}"))
+}
+
+fn read_task_next_id(path: &Path) -> Result<String, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", normalize_path(path)))?;
+    validate_fixed_id(content.trim()).map_err(|e| format!("{e} in {}", normalize_path(path)))
+}
+
+fn git_show_task_next_id() -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["show", "origin/main:docs/tasks/next-id"])
+        .output()
+        .map_err(|e| format!("failed to execute git show origin/main:{TASK_NEXT_ID_FILE}: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+        if !stdout.is_empty() {
+            return Err(stdout);
+        }
+        return Err(format!(
+            "git show origin/main:{TASK_NEXT_ID_FILE} returned non-zero exit code"
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err(format!(
+            "git show origin/main:{TASK_NEXT_ID_FILE} returned empty output"
+        ));
+    }
+    validate_fixed_id(&text).map_err(|e| format!("{e} in origin/main:{TASK_NEXT_ID_FILE}"))
+}
+
+fn run_git<const N: usize>(args: [&str; N]) -> Result<(), String> {
+    let out = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute git: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+        if !stdout.is_empty() {
+            return Err(stdout);
+        }
+        return Err("git returned non-zero exit code".to_string());
+    }
     Ok(())
 }
 
@@ -855,11 +1052,7 @@ fn upsert_close_reason(
 fn render_close_reason(reason: &CloseReason) -> String {
     format!(
         "## Close Reason\n\n- Type: {}\n- Detail: {}\n- Closed By: {}\n- Reference: {}\n- Closed At: {}",
-        reason.reason_type,
-        reason.detail,
-        reason.closed_by,
-        reason.reference,
-        reason.closed_at
+        reason.reason_type, reason.detail, reason.closed_by, reason.reference, reason.closed_at
     )
 }
 
@@ -1013,8 +1206,9 @@ fn sync_task_into_parent_rfc(
 
     let summary = match summary_override {
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => first_meaningful_line(&notes)
-            .unwrap_or_else(|| "Implementation completed; see task implementation notes".to_string()),
+        _ => first_meaningful_line(&notes).unwrap_or_else(|| {
+            "Implementation completed; see task implementation notes".to_string()
+        }),
     };
     let sync_date = date.unwrap_or_else(today_yyyy_mm_dd);
 
@@ -1122,8 +1316,12 @@ fn apply_task_sync_into_rfc(
 
     let phase_end_adjusted = phase_end + if status_idx.is_none() { 1 } else { 0 };
     if let Some(idx) = impl_idx {
-        lines[idx + if status_idx.is_none() && idx >= task_line_idx + 1 { 1 } else { 0 }] =
-            impl_line;
+        lines[idx
+            + if status_idx.is_none() && idx >= task_line_idx + 1 {
+                1
+            } else {
+                0
+            }] = impl_line;
     } else {
         let status_pos = (phase_start + 1..phase_end_adjusted)
             .find(|idx| lines[*idx].trim_start().starts_with("- Phase Status:"))
@@ -1281,7 +1479,9 @@ fn backlog_ref_candidates(normalized: &str) -> BacklogRefCandidates {
         }
     }
 
-    if normalized.starts_with("docs/backlogs/") && !normalized.starts_with(&format!("{BACKLOG_CLOSED_DIR}/")) {
+    if normalized.starts_with("docs/backlogs/")
+        && !normalized.starts_with(&format!("{BACKLOG_CLOSED_DIR}/"))
+    {
         if let Some((_, tail)) = normalized.split_once("docs/backlogs/") {
             closed_candidates.push(format!("{BACKLOG_CLOSED_DIR}/{tail}"));
         }
@@ -1302,10 +1502,7 @@ fn backlog_ref_candidates(normalized: &str) -> BacklogRefCandidates {
 }
 
 fn extract_id_from_backlog_path(path: &str) -> Option<String> {
-    let name = Path::new(path)
-        .file_name()?
-        .to_string_lossy()
-        .to_string();
+    let name = Path::new(path).file_name()?.to_string_lossy().to_string();
     parse_backlog_name_any(&name).map(|(id, _, _)| format!("{id:06}"))
 }
 
@@ -1324,11 +1521,27 @@ fn rfc_sync_summary_json(summary: &RfcSyncSummary) -> String {
     format!(
         "{{\"checked\":{},\"has_parent_rfc\":{},\"rfc_doc\":{},\"updated\":{},\"phase\":{},\"detail\":{}}}",
         if summary.checked { "true" } else { "false" },
-        if summary.has_parent_rfc { "true" } else { "false" },
+        if summary.has_parent_rfc {
+            "true"
+        } else {
+            "false"
+        },
         json_nullable(&summary.rfc_doc),
         if summary.updated { "true" } else { "false" },
         json_nullable(&summary.phase),
         json_nullable(&summary.detail),
+    )
+}
+
+fn next_id_sync_summary_json(summary: &NextIdSyncSummary) -> String {
+    format!(
+        "{{\"task\":\"{}\",\"task_id\":\"{}\",\"local_before\":\"{}\",\"origin_main\":\"{}\",\"local_after\":\"{}\",\"updated\":{}}}",
+        json_escape(&summary.task),
+        json_escape(&summary.task_id),
+        json_escape(&summary.local_before),
+        json_escape(&summary.origin_main),
+        json_escape(&summary.local_after),
+        if summary.updated { "true" } else { "false" },
     )
 }
 
@@ -1378,8 +1591,8 @@ fn detect_max_backlog_id(open_dir: &Path, closed_dir: &Path) -> Result<u32, Stri
         if !dir.is_dir() {
             return Err(format!("not a directory: {}", normalize_path(dir)));
         }
-        let entries =
-            fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", normalize_path(dir)))?;
+        let entries = fs::read_dir(dir)
+            .map_err(|e| format!("failed to read {}: {e}", normalize_path(dir)))?;
         for entry in entries {
             let entry = match entry {
                 Ok(v) => v,
@@ -1411,7 +1624,8 @@ fn find_backlog_by_id(dir: &Path, id: &str) -> Result<Vec<PathBuf>, String> {
         return Ok(out);
     }
     let prefix = format!("{id}-");
-    let entries = fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", normalize_path(dir)))?;
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", normalize_path(dir)))?;
     for entry in entries {
         let entry = match entry {
             Ok(v) => v,
