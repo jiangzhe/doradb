@@ -3,6 +3,7 @@ id: 000079
 title: Adopt cargo-nextest for validation and timeout enforcement
 status: implemented  # proposal | implemented | superseded
 created: 2026-03-19
+github_issue: 451
 ---
 
 # Task: Adopt cargo-nextest for validation and timeout enforcement
