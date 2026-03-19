@@ -1,7 +1,7 @@
 ---
 id: 000078
 title: Catalog Separation And Background-Worker Extraction
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-19
 github_issue: 449
 ---
@@ -192,6 +192,73 @@ Reference:
    11. `TransactionSystemWorkers`
 
 ## Implementation Notes
+1. Implemented `Catalog` as a direct engine component and runtime field:
+   - `EngineInner` now stores `catalog: QuiescentGuard<Catalog>`;
+   - `Engine::catalog()` and `EngineRef::catalog()` now read that field
+     directly instead of routing through `trx_sys`;
+   - `TransactionSystem` no longer owns `Catalog` and now depends on an
+     explicit catalog guard.
+2. Moved catalog-checkpoint ownership onto the catalog side:
+   - checkpoint scan/apply types and orchestration now live under
+     `doradb-storage/src/catalog/checkpoint.rs`;
+   - `TransactionSystem` now provides lower-level redo/log scan config helpers
+     instead of owning the catalog-checkpoint flow.
+3. Extracted grouped worker components for the long-lived subsystem workers:
+   - `DiskPoolWorkers`
+   - `TableFileSystemWorkers`
+   - `MemPoolWorkers`
+   - `TransactionSystemWorkers`
+   Each worker component owns its startup artifacts, shutdown state, and join
+   handles, and joins all managed threads during `shutdown(...)`.
+4. Simplified the core runtime owners after worker extraction:
+   - `GlobalReadonlyBufferPool`, `TableFileSystem`, `EvictableBufferPool`, and
+     `TransactionSystem` no longer own worker join handles or embedded worker
+     startup/shutdown flow;
+   - normal core-owner drop remains a quiescent drain boundary, while explicit
+     worker stop/join now belongs to the worker components.
+5. Best-effort per-component startup separation shipped through a concrete
+   build-time provision mechanism:
+   - phase 4 ended up introducing `RegistryBuilder`, `Shelf`, `ShelfScope`,
+     and `Supplier` in `doradb-storage/src/component.rs`;
+   - one-shot startup artifacts now move across explicit component edges such as
+     `TableFileSystem -> TableFileSystemWorkers`,
+     `MemPool -> MemPoolWorkers`, and
+     `TransactionSystem -> TransactionSystemWorkers`;
+   - successful engine build now requires an empty build shelf, and failed
+     startup uses builder-backed shutdown before registry drop.
+6. Final registration order differs from the original design draft in one
+   important place:
+   - `Catalog` registers after `MemPool`, not before it;
+   - this shipped order is required because catalog-owned table runtimes retain
+     pool guards, so reverse shutdown/drop must release those table-held guards
+     before pool owners are torn down.
+7. Test and helper cleanup completed during implementation:
+   - standalone `Started*` helper types were moved into test modules and
+     removed from production-scope APIs;
+   - `EvictableBufferPoolConfig::build()` now serves as the internal split
+     constructor returning `(EvictableBufferPool, PendingIOThread)`, while
+     readonly pool constructors remain public because `DiskPool` still depends
+     on them in production code.
+8. Focused validation completed for the implemented lifecycle path:
+```bash
+cargo test -p doradb-storage component::tests::test_shelf_take_removes_edge_entry -- --exact
+cargo test -p doradb-storage component::tests::test_shelf_rejects_duplicate_edge_put -- --exact
+cargo test -p doradb-storage engine::tests::test_engine_shutdown_busy_until_refs_drop -- --exact
+cargo test -p doradb-storage engine::tests::test_engine_shutdown_is_idempotent_and_rejects_new_work -- --exact
+cargo test -p doradb-storage engine::tests::test_unstarted_transaction_system_shutdown_is_safe -- --exact
+cargo test -p doradb-storage file::table_fs::tests::test_table_file_system_shutdown_is_idempotent -- --exact
+cargo test -p doradb-storage buffer::evict::tests::test_evictable_buffer_pool_started_scope_starts_workers_for_eviction_and_reload -- --exact
+cargo test -p doradb-storage buffer::readonly::tests::test_readonly_pool_lifecycle_drop_order_with_table_fs -- --exact
+cargo test -p doradb-storage catalog::tests::test_catalog_checkpoint_scan_apply_full_range -- --exact
+cargo test -p doradb-storage buffer::readonly::tests::test_readonly_pool_drop_unblocks_detached_reserve_waiter -- --exact
+cargo test -p doradb-storage buffer::readonly::tests::test_readonly_pool_drop_only_eviction_and_reload -- --exact
+cargo test -p doradb-storage buffer::readonly::tests::test_global_readonly_pool_shutdown_is_idempotent_before_worker_start -- --exact
+cargo test -p doradb-storage --no-run
+cargo test -p doradb-storage --no-default-features --no-run
+```
+9. Full crate-wide test runs were not completed during this task branch; the
+   recorded validation above is the focused set that was actually run while
+   implementing and hardening the phase-4 changes.
 
 ## Impacts
 
@@ -242,9 +309,11 @@ Reference:
 
 ## Open Questions
 
-None at design time after review. The task direction is fixed to:
-1. move catalog-checkpoint ownership to `Catalog`;
-2. prefer separated startup per component on a best-effort basis and avoid a
-   generic build-artifact mechanism unless a concrete subsystem needs it; and
-3. provide standalone worker/core bundle wrappers at least for tests, using
-   test-module helpers plus re-exports when cross-module test reuse is needed.
+1. Follow-up backlog [000063-remove-internal-arc-state-from-readonly-and-evictable-pools.md](../backlogs/000063-remove-internal-arc-state-from-readonly-and-evictable-pools.md)
+   remains open for a later cleanup pass. The current readonly detached
+   miss-load state still uses `Arc`-owned sub-state as a workaround for the
+   current IO-failure/cancellation model, and the evictable/readonly runtimes
+   still mix keepalive guards with `Arc`-cloned internal state.
+2. That cleanup depends on the broader IO-owned completion/generalization work
+   tracked in backlog
+   `docs/backlogs/000053-io-thread-owned-completion-callback-framework-for-file-io.md`.
