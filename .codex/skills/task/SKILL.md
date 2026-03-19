@@ -17,7 +17,7 @@ This skill has two prompt workflows:
 1. Perform deep research first.
 2. Present multiple proposals and tradeoffs.
 3. Run two formal rounds before writing.
-4. Require explicit approval before writing to `docs/tasks/`.
+4. Require explicit approval before writing to a task worktree under `worktrees/<task-id>/docs/tasks/`.
 
 Do not skip or reorder these steps.
 
@@ -78,7 +78,7 @@ Resolve disagreements, tighten scope, and finalize:
 - test scenarios
 - open questions (if any)
 
-Round 2 must complete before any write to `docs/tasks/`.
+Round 2 must complete before any write to `worktrees/<task-id>/docs/tasks/`.
 
 ## Test Runner Constraint
 
@@ -95,18 +95,29 @@ Do not infer approval from silence or partial agreement.
 Do not create draft files before approval.
 
 After explicit approval:
-1. Determine next task id:
+1. Refresh the remote base branch from the dispatch root:
 ```bash
-tools/task.rs next-task-id
+git fetch origin main
 ```
-2. Create the task file from template (standard path):
+2. Reserve the next task id in the dispatch root:
+```bash
+tools/doc-id.rs alloc-id --kind task
+```
+3. Create the isolated task worktree from `origin/main`:
+```bash
+git worktree add worktrees/<task-id> origin/main
+```
+If `worktrees/<task-id>` already exists or `git worktree add` fails, stop and resolve that issue instead of falling back to the root checkout.
+4. Create the task file from template inside the new worktree:
 ```bash
 tools/task.rs create-task-doc \
   --title "Task title" \
   --slug "task-title" \
-  --auto-id
+  --id <task-id> \
+  --output-dir worktrees/<task-id>/docs/tasks
 ```
-3. If the request starts from `docs/backlogs/`, treat that backlog doc as context input only.
+5. Continue task-document writing inside `worktrees/<task-id>/...`.
+6. If the request starts from `docs/backlogs/`, treat that backlog doc as context input only.
    - Still run full deep research and proposal rounds.
    - Do not skip quality gates because backlog is brief.
    - Backlog filename must match `docs/backlogs/<6digits>-<follow-up-topic>.md`.
@@ -114,7 +125,7 @@ tools/task.rs create-task-doc \
    - If any source backlog file is under `docs/backlogs/closed/`, ask the user whether to continue task creation from already-closed backlog item(s).
    - If task creation proceeds from backlog, include a `Source Backlogs:` list in task doc context for resolve traceability.
    - Manual backlog create/close workflow is owned by `$backlog` skill (`tools/backlog.rs`), not by this skill.
-4. Fill the file according to `docs/tasks/000000-template.md`.
+7. Fill the file according to `docs/tasks/000000-template.md` in the task worktree.
 
 ## `task resolve` Required Flow
 
@@ -134,12 +145,17 @@ tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
 ```bash
 tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
-7. `task resolve` must always check RFC parent linkage.
+7. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
+```bash
+tools/task.rs resolve-task-next-id --task docs/tasks/000042-example.md
+```
+This command fetches `origin/main` and updates the local `docs/tasks/next-id` to at least the largest of the local value, fetched `origin/main` value, and `task id + 1`.
+8. `task resolve` must always check RFC parent linkage.
    - If task is a sub-task of an RFC, update corresponding RFC `Implementation Phases` during resolve:
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
-8. `task resolve` must not run `git commit` or `git push`.
+9. `task resolve` must not run `git commit` or `git push`.
    - Resolve updates are limited to document synchronization and related backlog/RFC tooling.
    - Leave commit/push decisions to an explicit user request or a separate workflow.
 

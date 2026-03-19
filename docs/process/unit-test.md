@@ -1,6 +1,23 @@
 # Unit Testing
 
-This project uses `cargo test` for all unit tests. It is crucial to ensure that all tests pass before submitting any code changes.
+This project uses `cargo-nextest` as the primary runner for routine local and
+CI validation of `doradb-storage`. It is crucial to ensure that both standard
+validation passes succeed before submitting any code changes.
+
+## Install `cargo-nextest`
+
+Install nextest with a locked dependency set:
+
+```bash
+cargo install --locked cargo-nextest
+```
+
+Repository defaults live in `.config/nextest.toml`. The default local profile
+enforces:
+
+- `10s` per-test timeout enforcement via `slow-timeout`
+- `15s` global test-execution timeout
+- fail-fast local behavior for quick feedback
 
 ## `libaio` Feature Gate
 
@@ -13,7 +30,7 @@ To accommodate this, there is a feature gate for `libaio`. When the `libaio` fea
 *   **With `libaio` (default):**
 
     ```bash
-    cargo test
+    cargo nextest run -p doradb-storage
     ```
 
 *   **Without `libaio`:**
@@ -21,16 +38,29 @@ To accommodate this, there is a feature gate for `libaio`. When the `libaio` fea
     Use the `--no-default-features` flag to disable the `libaio` feature.
 
     ```bash
-    cargo test --no-default-features
+    cargo nextest run -p doradb-storage --no-default-features
     ```
+
+Run the default-feature and `--no-default-features` passes sequentially. Do
+not run them concurrently in the same workspace unless a dedicated follow-up
+task proves the suite is isolation-safe under that layout.
+
+## Doc Tests
+
+This project currently does not have doctests.
+
+Do not run `cargo test --doc` as part of routine local validation or CI for
+`doradb-storage`. The supported validation flow is the sequential dual-pass
+`cargo nextest run` path above.
 
 ## Parallel Execution and Timeout Guidance
 
--   `cargo test` uses Rust's built-in test harness, which executes tests in parallel by default.
--   This project expects unit tests to provide fast feedback, but plain `cargo test` does not provide built-in timeout configuration or automatic hang detection.
--   Do not assume a universal 10-second timeout for crate-wide test runs when invoking plain `cargo test`.
--   If timeout-based enforcement or hang detection is required, treat that as explicit test-runner/tooling work rather than an ad hoc `cargo test` flag.
--   Future evaluation of `cargo-nextest` for timeout policy is tracked in `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md`.
+-   `cargo nextest run` executes tests in parallel by default.
+-   The repository default profile enforces the shared timeout policy for both
+    local validation passes.
+-   Local runs use fail-fast behavior for quicker feedback.
+-   CI uses dedicated nextest profiles that emit JUnit XML under
+    `target/**/nextest/` for machine-readable failure inspection.
 
 ## Test Policy
 
@@ -77,3 +107,7 @@ tools/coverage_focus.rs \
 The script regenerates coverage artifacts in two passes (default features and `--no-default-features`), merges LCOV with `grcov`, then prints focused line-coverage summaries and uncovered-line hotspots.
 
 All intermediate coverage artifacts are written under `target/coverage-focus/` so repository root is not polluted.
+
+Coverage execution and coverage-tooling migration remain on the current path
+for now and are tracked separately by
+`docs/backlogs/000064-investigate-and-improve-coverage-tooling.md`.

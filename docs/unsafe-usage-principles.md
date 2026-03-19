@@ -40,8 +40,8 @@ For unsafe-touching changes:
 2. refresh baseline inventory:
    - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
 3. run behavior-preserving tests:
-   - `cargo test -p doradb-storage`
-   - `cargo test -p doradb-storage --no-default-features` (when relevant)
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features` (when relevant)
 
 ## 5. Planning Compliance
 

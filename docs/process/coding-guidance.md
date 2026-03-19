@@ -47,7 +47,8 @@ We rely on tooling to enforce style.
 ## 4. Testing
 
 *   **Unit Tests**: Place in `mod tests` within the source file or in `tests.rs`.
-*   **Dual-Pass Testing**: Run tests with both default features (`libaio`) and `--no-default-features`.
+*   **Dual-Pass Testing**: Run `cargo nextest run -p doradb-storage` and `cargo nextest run -p doradb-storage --no-default-features` sequentially.
+*   **Doc Tests**: This project currently does not have doctests, and routine validation does not run `cargo test --doc`.
 
 ## 5. Unsafe Code
 

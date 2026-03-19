@@ -48,6 +48,6 @@ Hook behavior (`.githooks/pre-commit`):
 
 5. Validation
    - [ ] Behavior-preserving tests pass:
-         `cargo test -p doradb-storage`
+         `cargo nextest run -p doradb-storage`
    - [ ] No-default-features tests pass when relevant:
-         `cargo test -p doradb-storage --no-default-features`
+         `cargo nextest run -p doradb-storage --no-default-features`

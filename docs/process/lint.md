@@ -30,8 +30,8 @@ cargo clippy --all-features --all-targets -- -D warnings
 3. Run tests:
 
 ```bash
-cargo test -p doradb-storage
-cargo test -p doradb-storage --no-default-features
+cargo nextest run -p doradb-storage
+cargo nextest run -p doradb-storage --no-default-features
 ```
 
 ## Pre-commit Enforcement

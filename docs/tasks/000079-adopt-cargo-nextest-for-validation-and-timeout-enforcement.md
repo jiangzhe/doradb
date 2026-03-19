@@ -1,7 +1,7 @@
 ---
 id: 000079
 title: Adopt cargo-nextest for validation and timeout enforcement
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-19
 ---
 
