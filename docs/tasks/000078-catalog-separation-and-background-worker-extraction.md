@@ -3,6 +3,7 @@ id: 000078
 title: Catalog Separation And Background-Worker Extraction
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-19
+github_issue: 449
 ---
 
 # Task: Catalog Separation And Background-Worker Extraction
