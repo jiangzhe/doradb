@@ -514,10 +514,20 @@ Reference:
     boundaries, and prepare cleaner component-level lifecycle management.
   - Non-goals: No broader user-facing graceful-shutdown policy beyond the
     explicit shutdown barrier and later follow-up backlog work.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc:
+    `docs/tasks/000078-catalog-separation-and-background-worker-extraction.md`
+  - Task Issue: `#449`
+  - Phase Status: done
+  - Implementation Summary: Implemented in `doradb-storage` by task 000078:
+    split `Catalog` into a direct engine component and explicit
+    `TransactionSystem` dependency, moved catalog-checkpoint orchestration onto
+    the catalog side, extracted grouped worker components for disk pool, table
+    FS, mem pool, and transaction system, adopted `RegistryBuilder`/`Shelf`
+    for build-time startup artifact handoff, and finalized component order with
+    `Catalog` after `MemPool` so reverse shutdown/drop releases table-held pool
+    guards safely. [Task Resolve Sync:
+    docs/tasks/000078-catalog-separation-and-background-worker-extraction.md @
+    2026-03-19]
 
 - **Phase 5: Hardening, Cleanup, Diagnostics, And Documentation**
   - Scope: Add one dedicated document under `docs/` for component lifetime

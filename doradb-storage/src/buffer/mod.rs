@@ -12,12 +12,14 @@ mod util;
 
 #[cfg(test)]
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
+pub(crate) use evict::MemPoolWorkers;
 pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
 pub use identity::PoolRole;
 pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
+pub(crate) use readonly::DiskPoolWorkers;
 pub use readonly::{
     GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey, ReadonlyPageSource,
 };
@@ -29,7 +31,7 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, PageID, VersionedPageID};
 use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
-    MetaPoolConfig,
+    MetaPoolConfig, ShelfScope,
 };
 use crate::error::Result;
 use crate::error::Validation;
@@ -245,7 +247,11 @@ impl Component for MetaPool {
     const NAME: &'static str = "meta_pool";
 
     #[inline]
-    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+    async fn build(
+        config: Self::Config,
+        registry: &mut ComponentRegistry,
+        _shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
         registry.register::<Self>(FixedBufferPool::with_capacity(
             PoolRole::Meta,
             config.bytes,
@@ -269,7 +275,11 @@ impl Component for IndexPool {
     const NAME: &'static str = "index_pool";
 
     #[inline]
-    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+    async fn build(
+        config: Self::Config,
+        registry: &mut ComponentRegistry,
+        _shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
         registry.register::<Self>(FixedBufferPool::with_capacity(
             PoolRole::Index,
             config.bytes,
@@ -293,14 +303,15 @@ impl Component for MemPool {
     const NAME: &'static str = "mem_pool";
 
     #[inline]
-    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
-        registry.register::<Self>(config.role(PoolRole::Mem).build()?)?;
-        let pool = registry.dependency::<Self>()?;
-        // The pool must already live in its quiescent owner before worker
-        // startup so the background threads hold cloned guards instead of any
-        // leaked static owner.
-        EvictableBufferPool::start_background_workers_guarded(pool.clone_inner());
-        Ok(())
+    async fn build(
+        config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let (pool, pending) = config.role(PoolRole::Mem).build()?;
+        registry.register::<Self>(pool)?;
+        shelf.put::<MemPoolWorkers>(pending)?;
+        MemPoolWorkers::build((), registry, shelf.scope::<MemPoolWorkers>()).await
     }
 
     #[inline]
@@ -309,9 +320,7 @@ impl Component for MemPool {
     }
 
     #[inline]
-    fn shutdown(component: &Self::Owned) {
-        component.shutdown();
-    }
+    fn shutdown(_component: &Self::Owned) {}
 }
 
 impl Component for crate::DiskPool {
@@ -322,17 +331,16 @@ impl Component for crate::DiskPool {
     const NAME: &'static str = "disk_pool";
 
     #[inline]
-    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+    async fn build(
+        config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
         registry.register::<Self>(GlobalReadonlyBufferPool::with_capacity(
             PoolRole::Disk,
             config.bytes,
         )?)?;
-        let pool = registry.dependency::<Self>()?;
-        // The readonly evictor needs one keepalive guard cloned into the
-        // thread runtime, so startup must happen after stable owner
-        // registration.
-        GlobalReadonlyBufferPool::start_evictor_thread_guarded(pool.clone_inner());
-        Ok(())
+        DiskPoolWorkers::build((), registry, shelf.scope::<DiskPoolWorkers>()).await
     }
 
     #[inline]
@@ -341,7 +349,5 @@ impl Component for crate::DiskPool {
     }
 
     #[inline]
-    fn shutdown(component: &Self::Owned) {
-        component.shutdown();
-    }
+    fn shutdown(_component: &Self::Owned) {}
 }

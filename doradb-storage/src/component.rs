@@ -4,9 +4,30 @@ use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// One lifecycle-managed engine subsystem.
+///
+/// A component contributes one owned runtime value (`Owned`) and one cloneable
+/// dependency handle (`Access`) to the engine registry. The registry stores the
+/// owner inside a [`QuiescentBox`], which gives later components a stable
+/// address to reference through quiescent guards while still keeping final
+/// teardown under registry control.
+///
+/// Component contract:
+/// - [`Self::build`] runs after all earlier dependencies have been registered
+///   and may fetch them from [`ComponentRegistry`].
+/// - [`Self::build`] may register additional helper components, such as worker
+///   components, as long as the overall registration order remains a valid
+///   dependency order.
+/// - [`Self::access`] derives the cloneable handle stored in the registry for
+///   later dependency lookup.
+/// - [`Self::shutdown`] is called in reverse registration order before owner
+///   drop. Because shutdown does not receive the registry, components that need
+///   other objects during teardown must retain those dependencies in their own
+///   owned state.
 pub(crate) trait Component: Sized + 'static {
     type Config;
     type Owned: Send + Sync + 'static;
@@ -17,11 +38,18 @@ pub(crate) trait Component: Sized + 'static {
     fn build(
         config: Self::Config,
         registry: &mut ComponentRegistry,
+        shelf: ShelfScope<'_, Self>,
     ) -> impl Future<Output = Result<()>> + Send;
 
     fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access;
 
     fn shutdown(component: &Self::Owned);
+}
+
+/// Build-time provision edge from one component to a specific downstream
+/// component.
+pub(crate) trait Supplier<Down: Component>: Component {
+    type Provision: Send + 'static;
 }
 
 trait ErasedComponentBox: Send + Sync {
@@ -39,10 +67,192 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
     }
 }
 
+/// Ordered registry for engine components and their dependency handles.
+///
+/// The registry intentionally models lifecycle as one fixed topological order
+/// rather than a general dependency DAG. Registration order defines:
+/// - which dependencies are available to later [`Component::build`] calls
+/// - reverse-order explicit shutdown in [`Self::shutdown_all`]
+/// - reverse-order final owner drop in [`Drop`]
+///
+/// Current engine registration order:
+/// 1. `DiskPool`
+/// 2. `DiskPoolWorkers` -> `DiskPool`
+/// 3. `TableFileSystem`
+/// 4. `TableFileSystemWorkers` -> `TableFileSystem`
+/// 5. `MetaPool`
+/// 6. `IndexPool`
+/// 7. `MemPool`
+/// 8. `MemPoolWorkers` -> `MemPool`
+/// 9. `Catalog` -> `MetaPool`, `IndexPool`, `TableFileSystem`, `DiskPool`
+/// 10. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`,
+///     `TableFileSystem`, `DiskPool`, `Catalog`
+/// 11. `TransactionSystemWorkers` -> `TransactionSystem`
+///
+/// In addition to the direct component edges above, `Catalog` owns user-table
+/// runtimes that retain guards into `MemPool`, `IndexPool`, `TableFileSystem`,
+/// and `DiskPool`. That is why `Catalog` must be registered after those pool
+/// and file components: reverse shutdown and drop must release table-owned
+/// guards before the underlying pool owners are torn down.
+///
+/// Worker components may also retain extra shutdown-only dependencies in their
+/// owned state, but those retained guards are an implementation detail rather
+/// than additional registry lookup edges.
 pub(crate) struct ComponentRegistry {
     access_map: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     boxed_vec: Vec<Box<dyn ErasedComponentBox>>,
     shutdown_started: AtomicBool,
+}
+
+type ShelfKey = (TypeId, TypeId);
+
+/// Build-only storage for transient provisions passed between components.
+pub(crate) struct Shelf {
+    parts: HashMap<ShelfKey, Box<dyn Any + Send>>,
+}
+
+impl Shelf {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            parts: HashMap::new(),
+        }
+    }
+
+    #[inline]
+    fn key<Up: Component, Down: Component>() -> ShelfKey {
+        (TypeId::of::<Up>(), TypeId::of::<Down>())
+    }
+
+    #[inline]
+    fn put<Up, Down>(&mut self, provision: <Up as Supplier<Down>>::Provision) -> Result<()>
+    where
+        Up: Supplier<Down>,
+        Down: Component,
+    {
+        let old = self
+            .parts
+            .insert(Self::key::<Up, Down>(), Box::new(provision));
+        if old.is_some() {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn take<Up, Down>(&mut self) -> Option<<Up as Supplier<Down>>::Provision>
+    where
+        Up: Supplier<Down>,
+        Down: Component,
+    {
+        self.parts
+            .remove(&Self::key::<Up, Down>())
+            .map(|provision| {
+                *provision
+                    .downcast::<<Up as Supplier<Down>>::Provision>()
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "invalid shelf provision type for edge {} -> {}",
+                            Up::NAME,
+                            Down::NAME
+                        )
+                    })
+            })
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.parts.clear();
+    }
+
+    #[inline]
+    pub(crate) fn scope<C: Component>(&mut self) -> ShelfScope<'_, C> {
+        ShelfScope {
+            shelf: self,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Component-scoped view over the shared build shelf.
+pub(crate) struct ShelfScope<'a, C> {
+    shelf: &'a mut Shelf,
+    _marker: PhantomData<fn() -> C>,
+}
+
+impl<'a, C: Component> ShelfScope<'a, C> {
+    #[inline]
+    pub(crate) fn put<Down>(&mut self, provision: <C as Supplier<Down>>::Provision) -> Result<()>
+    where
+        C: Supplier<Down>,
+        Down: Component,
+    {
+        self.shelf.put::<C, Down>(provision)
+    }
+
+    #[inline]
+    pub(crate) fn take<Up>(&mut self) -> Option<<Up as Supplier<C>>::Provision>
+    where
+        Up: Supplier<C>,
+    {
+        self.shelf.take::<Up, C>()
+    }
+
+    #[inline]
+    pub(crate) fn scope<Other: Component>(&mut self) -> ShelfScope<'_, Other> {
+        self.shelf.scope::<Other>()
+    }
+}
+
+/// Build-phase owner for the runtime registry and transient provisions.
+pub(crate) struct RegistryBuilder {
+    registry: Option<ComponentRegistry>,
+    shelf: Shelf,
+}
+
+impl RegistryBuilder {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            registry: Some(ComponentRegistry::new()),
+            shelf: Shelf::new(),
+        }
+    }
+
+    #[inline]
+    pub(crate) async fn build<C: Component>(&mut self, config: C::Config) -> Result<()> {
+        let registry = self
+            .registry
+            .as_mut()
+            .expect("registry builder is armed until finish");
+        let shelf = self.shelf.scope::<C>();
+        C::build(config, registry, shelf).await
+    }
+
+    #[inline]
+    pub(crate) fn finish(mut self) -> Result<ComponentRegistry> {
+        if !self.shelf.is_empty() {
+            return Err(Error::InvalidState);
+        }
+        self.registry.take().ok_or(Error::InvalidState)
+    }
+}
+
+impl Drop for RegistryBuilder {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.as_ref() {
+            registry.shutdown_all();
+        }
+        // Provisions can retain quiescent guards into registered owners, so the
+        // shelf must be drained before owner drop starts.
+        self.shelf.clear();
+    }
 }
 
 impl Default for ComponentRegistry {
@@ -53,6 +263,7 @@ impl Default for ComponentRegistry {
 }
 
 impl ComponentRegistry {
+    /// Create an empty component registry.
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
@@ -62,6 +273,11 @@ impl ComponentRegistry {
         }
     }
 
+    /// Register one component owner and publish its dependency handle.
+    ///
+    /// Registration order is significant: later components may only depend on
+    /// components that were registered earlier, and reverse registration order
+    /// becomes the engine shutdown/drop order.
     #[inline]
     pub(crate) fn register<C: Component>(&mut self, owned: C::Owned) -> Result<()> {
         debug_assert!(
@@ -81,6 +297,8 @@ impl ComponentRegistry {
         Ok(())
     }
 
+    /// Return the cloned dependency handle for a previously registered
+    /// component, if present.
     #[inline]
     pub(crate) fn get<C: Component>(&self) -> Option<C::Access> {
         self.access_map
@@ -89,12 +307,18 @@ impl ComponentRegistry {
             .cloned()
     }
 
+    /// Fetch a required dependency handle for a previously registered
+    /// component.
     #[inline]
     pub(crate) fn dependency<C: Component>(&self) -> Result<C::Access> {
         self.get::<C>()
             .ok_or(Error::EngineComponentMissingDependency)
     }
 
+    /// Run explicit component shutdown in reverse registration order.
+    ///
+    /// This is idempotent at the registry level and is intended to stop worker
+    /// activity before owner drop starts waiting on quiescent guards.
     #[inline]
     pub(crate) fn shutdown_all(&self) {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
@@ -208,7 +432,11 @@ mod tests {
         const NAME: &'static str = "value";
 
         #[inline]
-        async fn build(_config: Self::Config, _registry: &mut ComponentRegistry) -> Result<()> {
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> Result<()> {
             unreachable!("test-only component")
         }
 
@@ -242,6 +470,7 @@ mod tests {
                 async fn build(
                     _config: Self::Config,
                     _registry: &mut ComponentRegistry,
+                    _shelf: ShelfScope<'_, Self>,
                 ) -> Result<()> {
                     unreachable!("test-only component")
                 }
@@ -292,7 +521,11 @@ mod tests {
         const NAME: &'static str = "access-order";
 
         #[inline]
-        async fn build(_config: Self::Config, _registry: &mut ComponentRegistry) -> Result<()> {
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> Result<()> {
             unreachable!("test-only component")
         }
 
@@ -368,5 +601,76 @@ mod tests {
         drop(registry);
 
         assert_eq!(events.lock().as_slice(), &["access", "owner"]);
+    }
+
+    struct Upstream;
+    struct Downstream;
+
+    impl Component for Upstream {
+        type Config = ();
+        type Owned = ();
+        type Access = ();
+
+        const NAME: &'static str = "up";
+
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> Result<()> {
+            unreachable!("test-only component")
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(_component: &Self::Owned) {}
+    }
+
+    impl Component for Downstream {
+        type Config = ();
+        type Owned = ();
+        type Access = ();
+
+        const NAME: &'static str = "down";
+
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> Result<()> {
+            unreachable!("test-only component")
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(_component: &Self::Owned) {}
+    }
+
+    impl Supplier<Downstream> for Upstream {
+        type Provision = usize;
+    }
+
+    #[test]
+    fn test_shelf_take_removes_edge_entry() {
+        let mut shelf = Shelf::new();
+        {
+            let mut up = shelf.scope::<Upstream>();
+            up.put::<Downstream>(7).unwrap();
+        }
+        {
+            let mut down = shelf.scope::<Downstream>();
+            assert_eq!(down.take::<Upstream>(), Some(7));
+            assert_eq!(down.take::<Upstream>(), None);
+        }
+        assert!(shelf.is_empty());
+    }
+
+    #[test]
+    fn test_shelf_rejects_duplicate_edge_put() {
+        let mut shelf = Shelf::new();
+        let mut up = shelf.scope::<Upstream>();
+        up.put::<Downstream>(7).unwrap();
+        let err = up.put::<Downstream>(11).unwrap_err();
+        assert!(matches!(err, Error::InvalidState));
     }
 }

@@ -120,7 +120,7 @@ mod basic_tests {
 pub(super) async fn log_recover(
     meta_pool: &FixedBufferPool,
     deps: RecoveryDeps,
-    catalog: &mut Catalog,
+    catalog: &Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
 ) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>)> {
@@ -180,7 +180,7 @@ pub struct LogRecovery<'a> {
     mem_pool: QuiescentGuard<EvictableBufferPool>,
     table_fs: QuiescentGuard<TableFileSystem>,
     global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
-    catalog: &'a mut Catalog,
+    catalog: &'a Catalog,
     log_merger: LogMerger,
     catalog_replay_start_ts: TrxID,
     replay_floor: TrxID,
@@ -203,7 +203,7 @@ impl<'a> LogRecovery<'a> {
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: QuiescentGuard<TableFileSystem>,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
-        catalog: &'a mut Catalog,
+        catalog: &'a Catalog,
         log_merger: LogMerger,
     ) -> Self {
         let pool_guards = PoolGuards::builder()

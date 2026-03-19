@@ -1,4 +1,5 @@
 /target
+/doradb-storage/target
 Cargo.lock
 /.vscode
 tarpaulin-report.html

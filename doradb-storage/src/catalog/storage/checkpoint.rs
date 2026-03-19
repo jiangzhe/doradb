@@ -3,6 +3,7 @@ use crate::buffer::page::{BufferPage, PageID};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuards};
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
+use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{Error, Result};
 use crate::file::multi_table_file::{
@@ -19,7 +20,6 @@ use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowID, RowPage};
 use crate::table::TableAccess;
 use crate::trx::redo::RowRedoKind;
-use crate::trx::sys::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::value::Val;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
