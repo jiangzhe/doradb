@@ -1,9 +1,11 @@
+mod checkpoint;
 // mod index;
 pub mod runtime;
 pub mod spec;
 pub mod storage;
 pub mod table;
 
+pub use checkpoint::*;
 pub use runtime::*;
 pub use spec::*;
 pub use storage::*;
@@ -15,16 +17,16 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
     PoolRole,
 };
+use crate::component::{Component, ComponentRegistry, IndexPool, MetaPool, ShelfScope};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::index::SecondaryIndex;
 use crate::latch::LatchFallbackMode;
-use crate::quiescent::QuiescentGuard;
+use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage};
 use crate::table::{ColumnDeletionBuffer, Table, TableAccess};
-use crate::trx::sys::{CatalogCheckpointBatch, TransactionSystem};
 use dashmap::DashMap;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -56,6 +58,42 @@ pub struct Catalog {
     next_user_obj_id: AtomicU64,
     user_tables: DashMap<TableID, Arc<Table>>,
     pub storage: CatalogStorage,
+}
+
+impl Component for Catalog {
+    type Config = ();
+    type Owned = Self;
+    type Access = QuiescentGuard<Self>;
+
+    const NAME: &'static str = "catalog";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        _shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let meta_pool = registry.dependency::<MetaPool>()?;
+        let index_pool = registry.dependency::<IndexPool>()?;
+        let table_fs = registry.dependency::<TableFileSystem>()?;
+        let disk_pool = registry.dependency::<crate::DiskPool>()?;
+        let storage = CatalogStorage::new(
+            meta_pool.clone_inner(),
+            index_pool.clone_inner(),
+            &table_fs,
+            disk_pool.clone_inner(),
+        )
+        .await?;
+        registry.register::<Self>(Catalog::new(storage).await?)
+    }
+
+    #[inline]
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
+        owner.guard()
+    }
+
+    #[inline]
+    fn shutdown(_component: &Self::Owned) {}
 }
 
 impl Catalog {
@@ -94,43 +132,6 @@ impl Catalog {
     #[inline]
     pub fn curr_next_user_obj_id(&self) -> ObjID {
         self.next_user_obj_id.load(Ordering::Acquire)
-    }
-
-    /// Trigger one ad-hoc catalog checkpoint publish.
-    ///
-    /// # Panics
-    ///
-    /// Panics if another checkpoint is already in progress on the same
-    /// shared `CatalogStorage`/`MultiTableFile`. Concurrent checkpoint
-    /// publishes are not supported by design; the underlying
-    /// [`crate::file::cow_file::CowFile`] enforces a single mutable writer via
-    /// an atomic claim and will panic on violation.
-    #[inline]
-    pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
-        let batch = self.scan_checkpoint_batch(trx_sys)?;
-        self.apply_checkpoint_batch(batch).await
-    }
-
-    /// Scan persisted redo logs and collect one safe catalog checkpoint batch.
-    ///
-    /// This call satisfies `scan_catalog_checkpoint_batch`'s precondition by
-    /// using the global persisted watermark across all log partitions.
-    ///
-    /// Scanned batches are intended for single-flight publish flow and must not
-    /// be raced with other catalog checkpoint publishes against the same shared
-    /// `CatalogStorage`/`MultiTableFile` writer.
-    pub fn scan_checkpoint_batch(
-        &self,
-        trx_sys: &TransactionSystem,
-    ) -> Result<CatalogCheckpointBatch> {
-        let snapshot = self.storage.checkpoint_snapshot()?;
-        let catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
-        let durable_upper_cts = trx_sys.persisted_watermark_cts();
-        trx_sys.scan_catalog_checkpoint_batch(
-            catalog_replay_start_ts,
-            durable_upper_cts,
-            |table_id| self.loaded_table_heap_redo_start_ts(table_id),
-        )
     }
 
     /// Apply one scanned catalog checkpoint batch into `catalog.mtb`.

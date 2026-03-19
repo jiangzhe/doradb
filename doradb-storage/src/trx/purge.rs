@@ -36,7 +36,7 @@ impl TransactionSystem {
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
-    ) {
+    ) -> Vec<JoinHandle<()>> {
         let trx_sys = trx_sys.into_sync();
         let mem_pool = mem_pool.into_sync();
         if trx_sys.config.purge_threads == 1 {
@@ -54,8 +54,7 @@ impl TransactionSystem {
                     purge_chan,
                 )))
             });
-            let mut g = trx_sys.purge_threads.lock();
-            g.push(handle);
+            vec![handle]
         } else {
             // multi-threaded purger
             let dispatcher_guards = pool_guards.clone();
@@ -72,9 +71,10 @@ impl TransactionSystem {
                     purge_chan,
                 )));
             });
-            let mut g = trx_sys.purge_threads.lock();
-            g.push(handle);
-            g.extend(executors);
+            let mut handles = Vec::with_capacity(executors.len() + 1);
+            handles.push(handle);
+            handles.extend(executors);
+            handles
         }
     }
 

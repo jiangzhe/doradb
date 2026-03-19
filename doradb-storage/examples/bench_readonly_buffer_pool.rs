@@ -1,13 +1,15 @@
 use clap::Parser;
 use doradb_storage::buffer::guard::PageGuard;
 use doradb_storage::buffer::page::{PAGE_SIZE, Page, PageID};
-use doradb_storage::buffer::{BufferPool, GlobalReadonlyBufferPool, PoolRole, ReadonlyBufferPool};
+use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+use doradb_storage::engine::EngineConfig;
 use doradb_storage::error::PersistedFileKind;
 use doradb_storage::file::table_fs::TableFileSystemConfig;
 use doradb_storage::io::AIOBuf;
 use doradb_storage::latch::LatchFallbackMode;
 use doradb_storage::quiescent::QuiescentBox;
+use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::ValKind;
 use rand::RngCore;
 use std::sync::Arc;
@@ -53,26 +55,39 @@ fn main() {
     let args = Args::parse();
     smol::block_on(async move {
         let temp_dir = TempDir::new().unwrap();
-        let fs = TableFileSystemConfig::default()
-            .data_dir(temp_dir.path())
+        let engine = EngineConfig::default()
+            .storage_root(temp_dir.path())
+            .file(
+                TableFileSystemConfig::default()
+                    .data_dir(".")
+                    .readonly_buffer_size(args.cache_bytes),
+            )
+            .meta_buffer(32usize * 1024 * 1024)
+            .index_buffer(64usize * 1024 * 1024)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .max_mem_size(64usize * 1024 * 1024)
+                    .max_file_size(128usize * 1024 * 1024),
+            )
+            .trx(TrxSysConfig::default().skip_recovery(true))
             .build()
+            .await
             .unwrap();
-        let table_file = fs.create_table_file(901, make_metadata(), false).unwrap();
+        let table_file = engine
+            .table_fs
+            .create_table_file(901, make_metadata(), false)
+            .unwrap();
         let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
         drop(old_root);
 
         write_pages(&table_file, args.pages).await;
 
-        // The cold scan can exceed cache capacity, so the benchmark must use a
-        // started standalone readonly pool with its eviction worker running.
-        let global =
-            GlobalReadonlyBufferPool::with_capacity_owned(PoolRole::Disk, args.cache_bytes)
-                .unwrap();
         let pool = QuiescentBox::new(ReadonlyBufferPool::new(
             901,
             PersistedFileKind::TableFile,
             Arc::clone(&table_file),
-            global.guard(),
+            engine.disk_pool.clone_inner(),
         ));
         let pool_guard = (*pool).pool_guard();
 
@@ -116,7 +131,7 @@ fn main() {
             PAGE_SIZE,
             args.pages,
             args.warm_reads,
-            global.allocated(),
+            engine.disk_pool.allocated(),
             cold_elapsed.as_millis(),
             warm_elapsed.as_millis(),
             cold_per_read_ns,
@@ -127,9 +142,7 @@ fn main() {
 
         drop(pool_guard);
         drop(pool);
-        global.shutdown();
-        drop(global);
         drop(table_file);
-        drop(fs);
+        drop(engine);
     });
 }

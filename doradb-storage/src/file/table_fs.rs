@@ -1,13 +1,14 @@
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
-use crate::component::{Component, ComponentRegistry};
+use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::error::{Error, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
-use crate::io::{AIOClient, AIOContext};
+use crate::io::{AIOClient, AIOContext, AIOEventLoop};
+use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -19,12 +20,18 @@ use std::thread::JoinHandle;
 /// creating, opening, closing and removing table files.
 pub struct TableFileSystem {
     io_client: AIOClient<FileIO>,
-    handle: Mutex<Option<JoinHandle<()>>>,
     buf_list: FixedSizeBufferFreeList,
     data_dir: PathBuf,
     // Catalog multi-table file name.
     catalog_file_name: String,
 }
+
+pub(crate) struct TableFileSystemWorkersOwned {
+    fs: QuiescentGuard<TableFileSystem>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(crate) struct TableFileSystemWorkers;
 
 impl TableFileSystem {
     /// Create a new table-file subsystem.
@@ -32,19 +39,23 @@ impl TableFileSystem {
     /// This initializes one async IO context, its event loop thread, and a
     /// shared direct-buffer free list for table and catalog files.
     #[inline]
-    fn new(io_depth: usize, data_dir: PathBuf, catalog_file_name: String) -> Result<Self> {
+    fn new(
+        io_depth: usize,
+        data_dir: PathBuf,
+        catalog_file_name: String,
+    ) -> Result<(Self, AIOEventLoop<FileIO>)> {
         let ctx = AIOContext::new(io_depth)?;
         let buf_list = FixedSizeBufferFreeList::new(COW_FILE_PAGE_SIZE, io_depth, io_depth * 2);
         let (event_loop, io_client) = ctx.event_loop();
-        let listener = FileIOListener::new(buf_list.clone());
-        let handle = event_loop.start_thread(listener);
-        Ok(TableFileSystem {
-            io_client,
-            handle: Mutex::new(Some(handle)),
-            buf_list,
-            data_dir,
-            catalog_file_name,
-        })
+        Ok((
+            TableFileSystem {
+                io_client,
+                buf_list,
+                data_dir,
+                catalog_file_name,
+            },
+            event_loop,
+        ))
     }
 
     /// Create a new table file.
@@ -116,20 +127,14 @@ impl TableFileSystem {
         .await
     }
 
-    #[inline]
-    pub(crate) fn shutdown(&self) {
-        self.io_client.shutdown();
-        if let Some(handle) = self.handle.lock().take() {
-            handle.join().unwrap();
-        }
+    fn start_worker(fs: QuiescentGuard<Self>, event_loop: AIOEventLoop<FileIO>) -> JoinHandle<()> {
+        let listener = FileIOListener::new(fs.buf_list.clone());
+        event_loop.start_thread(listener)
     }
 }
 
-impl Drop for TableFileSystem {
-    #[inline]
-    fn drop(&mut self) {
-        self.shutdown();
-    }
+impl Supplier<TableFileSystemWorkers> for TableFileSystem {
+    type Provision = AIOEventLoop<FileIO>;
 }
 
 impl Component for TableFileSystem {
@@ -140,18 +145,59 @@ impl Component for TableFileSystem {
     const NAME: &'static str = "table_fs";
 
     #[inline]
-    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
-        registry.register::<Self>(config.build()?)
+    async fn build(
+        config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let (fs, setup) = config.build_parts()?;
+        registry.register::<Self>(fs)?;
+        shelf.put::<TableFileSystemWorkers>(setup)?;
+        TableFileSystemWorkers::build((), registry, shelf.scope::<TableFileSystemWorkers>()).await
     }
 
     #[inline]
-    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
         owner.guard()
     }
 
     #[inline]
+    fn shutdown(_component: &Self::Owned) {}
+}
+
+impl Component for TableFileSystemWorkers {
+    type Config = ();
+    type Owned = TableFileSystemWorkersOwned;
+    type Access = ();
+
+    const NAME: &'static str = "table_fs_workers";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let fs = registry.dependency::<TableFileSystem>()?;
+        let handle = TableFileSystem::start_worker(
+            fs.clone(),
+            shelf.take::<TableFileSystem>().ok_or(Error::InvalidState)?,
+        );
+        registry.register::<Self>(TableFileSystemWorkersOwned {
+            fs,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+
+    #[inline]
+    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+    #[inline]
     fn shutdown(component: &Self::Owned) {
-        component.shutdown();
+        component.fs.io_client.shutdown();
+        if let Some(handle) = component.handle.lock().take() {
+            handle.join().unwrap();
+        }
     }
 }
 
@@ -203,7 +249,7 @@ impl TableFileSystemConfig {
 
     /// Validate config and construct a [`TableFileSystem`].
     #[inline]
-    pub fn build(self) -> Result<TableFileSystem> {
+    fn build_parts(self) -> Result<(TableFileSystem, AIOEventLoop<FileIO>)> {
         if !validate_catalog_file_name(&self.catalog_file_name) {
             return Err(Error::InvalidStoragePath(format!(
                 "catalog file name must be a plain `.mtb` file name: {}",
@@ -212,6 +258,11 @@ impl TableFileSystemConfig {
         }
         let data_dir = validate_data_dir(&self.data_dir)?;
         TableFileSystem::new(self.io_depth, data_dir, self.catalog_file_name)
+    }
+
+    #[inline]
+    pub fn build(self) -> Result<TableFileSystem> {
+        Ok(self.build_parts()?.0)
     }
 }
 
@@ -265,19 +316,62 @@ pub(crate) mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    pub(crate) struct StartedTableFileSystem {
+        owner: QuiescentBox<TableFileSystem>,
+        handle: Mutex<Option<JoinHandle<()>>>,
+    }
+
+    impl StartedTableFileSystem {
+        #[inline]
+        pub(crate) fn guard(&self) -> QuiescentGuard<TableFileSystem> {
+            self.owner.guard()
+        }
+
+        #[inline]
+        pub(crate) fn shutdown(&self) {
+            self.owner.io_client.shutdown();
+            if let Some(handle) = self.handle.lock().take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    impl std::ops::Deref for StartedTableFileSystem {
+        type Target = TableFileSystem;
+
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            &self.owner
+        }
+    }
+
+    impl Drop for StartedTableFileSystem {
+        #[inline]
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    fn start_test_fs(config: TableFileSystemConfig) -> StartedTableFileSystem {
+        let (fs, event_loop) = config.build_parts().unwrap();
+        let owner = QuiescentBox::new(fs);
+        let handle = TableFileSystem::start_worker(owner.guard(), event_loop);
+        StartedTableFileSystem {
+            owner,
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
     #[inline]
-    pub(crate) fn build_test_fs() -> (TempDir, TableFileSystem) {
+    pub(crate) fn build_test_fs() -> (TempDir, StartedTableFileSystem) {
         let temp_dir = TempDir::new().unwrap();
         let fs = build_test_fs_in(temp_dir.path());
         (temp_dir, fs)
     }
 
     #[inline]
-    pub(crate) fn build_test_fs_in(data_dir: &Path) -> TableFileSystem {
-        TableFileSystemConfig::default()
-            .data_dir(data_dir)
-            .build()
-            .unwrap()
+    pub(crate) fn build_test_fs_in(data_dir: &Path) -> StartedTableFileSystem {
+        start_test_fs(TableFileSystemConfig::default().data_dir(data_dir))
     }
 
     #[test]

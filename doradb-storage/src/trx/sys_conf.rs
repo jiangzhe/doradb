@@ -3,7 +3,7 @@ use crate::buffer::{
     PoolRole,
 };
 use crate::catalog::Catalog;
-use crate::catalog::storage::CatalogStorage;
+use crate::component::Supplier;
 use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
 use crate::io::{AIOContext, align_to_sector_size};
@@ -12,9 +12,9 @@ use crate::storage_path::{path_to_utf8, validate_log_file_stem};
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
 use crate::trx::purge::{GC, Purge};
 use crate::trx::recover::log_recover;
-use crate::trx::sys::TransactionSystem;
+use crate::trx::sys::{TransactionSystem, TransactionSystemWorkers, TransactionSystemWorkersOwned};
 use byte_unit::Byte;
-use flume::Receiver;
+use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -71,6 +71,7 @@ pub(crate) struct PendingTransactionSystem {
 
 pub(crate) struct PendingTransactionSystemStartup {
     gc_rxs: Vec<Receiver<GC>>,
+    purge_tx: Sender<Purge>,
     purge_rx: Receiver<Purge>,
     mem_pool: QuiescentGuard<EvictableBufferPool>,
     pool_guards: PoolGuards,
@@ -85,16 +86,35 @@ impl PendingTransactionSystem {
 
 impl PendingTransactionSystemStartup {
     #[inline]
-    pub(crate) async fn start(self, trx_sys: QuiescentGuard<TransactionSystem>) {
-        TransactionSystem::start_io_threads(trx_sys.clone());
-        TransactionSystem::start_gc_threads(trx_sys.clone(), self.gc_rxs);
-        TransactionSystem::start_purge_threads(
+    pub(crate) fn start(
+        self,
+        trx_sys: QuiescentGuard<TransactionSystem>,
+    ) -> TransactionSystemWorkersOwned {
+        let io_threads = TransactionSystem::start_io_threads(trx_sys.clone());
+        let gc_threads = TransactionSystem::start_gc_threads(
+            trx_sys.clone(),
+            self.gc_rxs,
+            self.purge_tx.clone(),
+        );
+        let purge_threads = TransactionSystem::start_purge_threads(
             trx_sys.clone(),
             self.mem_pool,
             self.pool_guards,
             self.purge_rx,
         );
+        TransactionSystemWorkersOwned {
+            trx_sys: trx_sys.into_sync(),
+            purge_tx: self.purge_tx,
+            io_threads: parking_lot::Mutex::new(io_threads),
+            gc_threads: parking_lot::Mutex::new(gc_threads),
+            purge_threads: parking_lot::Mutex::new(purge_threads),
+            shutdown_started: std::sync::atomic::AtomicBool::new(false),
+        }
     }
+}
+
+impl Supplier<TransactionSystemWorkers> for TransactionSystem {
+    type Provision = PendingTransactionSystemStartup;
 }
 
 impl TrxSysConfig {
@@ -222,6 +242,7 @@ impl TrxSysConfig {
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: QuiescentGuard<TableFileSystem>,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+        catalog: QuiescentGuard<Catalog>,
     ) -> Result<PendingTransactionSystem> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
@@ -229,14 +250,6 @@ impl TrxSysConfig {
             log_partition_initializers.push(initializer);
         }
 
-        let catalog_storage = CatalogStorage::new(
-            meta_pool.clone(),
-            index_pool.clone(),
-            &table_fs,
-            global_disk_pool.clone(),
-        )
-        .await?;
-        let mut catalog = Catalog::new(catalog_storage).await?;
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, meta_pool.pool_guard())
             .push(PoolRole::Index, index_pool.pool_guard())
@@ -254,18 +267,19 @@ impl TrxSysConfig {
                 table_fs,
                 global_disk_pool,
             },
-            &mut catalog,
+            &catalog,
             log_partition_initializers,
             self.skip_recovery,
         )
         .await?;
 
-        let (purge_chan, purge_rx) = flume::unbounded();
-        let trx_sys = TransactionSystem::new(self, catalog, log_partitions, purge_chan);
+        let (purge_tx, purge_rx) = flume::unbounded();
+        let trx_sys = TransactionSystem::new(self, catalog, log_partitions);
         Ok(PendingTransactionSystem {
             trx_sys,
             startup: PendingTransactionSystemStartup {
                 gc_rxs,
+                purge_tx,
                 purge_rx,
                 mem_pool,
                 pool_guards,

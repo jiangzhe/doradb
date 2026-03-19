@@ -16,7 +16,7 @@ use crossbeam_utils::CachePadded;
 use event_listener::EventListener;
 use flume::{Receiver, Sender};
 use glob::{Pattern, glob};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const LOG_HEADER_PAGES: usize = 2;
@@ -44,6 +43,28 @@ pub struct LogPartitionInitializer {
 }
 
 impl LogPartitionInitializer {
+    #[inline]
+    pub(crate) fn recovery(
+        file_prefix: String,
+        log_no: usize,
+        io_depth_per_log: usize,
+        file_max_size: usize,
+        max_io_size: usize,
+        logs: Vec<PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            ctx: AIOContext::new(io_depth_per_log)?,
+            mode: LogPartitionMode::Recovery(VecDeque::from(logs)),
+            file_prefix,
+            file_max_size,
+            file_header_size: max_io_size * LOG_HEADER_PAGES,
+            page_size: max_io_size,
+            io_depth_per_log,
+            log_no,
+            file_seq: None,
+        })
+    }
+
     #[inline]
     pub fn stream(self) -> LogPartitionStream {
         LogPartitionStream {
@@ -113,8 +134,6 @@ impl LogPartitionInitializer {
                     self.io_depth_per_log * 2,
                     move || DirectBuf::zeroed(self.page_size),
                 ),
-                io_thread: Mutex::new(None),
-                gc_thread: Mutex::new(None),
             },
             gc_rx,
         ))
@@ -159,12 +178,6 @@ pub(super) struct LogPartition {
     /// Free list of page buffer, which is used by commit group to concat
     /// redo logs.
     pub(super) buf_free_list: FreeList<DirectBuf>,
-    /// Standalone thread to handle transaction commit.
-    /// Including submit IO requests, wait IO responses
-    /// and do fsync().
-    pub(super) io_thread: Mutex<Option<JoinHandle<()>>>,
-    /// Standalone thread for GC info analysis.
-    pub(super) gc_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl LogPartition {

@@ -9,6 +9,7 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, PoolRole, RowPoolRole};
+use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -18,7 +19,7 @@ use crate::io::{
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::notify::EventNotifyOnDrop;
-use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
+use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
 use crate::storage_path::{path_to_utf8, validate_swap_file_path_candidate};
 use byte_unit::Byte;
 use event_listener::{Event, EventListener, listener};
@@ -43,10 +44,6 @@ pub struct EvictableBufferPool {
     alloc_ev: Event,
     // IO client to send IO requests.
     io_client: AIOClient<PoolRequest>,
-    // IO thread handle.
-    io_thread: Mutex<Option<JoinHandle<()>>>,
-    // Startup state held until the pool reaches a stable final address.
-    pending_io: Mutex<Option<PendingIOThread>>,
     // shutdown flag.
     shutdown_flag: Arc<AtomicBool>,
     // In-memory page set.
@@ -57,6 +54,14 @@ pub struct EvictableBufferPool {
     stats: Arc<EvictableBufferPoolStats>,
     role: PoolRole,
     arena: QuiescentArena,
+}
+
+pub(crate) struct MemPoolWorkers;
+
+pub(crate) struct MemPoolWorkersOwned {
+    pool: SyncQuiescentGuard<EvictableBufferPool>,
+    io_thread: Mutex<Option<JoinHandle<()>>>,
+    evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl EvictableBufferPool {
@@ -240,29 +245,11 @@ impl EvictableBufferPool {
     }
 
     #[inline]
-    pub(crate) fn start_background_workers_guarded(pool: QuiescentGuard<Self>) {
-        // Acquire one direct guard from the stable owner, convert it once to
-        // `SyncQuiescentGuard`, then clone that wrapper into the IO and
-        // eviction workers. This keeps spawned threads on the guard side
-        // without recreating static-lifetime owners or handles.
-        let pending = {
-            let mut g = pool.pending_io.lock();
-            g.take()
-        };
-        let Some(pending) = pending else {
-            return;
-        };
-        let pool = pool.into_sync();
-        Self::start_io_thread_guarded(pool.clone(), pending.event_loop, pending.file_io);
-        Self::start_evict_thread_guarded(pool);
-    }
-
-    #[inline]
-    fn start_io_thread_guarded(
+    fn spawn_io_thread_guarded(
         pool: SyncQuiescentGuard<Self>,
         event_loop: AIOEventLoop<PoolRequest>,
         file_io: SingleFileIO,
-    ) {
+    ) -> JoinHandle<()> {
         let listener = EvictableBufferPoolListener {
             inflight_io: Arc::clone(&pool.inflight_io),
             in_mem: Arc::clone(&pool.in_mem),
@@ -272,13 +259,11 @@ impl EvictableBufferPool {
             prev_running: 0,
             _pool: Some(pool.clone()),
         };
-        let io_thread = event_loop.start_thread(listener);
-        let mut g = pool.io_thread.lock();
-        *g = Some(io_thread);
+        event_loop.start_thread(listener)
     }
 
     #[inline]
-    fn start_evict_thread_guarded(pool: SyncQuiescentGuard<Self>) {
+    fn spawn_evict_thread_guarded(pool: SyncQuiescentGuard<Self>) -> JoinHandle<()> {
         let runtime = EvictableRuntime {
             arena: pool.arena.arena_guard(pool.pool_guard()),
             in_mem: Arc::clone(&pool.in_mem),
@@ -288,26 +273,15 @@ impl EvictableBufferPool {
         };
         let policy =
             PressureDeltaClockPolicy::new(pool.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
-        let handle = Evictor::new(runtime, policy, Arc::clone(&pool.shutdown_flag))
-            .start_thread("EvictableBufferPoolEvictor");
-        let mut g = pool.in_mem.evict_thread.lock();
-        *g = Some(handle);
+        Evictor::new(runtime, policy, Arc::clone(&pool.shutdown_flag))
+            .start_thread("EvictableBufferPoolEvictor")
     }
 
     #[inline]
-    pub(crate) fn shutdown(&self) {
+    fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
-
-        self.in_mem.close();
+        self.in_mem.evict_ev.notify(1);
         self.io_client.shutdown();
-        {
-            let mut g = self.io_thread.lock();
-            if let Some(handle) = g.take() {
-                drop(g);
-                handle.join().unwrap();
-            }
-        }
-        let _ = self.pending_io.lock().take();
     }
 
     /// Reserve a page in memory.
@@ -573,16 +547,57 @@ impl BufferPool for EvictableBufferPool {
     }
 }
 
-impl Drop for EvictableBufferPool {
-    #[inline]
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
 unsafe impl Send for EvictableBufferPool {}
 
 unsafe impl Sync for EvictableBufferPool {}
+
+impl Component for MemPoolWorkers {
+    type Config = ();
+    type Owned = MemPoolWorkersOwned;
+    type Access = ();
+
+    const NAME: &'static str = "mem_pool_workers";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let pool = registry.dependency::<crate::MemPool>()?;
+        let pending = shelf.take::<crate::MemPool>().ok_or(Error::InvalidState)?;
+        let sync_pool = pool.clone_inner().into_sync();
+        let io_thread = EvictableBufferPool::spawn_io_thread_guarded(
+            sync_pool.clone(),
+            pending.event_loop,
+            pending.file_io,
+        );
+        let evict_thread = EvictableBufferPool::spawn_evict_thread_guarded(sync_pool.clone());
+        registry.register::<Self>(MemPoolWorkersOwned {
+            pool: sync_pool,
+            io_thread: Mutex::new(Some(io_thread)),
+            evict_thread: Mutex::new(Some(evict_thread)),
+        })
+    }
+
+    #[inline]
+    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.pool.signal_shutdown();
+        if let Some(handle) = component.io_thread.lock().take() {
+            handle.join().unwrap();
+        }
+        if let Some(handle) = component.evict_thread.lock().take() {
+            handle.join().unwrap();
+        }
+    }
+}
+
+impl Supplier<MemPoolWorkers> for crate::MemPool {
+    type Provision = PendingIOThread;
+}
 
 /// IO event-loop adapter for [`EvictableBufferPool`].
 ///
@@ -878,7 +893,6 @@ struct InMemPageSet {
     // Event to notify evictor thread to choose page candidates,
     // write to disk and release memory.
     evict_ev: Event,
-    evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl InMemPageSet {
@@ -892,7 +906,6 @@ impl InMemPageSet {
             set: Mutex::new(BTreeSet::new()),
             load_ev: Event::new(),
             evict_ev: Event::new(),
-            evict_thread: Mutex::new(None),
         }
     }
 
@@ -991,18 +1004,6 @@ impl InMemPageSet {
         let g = self.set.lock();
         clock_collect_batch(&g, clock_hand, limit, out)
     }
-
-    #[inline]
-    fn close(&self) {
-        // notify evict thread to quit.
-        self.evict_ev.notify(1);
-        {
-            let mut g = self.evict_thread.lock();
-            if let Some(handle) = g.take() {
-                handle.join().unwrap();
-            }
-        }
-    }
 }
 
 /// Thin wrapper for sparse-file page IO used by the evictable pool.
@@ -1041,7 +1042,7 @@ impl SingleFileIO {
     }
 }
 
-struct PendingIOThread {
+pub(crate) struct PendingIOThread {
     event_loop: AIOEventLoop<PoolRequest>,
     file_io: SingleFileIO,
 }
@@ -1170,7 +1171,7 @@ impl EvictableBufferPoolConfig {
     /// Worker startup must happen only after the pool has reached a stable
     /// owner address in [`QuiescentBox`].
     #[inline]
-    pub fn build(self) -> Result<EvictableBufferPool> {
+    pub(crate) fn build(self) -> Result<(EvictableBufferPool, PendingIOThread)> {
         self.role.assert_valid("evictable buffer pool");
         validate_swap_file_path_candidate(&self.data_swap_file)?;
         // 1. Calculate memory usage.
@@ -1209,11 +1210,6 @@ impl EvictableBufferPoolConfig {
             alloc_map: AllocMap::new(max_nbr),
             alloc_ev: Event::new(),
             io_client,
-            io_thread: Mutex::new(None),
-            pending_io: Mutex::new(Some(PendingIOThread {
-                event_loop,
-                file_io,
-            })),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             inflight_io: Arc::new(InflightIO::default()),
@@ -1221,21 +1217,13 @@ impl EvictableBufferPoolConfig {
             role: self.role,
             arena,
         };
-        Ok(pool)
-    }
-
-    /// Builds a started quiescent owner for standalone evictable-pool usage.
-    ///
-    /// The returned owner already has its IO and eviction workers running
-    /// through the guarded startup path. Call [`EvictableBufferPool::shutdown`]
-    /// before dropping non-process-lifetime owners, otherwise
-    /// [`QuiescentBox`] teardown will wait forever on the workers' keepalive
-    /// guards.
-    #[inline]
-    pub fn build_owned(self) -> Result<QuiescentBox<EvictableBufferPool>> {
-        let pool = QuiescentBox::new(self.build()?);
-        EvictableBufferPool::start_background_workers_guarded(pool.guard());
-        Ok(pool)
+        Ok((
+            pool,
+            PendingIOThread {
+                event_loop,
+                file_io,
+            },
+        ))
     }
 }
 
@@ -1401,7 +1389,7 @@ pub enum PoolRequest {
 mod tests {
     use super::*;
     use crate::buffer::guard::PageGuard;
-    use crate::quiescent::QuiescentBox;
+    use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
     use std::ops::Deref;
     use std::sync::Arc;
@@ -1412,17 +1400,40 @@ mod tests {
 
     struct StartedEvictPool {
         owner: QuiescentBox<EvictableBufferPool>,
+        io_thread: Mutex<Option<JoinHandle<()>>>,
+        evict_thread: Mutex<Option<JoinHandle<()>>>,
     }
 
     impl StartedEvictPool {
         fn new(config: EvictableBufferPoolConfig) -> Self {
+            let (pool, pending) = config.build().unwrap();
+            let owner = QuiescentBox::new(pool);
+            let sync_pool = owner.guard().into_sync();
+            let io_thread = EvictableBufferPool::spawn_io_thread_guarded(
+                sync_pool.clone(),
+                pending.event_loop,
+                pending.file_io,
+            );
+            let evict_thread = EvictableBufferPool::spawn_evict_thread_guarded(sync_pool);
             Self {
-                owner: config.build_owned().unwrap(),
+                owner,
+                io_thread: Mutex::new(Some(io_thread)),
+                evict_thread: Mutex::new(Some(evict_thread)),
             }
         }
 
         fn owner_guard(&self) -> QuiescentGuard<EvictableBufferPool> {
             self.owner.guard()
+        }
+
+        fn shutdown(&self) {
+            self.owner.signal_shutdown();
+            if let Some(handle) = self.io_thread.lock().take() {
+                handle.join().unwrap();
+            }
+            if let Some(handle) = self.evict_thread.lock().take() {
+                handle.join().unwrap();
+            }
         }
     }
 
@@ -1436,7 +1447,7 @@ mod tests {
 
     impl Drop for StartedEvictPool {
         fn drop(&mut self) {
-            self.owner.shutdown();
+            self.shutdown();
         }
     }
 
@@ -1462,10 +1473,11 @@ mod tests {
             .max_mem_size(64u64 * 1024 * 1024)
             .max_file_size(128u64 * 1024 * 1024)
             .build()
-            .unwrap();
+            .unwrap()
+            .0;
 
-        pool.shutdown();
-        pool.shutdown();
+        pool.signal_shutdown();
+        pool.signal_shutdown();
     }
 
     #[test]
@@ -1658,16 +1670,16 @@ mod tests {
     }
 
     #[test]
-    fn test_evictable_buffer_pool_build_owned_starts_workers_for_eviction_and_reload() {
+    fn test_evictable_buffer_pool_started_scope_starts_workers_for_eviction_and_reload() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let pool = EvictableBufferPoolConfig::default()
-                .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
-                .max_mem_size(64u64 * 1024 * 130)
-                .max_file_size(128u64 * 1024 * 130)
-                .build_owned()
-                .unwrap();
+            let pool = StartedEvictPool::new(
+                EvictableBufferPoolConfig::default()
+                    .role(crate::buffer::PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.bin"))
+                    .max_mem_size(64u64 * 1024 * 130)
+                    .max_file_size(128u64 * 1024 * 130),
+            );
             let pool_guard = EvictableBufferPool::pool_guard(&pool);
             let total_pages = pool.in_mem.max_count + 64;
 
@@ -1704,7 +1716,8 @@ mod tests {
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64)
                     .build()
-                    .unwrap(),
+                    .unwrap()
+                    .0,
             );
             let guard = {
                 let pool_guard = EvictableBufferPool::pool_guard(&pool);

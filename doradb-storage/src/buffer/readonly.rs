@@ -9,6 +9,7 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageS
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, PoolRole};
+use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Validation::Valid;
 use crate::error::{Error, PersistedFileKind, Result, Validation};
 use crate::file::multi_table_file::MultiTableFile;
@@ -106,9 +107,15 @@ pub struct GlobalReadonlyBufferPool {
     residency: Arc<ReadonlyResidency>,
     eviction_arbiter: EvictionArbiter,
     shutdown_flag: Arc<AtomicBool>,
-    evict_thread: Mutex<Option<JoinHandle<()>>>,
     role: PoolRole,
     arena: QuiescentArena,
+}
+
+pub(crate) struct DiskPoolWorkers;
+
+pub(crate) struct DiskPoolWorkersOwned {
+    pool: SyncQuiescentGuard<GlobalReadonlyBufferPool>,
+    evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl GlobalReadonlyBufferPool {
@@ -146,37 +153,9 @@ impl GlobalReadonlyBufferPool {
             residency: Arc::new(ReadonlyResidency::new(size, eviction_arbiter)),
             eviction_arbiter,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
-            evict_thread: Mutex::new(None),
             role,
             arena,
         };
-        Ok(pool)
-    }
-
-    /// Creates a started quiescent owner for standalone readonly-pool usage.
-    ///
-    /// The returned owner already has its eviction worker running through the
-    /// guarded startup path. Call [`Self::shutdown`] before dropping
-    /// non-process-lifetime owners, otherwise [`QuiescentBox`] teardown will
-    /// wait forever on the worker's keepalive guard.
-    #[inline]
-    pub fn with_capacity_owned(role: PoolRole, pool_size: usize) -> Result<QuiescentBox<Self>> {
-        Self::with_capacity_and_arbiter_builder_owned(role, pool_size, EvictionArbiter::builder())
-    }
-
-    /// Creates a started quiescent owner with explicit eviction arbiter builder.
-    #[inline]
-    pub fn with_capacity_and_arbiter_builder_owned(
-        role: PoolRole,
-        pool_size: usize,
-        eviction_arbiter_builder: EvictionArbiterBuilder,
-    ) -> Result<QuiescentBox<Self>> {
-        let pool = QuiescentBox::new(Self::with_capacity_and_arbiter_builder(
-            role,
-            pool_size,
-            eviction_arbiter_builder,
-        )?);
-        Self::start_evictor_thread_guarded(pool.guard());
         Ok(pool)
     }
 
@@ -397,7 +376,7 @@ impl GlobalReadonlyBufferPool {
     }
 
     #[inline]
-    pub(crate) fn start_evictor_thread_guarded(pool: QuiescentGuard<Self>) {
+    pub(crate) fn spawn_evictor_thread_guarded(pool: QuiescentGuard<Self>) -> JoinHandle<()> {
         // Acquire one direct guard from the stable owner, convert it once to
         // `SyncQuiescentGuard`, then clone that wrapper into the spawned
         // thread/runtime. This keeps worker startup on the guard side without
@@ -411,27 +390,14 @@ impl GlobalReadonlyBufferPool {
         };
         let policy = PressureDeltaClockPolicy::new(pool.eviction_arbiter, 1);
         let evictor = Evictor::new(runtime, policy, Arc::clone(&pool.shutdown_flag));
-        let handle = evictor.start_thread("ReadonlyBufferPoolEvictor");
-        let mut g = pool.evict_thread.lock();
-        *g = Some(handle);
+        evictor.start_thread("ReadonlyBufferPoolEvictor")
     }
 
-    /// Stops the eviction worker for a started standalone readonly pool.
-    ///
-    /// This method is idempotent and is required before dropping owners
-    /// created by [`Self::with_capacity_owned`] or
-    /// [`Self::with_capacity_and_arbiter_builder_owned`].
     #[inline]
-    pub fn shutdown(&self) {
+    fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
         self.residency.free_ev.notify(usize::MAX);
         self.residency.evict_ev.notify(1);
-        {
-            let mut g = self.evict_thread.lock();
-            if let Some(handle) = g.take() {
-                handle.join().unwrap();
-            }
-        }
     }
 
     #[inline]
@@ -606,13 +572,49 @@ impl GlobalReadonlyBufferPool {
 }
 
 impl Drop for GlobalReadonlyBufferPool {
+    #[inline]
     fn drop(&mut self) {
-        self.shutdown();
+        self.signal_shutdown();
     }
 }
 
 unsafe impl Send for GlobalReadonlyBufferPool {}
 unsafe impl Sync for GlobalReadonlyBufferPool {}
+
+impl Component for DiskPoolWorkers {
+    type Config = ();
+    type Owned = DiskPoolWorkersOwned;
+    type Access = ();
+
+    const NAME: &'static str = "disk_pool_workers";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        _shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let pool = registry.dependency::<crate::DiskPool>()?;
+        let sync_pool = pool.clone_inner().into_sync();
+        let evict_thread =
+            GlobalReadonlyBufferPool::spawn_evictor_thread_guarded(pool.into_inner());
+        registry.register::<Self>(DiskPoolWorkersOwned {
+            pool: sync_pool,
+            evict_thread: Mutex::new(Some(evict_thread)),
+        })
+    }
+
+    #[inline]
+    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.pool.signal_shutdown();
+        if let Some(handle) = component.evict_thread.lock().take() {
+            handle.join().unwrap();
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct InflightLoadValidation {
@@ -1337,6 +1339,55 @@ pub(crate) mod tests {
     use std::thread;
     use std::time::Duration;
 
+    struct StartedGlobalReadonlyBufferPool {
+        owner: QuiescentBox<GlobalReadonlyBufferPool>,
+        evict_thread: Mutex<Option<JoinHandle<()>>>,
+    }
+
+    impl StartedGlobalReadonlyBufferPool {
+        #[inline]
+        fn new(pool_size: usize) -> Self {
+            let owner = QuiescentBox::new(
+                GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, pool_size).unwrap(),
+            );
+            let evict_thread =
+                GlobalReadonlyBufferPool::spawn_evictor_thread_guarded(owner.guard());
+            Self {
+                owner,
+                evict_thread: Mutex::new(Some(evict_thread)),
+            }
+        }
+
+        #[inline]
+        fn guard(&self) -> crate::quiescent::QuiescentGuard<GlobalReadonlyBufferPool> {
+            self.owner.guard()
+        }
+
+        #[inline]
+        fn shutdown(&self) {
+            self.owner.signal_shutdown();
+            if let Some(handle) = self.evict_thread.lock().take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    impl Deref for StartedGlobalReadonlyBufferPool {
+        type Target = GlobalReadonlyBufferPool;
+
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            &self.owner
+        }
+    }
+
+    impl Drop for StartedGlobalReadonlyBufferPool {
+        #[inline]
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
     fn frame_page_bytes(cap: usize) -> usize {
         cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
     }
@@ -1347,8 +1398,8 @@ pub(crate) mod tests {
         )
     }
 
-    fn started_global_pool(pool_size: usize) -> QuiescentBox<GlobalReadonlyBufferPool> {
-        GlobalReadonlyBufferPool::with_capacity_owned(PoolRole::Disk, pool_size).unwrap()
+    fn started_global_pool(pool_size: usize) -> StartedGlobalReadonlyBufferPool {
+        StartedGlobalReadonlyBufferPool::new(pool_size)
     }
 
     /// Test-only owner wrapper for a started global readonly pool.
@@ -1358,7 +1409,7 @@ pub(crate) mod tests {
     /// guard. This scope centralizes that shutdown ordering for other test
     /// modules that need a reusable readonly cache.
     pub(crate) struct GlobalReadOnlyPoolScope {
-        owner: QuiescentBox<GlobalReadonlyBufferPool>,
+        owner: StartedGlobalReadonlyBufferPool,
     }
 
     impl Deref for GlobalReadOnlyPoolScope {
@@ -1398,14 +1449,32 @@ pub(crate) mod tests {
         )
     }
 
-    fn owned_readonly_pool<S>(
+    #[allow(dead_code)]
+    trait GlobalReadonlyPoolHandle {
+        fn guard(&self) -> crate::quiescent::QuiescentGuard<GlobalReadonlyBufferPool>;
+    }
+
+    impl GlobalReadonlyPoolHandle for QuiescentBox<GlobalReadonlyBufferPool> {
+        fn guard(&self) -> crate::quiescent::QuiescentGuard<GlobalReadonlyBufferPool> {
+            QuiescentBox::guard(self)
+        }
+    }
+
+    impl GlobalReadonlyPoolHandle for StartedGlobalReadonlyBufferPool {
+        fn guard(&self) -> crate::quiescent::QuiescentGuard<GlobalReadonlyBufferPool> {
+            StartedGlobalReadonlyBufferPool::guard(self)
+        }
+    }
+
+    fn owned_readonly_pool<S, G>(
         file_id: ReadonlyFileID,
         file_kind: PersistedFileKind,
         page_source: Arc<S>,
-        global: &QuiescentBox<GlobalReadonlyBufferPool>,
+        global: &G,
     ) -> QuiescentBox<ReadonlyBufferPool>
     where
         S: ReadonlyPageSource + 'static,
+        G: GlobalReadonlyPoolHandle,
     {
         QuiescentBox::new(ReadonlyBufferPool::new(
             file_id,
@@ -1420,8 +1489,8 @@ pub(crate) mod tests {
         let pool =
             GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, frame_page_bytes(2)).unwrap();
 
-        pool.shutdown();
-        pool.shutdown();
+        pool.signal_shutdown();
+        pool.signal_shutdown();
     }
 
     fn make_metadata() -> Arc<TableMetadata> {

@@ -5,7 +5,7 @@
 use crate::buffer::{EvictableBufferPoolConfig, PoolRole};
 use crate::catalog::Catalog;
 use crate::component::{
-    Component, ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig,
+    ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
 };
 use crate::error::{Error, Result};
 use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
@@ -85,7 +85,7 @@ impl Engine {
 
     #[inline]
     pub fn catalog(&self) -> &Catalog {
-        &self.trx_sys.catalog
+        &self.catalog
     }
 
     #[inline]
@@ -161,52 +161,12 @@ impl EngineRef {
 
     #[inline]
     pub fn catalog(&self) -> &Catalog {
-        &self.trx_sys.catalog
-    }
-}
-
-struct EngineBuildCleanup {
-    registry: Option<ComponentRegistry>,
-}
-
-impl EngineBuildCleanup {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            registry: Some(ComponentRegistry::new()),
-        }
-    }
-
-    #[inline]
-    fn registry_mut(&mut self) -> &mut ComponentRegistry {
-        self.registry
-            .as_mut()
-            .expect("build cleanup registry is always present until disarmed")
-    }
-
-    #[inline]
-    fn take_registry(&mut self) -> ComponentRegistry {
-        self.registry
-            .take()
-            .expect("build cleanup registry is always present until disarmed")
-    }
-}
-
-impl Drop for EngineBuildCleanup {
-    #[inline]
-    fn drop(&mut self) {
-        // Failed startup can return after guarded worker threads have already
-        // been spawned but before a stable `Engine` exists. Shut every started
-        // component down explicitly before the registry drops owners in reverse
-        // order, otherwise quiescent owner teardown can block forever on live
-        // worker keepalive guards.
-        if let Some(registry) = self.registry.as_ref() {
-            registry.shutdown_all();
-        }
+        &self.catalog
     }
 }
 
 pub struct EngineInner {
+    pub catalog: QuiescentGuard<Catalog>,
     pub trx_sys: QuiescentGuard<TransactionSystem>,
     // meta pool is used for block index and catalog tables.
     pub meta_pool: MetaPool,
@@ -328,37 +288,37 @@ impl EngineConfig {
         let file = self.file.data_dir(resolved.data_dir_path());
         let readonly_buffer_size = file.readonly_buffer_size;
         let trx_cfg = self.trx.log_dir(resolved.log_dir_path());
-        let mut cleanup = EngineBuildCleanup::new();
+        let mut builder = RegistryBuilder::new();
         // Components are registered in one fixed dependency order. Reverse
         // registration order then defines both explicit shutdown order and the
         // final owner drop order.
-        DiskPool::build(
-            DiskPoolConfig::new(readonly_buffer_size),
-            cleanup.registry_mut(),
-        )
-        .await?;
-        TableFileSystem::build(file, cleanup.registry_mut()).await?;
-        MetaPool::build(
-            MetaPoolConfig::new(self.meta_buffer.as_u64() as usize),
-            cleanup.registry_mut(),
-        )
-        .await?;
-        IndexPool::build(
-            IndexPoolConfig::new(self.index_buffer.as_u64() as usize),
-            cleanup.registry_mut(),
-        )
-        .await?;
-        MemPool::build(
-            self.data_buffer
-                .role(PoolRole::Mem)
-                .data_swap_file(resolved.data_swap_file_path()),
-            cleanup.registry_mut(),
-        )
-        .await?;
-        TransactionSystem::build(trx_cfg, cleanup.registry_mut()).await?;
+        builder
+            .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
+            .await?;
+        builder.build::<TableFileSystem>(file).await?;
+        builder
+            .build::<MetaPool>(MetaPoolConfig::new(self.meta_buffer.as_u64() as usize))
+            .await?;
+        builder
+            .build::<IndexPool>(IndexPoolConfig::new(self.index_buffer.as_u64() as usize))
+            .await?;
+        builder
+            .build::<MemPool>(
+                self.data_buffer
+                    .role(PoolRole::Mem)
+                    .data_swap_file(resolved.data_swap_file_path()),
+            )
+            .await?;
+        // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
+        // guards for row/index/readonly access. Register catalog after the pools it
+        // can pin so reverse shutdown/drop order releases table guards before pool
+        // owners are torn down.
+        builder.build::<Catalog>(()).await?;
+        builder.build::<TransactionSystem>(trx_cfg).await?;
 
         resolved.persist_marker_if_missing()?;
-        let registry = cleanup.take_registry();
+        let registry = builder.finish()?;
+        let catalog = registry.dependency::<Catalog>()?;
         let trx_sys = registry.dependency::<TransactionSystem>()?;
         let meta_pool = registry.dependency::<MetaPool>()?;
         let index_pool = registry.dependency::<IndexPool>()?;
@@ -366,6 +326,7 @@ impl EngineConfig {
         let table_fs = registry.dependency::<TableFileSystem>()?;
         let disk_pool = registry.dependency::<DiskPool>()?;
         let engine_inner = EngineInner {
+            catalog,
             trx_sys,
             meta_pool,
             index_pool,
@@ -383,8 +344,10 @@ impl EngineConfig {
 mod tests {
     use super::*;
     use crate::buffer::{FixedBufferPool, GlobalReadonlyBufferPool};
+    use crate::catalog::storage::CatalogStorage;
     use crate::catalog::tests::table1;
     use crate::error::Error;
+    use crate::file::build_test_fs_in;
     use crate::storage_path::STORAGE_LAYOUT_FILE_NAME;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -637,12 +600,7 @@ mod tests {
             let swap_file = temp_dir.path().join("data.bin");
             fs::create_dir_all(&data_dir).unwrap();
             fs::create_dir_all(&log_dir).unwrap();
-            let table_fs = crate::quiescent::QuiescentBox::new(
-                TableFileSystemConfig::default()
-                    .data_dir(&data_dir)
-                    .build()
-                    .unwrap(),
-            );
+            let table_fs = build_test_fs_in(&data_dir);
             let meta_pool = crate::quiescent::QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Meta, TEST_POOL_BYTES).unwrap(),
             );
@@ -656,10 +614,25 @@ mod tests {
                     .max_mem_size(TEST_POOL_BYTES)
                     .max_file_size(128usize * 1024 * 1024)
                     .build()
-                    .unwrap(),
+                    .unwrap()
+                    .0,
             );
             let disk_pool = crate::quiescent::QuiescentBox::new(
                 GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, TEST_POOL_BYTES).unwrap(),
+            );
+            let catalog = crate::quiescent::QuiescentBox::new(
+                Catalog::new(
+                    CatalogStorage::new(
+                        meta_pool.guard(),
+                        index_pool.guard(),
+                        &table_fs,
+                        disk_pool.guard(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await
+                .unwrap(),
             );
 
             let pending = TrxSysConfig::default()
@@ -672,13 +645,14 @@ mod tests {
                     mem_pool.guard(),
                     table_fs.guard(),
                     disk_pool.guard(),
+                    catalog.guard(),
                 )
                 .await
                 .unwrap();
 
-            let (trx_sys, _startup) = pending.into_parts();
-            trx_sys.shutdown();
-            trx_sys.shutdown();
+            let (trx_sys, startup) = pending.into_parts();
+            drop(startup);
+            drop(trx_sys);
         });
     }
 }

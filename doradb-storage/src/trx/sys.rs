@@ -1,19 +1,15 @@
-use crate::catalog::{Catalog, TableCache, TableID, is_catalog_obj_id, is_user_obj_id};
-use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool};
+use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
+use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
 use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
-use crate::io::AIOContext;
-use crate::quiescent::QuiescentGuard;
+use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::session::SessionState;
 use crate::thread;
 use crate::trx::group::Commit;
-use crate::trx::log::{
-    LOG_HEADER_PAGES, LogPartition, LogPartitionInitializer, LogPartitionMode, list_log_files,
-};
-use crate::trx::log_replay::LogMerger;
+use crate::trx::log::{LOG_HEADER_PAGES, LogPartition};
 use crate::trx::log_replay::MmapLogReader;
 use crate::trx::purge::{GC, Purge};
-use crate::trx::redo::{DDLRedo, RedoLogs, RowRedoKind};
+use crate::trx::redo::RedoLogs;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
@@ -22,12 +18,16 @@ use crate::trx::{
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::mem;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+
+pub use crate::catalog::{
+    CatalogCheckpointBatch, CatalogCheckpointBlockingDDL, CatalogCheckpointScanStopReason,
+    CatalogRedoEntry,
+};
 pub const GC_BUCKETS: usize = 64;
 
 /// TransactionSystem controls lifecycle of all transactions.
@@ -85,53 +85,26 @@ pub struct TransactionSystem {
     /// Transaction system configuration.
     pub(super) config: CachePadded<TrxSysConfig>,
     /// Catalog of the database.
-    pub(crate) catalog: CachePadded<Catalog>,
-    /// Channel to send message to purge threads.
-    purge_chan: Sender<Purge>,
-    /// Purge threads purge unused undo logs, row pages and index entries.
-    pub(super) purge_threads: Mutex<Vec<JoinHandle<()>>>,
-    shutdown_started: AtomicBool,
+    pub(crate) catalog: CachePadded<QuiescentGuard<Catalog>>,
 }
 
-/// One catalog-row redo operation extracted from persisted logs.
-pub struct CatalogRedoEntry {
-    pub table_id: TableID,
-    pub kind: RowRedoKind,
-}
+pub(crate) struct TransactionSystemWorkers;
 
-/// Table DDL kinds that can block catalog checkpoint scan on ordering safety.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatalogCheckpointBlockingDDL {
-    DropTable,
-}
-
-/// Stop reason for one catalog checkpoint scan batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatalogCheckpointScanStopReason {
-    ReachedDurableUpper,
-    BlockedByTableDDL {
-        table_id: TableID,
-        ddl: CatalogCheckpointBlockingDDL,
-    },
-}
-
-/// Catalog checkpoint scan result consumed by apply phase.
-pub struct CatalogCheckpointBatch {
-    pub replay_start_ts: TrxID,
-    pub durable_upper_cts: TrxID,
-    pub safe_cts: TrxID,
-    pub catalog_ops: Vec<CatalogRedoEntry>,
-    pub catalog_ddl_txn_count: usize,
-    pub stop_reason: CatalogCheckpointScanStopReason,
+pub(crate) struct TransactionSystemWorkersOwned {
+    pub(crate) trx_sys: SyncQuiescentGuard<TransactionSystem>,
+    pub(crate) purge_tx: Sender<Purge>,
+    pub(crate) io_threads: Mutex<Vec<JoinHandle<()>>>,
+    pub(crate) gc_threads: Mutex<Vec<JoinHandle<()>>>,
+    pub(crate) purge_threads: Mutex<Vec<JoinHandle<()>>>,
+    pub(crate) shutdown_started: AtomicBool,
 }
 
 impl TransactionSystem {
     #[inline]
     pub(super) fn new(
         config: TrxSysConfig,
-        catalog: Catalog,
+        catalog: QuiescentGuard<Catalog>,
         log_partitions: Vec<CachePadded<LogPartition>>,
-        purge_chan: Sender<Purge>,
     ) -> Self {
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
@@ -140,9 +113,6 @@ impl TransactionSystem {
             log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
             config: CachePadded::new(config),
             catalog: CachePadded::new(catalog),
-            purge_chan,
-            purge_threads: Mutex::new(vec![]),
-            shutdown_started: AtomicBool::new(false),
         }
     }
 
@@ -332,35 +302,41 @@ impl TransactionSystem {
 
     /// Start background GC threads.
     #[inline]
-    pub(super) fn start_gc_threads(trx_sys: QuiescentGuard<Self>, gc_rxs: Vec<Receiver<GC>>) {
+    pub(super) fn start_gc_threads(
+        trx_sys: QuiescentGuard<Self>,
+        gc_rxs: Vec<Receiver<GC>>,
+        purge_chan: Sender<Purge>,
+    ) -> Vec<JoinHandle<()>> {
         let trx_sys = trx_sys.into_sync();
+        let mut handles = Vec::with_capacity(gc_rxs.len());
         for (idx, gc_rx) in gc_rxs.into_iter().enumerate() {
             let thread_name = format!("GC-Thread-{idx}");
-            let partition = &*trx_sys.log_partitions[idx];
-            let purge_chan = trx_sys.purge_chan.clone();
             let task_trx_sys = trx_sys.clone();
+            let task_purge_chan = purge_chan.clone();
             let handle = thread::spawn_named(thread_name, move || {
                 let partition = &*task_trx_sys.log_partitions[idx];
-                partition.gc_loop(gc_rx, purge_chan);
+                partition.gc_loop(gc_rx, task_purge_chan);
             });
-            *partition.gc_thread.lock() = Some(handle);
+            handles.push(handle);
         }
+        handles
     }
 
     /// Start background IO threads.
     #[inline]
-    pub(super) fn start_io_threads(trx_sys: QuiescentGuard<Self>) {
+    pub(super) fn start_io_threads(trx_sys: QuiescentGuard<Self>) -> Vec<JoinHandle<()>> {
         let trx_sys = trx_sys.into_sync();
+        let mut handles = Vec::with_capacity(trx_sys.log_partitions.len());
         for idx in 0..trx_sys.log_partitions.len() {
             let thread_name = format!("IO-Thread-{idx}");
-            let partition = &*trx_sys.log_partitions[idx];
             let task_trx_sys = trx_sys.clone();
             let handle = thread::spawn_named(thread_name, move || {
                 let partition = &*task_trx_sys.log_partitions[idx];
                 partition.io_loop(&task_trx_sys.config);
             });
-            *partition.io_thread.lock() = Some(handle);
+            handles.push(handle);
         }
+        handles
     }
 
     #[inline]
@@ -383,180 +359,15 @@ impl TransactionSystem {
             .unwrap_or(MIN_SNAPSHOT_TS)
     }
 
-    /// Scans persisted redo logs and returns one catalog checkpoint batch.
-    ///
-    /// Caller must pass a `durable_upper_cts` that does not exceed
-    /// `self.persisted_watermark_cts()`. This scan assumes the supplied upper
-    /// bound is already clamped to the slowest partition's persisted watermark.
-    ///
-    /// The scan range is `[replay_start_ts, durable_upper_cts]`.
-    /// It stops early when reaching a blocking table DDL whose table replay-start
-    /// timestamp has not advanced past that DDL CTS yet.
-    ///
-    /// For each scanned log that is accepted into the batch, `safe_cts` advances to
-    /// that log's cts even if it does not contain catalog row-redo changes.
-    pub(crate) fn scan_catalog_checkpoint_batch<F>(
-        &self,
-        replay_start_ts: TrxID,
-        durable_upper_cts: TrxID,
-        mut table_replay_start_ts_lookup: F,
-    ) -> Result<CatalogCheckpointBatch>
-    where
-        F: FnMut(TableID) -> Option<TrxID>,
-    {
-        debug_assert!(
-            durable_upper_cts <= self.persisted_watermark_cts(),
-            "catalog checkpoint scan upper bound must not exceed persisted watermark"
-        );
-        let mut batch = CatalogCheckpointBatch {
-            replay_start_ts,
-            durable_upper_cts,
-            safe_cts: replay_start_ts.saturating_sub(1),
-            catalog_ops: vec![],
-            catalog_ddl_txn_count: 0,
-            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
-        };
-        if durable_upper_cts < replay_start_ts {
-            return Ok(batch);
-        }
-
-        let mut log_merger = LogMerger::default();
-        let file_prefix = self.config.file_prefix()?;
-        for log_no in 0..self.config.log_partitions {
-            let logs = list_log_files(&file_prefix, log_no, false)?;
-            if logs.is_empty() {
-                continue;
-            }
-            let stream = LogPartitionInitializer {
-                ctx: AIOContext::new(self.config.io_depth_per_log)?,
-                mode: LogPartitionMode::Recovery(VecDeque::from(logs)),
-                file_prefix: file_prefix.clone(),
-                file_max_size: self.config.log_file_max_size.as_u64() as usize,
-                file_header_size: self.config.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
-                page_size: self.config.max_io_size.as_u64() as usize,
-                io_depth_per_log: self.config.io_depth_per_log,
-                log_no,
-                file_seq: None,
-            }
-            .stream();
-            log_merger.add_stream(stream)?;
-        }
-
-        while let Some(log) = log_merger.try_next()? {
-            let (header, redo) = log.into_inner();
-            if header.cts < replay_start_ts {
-                continue;
-            }
-            if header.cts > durable_upper_cts {
-                break;
-            }
-
-            if let Some(ddl) = redo.ddl.as_deref()
-                && let Some((table_id, ddl_kind)) = blocking_table_ddl(ddl)
-                && is_user_obj_id(table_id)
-            {
-                let Some(table_replay_start_ts) = table_replay_start_ts_lookup(table_id) else {
-                    batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
-                        table_id,
-                        ddl: ddl_kind,
-                    };
-                    break;
-                };
-                if table_replay_start_ts <= header.cts {
-                    batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
-                        table_id,
-                        ddl: ddl_kind,
-                    };
-                    break;
-                }
-            }
-
-            batch.safe_cts = header.cts;
-
-            if let Some(ddl) = redo.ddl.as_deref()
-                && is_catalog_ddl(ddl)
-            {
-                batch.catalog_ddl_txn_count = batch.catalog_ddl_txn_count.saturating_add(1);
-            }
-
-            for (table_id, table_dml) in redo.dml {
-                if !is_catalog_obj_id(table_id) {
-                    continue;
-                }
-                for row_redo in table_dml.rows.into_values() {
-                    batch.catalog_ops.push(CatalogRedoEntry {
-                        table_id,
-                        kind: row_redo.kind,
-                    });
-                }
-            }
-        }
-        Ok(batch)
-    }
-
     #[inline]
-    pub(crate) fn shutdown(&self) {
-        if self.shutdown_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        let log_partitions = &*self.log_partitions;
-        // Stop log and GC workers first so no background transaction path can
-        // enqueue more redo or retain references into the catalog while we are
-        // dismantling transaction-system state.
-        for partition in log_partitions {
-            {
-                let mut group_commit_g = partition.group_commit.lock();
-                group_commit_g.queue.push_back(Commit::Shutdown);
-                if group_commit_g.queue.len() == 1 {
-                    partition.group_commit.notify_one();
-                }
-            }
-            let _ = partition.gc_chan.send(GC::Stop);
-        }
-
-        for partition in log_partitions {
-            if let Some(sync_thread) = partition.io_thread.lock().take() {
-                sync_thread.join().unwrap();
-            }
-            if let Some(gc_thread) = partition.gc_thread.lock().take() {
-                gc_thread.join().unwrap();
-            }
-        }
-
-        let _ = self.purge_chan.send(Purge::Stop);
-        let purge_threads = { mem::take(&mut *self.purge_threads.lock()) };
-        for handle in purge_threads {
-            handle.join().unwrap();
-        }
-
-        for partition in log_partitions {
-            let mut group_commit_g = partition.group_commit.lock();
-            let Some(log_file) = group_commit_g.log_file.take() else {
-                continue;
-            };
-            drop(log_file);
-        }
-    }
-}
-
-#[inline]
-fn blocking_table_ddl(ddl: &DDLRedo) -> Option<(TableID, CatalogCheckpointBlockingDDL)> {
-    match ddl {
-        DDLRedo::DropTable(table_id) => Some((*table_id, CatalogCheckpointBlockingDDL::DropTable)),
-        _ => None,
-    }
-}
-
-#[inline]
-fn is_catalog_ddl(ddl: &DDLRedo) -> bool {
-    matches!(ddl, DDLRedo::CreateTable(_) | DDLRedo::DropTable(_))
-}
-
-impl Drop for TransactionSystem {
-    #[inline]
-    fn drop(&mut self) {
-        self.shutdown();
+    pub(crate) fn catalog_checkpoint_scan_config(&self) -> Result<CatalogCheckpointScanConfig> {
+        Ok(CatalogCheckpointScanConfig {
+            file_prefix: self.config.file_prefix()?,
+            log_partitions: self.config.log_partitions,
+            io_depth_per_log: self.config.io_depth_per_log,
+            log_file_max_size: self.config.log_file_max_size.as_u64() as usize,
+            max_io_size: self.config.max_io_size.as_u64() as usize,
+        })
     }
 }
 
@@ -576,13 +387,6 @@ pub struct TrxSysStats {
     pub purge_index_count: usize,
 }
 
-pub struct TrxSysStartContext {
-    // Receiver side of purge requests, used by dispatcher/purge thread.
-    pub purge_rx: Receiver<Purge>,
-    // Receiver side of GC requests, used by purge thread.
-    pub gc_chans: Vec<Receiver<GC>>,
-}
-
 impl Component for TransactionSystem {
     type Config = TrxSysConfig;
     type Owned = Self;
@@ -591,12 +395,17 @@ impl Component for TransactionSystem {
     const NAME: &'static str = "trx_sys";
 
     #[inline]
-    async fn build(config: Self::Config, registry: &mut ComponentRegistry) -> Result<()> {
+    async fn build(
+        config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
         let meta_pool = registry.dependency::<MetaPool>()?;
         let index_pool = registry.dependency::<IndexPool>()?;
         let mem_pool = registry.dependency::<MemPool>()?;
         let table_fs = registry.dependency::<TableFileSystem>()?;
         let disk_pool = registry.dependency::<crate::DiskPool>()?;
+        let catalog = registry.dependency::<Catalog>()?;
 
         let pending = config
             .prepare(
@@ -605,13 +414,14 @@ impl Component for TransactionSystem {
                 mem_pool.clone_inner(),
                 table_fs,
                 disk_pool.clone_inner(),
+                catalog,
             )
             .await?;
         let (trx_sys, startup) = pending.into_parts();
         registry.register::<Self>(trx_sys)?;
-        let trx_sys = registry.dependency::<Self>()?;
-        startup.start(trx_sys).await;
-        Ok(())
+        shelf.put::<TransactionSystemWorkers>(startup)?;
+        TransactionSystemWorkers::build((), registry, shelf.scope::<TransactionSystemWorkers>())
+            .await
     }
 
     #[inline]
@@ -620,8 +430,72 @@ impl Component for TransactionSystem {
     }
 
     #[inline]
+    fn shutdown(_component: &Self::Owned) {}
+}
+
+impl Component for TransactionSystemWorkers {
+    type Config = ();
+    type Owned = TransactionSystemWorkersOwned;
+    type Access = ();
+
+    const NAME: &'static str = "trx_sys_workers";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let trx_sys = registry.dependency::<TransactionSystem>()?;
+        let startup = shelf
+            .take::<TransactionSystem>()
+            .ok_or(crate::error::Error::InvalidState)?;
+        registry.register::<Self>(startup.start(trx_sys))
+    }
+
+    #[inline]
+    fn access(_owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {}
+
+    #[inline]
     fn shutdown(component: &Self::Owned) {
-        component.shutdown();
+        if component.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let log_partitions = &*component.trx_sys.log_partitions;
+        for partition in log_partitions {
+            {
+                let mut group_commit_g = partition.group_commit.lock();
+                group_commit_g.queue.push_back(Commit::Shutdown);
+                if group_commit_g.queue.len() == 1 {
+                    partition.group_commit.notify_one();
+                }
+            }
+            let _ = partition.gc_chan.send(GC::Stop);
+        }
+
+        let io_threads = { mem::take(&mut *component.io_threads.lock()) };
+        for handle in io_threads {
+            handle.join().unwrap();
+        }
+        let gc_threads = { mem::take(&mut *component.gc_threads.lock()) };
+        for handle in gc_threads {
+            handle.join().unwrap();
+        }
+
+        let _ = component.purge_tx.send(Purge::Stop);
+        let purge_threads = { mem::take(&mut *component.purge_threads.lock()) };
+        for handle in purge_threads {
+            handle.join().unwrap();
+        }
+
+        for partition in log_partitions {
+            let mut group_commit_g = partition.group_commit.lock();
+            let Some(log_file) = group_commit_g.log_file.take() else {
+                continue;
+            };
+            drop(log_file);
+        }
     }
 }
 
@@ -629,7 +503,7 @@ impl Component for TransactionSystem {
 mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPoolConfig;
-    use crate::catalog::tests::{table1, table2};
+    use crate::catalog::tests::table2;
     use crate::engine::EngineConfig;
     use crate::value::Val;
     use crossbeam_utils::CachePadded;
@@ -677,101 +551,6 @@ mod tests {
             }
 
             drop(session);
-            drop(engine);
-        })
-    }
-
-    #[test]
-    fn test_catalog_checkpoint_scan_respects_upper_bound_and_replay_start() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
-                        .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-scan-upper-bound")
-                        .skip_recovery(false),
-                )
-                .build()
-                .await
-                .unwrap();
-
-            let _ = table1(&engine).await;
-            let first_upper = engine.trx_sys.persisted_watermark_cts();
-            let _ = table2(&engine).await;
-            let second_upper = engine.trx_sys.persisted_watermark_cts();
-            assert!(second_upper > first_upper);
-
-            let batch1 = engine
-                .trx_sys
-                .scan_catalog_checkpoint_batch(MIN_SNAPSHOT_TS, first_upper, |_| None)
-                .unwrap();
-            assert_eq!(batch1.replay_start_ts, MIN_SNAPSHOT_TS);
-            assert_eq!(batch1.durable_upper_cts, first_upper);
-            assert_eq!(batch1.safe_cts, first_upper);
-            assert_eq!(batch1.catalog_ddl_txn_count, 1);
-            assert!(!batch1.catalog_ops.is_empty());
-            assert_eq!(
-                batch1.stop_reason,
-                CatalogCheckpointScanStopReason::ReachedDurableUpper
-            );
-            engine
-                .catalog()
-                .apply_checkpoint_batch(batch1)
-                .await
-                .unwrap();
-
-            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert_eq!(snap1.catalog_replay_start_ts, first_upper.saturating_add(1));
-
-            let batch2 = engine
-                .trx_sys
-                .scan_catalog_checkpoint_batch(snap1.catalog_replay_start_ts, second_upper, |_| {
-                    None
-                })
-                .unwrap();
-            assert_eq!(batch2.replay_start_ts, snap1.catalog_replay_start_ts);
-            assert_eq!(batch2.durable_upper_cts, second_upper);
-            assert_eq!(batch2.safe_cts, second_upper);
-            assert_eq!(batch2.catalog_ddl_txn_count, 1);
-            assert!(!batch2.catalog_ops.is_empty());
-            assert_eq!(
-                batch2.stop_reason,
-                CatalogCheckpointScanStopReason::ReachedDurableUpper
-            );
-            engine
-                .catalog()
-                .apply_checkpoint_batch(batch2)
-                .await
-                .unwrap();
-
-            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-            assert_eq!(
-                snap2.catalog_replay_start_ts,
-                second_upper.saturating_add(1)
-            );
-
-            let batch3 = engine
-                .trx_sys
-                .scan_catalog_checkpoint_batch(snap2.catalog_replay_start_ts, second_upper, |_| {
-                    None
-                })
-                .unwrap();
-            assert_eq!(batch3.catalog_ddl_txn_count, 0);
-            assert!(batch3.catalog_ops.is_empty());
-            assert_eq!(batch3.safe_cts, second_upper);
-            assert_eq!(
-                batch3.stop_reason,
-                CatalogCheckpointScanStopReason::ReachedDurableUpper
-            );
-
             drop(engine);
         })
     }
