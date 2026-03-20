@@ -264,6 +264,23 @@ Reference:
   - Phase Status: done
   - Implementation Summary: Added scan-bound, restart, and mixed-state checkpoint validation; fixed persisted row-block index bootstrap from `pivot_row_id`; and synced living docs to the `catalog.mtb` / `catalog_replay_start_ts` contract. [Task Resolve Sync: docs/tasks/000057-catalog-checkpoint-validation-and-documentation-sync.md @ 2026-03-10]
 
+- **Phase 11: CatalogTable-only No-Trx Replay Helper Boundary Cleanup**
+  - Scope: remove catalog-only no-trx replay/bootstrap helpers from the shared
+    `TableAccess` surface and keep them available only through
+    `CatalogTable`-specific entrypoints used by catalog checkpoint bootstrap
+    and catalog redo replay.
+  - Goals: tighten the storage runtime API boundary so user-table access paths
+    remain transaction-only without changing catalog checkpoint/recovery
+    semantics.
+  - Non-goals: no redo/checkpoint format changes, no foreground transactional
+    API redesign, and no broader accessor hierarchy rework beyond the narrow
+    no-trx boundary cleanup.
+  - Task Doc:
+    `docs/tasks/000081-catalog-no-trx-replay-helpers-catalogtable-only.md`
+  - Phase Status: done
+  - Implementation Summary: Removed shared insert_no_trx/delete_unique_no_trx from TableAccess, moved catalog replay/bootstrap entrypoints behind CatalogTable, and kept checkpoint/recovery semantics unchanged. [Task Resolve Sync: docs/tasks/000081-catalog-no-trx-replay-helpers-catalogtable-only.md @ 2026-03-20]
+  - Task Issue: `#455`
+
 ## Consequences
 
 ### Positive

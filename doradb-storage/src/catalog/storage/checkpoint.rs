@@ -18,7 +18,6 @@ use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, PersistedLwcPage};
 use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowID, RowPage};
-use crate::table::TableAccess;
 use crate::trx::redo::RowRedoKind;
 use crate::value::Val;
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,10 +71,7 @@ impl CatalogStorage {
                 .load_visible_rows_from_root(self.tables[idx].metadata(), root)
                 .await?;
             for row in rows {
-                self.tables[idx]
-                    .accessor()
-                    .insert_no_trx(guards, &row.vals)
-                    .await;
+                self.tables[idx].insert_no_trx(guards, &row.vals).await;
             }
         }
         Ok(())
