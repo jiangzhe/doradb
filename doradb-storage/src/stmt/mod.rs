@@ -1,5 +1,5 @@
 use crate::buffer::PoolGuards;
-use crate::buffer::page::PageID;
+use crate::buffer::page::VersionedPageID;
 
 use crate::catalog::{TableCache, TableID, TableSpec};
 use crate::row::RowID;
@@ -83,7 +83,10 @@ impl Statement {
     }
 
     #[inline]
-    pub fn load_active_insert_page(&mut self, table_id: TableID) -> Option<(PageID, RowID)> {
+    pub fn load_active_insert_page(
+        &mut self,
+        table_id: TableID,
+    ) -> Option<(VersionedPageID, RowID)> {
         self.trx
             .session
             .as_mut()
@@ -91,7 +94,12 @@ impl Statement {
     }
 
     #[inline]
-    pub fn save_active_insert_page(&mut self, table_id: TableID, page_id: PageID, row_id: RowID) {
+    pub fn save_active_insert_page(
+        &mut self,
+        table_id: TableID,
+        page_id: VersionedPageID,
+        row_id: RowID,
+    ) {
         if let Some(session) = self.trx.session.as_mut() {
             session.save_active_insert_page(table_id, page_id, row_id);
         }

@@ -1496,12 +1496,12 @@ mod tests {
             {
                 let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 assert_eq!(g.page_id(), 1);
-                let stale_versioned = g.bf().versioned_page_id();
+                let stale_versioned = g.versioned_page_id();
                 pool.deallocate_page(g);
                 let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 assert_eq!(g.page_id(), 1);
                 assert_eq!(g.bf().generation(), stale_versioned.generation + 2);
-                let current_versioned = g.bf().versioned_page_id();
+                let current_versioned = g.versioned_page_id();
                 drop(g);
 
                 let g = pool
@@ -1525,7 +1525,7 @@ mod tests {
             {
                 let g = pool.allocate_page::<RowPage>(&pool_guard).await;
                 let page_id = g.page_id();
-                let versioned = g.bf().versioned_page_id();
+                let versioned = g.versioned_page_id();
                 drop(g);
 
                 // Keep an optimistic guard, then reuse the page slot.

@@ -11,7 +11,7 @@ pub use persistence::*;
 pub use recover::*;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
-use crate::buffer::page::PageID;
+use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuard,
     PoolGuards, ReadonlyBufferPool, RowPoolRole,
@@ -220,6 +220,23 @@ impl<P: BufferPool> GenericMemTable<P> {
                 LatchFallbackMode::Shared,
             )
             .await
+            .lock_shared_async()
+            .await
+    }
+
+    #[inline]
+    pub(crate) async fn try_get_row_page_versioned_shared(
+        &self,
+        guards: &PoolGuards,
+        page_id: VersionedPageID,
+    ) -> Option<PageSharedGuard<RowPage>> {
+        self.mem_pool()
+            .try_get_page_versioned::<RowPage>(
+                self.row_pool_guard(guards),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
+            .await?
             .lock_shared_async()
             .await
     }

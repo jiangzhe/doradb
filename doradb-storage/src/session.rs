@@ -1,4 +1,4 @@
-use crate::buffer::page::PageID;
+use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards, PoolRole};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
 use crate::catalog::{IndexSpec, TableID, TableSpec};
@@ -47,13 +47,21 @@ impl Session {
 
     /// Remove and return the cached insert page for a table, if present.
     #[inline]
-    pub fn load_active_insert_page(&mut self, table_id: TableID) -> Option<(PageID, RowID)> {
+    pub fn load_active_insert_page(
+        &mut self,
+        table_id: TableID,
+    ) -> Option<(VersionedPageID, RowID)> {
         self.state.load_active_insert_page(table_id)
     }
 
     /// Cache the current insert page for a table.
     #[inline]
-    pub fn save_active_insert_page(&mut self, table_id: TableID, page_id: PageID, row_id: RowID) {
+    pub fn save_active_insert_page(
+        &mut self,
+        table_id: TableID,
+        page_id: VersionedPageID,
+        row_id: RowID,
+    ) {
         self.state
             .save_active_insert_page(table_id, page_id, row_id);
     }
@@ -240,7 +248,7 @@ pub struct SessionState {
     pool_guards: PoolGuards,
     in_trx: AtomicBool,
     last_cts: AtomicU64,
-    active_insert_pages: Mutex<HashMap<TableID, (PageID, RowID)>>,
+    active_insert_pages: Mutex<HashMap<TableID, (VersionedPageID, RowID)>>,
 }
 
 impl SessionState {
@@ -299,14 +307,19 @@ impl SessionState {
 
     /// Remove and return the cached insert page for a table, if present.
     #[inline]
-    pub fn load_active_insert_page(&self, table_id: TableID) -> Option<(PageID, RowID)> {
+    pub fn load_active_insert_page(&self, table_id: TableID) -> Option<(VersionedPageID, RowID)> {
         let mut g = self.active_insert_pages.lock();
         g.remove(&table_id)
     }
 
     /// Cache the active insert page for a table.
     #[inline]
-    pub fn save_active_insert_page(&self, table_id: TableID, page_id: PageID, row_id: RowID) {
+    pub fn save_active_insert_page(
+        &self,
+        table_id: TableID,
+        page_id: VersionedPageID,
+        row_id: RowID,
+    ) {
         let mut g = self.active_insert_pages.lock();
         let res = g.insert(table_id, (page_id, row_id));
         debug_assert!(res.is_none());
