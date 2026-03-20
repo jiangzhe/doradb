@@ -1,9 +1,11 @@
-use crate::buffer::{FixedBufferPool, PoolGuard};
+use crate::buffer::{FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{TableID, TableMetadata};
 use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::QuiescentGuard;
+use crate::row::ops::SelectKey;
 use crate::table::{GenericMemTable, MemTableAccessor};
 use crate::trx::MIN_SNAPSHOT_TS;
+use crate::value::Val;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -41,6 +43,18 @@ impl CatalogTable {
     #[inline]
     pub fn accessor(&self) -> MemTableAccessor<'_> {
         MemTableAccessor::from(self)
+    }
+
+    #[inline]
+    pub(crate) async fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) {
+        self.accessor().insert_catalog_no_trx(guards, cols).await;
+    }
+
+    #[inline]
+    pub(crate) async fn delete_unique_no_trx(&self, guards: &PoolGuards, key: &SelectKey) {
+        self.accessor()
+            .delete_catalog_unique_no_trx(guards, key)
+            .await;
     }
 
     #[inline]

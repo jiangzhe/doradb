@@ -26,7 +26,7 @@ use crate::file::table_fs::TableFileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
 use crate::row::{RowID, RowPage};
-use crate::table::{Table, TableAccess, TableRecover};
+use crate::table::{Table, TableRecover};
 use crate::trx::log::{LogPartition, LogPartitionInitializer};
 use crate::trx::log_replay::{LogMerger, LogPartitionStream, TrxLog};
 use crate::trx::purge::GC;
@@ -548,16 +548,10 @@ impl<'a> LogRecovery<'a> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
-                    table
-                        .accessor()
-                        .insert_no_trx(&self.pool_guards, vals)
-                        .await;
+                    table.insert_no_trx(&self.pool_guards, vals).await;
                 }
                 RowRedoKind::DeleteByUniqueKey(key) => {
-                    table
-                        .accessor()
-                        .delete_unique_no_trx(&self.pool_guards, key)
-                        .await;
+                    table.delete_unique_no_trx(&self.pool_guards, key).await;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     // updates of catalog are implemented as DeleteByUniqueKey and Insert.

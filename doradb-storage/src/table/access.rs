@@ -92,9 +92,6 @@ pub trait TableAccess {
     fn insert_mvcc(&self, stmt: &mut Statement, cols: Vec<Val>)
     -> impl Future<Output = InsertMvcc>;
 
-    /// Insert row in non-transactional way.
-    fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) -> impl Future<Output = ()>;
-
     /// Update row in transaction.
     /// This method is for update based on unique index lookup.
     /// It also takes care of index change.
@@ -119,13 +116,6 @@ pub trait TableAccess {
         key: &SelectKey,
         log_by_key: bool,
     ) -> impl Future<Output = DeleteMvcc>;
-
-    /// Delete row in non-transactional way.
-    fn delete_unique_no_trx(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-    ) -> impl Future<Output = ()>;
 
     /// Delete index by purge threads.
     /// This method will be only called by internal threads and don't maintain
@@ -330,6 +320,87 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                 }
             }
         }
+    }
+
+    #[inline]
+    async fn insert_no_trx_inner(&self, guards: &PoolGuards, cols: &[Val]) {
+        debug_assert!(cols.len() == self.metadata().col_count());
+        debug_assert!({
+            cols.iter()
+                .enumerate()
+                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
+        });
+        let metadata = self.metadata();
+        // prepare index keys.
+        let keys = metadata.keys_for_insert(cols);
+        // calculate row length.
+        let row_len = row_len(metadata, cols);
+        // estimate max row count for insert page.
+        let row_count = estimate_max_row_count(row_len, metadata.col_count());
+        loop {
+            // acquire insert page from block index.
+            let mut page_guard =
+                GenericMemTable::get_insert_page_exclusive(self, guards, row_count, None).await;
+            let page = page_guard.page_mut();
+            debug_assert!(metadata.col_count() == page.header.col_count as usize);
+            debug_assert!(cols.len() == page.header.col_count as usize);
+            let var_len = var_len_for_insert(metadata, cols);
+            let (row_idx, var_offset) =
+                if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
+                    (row_idx, var_offset)
+                } else {
+                    // we just ignore this page and retry.
+                    continue;
+                };
+            let row_id = page.header.start_row_id + row_idx as RowID;
+            let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
+            debug_assert!(row.is_deleted());
+            for (col_idx, user_col) in cols.iter().enumerate() {
+                row.update_col(metadata, col_idx, user_col, false);
+            }
+            // update index
+            for key in keys {
+                self.insert_index_no_trx(guards, key, row_id).await;
+            }
+            row.finish_insert();
+            // Cache insert page.
+            GenericMemTable::cache_exclusive_insert_page(self, page_guard);
+            return;
+        }
+    }
+
+    #[inline]
+    async fn delete_unique_no_trx_inner(&self, guards: &PoolGuards, key: &SelectKey) {
+        debug_assert!(key.index_no < self.sec_idx().len());
+        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        let index = self.sec_idx()[key.index_no].unique().unwrap();
+        let index_pool_guard = guards.index_guard();
+        let (mut page_guard, row_id) = match index
+            .lookup(index_pool_guard, &key.vals, MIN_SNAPSHOT_TS)
+            .await
+        {
+            None => unreachable!(),
+            Some((row_id, _)) => match self.find_row(guards, row_id, self.storage).await {
+                RowLocation::NotFound => unreachable!(),
+                RowLocation::LwcPage(..) => todo!("lwc page"),
+                RowLocation::RowPage(page_id) => {
+                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await;
+                    (page_guard, row_id)
+                }
+            },
+        };
+        let page = page_guard.page_mut();
+        let row_idx = page.row_idx(row_id);
+        debug_assert!(!page.is_deleted(row_idx));
+        let row = page.row(row_idx);
+        let keys = self.metadata().keys_for_delete(row);
+        // delete index immediately.
+        for key in keys {
+            let res = self.delete_index_directly(guards, &key, row_id).await;
+            assert!(res);
+        }
+        page.set_deleted_exclusive(row_idx, true);
     }
 
     /// Insert row into given page.
@@ -1797,6 +1868,18 @@ pub type HybridTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool>;
 /// - `I = FixedBufferPool` for secondary indexes
 pub type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool>;
 
+impl TableAccessor<'_, FixedBufferPool> {
+    #[inline]
+    pub(crate) async fn insert_catalog_no_trx(&self, guards: &PoolGuards, cols: &[Val]) {
+        self.insert_no_trx_inner(guards, cols).await;
+    }
+
+    #[inline]
+    pub(crate) async fn delete_catalog_unique_no_trx(&self, guards: &PoolGuards, key: &SelectKey) {
+        self.delete_unique_no_trx_inner(guards, key).await;
+    }
+}
+
 impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
     async fn table_scan_uncommitted<F>(&self, guards: &PoolGuards, mut row_action: F)
     where
@@ -1988,52 +2071,6 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         InsertMvcc::Ok(row_id)
     }
 
-    async fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) {
-        debug_assert!(cols.len() == self.metadata().col_count());
-        debug_assert!({
-            cols.iter()
-                .enumerate()
-                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
-        });
-        let metadata = self.metadata();
-        // prepare index keys.
-        let keys = metadata.keys_for_insert(cols);
-        // calculate row length.
-        let row_len = row_len(metadata, cols);
-        // estimate max row count for insert page.
-        let row_count = estimate_max_row_count(row_len, metadata.col_count());
-        loop {
-            // acquire insert page from block index.
-            let mut page_guard =
-                GenericMemTable::get_insert_page_exclusive(self, guards, row_count, None).await;
-            let page = page_guard.page_mut();
-            debug_assert!(metadata.col_count() == page.header.col_count as usize);
-            debug_assert!(cols.len() == page.header.col_count as usize);
-            let var_len = var_len_for_insert(metadata, cols);
-            let (row_idx, var_offset) =
-                if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
-                    (row_idx, var_offset)
-                } else {
-                    // we just ignore this page and retry.
-                    continue;
-                };
-            let row_id = page.header.start_row_id + row_idx as RowID;
-            let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
-            debug_assert!(row.is_deleted());
-            for (col_idx, user_col) in cols.iter().enumerate() {
-                row.update_col(metadata, col_idx, user_col, false);
-            }
-            // update index
-            for key in keys {
-                self.insert_index_no_trx(guards, key, row_id).await;
-            }
-            row.finish_insert();
-            // Cache insert page.
-            GenericMemTable::cache_exclusive_insert_page(self, page_guard);
-            return;
-        }
-    }
-
     async fn update_unique_mvcc(
         &self,
         stmt: &mut Statement,
@@ -2220,39 +2257,6 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                 }
             }
         }
-    }
-
-    async fn delete_unique_no_trx(&self, guards: &PoolGuards, key: &SelectKey) {
-        debug_assert!(key.index_no < self.sec_idx().len());
-        debug_assert!(self.metadata().index_specs[key.index_no].unique());
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
-        let index = self.sec_idx()[key.index_no].unique().unwrap();
-        let index_pool_guard = guards.index_guard();
-        let (mut page_guard, row_id) = match index
-            .lookup(index_pool_guard, &key.vals, MIN_SNAPSHOT_TS)
-            .await
-        {
-            None => unreachable!(),
-            Some((row_id, _)) => match self.find_row(guards, row_id, self.storage).await {
-                RowLocation::NotFound => unreachable!(),
-                RowLocation::LwcPage(..) => todo!("lwc page"),
-                RowLocation::RowPage(page_id) => {
-                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await;
-                    (page_guard, row_id)
-                }
-            },
-        };
-        let page = page_guard.page_mut();
-        let row_idx = page.row_idx(row_id);
-        debug_assert!(!page.is_deleted(row_idx));
-        let row = page.row(row_idx);
-        let keys = self.metadata().keys_for_delete(row);
-        // delete index immediately.
-        for key in keys {
-            let res = self.delete_index_directly(guards, &key, row_id).await;
-            assert!(res);
-        }
-        page.set_deleted_exclusive(row_idx, true);
     }
 
     async fn delete_index(
