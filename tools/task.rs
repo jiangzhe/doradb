@@ -319,8 +319,6 @@ fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), Str
         ));
     }
 
-    run_git_dynamic(&["fetch", "--prune", "origin"])?;
-
     let worktrees =
         parse_worktree_list_porcelain(&run_git_capture(&["worktree", "list", "--porcelain"])?);
     let mut summary = WorktreePurgeSummary {
@@ -351,6 +349,8 @@ fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), Str
     }
 
     if apply {
+        run_git_dynamic(&["fetch", "--prune", "origin"])?;
+
         for entry in summary.safe_to_purge.clone() {
             if let Err(err) = purge_worktree_entry(&entry) {
                 summary.failures.push(WorktreePurgeFailure {
@@ -2496,6 +2496,7 @@ fn normalize_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2720,6 +2721,23 @@ created: 2026-03-20\n\
         assert!(json.contains("\"task_status\":\"implemented\""));
     }
 
+    #[test]
+    fn run_purge_worktrees_keeps_dry_run_read_only() {
+        let root = unique_temp_dir("task-tool-purge-read-only");
+        fs::create_dir_all(&root).unwrap();
+        init_test_git_repo(&root);
+
+        let dry_run = with_current_dir_locked(&root, || run_purge_worktrees(std::iter::empty()));
+        assert!(dry_run.is_ok(), "dry run unexpectedly failed: {dry_run:?}");
+
+        let apply_result = with_current_dir_locked(&root, || {
+            run_purge_worktrees(["--apply".to_string()].into_iter())
+        });
+        assert!(apply_result.is_err(), "apply unexpectedly succeeded");
+
+        fs::remove_dir_all(root).ok();
+    }
+
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         for attempt in 0..100u32 {
             let nanos = SystemTime::now()
@@ -2733,5 +2751,47 @@ created: 2026-03-20\n\
             }
         }
         panic!("failed to allocate unique temp dir");
+    }
+
+    fn init_test_git_repo(root: &Path) {
+        run_git_ok(root, &["init", "-b", "main"]);
+        let origin = root.join("missing-origin.git");
+        let origin = origin.to_string_lossy().into_owned();
+        run_git_ok(root, &["remote", "add", "origin", &origin]);
+    }
+
+    fn run_git_ok(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to run git {args:?} in {}: {err}",
+                    normalize_path(dir)
+                )
+            });
+        assert!(
+            status.success(),
+            "git {args:?} failed in {} with status {status}",
+            normalize_path(dir)
+        );
+    }
+
+    fn with_current_dir_locked<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = current_dir_lock().lock().unwrap();
+        let original = env::current_dir().unwrap();
+        env::set_current_dir(dir).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        env::set_current_dir(original).unwrap();
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn current_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 }
