@@ -1,7 +1,7 @@
 ---
 id: 000081
 title: Make Catalog No-Trx Replay Helpers CatalogTable-only
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-20
 github_issue: 455
 ---
@@ -127,6 +127,51 @@ Reference:
 
 ## Implementation Notes
 
+1. Tightened the shared accessor boundary in
+   `doradb-storage/src/table/access.rs`:
+   - removed `insert_no_trx` and `delete_unique_no_trx` from the public
+     `TableAccess` trait;
+   - kept the underlying non-transactional row/index maintenance logic as
+     internal helper routines;
+   - re-exposed catalog-only wrappers only for
+     `TableAccessor<'_, FixedBufferPool>`, so user-table accessors no longer
+     carry shared no-trx insert/delete entrypoints.
+2. Moved catalog replay/bootstrap no-trx entrypoints behind `CatalogTable`:
+   - `doradb-storage/src/catalog/runtime.rs` now provides inherent
+     `CatalogTable::insert_no_trx(...)` and
+     `CatalogTable::delete_unique_no_trx(...)` helpers;
+   - `doradb-storage/src/catalog/storage/checkpoint.rs` now bootstraps
+     checkpointed catalog rows through the `CatalogTable` helper instead of the
+     shared accessor trait;
+   - `doradb-storage/src/trx/recover.rs` now replays catalog insert and
+     delete-by-unique-key redo through `CatalogTable`, while user-table replay
+     paths remain unchanged.
+3. Transactional catalog storage wrappers remained behaviorally unchanged:
+   - `doradb-storage/src/catalog/storage/tables.rs`
+   - `doradb-storage/src/catalog/storage/columns.rs`
+   - `doradb-storage/src/catalog/storage/indexes.rs`
+   These wrappers continue to use `insert_mvcc` / `delete_unique_mvcc`, and no
+   redo-format, checkpoint-format, or recovery-semantics changes were needed
+   to ship the boundary cleanup.
+4. Verification executed for the implemented state:
+   - `cargo fmt -p doradb-storage`
+   - `cargo build -p doradb-storage`
+   - `cargo build -p doradb-storage --no-default-features`
+   - `cargo nextest run -p doradb-storage`
+     - result: `408/408` passed in `3.109s`
+   - `cargo nextest run -p doradb-storage --no-default-features`
+     - result: `408/408` passed in `2.242s`
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000081-catalog-no-trx-replay-helpers-catalogtable-only.md`
+     - result: local `docs/tasks/next-id` advanced from `000080` to `000082`
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000081-catalog-no-trx-replay-helpers-catalogtable-only.md`
+     - result: synced RFC-0006 by adding and marking phase 11 done in
+       `docs/rfcs/0006-cache-first-unified-catalog-storage-refactor.md`
+5. Resolve-time tracking updates:
+   - source backlog `000062` was archived as implemented:
+     `docs/backlogs/closed/000062-make-insert-no-trx-catalog-table-only.md`
+   - implementation tracked in GitHub issue `#455`
+   - pull request opened as `#456`
+   - no additional follow-up backlog doc was created during this resolve pass
 
 ## Impacts
 
@@ -163,8 +208,4 @@ Reference:
 
 ## Open Questions
 
-1. If moving `delete_unique_no_trx` behind `CatalogTable` unexpectedly requires
-   broader API surgery or non-trivial behavior changes beyond the current
-   catalog row-store assumptions, keep `insert_no_trx` mandatory in this task
-   and split the delete cleanup into a follow-up backlog item instead. Current
-   call-site analysis suggests both helpers can ship together.
+None currently.
