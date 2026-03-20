@@ -119,8 +119,8 @@ impl Engine {
     /// Try to create a new session while the engine is still running.
     #[inline]
     pub fn try_new_session(&self) -> Result<Session> {
-        self.inner()
-            .with_running_admission(|| Session::new(self.new_ref()))
+        let inner = self.inner();
+        inner.with_running_admission(|| Session::new(EngineRef(Arc::clone(inner))))
     }
 
     /// Return the shared catalog handle.
@@ -129,10 +129,12 @@ impl Engine {
         &self.catalog
     }
 
-    /// Clone the shared runtime handle.
+    /// Try to clone the shared runtime handle while the engine is still
+    /// running.
     #[inline]
-    pub fn new_ref(&self) -> EngineRef {
-        EngineRef(Arc::clone(self.inner()))
+    pub fn new_ref(&self) -> Result<EngineRef> {
+        let inner = self.inner();
+        inner.with_running_admission(|| EngineRef(Arc::clone(inner)))
     }
 
     /// Start idempotent engine shutdown.
@@ -163,9 +165,13 @@ impl Engine {
         }
 
         // Any live session/transaction/statement keeps an `EngineRef` alive
-        // through `SessionState`. Requiring the last strong reference here
-        // gives transaction-system shutdown a clean point where user-originated
-        // work has already drained before we start disabling runtime state.
+        // through `SessionState`. Owner-side `EngineRef` creation and session
+        // admission also hold the read side of `admission_gate`, so once the
+        // Running -> ShuttingDown transition completes under the write lock no
+        // new owner-created runtime handles can appear before this snapshot.
+        // Requiring the last strong reference here gives transaction-system
+        // shutdown a clean point where user-originated work has already
+        // drained before we start disabling runtime state.
         let strong_count = Arc::strong_count(inner);
         if strong_count != 1 {
             return Err(Error::StorageEngineShutdownBusy(strong_count - 1));
@@ -420,6 +426,7 @@ mod tests {
     use crate::storage_path::STORAGE_LAYOUT_FILE_NAME;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Arc as StdArc, Barrier};
     use tempfile::TempDir;
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
@@ -586,13 +593,41 @@ mod tests {
             };
             assert!(matches!(err, Error::StorageEngineShutdown));
 
-            let engine_ref = engine.new_ref();
+            let err = match engine.new_ref() {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageEngineShutdown));
+        });
+    }
+
+    #[test]
+    fn test_engine_ref_rejected_once_shutdown_begins() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine_ref = engine.new_ref().unwrap();
+
+            let err = match engine.shutdown() {
+                Ok(_) => panic!("expected busy shutdown error"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageEngineShutdownBusy(1)));
+
             let err = match engine_ref.try_new_session() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
             assert!(matches!(err, Error::StorageEngineShutdown));
+
+            let err = match engine.new_ref() {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::StorageEngineShutdown));
+
             drop(engine_ref);
+            engine.shutdown().unwrap();
         });
     }
 
@@ -646,12 +681,67 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let leaked_ref = engine.new_ref();
+            let leaked_ref = engine.new_ref().unwrap();
 
             let res = catch_unwind(AssertUnwindSafe(|| drop(engine)));
             assert!(res.is_err());
 
             drop(leaked_ref);
+        });
+    }
+
+    #[test]
+    fn test_shutdown_race_with_owner_ref_creation() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let barrier = StdArc::new(Barrier::new(3));
+            let engine = &engine;
+
+            std::thread::scope(|scope| {
+                let shutdown_barrier = StdArc::clone(&barrier);
+                let shutdown_handle = scope.spawn(move || {
+                    shutdown_barrier.wait();
+                    engine.shutdown()
+                });
+
+                let ref_barrier = StdArc::clone(&barrier);
+                let ref_handle = scope.spawn(move || {
+                    ref_barrier.wait();
+                    engine.new_ref()
+                });
+
+                barrier.wait();
+
+                let shutdown_res = shutdown_handle.join().unwrap();
+                let new_ref_res = ref_handle.join().unwrap();
+
+                match (shutdown_res, new_ref_res) {
+                    (Ok(()), Err(Error::StorageEngineShutdown)) => {}
+                    (Err(Error::StorageEngineShutdownBusy(1)), Ok(engine_ref)) => {
+                        drop(engine_ref);
+                        engine.shutdown().unwrap();
+                    }
+                    (Ok(()), Ok(engine_ref)) => {
+                        drop(engine_ref);
+                        panic!(
+                            "shutdown succeeded but owner-side EngineRef creation also succeeded"
+                        );
+                    }
+                    (Err(err), Ok(engine_ref)) => {
+                        drop(engine_ref);
+                        panic!("unexpected shutdown result during race: {err:?}");
+                    }
+                    (Ok(()), Err(err)) => {
+                        panic!("unexpected new_ref error after successful shutdown: {err:?}");
+                    }
+                    (Err(shutdown_err), Err(new_ref_err)) => {
+                        panic!(
+                            "unexpected shutdown/new_ref race outcome: shutdown={shutdown_err:?}, new_ref={new_ref_err:?}"
+                        );
+                    }
+                }
+            });
         });
     }
 

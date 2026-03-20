@@ -108,6 +108,8 @@ struct NextIdSyncSummary {
 struct GitWorktree {
     path: String,
     branch: Option<String>,
+    locked: bool,
+    prunable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1086,6 +1088,8 @@ fn parse_worktree_list_porcelain(text: &str) -> Vec<GitWorktree> {
     let mut out = Vec::new();
     let mut current_path: Option<String> = None;
     let mut current_branch: Option<String> = None;
+    let mut current_locked = false;
+    let mut current_prunable = false;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -1094,7 +1098,11 @@ fn parse_worktree_list_porcelain(text: &str) -> Vec<GitWorktree> {
                 out.push(GitWorktree {
                     path,
                     branch: current_branch.take(),
+                    locked: current_locked,
+                    prunable: current_prunable,
                 });
+                current_locked = false;
+                current_prunable = false;
             }
             continue;
         }
@@ -1104,7 +1112,11 @@ fn parse_worktree_list_porcelain(text: &str) -> Vec<GitWorktree> {
                 out.push(GitWorktree {
                     path: existing,
                     branch: current_branch.take(),
+                    locked: current_locked,
+                    prunable: current_prunable,
                 });
+                current_locked = false;
+                current_prunable = false;
             }
             continue;
         }
@@ -1115,6 +1127,14 @@ fn parse_worktree_list_porcelain(text: &str) -> Vec<GitWorktree> {
         }
         if let Some(branch) = trimmed.strip_prefix("branch ") {
             current_branch = Some(branch.to_string());
+            continue;
+        }
+        if trimmed == "locked" || trimmed.starts_with("locked ") {
+            current_locked = true;
+            continue;
+        }
+        if trimmed == "prunable" || trimmed.starts_with("prunable ") {
+            current_prunable = true;
         }
     }
 
@@ -1122,6 +1142,8 @@ fn parse_worktree_list_porcelain(text: &str) -> Vec<GitWorktree> {
         out.push(GitWorktree {
             path,
             branch: current_branch.take(),
+            locked: current_locked,
+            prunable: current_prunable,
         });
     }
 
@@ -1144,6 +1166,16 @@ fn inspect_worktree_for_purge(worktree: &GitWorktree) -> Result<WorktreePurgeEnt
 
     if entry.branch.as_deref() == Some("main") {
         entry.reasons.push("main_dispatch_branch".to_string());
+        return Ok(entry);
+    }
+
+    if worktree.locked {
+        entry.reasons.push("worktree_locked".to_string());
+    }
+    if worktree.prunable {
+        entry.reasons.push("worktree_prunable".to_string());
+    }
+    if !entry.reasons.is_empty() {
         return Ok(entry);
     }
 
@@ -2463,10 +2495,11 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn parse_worktree_list_porcelain_extracts_paths_and_branches() {
+    fn parse_worktree_list_porcelain_extracts_paths_branches_and_flags() {
         let input = "\
 worktree /repo\n\
 HEAD abcdef\n\
@@ -2475,6 +2508,12 @@ branch refs/heads/main\n\
 worktree /repo/.worktrees/000080\n\
 HEAD 123456\n\
 branch refs/heads/topic\n\
+locked manual cleanup pending\n\
+\n\
+worktree /repo/.worktrees/000081\n\
+HEAD 654321\n\
+branch refs/heads/other\n\
+prunable gitdir file points to non-existent location\n\
 \n";
 
         let parsed = parse_worktree_list_porcelain(input);
@@ -2484,11 +2523,84 @@ branch refs/heads/topic\n\
                 GitWorktree {
                     path: "/repo".to_string(),
                     branch: Some("main".to_string()),
+                    locked: false,
+                    prunable: false,
                 },
                 GitWorktree {
                     path: "/repo/.worktrees/000080".to_string(),
                     branch: Some("topic".to_string()),
-                }
+                    locked: true,
+                    prunable: false,
+                },
+                GitWorktree {
+                    path: "/repo/.worktrees/000081".to_string(),
+                    branch: Some("other".to_string()),
+                    locked: false,
+                    prunable: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn inspect_worktree_for_purge_short_circuits_locked_worktree() {
+        let entry = inspect_worktree_for_purge(&GitWorktree {
+            path: "/repo/.worktrees/000080".to_string(),
+            branch: Some("shortbranch".to_string()),
+            locked: true,
+            prunable: false,
+        })
+        .unwrap();
+
+        assert!(!entry.safe);
+        assert_eq!(entry.clean, None);
+        assert_eq!(entry.task_doc, None);
+        assert_eq!(entry.task_status, None);
+        assert_eq!(entry.remote_branch, None);
+        assert_eq!(entry.pushed, None);
+        assert_eq!(entry.reasons, vec!["worktree_locked".to_string()]);
+    }
+
+    #[test]
+    fn inspect_worktree_for_purge_short_circuits_prunable_worktree() {
+        let entry = inspect_worktree_for_purge(&GitWorktree {
+            path: "/repo/.worktrees/000081".to_string(),
+            branch: Some("shortbranch".to_string()),
+            locked: false,
+            prunable: true,
+        })
+        .unwrap();
+
+        assert!(!entry.safe);
+        assert_eq!(entry.clean, None);
+        assert_eq!(entry.task_doc, None);
+        assert_eq!(entry.task_status, None);
+        assert_eq!(entry.remote_branch, None);
+        assert_eq!(entry.pushed, None);
+        assert_eq!(entry.reasons, vec!["worktree_prunable".to_string()]);
+    }
+
+    #[test]
+    fn inspect_worktree_for_purge_short_circuits_worktree_with_both_flags() {
+        let entry = inspect_worktree_for_purge(&GitWorktree {
+            path: "/repo/.worktrees/000082".to_string(),
+            branch: Some("shortbranch".to_string()),
+            locked: true,
+            prunable: true,
+        })
+        .unwrap();
+
+        assert!(!entry.safe);
+        assert_eq!(entry.clean, None);
+        assert_eq!(entry.task_doc, None);
+        assert_eq!(entry.task_status, None);
+        assert_eq!(entry.remote_branch, None);
+        assert_eq!(entry.pushed, None);
+        assert_eq!(
+            entry.reasons,
+            vec![
+                "worktree_locked".to_string(),
+                "worktree_prunable".to_string()
             ]
         );
     }

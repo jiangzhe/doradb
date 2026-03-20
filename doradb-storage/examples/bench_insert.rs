@@ -67,7 +67,9 @@ fn main() {
             for sess_id in 0..args.sessions {
                 let wg = wg.clone();
                 let stop = Arc::clone(&stop);
-                let engine = engine.new_ref();
+                let engine = engine
+                    .new_ref()
+                    .expect("engine should be running while spawning workers");
                 ex.spawn(worker(
                     engine,
                     table_id,

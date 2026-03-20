@@ -175,7 +175,7 @@ tools/task.rs purge-worktrees
    - same-name remote branch exists,
    - remote branch contains the local tip.
 7. Keep all other worktrees in `unfinished` with reasons.
-8. Recognize both legacy `worktrees/<task-id>` and hidden `.worktrees/<task-id>` layouts by matching any non-`main` worktree whose basename is exactly 6 digits.
+8. Recognize task worktrees under `.worktrees/<task-id>` by matching any non-`main` worktree whose basename is exactly 6 digits.
 9. Apply deletion only with:
 ```bash
 tools/task.rs purge-worktrees --apply

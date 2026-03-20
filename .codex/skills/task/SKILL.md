@@ -201,7 +201,7 @@ tools/task.rs purge-worktrees --apply
    - the local worktree via `git worktree remove`;
    - the local branch via `git branch -D`.
 9. Never delete remote branches in this workflow.
-10. Treat any non-`main` worktree whose basename is a 6-digit task id as eligible for inspection, regardless of whether it lives under legacy `worktrees/` or hidden `.worktrees/`.
+10. Treat any non-`main` worktree under `.worktrees/` whose basename is a 6-digit task id as eligible for inspection.
 
 ## Output Quality Bar
 
