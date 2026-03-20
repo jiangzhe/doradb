@@ -1,7 +1,7 @@
 ---
 id: 0009
 title: Remove Static Lifetime From Engine Components
-status: proposal
+status: implemented
 tags: [storage-engine, lifetime, quiescent, shutdown]
 created: 2026-03-17
 github_issue: 438
@@ -173,7 +173,7 @@ Issue Labels:
 ### Source Backlogs (Optional)
 
 - [B1] `docs/backlogs/000042-graceful-storage-engine-shutdown-lifecycle-for-sessions-and-system-components.md`
-- [B2] `docs/backlogs/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
+- [B2] `docs/backlogs/closed/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
 
 ## Decision
 
@@ -451,9 +451,6 @@ Reference:
   - Task Issue: `#439`
   - Phase Status: done
   - Implementation Summary: Implemented in `doradb-storage` with the phase-1 shutdown barrier selected by [Task Resolve Sync: docs/tasks/000073-engine-shutdown-barrier.md @ 2026-03-17]
-  - Related Backlogs:
-    - `docs/backlogs/000059-add-session-drain-and-forced-shutdown-policy-after-engine-shutdown-barrier.md`
-
 - **Phase 2: Guard-Owned Engine Components And Runtime Static-Lifetime Removal**
   - Scope: Replace `EngineInner` leaked-static component fields and transitional
     handle storage with direct `QuiescentGuard<T>` / `QuiDep<T>` ownership;
@@ -481,8 +478,7 @@ Reference:
     `StaticLifetimeScope` / static-builder surface. [Task Resolve Sync:
     docs/tasks/000075-guard-owned-engine-components.md @ 2026-03-18]
   - Related Backlogs:
-    - `docs/backlogs/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
-    - `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
+    - `docs/backlogs/closed/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
 
 - **Phase 3: Component-Oriented Engine Lifecycle**
   - Scope: Introduce a crate-private `Component` trait that defines dependency
@@ -514,8 +510,7 @@ Reference:
     boundaries, and prepare cleaner component-level lifecycle management.
   - Non-goals: No broader user-facing graceful-shutdown policy beyond the
     explicit shutdown barrier and later follow-up backlog work.
-  - Task Doc:
-    `docs/tasks/000078-catalog-separation-and-background-worker-extraction.md`
+  - Task Doc: `docs/tasks/000078-catalog-separation-and-background-worker-extraction.md`
   - Task Issue: `#449`
   - Phase Status: done
   - Implementation Summary: Implemented in `doradb-storage` by task 000078:
@@ -597,10 +592,14 @@ Reference:
 ## Future Work
 
 1. Full graceful shutdown semantics such as session draining, wait timeouts,
-   forced-stop policy, and user-facing shutdown status reporting. [B1]
-2. Any broader capability or resource-governance model beyond the existing
+   forced-stop policy, and user-facing shutdown status reporting remain tracked
+   in `docs/backlogs/000059-add-session-drain-and-forced-shutdown-policy-after-engine-shutdown-barrier.md`.
+2. Shutdown busy checks for externally held `Arc<Table>` /
+   `Arc<CatalogTable>` handles remain tracked in
+   `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`.
+3. Any broader capability or resource-governance model beyond the existing
    `PoolGuard` and quiescent component ownership. [D10] [D11]
-3. Performance tuning after the ownership migration, if any worker-stop or
+4. Performance tuning after the ownership migration, if any worker-stop or
    lifecycle gating paths show measurable overhead in benchmarks. [D2] [D3]
 
 ## References
@@ -614,4 +613,6 @@ Reference:
 - `docs/tasks/000072-add-buffer-pool-identity-validation-for-guard-provenance.md`
 - `docs/tasks/000029-static-lifetime-test-teardown-safety-phase-6.md`
 - `docs/backlogs/000042-graceful-storage-engine-shutdown-lifecycle-for-sessions-and-system-components.md`
-- `docs/backlogs/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
+- `docs/backlogs/closed/000055-preserve-evictable-buffer-pool-worker-start-contract-when-replacing-build-static.md`
+- `docs/backlogs/000059-add-session-drain-and-forced-shutdown-policy-after-engine-shutdown-barrier.md`
+- `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
