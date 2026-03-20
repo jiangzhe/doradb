@@ -2,9 +2,10 @@
 
 ## Command Model
 
-`task` has two prompt workflows:
+`task` has three prompt workflows:
 1. `task create`: design-phase analysis and task doc creation.
 2. `task resolve`: post-implementation sync and follow-up tracking.
+3. `task purge worktree`: dry-run and optional removal flow for completed task worktrees.
 
 ## `task create` Formal Round Definition
 
@@ -149,6 +150,37 @@ tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
 11. Do not run `git commit` or `git push` during `task resolve`.
 12. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
+
+## `task purge worktree` Checklist
+
+Complete all items:
+
+1. Run from the `main` dispatch worktree, not from a task worktree.
+2. Start with:
+```bash
+tools/task.rs purge-worktrees
+```
+3. List all worktrees before deciding anything.
+4. Exclude the `main` worktree from purge.
+5. For each non-`main` worktree, inspect:
+   - task id from 6-digit worktree basename,
+   - task doc under that worktree's own `docs/tasks/`,
+   - task `status:`,
+   - worktree cleanliness,
+   - same-name remote branch existence,
+   - whether the local tip is already pushed to that remote branch.
+6. Mark a worktree safe only when:
+   - task status is `implemented`,
+   - worktree is clean,
+   - same-name remote branch exists,
+   - remote branch contains the local tip.
+7. Keep all other worktrees in `unfinished` with reasons.
+8. Recognize both legacy `worktrees/<task-id>` and hidden `.worktrees/<task-id>` layouts by matching any non-`main` worktree whose basename is exactly 6 digits.
+9. Apply deletion only with:
+```bash
+tools/task.rs purge-worktrees --apply
+```
+10. Apply mode removes only the local worktree and local branch. Do not delete remote branches.
 
 ## Backlog Integration
 

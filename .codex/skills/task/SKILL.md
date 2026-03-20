@@ -8,9 +8,10 @@ description: Design a task document for a feature or bug fix through deep resear
 Use this skill to design a high-quality task document before coding.
 Scripts are executable; invoke them directly (no `cargo +nightly -Zscript` prefix).
 
-This skill has two prompt workflows:
+This skill has three prompt workflows:
 1. `task create`: design-phase planning and task doc creation.
 2. `task resolve`: post-implementation synchronization after code/tests/review are complete.
+3. `task purge worktree`: inspect task worktrees and remove only the ones that are safe to purge.
 
 ## `task create` Required Flow
 
@@ -166,6 +167,41 @@ tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 9. `task resolve` must not run `git commit` or `git push`.
    - Resolve updates are limited to document synchronization and related backlog/RFC tooling.
    - Leave commit/push decisions to an explicit user request or a separate workflow.
+
+## `task purge worktree` Required Flow
+
+Use `task purge worktree` only from the `main` dispatch worktree.
+
+1. Start with a dry run:
+```bash
+tools/task.rs purge-worktrees
+```
+2. The workflow must list all worktrees first.
+3. Exclude the `main` worktree from purge with reason `main_dispatch_branch`.
+4. For every other worktree:
+   - derive task id from the worktree directory basename when it is exactly 6 digits;
+   - inspect that worktree's own `docs/tasks/<task-id>-*.md`;
+   - read task frontmatter `status:`;
+   - check whether the worktree is clean;
+   - check whether the same branch name exists on `origin/` and already contains the local tip.
+5. A worktree is safe to purge only when all are true:
+   - task status is `implemented`;
+   - worktree is clean;
+   - same-name remote branch exists;
+   - local branch tip is already pushed to that remote branch.
+6. In dry-run mode, finish by listing:
+   - `safe_to_purge`;
+   - `unfinished`;
+   - `excluded`.
+7. Apply purge only with explicit user intent:
+```bash
+tools/task.rs purge-worktrees --apply
+```
+8. Apply mode removes only:
+   - the local worktree via `git worktree remove`;
+   - the local branch via `git branch -D`.
+9. Never delete remote branches in this workflow.
+10. Treat any non-`main` worktree whose basename is a 6-digit task id as eligible for inspection, regardless of whether it lives under legacy `worktrees/` or hidden `.worktrees/`.
 
 ## Output Quality Bar
 
