@@ -540,7 +540,7 @@ mod tests {
                 let _ = smol::block_on(trx.commit());
             }
             {
-                let engine = engine.new_ref();
+                let engine = engine.new_ref().unwrap();
                 std::thread::spawn(move || {
                     let mut session = engine.try_new_session().unwrap();
                     let trx = session.try_begin_trx().unwrap().unwrap();

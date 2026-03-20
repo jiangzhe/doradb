@@ -23,6 +23,7 @@ fn usage() -> &'static str {
 Subcommands:\n\
   next-task-id          Print the next task id from docs/tasks/next-id\n\
   create-task-doc       Create a docs/tasks task document from template with validated id and slug\n\
+  purge-worktrees       List purge-safe task worktrees and optionally remove them\n\
   resolve-task-next-id  Refresh docs/tasks/next-id during task resolve\n\
   resolve-task-rfc      Sync task resolve outcome into parent RFC Implementation Phases\n"
 }
@@ -63,6 +64,10 @@ fn resolve_task_next_id_usage() -> &'static str {
     "Usage: tools/task.rs resolve-task-next-id --task <docs/tasks/<id>-<slug>.md>"
 }
 
+fn purge_worktrees_usage() -> &'static str {
+    "Usage: tools/task.rs purge-worktrees [--apply]"
+}
+
 #[derive(Clone)]
 struct CloseReason {
     reason_type: String,
@@ -99,6 +104,47 @@ struct NextIdSyncSummary {
     updated: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitWorktree {
+    path: String,
+    branch: Option<String>,
+    locked: bool,
+    prunable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreePurgeEntry {
+    path: String,
+    branch: Option<String>,
+    task_id: Option<String>,
+    task_doc: Option<String>,
+    task_status: Option<String>,
+    clean: Option<bool>,
+    remote_branch: Option<String>,
+    pushed: Option<bool>,
+    safe: bool,
+    reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreePurgeFailure {
+    path: String,
+    branch: Option<String>,
+    error: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreePurgeSummary {
+    current_branch: String,
+    dry_run: bool,
+    all_worktrees: Vec<WorktreePurgeEntry>,
+    excluded: Vec<WorktreePurgeEntry>,
+    safe_to_purge: Vec<WorktreePurgeEntry>,
+    unfinished: Vec<WorktreePurgeEntry>,
+    purged: Vec<WorktreePurgeEntry>,
+    failures: Vec<WorktreePurgeFailure>,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -119,6 +165,7 @@ fn run() -> Result<(), String> {
         }
         "next-task-id" => run_next_task_id(args),
         "create-task-doc" => run_create_task_doc(args),
+        "purge-worktrees" => run_purge_worktrees(args),
         "resolve-task-next-id" => run_resolve_task_next_id(args),
         "resolve-task-rfc" => run_resolve_task_rfc(args),
         _ => Err(format!("unknown subcommand: {subcommand}\n{}", usage())),
@@ -246,6 +293,83 @@ fn run_create_task_doc(mut args: impl Iterator<Item = String>) -> Result<(), Str
         .map_err(|e| format!("failed to write {}: {e}", normalize_path(&out_path)))?;
 
     println!("{}", normalize_path(&out_path));
+    Ok(())
+}
+
+fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut apply = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--apply" => {
+                apply = true;
+            }
+            "-h" | "--help" => {
+                println!("{}", purge_worktrees_usage());
+                return Ok(());
+            }
+            _ => return Err(format!("unknown arg: {arg}\n{}", purge_worktrees_usage())),
+        }
+    }
+
+    let current_branch = run_git_capture(&["branch", "--show-current"])?;
+    if current_branch != "main" {
+        return Err(format!(
+            "purge-worktrees must run from the main dispatch worktree; current branch: {current_branch}"
+        ));
+    }
+
+    let worktrees =
+        parse_worktree_list_porcelain(&run_git_capture(&["worktree", "list", "--porcelain"])?);
+    let mut summary = WorktreePurgeSummary {
+        current_branch,
+        dry_run: !apply,
+        all_worktrees: Vec::new(),
+        excluded: Vec::new(),
+        safe_to_purge: Vec::new(),
+        unfinished: Vec::new(),
+        purged: Vec::new(),
+        failures: Vec::new(),
+    };
+
+    for worktree in worktrees {
+        let entry = inspect_worktree_for_purge(&worktree)?;
+        summary.all_worktrees.push(entry.clone());
+        if entry
+            .reasons
+            .iter()
+            .any(|reason| reason == "main_dispatch_branch")
+        {
+            summary.excluded.push(entry);
+        } else if entry.safe {
+            summary.safe_to_purge.push(entry);
+        } else {
+            summary.unfinished.push(entry);
+        }
+    }
+
+    if apply {
+        run_git_dynamic(&["fetch", "--prune", "origin"])?;
+
+        for entry in summary.safe_to_purge.clone() {
+            if let Err(err) = purge_worktree_entry(&entry) {
+                summary.failures.push(WorktreePurgeFailure {
+                    path: entry.path.clone(),
+                    branch: entry.branch.clone(),
+                    error: err,
+                });
+            } else {
+                summary.purged.push(entry);
+            }
+        }
+    }
+
+    println!("{}", worktree_purge_summary_json(&summary));
+
+    if !summary.failures.is_empty() {
+        return Err("one or more worktrees failed to purge".to_string());
+    }
+
     Ok(())
 }
 
@@ -890,6 +1014,351 @@ fn run_git<const N: usize>(args: [&str; N]) -> Result<(), String> {
         return Err("git returned non-zero exit code".to_string());
     }
     Ok(())
+}
+
+fn run_git_dynamic(args: &[&str]) -> Result<(), String> {
+    let out = run_git_output(args)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+        if !stdout.is_empty() {
+            return Err(stdout);
+        }
+        return Err("git returned non-zero exit code".to_string());
+    }
+    Ok(())
+}
+
+fn run_git_capture(args: &[&str]) -> Result<String, String> {
+    let out = run_git_output(args)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+        if !stdout.is_empty() {
+            return Err(stdout);
+        }
+        return Err("git returned non-zero exit code".to_string());
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(text)
+}
+
+fn run_git_capture_in_dir(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = run_git_output_in_dir(dir, args)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+        if !stdout.is_empty() {
+            return Err(stdout);
+        }
+        return Err(format!(
+            "git returned non-zero exit code in {}",
+            normalize_path(dir)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn run_git_output(args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute git: {e}"))
+}
+
+fn run_git_output_in_dir(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute git in {}: {e}", normalize_path(dir)))
+}
+
+fn parse_worktree_list_porcelain(text: &str) -> Vec<GitWorktree> {
+    let mut out = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+    let mut current_locked = false;
+    let mut current_prunable = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if let Some(path) = current_path.take() {
+                out.push(GitWorktree {
+                    path,
+                    branch: current_branch.take(),
+                    locked: current_locked,
+                    prunable: current_prunable,
+                });
+                current_locked = false;
+                current_prunable = false;
+            }
+            continue;
+        }
+
+        if let Some(path) = trimmed.strip_prefix("worktree ") {
+            if let Some(existing) = current_path.replace(path.to_string()) {
+                out.push(GitWorktree {
+                    path: existing,
+                    branch: current_branch.take(),
+                    locked: current_locked,
+                    prunable: current_prunable,
+                });
+                current_locked = false;
+                current_prunable = false;
+            }
+            continue;
+        }
+
+        if let Some(branch) = trimmed.strip_prefix("branch refs/heads/") {
+            current_branch = Some(branch.to_string());
+            continue;
+        }
+        if let Some(branch) = trimmed.strip_prefix("branch ") {
+            current_branch = Some(branch.to_string());
+            continue;
+        }
+        if trimmed == "locked" || trimmed.starts_with("locked ") {
+            current_locked = true;
+            continue;
+        }
+        if trimmed == "prunable" || trimmed.starts_with("prunable ") {
+            current_prunable = true;
+        }
+    }
+
+    if let Some(path) = current_path.take() {
+        out.push(GitWorktree {
+            path,
+            branch: current_branch.take(),
+            locked: current_locked,
+            prunable: current_prunable,
+        });
+    }
+
+    out
+}
+
+fn inspect_worktree_for_purge(worktree: &GitWorktree) -> Result<WorktreePurgeEntry, String> {
+    let mut entry = WorktreePurgeEntry {
+        path: worktree.path.clone(),
+        branch: worktree.branch.clone(),
+        task_id: task_id_from_worktree_path(Path::new(&worktree.path)),
+        task_doc: None,
+        task_status: None,
+        clean: None,
+        remote_branch: None,
+        pushed: None,
+        safe: false,
+        reasons: Vec::new(),
+    };
+
+    if entry.branch.as_deref() == Some("main") {
+        entry.reasons.push("main_dispatch_branch".to_string());
+        return Ok(entry);
+    }
+
+    if worktree.locked {
+        entry.reasons.push("worktree_locked".to_string());
+    }
+    if worktree.prunable {
+        entry.reasons.push("worktree_prunable".to_string());
+    }
+    if !entry.reasons.is_empty() {
+        return Ok(entry);
+    }
+
+    let worktree_path = Path::new(&entry.path);
+    entry.clean = Some(is_worktree_clean(worktree_path)?);
+
+    if let Some(task_id) = entry.task_id.clone() {
+        match find_task_doc_in_worktree(worktree_path, &task_id)? {
+            TaskDocLookup::NotFound => {
+                entry.reasons.push("task_doc_not_found".to_string());
+            }
+            TaskDocLookup::Multiple => {
+                entry.reasons.push("multiple_task_docs_for_id".to_string());
+            }
+            TaskDocLookup::Found(path) => {
+                entry.task_doc = Some(normalize_path(&path));
+                let text = fs::read_to_string(&path)
+                    .map_err(|e| format!("failed to read {}: {e}", normalize_path(&path)))?;
+                entry.task_status = parse_task_status(&text);
+            }
+        }
+    } else {
+        entry.reasons.push("no_task_id_suffix".to_string());
+    }
+
+    match entry.task_status.as_deref() {
+        Some("implemented") => {}
+        Some(_) => entry.reasons.push("task_not_implemented".to_string()),
+        None if entry.task_doc.is_some() => entry.reasons.push("task_status_missing".to_string()),
+        None => {}
+    }
+
+    match entry.clean {
+        Some(true) => {}
+        Some(false) => entry.reasons.push("worktree_dirty".to_string()),
+        None => entry
+            .reasons
+            .push("worktree_cleanliness_unknown".to_string()),
+    }
+
+    if let Some(branch) = entry.branch.as_deref() {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        if git_ref_exists(&remote_ref)? {
+            entry.remote_branch = Some(format!("origin/{branch}"));
+            let pushed = git_ref_is_ancestor(&format!("refs/heads/{branch}"), &remote_ref)?;
+            entry.pushed = Some(pushed);
+            if !pushed {
+                entry.reasons.push("local_not_pushed".to_string());
+            }
+        } else {
+            entry.pushed = Some(false);
+            entry.reasons.push("remote_branch_missing".to_string());
+        }
+    } else {
+        entry.reasons.push("no_local_branch".to_string());
+    }
+
+    entry.safe = entry.reasons.is_empty();
+    Ok(entry)
+}
+
+fn purge_worktree_entry(entry: &WorktreePurgeEntry) -> Result<(), String> {
+    run_git_dynamic(&["worktree", "remove", &entry.path])?;
+    if let Some(branch) = entry.branch.as_deref() {
+        run_git_dynamic(&["branch", "-D", branch])?;
+    }
+    Ok(())
+}
+
+fn task_id_from_worktree_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    if name.len() == 6 && name.bytes().all(|b| b.is_ascii_digit()) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TaskDocLookup {
+    NotFound,
+    Multiple,
+    Found(PathBuf),
+}
+
+fn find_task_doc_in_worktree(worktree_path: &Path, task_id: &str) -> Result<TaskDocLookup, String> {
+    let docs_dir = worktree_path.join("docs/tasks");
+    if !docs_dir.exists() {
+        return Ok(TaskDocLookup::NotFound);
+    }
+    if !docs_dir.is_dir() {
+        return Err(format!("not a directory: {}", normalize_path(&docs_dir)));
+    }
+
+    let prefix = format!("{task_id}-");
+    let mut matches = Vec::new();
+    let entries = fs::read_dir(&docs_dir)
+        .map_err(|e| format!("failed to read {}: {e}", normalize_path(&docs_dir)))?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if parse_strict_six_digit_task_name(&name).is_some() {
+            matches.push(entry.path());
+        }
+    }
+
+    matches.sort();
+    Ok(match matches.len() {
+        0 => TaskDocLookup::NotFound,
+        1 => TaskDocLookup::Found(matches.remove(0)),
+        _ => TaskDocLookup::Multiple,
+    })
+}
+
+fn parse_task_status(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("status:") {
+            let status = value.split('#').next()?.trim();
+            if !status.is_empty() {
+                return Some(status.to_string());
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn is_worktree_clean(path: &Path) -> Result<bool, String> {
+    Ok(run_git_capture_in_dir(path, &["status", "--porcelain=v1"])?.is_empty())
+}
+
+fn git_ref_exists(refname: &str) -> Result<bool, String> {
+    let out = run_git_output(&["show-ref", "--verify", "--quiet", refname])?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if !stderr.is_empty() {
+                Err(stderr)
+            } else {
+                Err(format!("git show-ref failed for {refname}"))
+            }
+        }
+    }
+}
+
+fn git_ref_is_ancestor(ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let out = run_git_output(&["merge-base", "--is-ancestor", ancestor, descendant])?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if !stderr.is_empty() {
+                Err(stderr)
+            } else {
+                Err(format!(
+                    "git merge-base --is-ancestor failed for {ancestor} -> {descendant}"
+                ))
+            }
+        }
+    }
 }
 
 fn resolve_open_backlog_path(
@@ -1545,6 +2014,63 @@ fn next_id_sync_summary_json(summary: &NextIdSyncSummary) -> String {
     )
 }
 
+fn worktree_purge_summary_json(summary: &WorktreePurgeSummary) -> String {
+    format!(
+        "{{\"current_branch\":\"{}\",\"dry_run\":{},\"all_worktrees\":{},\"excluded\":{},\"safe_to_purge\":{},\"unfinished\":{},\"purged\":{},\"failures\":{}}}",
+        json_escape(&summary.current_branch),
+        if summary.dry_run { "true" } else { "false" },
+        worktree_purge_entry_array_json(&summary.all_worktrees),
+        worktree_purge_entry_array_json(&summary.excluded),
+        worktree_purge_entry_array_json(&summary.safe_to_purge),
+        worktree_purge_entry_array_json(&summary.unfinished),
+        worktree_purge_entry_array_json(&summary.purged),
+        worktree_purge_failure_array_json(&summary.failures),
+    )
+}
+
+fn worktree_purge_entry_array_json(entries: &[WorktreePurgeEntry]) -> String {
+    let body = entries
+        .iter()
+        .map(worktree_purge_entry_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
+
+fn worktree_purge_entry_json(entry: &WorktreePurgeEntry) -> String {
+    format!(
+        "{{\"path\":\"{}\",\"branch\":{},\"task_id\":{},\"task_doc\":{},\"task_status\":{},\"clean\":{},\"remote_branch\":{},\"pushed\":{},\"safe\":{},\"reasons\":{}}}",
+        json_escape(&entry.path),
+        json_nullable(&entry.branch),
+        json_nullable(&entry.task_id),
+        json_nullable(&entry.task_doc),
+        json_nullable(&entry.task_status),
+        json_nullable_bool(entry.clean),
+        json_nullable(&entry.remote_branch),
+        json_nullable_bool(entry.pushed),
+        if entry.safe { "true" } else { "false" },
+        json_array(&entry.reasons),
+    )
+}
+
+fn worktree_purge_failure_array_json(items: &[WorktreePurgeFailure]) -> String {
+    let body = items
+        .iter()
+        .map(worktree_purge_failure_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
+
+fn worktree_purge_failure_json(item: &WorktreePurgeFailure) -> String {
+    format!(
+        "{{\"path\":\"{}\",\"branch\":{},\"error\":\"{}\"}}",
+        json_escape(&item.path),
+        json_nullable(&item.branch),
+        json_escape(&item.error),
+    )
+}
+
 fn json_array(items: &[String]) -> String {
     let body = items
         .iter()
@@ -1557,6 +2083,14 @@ fn json_array(items: &[String]) -> String {
 fn json_nullable(value: &Option<String>) -> String {
     match value {
         Some(v) => format!("\"{}\"", json_escape(v)),
+        None => "null".to_string(),
+    }
+}
+
+fn json_nullable_bool(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
         None => "null".to_string(),
     }
 }
@@ -1956,4 +2490,308 @@ fn normalize_reference_path(path: &Path) -> PathBuf {
 
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parse_worktree_list_porcelain_extracts_paths_branches_and_flags() {
+        let input = "\
+worktree /repo\n\
+HEAD abcdef\n\
+branch refs/heads/main\n\
+\n\
+worktree /repo/.worktrees/000080\n\
+HEAD 123456\n\
+branch refs/heads/topic\n\
+locked manual cleanup pending\n\
+\n\
+worktree /repo/.worktrees/000081\n\
+HEAD 654321\n\
+branch refs/heads/other\n\
+prunable gitdir file points to non-existent location\n\
+\n";
+
+        let parsed = parse_worktree_list_porcelain(input);
+        assert_eq!(
+            parsed,
+            vec![
+                GitWorktree {
+                    path: "/repo".to_string(),
+                    branch: Some("main".to_string()),
+                    locked: false,
+                    prunable: false,
+                },
+                GitWorktree {
+                    path: "/repo/.worktrees/000080".to_string(),
+                    branch: Some("topic".to_string()),
+                    locked: true,
+                    prunable: false,
+                },
+                GitWorktree {
+                    path: "/repo/.worktrees/000081".to_string(),
+                    branch: Some("other".to_string()),
+                    locked: false,
+                    prunable: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn inspect_worktree_for_purge_short_circuits_locked_worktree() {
+        let entry = inspect_worktree_for_purge(&GitWorktree {
+            path: "/repo/.worktrees/000080".to_string(),
+            branch: Some("shortbranch".to_string()),
+            locked: true,
+            prunable: false,
+        })
+        .unwrap();
+
+        assert!(!entry.safe);
+        assert_eq!(entry.clean, None);
+        assert_eq!(entry.task_doc, None);
+        assert_eq!(entry.task_status, None);
+        assert_eq!(entry.remote_branch, None);
+        assert_eq!(entry.pushed, None);
+        assert_eq!(entry.reasons, vec!["worktree_locked".to_string()]);
+    }
+
+    #[test]
+    fn inspect_worktree_for_purge_short_circuits_prunable_worktree() {
+        let entry = inspect_worktree_for_purge(&GitWorktree {
+            path: "/repo/.worktrees/000081".to_string(),
+            branch: Some("shortbranch".to_string()),
+            locked: false,
+            prunable: true,
+        })
+        .unwrap();
+
+        assert!(!entry.safe);
+        assert_eq!(entry.clean, None);
+        assert_eq!(entry.task_doc, None);
+        assert_eq!(entry.task_status, None);
+        assert_eq!(entry.remote_branch, None);
+        assert_eq!(entry.pushed, None);
+        assert_eq!(entry.reasons, vec!["worktree_prunable".to_string()]);
+    }
+
+    #[test]
+    fn inspect_worktree_for_purge_short_circuits_worktree_with_both_flags() {
+        let entry = inspect_worktree_for_purge(&GitWorktree {
+            path: "/repo/.worktrees/000082".to_string(),
+            branch: Some("shortbranch".to_string()),
+            locked: true,
+            prunable: true,
+        })
+        .unwrap();
+
+        assert!(!entry.safe);
+        assert_eq!(entry.clean, None);
+        assert_eq!(entry.task_doc, None);
+        assert_eq!(entry.task_status, None);
+        assert_eq!(entry.remote_branch, None);
+        assert_eq!(entry.pushed, None);
+        assert_eq!(
+            entry.reasons,
+            vec![
+                "worktree_locked".to_string(),
+                "worktree_prunable".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn task_id_from_worktree_path_uses_six_digit_basename() {
+        assert_eq!(
+            task_id_from_worktree_path(Path::new("/repo/.worktrees/000080")),
+            Some("000080".to_string())
+        );
+        assert_eq!(
+            task_id_from_worktree_path(Path::new("/repo/worktrees/000081")),
+            Some("000081".to_string())
+        );
+        assert_eq!(task_id_from_worktree_path(Path::new("/repo/main")), None);
+        assert_eq!(
+            task_id_from_worktree_path(Path::new("/repo/.worktrees/task-80")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_task_status_reads_frontmatter_value_and_strips_comment() {
+        let input = "\
+---\n\
+id: 000080\n\
+status: implemented  # proposal | implemented | superseded\n\
+created: 2026-03-20\n\
+---\n\
+\n\
+# Task\n";
+        assert_eq!(parse_task_status(input).as_deref(), Some("implemented"));
+    }
+
+    #[test]
+    fn parse_task_status_returns_none_without_frontmatter() {
+        assert_eq!(parse_task_status("# Task\n"), None);
+    }
+
+    #[test]
+    fn find_task_doc_in_worktree_finds_single_matching_doc() {
+        let root = unique_temp_dir("task-tool-single-doc");
+        let docs_dir = root.join("docs/tasks");
+        fs::create_dir_all(&docs_dir).unwrap();
+        fs::write(
+            docs_dir.join("000080-example-task.md"),
+            "---\nstatus: proposal\n---\n",
+        )
+        .unwrap();
+
+        match find_task_doc_in_worktree(&root, "000080").unwrap() {
+            TaskDocLookup::Found(path) => {
+                assert_eq!(
+                    normalize_path(&path),
+                    normalize_path(&docs_dir.join("000080-example-task.md"))
+                )
+            }
+            other => panic!("unexpected lookup result: {other:?}"),
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn find_task_doc_in_worktree_reports_multiple_matches() {
+        let root = unique_temp_dir("task-tool-multi-doc");
+        let docs_dir = root.join("docs/tasks");
+        fs::create_dir_all(&docs_dir).unwrap();
+        fs::write(
+            docs_dir.join("000080-first.md"),
+            "---\nstatus: proposal\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            docs_dir.join("000080-second.md"),
+            "---\nstatus: proposal\n---\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            find_task_doc_in_worktree(&root, "000080").unwrap(),
+            TaskDocLookup::Multiple
+        ));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn worktree_purge_summary_json_renders_expected_fields() {
+        let entry = WorktreePurgeEntry {
+            path: "/repo/.worktrees/000080".to_string(),
+            branch: Some("shortbranch".to_string()),
+            task_id: Some("000080".to_string()),
+            task_doc: Some("docs/tasks/000080-example.md".to_string()),
+            task_status: Some("implemented".to_string()),
+            clean: Some(true),
+            remote_branch: Some("origin/shortbranch".to_string()),
+            pushed: Some(true),
+            safe: true,
+            reasons: Vec::new(),
+        };
+        let summary = WorktreePurgeSummary {
+            current_branch: "main".to_string(),
+            dry_run: true,
+            all_worktrees: vec![entry.clone()],
+            excluded: Vec::new(),
+            safe_to_purge: vec![entry.clone()],
+            unfinished: Vec::new(),
+            purged: Vec::new(),
+            failures: Vec::new(),
+        };
+
+        let json = worktree_purge_summary_json(&summary);
+        assert!(json.contains("\"current_branch\":\"main\""));
+        assert!(json.contains("\"dry_run\":true"));
+        assert!(json.contains("\"safe_to_purge\":[{"));
+        assert!(json.contains("\"task_status\":\"implemented\""));
+    }
+
+    #[test]
+    fn run_purge_worktrees_keeps_dry_run_read_only() {
+        let root = unique_temp_dir("task-tool-purge-read-only");
+        fs::create_dir_all(&root).unwrap();
+        init_test_git_repo(&root);
+
+        let dry_run = with_current_dir_locked(&root, || run_purge_worktrees(std::iter::empty()));
+        assert!(dry_run.is_ok(), "dry run unexpectedly failed: {dry_run:?}");
+
+        let apply_result = with_current_dir_locked(&root, || {
+            run_purge_worktrees(["--apply".to_string()].into_iter())
+        });
+        assert!(apply_result.is_err(), "apply unexpectedly succeeded");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        for attempt in 0..100u32 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                env::temp_dir().join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+            if !path.exists() {
+                return path;
+            }
+        }
+        panic!("failed to allocate unique temp dir");
+    }
+
+    fn init_test_git_repo(root: &Path) {
+        run_git_ok(root, &["init", "-b", "main"]);
+        let origin = root.join("missing-origin.git");
+        let origin = origin.to_string_lossy().into_owned();
+        run_git_ok(root, &["remote", "add", "origin", &origin]);
+    }
+
+    fn run_git_ok(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to run git {args:?} in {}: {err}",
+                    normalize_path(dir)
+                )
+            });
+        assert!(
+            status.success(),
+            "git {args:?} failed in {} with status {status}",
+            normalize_path(dir)
+        );
+    }
+
+    fn with_current_dir_locked<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = current_dir_lock().lock().unwrap();
+        let original = env::current_dir().unwrap();
+        env::set_current_dir(dir).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        env::set_current_dir(original).unwrap();
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn current_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 }

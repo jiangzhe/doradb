@@ -51,7 +51,9 @@ fn main() {
             for _ in 0..args.sessions {
                 let wg = wg.clone();
                 let stop = Arc::clone(&stop);
-                let engine = engine.new_ref();
+                let engine = engine
+                    .new_ref()
+                    .expect("engine should be running while spawning workers");
                 ex.spawn(worker(engine, stop, wg)).detach();
             }
             // start system threads.

@@ -8,16 +8,17 @@ description: Design a task document for a feature or bug fix through deep resear
 Use this skill to design a high-quality task document before coding.
 Scripts are executable; invoke them directly (no `cargo +nightly -Zscript` prefix).
 
-This skill has two prompt workflows:
+This skill has three prompt workflows:
 1. `task create`: design-phase planning and task doc creation.
 2. `task resolve`: post-implementation synchronization after code/tests/review are complete.
+3. `task purge worktree`: inspect task worktrees and remove only the ones that are safe to purge.
 
 ## `task create` Required Flow
 
 1. Perform deep research first.
 2. Present multiple proposals and tradeoffs.
 3. Run two formal rounds before writing.
-4. Require explicit approval before writing to a task worktree under `worktrees/<task-id>/docs/tasks/`.
+4. Require explicit approval before writing to a task worktree under `.worktrees/<task-id>/docs/tasks/`.
 
 Do not skip or reorder these steps.
 
@@ -78,7 +79,7 @@ Resolve disagreements, tighten scope, and finalize:
 - test scenarios
 - open questions (if any)
 
-Round 2 must complete before any write to `worktrees/<task-id>/docs/tasks/`.
+Round 2 must complete before any write to `.worktrees/<task-id>/docs/tasks/`.
 
 ## Test Runner Constraint
 
@@ -103,21 +104,29 @@ git fetch origin main
 ```bash
 tools/doc-id.rs alloc-id --kind task
 ```
-3. Create the isolated task worktree from `origin/main`:
+3. Derive a concise branch name from the task title keywords.
+   - Do not prefix it with `task/`.
+   - Do not include the task id.
+   - Keep it under 20 characters.
+   - Prefer a short semantic stem over the full task title or doc slug.
+4. Create the isolated task worktree from `origin/main` on the new branch under
+   hidden `.worktrees/` so common scanners such as `rg` and `fd` do not pick it
+   up by default:
 ```bash
-git worktree add worktrees/<task-id> origin/main
+git worktree add -b <branch-name> .worktrees/<task-id> origin/main
 ```
-If `worktrees/<task-id>` already exists or `git worktree add` fails, stop and resolve that issue instead of falling back to the root checkout.
-4. Create the task file from template inside the new worktree:
+If `.worktrees/<task-id>` already exists or `git worktree add` fails, stop and resolve that issue instead of falling back to the root checkout.
+5. Create the task file from template inside the new worktree:
 ```bash
 tools/task.rs create-task-doc \
   --title "Task title" \
   --slug "task-title" \
   --id <task-id> \
-  --output-dir worktrees/<task-id>/docs/tasks
+  --output-dir .worktrees/<task-id>/docs/tasks
 ```
-5. Continue task-document writing inside `worktrees/<task-id>/...`.
-6. If the request starts from `docs/backlogs/`, treat that backlog doc as context input only.
+6. Continue task-document writing inside `.worktrees/<task-id>/...`.
+   - Task-doc slug and branch name are separate; keep the branch shorter when needed.
+7. If the request starts from `docs/backlogs/`, treat that backlog doc as context input only.
    - Still run full deep research and proposal rounds.
    - Do not skip quality gates because backlog is brief.
    - Backlog filename must match `docs/backlogs/<6digits>-<follow-up-topic>.md`.
@@ -125,7 +134,7 @@ tools/task.rs create-task-doc \
    - If any source backlog file is under `docs/backlogs/closed/`, ask the user whether to continue task creation from already-closed backlog item(s).
    - If task creation proceeds from backlog, include a `Source Backlogs:` list in task doc context for resolve traceability.
    - Manual backlog create/close workflow is owned by `$backlog` skill (`tools/backlog.rs`), not by this skill.
-7. Fill the file according to `docs/tasks/000000-template.md` in the task worktree.
+8. Fill the file according to `docs/tasks/000000-template.md` in the task worktree.
 
 ## `task resolve` Required Flow
 
@@ -158,6 +167,41 @@ tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 9. `task resolve` must not run `git commit` or `git push`.
    - Resolve updates are limited to document synchronization and related backlog/RFC tooling.
    - Leave commit/push decisions to an explicit user request or a separate workflow.
+
+## `task purge worktree` Required Flow
+
+Use `task purge worktree` only from the `main` dispatch worktree.
+
+1. Start with a dry run:
+```bash
+tools/task.rs purge-worktrees
+```
+2. The workflow must list all worktrees first.
+3. Exclude the `main` worktree from purge with reason `main_dispatch_branch`.
+4. For every other worktree:
+   - derive task id from the worktree directory basename when it is exactly 6 digits;
+   - inspect that worktree's own `docs/tasks/<task-id>-*.md`;
+   - read task frontmatter `status:`;
+   - check whether the worktree is clean;
+   - check whether the same branch name exists on `origin/` and already contains the local tip.
+5. A worktree is safe to purge only when all are true:
+   - task status is `implemented`;
+   - worktree is clean;
+   - same-name remote branch exists;
+   - local branch tip is already pushed to that remote branch.
+6. In dry-run mode, finish by listing:
+   - `safe_to_purge`;
+   - `unfinished`;
+   - `excluded`.
+7. Apply purge only with explicit user intent:
+```bash
+tools/task.rs purge-worktrees --apply
+```
+8. Apply mode removes only:
+   - the local worktree via `git worktree remove`;
+   - the local branch via `git branch -D`.
+9. Never delete remote branches in this workflow.
+10. Treat any non-`main` worktree under `.worktrees/` whose basename is a 6-digit task id as eligible for inspection.
 
 ## Output Quality Bar
 

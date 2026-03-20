@@ -4,6 +4,10 @@
 
 Doradb storage is designed for HTAP scenario.
 
+For the storage-engine owner/runtime split, component registration order,
+shutdown sequencing, and guard-lifetime rules, see
+[Engine Component Lifetime](./engine-component-lifetime.md).
+
 The storage has three data formats:
 
 1. In-memory row pages.

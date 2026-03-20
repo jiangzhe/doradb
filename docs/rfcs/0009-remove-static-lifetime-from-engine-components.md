@@ -531,18 +531,19 @@ Reference:
 
 - **Phase 5: Hardening, Cleanup, Diagnostics, And Documentation**
   - Scope: Add one dedicated document under `docs/` for component lifetime
-    management and guard patterns; add opt-in quiescent-drop timeout support
-    for debug/test diagnosis without changing default production blocking
-    semantics; and audit and clean stale or duplicated tests.
-  - Goals: Document the final lifetime/guard design, improve deadlock
-    diagnosis in tests, and harden the post-migration test matrix.
+    management and guard patterns, move teardown-only registry ownership out of
+    the shared runtime handle, and audit/clean stale or duplicated lifecycle
+    tests without changing the default blocking quiescent-drop contract.
+  - Goals: Document the final lifetime/guard design, make owner/runtime
+    shutdown-drop ordering explicit, and harden the post-migration lifecycle
+    test matrix.
   - Non-goals: No broader graceful-shutdown policy beyond what earlier phases
-    already introduced; no default production timeout that weakens
-    `QuiescentBox` safety semantics.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    already introduced, including session drain; no new quiescent-drop timeout
+    or diagnostic surface in this phase.
+  - Task Doc: `docs/tasks/000080-engine-component-lifetime-hardening-cleanup-diagnostics-and-documentation.md`
+  - Task Issue: `#453`
+  - Phase Status: done
+  - Implementation Summary: Implemented the engine owner/runtime split, added the engine lifetime design document, and completed lifecycle helper cleanup without new quiescent diagnostics. [Task Resolve Sync: docs/tasks/000080-engine-component-lifetime-hardening-cleanup-diagnostics-and-documentation.md @ 2026-03-20]
 
 ## Consequences
 

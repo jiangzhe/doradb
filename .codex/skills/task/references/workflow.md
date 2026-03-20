@@ -2,13 +2,14 @@
 
 ## Command Model
 
-`task` has two prompt workflows:
+`task` has three prompt workflows:
 1. `task create`: design-phase analysis and task doc creation.
 2. `task resolve`: post-implementation sync and follow-up tracking.
+3. `task purge worktree`: dry-run and optional removal flow for completed task worktrees.
 
 ## `task create` Formal Round Definition
 
-Use exactly two mandatory rounds before writing any file in the task worktree under `worktrees/<task-id>/docs/tasks/`:
+Use exactly two mandatory rounds before writing any file in the task worktree under `.worktrees/<task-id>/docs/tasks/`:
 
 1. `Round 1`: deep research + initial design alternatives.
 2. `Round 2`: revised design after user feedback from Round 1.
@@ -94,21 +95,29 @@ git fetch origin main
 ```bash
 tools/doc-id.rs alloc-id --kind task
 ```
-3. Create the isolated task worktree:
+3. Derive a concise branch name from the task title keywords.
+   - Do not prefix it with `task/`.
+   - Do not include the task id.
+   - Keep it under 20 characters.
+   - Prefer a short semantic stem over the full task title or doc slug.
+4. Create the isolated task worktree on that new branch under hidden
+   `.worktrees/` so common scanners such as `rg` and `fd` do not pick it up by
+   default:
 ```bash
-git worktree add worktrees/<task-id> origin/main
+git worktree add -b <branch-name> .worktrees/<task-id> origin/main
 ```
-4. Create the task doc inside the worktree:
+5. Create the task doc inside the worktree:
 ```bash
 tools/task.rs create-task-doc \
   --title "Task title" \
   --slug "task-title" \
   --id <task-id> \
-  --output-dir worktrees/<task-id>/docs/tasks
+  --output-dir .worktrees/<task-id>/docs/tasks
 ```
-5. Continue writing and later implementation work inside `worktrees/<task-id>/...`.
+6. Continue writing and later implementation work inside `.worktrees/<task-id>/...`.
+   - Task-doc slug and branch name are separate; keep the branch shorter when needed.
 
-Stop if `worktrees/<task-id>` already exists or if `git worktree add` fails. Do not fall back to writing task docs in the dispatch root.
+Stop if `.worktrees/<task-id>` already exists or if `git worktree add` fails. Do not fall back to writing task docs in the dispatch root.
 
 ## `task resolve` Checklist
 
@@ -142,6 +151,37 @@ tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 11. Do not run `git commit` or `git push` during `task resolve`.
 12. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
 
+## `task purge worktree` Checklist
+
+Complete all items:
+
+1. Run from the `main` dispatch worktree, not from a task worktree.
+2. Start with:
+```bash
+tools/task.rs purge-worktrees
+```
+3. List all worktrees before deciding anything.
+4. Exclude the `main` worktree from purge.
+5. For each non-`main` worktree, inspect:
+   - task id from 6-digit worktree basename,
+   - task doc under that worktree's own `docs/tasks/`,
+   - task `status:`,
+   - worktree cleanliness,
+   - same-name remote branch existence,
+   - whether the local tip is already pushed to that remote branch.
+6. Mark a worktree safe only when:
+   - task status is `implemented`,
+   - worktree is clean,
+   - same-name remote branch exists,
+   - remote branch contains the local tip.
+7. Keep all other worktrees in `unfinished` with reasons.
+8. Recognize task worktrees under `.worktrees/<task-id>` by matching any non-`main` worktree whose basename is exactly 6 digits.
+9. Apply deletion only with:
+```bash
+tools/task.rs purge-worktrees --apply
+```
+10. Apply mode removes only the local worktree and local branch. Do not delete remote branches.
+
 ## Backlog Integration
 
 1. Open backlog docs live in `docs/backlogs/<6digits>-<follow-up-topic>.md`.
@@ -151,7 +191,7 @@ tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 5. A backlog doc is input context for `task create`, not a shortcut for design quality gates.
 6. If one or more source backlog docs are already under `docs/backlogs/closed/`, prompt user before continuing task creation from closed item(s).
 7. If task creation proceeds from backlog, record `Source Backlogs:` list in task doc to enable resolve-time closure tracking.
-8. Even when backlog exists, still run deep research, proposals, and two formal rounds before writing `worktrees/<task-id>/docs/tasks/`.
+8. Even when backlog exists, still run deep research, proposals, and two formal rounds before writing `.worktrees/<task-id>/docs/tasks/`.
 9. Manual backlog create/close workflow is owned by `$backlog` skill:
 ```bash
 tools/backlog.rs create-doc ...
