@@ -1,7 +1,7 @@
 ---
 id: 000080
 title: Engine Component Lifetime Hardening, Cleanup, And Documentation
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-19
 github_issue: 453
 ---
@@ -203,28 +203,58 @@ Reference:
 
 ## Implementation Notes
 
+1. Completed the owner/runtime split in `doradb-storage/src/engine.rs`:
+   - `Engine` now owns `ComponentRegistry` while `EngineRef = Arc<EngineInner>`
+     remains the shared runtime handle;
+   - `shutdown()` dispatches through the owner-held registry and preserves the
+     existing idempotent/busy-shutdown behavior;
+   - `Engine::drop` makes the final owner-drop ordering explicit by releasing
+     `Arc<EngineInner>` before registry-owned component owners, and treats
+     leaked runtime refs as a fatal owner-contract violation.
+2. Added `docs/engine-component-lifetime.md` and linked it from
+   `docs/architecture.md`:
+   - the document now serves as the general engine lifetime reference instead
+     of an RFC-phase summary;
+   - it documents component registration order, shutdown/drop ordering, the
+     blocking `QuiescentBox<T>` contract, pool-guard provenance, and worker
+     teardown patterns;
+   - it states explicitly that session drain is not implemented and that
+     `PoolIdentity` provenance is enforced by runtime checks.
+3. Completed the targeted lifecycle-helper cleanup without adding new
+   quiescent-drop diagnostics:
+   - moved the shared worker join helper into `doradb-storage/src/thread.rs`;
+   - localized synchronous/async polling helpers to the evict and readonly test
+     modules that actually use them;
+   - removed the temporary shared `test_util.rs` path.
+4. Audited the touched public API surface and added the missing owner/runtime
+   split rustdoc in `doradb-storage/src/engine.rs`.
+5. Verification executed for the implemented state:
+   - `cargo nextest run -p doradb-storage`
+     - result: `408/408` passed in `3.142s`
+   - `cargo nextest run -p doradb-storage --no-default-features`
+     - result: `408/408` passed in `2.538s`
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000080-engine-component-lifetime-hardening-cleanup-diagnostics-and-documentation.md`
+     - result: local `docs/tasks/next-id` was already aligned at `000082`
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000080-engine-component-lifetime-hardening-cleanup-diagnostics-and-documentation.md`
+     - result: updated phase 5 in `docs/rfcs/0009-remove-static-lifetime-from-engine-components.md`
+6. Resolve-time tracking updates:
+   - no source backlog references were present, so no backlog docs were archived
+     during resolve
+   - implementation tracked in GitHub issue `#453`
+   - pull request opened as `#454`
+
 ## Impacts
 
-- `docs/engine-component-lifetime.md`
-- `docs/architecture.md`
-- `doradb-storage/src/engine.rs`
-- `doradb-storage/src/component.rs`
-- `doradb-storage/src/quiescent.rs`
-- `doradb-storage/src/buffer/mod.rs`
-- `doradb-storage/src/buffer/pool_guard.rs`
-- `doradb-storage/src/buffer/arena.rs`
-- `doradb-storage/src/buffer/guard.rs`
-- `doradb-storage/src/buffer/readonly.rs`
-- `doradb-storage/src/buffer/evict.rs`
-- `doradb-storage/src/file/table_fs.rs`
-- public items expected to be audited/documented:
-  - `Engine`
-  - `EngineRef`
-  - `EngineConfig`
-  - `BufferPool`
-  - `PoolGuard`
-  - `PoolGuards`
-  - `PoolGuardsBuilder`
+1. Design documentation:
+   - `docs/engine-component-lifetime.md`
+   - `docs/architecture.md`
+2. Engine ownership/runtime split and rustdoc:
+   - `doradb-storage/src/engine.rs`
+3. Worker-backed lifecycle test cleanup:
+   - `doradb-storage/src/thread.rs`
+   - `doradb-storage/src/file/table_fs.rs`
+   - `doradb-storage/src/buffer/readonly.rs`
+   - `doradb-storage/src/buffer/evict.rs`
 
 ## Test Cases
 
@@ -251,6 +281,10 @@ Reference:
 
 ## Open Questions
 
-Quiescent-drop diagnostics are explicitly deferred. If they are revisited in a
-follow-up task, that work should first justify the owner-drop safety and panic
-behavior around outstanding raw-pointer guards.
+1. Quiescent-drop diagnostics are explicitly deferred. If they are revisited in
+   a follow-up task, that work should first justify the owner-drop safety and
+   panic behavior around outstanding raw-pointer guards.
+2. Session drain remains unimplemented. Any future lifecycle task that revisits
+   shutdown waiting policy should define how owner-side shutdown interacts with
+   live `EngineRef`/session holders instead of assuming the current admission
+   barrier is sufficient.
