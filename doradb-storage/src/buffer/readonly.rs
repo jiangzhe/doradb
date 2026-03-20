@@ -1332,12 +1332,29 @@ pub(crate) mod tests {
     use crate::io::AIOBuf;
     use crate::lwc::{LWC_PAGE_PAYLOAD_SIZE, LwcPage, LwcPageHeader, validate_persisted_lwc_page};
     use crate::quiescent::QuiescentBox;
+    use crate::thread::join_worker;
     use crate::value::ValKind;
     use std::ops::Deref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
+
+    const TEST_WAIT_RETRIES: usize = 100;
+    const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+
+    async fn wait_for<F>(mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..TEST_WAIT_RETRIES {
+            if predicate() {
+                return;
+            }
+            smol::Timer::after(TEST_WAIT_INTERVAL).await;
+        }
+        panic!("condition was not satisfied before timeout");
+    }
 
     struct StartedGlobalReadonlyBufferPool {
         owner: QuiescentBox<GlobalReadonlyBufferPool>,
@@ -1366,9 +1383,7 @@ pub(crate) mod tests {
         #[inline]
         fn shutdown(&self) {
             self.owner.signal_shutdown();
-            if let Some(handle) = self.evict_thread.lock().take() {
-                handle.join().unwrap();
-            }
+            join_worker(&self.evict_thread);
         }
     }
 
@@ -1660,19 +1675,6 @@ pub(crate) mod tests {
                 }
             })
         }
-    }
-
-    async fn wait_for<F>(mut predicate: F)
-    where
-        F: FnMut() -> bool,
-    {
-        for _ in 0..100 {
-            if predicate() {
-                return;
-            }
-            smol::Timer::after(Duration::from_millis(10)).await;
-        }
-        panic!("condition was not satisfied before timeout");
     }
 
     unsafe fn copy_page_into_ptr(src: &Page, dst: UnsafePtr<u8>) {

@@ -17,7 +17,7 @@ This skill has two prompt workflows:
 1. Perform deep research first.
 2. Present multiple proposals and tradeoffs.
 3. Run two formal rounds before writing.
-4. Require explicit approval before writing to a task worktree under `worktrees/<task-id>/docs/tasks/`.
+4. Require explicit approval before writing to a task worktree under `.worktrees/<task-id>/docs/tasks/`.
 
 Do not skip or reorder these steps.
 
@@ -78,7 +78,7 @@ Resolve disagreements, tighten scope, and finalize:
 - test scenarios
 - open questions (if any)
 
-Round 2 must complete before any write to `worktrees/<task-id>/docs/tasks/`.
+Round 2 must complete before any write to `.worktrees/<task-id>/docs/tasks/`.
 
 ## Test Runner Constraint
 
@@ -103,21 +103,29 @@ git fetch origin main
 ```bash
 tools/doc-id.rs alloc-id --kind task
 ```
-3. Create the isolated task worktree from `origin/main`:
+3. Derive a concise branch name from the task title keywords.
+   - Do not prefix it with `task/`.
+   - Do not include the task id.
+   - Keep it under 20 characters.
+   - Prefer a short semantic stem over the full task title or doc slug.
+4. Create the isolated task worktree from `origin/main` on the new branch under
+   hidden `.worktrees/` so common scanners such as `rg` and `fd` do not pick it
+   up by default:
 ```bash
-git worktree add worktrees/<task-id> origin/main
+git worktree add -b <branch-name> .worktrees/<task-id> origin/main
 ```
-If `worktrees/<task-id>` already exists or `git worktree add` fails, stop and resolve that issue instead of falling back to the root checkout.
-4. Create the task file from template inside the new worktree:
+If `.worktrees/<task-id>` already exists or `git worktree add` fails, stop and resolve that issue instead of falling back to the root checkout.
+5. Create the task file from template inside the new worktree:
 ```bash
 tools/task.rs create-task-doc \
   --title "Task title" \
   --slug "task-title" \
   --id <task-id> \
-  --output-dir worktrees/<task-id>/docs/tasks
+  --output-dir .worktrees/<task-id>/docs/tasks
 ```
-5. Continue task-document writing inside `worktrees/<task-id>/...`.
-6. If the request starts from `docs/backlogs/`, treat that backlog doc as context input only.
+6. Continue task-document writing inside `.worktrees/<task-id>/...`.
+   - Task-doc slug and branch name are separate; keep the branch shorter when needed.
+7. If the request starts from `docs/backlogs/`, treat that backlog doc as context input only.
    - Still run full deep research and proposal rounds.
    - Do not skip quality gates because backlog is brief.
    - Backlog filename must match `docs/backlogs/<6digits>-<follow-up-topic>.md`.
@@ -125,7 +133,7 @@ tools/task.rs create-task-doc \
    - If any source backlog file is under `docs/backlogs/closed/`, ask the user whether to continue task creation from already-closed backlog item(s).
    - If task creation proceeds from backlog, include a `Source Backlogs:` list in task doc context for resolve traceability.
    - Manual backlog create/close workflow is owned by `$backlog` skill (`tools/backlog.rs`), not by this skill.
-7. Fill the file according to `docs/tasks/000000-template.md` in the task worktree.
+8. Fill the file according to `docs/tasks/000000-template.md` in the task worktree.
 
 ## `task resolve` Required Flow
 

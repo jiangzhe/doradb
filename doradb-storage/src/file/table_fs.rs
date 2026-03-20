@@ -312,6 +312,7 @@ pub(crate) mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
     };
     use crate::error::Error;
+    use crate::thread::join_worker;
     use crate::value::ValKind;
     use std::path::Path;
     use tempfile::TempDir;
@@ -330,9 +331,7 @@ pub(crate) mod tests {
         #[inline]
         pub(crate) fn shutdown(&self) {
             self.owner.io_client.shutdown();
-            if let Some(handle) = self.handle.lock().take() {
-                handle.join().unwrap();
-            }
+            join_worker(&self.handle);
         }
     }
 

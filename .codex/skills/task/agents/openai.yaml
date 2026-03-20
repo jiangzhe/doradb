@@ -1,4 +1,4 @@
 interface:
   display_name: "Task Design"
   short_description: "Deep-research, multi-round task design with approval gates"
-  default_prompt: "Use $task create for deep-research design rounds with explicit approval gating, root-side task id allocation, and task-doc creation in `worktrees/<task-id>/docs/tasks/`; use $task resolve from the task worktree, including `tools/task.rs resolve-task-next-id --task docs/tasks/<id>-<slug>.md` before RFC sync, and handle source backlog closure explicitly through $backlog."
+  default_prompt: "Use $task create for deep-research design rounds with explicit approval gating, root-side task id allocation, concise unprefixed branch creation under 20 characters via `git worktree add -b <branch-name> .worktrees/<task-id> origin/main`, and task-doc creation in `.worktrees/<task-id>/docs/tasks/`; keep the branch name separate from the full task-doc slug. Use $task resolve from the task worktree, including `tools/task.rs resolve-task-next-id --task docs/tasks/<id>-<slug>.md` before RFC sync, and handle source backlog closure explicitly through $backlog."

@@ -1391,12 +1391,26 @@ mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
+    use crate::thread::join_worker;
     use std::ops::Deref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    const TEST_WAIT_RETRIES: usize = 100;
+    const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+
+    fn wait_for(mut predicate: impl FnMut() -> bool) {
+        for _ in 0..TEST_WAIT_RETRIES {
+            if predicate() {
+                return;
+            }
+            thread::sleep(TEST_WAIT_INTERVAL);
+        }
+        panic!("condition was not satisfied before timeout");
+    }
 
     struct StartedEvictPool {
         owner: QuiescentBox<EvictableBufferPool>,
@@ -1428,12 +1442,8 @@ mod tests {
 
         fn shutdown(&self) {
             self.owner.signal_shutdown();
-            if let Some(handle) = self.io_thread.lock().take() {
-                handle.join().unwrap();
-            }
-            if let Some(handle) = self.evict_thread.lock().take() {
-                handle.join().unwrap();
-            }
+            join_worker(&self.io_thread);
+            join_worker(&self.evict_thread);
         }
     }
 
@@ -1449,19 +1459,6 @@ mod tests {
         fn drop(&mut self) {
             self.shutdown();
         }
-    }
-
-    fn wait_for<F>(mut predicate: F)
-    where
-        F: FnMut() -> bool,
-    {
-        for _ in 0..100 {
-            if predicate() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("condition was not satisfied before timeout");
     }
 
     #[test]

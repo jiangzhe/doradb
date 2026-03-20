@@ -1,6 +1,6 @@
 /target
 /doradb-storage/target
-/worktrees
+/.worktrees
 Cargo.lock
 /.vscode
 tarpaulin-report.html

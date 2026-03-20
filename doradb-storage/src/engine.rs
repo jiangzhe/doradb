@@ -1,7 +1,9 @@
 //! Storage engine for DoraDB.
 //!
 //! This module provides the main entry point of the storage engine,
-//! including start, stop, recover, and execute commands.
+//! including start, stop, recover, and execute commands. See
+//! `docs/engine-component-lifetime.md` for the runtime-versus-owner lifetime
+//! model that this module and [`crate::component::ComponentRegistry`] enforce.
 use crate::buffer::{EvictableBufferPoolConfig, PoolRole};
 use crate::catalog::Catalog;
 use crate::component::{
@@ -65,34 +67,79 @@ impl EngineLifecycle {
     }
 }
 
-/// Storage engine of DoraDB.
-pub struct Engine(Arc<EngineInner>);
+/// Storage engine owner.
+///
+/// `Engine` owns teardown-only state such as the top-level
+/// [`ComponentRegistry`], while [`EngineRef`] and [`Session`] hold only the
+/// shared runtime handle in [`EngineInner`]. Explicit shutdown and final owner
+/// drop therefore stay with the owner object instead of the cloneable runtime
+/// access path.
+pub struct Engine {
+    inner: Option<Arc<EngineInner>>,
+    components: Option<ComponentRegistry>,
+}
 
 impl Deref for Engine {
     type Target = EngineInner;
+
     #[inline]
     fn deref(&self) -> &EngineInner {
-        &self.0
+        self.inner().as_ref()
     }
 }
 
 impl Engine {
     #[inline]
+    fn inner(&self) -> &Arc<EngineInner> {
+        self.inner
+            .as_ref()
+            .expect("engine owner keeps runtime handle until drop")
+    }
+
+    #[inline]
+    fn components(&self) -> &ComponentRegistry {
+        self.components
+            .as_ref()
+            .expect("engine owner keeps component registry until drop")
+    }
+
+    #[inline]
+    fn release_owned_parts(&mut self) -> (Arc<EngineInner>, ComponentRegistry) {
+        let inner = self
+            .inner
+            .take()
+            .expect("engine runtime handle is present until final drop");
+        let components = self
+            .components
+            .take()
+            .expect("engine component registry is present until final drop");
+        (inner, components)
+    }
+
+    /// Try to create a new session while the engine is still running.
+    #[inline]
     pub fn try_new_session(&self) -> Result<Session> {
-        self.0
+        self.inner()
             .with_running_admission(|| Session::new(self.new_ref()))
     }
 
+    /// Return the shared catalog handle.
     #[inline]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
+    /// Clone the shared runtime handle.
     #[inline]
     pub fn new_ref(&self) -> EngineRef {
-        EngineRef(Arc::clone(&self.0))
+        EngineRef(Arc::clone(self.inner()))
     }
 
+    /// Start idempotent engine shutdown.
+    ///
+    /// Shutdown rejects new work immediately, waits for user-owned
+    /// [`EngineRef`]s and sessions to drain, then dispatches component shutdown
+    /// in reverse registration order.
     #[inline]
     pub fn shutdown(&self) -> Result<()> {
         self.finalize_shutdown()
@@ -100,15 +147,16 @@ impl Engine {
 
     #[inline]
     fn finalize_shutdown(&self) -> Result<()> {
-        let _finalize = self.0.lifecycle.finalize_lock.lock();
-        if self.0.lifecycle.state() == EngineLifecycleState::Shutdown {
+        let inner = self.inner();
+        let _finalize = inner.lifecycle.finalize_lock.lock();
+        if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
             return Ok(());
         }
 
         {
-            let _gate = self.0.lifecycle.admission_gate.write();
-            if self.0.lifecycle.state() == EngineLifecycleState::Running {
-                self.0
+            let _gate = inner.lifecycle.admission_gate.write();
+            if inner.lifecycle.state() == EngineLifecycleState::Running {
+                inner
                     .lifecycle
                     .set_state(EngineLifecycleState::ShuttingDown);
             }
@@ -118,13 +166,13 @@ impl Engine {
         // through `SessionState`. Requiring the last strong reference here
         // gives transaction-system shutdown a clean point where user-originated
         // work has already drained before we start disabling runtime state.
-        let strong_count = Arc::strong_count(&self.0);
+        let strong_count = Arc::strong_count(inner);
         if strong_count != 1 {
             return Err(Error::StorageEngineShutdownBusy(strong_count - 1));
         }
 
-        self.0.shutdown_components();
-        self.0.lifecycle.set_state(EngineLifecycleState::Shutdown);
+        self.components().shutdown_all();
+        inner.lifecycle.set_state(EngineLifecycleState::Shutdown);
         Ok(())
     }
 }
@@ -132,16 +180,34 @@ impl Engine {
 impl Drop for Engine {
     #[inline]
     fn drop(&mut self) {
-        // Engine is supposed to be last one to drop.
-        if Arc::strong_count(&self.0) != 1 {
-            panic!("fatal: engine ref is leaked");
-        }
         if let Err(err) = self.finalize_shutdown() {
+            if matches!(err, Error::StorageEngineShutdownBusy(_)) {
+                // Fatal owner-drop violations still need to stop background
+                // workers, but the owner registry cannot be dropped while
+                // leaked runtime refs still retain component guards.
+                let components = self
+                    .components
+                    .take()
+                    .expect("engine component registry is present until drop");
+                components.shutdown_all();
+                std::mem::forget(components);
+            }
             panic!("fatal: engine shutdown failed: {err}");
         }
+
+        // Drop the shared runtime handle before registry-owned component
+        // owners. That makes the owner/runtime split explicit instead of
+        // relying on incidental struct layout.
+        let (inner, components) = self.release_owned_parts();
+        drop(inner);
+        drop(components);
     }
 }
 
+/// Cloneable shared runtime handle for the storage engine.
+///
+/// `EngineRef` intentionally does not own shutdown orchestration. It only
+/// exposes the runtime state needed by sessions and internal subsystems.
 #[derive(Clone)]
 pub struct EngineRef(Arc<EngineInner>);
 
@@ -154,33 +220,39 @@ impl Deref for EngineRef {
 }
 
 impl EngineRef {
+    /// Try to create a new session while the engine is still running.
     #[inline]
     pub fn try_new_session(&self) -> Result<Session> {
         self.0.with_running_admission(|| Session::new(self.clone()))
     }
 
+    /// Return the shared catalog handle.
     #[inline]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 }
 
+/// Shared runtime state for an [`Engine`].
+///
+/// The fields here are the cloneable handles that sessions and other runtime
+/// objects may retain. Owner-only teardown state lives on [`Engine`] itself.
 pub struct EngineInner {
+    /// Shared catalog handle.
     pub catalog: QuiescentGuard<Catalog>,
+    /// Shared transaction-system handle.
     pub trx_sys: QuiescentGuard<TransactionSystem>,
-    // meta pool is used for block index and catalog tables.
+    /// Metadata pool used for block-index and catalog tables.
     pub meta_pool: MetaPool,
-    // index pool is used for secondary index.
-    // This pool will be optimized to support CoW B+tree index.
+    /// Secondary-index pool.
     pub index_pool: IndexPool,
-    // data pool is used for data tables.
+    /// In-memory row-page pool for table data.
     pub mem_pool: MemPool,
-    // Table file system to handle async IO of files on disk.
+    /// Table-file subsystem that runs persistent page IO.
     pub table_fs: QuiescentGuard<TableFileSystem>,
-    // Global readonly buffer pool for table-file page reads.
+    /// Global readonly pool for persisted table-file reads.
     pub disk_pool: DiskPool,
     lifecycle: EngineLifecycle,
-    _components: ComponentRegistry,
 }
 
 impl EngineInner {
@@ -192,24 +264,12 @@ impl EngineInner {
         }
         Ok(f())
     }
-
-    #[inline]
-    fn shutdown_components(&self) {
-        // Normal engine shutdown must stop components explicitly before owner
-        // drop. The registry dispatches shutdown in reverse registration order,
-        // which preserves the current `trx_sys -> mem_pool -> table_fs ->
-        // disk_pool` lifecycle relationship and leaves fixed pools as no-op
-        // shutdown components.
-        self._components.shutdown_all();
-    }
 }
-
-unsafe impl Send for Engine {}
-unsafe impl Sync for Engine {}
 
 const DEFAULT_META_BUFFER: usize = 32 * 1024 * 1024;
 const DEFAULT_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
 
+/// Storage-engine configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     storage_root: PathBuf,
@@ -235,42 +295,49 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    /// Set the storage root directory.
     #[inline]
     pub fn storage_root(mut self, storage_root: impl Into<PathBuf>) -> Self {
         self.storage_root = storage_root.into();
         self
     }
 
+    /// Set the transaction-system configuration.
     #[inline]
     pub fn trx(mut self, trx: TrxSysConfig) -> Self {
         self.trx = trx;
         self
     }
 
+    /// Set the metadata-pool size.
     #[inline]
     pub fn meta_buffer(mut self, meta_buffer: impl Into<Byte>) -> Self {
         self.meta_buffer = meta_buffer.into();
         self
     }
 
+    /// Set the secondary-index-pool size.
     #[inline]
     pub fn index_buffer(mut self, index_buffer: impl Into<Byte>) -> Self {
         self.index_buffer = index_buffer.into();
         self
     }
 
+    /// Set the row-data buffer-pool configuration.
     #[inline]
     pub fn data_buffer(mut self, data_buffer: EvictableBufferPoolConfig) -> Self {
         self.data_buffer = data_buffer;
         self
     }
 
+    /// Set the table-file subsystem configuration.
     #[inline]
     pub fn file(mut self, file: TableFileSystemConfig) -> Self {
         self.file = file;
         self
     }
 
+    /// Build the storage engine and all registered components.
     #[inline]
     pub async fn build(self) -> Result<Engine> {
         let resolved = ResolvedStoragePaths::resolve(
@@ -334,9 +401,11 @@ impl EngineConfig {
             table_fs,
             disk_pool,
             lifecycle: EngineLifecycle::new(),
-            _components: registry,
         };
-        Ok(Engine(Arc::new(engine_inner)))
+        Ok(Engine {
+            inner: Some(Arc::new(engine_inner)),
+            components: Some(registry),
+        })
     }
 }
 
@@ -582,11 +651,6 @@ mod tests {
             let res = catch_unwind(AssertUnwindSafe(|| drop(engine)));
             assert!(res.is_err());
 
-            // This test deliberately violates the engine drop contract to
-            // assert the panic. After that assertion, shut the running
-            // components down explicitly so the surviving `EngineRef` can drop
-            // without leaving worker guards alive forever.
-            leaked_ref.shutdown_components();
             drop(leaked_ref);
         });
     }
