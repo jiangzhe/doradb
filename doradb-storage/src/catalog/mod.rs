@@ -22,7 +22,6 @@ use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::index::SecondaryIndex;
-use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage};
@@ -382,26 +381,14 @@ impl TableHandle {
     ) -> Option<PageSharedGuard<RowPage>> {
         match self {
             TableHandle::User(table) => {
-                let page_guard = table
-                    .mem_pool
-                    .try_get_page_versioned::<RowPage>(
-                        guards.mem_guard(),
-                        page_id,
-                        LatchFallbackMode::Shared,
-                    )
-                    .await?;
-                page_guard.lock_shared_async().await
+                table
+                    .try_get_row_page_versioned_shared(guards, page_id)
+                    .await
             }
             TableHandle::Catalog(table) => {
-                let page_guard = table
-                    .mem_pool
-                    .try_get_page_versioned::<RowPage>(
-                        guards.meta_guard(),
-                        page_id,
-                        LatchFallbackMode::Shared,
-                    )
-                    .await?;
-                page_guard.lock_shared_async().await
+                table
+                    .try_get_row_page_versioned_shared(guards, page_id)
+                    .await
             }
         }
     }

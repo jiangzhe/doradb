@@ -287,14 +287,14 @@ mod tests {
             {
                 let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 let page_id = g.page_id();
-                let stale_versioned = g.bf().versioned_page_id();
+                let stale_versioned = g.versioned_page_id();
                 let first_generation = stale_versioned.generation;
                 pool.deallocate_page(g);
 
                 let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 assert_eq!(g.page_id(), page_id);
                 assert_eq!(g.bf().generation(), first_generation + 2);
-                let current_versioned = g.bf().versioned_page_id();
+                let current_versioned = g.versioned_page_id();
                 drop(g);
 
                 let g = pool
@@ -318,7 +318,7 @@ mod tests {
             {
                 let g = pool.allocate_page::<BlockNode>(&pool_guard).await;
                 let page_id = g.page_id();
-                let versioned = g.bf().versioned_page_id();
+                let versioned = g.versioned_page_id();
                 drop(g);
 
                 // Keep an optimistic guard, then reuse the page slot.
@@ -381,7 +381,7 @@ mod tests {
                 .lock_exclusive_async()
                 .await
                 .unwrap();
-            let versioned = g.bf().versioned_page_id();
+            let versioned = g.versioned_page_id();
             drop(g);
 
             let stale_guard = pool
@@ -447,7 +447,7 @@ mod tests {
                 .lock_exclusive_async()
                 .await
                 .unwrap();
-            let versioned = g.bf().versioned_page_id();
+            let versioned = g.versioned_page_id();
             drop(g);
 
             let stale_guard = pool

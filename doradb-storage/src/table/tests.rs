@@ -1601,6 +1601,134 @@ fn test_data_checkpoint_gc_verification() {
 }
 
 #[test]
+fn test_session_cached_insert_page_reuses_live_versioned_page() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(1), Val::from("cached-row")])
+                .await,
+        );
+        trx = stmt.succeed();
+        trx.commit().await.unwrap();
+
+        let (cached_page, cached_row_id) = session
+            .load_active_insert_page(sys.table.table_id())
+            .unwrap();
+        assert_eq!(cached_row_id, row_id);
+        assert!(
+            sys.table
+                .try_get_row_page_versioned_shared(session.pool_guards(), cached_page)
+                .await
+                .is_some()
+        );
+        session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let next_row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(2), Val::from("still-cached")])
+                .await,
+        );
+        trx = stmt.succeed();
+        trx.commit().await.unwrap();
+
+        let next_page_id = match sys.table.find_row(session.pool_guards(), next_row_id).await {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::LwcPage(..) | RowLocation::NotFound => {
+                panic!("row should still be in the in-memory row store")
+            }
+        };
+        assert_eq!(next_page_id, cached_page.page_id);
+
+        let (next_cached_page, next_cached_row_id) = session
+            .load_active_insert_page(sys.table.table_id())
+            .unwrap();
+        assert_eq!(next_cached_row_id, next_row_id);
+        assert_eq!(next_cached_page, cached_page);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(1), Val::from("cached-row")])
+                .await,
+        );
+        trx = stmt.succeed();
+        trx.commit().await.unwrap();
+
+        let (cached_page, cached_row_id) = session
+            .load_active_insert_page(sys.table.table_id())
+            .unwrap();
+        assert_eq!(cached_row_id, row_id);
+        session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
+
+        sys.table.freeze(&session, usize::MAX).await;
+        let mut checkpoint_session = sys.try_new_session().unwrap();
+        sys.table
+            .data_checkpoint(&mut checkpoint_session)
+            .await
+            .unwrap();
+
+        let mut reclaimed = false;
+        for _ in 0..20 {
+            if sys
+                .table
+                .try_get_row_page_versioned_shared(session.pool_guards(), cached_page)
+                .await
+                .is_none()
+            {
+                reclaimed = true;
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(200)).await;
+        }
+        assert!(
+            reclaimed,
+            "row page should be reclaimed before repro insert"
+        );
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let post_gc_row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(2), Val::from("post-gc-row")])
+                .await,
+        );
+        trx = stmt.succeed();
+        trx.commit().await.unwrap();
+
+        let key = single_key(2i32);
+        sys.new_trx_select(&mut session, &key, |vals| {
+            assert_eq!(vals, vec![Val::from(2), Val::from("post-gc-row")]);
+        })
+        .await;
+
+        let (next_cached_page, next_cached_row_id) = session
+            .load_active_insert_page(sys.table.table_id())
+            .unwrap();
+        assert_eq!(next_cached_row_id, post_gc_row_id);
+        assert_ne!(next_cached_page, cached_page);
+
+        drop(checkpoint_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_data_checkpoint_error_rollback() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -1796,6 +1924,13 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
     SelectKey {
         index_no: 0,
         vals: vec![value.into()],
+    }
+}
+
+fn unwrap_insert_result(res: InsertMvcc) -> RowID {
+    match res {
+        InsertMvcc::Ok(row_id) => row_id,
+        res => panic!("unexpected insert result: {res:?}"),
     }
 }
 

@@ -306,10 +306,13 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         let row_count = estimate_max_row_count(row_len, metadata.col_count());
         loop {
             let page_guard = self.get_insert_page(stmt, row_count).await;
-            let page_id = page_guard.page_id();
             match self.insert_row_to_page(stmt, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
-                    stmt.save_active_insert_page(self.table_id(), page_id, row_id);
+                    stmt.save_active_insert_page(
+                        self.table_id(),
+                        page_guard.versioned_page_id(),
+                        row_id,
+                    );
                     return (row_id, page_guard);
                 }
                 // this page cannot be inserted any more, just leave it and retry another page.
@@ -419,7 +422,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         debug_assert!(matches!(undo_kind, RowUndoKind::Insert));
         let metadata = self.metadata();
         let page_id = page_guard.page_id();
-        let versioned_page_id = page_guard.bf().versioned_page_id();
+        let versioned_page_id = page_guard.versioned_page_id();
         let (ctx, page) = page_guard.ctx_and_page();
         let ver_map = ctx.row_ver().unwrap();
         let state_guard = ver_map.read_state();
@@ -1086,15 +1089,16 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         stmt: &mut Statement,
         row_count: usize,
     ) -> PageSharedGuard<RowPage> {
-        if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
-            let page_guard = self
-                .must_get_row_page_shared(stmt.pool_guards(), page_id)
-                .await;
+        if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id())
+            && let Some(page_guard) = self
+                .try_get_row_page_versioned_shared(stmt.pool_guards(), page_id)
+                .await
+        {
             // because we save last insert page in session and meanwhile other thread may access this page
             // and do some modification, even worse, buffer pool may evict it and reload other data into
             // this page. so here, we do not require that no change should happen, but if something change,
             // we validate that page id and row id range is still valid.
-            if validate_page_row_range(&page_guard, page_id, row_id) {
+            if validate_page_row_range(&page_guard, page_id.page_id, row_id) {
                 return page_guard;
             }
         }
@@ -1145,7 +1149,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                 stmt,
                 self.metadata(),
                 self.table_id(),
-                page_guard.bf().versioned_page_id(),
+                page_guard.versioned_page_id(),
                 row_id,
                 key,
             );

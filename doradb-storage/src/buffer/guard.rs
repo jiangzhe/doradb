@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuard;
 use crate::buffer::frame::{BufferFrame, FrameContext};
-use crate::buffer::page::PageID;
+use crate::buffer::page::{PageID, VersionedPageID};
 use crate::error::{
     Validation,
     Validation::{Invalid, Valid},
@@ -142,6 +142,14 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub fn page_id(&self) -> PageID {
         self.bf().page_id
+    }
+
+    #[inline]
+    pub fn versioned_page_id(&self) -> VersionedPageID {
+        VersionedPageID {
+            page_id: self.page_id(),
+            generation: self.captured_generation,
+        }
     }
 
     #[inline]
@@ -435,6 +443,14 @@ impl<T> PageOptimisticGuard<T> {
     }
 
     #[inline]
+    pub fn versioned_page_id(&self) -> VersionedPageID {
+        VersionedPageID {
+            page_id: self.page_id(),
+            generation: self.captured_generation,
+        }
+    }
+
+    #[inline]
     pub fn try_shared(mut self) -> Validation<PageSharedGuard<T>> {
         self.guard.try_shared().map(|_| PageSharedGuard {
             keepalive: self.keepalive,
@@ -548,6 +564,14 @@ impl<T: 'static> PageSharedGuard<T> {
     }
 
     #[inline]
+    pub fn versioned_page_id(&self) -> VersionedPageID {
+        VersionedPageID {
+            page_id: self.page_id(),
+            generation: self.captured_generation,
+        }
+    }
+
+    #[inline]
     pub fn ctx_and_page(&self) -> (&FrameContext, &T) {
         let bf = self.bf();
         let undo_map = bf.ctx.as_ref().unwrap();
@@ -632,6 +656,14 @@ impl<T: 'static> PageExclusiveGuard<T> {
     #[inline]
     pub fn page_id(&self) -> PageID {
         self.bf().page_id
+    }
+
+    #[inline]
+    pub fn versioned_page_id(&self) -> VersionedPageID {
+        VersionedPageID {
+            page_id: self.page_id(),
+            generation: self.captured_generation,
+        }
     }
 
     #[inline]
