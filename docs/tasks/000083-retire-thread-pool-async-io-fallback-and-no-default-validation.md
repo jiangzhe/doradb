@@ -203,7 +203,10 @@ Reference:
    - `cargo clippy --all-features --all-targets -- -D warnings`
    - `cargo nextest list -p doradb-storage --profile ci`
    - `tools/coverage_focus.rs --help`
-6. Resolve-time sync:
+6. Tracking and review sync:
+   - implementation tracked in GitHub issue `#462`;
+   - pull request opened as `#463`.
+7. Resolve-time sync:
    - no unsafe inventory refresh was required because the task removed
      fallback-only branches without expanding unsafe scope;
    - `tools/task.rs resolve-task-next-id --task docs/tasks/000083-retire-thread-pool-async-io-fallback-and-no-default-validation.md`

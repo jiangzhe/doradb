@@ -239,9 +239,9 @@ This RFC changes code in an unsafe-sensitive area.
     and delete temporary workaround code and policy.
   - Non-goals: backend-neutral generic redesign; `io_uring` backend delivery.
   - Task Doc: `docs/tasks/000083-retire-thread-pool-async-io-fallback-and-no-default-validation.md`
-  - Task Issue: `#0`
+  - Task Issue: `#462`
   - Phase Status: done
-  - Implementation Summary: Removed the no-libaio fallback, collapsed validation/tooling to the supported libaio path, and retired the obsolete stub-ABI backlog premise. [Task Resolve Sync: docs/tasks/000083-retire-thread-pool-async-io-fallback-and-no-default-validation.md @ 2026-03-21]
+  - Implementation Summary: 1. Simplified `doradb-storage/src/io/` to the single supported backend: [Task Resolve Sync: docs/tasks/000083-retire-thread-pool-async-io-fallback-and-no-default-validation.md @ 2026-03-21]
   - Related Backlogs:
     - `docs/backlogs/closed/000003-improve-libaio-stub-struct-design.md`
 
