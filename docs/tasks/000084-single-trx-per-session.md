@@ -83,6 +83,30 @@ regression tests.
 
 ## Implementation Notes
 
+1. Implemented the session admission fix in `doradb-storage/src/session.rs`
+   by adding `SessionState::try_enter_trx()` with `compare_exchange(false,
+   true, ...)` and moving the begin-path state claim inside
+   `EngineInner::with_running_admission(...)`. This preserves `Ok(None)` for an
+   already-active session and avoids leaving `in_trx` set when begin is
+   rejected because engine admission is shut down.
+2. Kept transaction exit cleanup at the existing commit and rollback paths.
+   No changes were required in `doradb-storage/src/trx/log.rs` or
+   `doradb-storage/src/trx/sys.rs`; the existing `SessionState::commit()` and
+   `SessionState::rollback()` release logic remained correct once begin claimed
+   the session slot.
+3. Added regression coverage in `doradb-storage/src/engine.rs` for:
+   same-session overlap rejection, same-session reuse after commit, rollback,
+   and readonly commit, distinct-session overlap, and shutdown rejection not
+   leaving the session marked active.
+4. Verification completed with:
+   - `cargo fmt --all`
+   - `cargo test -p doradb-storage --lib engine::tests`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features`
+5. Tracking links:
+   - GitHub issue: `#464`
+   - Pull request: `#465`
+
 ## Impacts
 
 Primary code paths:
