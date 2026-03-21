@@ -31,7 +31,6 @@ cargo clippy --all-features --all-targets -- -D warnings
 
 ```bash
 cargo nextest run -p doradb-storage
-cargo nextest run -p doradb-storage --no-default-features
 ```
 
 ## Pre-commit Enforcement

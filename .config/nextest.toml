@@ -6,16 +6,9 @@ slow-timeout = { period = "10s", terminate-after = 1, grace-period = "0s" }
 global-timeout = "15s"
 fail-fast = true
 
-[profile.ci-default-features]
+[profile.ci]
 fail-fast = false
 
-[profile.ci-default-features.junit]
+[profile.ci.junit]
 path = "junit.xml"
-report-name = "doradb-storage-default-features"
-
-[profile.ci-no-default-features]
-fail-fast = false
-
-[profile.ci-no-default-features.junit]
-path = "junit.xml"
-report-name = "doradb-storage-no-default-features"
+report-name = "doradb-storage"
