@@ -94,24 +94,15 @@ jobs:
       run: cargo install grcov
     - name: Clippy (all features / all targets)
       run: cargo clippy --all-features --all-targets -- -D warnings
-    - name: Validate with nextest (default features)
+    - name: Validate with nextest
       env:
         RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
-        LLVM_PROFILE_FILE: "coverage/default/coverage-%p-%m.profraw"
-        CARGO_TARGET_DIR: "target/coverage-default"
+        LLVM_PROFILE_FILE: "coverage/coverage-%p-%m.profraw"
+        CARGO_TARGET_DIR: "target/coverage"
         RUST_BACKTRACE: "full"
       run: |
-        mkdir -p coverage/default
-        cargo nextest run -p doradb-storage --profile ci-default-features
-    - name: Validate with nextest (no default features)
-      env:
-        RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
-        LLVM_PROFILE_FILE: "coverage/no-default/coverage-%p-%m.profraw"
-        CARGO_TARGET_DIR: "target/coverage-no-default"
-        RUST_BACKTRACE: "full"
-      run: |
-        mkdir -p coverage/no-default
-        cargo nextest run -p doradb-storage --no-default-features --profile ci-no-default-features
+        mkdir -p coverage
+        cargo nextest run -p doradb-storage --profile ci
     - name: Upload nextest JUnit reports
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
@@ -119,9 +110,8 @@ jobs:
         name: nextest-junit
         if-no-files-found: warn
         path: |
-          target/**/nextest/ci-default-features/junit.xml
-          target/**/nextest/ci-no-default-features/junit.xml
-    - name: Generate coverage report (merged)
+          target/**/nextest/ci/junit.xml
+    - name: Generate coverage report
       run: |
         grcov . \
           --binary-path ./target \

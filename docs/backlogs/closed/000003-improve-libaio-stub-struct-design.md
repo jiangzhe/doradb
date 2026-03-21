@@ -25,3 +25,11 @@ No-`libaio` fallback path no longer depends on fieldful `iocb` stubs, and stub s
 ## Notes (Optional)
 
 Coordinate this refactor with AIO tests and feature-gated ABI exports to avoid breaking existing no-`libaio` execution flow.
+
+## Close Reason
+
+- Type: obsolete
+- Detail: Task 000083 removed the no-libaio fallback and deleted the fallback-only ABI stubs, so this backlog's premise no longer exists.
+- Closed By: backlog close
+- Reference: docs/tasks/000083-retire-thread-pool-async-io-fallback-and-no-default-validation.md
+- Closed At: 2026-03-21

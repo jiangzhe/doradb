@@ -41,7 +41,6 @@ For unsafe-touching changes:
    - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
 3. run behavior-preserving tests:
    - `cargo nextest run -p doradb-storage`
-   - `cargo nextest run -p doradb-storage --no-default-features` (when relevant)
 
 ## 5. Planning Compliance
 

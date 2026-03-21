@@ -118,7 +118,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 
 ### Source Backlogs (Optional)
 
-- [B1] `docs/backlogs/000003-improve-libaio-stub-struct-design.md` - existing
+- [B1] `docs/backlogs/closed/000003-improve-libaio-stub-struct-design.md` -
+  archived
   backlog assumes the no-`libaio` fallback remains and should be reevaluated
   once the fallback is retired.
 
@@ -237,12 +238,12 @@ This RFC changes code in an unsafe-sensitive area.
   - Goals: simplify the support matrix, align validation with production usage,
     and delete temporary workaround code and policy.
   - Non-goals: backend-neutral generic redesign; `io_uring` backend delivery.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000083-retire-thread-pool-async-io-fallback-and-no-default-validation.md`
   - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Removed the no-libaio fallback, collapsed validation/tooling to the supported libaio path, and retired the obsolete stub-ABI backlog premise. [Task Resolve Sync: docs/tasks/000083-retire-thread-pool-async-io-fallback-and-no-default-validation.md @ 2026-03-21]
   - Related Backlogs:
-    - `docs/backlogs/000003-improve-libaio-stub-struct-design.md`
+    - `docs/backlogs/closed/000003-improve-libaio-stub-struct-design.md`
 
 - **Phase 2: Introduce Backend-Neutral Completion Core**
   - Scope: refactor `crate::io` so generic request/completion flow is backend
@@ -331,6 +332,6 @@ This RFC changes code in an unsafe-sensitive area.
 ## References
 
 - `docs/rfcs/0001-thread-pool-async-direct-io.md`
-- `docs/backlogs/000003-improve-libaio-stub-struct-design.md`
+- `docs/backlogs/closed/000003-improve-libaio-stub-struct-design.md`
 - `docs/process/unit-test.md`
 - `docs/process/issue-tracking.md`
