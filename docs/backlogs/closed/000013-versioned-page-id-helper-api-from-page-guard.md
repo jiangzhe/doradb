@@ -19,3 +19,10 @@ Add helper API to obtain current `VersionedPageID` directly from page guards to 
 
 Call sites use shared helper API and pass existing tests without identity-regression issues.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000082-fix-stale-cached-insert-page-id-after-checkpoint-gc.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-21

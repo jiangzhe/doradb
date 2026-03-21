@@ -1,7 +1,7 @@
 ---
 id: 000082
 title: Fix Stale Cached Insert Page ID After Checkpoint GC
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-20
 github_issue: 458
 ---
@@ -134,6 +134,52 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented version-aware cached insert-page identity across the insert
+   path:
+   - `doradb-storage/src/buffer/guard.rs` now exposes
+     `versioned_page_id()` helpers on facade, optimistic, shared, and
+     exclusive page guards;
+   - `doradb-storage/src/session.rs` and `doradb-storage/src/stmt/mod.rs`
+     now store session-scoped active insert pages as
+     `(VersionedPageID, RowID)` instead of `(PageID, RowID)`;
+   - `doradb-storage/src/table/mod.rs` now provides
+     `try_get_row_page_versioned_shared(...)`, and
+     `doradb-storage/src/table/access.rs` now reopens cached insert pages
+     through that helper before falling back to normal insert-page selection;
+   - `doradb-storage/src/catalog/mod.rs` now routes table-handle versioned
+     row-page lookup through the shared table helper instead of duplicating
+     buffer-pool access logic.
+2. Replaced direct `bf().versioned_page_id()` usage with guard helpers where
+   this task touched the code:
+   - production insert/undo call sites in
+     `doradb-storage/src/table/access.rs`;
+   - nearby buffer-pool tests in `doradb-storage/src/buffer/fixed.rs` and
+     `doradb-storage/src/buffer/evict.rs`.
+3. Replaced the old crash witness with passing regressions in
+   `doradb-storage/src/table/tests.rs`:
+   - `test_session_cached_insert_page_reuses_live_versioned_page`
+   - `test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc`
+   These tests cover both the live cached-page fast path and the
+   checkpoint-GC fallback path without relying on a subprocess panic check.
+4. Verification executed for the implemented state:
+   - `cargo test -p doradb-storage cached_insert_page -- --nocapture`
+   - `cargo nextest run -p doradb-storage`
+     - result: `412/412` passed in `3.242s`
+   - `cargo nextest run -p doradb-storage --no-default-features`
+     - result: `412/412` passed in `2.353s`
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+5. Resolve-time tracking updates:
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000082-fix-stale-cached-insert-page-id-after-checkpoint-gc.md`
+     - result: `docs/tasks/next-id` advanced from `000082` to `000083`
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000082-fix-stale-cached-insert-page-id-after-checkpoint-gc.md`
+     - result: no parent RFC reference found; no RFC doc update was needed
+   - source backlogs archived as implemented:
+     - `docs/backlogs/closed/000065-invalidate-stale-cached-insert-page-ids-after-checkpoint-gc.md`
+     - `docs/backlogs/closed/000013-versioned-page-id-helper-api-from-page-guard.md`
+   - implementation tracked in GitHub issue `#458`
+   - pull request opened as `#459`
+   - no additional follow-up backlog doc was created during this resolve pass
+
 ## Impacts
 
 1. `doradb-storage/src/buffer/guard.rs`
@@ -168,6 +214,4 @@ Reference:
 
 ## Open Questions
 
-1. If future investigation finds other long-lived raw `PageID` caches beyond
-   the session insert-page cache, they should be evaluated separately instead of
-   widening this task's implementation by default.
+None currently.
