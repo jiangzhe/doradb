@@ -4,6 +4,7 @@ title: Retire Thread-Pool Async IO and Introduce Backend-Neutral Completion Core
 status: proposal
 tags: [io, async, libaio, io_uring]
 created: 2026-03-21
+github_issue: 460
 ---
 
 # RFC-0010: Retire Thread-Pool Async IO and Introduce Backend-Neutral Completion Core
