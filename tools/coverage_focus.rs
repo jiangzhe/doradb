@@ -11,12 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 const COVERAGE_WORK_DIR: &str = "target/coverage-focus";
-const PROFILE_ROOT: &str = "target/coverage-focus/profiles";
-const PROFILE_DEFAULT_DIR: &str = "target/coverage-focus/profiles/default";
-const PROFILE_NO_DEFAULT_DIR: &str = "target/coverage-focus/profiles/no-default";
-const TARGET_DEFAULT_DIR: &str = "target/coverage-focus/cargo-default";
-const TARGET_NO_DEFAULT_DIR: &str = "target/coverage-focus/cargo-no-default";
-const LCOV_OUT: &str = "target/coverage-focus/lcov.merged.info";
+const PROFILE_DIR: &str = "target/coverage-focus/profiles";
+const TARGET_DIR: &str = "target/coverage-focus/cargo";
+const LCOV_OUT: &str = "target/coverage-focus/lcov.info";
 
 #[derive(Debug)]
 struct Args {
@@ -63,7 +60,7 @@ Prerequisites:\n\
 - `grcov` available in PATH (`cargo install grcov`)\n\
 - LLVM tools with `llvm-profdata` (for example `rustup component add llvm-tools`)\n\
 - Optional `COVERAGE_FOCUS_LLVM_PATH` can point to the LLVM tools directory\n\
-- Default-feature test phase may require `libaio1` and `libaio-dev` in Linux environments\n\
+- Supported coverage runs require `libaio1` and `libaio-dev` in Linux environments\n\
 \n\
 Output:\n\
 - By default, command stdout/stderr is hidden and only step descriptions are printed\n\
@@ -244,10 +241,7 @@ fn precheck_llvm_tools(repo_root: &Path) -> Result<PathBuf, String> {
 
 fn prepare_coverage_dirs() -> Result<(), String> {
     remove_path_if_exists(Path::new(COVERAGE_WORK_DIR))?;
-    fs::create_dir_all(PROFILE_DEFAULT_DIR)
-        .map_err(|e| format!("failed to create {PROFILE_DEFAULT_DIR}: {e}"))?;
-    fs::create_dir_all(PROFILE_NO_DEFAULT_DIR)
-        .map_err(|e| format!("failed to create {PROFILE_NO_DEFAULT_DIR}: {e}"))?;
+    fs::create_dir_all(PROFILE_DIR).map_err(|e| format!("failed to create {PROFILE_DIR}: {e}"))?;
     Ok(())
 }
 
@@ -265,23 +259,18 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
 }
 
 fn run_coverage_phases(repo_root: &Path, show_output: bool) -> Result<(), String> {
-    println!("== coverage phase: default features ==");
-    let default_profile = repo_root
-        .join(PROFILE_DEFAULT_DIR)
-        .join("coverage-%p-%m.profraw");
-    let default_target_dir = repo_root.join(TARGET_DEFAULT_DIR);
-    let default_env = vec![
+    println!("== coverage phase: supported libaio backend ==");
+    let profile = repo_root.join(PROFILE_DIR).join("coverage-%p-%m.profraw");
+    let target_dir = repo_root.join(TARGET_DIR);
+    let coverage_env = vec![
         (
             "RUSTFLAGS",
             "-Cinstrument-coverage -Ctarget-cpu=native".to_string(),
         ),
-        (
-            "LLVM_PROFILE_FILE",
-            default_profile.to_string_lossy().to_string(),
-        ),
+        ("LLVM_PROFILE_FILE", profile.to_string_lossy().to_string()),
         (
             "CARGO_TARGET_DIR",
-            default_target_dir.to_string_lossy().to_string(),
+            target_dir.to_string_lossy().to_string(),
         ),
         ("RUST_BACKTRACE", "full".to_string()),
     ];
@@ -289,38 +278,10 @@ fn run_coverage_phases(repo_root: &Path, show_output: bool) -> Result<(), String
         repo_root,
         "cargo",
         &["test", "--all"],
-        &default_env,
+        &coverage_env,
         show_output,
     )
-    .map_err(|msg| format_default_phase_error(msg))?;
-
-    println!("== coverage phase: no default features ==");
-    let no_default_profile = repo_root
-        .join(PROFILE_NO_DEFAULT_DIR)
-        .join("coverage-%p-%m.profraw");
-    let no_default_target_dir = repo_root.join(TARGET_NO_DEFAULT_DIR);
-    let no_default_env = vec![
-        (
-            "RUSTFLAGS",
-            "-Cinstrument-coverage -Ctarget-cpu=native".to_string(),
-        ),
-        (
-            "LLVM_PROFILE_FILE",
-            no_default_profile.to_string_lossy().to_string(),
-        ),
-        (
-            "CARGO_TARGET_DIR",
-            no_default_target_dir.to_string_lossy().to_string(),
-        ),
-        ("RUST_BACKTRACE", "full".to_string()),
-    ];
-    run_checked(
-        repo_root,
-        "cargo",
-        &["test", "--all", "--no-default-features"],
-        &no_default_env,
-        show_output,
-    )?;
+    .map_err(|msg| format_coverage_phase_error(msg))?;
 
     Ok(())
 }
@@ -393,11 +354,11 @@ fn ensure_success(
     Err(msg)
 }
 
-fn format_default_phase_error(base: String) -> String {
+fn format_coverage_phase_error(base: String) -> String {
     let mut out = String::new();
     out.push_str(&base);
     out.push_str("\n");
-    out.push_str("default-feature coverage phase failed. If this environment is missing libaio, install `libaio1` and `libaio-dev` (Ubuntu: `sudo apt-get install -y libaio1 libaio-dev`) and rerun.");
+    out.push_str("supported coverage phase failed. If this environment is missing libaio, install `libaio1` and `libaio-dev` (Ubuntu: `sudo apt-get install -y libaio1 libaio-dev`) and rerun.");
     out
 }
 
@@ -406,9 +367,9 @@ fn generate_merged_lcov(
     llvm_tools_dir: &Path,
     show_output: bool,
 ) -> Result<(), String> {
-    println!("== merge coverage with grcov ==");
+    println!("== generate coverage with grcov ==");
     let mut args = vec![
-        PROFILE_ROOT.to_string(),
+        PROFILE_DIR.to_string(),
         "--binary-path".to_string(),
         COVERAGE_WORK_DIR.to_string(),
         "-s".to_string(),

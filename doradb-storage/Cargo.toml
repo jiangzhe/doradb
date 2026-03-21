@@ -36,10 +36,6 @@ blake3 = "1.8"
 ordered-float = {version = "5.1", features = ["serde"] }
 dashmap = "6.1"
 
-[features]
-default = ["libaio"]
-libaio = []
-
 [dev-dependencies]
 rand = "0.9"
 rand_chacha = "0.9"

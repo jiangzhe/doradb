@@ -41,13 +41,13 @@ We rely on tooling to enforce style.
 ### I/O Abstraction
 *   **Use `crate::io`**: All file I/O must go through the `crate::io` module.
     *   **Do not** use `std::fs` or `tokio::fs` for data path operations.
-*   **`libaio` Support**: Code must compile and run with `--no-default-features` (fallback to thread pool).
+*   **`libaio` Backend**: The current repository supports the `libaio`-backed `crate::io` path only. Ensure Linux development environments provide `libaio1` and `libaio-dev`.
 *   **Alignment**: Respect `crate::io::MIN_PAGE_SIZE` (4096 bytes) for Direct I/O buffers.
 
 ## 4. Testing
 
 *   **Unit Tests**: Place in `mod tests` within the source file or in `tests.rs`.
-*   **Dual-Pass Testing**: Run `cargo nextest run -p doradb-storage` and `cargo nextest run -p doradb-storage --no-default-features` sequentially.
+*   **Routine Validation**: Run `cargo nextest run -p doradb-storage`.
 *   **Doc Tests**: This project currently does not have doctests, and routine validation does not run `cargo test --doc`.
 
 ## 5. Unsafe Code
@@ -61,4 +61,4 @@ We rely on tooling to enforce style.
 - [ ] **Visibility**: Is this new method actually needed to be `pub`?
 - [ ] **Documentation**: Do all public entities have `///` comments?
 - [ ] **Locking**: Did you use `parking_lot` for small, fast blocking sections?
-- [ ] **I/O**: Does it work with and without `libaio`?
+- [ ] **I/O**: Does it preserve the supported `libaio` backend contract?
