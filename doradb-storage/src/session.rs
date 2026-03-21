@@ -69,16 +69,17 @@ impl Session {
     /// Begin a new transaction if the session is currently idle.
     #[inline]
     pub fn try_begin_trx(&mut self) -> Result<Option<ActiveTrx>> {
-        if self.state.in_trx.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
-        let trx = self.state.engine_ref.with_running_admission(|| {
-            self.state
-                .engine_ref
-                .trx_sys
-                .begin_trx(Arc::clone(&self.state))
-        })?;
-        Ok(Some(trx))
+        self.state.engine_ref.with_running_admission(|| {
+            if !self.state.try_enter_trx() {
+                return None;
+            }
+            Some(
+                self.state
+                    .engine_ref
+                    .trx_sys
+                    .begin_trx(Arc::clone(&self.state)),
+            )
+        })
     }
 
     /// Create a new table.
@@ -290,6 +291,13 @@ impl SessionState {
             return None;
         }
         Some(trx_id)
+    }
+
+    #[inline]
+    fn try_enter_trx(&self) -> bool {
+        self.in_trx
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Mark the session transaction as committed at the given CTS.

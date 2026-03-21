@@ -655,9 +655,96 @@ mod tests {
                 Err(err) => err,
             };
             assert!(matches!(err, Error::StorageEngineShutdown));
+            assert!(!session.in_trx());
 
             drop(session);
             engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_same_session_rejects_overlapping_transactions() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            assert!(session.in_trx());
+            assert!(session.try_begin_trx().unwrap().is_none());
+
+            trx.rollback().await;
+            assert!(!session.in_trx());
+        });
+    }
+
+    #[test]
+    fn test_same_session_reuse_after_commit() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.add_pseudo_redo_log_entry();
+            let cts = trx.commit().await.unwrap();
+            assert!(cts > 0);
+            assert!(!session.in_trx());
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            trx.rollback().await;
+        });
+    }
+
+    #[test]
+    fn test_same_session_reuse_after_rollback() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            trx.rollback().await;
+            assert!(!session.in_trx());
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            trx.rollback().await;
+        });
+    }
+
+    #[test]
+    fn test_same_session_reuse_after_readonly_commit() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let cts = trx.commit().await.unwrap();
+            assert_eq!(cts, 0);
+            assert!(!session.in_trx());
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            trx.rollback().await;
+        });
+    }
+
+    #[test]
+    fn test_distinct_sessions_can_hold_overlapping_transactions() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session1 = engine.try_new_session().unwrap();
+            let mut session2 = engine.try_new_session().unwrap();
+
+            let trx1 = session1.try_begin_trx().unwrap().unwrap();
+            let trx2 = session2.try_begin_trx().unwrap().unwrap();
+
+            assert!(session1.in_trx());
+            assert!(session2.in_trx());
+
+            trx1.rollback().await;
+            trx2.rollback().await;
         });
     }
 
