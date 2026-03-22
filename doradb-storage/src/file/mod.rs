@@ -9,25 +9,22 @@ pub mod table_fs;
 #[cfg(test)]
 pub(crate) use self::table_fs::tests::{build_test_fs, build_test_fs_in};
 
+use crate::buffer::{PersistedBlockKey, ReadonlyLoadSubmission};
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::io_iocb_cmd;
 use crate::io::{
-    AIO, AIOBuf, AIOClient, AIOContext, AIOError, AIOEventListener, AIOKey, AIOKind, AIOResult,
-    AIOStats, IOQueue, STORAGE_SECTOR_SIZE, UnsafeAIO, align_to_sector_size,
+    AIO, AIOBuf, AIOClient, AIOError, AIOKey, AIOKind, AIOResult, AIOStats, Completion, IOQueue,
+    IOStateMachine, IOSubmission, Operation, STORAGE_SECTOR_SIZE, UnsafeAIO, align_to_sector_size,
 };
-use crate::notify::EventNotifyOnDrop;
-use crate::ptr::UnsafePtr;
 use crate::{error::Error, error::Result};
-use event_listener::{EventListener, Listener};
 use libc::{
     O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
     stat,
 };
+use parking_lot::RawMutex;
 use parking_lot::lock_api::RawMutex as RawMutexAPI;
-use parking_lot::{Mutex, RawMutex};
 use scopeguard::defer;
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
@@ -263,345 +260,184 @@ pub fn sparse_file_size(fd: RawFd) -> std::io::Result<(usize, usize)> {
     }
 }
 
-pub enum FileIOState {
-    RequestBuf(DirectBuf),
-    RunningBuf(AIO<DirectBuf>),
-    RequestStaticRead { ptr: UnsafePtr<u8>, len: usize },
-    RunningStaticRead { aio: UnsafeAIO, len: usize },
-    Result(FileIOResult),
-    Invalid,
-}
-
-impl FileIOState {
-    #[inline]
-    pub fn take_buf(&mut self) -> Option<DirectBuf> {
-        let state = std::mem::replace(self, FileIOState::Invalid);
-        match state {
-            FileIOState::RequestBuf(buf) => Some(buf),
-            FileIOState::RunningBuf(mut aio) => aio.take_buf(),
-            FileIOState::Result(FileIOResult::ReadOk(buf)) => Some(buf),
-            FileIOState::Result(_) | FileIOState::Invalid => None,
-            FileIOState::RequestStaticRead { .. } | FileIOState::RunningStaticRead { .. } => None,
-        }
-    }
-
-    #[inline]
-    pub fn aio_key(&self) -> Option<AIOKey> {
-        match self {
-            FileIOState::RunningBuf(aio) => Some(aio.key),
-            FileIOState::RunningStaticRead { aio, .. } => Some(aio.key),
-            _ => None,
-        }
-    }
-}
-
-impl Default for FileIOState {
-    #[inline]
-    fn default() -> Self {
-        FileIOState::Invalid
-    }
-}
-
-pub enum FileIOResult {
-    ReadOk(DirectBuf),
-    ReadStaticOk,
-    WriteOk,
-    Err(std::io::Error),
-}
-
+/// Worker-owned file write submission for the table-filesystem IO worker.
+///
+/// The submission keeps the persisted-block identity, the backend-agnostic IO
+/// operation, and the waiter notification state together until completion.
 pub struct FileIO {
-    kind: AIOKind,
-    fd: RawFd,
-    offset: usize,
-    state: Arc<Mutex<FileIOState>>,
-    ev: EventNotifyOnDrop,
+    key: PersistedBlockKey,
+    operation: Option<Operation>,
+    done: Arc<Completion<Result<()>>>,
     recycle: bool,
 }
 
 impl FileIO {
     #[inline]
-    pub fn prepare(
-        kind: AIOKind,
+    fn prepare_write(
+        key: PersistedBlockKey,
         fd: RawFd,
         offset: usize,
         buf: DirectBuf,
         recycle: bool,
-    ) -> (Self, FileIOPromise) {
-        let ev = EventNotifyOnDrop::new();
-        let listener = ev.listen();
-        let state = Arc::new(Mutex::new(FileIOState::RequestBuf(buf)));
+    ) -> (Self, impl std::future::Future<Output = Result<()>> + Send) {
+        let done = Arc::new(Completion::new());
+        let waiter = Arc::clone(&done);
         let fio = FileIO {
-            kind,
-            fd,
-            offset,
-            state: state.clone(),
-            ev,
+            key,
+            operation: Some(Operation::pwrite_owned(fd, offset, buf)),
+            done,
             recycle,
         };
-        let promise = FileIOPromise { state, listener };
-        (fio, promise)
+        (fio, async move { waiter.wait_result().await })
     }
 
-    /// Prepares an async read that targets caller-owned memory.
-    ///
-    /// # Safety
-    ///
-    /// The caller must keep `ptr..ptr+len` valid and sector-aligned until
-    /// the returned promise is resolved.
+    /// Takes the owned direct buffer back out of this submission, if still present.
     #[inline]
-    pub unsafe fn prepare_static_read(
-        fd: RawFd,
-        offset: usize,
-        ptr: UnsafePtr<u8>,
-        len: usize,
-    ) -> (Self, FileIOPromise) {
-        let ev = EventNotifyOnDrop::new();
-        let listener = ev.listen();
-        let state = Arc::new(Mutex::new(FileIOState::RequestStaticRead { ptr, len }));
-        let fio = FileIO {
-            kind: AIOKind::Read,
-            fd,
-            offset,
-            state: state.clone(),
-            ev,
-            recycle: false,
-        };
-        let promise = FileIOPromise { state, listener };
-        (fio, promise)
-    }
-
-    #[inline]
-    pub fn take_buf(self) -> Option<DirectBuf> {
-        let mut g = self.state.lock();
-        g.take_buf()
+    pub fn take_buf(mut self) -> Option<DirectBuf> {
+        self.operation.as_mut().and_then(Operation::take_buf)
     }
 }
 
-/// Read one full page via async direct IO and return the filled direct buffer.
-///
-/// On request-submit failure, the allocated buffer is recycled back into `buf_list`.
-#[inline]
-pub(crate) async fn read_page_direct(
-    fd: RawFd,
-    page_id: u64,
-    page_size: usize,
-    io_client: &AIOClient<FileIO>,
-    buf_list: &FixedSizeBufferFreeList,
-) -> Result<DirectBuf> {
-    let buf = buf_list.pop_async(true).await;
-    debug_assert!(buf.capacity() == page_size);
-    let offset = page_id as usize * page_size;
-    let (fio, promise) = FileIO::prepare(AIOKind::Read, fd, offset, buf, true);
-    if let Err(err) = io_client.send_async(fio).await {
-        if let Some(buf) = err.into_inner().take_buf() {
-            buf_list.recycle(buf);
-        }
-        return Err(Error::SendError);
+impl IOSubmission for FileIO {
+    type Key = PersistedBlockKey;
+
+    #[inline]
+    fn key(&self) -> &Self::Key {
+        &self.key
     }
-    match promise.wait_async().await {
-        FileIOResult::ReadOk(buf) => Ok(buf),
-        FileIOResult::ReadStaticOk => panic!("invalid state"),
-        FileIOResult::WriteOk => panic!("invalid state"),
-        FileIOResult::Err(err) => Err(err.into()),
+
+    #[inline]
+    fn operation(&mut self) -> &mut Operation {
+        self.operation
+            .as_mut()
+            .expect("file IO operation requested after submission ownership moved")
+    }
+}
+
+pub(crate) enum TableFsRequest {
+    Write(FileIO),
+    Read(ReadonlyLoadSubmission),
+}
+
+pub(crate) enum TableFsSubmission {
+    Write(FileIO),
+    Read(ReadonlyLoadSubmission),
+}
+
+impl IOSubmission for TableFsSubmission {
+    type Key = PersistedBlockKey;
+
+    #[inline]
+    fn key(&self) -> &Self::Key {
+        match self {
+            TableFsSubmission::Write(sub) => sub.key(),
+            TableFsSubmission::Read(sub) => sub.key(),
+        }
+    }
+
+    #[inline]
+    fn operation(&mut self) -> &mut Operation {
+        match self {
+            TableFsSubmission::Write(sub) => sub.operation(),
+            TableFsSubmission::Read(sub) => sub.operation(),
+        }
     }
 }
 
 /// Write one direct buffer via async direct IO.
 ///
+/// `key` identifies the persisted block targeted by this write for higher-layer
+/// invalidation and inflight bookkeeping.
+///
 /// When `recycle` is true, write buffers are recycled by IO completion path
 /// and also on request-submit failure.
 #[inline]
 pub(crate) async fn write_direct(
+    key: PersistedBlockKey,
     fd: RawFd,
     offset: usize,
     buf: DirectBuf,
     recycle: bool,
-    io_client: &AIOClient<FileIO>,
+    io_client: &AIOClient<TableFsRequest>,
     buf_list: &FixedSizeBufferFreeList,
 ) -> Result<()> {
-    let (fio, promise) = FileIO::prepare(AIOKind::Write, fd, offset, buf, recycle);
-    if let Err(err) = io_client.send_async(fio).await {
-        if let Some(buf) = err.into_inner().take_buf()
+    let (fio, result) = FileIO::prepare_write(key, fd, offset, buf, recycle);
+    if let Err(err) = io_client.send_async(TableFsRequest::Write(fio)).await {
+        let TableFsRequest::Write(fio) = err.into_inner() else {
+            unreachable!("write_direct received unexpected readonly-load send error");
+        };
+        if let Some(buf) = fio.take_buf()
             && recycle
         {
             buf_list.recycle(buf);
         }
         return Err(Error::SendError);
     }
-    match promise.wait_async().await {
-        FileIOResult::WriteOk => Ok(()),
-        FileIOResult::ReadStaticOk => panic!("invalid state"),
-        FileIOResult::ReadOk(_) => panic!("invalid state"),
-        FileIOResult::Err(err) => Err(err.into()),
-    }
+    result.await
 }
 
-pub struct FileIOPromise {
-    state: Arc<Mutex<FileIOState>>,
-    listener: EventListener,
-}
-
-impl FileIOPromise {
-    #[inline]
-    pub fn wait(self) -> FileIOResult {
-        self.listener.wait();
-        let mut g = self.state.lock();
-        match std::mem::take(&mut *g) {
-            FileIOState::Result(res) => res,
-            FileIOState::Invalid
-            | FileIOState::RequestBuf(_)
-            | FileIOState::RunningBuf(_)
-            | FileIOState::RequestStaticRead { .. }
-            | FileIOState::RunningStaticRead { .. } => {
-                panic!("invalid state");
-            }
-        }
-    }
-
-    #[inline]
-    pub async fn wait_async(self) -> FileIOResult {
-        self.listener.await;
-        let mut g = self.state.lock();
-        match std::mem::take(&mut *g) {
-            FileIOState::Result(res) => res,
-            FileIOState::Invalid
-            | FileIOState::RequestBuf(_)
-            | FileIOState::RunningBuf(_)
-            | FileIOState::RequestStaticRead { .. }
-            | FileIOState::RunningStaticRead { .. } => {
-                panic!("invalid state");
-            }
-        }
-    }
-}
-
-pub struct FileIOListener {
-    inflight_io: HashMap<AIOKey, FileIO>,
-    key: AIOKey,
+pub(crate) struct TableFsStateMachine {
     stats: AIOStats,
     buf_list: FixedSizeBufferFreeList,
 }
 
-impl FileIOListener {
+impl TableFsStateMachine {
+    /// Creates one state machine for the shared table-filesystem IO worker.
     #[inline]
-    pub fn new(buf_list: FixedSizeBufferFreeList) -> FileIOListener {
-        FileIOListener {
-            inflight_io: HashMap::new(),
-            key: 0,
+    pub fn new(buf_list: FixedSizeBufferFreeList) -> TableFsStateMachine {
+        TableFsStateMachine {
             stats: AIOStats::default(),
             buf_list,
         }
     }
 }
 
-impl AIOEventListener for FileIOListener {
-    type Request = FileIO;
-    type Submission = FileIO;
+impl IOStateMachine for TableFsStateMachine {
+    type Request = TableFsRequest;
+    type Key = PersistedBlockKey;
+    type Submission = TableFsSubmission;
 
     #[inline]
-    fn on_request(&mut self, req: FileIO, queue: &mut IOQueue<FileIO>) {
-        let key = self.key;
-        self.key += 1;
-        let mut g = req.state.lock();
-        let state = std::mem::replace(&mut *g, FileIOState::Invalid);
-        let iocb = match state {
-            FileIOState::RequestBuf(buf) => {
-                let aio = match req.kind {
-                    AIOKind::Read => pread_direct(key, req.fd, req.offset, buf),
-                    AIOKind::Write => pwrite_direct(key, req.fd, req.offset, buf),
-                };
-                let iocb = aio.iocb_raw();
-                *g = FileIOState::RunningBuf(aio);
-                iocb
-            }
-            FileIOState::RequestStaticRead { ptr, len } => {
-                debug_assert!(matches!(req.kind, AIOKind::Read));
-                // SAFETY: caller of `prepare_static_read` guarantees pointer validity and
-                // alignment for the whole async IO operation.
-                let aio = unsafe { pread_unchecked(key, req.fd, req.offset, ptr.0, len) };
-                let iocb = aio.iocb_raw();
-                *g = FileIOState::RunningStaticRead { aio, len };
-                iocb
-            }
-            FileIOState::Result(_)
-            | FileIOState::Invalid
-            | FileIOState::RunningBuf(_)
-            | FileIOState::RunningStaticRead { .. } => {
-                panic!("invalid file io request state")
-            }
-        };
-        drop(g);
-        queue.push(iocb, req);
+    fn prepare_request(&mut self, req: TableFsRequest, queue: &mut IOQueue<TableFsSubmission>) {
+        match req {
+            TableFsRequest::Write(req) => queue.push(TableFsSubmission::Write(req)),
+            TableFsRequest::Read(req) => queue.push(TableFsSubmission::Read(req)),
+        }
     }
 
     #[inline]
-    fn on_submit(&mut self, sub: FileIO) {
-        let aio_key = {
-            let g = sub.state.lock();
-            g.aio_key().unwrap()
-        };
-        let res = self.inflight_io.insert(aio_key, sub);
-        debug_assert!(res.is_none());
+    fn on_submit(&mut self, _sub: &TableFsSubmission) {
+        // Submission ownership is retained by the worker inflight table.
     }
 
     #[inline]
-    fn on_complete(&mut self, key: AIOKey, res: std::io::Result<usize>) -> AIOKind {
-        let sub = self.inflight_io.remove(&key).unwrap();
-        let mut g = sub.state.lock();
-        let state = std::mem::replace(&mut *g, FileIOState::Invalid);
-        match state {
-            FileIOState::RunningBuf(mut aio) => {
-                let mut buf = aio.take_buf().unwrap();
+    fn on_complete(&mut self, sub: TableFsSubmission, res: std::io::Result<usize>) -> AIOKind {
+        match sub {
+            TableFsSubmission::Write(mut sub) => {
+                let mut operation = sub
+                    .operation
+                    .take()
+                    .expect("write submission must still own its operation during completion");
+                let buf = operation
+                    .take_buf()
+                    .expect("write operation must still own its direct buffer");
                 match res {
                     Ok(len) => {
                         debug_assert!(len == buf.capacity());
-                        match sub.kind {
-                            AIOKind::Read => {
-                                buf.truncate(len);
-                                *g = FileIOState::Result(FileIOResult::ReadOk(buf));
-                            }
-                            AIOKind::Write => {
-                                // recycle write buffer.
-                                if sub.recycle {
-                                    self.buf_list.recycle(buf);
-                                }
-                                *g = FileIOState::Result(FileIOResult::WriteOk);
-                            }
+                        if sub.recycle {
+                            self.buf_list.recycle(buf);
                         }
+                        sub.done.complete(Ok(()));
                     }
                     Err(err) => {
                         self.buf_list.recycle(buf);
-                        *g = FileIOState::Result(FileIOResult::Err(err));
+                        sub.done.complete(Err(err.into()));
                     }
                 }
+                AIOKind::Write
             }
-            FileIOState::RunningStaticRead { aio: _aio, len } => match res {
-                Ok(read_len) if read_len == len => {
-                    *g = FileIOState::Result(FileIOResult::ReadStaticOk);
-                }
-                Ok(read_len) => {
-                    *g = FileIOState::Result(FileIOResult::Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "static read completed with short length: expected={}, actual={}",
-                            len, read_len
-                        ),
-                    )));
-                }
-                Err(err) => {
-                    *g = FileIOState::Result(FileIOResult::Err(err));
-                }
-            },
-            FileIOState::RequestBuf(_)
-            | FileIOState::RequestStaticRead { .. }
-            | FileIOState::Result(_)
-            | FileIOState::Invalid => {
-                panic!("invalid file io completion state");
-            }
+            TableFsSubmission::Read(sub) => sub.complete(res),
         }
-        drop(g);
-        drop(sub.ev); // notify waiter.
-        sub.kind
     }
 
     #[inline]
@@ -610,7 +446,7 @@ impl AIOEventListener for FileIOListener {
     }
 
     #[inline]
-    fn end_loop(self, _ctx: &AIOContext) {
+    fn end_loop(self) {
         // do nothing
     }
 }

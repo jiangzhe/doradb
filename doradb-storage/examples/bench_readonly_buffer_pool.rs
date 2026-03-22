@@ -6,7 +6,7 @@ use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
 use doradb_storage::engine::EngineConfig;
 use doradb_storage::error::PersistedFileKind;
 use doradb_storage::file::table_fs::TableFileSystemConfig;
-use doradb_storage::io::AIOBuf;
+use doradb_storage::io::{AIOBuf, DirectBuf};
 use doradb_storage::latch::LatchFallbackMode;
 use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::trx::sys_conf::TrxSysConfig;
@@ -43,7 +43,7 @@ fn make_metadata() -> Arc<TableMetadata> {
 
 async fn write_pages(table_file: &Arc<doradb_storage::file::table_file::TableFile>, pages: usize) {
     for page_id in 0..pages {
-        let mut buf = table_file.buf_list().pop_async(true).await;
+        let mut buf = DirectBuf::zeroed(PAGE_SIZE);
         let bytes = buf.as_bytes_mut();
         bytes.fill(0);
         bytes[0..8].copy_from_slice(&(page_id as u64).to_le_bytes());
@@ -83,7 +83,7 @@ fn main() {
 
         write_pages(&table_file, args.pages).await;
 
-        let pool = QuiescentBox::new(ReadonlyBufferPool::new(
+        let pool = QuiescentBox::new(ReadonlyBufferPool::from_table_file(
             901,
             PersistedFileKind::TableFile,
             Arc::clone(&table_file),

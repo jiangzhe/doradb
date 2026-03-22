@@ -1,14 +1,16 @@
 use crate::bitmap::AllocMap;
+use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{PAGE_SIZE, PageID};
+use crate::buffer::{
+    BufferPool, PersistedBlockKey, PersistedFileID, ReadonlyBufferPool, ReadonlyLoadSubmission,
+};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
 use crate::file::super_page::{SUPER_PAGE_SIZE, SuperPage};
-use crate::file::{
-    FileIO, FileIOResult, FixedSizeBufferFreeList, SparseFile, read_page_direct, write_direct,
-};
-use crate::io::{AIOBuf, AIOClient, DirectBuf};
-use crate::ptr::UnsafePtr;
+use crate::file::{FixedSizeBufferFreeList, SparseFile, TableFsRequest, write_direct};
+use crate::io::{AIOClient, DirectBuf};
+use crate::latch::LatchFallbackMode;
 use crate::trx::TrxID;
 use std::fs;
 use std::ops::{Deref, DerefMut};
@@ -156,9 +158,10 @@ pub struct CowCodec<M> {
 /// [`CowCodec`].
 pub struct CowFile<M> {
     file: SparseFile,
+    file_id: PersistedFileID,
     active_root: AtomicPtr<ActiveRoot<M>>,
     mutable_inflight: AtomicBool,
-    io_client: AIOClient<FileIO>,
+    io_client: AIOClient<TableFsRequest>,
     buf_list: FixedSizeBufferFreeList,
     codec: CowCodec<M>,
 }
@@ -172,7 +175,8 @@ impl<M> CowFile<M> {
     pub(crate) fn create(
         file_path: impl AsRef<str>,
         initial_size: usize,
-        io_client: AIOClient<FileIO>,
+        file_id: PersistedFileID,
+        io_client: AIOClient<TableFsRequest>,
         buf_list: FixedSizeBufferFreeList,
         codec: CowCodec<M>,
         trunc: bool,
@@ -184,6 +188,7 @@ impl<M> CowFile<M> {
         }?;
         Ok(CowFile {
             file,
+            file_id,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
             io_client,
@@ -199,25 +204,21 @@ impl<M> CowFile<M> {
     #[inline]
     pub(crate) fn open(
         file_path: impl AsRef<str>,
-        io_client: AIOClient<FileIO>,
+        file_id: PersistedFileID,
+        io_client: AIOClient<TableFsRequest>,
         buf_list: FixedSizeBufferFreeList,
         codec: CowCodec<M>,
     ) -> Result<Self> {
         let file = SparseFile::open(file_path)?;
         Ok(CowFile {
             file,
+            file_id,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
             io_client,
             buf_list,
             codec,
         })
-    }
-
-    /// Reusable direct-buffer list bound to this file IO client.
-    #[inline]
-    pub fn buf_list(&self) -> &FixedSizeBufferFreeList {
-        &self.buf_list
     }
 
     /// Return the current in-memory active root reference.
@@ -267,54 +268,17 @@ impl<M> CowFile<M> {
         );
     }
 
-    /// Read one page using async direct IO.
-    #[inline]
-    async fn read_page(&self, page_id: PageID) -> Result<DirectBuf> {
-        read_page_direct(
-            self.file.as_raw_fd(),
-            page_id,
-            COW_FILE_PAGE_SIZE,
-            &self.io_client,
-            &self.buf_list,
-        )
-        .await
-    }
-
-    /// Reads one page directly into caller-owned memory.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `ptr` points to writable, sector-aligned memory
-    /// of at least `COW_FILE_PAGE_SIZE` bytes, and remains valid until async completion.
-    #[inline]
-    pub async unsafe fn read_page_into_ptr(
-        &self,
-        page_id: PageID,
-        ptr: UnsafePtr<u8>,
-    ) -> Result<()> {
-        let offset = page_id as usize * COW_FILE_PAGE_SIZE;
-        // SAFETY: caller upholds pointer validity/alignment until promise resolves.
-        let (fio, promise) = unsafe {
-            FileIO::prepare_static_read(self.file.as_raw_fd(), offset, ptr, COW_FILE_PAGE_SIZE)
-        };
-        if self.io_client.send_async(fio).await.is_err() {
-            return Err(Error::SendError);
-        }
-        let res = promise.wait_async().await;
-        match res {
-            FileIOResult::ReadStaticOk => Ok(()),
-            FileIOResult::ReadOk(_) => panic!("invalid state"),
-            FileIOResult::WriteOk => panic!("invalid state"),
-            FileIOResult::Err(err) => Err(err.into()),
-        }
-    }
-
     /// Write one page using async direct IO.
     #[inline]
     pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
         debug_assert!(buf.capacity() == COW_FILE_PAGE_SIZE);
         let offset = page_id as usize * COW_FILE_PAGE_SIZE;
         self.write_at_offset(offset, buf, true).await
+    }
+
+    #[inline]
+    fn block_key(&self, offset: usize) -> PersistedBlockKey {
+        PersistedBlockKey::new(self.file_id, (offset / COW_FILE_PAGE_SIZE) as PageID)
     }
 
     /// Write one buffer at given byte offset.
@@ -326,6 +290,7 @@ impl<M> CowFile<M> {
         recycle: bool,
     ) -> Result<()> {
         write_direct(
+            self.block_key(offset),
             self.file.as_raw_fd(),
             offset,
             buf,
@@ -334,6 +299,25 @@ impl<M> CowFile<M> {
             &self.buf_list,
         )
         .await
+    }
+
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    #[inline]
+    pub(crate) async fn queue_readonly_load(&self, req: ReadonlyLoadSubmission) -> Result<()> {
+        match self.io_client.send_async(TableFsRequest::Read(req)).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let TableFsRequest::Read(req) = err.into_inner() else {
+                    unreachable!("table worker returned unexpected readonly load request");
+                };
+                req.fail(Error::SendError);
+                Err(Error::SendError)
+            }
+        }
     }
 
     /// Replace active root with new root, returning previous-root guard if present.
@@ -351,32 +335,41 @@ impl<M> CowFile<M> {
     /// codec, and rejects invalid root invariants before returning an
     /// in-memory [`ActiveRoot`].
     #[inline]
-    pub async fn load_active_root(&self) -> Result<ActiveRoot<M>> {
-        let super_buf = self.read_page(0).await?;
+    pub async fn load_active_root_from_pool(
+        &self,
+        disk_pool: &ReadonlyBufferPool,
+    ) -> Result<ActiveRoot<M>> {
+        let _ = disk_pool.invalidate_block_id(0);
+        let pool_guard = disk_pool.pool_guard();
+        let super_page_guard: crate::buffer::guard::PageSharedGuard<crate::buffer::page::Page> = loop {
+            let guard = disk_pool
+                .get_page::<crate::buffer::page::Page>(&pool_guard, 0, LatchFallbackMode::Shared)
+                .await;
+            if let Some(shared) = guard.lock_shared_async().await {
+                break shared;
+            }
+        };
         let super_page =
-            match Self::pick_super_page(super_buf.as_bytes(), self.codec.parse_super_page) {
-                Ok(super_page) => super_page,
-                Err(err) => {
-                    self.buf_list.push(super_buf);
-                    return Err(err);
-                }
-            };
-        self.buf_list.push(super_buf);
+            Self::pick_super_page(super_page_guard.page(), self.codec.parse_super_page)?;
+        drop(super_page_guard);
 
-        let meta_buf = self.read_page(super_page.body.meta_page_id).await?;
+        let _ = disk_pool.invalidate_block_id(super_page.body.meta_page_id);
+        let meta_page_guard: crate::buffer::guard::PageSharedGuard<crate::buffer::page::Page> = loop {
+            let guard = disk_pool
+                .get_page::<crate::buffer::page::Page>(
+                    &pool_guard,
+                    super_page.body.meta_page_id,
+                    LatchFallbackMode::Shared,
+                )
+                .await;
+            if let Some(shared) = guard.lock_shared_async().await {
+                break shared;
+            }
+        };
         let parsed_meta =
-            match (self.codec.parse_meta_page)(super_page.body.meta_page_id, meta_buf.as_bytes()) {
-                Ok(meta) => meta,
-                Err(err) => {
-                    self.buf_list.push(meta_buf);
-                    return Err(err);
-                }
-            };
-        if let Err(err) = (self.codec.validate_root)(super_page.body.meta_page_id, &parsed_meta) {
-            self.buf_list.push(meta_buf);
-            return Err(err);
-        }
-        self.buf_list.push(meta_buf);
+            (self.codec.parse_meta_page)(super_page.body.meta_page_id, meta_page_guard.page())?;
+        (self.codec.validate_root)(super_page.body.meta_page_id, &parsed_meta)?;
+        drop(meta_page_guard);
 
         Ok(ActiveRoot::from_parts(
             super_page.header.page_no,

@@ -1,9 +1,11 @@
+mod backend;
 mod buf;
+mod completion;
 mod libaio_abi;
+mod libaio_backend;
 
 use crate::thread;
 use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
-use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
@@ -11,8 +13,11 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 use thiserror::Error;
 
+pub use backend::*;
 pub use buf::*;
+pub use completion::*;
 pub use libaio_abi::*;
+pub use libaio_backend::*;
 
 pub const MIN_PAGE_SIZE: usize = 4096;
 pub const STORAGE_SECTOR_SIZE: usize = 4096;
@@ -22,8 +27,6 @@ pub const STORAGE_SECTOR_SIZE: usize = 4096;
 pub fn align_to_sector_size(len: usize) -> usize {
     len.max(STORAGE_SECTOR_SIZE).div_ceil(STORAGE_SECTOR_SIZE) * STORAGE_SECTOR_SIZE
 }
-
-const DEFAULT_AIO_MAX_EVENTS: usize = 32;
 
 #[derive(Debug, Clone, Error)]
 pub enum AIOError {
@@ -42,178 +45,8 @@ pub enum AIOError {
 }
 
 pub type AIOResult<T> = StdResult<T, AIOError>;
-
-pub struct AIOContext {
-    ctx: io_context_t,
-    max_events: usize,
-}
-
-unsafe impl Sync for AIOContext {}
-unsafe impl Send for AIOContext {}
-
-impl AIOContext {
-    /// Create a new AIO context with max events(io depth).
-    #[inline]
-    pub fn new(max_events: usize) -> AIOResult<Self> {
-        debug_assert!(max_events < isize::MAX as usize);
-        let mut ctx = std::ptr::null_mut();
-        unsafe {
-            match io_setup(max_events as i32, &mut ctx) {
-                0 => Ok(AIOContext { ctx, max_events }),
-                _ => Err(AIOError::SetupError),
-            }
-        }
-    }
-
-    /// Create a default AIO context.
-    #[inline]
-    pub fn try_default() -> AIOResult<Self> {
-        AIOContext::new(DEFAULT_AIO_MAX_EVENTS)
-    }
-
-    /// Returns maximum events.
-    #[inline]
-    pub fn max_events(&self) -> usize {
-        self.max_events
-    }
-
-    /// Create a heap-allocated event array for IO submit and wait.
-    #[inline]
-    pub fn events(&self) -> Box<[io_event]> {
-        vec![io_event::default(); self.max_events].into_boxed_slice()
-    }
-
-    /// Submit IO requests with limit.
-    /// Submit count will be returned, and caller need to take
-    /// care of cleaning the input slice.
-    #[inline]
-    pub fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> usize {
-        if reqs.is_empty() || limit == 0 {
-            return 0;
-        }
-        let batch_size = limit.min(reqs.len());
-        let ret = io_submit_impl(self.ctx, batch_size as c_long, reqs.as_ptr() as *mut _);
-        // See https://man7.org/linux/man-pages/man2/io_submit.2.html
-        // for the details of return value of io_submit().
-        // if success, non-negative value indicates how many IO submitted.
-        // if error, negative value of error code.
-        if ret < 0 {
-            let errcode = -ret;
-            if errcode == EAGAIN {
-                return 0;
-            }
-            panic!(
-                "io_submit returns error code {errcode}: batch_size={batch_size} limit={limit} reqs_len={}",
-                reqs.len()
-            );
-        }
-        ret as usize
-    }
-
-    /// Wait until given number of IO finishes, and execute callback for each.
-    /// Returns number of finished events.
-    #[inline]
-    pub fn wait_at_least<F>(
-        &self,
-        events: &mut [io_event],
-        min_nr: usize,
-        mut callback: F,
-    ) -> (usize, usize)
-    where
-        F: FnMut(AIOKey, StdResult<usize, std::io::Error>) -> AIOKind,
-    {
-        let max_nwait = events.len();
-        let count = loop {
-            let ret = unsafe {
-                io_getevents(
-                    self.ctx,
-                    min_nr as c_long,
-                    max_nwait as c_long,
-                    events.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if ret < 0 {
-                let errcode = -ret;
-                if errcode == EINTR {
-                    // retry if interrupt
-                    continue;
-                }
-                panic!("io_getevents returns error code {errcode}");
-            }
-            break ret as usize;
-        };
-        assert!(
-            count != 0,
-            "io_getevents with min_nr=1 and timeout=None should not return 0"
-        );
-        let mut read_count = 0;
-        let mut write_count = 0;
-        for ev in &events[..count] {
-            let key = ev.data;
-            let res = if ev.res >= 0 {
-                Ok(ev.res as usize)
-            } else {
-                let err = std::io::Error::from_raw_os_error(-ev.res as i32);
-                Err(err)
-            };
-            match callback(key, res) {
-                AIOKind::Read => read_count += 1,
-                AIOKind::Write => write_count += 1,
-            }
-        }
-        (read_count, write_count)
-    }
-
-    /// Build a event loop.
-    #[inline]
-    pub fn event_loop<T>(self) -> (AIOEventLoop<T>, AIOClient<T>) {
-        const DEFAULT_AIO_EVENT_LOOP_BACKLOG: usize = 10;
-        let (tx, rx) = flume::bounded(DEFAULT_AIO_EVENT_LOOP_BACKLOG);
-        let el = AIOEventLoop {
-            ctx: self,
-            rx,
-            submitted: 0,
-            shutdown: false,
-        };
-        (el, AIOClient(tx))
-    }
-}
-
-#[inline]
-fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
-    #[cfg(test)]
-    {
-        let hook = *IO_SUBMIT_HOOK.lock().unwrap();
-        if let Some(hook) = hook {
-            return hook(ctx, nr, ios);
-        }
-    }
-    // SAFETY: `ctx`, `nr`, and `ios` are forwarded to libaio exactly as prepared
-    // by caller-side request construction.
-    unsafe { io_submit(ctx, nr, ios) }
-}
-
 #[cfg(test)]
-type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
-
-#[cfg(test)]
-static IO_SUBMIT_HOOK: std::sync::Mutex<Option<IoSubmitHook>> = std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
-    let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
-    std::mem::replace(&mut *guard, hook)
-}
-
-impl Drop for AIOContext {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            assert_eq!(io_destroy(self.ctx), 0);
-        }
-    }
-}
+use libaio_backend::set_io_submit_hook;
 
 pub type IocbRawPtr = *mut iocb;
 
@@ -319,6 +152,156 @@ impl UnsafeAIO {
     }
 }
 
+/// Buffer ownership model for one backend-agnostic IO operation.
+///
+/// Higher layers either transfer an owned direct buffer to the worker or
+/// provide a borrowed page-aligned pointer whose lifetime they keep valid until
+/// completion.
+pub enum IOMemory {
+    Owned(DirectBuf),
+    Borrowed { ptr: *mut u8, len: usize },
+}
+
+// SAFETY: borrowed pointers are only used for buffer/page memory that higher
+// layers guarantee remains valid until completion, matching the old
+// `UnsafeAIO` contract.
+unsafe impl Send for IOMemory {}
+
+/// Backend-agnostic description of one submitted kernel IO operation.
+///
+/// This type is backend-agnostic: it describes one read/write operation and
+/// owns or borrows the memory that the backend will bind into its prepared
+/// submission shape.
+pub struct Operation {
+    kind: AIOKind,
+    fd: RawFd,
+    offset: usize,
+    memory: IOMemory,
+}
+
+impl Operation {
+    /// Build one owned-buffer read operation.
+    #[inline]
+    pub fn pread_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
+        Operation {
+            kind: AIOKind::Read,
+            fd,
+            offset,
+            memory: IOMemory::Owned(buf),
+        }
+    }
+
+    /// Build one owned-buffer write operation.
+    #[inline]
+    pub fn pwrite_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
+        Operation {
+            kind: AIOKind::Write,
+            fd,
+            offset,
+            memory: IOMemory::Owned(buf),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must guarantee the pointer is valid for the entire lifetime of
+    /// the submitted IO and correctly aligned for the storage backend.
+    /// The worker may move this completion between threads before submission.
+    #[inline]
+    pub unsafe fn pread_borrowed(fd: RawFd, offset: usize, ptr: *mut u8, len: usize) -> Self {
+        Operation {
+            kind: AIOKind::Read,
+            fd,
+            offset,
+            memory: IOMemory::Borrowed { ptr, len },
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must guarantee the pointer is valid for the entire lifetime of
+    /// the submitted IO and correctly aligned for the storage backend.
+    /// The worker may move this completion between threads before submission.
+    #[inline]
+    pub unsafe fn pwrite_borrowed(fd: RawFd, offset: usize, ptr: *mut u8, len: usize) -> Self {
+        Operation {
+            kind: AIOKind::Write,
+            fd,
+            offset,
+            memory: IOMemory::Borrowed { ptr, len },
+        }
+    }
+
+    /// Returns whether this operation is a read or a write.
+    #[inline]
+    pub fn kind(&self) -> AIOKind {
+        self.kind
+    }
+
+    /// Returns the raw file descriptor targeted by this operation.
+    #[inline]
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Returns the byte offset used for this operation.
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Returns the byte length of the bound buffer or pointer.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match &self.memory {
+            IOMemory::Owned(buf) => buf.capacity(),
+            IOMemory::Borrowed { len, .. } => *len,
+        }
+    }
+
+    /// Returns whether this operation targets an empty buffer.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Takes ownership of the direct buffer if this completion owns one.
+    #[inline]
+    pub fn take_buf(&mut self) -> Option<DirectBuf> {
+        match std::mem::replace(
+            &mut self.memory,
+            IOMemory::Borrowed {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            },
+        ) {
+            IOMemory::Owned(buf) => Some(buf),
+            other => {
+                self.memory = other;
+                None
+            }
+        }
+    }
+
+    /// Returns a shared reference to the owned direct buffer, if present.
+    #[inline]
+    pub fn buf(&self) -> Option<&DirectBuf> {
+        match &self.memory {
+            IOMemory::Owned(buf) => Some(buf),
+            IOMemory::Borrowed { .. } => None,
+        }
+    }
+
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match &mut self.memory {
+            IOMemory::Owned(buf) => buf.as_bytes_mut().as_mut_ptr(),
+            IOMemory::Borrowed { ptr, .. } => *ptr,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AIOKind {
     Read,
     Write,
@@ -340,8 +323,6 @@ impl<T> AIOMessage<T> {
 }
 
 pub struct IOQueue<T> {
-    // aligned with AIO interface.
-    iocbs: Vec<IocbRawPtr>,
     reqs: VecDeque<T>,
 }
 
@@ -350,7 +331,6 @@ impl<T> IOQueue<T> {
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         IOQueue {
-            iocbs: Vec::with_capacity(capacity),
             reqs: VecDeque::with_capacity(capacity),
         }
     }
@@ -358,7 +338,7 @@ impl<T> IOQueue<T> {
     /// Returns length of the queue.
     #[inline]
     pub fn len(&self) -> usize {
-        self.iocbs.len()
+        self.reqs.len()
     }
 
     /// Returns whether the queue is empty.
@@ -368,86 +348,181 @@ impl<T> IOQueue<T> {
     }
 
     #[inline]
-    pub fn iocbs(&self) -> &[IocbRawPtr] {
-        &self.iocbs
-    }
-
-    #[inline]
-    pub fn drain_to(&mut self, n: usize) -> Vec<(IocbRawPtr, T)> {
-        self.iocbs.drain(0..n).zip(self.reqs.drain(0..n)).collect()
+    pub fn drain_to(&mut self, n: usize) -> Vec<T> {
+        self.reqs.drain(0..n).collect()
     }
 
     /// Checks consistency of this queue.
     #[inline]
     pub fn consistent(&self) -> bool {
-        self.reqs.len() == self.iocbs.len()
+        true
     }
 
     #[inline]
-    pub fn push(&mut self, iocb: IocbRawPtr, req: T) {
-        self.iocbs.push(iocb);
+    pub fn push(&mut self, req: T) {
         self.reqs.push_back(req);
     }
+}
+
+/// One worker-owned submission staged for backend preparation and completion.
+///
+/// The state-machine key is opaque to the generic worker. Domain-specific
+/// inflight dedupe and ordering live above the worker in the state machine and
+/// its owning subsystem.
+pub trait IOSubmission {
+    type Key;
+
+    /// Returns the domain key associated with this submission.
+    fn key(&self) -> &Self::Key;
+    /// Returns the backend-agnostic IO operation to prepare and submit.
+    fn operation(&mut self) -> &mut Operation;
 }
 
 /// AIOKey represents the unique key of any AIO request.
 pub type AIOKey = u64;
 
-#[derive(Debug, Default)]
-pub struct AIOStats {
-    pub queuing: usize,
-    pub running: usize,
-    pub finished_reads: usize,
-    pub finished_writes: usize,
-    pub io_submit_count: usize,
-    pub io_submit_nanos: usize,
-    pub io_wait_count: usize,
-    pub io_wait_nanos: usize,
+const INVALID_SLOT: u32 = u32::MAX;
+
+enum Entry<T> {
+    Occupied(T),
+    Vacant(u32),
 }
 
-impl AIOStats {
+struct Slot<T> {
+    generation: u32,
+    entry: Entry<T>,
+}
+
+struct InflightSlots<T> {
+    slots: Vec<Slot<T>>,
+    free_head: u32,
+}
+
+impl<T> InflightSlots<T> {
     #[inline]
-    pub fn merge(&mut self, other: &AIOStats) {
-        self.queuing += other.queuing;
-        self.running += other.running;
-        self.finished_reads += other.finished_reads;
-        self.finished_writes += other.finished_writes;
-        self.io_submit_count += other.io_submit_count;
-        self.io_submit_nanos += other.io_submit_nanos;
-        self.io_wait_count += other.io_wait_count;
-        self.io_wait_nanos += other.io_wait_nanos;
+    fn new(capacity: usize) -> Self {
+        assert!(capacity <= u32::MAX as usize);
+        let mut slots = Vec::with_capacity(capacity);
+        for idx in 0..capacity {
+            let next = if idx + 1 < capacity {
+                (idx + 1) as u32
+            } else {
+                INVALID_SLOT
+            };
+            slots.push(Slot {
+                generation: 0,
+                entry: Entry::Vacant(next),
+            });
+        }
+        InflightSlots {
+            slots,
+            free_head: if capacity == 0 { INVALID_SLOT } else { 0 },
+        }
+    }
+
+    #[inline]
+    fn has_vacant(&self) -> bool {
+        self.free_head != INVALID_SLOT
+    }
+
+    #[inline]
+    fn reserve(&mut self) -> Option<(BackendToken, u32)> {
+        let slot = self.free_head;
+        if slot == INVALID_SLOT {
+            return None;
+        }
+        let slot_ref = &self.slots[slot as usize];
+        let Entry::Vacant(next) = slot_ref.entry else {
+            unreachable!("free list head must be vacant");
+        };
+        self.free_head = next;
+        Some((BackendToken::new(slot_ref.generation, slot), slot))
+    }
+
+    #[inline]
+    fn occupy_reserved(&mut self, slot: u32, value: T) {
+        let slot_ref = &mut self.slots[slot as usize];
+        debug_assert!(matches!(slot_ref.entry, Entry::Vacant(_)));
+        slot_ref.entry = Entry::Occupied(value);
+    }
+
+    #[inline]
+    fn get_mut(&mut self, slot: u32) -> &mut T {
+        match &mut self.slots[slot as usize].entry {
+            Entry::Occupied(value) => value,
+            Entry::Vacant(_) => panic!("slot {slot} is not occupied"),
+        }
+    }
+
+    #[inline]
+    fn take(&mut self, token: BackendToken) -> T {
+        let slot = token.slot_index();
+        let generation = token.generation();
+        let slot_ref = self.slots.get_mut(slot as usize).unwrap_or_else(|| {
+            panic!(
+                "completion references invalid inflight slot: token={}",
+                token.raw()
+            )
+        });
+        assert!(
+            slot_ref.generation == generation,
+            "completion references stale inflight token: token={} slot_generation={}",
+            token.raw(),
+            slot_ref.generation
+        );
+        let prev_head = self.free_head;
+        let entry = std::mem::replace(&mut slot_ref.entry, Entry::Vacant(prev_head));
+        slot_ref.generation = slot_ref.generation.wrapping_add(1);
+        self.free_head = slot;
+        match entry {
+            Entry::Occupied(value) => value,
+            Entry::Vacant(_) => panic!(
+                "completion references vacant inflight slot: token={}",
+                token.raw()
+            ),
+        }
     }
 }
 
-/// AIOEventListener defines
-/// how to process with IO requests and responses.
-pub trait AIOEventListener {
+struct InflightEntry<S, P> {
+    submission: S,
+    _prepared: P,
+    submitted: bool,
+}
+
+/// IOStateMachine defines how one worker maps requests to submissions and
+/// applies completion-side state transitions.
+pub trait IOStateMachine {
     type Request;
-    type Submission;
+    /// Opaque domain identity attached to each submission.
+    ///
+    /// The generic worker does not interpret this key. Subsystems use it for
+    /// their own inflight maps, dedupe, and debugging.
+    type Key;
+    type Submission: IOSubmission<Key = Self::Key>;
 
-    /// Called when sending request to AIO event loop.
-    /// Implementor should convert the request to submission and put it in the queue.
-    fn on_request(&mut self, req: Self::Request, queue: &mut IOQueue<Self::Submission>);
+    /// Called when receiving a new request from the worker channel.
+    /// Implementor should convert it to one or more concrete submissions.
+    fn prepare_request(&mut self, req: Self::Request, queue: &mut IOQueue<Self::Submission>);
 
-    /// Called when submitted to AIO context.
-    fn on_submit(&mut self, sub: Self::Submission);
+    /// Called after one submission is accepted by the kernel.
+    fn on_submit(&mut self, sub: &Self::Submission);
 
     /// Called when AIO is completed.
     /// The result contains number of bytes read/write, or the IO error.
-    /// It's caller's responsibility to store intermediate result (especially
-    /// buffer allocation) and map it via AIOKey in on_complete() function.
-    /// In such way, the caller always keeps the buffer in valid state.
-    fn on_complete(&mut self, key: AIOKey, res: std::io::Result<usize>) -> AIOKind;
+    fn on_complete(&mut self, sub: Self::Submission, res: std::io::Result<usize>) -> AIOKind;
 
     /// Called when stats is collected.
     fn on_stats(&mut self, stats: &AIOStats);
 
     /// Called when event loop is ended.
-    fn end_loop(self, ctx: &AIOContext);
+    fn end_loop(self);
 }
 
-/// Client of AIO event loop, can submit IO request
-/// or shutdown the execution loop.``
+/// Cloneable sender used to enqueue requests into one [`IOWorker`].
+///
+/// The client only transports state-machine requests. It does not own any
+/// backend-specific submission state.
 pub struct AIOClient<T>(Sender<AIOMessage<T>>);
 
 impl<T> AIOClient<T> {
@@ -493,39 +568,86 @@ impl<T> Clone for AIOClient<T> {
     }
 }
 
-/// Event loop of AIO.
-pub struct AIOEventLoop<T> {
-    ctx: AIOContext,
-    /// channel of IO requests.
+/// Delayed worker construction until the owner can provide the concrete state machine.
+///
+/// The builder fixes the backend and request channel first, then binds one
+/// concrete [`IOStateMachine`] later.
+pub struct IOWorkerBuilder<T, B = LibaioContext> {
+    backend: B,
     rx: Receiver<AIOMessage<T>>,
-    // Total number of IO submitted.
-    submitted: usize,
-    // flag to stop the event loop.
-    shutdown: bool,
 }
 
-impl<T> AIOEventLoop<T> {
-    /// Start a separate thread for AIO event loop.
-    pub fn start_thread<L>(self, listener: L) -> JoinHandle<()>
+impl<T, B> IOWorkerBuilder<T, B>
+where
+    B: IOBackend,
+{
+    /// Attaches one state machine to this backend-bound worker builder.
+    #[inline]
+    pub fn bind<S>(self, state_machine: S) -> IOWorker<T, S, B>
     where
-        L: AIOEventListener<Request = T> + Send + 'static,
-        L::Request: Send + 'static,
+        S: IOStateMachine<Request = T>,
     {
-        thread::spawn_named("AIOEventLoop", move || self.run(listener))
+        let io_depth = self.backend.max_events();
+        let submit_batch = self.backend.new_submit_batch();
+        IOWorker {
+            backend: self.backend,
+            rx: self.rx,
+            submitted: 0,
+            shutdown: false,
+            staged_slots: VecDeque::new(),
+            submit_batch,
+            slots: InflightSlots::new(io_depth),
+            state_machine,
+        }
+    }
+}
+
+/// Concrete batch-oriented IO worker with one state machine implementation.
+///
+/// The worker owns:
+/// - request receipt from the channel
+/// - inflight slot allocation and ABA-safe completion tokens
+/// - backend preparation and batch submission
+/// - dispatch back into the state machine on submit and completion
+///
+/// Domain-level dedupe and same-key conflict policy remain inside the state
+/// machine and its owning subsystem.
+pub struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = LibaioContext> {
+    backend: B,
+    rx: Receiver<AIOMessage<T>>,
+    submitted: usize,
+    shutdown: bool,
+    staged_slots: VecDeque<u32>,
+    submit_batch: B::SubmitBatch,
+    slots: InflightSlots<InflightEntry<S::Submission, B::Prepared>>,
+    state_machine: S,
+}
+
+impl<T, S, B> IOWorker<T, S, B>
+where
+    S: IOStateMachine<Request = T>,
+    S::Request: Send + 'static,
+    S::Submission: Send + 'static,
+    B: IOBackend,
+    B::Prepared: Send + 'static,
+    B::SubmitBatch: Send + 'static,
+{
+    /// Starts a dedicated thread that runs this worker until shutdown and drain.
+    pub fn start_thread(self) -> JoinHandle<()>
+    where
+        S: Send + 'static,
+        B: Send + 'static,
+    {
+        thread::spawn_named("IOWorker", move || self.run())
     }
 
     #[inline]
     fn io_depth(&self) -> usize {
-        self.ctx.max_events()
+        self.backend.max_events()
     }
 
     #[inline]
-    fn fetch_reqs<L: AIOEventListener<Request = T>>(
-        &mut self,
-        listener: &mut L,
-        queue: &mut IOQueue<L::Submission>,
-        mut min_reqs: usize,
-    ) {
+    fn fetch_reqs(&mut self, queue: &mut IOQueue<S::Submission>, mut min_reqs: usize) {
         let mut msg = if min_reqs > 0 {
             // won't fail because we always send Shutdown message before
             // we close sender side.
@@ -545,7 +667,7 @@ impl<T> AIOEventLoop<T> {
                     return;
                 }
                 AIOMessage::Req(req) => {
-                    listener.on_request(req, queue);
+                    self.state_machine.prepare_request(req, queue);
                 }
             }
             // collapse continuous messages
@@ -567,11 +689,36 @@ impl<T> AIOEventLoop<T> {
         }
     }
 
-    fn run<L: AIOEventListener<Request = T>>(mut self, mut listener: L) {
+    #[inline]
+    fn prepare_staged(&mut self, queue: &mut IOQueue<S::Submission>) {
+        while self.slots.has_vacant() {
+            let Some(mut sub) = queue.reqs.pop_front() else {
+                break;
+            };
+            let (token, slot) = self
+                .slots
+                .reserve()
+                .expect("slot reservation should succeed while vacant slots exist");
+            let mut prepared = self.backend.prepare(token, sub.operation());
+            self.backend
+                .push_prepared(&mut self.submit_batch, &mut prepared);
+            self.slots.occupy_reserved(
+                slot,
+                InflightEntry {
+                    submission: sub,
+                    _prepared: prepared,
+                    submitted: false,
+                },
+            );
+            self.staged_slots.push_back(slot);
+        }
+    }
+
+    fn run(mut self) {
         // IO results.
-        let mut results = self.ctx.events();
+        let mut results = self.backend.new_events();
         // IO queue
-        let mut queue: IOQueue<L::Submission> = IOQueue::with_capacity(self.io_depth());
+        let mut queue: IOQueue<S::Submission> = IOQueue::with_capacity(self.io_depth());
         loop {
             debug_assert!(
                 queue.consistent(),
@@ -579,23 +726,30 @@ impl<T> AIOEventLoop<T> {
             );
             // We only accept request if shutdown flag is false.
             if !self.shutdown {
-                if queue.len() + self.submitted == 0 {
+                if queue.len() + self.staged_slots.len() + self.submitted == 0 {
                     // there is no IO operation running.
-                    self.fetch_reqs(&mut listener, &mut queue, 1);
+                    self.fetch_reqs(&mut queue, 1);
                 } else if queue.len() < self.io_depth() {
-                    self.fetch_reqs(&mut listener, &mut queue, 0);
+                    self.fetch_reqs(&mut queue, 0);
                 } // otherwise, do not fetch
             }
+            self.prepare_staged(&mut queue);
             // Event if shutdown flag is set to true, we still process queued requests.
-            let (io_submit_count, io_submit_nanos) = if !queue.is_empty() {
+            let (io_submit_count, io_submit_nanos) = if !self.staged_slots.is_empty() {
                 let start = Instant::now();
                 // Try to submit as many IO requests as possible
                 debug_assert!(self.io_depth() >= self.submitted);
                 let limit = self.io_depth() - self.submitted;
-                let submit_count = self.ctx.submit_limit(queue.iocbs(), limit);
-                // Add requests to inflight tree.
-                for (_iocb, sub) in queue.drain_to(submit_count) {
-                    listener.on_submit(sub);
+                let submit_count = self.backend.submit_batch(&mut self.submit_batch, limit);
+                for _ in 0..submit_count {
+                    let slot = self
+                        .staged_slots
+                        .pop_front()
+                        .expect("submitted slots must have queued staging order");
+                    let entry = self.slots.get_mut(slot);
+                    debug_assert!(!entry.submitted);
+                    self.state_machine.on_submit(&entry.submission);
+                    entry.submitted = true;
                 }
                 debug_assert!(queue.consistent());
                 self.submitted += submit_count;
@@ -608,26 +762,33 @@ impl<T> AIOEventLoop<T> {
             // wait for any request to be done.
             // Note: even if we received shutdown message, we should wait all submitted IO finish before quiting.
             // This will prevent kernel from accessing a freed memory via async IO processing.
-            let (io_wait_count, io_wait_nanos, finished_reads, finished_writes) = if self.submitted
-                != 0
-            {
-                let start = Instant::now();
-                let (read_count, write_count) =
-                    self.ctx
-                        .wait_at_least(&mut results, 1, |key, res| listener.on_complete(key, res));
-                self.submitted -= read_count + write_count;
-                (
-                    1,
-                    start.elapsed().as_nanos() as usize,
-                    read_count,
-                    write_count,
-                )
-            } else {
-                (0, 0, 0, 0)
-            };
+            let (io_wait_count, io_wait_nanos, finished_reads, finished_writes) =
+                if self.submitted != 0 {
+                    let start = Instant::now();
+                    let completions = self.backend.wait_at_least(&mut results, 1);
+                    let mut read_count = 0;
+                    let mut write_count = 0;
+                    for (token, res) in completions {
+                        let entry = self.slots.take(token);
+                        debug_assert!(entry.submitted);
+                        match self.state_machine.on_complete(entry.submission, res) {
+                            AIOKind::Read => read_count += 1,
+                            AIOKind::Write => write_count += 1,
+                        }
+                    }
+                    self.submitted -= read_count + write_count;
+                    (
+                        1,
+                        start.elapsed().as_nanos() as usize,
+                        read_count,
+                        write_count,
+                    )
+                } else {
+                    (0, 0, 0, 0)
+                };
 
-            listener.on_stats(&AIOStats {
-                queuing: queue.len(),
+            self.state_machine.on_stats(&AIOStats {
+                queuing: queue.len() + self.staged_slots.len(),
                 running: self.submitted,
                 finished_reads,
                 finished_writes,
@@ -636,13 +797,17 @@ impl<T> AIOEventLoop<T> {
                 io_wait_count,
                 io_wait_nanos,
             });
-            // only quit when shutdown flag is set and no submitted tasks.
-            // all queued tasks are ignored. (is it safe???)
-            if self.shutdown && self.submitted == 0 {
+            // Drain local queues before quitting so backend-staged submissions
+            // and worker-owned request state are not dropped silently.
+            if self.shutdown
+                && self.submitted == 0
+                && self.staged_slots.is_empty()
+                && queue.is_empty()
+            {
                 break;
             }
         }
-        listener.end_loop(&self.ctx);
+        self.state_machine.end_loop();
     }
 }
 
@@ -680,12 +845,13 @@ pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T
 mod tests {
     use super::*;
     use crate::file::{FixedSizeBufferFreeList, SparseFile};
-    use std::collections::HashMap;
+    use libc::EAGAIN;
+    use std::os::fd::AsRawFd;
     use tempfile::TempDir;
 
     #[test]
     fn test_aio_file_ops() {
-        let ctx = AIOContext::try_default().unwrap();
+        let ctx = LibaioContext::try_default().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file1.txt");
         let file_path = file_path.to_string_lossy().into_owned();
@@ -724,21 +890,17 @@ mod tests {
     }
 
     #[test]
-    fn test_aio_event_loop() {
-        let ctx = AIOContext::new(16).unwrap();
+    fn test_io_worker() {
+        let ctx = LibaioContext::new(16).unwrap();
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file3.txt");
         let file_path = file_path.to_string_lossy().into_owned();
         let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
 
         let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
-        let listener = SimpleListener {
-            file,
-            map: HashMap::new(),
-            key: 0,
-        };
-        let (event_loop, client) = ctx.event_loop();
-        let handle = event_loop.start_thread(listener);
+        let listener = SimpleListener { file, next_key: 0 };
+        let (worker, client) = ctx.io_worker();
+        let handle = worker.bind(listener).start_thread();
 
         let mut buf = buf_free_list.pop(false);
         buf.reset();
@@ -769,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_submit_limit_eagain_no_panic() {
-        let ctx = AIOContext::try_default().unwrap();
+        let ctx = LibaioContext::try_default().unwrap();
         let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
         let iocb = iocb::boxed();
         let reqs = vec![iocb.as_mut_ptr()];
@@ -784,53 +946,54 @@ mod tests {
         buf: DirectBuf,
     }
     struct Submission {
+        key: u64,
         kind: AIOKind,
-        aio: AIO<DirectBuf>,
+        operation: Operation,
+    }
+    impl IOSubmission for Submission {
+        type Key = u64;
+
+        fn key(&self) -> &Self::Key {
+            &self.key
+        }
+
+        fn operation(&mut self) -> &mut Operation {
+            &mut self.operation
+        }
     }
     struct SimpleListener {
         file: SparseFile,
-        map: HashMap<AIOKey, Submission>,
-        key: AIOKey,
+        next_key: u64,
     }
-    impl AIOEventListener for SimpleListener {
+    impl IOStateMachine for SimpleListener {
         type Request = Request;
+        type Key = u64;
         type Submission = Submission;
 
-        fn on_request(&mut self, req: Request, queue: &mut IOQueue<Submission>) {
-            // auto-generated AIO key.
-            let key = self.key;
-            self.key += 1;
-            let (iocb, aio) = match req.kind {
-                AIOKind::Read => {
-                    let aio = self.file.pread_direct(key, req.offset, req.buf);
-                    let iocb = aio.iocb_raw();
-                    (iocb, aio)
-                }
+        fn prepare_request(&mut self, req: Request, queue: &mut IOQueue<Submission>) {
+            let key = self.next_key;
+            self.next_key += 1;
+            let operation = match req.kind {
+                AIOKind::Read => Operation::pread_owned(self.file.as_raw_fd(), req.offset, req.buf),
                 AIOKind::Write => {
-                    let aio = self.file.pwrite_direct(key, req.offset, req.buf);
-                    let iocb = aio.iocb_raw();
-                    (iocb, aio)
+                    Operation::pwrite_owned(self.file.as_raw_fd(), req.offset, req.buf)
                 }
             };
-            queue.push(
-                iocb,
-                Submission {
-                    kind: req.kind,
-                    aio,
-                },
-            )
+            queue.push(Submission {
+                key,
+                kind: req.kind,
+                operation,
+            })
         }
 
-        fn on_submit(&mut self, sub: Submission) {
+        fn on_submit(&mut self, sub: &Submission) {
             // here we must hold the IO buffer until syscall returns.
-            let res = self.map.insert(sub.aio.key, sub);
-            debug_assert!(res.is_none());
+            debug_assert!(*sub.key() < u64::MAX);
         }
 
-        fn on_complete(&mut self, key: AIOKey, res: std::io::Result<usize>) -> AIOKind {
+        fn on_complete(&mut self, sub: Submission, res: std::io::Result<usize>) -> AIOKind {
             match res {
                 Ok(len) => {
-                    let sub = self.map.remove(&key).unwrap();
                     match sub.kind {
                         AIOKind::Read => {
                             println!("read {} bytes", len);
@@ -839,13 +1002,9 @@ mod tests {
                             println!("write {} bytes", len);
                         }
                     }
-                    let buf = sub.aio.buf.as_ref().unwrap();
+                    let buf = sub.operation.buf().unwrap();
                     let n = buf.data().len().min(20);
                     println!("leading {} bytes: {:?}", n, &buf.data()[..n]);
-                    // Here we just drop the buffer.
-                    // In actual implementation, we should send the result buffer back
-                    // to client.
-                    drop(sub.aio);
                     sub.kind
                 }
                 Err(err) => {
@@ -858,7 +1017,7 @@ mod tests {
             println!("stats: {:?}", stats);
         }
 
-        fn end_loop(self, _ctx: &AIOContext) {
+        fn end_loop(self) {
             drop(self.file);
         }
     }

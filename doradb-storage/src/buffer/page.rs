@@ -1,6 +1,6 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
-use crate::io::UnsafeAIO;
+use crate::io::{IOSubmission, Operation};
 use crate::notify::EventNotifyOnDrop;
 use std::mem;
 use std::sync::Arc;
@@ -61,13 +61,38 @@ pub enum IOKind {
     ReadWaitForWrite,
 }
 
+/// One evictable-pool writeback submission owned by the generic IO worker.
+///
+/// Read-miss loads now use the shared generic read-load core in `buffer/load.rs`.
 pub struct PageIO {
-    pub page_guard: PageExclusiveGuard<Page>,
-    pub kind: IOKind,
-    pub uio: UnsafeAIO,
+    pub(crate) key: PageID,
+    pub(crate) operation: Operation,
+    pub(crate) page_guard: PageExclusiveGuard<Page>,
     // Batch-level completion token cloned into each write submission.
     // The last drop notifies the evictor waiting for the whole write batch.
     pub(crate) batch_done: Option<Arc<EventNotifyOnDrop>>,
+}
+
+impl PageIO {
+    /// Returns the evictable page id targeted by this submission.
+    #[inline]
+    pub fn page_id(&self) -> PageID {
+        self.page_guard.page_id()
+    }
+}
+
+impl IOSubmission for PageIO {
+    type Key = PageID;
+
+    #[inline]
+    fn key(&self) -> &Self::Key {
+        &self.key
+    }
+
+    #[inline]
+    fn operation(&mut self) -> &mut Operation {
+        &mut self.operation
+    }
 }
 
 /// Convenient for IO thread to process, no matter

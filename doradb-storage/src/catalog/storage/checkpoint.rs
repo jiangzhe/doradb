@@ -597,10 +597,10 @@ fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bo
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::ReadonlyCacheKey;
-    use crate::catalog::storage::CATALOG_MTB_READONLY_FILE_ID;
+    use crate::buffer::PersistedBlockKey;
     use crate::catalog::tests::{table1, table2};
     use crate::engine::EngineConfig;
+    use crate::file::multi_table_file::CATALOG_MTB_PERSISTED_FILE_ID;
     use crate::trx::sys_conf::TrxSysConfig;
     use tempfile::TempDir;
 
@@ -643,7 +643,7 @@ mod tests {
 
             let cached_after_first = engine.disk_pool.allocated();
             assert!(cached_after_first >= 1);
-            let root_key = ReadonlyCacheKey::new(CATALOG_MTB_READONLY_FILE_ID, root_page_id);
+            let root_key = PersistedBlockKey::new(CATALOG_MTB_PERSISTED_FILE_ID, root_page_id);
             assert!(engine.disk_pool.try_get_frame_id(&root_key).is_some());
 
             let entries2 = engine

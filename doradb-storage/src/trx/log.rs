@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
-use crate::io::{AIO, AIOContext, AIOError, AIOKind, DirectBuf, IocbRawPtr, io_event};
+use crate::io::{AIO, AIOError, AIOKind, DirectBuf, LibaioContext, io_event};
 use crate::notify::EventNotifyOnDrop;
 use crate::serde::Ser;
 use crate::session::SessionState;
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 pub const LOG_HEADER_PAGES: usize = 2;
 
 pub struct LogPartitionInitializer {
-    pub(super) ctx: AIOContext,
+    pub(super) ctx: LibaioContext,
     pub(super) mode: LogPartitionMode,
     pub(super) file_prefix: String,
     pub(super) file_max_size: usize,
@@ -53,7 +53,7 @@ impl LogPartitionInitializer {
         logs: Vec<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
-            ctx: AIOContext::new(io_depth_per_log)?,
+            ctx: LibaioContext::new(io_depth_per_log)?,
             mode: LogPartitionMode::Recovery(VecDeque::from(logs)),
             file_prefix,
             file_max_size,
@@ -164,7 +164,7 @@ pub(super) struct LogPartition {
     /// Split into multiple buckets in order to avoid bottleneck of global synchronization.
     pub(super) gc_buckets: Box<[GCBucket]>,
     /// AIO manager to handle async IO with libaio.
-    pub(super) aio_ctx: AIOContext,
+    pub(super) aio_ctx: LibaioContext,
     /// Index of log partition in total partitions, starts from 0.
     pub(super) log_no: usize,
     /// Maximum IO size of each group.
@@ -399,7 +399,6 @@ impl LogPartition {
 
                 debug_assert!(fp.in_progress == 0);
                 debug_assert!(fp.inflight.is_empty());
-                debug_assert!(fp.io_reqs.is_empty());
                 debug_assert!(fp.sync_groups.is_empty());
 
                 // todo: update file header.
@@ -484,7 +483,6 @@ struct FileProcessor<'a> {
     max_io_size: usize,
     inflight: BTreeMap<TrxID, SyncGroup>,
     in_progress: usize,
-    io_reqs: Vec<IocbRawPtr>,
     sync_groups: VecDeque<SyncGroup>,
     events: Box<[io_event]>,
     written: Vec<SyncGroup>,
@@ -506,7 +504,6 @@ impl<'a> FileProcessor<'a> {
             max_io_size: config.max_io_size.as_u64() as usize,
             inflight: BTreeMap::new(),
             in_progress: 0,
-            io_reqs: vec![],
             sync_groups: VecDeque::new(),
             events: partition.aio_ctx.events(),
             written: vec![],
@@ -525,8 +522,8 @@ impl<'a> FileProcessor<'a> {
     fn process_single_file(&mut self) -> Option<SparseFile> {
         loop {
             debug_assert!(
-                self.io_reqs.len() == self.sync_groups.len(),
-                "pending IO number equals to pending group number"
+                self.sync_groups.len() + self.inflight.len() >= self.in_progress,
+                "queued and inflight groups should cover all submitted work"
             );
             // If shutdown flag is set, we still submit and finish all pending IOs,
             // but do not accept any new IO requests.
@@ -597,13 +594,11 @@ impl<'a> FileProcessor<'a> {
                         return Some(log_file);
                     }
                     Some(Commit::Group(cg)) => {
-                        let (iocb_ptr, sg) = cg.split();
-                        self.io_reqs.push(iocb_ptr);
-                        self.sync_groups.push_back(sg);
+                        self.sync_groups.push_back(cg.into_sync_group());
                     }
                 }
             }
-            if !self.io_reqs.is_empty() {
+            if !self.sync_groups.is_empty() {
                 return None;
             }
             self.partition
@@ -629,9 +624,7 @@ impl<'a> FileProcessor<'a> {
                     return Some(log_file);
                 }
                 Some(Commit::Group(cg)) => {
-                    let (iocb_ptr, sg) = cg.split();
-                    self.io_reqs.push(iocb_ptr);
-                    self.sync_groups.push_back(sg);
+                    self.sync_groups.push_back(cg.into_sync_group());
                 }
             }
         }
@@ -726,13 +719,17 @@ impl<'a> FileProcessor<'a> {
     /// Submit IO requests, returns submitted count and elapsed time.
     #[inline]
     fn submit_io(&mut self) {
-        if !self.io_reqs.is_empty() {
+        if !self.sync_groups.is_empty() {
             let start = Instant::now();
             // try to submit as many IO requests as possible
             let limit = self.io_depth - self.in_progress;
-            let submit_count = self.partition.aio_ctx.submit_limit(&self.io_reqs, limit);
-            // remove io requests after submission.
-            self.io_reqs.drain(0..submit_count);
+            let io_reqs: Vec<_> = self
+                .sync_groups
+                .iter()
+                .take(limit)
+                .map(|sync_group| sync_group.aio.iocb_raw())
+                .collect();
+            let submit_count = self.partition.aio_ctx.submit_limit(&io_reqs, limit);
             // add sync groups to inflight tree.
             for sync_group in self.sync_groups.drain(..submit_count) {
                 let res = self.inflight.insert(sync_group.max_cts, sync_group);

@@ -6,7 +6,7 @@ use crate::catalog::Catalog;
 use crate::component::Supplier;
 use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
-use crate::io::{AIOContext, align_to_sector_size};
+use crate::io::{LibaioContext, align_to_sector_size};
 use crate::quiescent::QuiescentGuard;
 use crate::storage_path::{path_to_utf8, validate_log_file_stem};
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
@@ -192,7 +192,7 @@ impl TrxSysConfig {
     #[inline]
     pub fn log_partition_initializer(&self, log_no: usize) -> Result<LogPartitionInitializer> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
-        let ctx = AIOContext::new(self.io_depth_per_log)?;
+        let ctx = LibaioContext::new(self.io_depth_per_log)?;
         let file_prefix = self.file_prefix()?;
 
         // determine whether we should recovery from previous logs.

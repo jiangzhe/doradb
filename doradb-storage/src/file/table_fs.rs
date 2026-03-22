@@ -1,13 +1,14 @@
+use crate::buffer::{GlobalReadonlyBufferPool, ReadonlyBufferPool};
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
-use crate::error::{Error, Result};
+use crate::error::{Error, PersistedFileKind, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::multi_table_file::MultiTableFile;
+use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MultiTableFile};
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
-use crate::file::{FileIO, FileIOListener, FixedSizeBufferFreeList};
-use crate::io::{AIOClient, AIOContext, AIOEventLoop};
+use crate::file::{FixedSizeBufferFreeList, TableFsRequest, TableFsStateMachine};
+use crate::io::{AIOClient, IOWorkerBuilder, LibaioContext};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
 use parking_lot::Mutex;
@@ -19,7 +20,7 @@ use std::thread::JoinHandle;
 /// TableFileSystem provides functionalities including
 /// creating, opening, closing and removing table files.
 pub struct TableFileSystem {
-    io_client: AIOClient<FileIO>,
+    io_client: AIOClient<TableFsRequest>,
     buf_list: FixedSizeBufferFreeList,
     data_dir: PathBuf,
     // Catalog multi-table file name.
@@ -43,10 +44,10 @@ impl TableFileSystem {
         io_depth: usize,
         data_dir: PathBuf,
         catalog_file_name: String,
-    ) -> Result<(Self, AIOEventLoop<FileIO>)> {
-        let ctx = AIOContext::new(io_depth)?;
+    ) -> Result<(Self, IOWorkerBuilder<TableFsRequest>)> {
+        let ctx = LibaioContext::new(io_depth)?;
         let buf_list = FixedSizeBufferFreeList::new(COW_FILE_PAGE_SIZE, io_depth, io_depth * 2);
-        let (event_loop, io_client) = ctx.event_loop();
+        let (worker, io_client) = ctx.io_worker();
         Ok((
             TableFileSystem {
                 io_client,
@@ -54,7 +55,7 @@ impl TableFileSystem {
                 data_dir,
                 catalog_file_name,
             },
-            event_loop,
+            worker,
         ))
     }
 
@@ -72,6 +73,7 @@ impl TableFileSystem {
         let table_file = TableFile::create(
             &file_path,
             TABLE_FILE_INITIAL_SIZE,
+            table_id,
             self.io_client.clone(),
             self.buf_list.clone(),
             trunc,
@@ -83,14 +85,28 @@ impl TableFileSystem {
 
     /// Open an existing table file.
     #[inline]
-    pub async fn open_table_file(&self, table_id: TableID) -> Result<Arc<TableFile>> {
+    pub async fn open_table_file(
+        &self,
+        table_id: TableID,
+        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+    ) -> Result<(Arc<TableFile>, ReadonlyBufferPool)> {
         let file_path = self.table_file_path(table_id);
-        let table_file =
-            TableFile::open(&file_path, self.io_client.clone(), self.buf_list.clone())?;
-        let active_root = table_file.load_active_root().await?;
+        let table_file = Arc::new(TableFile::open(
+            &file_path,
+            table_id,
+            self.io_client.clone(),
+            self.buf_list.clone(),
+        )?);
+        let disk_pool = ReadonlyBufferPool::new(
+            table_id,
+            PersistedFileKind::TableFile,
+            Arc::clone(&table_file),
+            global_disk_pool,
+        );
+        let active_root = table_file.load_active_root_from_pool(&disk_pool).await?;
         let old_root = table_file.swap_active_root(active_root);
         debug_assert!(old_root.is_none());
-        Ok(Arc::new(table_file))
+        Ok((table_file, disk_pool))
     }
 
     /// Build file path for a logical table id.
@@ -118,23 +134,45 @@ impl TableFileSystem {
 
     /// Open existing catalog multi-table file or create a new one.
     #[inline]
-    pub async fn open_or_create_multi_table_file(&self) -> Result<Arc<MultiTableFile>> {
-        MultiTableFile::open_or_create(
+    pub async fn open_or_create_multi_table_file(
+        &self,
+        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+    ) -> Result<(Arc<MultiTableFile>, ReadonlyBufferPool)> {
+        let mtb = MultiTableFile::open_or_create(
             self.catalog_mtb_file_path(),
             self.io_client.clone(),
             self.buf_list.clone(),
         )
-        .await
+        .await?;
+        let disk_pool = ReadonlyBufferPool::new(
+            CATALOG_MTB_PERSISTED_FILE_ID,
+            PersistedFileKind::CatalogMultiTableFile,
+            Arc::clone(&mtb),
+            global_disk_pool,
+        );
+        if mtb
+            .active_root_ptr()
+            .load(std::sync::atomic::Ordering::Acquire)
+            .is_null()
+        {
+            let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
+            let old_root = mtb.swap_active_root(active_root);
+            debug_assert!(old_root.is_none());
+        }
+        Ok((mtb, disk_pool))
     }
 
-    fn start_worker(fs: QuiescentGuard<Self>, event_loop: AIOEventLoop<FileIO>) -> JoinHandle<()> {
-        let listener = FileIOListener::new(fs.buf_list.clone());
-        event_loop.start_thread(listener)
+    fn start_worker(
+        fs: QuiescentGuard<Self>,
+        worker: IOWorkerBuilder<TableFsRequest>,
+    ) -> JoinHandle<()> {
+        let state_machine = TableFsStateMachine::new(fs.buf_list.clone());
+        worker.bind(state_machine).start_thread()
     }
 }
 
 impl Supplier<TableFileSystemWorkers> for TableFileSystem {
-    type Provision = AIOEventLoop<FileIO>;
+    type Provision = IOWorkerBuilder<TableFsRequest>;
 }
 
 impl Component for TableFileSystem {
@@ -249,7 +287,7 @@ impl TableFileSystemConfig {
 
     /// Validate config and construct a [`TableFileSystem`].
     #[inline]
-    fn build_parts(self) -> Result<(TableFileSystem, AIOEventLoop<FileIO>)> {
+    fn build_parts(self) -> Result<(TableFileSystem, IOWorkerBuilder<TableFsRequest>)> {
         if !validate_catalog_file_name(&self.catalog_file_name) {
             return Err(Error::InvalidStoragePath(format!(
                 "catalog file name must be a plain `.mtb` file name: {}",

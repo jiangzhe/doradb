@@ -1,9 +1,9 @@
 use crate::buffer::page::VersionedPageID;
-use crate::buffer::{BufferPool, PoolGuards, PoolRole};
+use crate::buffer::{BufferPool, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
 use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
-use crate::error::{Error, Result};
+use crate::error::{Error, PersistedFileKind, Result};
 use crate::index::BlockIndex;
 use crate::row::RowID;
 use crate::table::Table;
@@ -224,15 +224,21 @@ impl Session {
             table_file.active_root().column_block_index_root,
         )
         .await;
+        let disk_pool = ReadonlyBufferPool::new(
+            table_id,
+            PersistedFileKind::TableFile,
+            Arc::clone(&table_file),
+            engine.disk_pool.clone_inner(),
+        );
         let table = Arc::new(
             Table::new(
                 engine.mem_pool.clone_inner(),
                 engine.index_pool.clone_inner(),
                 index_pool_guard,
-                engine.disk_pool.clone_inner(),
                 table_id,
                 blk_idx,
                 table_file,
+                disk_pool,
             )
             .await,
         );

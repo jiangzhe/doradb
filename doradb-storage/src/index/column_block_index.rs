@@ -1141,16 +1141,14 @@ fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{ReadonlyCacheKey, global_readonly_pool_scope, table_readonly_pool};
+    use crate::buffer::{PersistedBlockKey, global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::build_test_fs;
-    use crate::file::table_file::{MutableTableFile, TableFile};
+    use crate::file::table_file::MutableTableFile;
     use crate::index::load_payload_deletion_deltas;
-    use crate::io::AIOBuf;
-    use crate::ptr::UnsafePtr;
     use crate::value::ValKind;
     use std::sync::Arc;
 
@@ -1171,17 +1169,13 @@ mod tests {
 
     #[inline]
     async fn read_node_from_file(
-        table_file: &TableFile,
+        disk_pool: &ReadonlyBufferPool,
         page_id: PageID,
     ) -> Result<Box<ColumnBlockNode>> {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        // SAFETY: `DirectBuf` is sector-aligned and remains alive until async read completes.
-        unsafe {
-            table_file
-                .read_page_into_ptr(page_id, UnsafePtr(buf.as_bytes_mut().as_mut_ptr()))
-                .await?;
-        }
-        copy_persisted_node(buf.as_bytes(), PersistedFileKind::TableFile, page_id)
+        let page = disk_pool
+            .try_get_validated_page_shared(page_id, validate_persisted_column_block_index_page)
+            .await?;
+        copy_persisted_node(page.page(), PersistedFileKind::TableFile, page_id)
     }
 
     fn build_persisted_node() -> DirectBuf {
@@ -1487,7 +1481,7 @@ mod tests {
                 let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
                 drop(old_root);
 
-                let root_node = read_node_from_file(&table_file, root_page).await.unwrap();
+                let root_node = read_node_from_file(&disk_pool, root_page).await.unwrap();
                 assert_eq!(root_node.header.height, 2);
                 assert_eq!(root_node.header.count, 2);
                 let root_entries = root_node.branch_entries();
@@ -1636,7 +1630,8 @@ mod tests {
                     (table_file, child_page_id, result)
                 };
 
-                let new_root = read_node_from_file(&table_file, result.new_page_id)
+                let disk_pool = table_readonly_pool(&global, 205, &table_file);
+                let new_root = read_node_from_file(&disk_pool, result.new_page_id)
                     .await
                     .unwrap();
                 let new_entries = new_root.branch_entries();
@@ -1651,6 +1646,7 @@ mod tests {
                     COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID
                 );
 
+                drop(disk_pool);
                 drop(global);
                 drop(table_file);
                 drop(fs);
@@ -1698,8 +1694,8 @@ mod tests {
                 let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
                 drop(old_root);
 
-                let old_root_node = read_node_from_file(&table_file, root_v1).await.unwrap();
-                let new_root_node = read_node_from_file(&table_file, root_v2).await.unwrap();
+                let old_root_node = read_node_from_file(&disk_pool, root_v1).await.unwrap();
+                let new_root_node = read_node_from_file(&disk_pool, root_v2).await.unwrap();
                 assert!(old_root_node.is_branch());
                 assert!(new_root_node.is_branch());
                 assert_eq!(
@@ -2238,14 +2234,14 @@ mod tests {
                 let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
                 drop(old_root);
 
-                let root_node = read_node_from_file(&table_file, root_v1).await.unwrap();
+                let root_node = read_node_from_file(&disk_pool, root_v1).await.unwrap();
                 assert!(root_node.is_branch());
                 let left_leaf_page_id = root_node.branch_entries()[0].page_id;
 
                 let index_v1 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool);
                 assert_eq!(index_v1.find(0).await.unwrap().unwrap().block_id, 5000);
 
-                let left_leaf_key = ReadonlyCacheKey::new(206, left_leaf_page_id);
+                let left_leaf_key = PersistedBlockKey::new(206, left_leaf_page_id);
                 let frame_before = global
                     .try_get_frame_id(&left_leaf_key)
                     .expect("left leaf should be cached after first lookup");

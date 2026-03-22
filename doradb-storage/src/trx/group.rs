@@ -1,5 +1,5 @@
 use crate::file::SparseFile;
-use crate::io::{IocbRawPtr, pwrite};
+use crate::io::pwrite;
 use crate::notify::EventNotifyOnDrop;
 use crate::serde::Ser;
 use crate::session::SessionState;
@@ -112,22 +112,20 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn split(self) -> (IocbRawPtr, SyncGroup) {
+    pub(super) fn into_sync_group(self) -> SyncGroup {
         // confirm data length in buffer header.
         let buf = self.log_buf.finish();
         // we always write a complete page instead of partial data.
         let log_bytes = buf.capacity();
         let aio = pwrite(self.max_cts, self.fd, self.offset, buf);
-        let iocb_ptr = aio.iocb_raw();
-        let sync_group = SyncGroup {
+        SyncGroup {
             trx_list: self.trx_list,
             max_cts: self.max_cts,
             log_bytes,
             aio,
             sync_ev: self.sync_ev,
             finished: false,
-        };
-        (iocb_ptr, sync_group)
+        }
     }
 }
 

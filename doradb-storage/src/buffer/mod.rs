@@ -5,6 +5,7 @@ mod fixed;
 pub mod frame;
 pub mod guard;
 mod identity;
+mod load;
 pub mod page;
 mod pool_guard;
 mod readonly;
@@ -20,12 +21,11 @@ pub use identity::PoolRole;
 pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
 pub(crate) use readonly::DiskPoolWorkers;
-pub use readonly::{
-    GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyCacheKey, ReadonlyPageSource,
-};
+pub(crate) use readonly::ReadonlyLoadSubmission;
+pub use readonly::{GlobalReadonlyBufferPool, PersistedBlockKey, ReadonlyBufferPool};
 
-/// Physical file identity used by the shared readonly cache.
-pub type ReadonlyFileID = u64;
+/// Physical file identity used by persisted-block mappings and cache invalidation.
+pub type PersistedFileID = u64;
 
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, PageID, VersionedPageID};
@@ -35,9 +35,17 @@ use crate::component::{
 };
 use crate::error::Result;
 use crate::error::Validation;
+use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
 use std::future::Future;
+
+/// Shared terminal-status cell for one page-sized buffer-pool IO operation.
+///
+/// Readonly pools use this cell to fan out one deduplicated miss load to many
+/// waiters. Evictable pools use the same cell for read reloads and for readers
+/// waiting behind writeback of the same page.
+pub(crate) type PageIOCompletion = Completion<Result<PageID>>;
 
 /// Abstraction of buffer pool.
 pub trait BufferPool: Send + Sync {

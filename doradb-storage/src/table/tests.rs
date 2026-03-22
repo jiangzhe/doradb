@@ -1533,7 +1533,11 @@ fn test_data_checkpoint_persistence_recovery() {
         let root_before = table.file().active_root().clone();
         drop(table);
 
-        let table_file = engine.table_fs.open_table_file(table_id).await.unwrap();
+        let (table_file, _) = engine
+            .table_fs
+            .open_table_file(table_id, engine.disk_pool.clone_inner())
+            .await
+            .unwrap();
         let root_after = table_file.active_root();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
         assert_eq!(

@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::page::PageID;
-use crate::catalog::table::TableMetadata;
+use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
@@ -19,9 +19,8 @@ use crate::file::super_page::{
     SUPER_PAGE_FOOTER_OFFSET, SUPER_PAGE_SIZE, SUPER_PAGE_VERSION, SuperPage, SuperPageBody,
     SuperPageFooter, SuperPageHeader, SuperPageSerView, parse_super_page,
 };
-use crate::file::{FileIO, FixedSizeBufferFreeList};
+use crate::file::{FixedSizeBufferFreeList, TableFsRequest};
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
-use crate::ptr::UnsafePtr;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
@@ -227,7 +226,8 @@ impl TableFile {
     pub(super) fn create(
         file_path: impl AsRef<str>,
         initial_size: usize,
-        io_client: AIOClient<FileIO>,
+        table_id: TableID,
+        io_client: AIOClient<TableFsRequest>,
         buf_list: FixedSizeBufferFreeList,
         trunc: bool,
     ) -> Result<Self> {
@@ -235,6 +235,7 @@ impl TableFile {
         let cow_file = CowFile::create(
             file_path,
             initial_size,
+            table_id,
             io_client,
             buf_list,
             table_codec(),
@@ -246,34 +247,21 @@ impl TableFile {
     #[inline]
     pub(super) fn open(
         file_path: impl AsRef<str>,
-        io_client: AIOClient<FileIO>,
+        table_id: TableID,
+        io_client: AIOClient<TableFsRequest>,
         buf_list: FixedSizeBufferFreeList,
     ) -> Result<Self> {
-        let cow_file = CowFile::open(file_path, io_client, buf_list, table_codec())?;
+        let cow_file = CowFile::open(file_path, table_id, io_client, buf_list, table_codec())?;
         Ok(TableFile(cow_file))
     }
 
-    /// Load the active root after validating the selected table meta page.
+    /// Load the active root after validating the selected table meta page through readonly cache.
     #[inline]
-    pub async fn load_active_root(&self) -> Result<ActiveRoot> {
-        self.0.load_active_root().await
-    }
-
-    /// Reads one table-file page directly into caller-provided memory.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `ptr` points to writable, sector-aligned memory
-    /// of at least `COW_FILE_PAGE_SIZE` bytes, and remains valid until
-    /// async completion.
-    #[inline]
-    pub async unsafe fn read_page_into_ptr(
+    pub async fn load_active_root_from_pool(
         &self,
-        page_id: PageID,
-        ptr: UnsafePtr<u8>,
-    ) -> Result<()> {
-        // SAFETY: caller upholds pointer validity/alignment until async completion.
-        unsafe { self.0.read_page_into_ptr(page_id, ptr).await }
+        disk_pool: &ReadonlyBufferPool,
+    ) -> Result<ActiveRoot> {
+        self.0.load_active_root_from_pool(disk_pool).await
     }
 
     #[inline]
@@ -376,17 +364,6 @@ impl MutableTableFile {
         self.new_root
             .as_ref()
             .expect("mutable table file has been consumed")
-    }
-
-    /// Consume mutable handle and return wrapped table file.
-    #[inline]
-    pub fn into_file(mut self) -> Arc<TableFile> {
-        let table_file = self
-            .file
-            .take()
-            .expect("mutable table file has been consumed");
-        self.release_mutable_claim_with_file(&table_file);
-        table_file
     }
 
     /// Updates mutable root column-index pointer.
@@ -591,6 +568,7 @@ pub type OldRoot = OldCowRoot<TableMeta>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::guard::PageGuard;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
@@ -601,14 +579,22 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
-    async fn read_page_for_test(table_file: &TableFile, page_id: PageID) -> Result<DirectBuf> {
+    fn accept_any_page(
+        _page: &[u8],
+        _file_kind: PersistedFileKind,
+        _page_id: PageID,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn read_page_for_test(table_file: &Arc<TableFile>, page_id: PageID) -> Result<DirectBuf> {
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, 0, table_file);
+        let page = disk_pool
+            .try_get_validated_page_shared(page_id, accept_any_page)
+            .await?;
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        // SAFETY: `DirectBuf` is sector-aligned and remains alive during async read.
-        unsafe {
-            table_file
-                .read_page_into_ptr(page_id, UnsafePtr(buf.as_bytes_mut().as_mut_ptr()))
-                .await?;
-        }
+        buf.as_bytes_mut().copy_from_slice(page.page());
         Ok(buf)
     }
 
@@ -634,7 +620,8 @@ mod tests {
             assert_eq!(table_file.active_root().trx_id, 1);
 
             // write
-            let mut buf = table_file.buf_list().pop_async(true).await;
+            let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+            buf.reset();
             buf.extend_from_slice(b"hello, world");
             let res = table_file.write_page(3, buf).await;
             assert!(res.is_ok());
@@ -646,13 +633,17 @@ mod tests {
 
             drop(table_file);
 
-            let table_file2 = fs.open_table_file(41).await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (table_file2, disk_pool) = fs.open_table_file(41, global.guard()).await.unwrap();
             assert_eq!(table_file2.active_root().trx_id, 1);
 
             let mutable = MutableTableFile::fork(&table_file2);
             let (table_file3, old_root) = mutable.commit(2, false).await.unwrap();
             drop(old_root);
-            let active_root = table_file3.load_active_root().await.unwrap();
+            let active_root = table_file3
+                .load_active_root_from_pool(&disk_pool)
+                .await
+                .unwrap();
             assert_eq!(active_root.page_no, 1);
             assert_eq!(active_root.trx_id, 2);
             drop(table_file2);
@@ -663,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_page_into_ptr_validates_byte_count() {
+    fn test_readonly_buffer_read_propagates_io_error() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs
@@ -672,16 +663,12 @@ mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let mut page = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 145, &table_file);
             let out_of_range_page_id = 1_000_000;
-            let res = unsafe {
-                table_file
-                    .read_page_into_ptr(
-                        out_of_range_page_id,
-                        UnsafePtr(page.as_bytes_mut().as_mut_ptr()),
-                    )
-                    .await
-            };
+            let res = disk_pool
+                .try_get_validated_page_shared(out_of_range_page_id, accept_any_page)
+                .await;
             assert!(res.is_err());
 
             drop(table_file);
@@ -788,7 +775,8 @@ mod tests {
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
             let fs = build_test_fs_in(temp_dir.path());
-            let err = match fs.open_table_file(table_id).await {
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let err = match fs.open_table_file(table_id, global.guard()).await {
                 Ok(_) => panic!("expected table meta checksum corruption"),
                 Err(err) => err,
             };
@@ -824,7 +812,8 @@ mod tests {
             );
 
             let fs = build_test_fs_in(temp_dir.path());
-            let err = match fs.open_table_file(table_id).await {
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let err = match fs.open_table_file(table_id, global.guard()).await {
                 Ok(_) => panic!("expected table meta version corruption"),
                 Err(err) => err,
             };
