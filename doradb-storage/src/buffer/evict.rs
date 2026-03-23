@@ -1009,7 +1009,7 @@ impl InMemPageSet {
 /// releases the reserved memory budget.
 pub(crate) struct EvictPageReservation {
     page_id: PageID,
-    page_guard: Option<PageExclusiveGuard<Page>>,
+    page_guard: PageExclusiveGuard<Page>,
     in_mem: Arc<InMemPageSet>,
 }
 
@@ -1020,7 +1020,7 @@ impl EvictPageReservation {
         let page_id = page_guard.page_id();
         EvictPageReservation {
             page_id,
-            page_guard: Some(page_guard),
+            page_guard,
             in_mem,
         }
     }
@@ -1029,43 +1029,39 @@ impl EvictPageReservation {
 impl PageReservation for EvictPageReservation {
     #[inline]
     fn page(&self) -> &Page {
-        self.page_guard
-            .as_ref()
-            .expect("evict load target must hold an exclusive page guard before publish")
-            .page()
+        self.page_guard.page()
     }
 
     #[inline]
     fn page_mut(&mut self) -> &mut Page {
-        self.page_guard
-            .as_mut()
-            .expect("evict load target must hold an exclusive page guard before publish")
-            .page_mut()
+        self.page_guard.page_mut()
     }
 
     #[inline]
-    fn publish(mut self) -> Result<PageID> {
+    fn publish(self) -> Result<PageID> {
+        let EvictPageReservation {
+            page_id,
+            mut page_guard,
+            in_mem,
+        } = self;
         {
-            let page_guard = self
-                .page_guard
-                .as_mut()
-                .expect("evict load target must hold an exclusive page guard before publish");
             let bf = page_guard.bf_mut();
             bf.set_dirty(false);
             let old_kind = bf.compare_exchange_kind(FrameKind::Evicted, FrameKind::Hot);
             debug_assert!(old_kind == FrameKind::Evicted);
         }
-        drop(self.page_guard.take());
-        self.in_mem.pin(self.page_id);
-        Ok(self.page_id)
+        drop(page_guard);
+        in_mem.pin(page_id);
+        Ok(page_id)
     }
 
     #[inline]
     /// Reclaims the reserved page memory and releases the reserved memory slot.
-    fn rollback(mut self) {
-        if let Some(page_guard) = self.page_guard.take() {
-            self.in_mem.mark_page_dontneed(page_guard);
-        }
+    fn rollback(self) {
+        let EvictPageReservation {
+            page_guard, in_mem, ..
+        } = self;
+        in_mem.mark_page_dontneed(page_guard);
     }
 }
 

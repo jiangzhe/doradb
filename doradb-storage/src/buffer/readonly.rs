@@ -614,7 +614,7 @@ pub(crate) struct ReadonlyPageReservation {
     pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     key: PersistedBlockKey,
     frame_id: PageID,
-    page_guard: Option<PageExclusiveGuard<Page>>,
+    page_guard: PageExclusiveGuard<Page>,
 }
 
 impl ReadonlyPageReservation {
@@ -656,7 +656,7 @@ impl ReadonlyPageReservation {
             pool,
             key,
             frame_id,
-            page_guard: Some(page_guard),
+            page_guard,
         })
     }
 }
@@ -664,53 +664,52 @@ impl ReadonlyPageReservation {
 impl PageReservation for ReadonlyPageReservation {
     #[inline]
     fn page(&self) -> &Page {
-        self.page_guard
-            .as_ref()
-            .expect("readonly load target must hold an exclusive page guard before publish")
-            .page()
+        self.page_guard.page()
     }
 
     #[inline]
     fn page_mut(&mut self) -> &mut Page {
-        self.page_guard
-            .as_mut()
-            .expect("readonly load target must hold an exclusive page guard before publish")
-            .page_mut()
+        self.page_guard.page_mut()
     }
 
     #[inline]
-    fn publish(mut self) -> Result<PageID> {
+    fn publish(self) -> Result<PageID> {
+        let ReadonlyPageReservation {
+            pool,
+            key,
+            frame_id,
+            mut page_guard,
+        } = self;
         {
-            let frame = self
-                .page_guard
-                .as_mut()
-                .expect("readonly load target must hold an exclusive page guard before publish")
-                .bf_mut();
-            frame.set_persisted_block_key(self.key.file_id, self.key.block_id);
+            let frame = page_guard.bf_mut();
+            frame.set_persisted_block_key(key.file_id, key.block_id);
             frame.set_dirty(false);
             frame.bump_generation();
             frame.set_kind(FrameKind::Hot);
         }
-        match self.pool.mappings.entry(self.key) {
+        match pool.mappings.entry(key) {
             Entry::Vacant(vac) => {
-                vac.insert(self.frame_id);
+                vac.insert(frame_id);
             }
             Entry::Occupied(_) => return Err(Error::InvalidState),
         }
-        drop(self.page_guard.take());
-        self.pool.residency.mark_resident(self.frame_id);
-        if self.pool.residency.no_free_frame() {
-            self.pool.residency.evict_ev.notify(1);
+        drop(page_guard);
+        pool.residency.mark_resident(frame_id);
+        if pool.residency.no_free_frame() {
+            pool.residency.evict_ev.notify(1);
         }
-        Ok(self.frame_id)
+        Ok(frame_id)
     }
 
     #[inline]
     /// Returns the frame to the free list and clears all persisted-block state.
-    fn rollback(mut self) {
-        let Some(mut page_guard) = self.page_guard.take() else {
-            return;
-        };
+    fn rollback(self) {
+        let ReadonlyPageReservation {
+            pool,
+            frame_id,
+            mut page_guard,
+            ..
+        } = self;
         page_guard.page_mut().zero();
         let frame = page_guard.bf_mut();
         frame.clear_persisted_block_key();
@@ -718,7 +717,7 @@ impl PageReservation for ReadonlyPageReservation {
         frame.bump_generation();
         frame.set_kind(FrameKind::Uninitialized);
         drop(page_guard);
-        self.pool.residency.release_free(self.frame_id);
+        pool.residency.release_free(frame_id);
     }
 }
 
@@ -726,7 +725,9 @@ impl PageReservation for ReadonlyPageReservation {
 ///
 /// The submission keeps the reserved frame, the inflight dedupe cell, and the
 /// IO operation together until the worker either publishes a successful load or
-/// completes all waiters with an error.
+/// completes all waiters with an error. Exactly one terminal result is
+/// published; drop only reports `InternalError` if no earlier terminal path
+/// completed the miss.
 pub(crate) struct ReadSubmission {
     key: PersistedBlockKey,
     operation: Operation,
@@ -734,6 +735,7 @@ pub(crate) struct ReadSubmission {
     inflight: Arc<PageIOCompletion>,
     reservation: Option<ReadonlyReservedPage>,
     validation: Option<InflightLoadValidation>,
+    completed: bool,
 }
 
 impl ReadSubmission {
@@ -755,21 +757,30 @@ impl ReadSubmission {
             inflight,
             reservation: Some(reservation),
             validation,
+            completed: false,
         }
     }
 
     #[inline]
-    /// Publishes the terminal miss result to all joined waiters.
-    fn complete_inflight(&self, result: Result<PageID>) {
+    /// Publishes the terminal miss result at most once.
+    ///
+    /// `ReadSubmission` also completes in `Drop` as a last-resort rollback
+    /// path, so every explicit terminal path must mark the submission as
+    /// completed to avoid a redundant second completion and inflight-map check.
+    fn complete_inflight_once(&mut self, result: Result<PageID>) {
+        if self.completed {
+            return;
+        }
         self.pool
             .complete_inflight_load(self.key, &self.inflight, result);
+        self.completed = true;
     }
 
     #[inline]
     /// Fails the miss before worker completion and wakes all joined waiters.
     pub(crate) fn fail(mut self, err: Error) {
         drop(self.reservation.take());
-        self.complete_inflight(Err(err));
+        self.complete_inflight_once(Err(err));
     }
 
     #[inline]
@@ -790,7 +801,7 @@ impl ReadSubmission {
                         self.key.block_id,
                     ) {
                         drop(self.reservation.take());
-                        self.complete_inflight(Err(err));
+                        self.complete_inflight_once(Err(err));
                         return AIOKind::Read;
                     }
                 }
@@ -811,7 +822,7 @@ impl ReadSubmission {
                 Err(err.into())
             }
         };
-        self.complete_inflight(result);
+        self.complete_inflight_once(result);
         AIOKind::Read
     }
 }
@@ -834,7 +845,7 @@ impl Drop for ReadSubmission {
     #[inline]
     fn drop(&mut self) {
         drop(self.reservation.take());
-        self.complete_inflight(Err(Error::InternalError));
+        self.complete_inflight_once(Err(Error::InternalError));
     }
 }
 
@@ -1367,8 +1378,8 @@ pub(crate) mod tests {
     use crate::value::ValKind;
     use std::ops::Deref;
     use std::os::fd::RawFd;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock};
     use std::thread;
     use std::time::Duration;
 
@@ -1610,20 +1621,32 @@ pub(crate) mod tests {
         buf
     }
 
+    /// Serializes ownership of the process-global libaio test hook.
+    ///
+    /// The hook itself is stored in `io::libaio_backend` as one process-global
+    /// slot, so readonly tests must not interleave install/restore across
+    /// different test cases.
+    static LIBAIO_TEST_HOOK_LOCK: LazyLock<parking_lot::Mutex<()>> =
+        LazyLock::new(|| parking_lot::Mutex::new(()));
+
     struct InstalledLibaioTestHook {
         previous: Option<Arc<dyn LibaioTestHook>>,
+        guard: Option<parking_lot::MutexGuard<'static, ()>>,
     }
 
     impl Drop for InstalledLibaioTestHook {
         #[inline]
         fn drop(&mut self) {
             let _ = set_libaio_test_hook(self.previous.take());
+            drop(self.guard.take());
         }
     }
 
     fn install_libaio_test_hook(hook: Arc<dyn LibaioTestHook>) -> InstalledLibaioTestHook {
+        let guard = LIBAIO_TEST_HOOK_LOCK.lock();
         InstalledLibaioTestHook {
             previous: set_libaio_test_hook(Some(hook)),
+            guard: Some(guard),
         }
     }
 
@@ -1779,6 +1802,62 @@ pub(crate) mod tests {
         drop(g3);
         assert_eq!(global.invalidate_key(&key), Some(3));
         assert_eq!(global.allocated(), 0);
+    }
+
+    #[test]
+    fn test_read_submission_terminal_completion_is_one_shot() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs.create_table_file(118, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
+                118,
+                PersistedFileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
+            let key = PersistedBlockKey::new(118, 14);
+            let inflight = Arc::new(PageIOCompletion::new());
+            let task_arena = global.arena.arena_guard(global.pool_guard());
+            let (frame_id, page_guard) =
+                ReadonlyPageReservation::reserve_page(&global, key, task_arena)
+                    .await
+                    .unwrap();
+            let reservation = ReadonlyPageReservation::from_reserved_page(
+                pool.global.clone(),
+                key,
+                frame_id,
+                page_guard,
+            );
+            let mut submission = ReadSubmission::new(
+                pool.backing.clone(),
+                pool.global.clone(),
+                key,
+                Arc::clone(&inflight),
+                None,
+                reservation,
+            );
+
+            submission.complete_inflight_once(Err(Error::SendError));
+            assert!(submission.completed);
+            assert!(matches!(
+                inflight.completed_result(),
+                Some(Err(Error::SendError))
+            ));
+
+            drop(submission);
+            assert!(matches!(
+                inflight.completed_result(),
+                Some(Err(Error::SendError))
+            ));
+
+            drop(pool);
+            drop(table_file);
+            drop(fs);
+        });
     }
 
     #[test]
@@ -2040,10 +2119,10 @@ pub(crate) mod tests {
             read_hook.release();
 
             assert_eq!(waiter.await, b"hello");
+            wait_for(|| !global.inflight_loads.contains_key(&key)).await;
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 1);
             assert!(global.try_get_frame_id(&key).is_some());
-            assert!(!global.inflight_loads.contains_key(&key));
             drop(table_file);
             drop(fs);
         });
