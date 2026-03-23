@@ -223,7 +223,7 @@ impl QuiescentArena {
             frame.ctx = None;
             T::init_frame(frame);
             frame.set_dirty(true);
-            frame.clear_readonly_key();
+            frame.clear_persisted_block_key();
         }
         guard.page_mut().zero();
         guard

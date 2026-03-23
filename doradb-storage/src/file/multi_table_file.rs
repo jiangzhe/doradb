@@ -1,9 +1,11 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PageID;
+use crate::buffer::{PersistedFileID, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
+use crate::file::TableFsRequest;
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
     OldCowRoot, ParsedMeta, validate_active_meta_page_id,
@@ -19,7 +21,6 @@ use crate::file::super_page::{
     SuperPageHeader, SuperPageSerView, parse_super_page,
 };
 use crate::file::table_file::TABLE_FILE_INITIAL_SIZE;
-use crate::file::{FileIO, FixedSizeBufferFreeList};
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
@@ -33,6 +34,8 @@ use std::sync::Arc;
 pub const CATALOG_MTB_VERSION: u64 = 2;
 /// Reserved number of catalog logical-table root descriptors.
 pub const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 4;
+/// Reserved persisted-file identity of `catalog.mtb`.
+pub const CATALOG_MTB_PERSISTED_FILE_ID: PersistedFileID = USER_OBJ_ID_START - 1;
 /// Initial sparse-file size for `catalog.mtb`.
 pub const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
 
@@ -228,19 +231,23 @@ impl MultiTableFile {
     #[inline]
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,
-        io_client: AIOClient<FileIO>,
-        buf_list: FixedSizeBufferFreeList,
+        io_client: AIOClient<TableFsRequest>,
     ) -> Result<Arc<Self>> {
         let file_path = file_path.as_ref();
         let file_exists = Path::new(file_path).exists();
         let cow_file = if file_exists {
-            CowFile::open(file_path, io_client, buf_list, multi_table_codec())?
+            CowFile::open(
+                file_path,
+                CATALOG_MTB_PERSISTED_FILE_ID,
+                io_client,
+                multi_table_codec(),
+            )?
         } else {
             CowFile::create(
                 file_path,
                 MULTI_TABLE_FILE_INITIAL_SIZE,
+                CATALOG_MTB_PERSISTED_FILE_ID,
                 io_client,
-                buf_list,
                 multi_table_codec(),
                 false,
             )?
@@ -248,11 +255,7 @@ impl MultiTableFile {
 
         let file = Arc::new(MultiTableFile(cow_file));
 
-        if file_exists {
-            let active_root = file.load_active_root().await?;
-            let old_root = file.swap_active_root(active_root);
-            debug_assert!(old_root.is_none());
-        } else {
+        if !file_exists {
             let mutable =
                 MutableMultiTableFile::new(Arc::clone(&file), MultiTableActiveRoot::new());
             let (_, old_root) = mutable.commit().await?;
@@ -264,8 +267,11 @@ impl MultiTableFile {
 
     /// Load the active root after validating the selected `catalog.mtb` meta page.
     #[inline]
-    pub async fn load_active_root(&self) -> Result<MultiTableActiveRoot> {
-        self.0.load_active_root().await
+    pub async fn load_active_root_from_pool(
+        &self,
+        disk_pool: &ReadonlyBufferPool,
+    ) -> Result<MultiTableActiveRoot> {
+        self.0.load_active_root_from_pool(disk_pool).await
     }
 
     /// Returns active-root snapshot from in-memory pointer without additional IO.
@@ -379,12 +385,6 @@ impl MutableMultiTableFile {
         self.new_root
             .as_ref()
             .expect("mutable multi-table file has been consumed")
-    }
-
-    /// Returns mutable reference to mutable root snapshot.
-    #[inline]
-    pub fn root_mut(&mut self) -> &mut MultiTableActiveRoot {
-        self.new_root_mut()
     }
 
     /// Allocate a new page id for copy-on-write updates.
@@ -513,6 +513,7 @@ fn build_super_page(page_no: PageID, checkpoint_cts: TrxID, meta_page_id: PageID
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::global_readonly_pool_scope;
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::page_integrity::PAGE_INTEGRITY_TRAILER_SIZE;
     use crate::file::{build_test_fs, build_test_fs_in};
@@ -553,8 +554,12 @@ mod tests {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
 
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
             let s0 = mtb.load_snapshot().unwrap();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(s0.meta.next_user_obj_id, USER_OBJ_ID_START);
@@ -574,7 +579,10 @@ mod tests {
             assert_ne!(meta_page_id_0, meta_page_id_1);
             drop(mtb);
 
-            let mtb2 = fs.open_or_create_multi_table_file().await.unwrap();
+            let (mtb2, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
             let s1 = mtb2.load_snapshot().unwrap();
             assert_eq!(s1.catalog_replay_start_ts, 7);
             assert_eq!(s1.meta.next_user_obj_id, USER_OBJ_ID_START + 16);
@@ -590,7 +598,11 @@ mod tests {
     fn test_multi_table_file_meta_page_copy_on_write() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
@@ -619,7 +631,11 @@ mod tests {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
             drop(mtb);
             drop(fs);
 
@@ -640,7 +656,7 @@ mod tests {
             file.sync_all().unwrap();
 
             let fs = build_test_fs_in(dir.path());
-            let res = fs.open_or_create_multi_table_file().await;
+            let res = fs.open_or_create_multi_table_file(global.guard()).await;
             assert!(res.is_err());
         });
     }
@@ -650,7 +666,11 @@ mod tests {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
             let active_meta_page_id = mtb.active_root().meta_page_id;
             drop(mtb);
             drop(fs);
@@ -671,7 +691,7 @@ mod tests {
             file.sync_all().unwrap();
 
             let fs = build_test_fs_in(dir.path());
-            let err = match fs.open_or_create_multi_table_file().await {
+            let err = match fs.open_or_create_multi_table_file(global.guard()).await {
                 Ok(_) => panic!("expected multi-table meta version corruption"),
                 Err(err) => err,
             };
@@ -688,7 +708,11 @@ mod tests {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
             let active_meta_page_id = mtb.active_root().meta_page_id;
             drop(mtb);
             drop(fs);
@@ -698,7 +722,7 @@ mod tests {
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
             let fs = build_test_fs_in(dir.path());
-            let err = match fs.open_or_create_multi_table_file().await {
+            let err = match fs.open_or_create_multi_table_file(global.guard()).await {
                 Ok(_) => panic!("expected multi-table meta checksum corruption"),
                 Err(err) => err,
             };
@@ -715,7 +739,11 @@ mod tests {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
 
             let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots_v1.iter_mut().enumerate() {
@@ -743,7 +771,10 @@ mod tests {
             overwrite_file_bytes(&path, version_offset, &2u64.to_le_bytes());
 
             let fs = build_test_fs_in(dir.path());
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
             let snapshot = mtb.load_snapshot().unwrap();
             assert_eq!(
                 snapshot.catalog_replay_start_ts,
@@ -758,7 +789,11 @@ mod tests {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
 
             let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots_v1.iter_mut().enumerate() {
@@ -809,7 +844,7 @@ mod tests {
             );
 
             let fs = build_test_fs_in(dir.path());
-            let err = match fs.open_or_create_multi_table_file().await {
+            let err = match fs.open_or_create_multi_table_file(global.guard()).await {
                 Ok(_) => panic!("expected newest multi-table root invariant failure"),
                 Err(err) => err,
             };
@@ -826,7 +861,11 @@ mod tests {
     fn test_multi_table_file_rejects_concurrent_fork() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
 
             let _first = MutableMultiTableFile::fork(&mtb);
             let _second = MutableMultiTableFile::fork(&mtb);
@@ -837,7 +876,11 @@ mod tests {
     fn test_multi_table_file_allows_fork_after_drop() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
-            let mtb = fs.open_or_create_multi_table_file().await.unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let (mtb, _) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
 
             let first = MutableMultiTableFile::fork(&mtb);
             drop(first);

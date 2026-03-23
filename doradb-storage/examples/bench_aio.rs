@@ -1,6 +1,6 @@
 use clap::Parser;
 use doradb_storage::file::SparseFile;
-use doradb_storage::io::{AIOContext, AIOKind, DirectBuf};
+use doradb_storage::io::{AIOKind, DirectBuf, LibaioContext};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 fn main() {
     let args = Args::parse();
     let stop = Arc::new(AtomicBool::new(false));
-    let ctx = Arc::new(AIOContext::new(args.io_depth).unwrap());
+    let ctx = Arc::new(LibaioContext::new(args.io_depth).unwrap());
     let mut handles = vec![];
     let start = Instant::now();
     for id in 0..args.log_partitions {
@@ -38,7 +38,7 @@ fn main() {
     );
 }
 
-fn worker(id: usize, aio_mgr: Arc<AIOContext>, args: Args, stop: Arc<AtomicBool>) -> usize {
+fn worker(id: usize, aio_mgr: Arc<LibaioContext>, args: Args, stop: Arc<AtomicBool>) -> usize {
     let file_name = format!("{}.{}", &args.log_file_prefix, id);
 
     let file = SparseFile::create_or_trunc(&file_name, args.log_file_max_size).unwrap();
@@ -65,12 +65,13 @@ fn worker(id: usize, aio_mgr: Arc<AIOContext>, args: Args, stop: Arc<AtomicBool>
         }
         let submit_count = aio_mgr.submit_limit(&reqs, usize::MAX);
         reqs.drain(..submit_count);
-        let (read_count, write_count) = aio_mgr.wait_at_least(&mut events, 1, |key, res| {
-            assert!(res.is_ok());
-            log_bytes += res.unwrap();
-            inflight.remove(&key);
-            AIOKind::Write
-        });
+        let (read_count, write_count) =
+            aio_mgr.wait_at_least(&mut events, 1, |key, res: std::io::Result<usize>| {
+                assert!(res.is_ok());
+                log_bytes += res.unwrap();
+                inflight.remove(&key);
+                AIOKind::Write
+            });
         if args.sync != 0 && read_count + write_count >= args.sync {
             syncer.fdatasync();
         }

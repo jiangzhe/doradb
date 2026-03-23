@@ -65,6 +65,20 @@ path above.
 -   If your changes touch I/O-related code, ensure the supported `libaio`
     validation path still passes.
 
+## Test Structure Conventions
+
+-   Prefer inline `#[cfg(test)] mod tests` blocks in the same source file as the code under test.
+-   Keep test-only helper types, hook traits, and setup utilities inside that inline `tests` module by default.
+-   If another module's tests need those helpers, re-export them with a narrow `#[cfg(test)] pub(crate) use ...::tests::{...};` from the parent module instead of widening the normal runtime API.
+-   Do not create standalone test-support source files unless there is a clear project-wide need that cannot be handled by inline test modules.
+
+## Test-Only Code Preference
+
+-   Do not distort production structs, traits, or ownership flow just to satisfy tests. Prefer keeping the production path clean and adapting tests to it.
+-   Prefer real production execution paths in tests. Use test-only hooks only when they are needed for timing, fault injection, or other control that real IO/concurrency paths cannot provide directly.
+-   When a test-only hook is needed, prefer minimal `#[cfg(test)]` branches over always-compiled runtime registries, indirection layers, or state that exists only for tests.
+-   Keep test-only visibility narrow: prefer inline `#[cfg(test)]` items or `pub(crate)` test re-exports over new general-purpose public interfaces.
+
 ## Local Coverage Focus
 
 Use the local coverage focus script when you need fast feedback for one file or directory.

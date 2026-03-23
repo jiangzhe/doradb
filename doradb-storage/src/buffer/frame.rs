@@ -1,4 +1,4 @@
-use crate::buffer::ReadonlyFileID;
+use crate::buffer::PersistedFileID;
 use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID, VersionedPageID};
 use crate::catalog::TableMetadata;
 use crate::latch::HybridLatch;
@@ -37,9 +37,9 @@ pub struct BufferFrame {
     generation: AtomicU64,
     frame_kind: AtomicU8,
     dirty: AtomicBool,
-    has_readonly_key: AtomicBool,
-    readonly_file_id: AtomicU64,
-    readonly_block_id: AtomicU64,
+    has_persisted_block_key: AtomicBool,
+    persisted_file_id: AtomicU64,
+    persisted_block_id: AtomicU64,
     /// Context of this buffer frame. It can store additinal contextual information
     /// about the page, e.g. undo map of row page.
     pub ctx: Option<Box<FrameContext>>,
@@ -99,31 +99,31 @@ impl BufferFrame {
         self.dirty.store(dirty, Ordering::Release);
     }
 
-    /// Returns readonly cache key stored in this frame, if present.
+    /// Returns the persisted-block identity stored in this frame, if present.
     #[inline]
-    pub fn readonly_key(&self) -> Option<(ReadonlyFileID, PageID)> {
-        if !self.has_readonly_key.load(Ordering::Acquire) {
+    pub fn persisted_block_key(&self) -> Option<(PersistedFileID, PageID)> {
+        if !self.has_persisted_block_key.load(Ordering::Acquire) {
             return None;
         }
-        let file_id = self.readonly_file_id.load(Ordering::Acquire);
-        let block_id = self.readonly_block_id.load(Ordering::Acquire);
+        let file_id = self.persisted_file_id.load(Ordering::Acquire);
+        let block_id = self.persisted_block_id.load(Ordering::Acquire);
         Some((file_id, block_id))
     }
 
-    /// Updates readonly cache key metadata for this frame.
+    /// Updates persisted-block metadata for this frame.
     #[inline]
-    pub fn set_readonly_key(&self, file_id: ReadonlyFileID, block_id: PageID) {
-        self.readonly_file_id.store(file_id, Ordering::Release);
-        self.readonly_block_id.store(block_id, Ordering::Release);
-        self.has_readonly_key.store(true, Ordering::Release);
+    pub fn set_persisted_block_key(&self, file_id: PersistedFileID, block_id: PageID) {
+        self.persisted_file_id.store(file_id, Ordering::Release);
+        self.persisted_block_id.store(block_id, Ordering::Release);
+        self.has_persisted_block_key.store(true, Ordering::Release);
     }
 
-    /// Clears readonly cache key metadata for this frame.
+    /// Clears persisted-block metadata for this frame.
     #[inline]
-    pub fn clear_readonly_key(&self) {
-        self.has_readonly_key.store(false, Ordering::Release);
-        self.readonly_file_id.store(0, Ordering::Release);
-        self.readonly_block_id
+    pub fn clear_persisted_block_key(&self) {
+        self.has_persisted_block_key.store(false, Ordering::Release);
+        self.persisted_file_id.store(0, Ordering::Release);
+        self.persisted_block_id
             .store(INVALID_PAGE_ID, Ordering::Release);
     }
 
@@ -152,9 +152,9 @@ impl Default for BufferFrame {
             generation: AtomicU64::new(0),
             // by default the page is dirty because no copy on disk.
             dirty: AtomicBool::new(true),
-            readonly_file_id: AtomicU64::new(0),
-            readonly_block_id: AtomicU64::new(INVALID_PAGE_ID),
-            has_readonly_key: AtomicBool::new(false),
+            persisted_file_id: AtomicU64::new(0),
+            persisted_block_id: AtomicU64::new(INVALID_PAGE_ID),
+            has_persisted_block_key: AtomicBool::new(false),
             ctx: None,
             page: std::ptr::null_mut(),
         }

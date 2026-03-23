@@ -247,17 +247,22 @@ This RFC changes code in an unsafe-sensitive area.
 
 - **Phase 2: Introduce Backend-Neutral Completion Core**
   - Scope: refactor `crate::io` so generic request/completion flow is backend
-    neutral, migrate file/buffer/log consumers to the new driver boundary, and
-    keep `libaio` working on top of the new core.
+    neutral, migrate file and buffer-pool consumers to the new driver
+    boundary, and keep `libaio` plus temporary redo-log compatibility helpers
+    working on top of the new core.
   - Goals: remove `iocb` from the generic submission interface, preserve
-    explicit ownership/completion semantics, and make backend-specific ABI code
-    an internal driver concern.
+    explicit ownership/completion semantics, make backend-specific ABI code an
+    internal driver concern, and land the file/buffer migration needed for
+    later redo and `io_uring` follow-up work.
   - Non-goals: exposing `io_uring` yet; changing the higher-level storage
-    semantics of file, buffer, or redo-log consumers.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    semantics of file, buffer, or redo-log consumers; finishing redo-log
+    migration in this phase.
+  - Task Doc: `docs/tasks/000085-introduce-iocompletion-based-async-io-framework.md`
+  - Task Issue: `#467`
+  - Phase Status: done
+  - Implementation Summary: Backend-neutral completion core landed for io, file, and buffer-pool paths; redo-log migration remains tracked in docs/backlogs/000067-redo-group-io-core.md [Task Resolve Sync: docs/tasks/000085-introduce-iocompletion-based-async-io-framework.md @ 2026-03-23]
+  - Related Backlogs:
+    - `docs/backlogs/000067-redo-group-io-core.md`
 
 - **Phase 3: Unify Storage I/O Error Handling**
   - Scope: define and implement storage-engine-wide I/O error policy after the

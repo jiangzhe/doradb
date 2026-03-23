@@ -235,7 +235,9 @@ impl Catalog {
                         index.index_attributes,
                     ));
                 }
-                let table_file = table_fs.open_table_file(table.table_id).await?;
+                let (table_file, disk_pool) = table_fs
+                    .open_table_file(table.table_id, global_disk_pool.clone())
+                    .await?;
                 let active_root = table_file.active_root();
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
                 let metadata_in_file = &*active_root.metadata;
@@ -258,10 +260,10 @@ impl Catalog {
                         mem_pool.clone(),
                         index_pool.clone(),
                         index_pool_guard,
-                        global_disk_pool.clone(),
                         table.table_id,
                         blk_idx,
                         table_file,
+                        disk_pool,
                     )
                     .await,
                 );

@@ -4,17 +4,15 @@ mod indexes;
 mod object;
 mod tables;
 
-use crate::buffer::{
-    BufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool, ReadonlyFileID,
-};
+use crate::buffer::{BufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool};
 use crate::catalog::runtime::CatalogTable;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 pub use crate::catalog::storage::object::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
-use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{PersistedFileKind, Result};
+use crate::catalog::{ObjID, TableID};
+use crate::error::Result;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
 };
@@ -24,8 +22,6 @@ use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-
-pub(crate) const CATALOG_MTB_READONLY_FILE_ID: ReadonlyFileID = USER_OBJ_ID_START - 1;
 
 /// Runtime storage container for all catalog logical tables.
 pub struct CatalogStorage {
@@ -48,14 +44,10 @@ impl CatalogStorage {
     ) -> Result<Self> {
         let meta_pool_guard = meta_pool.pool_guard();
         let index_pool_guard = index_pool.pool_guard();
-        let mtb = table_fs.open_or_create_multi_table_file().await?;
+        let (mtb, disk_pool) = table_fs
+            .open_or_create_multi_table_file(global_disk_pool)
+            .await?;
         let mtb_snapshot = mtb.load_snapshot()?;
-        let disk_pool = ReadonlyBufferPool::new(
-            CATALOG_MTB_READONLY_FILE_ID,
-            PersistedFileKind::CatalogMultiTableFile,
-            Arc::clone(&mtb),
-            global_disk_pool,
-        );
 
         let mut cat: Vec<Arc<CatalogTable>> = vec![];
         for CatalogDefinition { table_id, metadata } in [

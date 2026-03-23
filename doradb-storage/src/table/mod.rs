@@ -13,12 +13,12 @@ pub use recover::*;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuard,
-    PoolGuards, ReadonlyBufferPool, RowPoolRole,
+    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool,
+    RowPoolRole,
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
-use crate::error::{PersistedFileKind, Result};
+use crate::error::Result;
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
@@ -399,17 +399,7 @@ impl<P: BufferPool> GenericMemTable<P> {
 
 impl ColumnStorage {
     #[inline]
-    pub(crate) fn new(
-        table_id: TableID,
-        file: Arc<TableFile>,
-        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
-    ) -> Self {
-        let disk_pool = ReadonlyBufferPool::new(
-            table_id,
-            PersistedFileKind::TableFile,
-            Arc::clone(&file),
-            global_disk_pool,
-        );
+    pub(crate) fn new(file: Arc<TableFile>, disk_pool: ReadonlyBufferPool) -> Self {
         ColumnStorage {
             file,
             disk_pool,
@@ -443,10 +433,10 @@ impl Table {
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         index_pool: QuiescentGuard<FixedBufferPool>,
         index_pool_guard: &crate::buffer::PoolGuard,
-        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         table_id: TableID,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
+        disk_pool: ReadonlyBufferPool,
     ) -> Self {
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
@@ -461,7 +451,7 @@ impl Table {
             active_root.trx_id,
         )
         .await;
-        let storage = ColumnStorage::new(table_id, file, global_disk_pool);
+        let storage = ColumnStorage::new(file, disk_pool);
         Table { mem, storage }
     }
 
