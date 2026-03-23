@@ -1302,12 +1302,19 @@ impl BufferPool for ReadonlyBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
-        match self.get_page_facade(guard, page_id, mode).await {
-            Ok(g) => g,
-            Err(err) => {
-                todo!("readonly BufferPool::get_page error policy is deferred: {err}");
-            }
-        }
+        self.get_page_facade(guard, page_id, mode)
+            .await
+            .expect("readonly buffer pool get_page should not ignore page-I/O failures")
+    }
+
+    #[inline]
+    async fn try_get_page<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> Result<FacadePageGuard<T>> {
+        self.get_page_facade(guard, page_id, mode).await
     }
 
     #[inline]
@@ -1319,6 +1326,16 @@ impl BufferPool for ReadonlyBufferPool {
     ) -> Option<FacadePageGuard<T>> {
         self.global.validate_guard(guard);
         None
+    }
+
+    #[inline]
+    async fn try_get_page_versioned_result<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        id: VersionedPageID,
+        mode: LatchFallbackMode,
+    ) -> Result<Option<FacadePageGuard<T>>> {
+        Ok(self.try_get_page_versioned(guard, id, mode).await)
     }
 
     #[inline]
@@ -1342,6 +1359,24 @@ impl BufferPool for ReadonlyBufferPool {
             g.rollback_exclusive_version_change();
         }
         Validation::Invalid
+    }
+
+    #[inline]
+    async fn try_get_child_page<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        p_guard: &FacadePageGuard<T>,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> Result<Validation<FacadePageGuard<T>>> {
+        let g = self.try_get_page(guard, page_id, mode).await?;
+        if p_guard.validate_bool() {
+            return Ok(Valid(g));
+        }
+        if g.is_exclusive() {
+            g.rollback_exclusive_version_change();
+        }
+        Ok(Validation::Invalid)
     }
 }
 

@@ -137,7 +137,7 @@ pub trait TableAccess {
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
-    ) -> impl Future<Output = bool>;
+    ) -> impl Future<Output = Result<bool>>;
 }
 
 /// Thin operation wrapper that exposes `TableAccess` over a table reference.
@@ -184,57 +184,69 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         user_read_set: &[usize],
         row_id: RowID,
     ) -> SelectMvcc {
-        let location = match self
-            .try_find_row(stmt.pool_guards(), row_id, self.storage)
-            .await
-        {
-            Ok(location) => location,
-            Err(err) => return SelectMvcc::Err(err),
-        };
-        match location {
-            RowLocation::NotFound => SelectMvcc::NotFound,
-            RowLocation::LwcPage(page_id) => {
-                let Some(deletion_buffer) = self.deletion_buffer() else {
-                    return SelectMvcc::NotFound;
-                };
-                if let Some(marker) = deletion_buffer.get(row_id) {
-                    match marker {
-                        DeleteMarker::Committed(ts) => {
-                            if ts <= stmt.trx.sts {
-                                return SelectMvcc::NotFound;
-                            }
-                        }
-                        DeleteMarker::Ref(status) => {
-                            let ts = status.ts();
-                            if trx_is_committed(ts) {
+        loop {
+            let location = match self
+                .try_find_row(stmt.pool_guards(), row_id, self.storage)
+                .await
+            {
+                Ok(location) => location,
+                Err(err) => return SelectMvcc::Err(err),
+            };
+            match location {
+                RowLocation::NotFound => return SelectMvcc::NotFound,
+                RowLocation::LwcPage(page_id) => {
+                    let Some(deletion_buffer) = self.deletion_buffer() else {
+                        return SelectMvcc::NotFound;
+                    };
+                    if let Some(marker) = deletion_buffer.get(row_id) {
+                        match marker {
+                            DeleteMarker::Committed(ts) => {
                                 if ts <= stmt.trx.sts {
                                     return SelectMvcc::NotFound;
                                 }
-                            } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
-                                return SelectMvcc::NotFound;
+                            }
+                            DeleteMarker::Ref(status) => {
+                                let ts = status.ts();
+                                if trx_is_committed(ts) {
+                                    if ts <= stmt.trx.sts {
+                                        return SelectMvcc::NotFound;
+                                    }
+                                } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
+                                    return SelectMvcc::NotFound;
+                                }
                             }
                         }
                     }
+                    return match self.read_lwc_row(page_id, row_id, user_read_set).await {
+                        Ok(Some(vals)) => SelectMvcc::Ok(vals),
+                        Ok(None) => SelectMvcc::NotFound,
+                        Err(err) => SelectMvcc::Err(err),
+                    };
                 }
-                match self.read_lwc_row(page_id, row_id, user_read_set).await {
-                    Ok(Some(vals)) => SelectMvcc::Ok(vals),
-                    Ok(None) => SelectMvcc::NotFound,
-                    Err(err) => SelectMvcc::Err(err),
-                }
-            }
-            RowLocation::RowPage(page_id) => {
-                let page_guard = self
-                    .must_get_row_page_shared(stmt.pool_guards(), page_id)
-                    .await;
-                let page = page_guard.page();
-                if !page.row_id_in_valid_range(row_id) {
-                    return SelectMvcc::NotFound;
-                }
-                let (ctx, page) = page_guard.ctx_and_page();
-                let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
-                match access.read_row_mvcc(&stmt.trx, self.metadata(), user_read_set, Some(key)) {
-                    ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
-                    ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
+                RowLocation::RowPage(page_id) => {
+                    let page_guard = match self
+                        .try_get_row_page_shared_result(stmt.pool_guards(), page_id)
+                        .await
+                    {
+                        Ok(Some(page_guard)) => page_guard,
+                        Ok(None) => continue,
+                        Err(err) => return SelectMvcc::Err(err),
+                    };
+                    let page = page_guard.page();
+                    if !page.row_id_in_valid_range(row_id) {
+                        continue;
+                    }
+                    let (ctx, page) = page_guard.ctx_and_page();
+                    let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
+                    return match access.read_row_mvcc(
+                        &stmt.trx,
+                        self.metadata(),
+                        user_read_set,
+                        Some(key),
+                    ) {
+                        ReadRow::Ok(vals) => SelectMvcc::Ok(vals),
+                        ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
+                    };
                 }
             }
         }
@@ -388,7 +400,11 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                 RowLocation::NotFound => unreachable!(),
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await;
+                    let page_guard = self
+                        .try_get_row_page_exclusive_result(guards, page_id)
+                        .await
+                        .expect("delete_unique_no_trx_inner should not ignore page-I/O failures")
+                        .expect("failed to lock exclusive row page");
                     (page_guard, row_id)
                 }
             },
@@ -731,6 +747,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         UpdateIndex::Ok => (),
                         UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
                         UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
+                        UpdateIndex::Err(err) => return UpdateIndex::Err(err),
                     }
                 } else {
                     let res = self
@@ -821,6 +838,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                     {
                         UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
+                        UpdateIndex::Err(err) => return UpdateIndex::Err(err),
                         UpdateIndex::Ok => (),
                     }
                 } else {
@@ -851,6 +869,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                     {
                         UpdateIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         UpdateIndex::WriteConflict => return UpdateIndex::WriteConflict,
+                        UpdateIndex::Err(err) => return UpdateIndex::Err(err),
                         UpdateIndex::Ok => (),
                     }
                 } else {
@@ -970,14 +989,14 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         index: &impl UniqueIndex,
         key: &SelectKey,
         row_id: RowID,
-    ) -> bool {
+    ) -> Result<bool> {
         let index_pool_guard = guards.index_guard();
         let (page_guard, row_id) = loop {
             match index
                 .lookup(index_pool_guard, &key.vals, MIN_SNAPSHOT_TS)
                 .await
             {
-                None => return false, // Another thread deleted this entry.
+                None => return Ok(false), // Another thread deleted this entry.
                 Some((index_row_id, deleted)) => {
                     if !deleted || index_row_id != row_id {
                         // 1. Delete flag is unset by other transaction,
@@ -985,11 +1004,11 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         // 2. Row id changed, means another transaction inserted
                         // new row with same key and reused this index entry.
                         // So we skip to delete it.
-                        return false;
+                        return Ok(false);
                     }
-                    match self.find_row(guards, row_id, self.storage).await {
+                    match self.try_find_row(guards, row_id, self.storage).await? {
                         RowLocation::NotFound => {
-                            return index
+                            return Ok(index
                                 .compare_delete(
                                     index_pool_guard,
                                     &key.vals,
@@ -997,11 +1016,15 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                                     false,
                                     MIN_SNAPSHOT_TS,
                                 )
-                                .await;
+                                .await);
                         }
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let page_guard = self.must_get_row_page_shared(guards, page_id).await;
+                            let Some(page_guard) =
+                                self.try_get_row_page_shared_result(guards, page_id).await?
+                            else {
+                                continue;
+                            };
                             if validate_page_row_range(&page_guard, page_id, row_id) {
                                 break (page_guard, row_id);
                             }
@@ -1016,11 +1039,11 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         // no version with matched keys can be found in either page
         // data or version chain.
         if !access.any_version_matches_key(self.metadata(), key) {
-            return index
+            return Ok(index
                 .compare_delete(index_pool_guard, &key.vals, row_id, false, MIN_SNAPSHOT_TS)
-                .await;
+                .await);
         }
-        false
+        Ok(false)
     }
 
     #[inline]
@@ -1030,14 +1053,14 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         index: &impl NonUniqueIndex,
         key: &SelectKey,
         row_id: RowID,
-    ) -> bool {
+    ) -> Result<bool> {
         let index_pool_guard = guards.index_guard();
         let (page_guard, row_id) = loop {
             match index
                 .lookup_unique(index_pool_guard, &key.vals, row_id, MIN_SNAPSHOT_TS)
                 .await
             {
-                None => return false, // Another thread deleted this entry.
+                None => return Ok(false), // Another thread deleted this entry.
                 Some(deleted) => {
                     if !deleted {
                         // 1. Delete flag is unset by other transaction,
@@ -1045,11 +1068,11 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         // 2. Row id changed, means another transaction inserted
                         // new row with same key and reused this index entry.
                         // So we skip to delete it.
-                        return false;
+                        return Ok(false);
                     }
-                    match self.find_row(guards, row_id, self.storage).await {
+                    match self.try_find_row(guards, row_id, self.storage).await? {
                         RowLocation::NotFound => {
-                            return index
+                            return Ok(index
                                 .compare_delete(
                                     index_pool_guard,
                                     &key.vals,
@@ -1057,11 +1080,15 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                                     false,
                                     MIN_SNAPSHOT_TS,
                                 )
-                                .await;
+                                .await);
                         }
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let page_guard = self.must_get_row_page_shared(guards, page_id).await;
+                            let Some(page_guard) =
+                                self.try_get_row_page_shared_result(guards, page_id).await?
+                            else {
+                                continue;
+                            };
                             if validate_page_row_range(&page_guard, page_id, row_id) {
                                 break (page_guard, row_id);
                             }
@@ -1076,11 +1103,11 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         // no version with matched keys can be found in either page
         // data or version chain.
         if !access.any_version_matches_key(self.metadata(), key) {
-            return index
+            return Ok(index
                 .compare_delete(index_pool_guard, &key.vals, row_id, false, MIN_SNAPSHOT_TS)
-                .await;
+                .await);
         }
-        false
+        Ok(false)
     }
 
     #[inline]
@@ -1089,17 +1116,19 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         stmt: &mut Statement,
         row_count: usize,
     ) -> PageSharedGuard<RowPage> {
-        if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id())
-            && let Some(page_guard) = self
-                .try_get_row_page_versioned_shared(stmt.pool_guards(), page_id)
+        if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
+            let page_guard = self
+                .try_get_row_page_versioned_shared_result(stmt.pool_guards(), page_id)
                 .await
-        {
-            // because we save last insert page in session and meanwhile other thread may access this page
-            // and do some modification, even worse, buffer pool may evict it and reload other data into
-            // this page. so here, we do not require that no change should happen, but if something change,
-            // we validate that page id and row id range is still valid.
-            if validate_page_row_range(&page_guard, page_id.page_id, row_id) {
-                return page_guard;
+                .expect("get_insert_page should not ignore row-page reload failures");
+            if let Some(page_guard) = page_guard {
+                // because we save last insert page in session and meanwhile other thread may access this page
+                // and do some modification, even worse, buffer pool may evict it and reload other data into
+                // this page. so here, we do not require that no change should happen, but if something change,
+                // we validate that page id and row id range is still valid.
+                if validate_page_row_range(&page_guard, page_id.page_id, row_id) {
+                    return page_guard;
+                }
             }
         }
         let redo_ctx = self.row_page_create_redo_ctx(stmt);
@@ -1208,19 +1237,25 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         debug_assert!(old_id != new_id);
         let (old_guard, old_id) = loop {
             match self
-                .find_row(stmt.pool_guards(), old_id, self.storage)
+                .try_find_row(stmt.pool_guards(), old_id, self.storage)
                 .await
             {
-                RowLocation::NotFound => return LinkForUniqueIndex::None,
-                RowLocation::LwcPage(..) => todo!("lwc page"),
-                RowLocation::RowPage(page_id) => {
-                    let old_guard = self
-                        .must_get_row_page_shared(stmt.pool_guards(), page_id)
-                        .await;
+                Ok(RowLocation::NotFound) => return LinkForUniqueIndex::None,
+                Ok(RowLocation::LwcPage(..)) => todo!("lwc page"),
+                Ok(RowLocation::RowPage(page_id)) => {
+                    let old_guard = match self
+                        .try_get_row_page_shared_result(stmt.pool_guards(), page_id)
+                        .await
+                    {
+                        Ok(Some(old_guard)) => old_guard,
+                        Ok(None) => continue,
+                        Err(err) => return LinkForUniqueIndex::Err(err),
+                    };
                     if validate_page_row_range(&old_guard, page_id, old_id) {
                         break (old_guard, old_id);
                     }
                 }
+                Err(err) => return LinkForUniqueIndex::Err(err),
             }
         };
         // The link process is to find one version of the old row that matches
@@ -1281,6 +1316,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         LinkForUniqueIndex::WriteConflict => {
                             return InsertIndex::WriteConflict;
                         }
+                        LinkForUniqueIndex::Err(err) => return InsertIndex::Err(err),
                         LinkForUniqueIndex::None => {
                             // No old row found, so we can update index to point to self.
                             // This may happen because purge thread can remove row data,
@@ -1520,6 +1556,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                     {
                         LinkForUniqueIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         LinkForUniqueIndex::WriteConflict => return UpdateIndex::WriteConflict,
+                        LinkForUniqueIndex::Err(err) => return UpdateIndex::Err(err),
                         LinkForUniqueIndex::None => {
                             // No old version found.
                             // so we can update index to point to self
@@ -1751,6 +1788,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                     {
                         LinkForUniqueIndex::DuplicateKey => return UpdateIndex::DuplicateKey,
                         LinkForUniqueIndex::WriteConflict => return UpdateIndex::WriteConflict,
+                        LinkForUniqueIndex::Err(err) => return UpdateIndex::Err(err),
                         LinkForUniqueIndex::None => {
                             // no old row found.
                             match index
@@ -2069,6 +2107,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                 InsertIndex::WriteConflict => {
                     return InsertMvcc::WriteConflict;
                 }
+                InsertIndex::Err(err) => return InsertMvcc::Err(err),
             }
         }
         page_guard.set_dirty(); // mark as dirty page.
@@ -2092,17 +2131,23 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
             {
                 None => return UpdateMvcc::NotFound,
                 Some((row_id, _)) => match self
-                    .find_row(stmt.pool_guards(), row_id, self.storage)
+                    .try_find_row(stmt.pool_guards(), row_id, self.storage)
                     .await
                 {
-                    RowLocation::NotFound => return UpdateMvcc::NotFound,
-                    RowLocation::LwcPage(..) => todo!("lwc page"),
-                    RowLocation::RowPage(page_id) => {
-                        let page_guard = self
-                            .must_get_row_page_shared(stmt.pool_guards(), page_id)
-                            .await;
+                    Ok(RowLocation::NotFound) => return UpdateMvcc::NotFound,
+                    Ok(RowLocation::LwcPage(..)) => todo!("lwc page"),
+                    Ok(RowLocation::RowPage(page_id)) => {
+                        let page_guard = match self
+                            .try_get_row_page_shared_result(stmt.pool_guards(), page_id)
+                            .await
+                        {
+                            Ok(Some(page_guard)) => page_guard,
+                            Ok(None) => continue,
+                            Err(err) => return UpdateMvcc::Err(err),
+                        };
                         (page_guard, row_id)
                     }
+                    Err(err) => return UpdateMvcc::Err(err),
                 },
             };
             let res = self
@@ -2126,6 +2171,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                             UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
                             UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
                             UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                            UpdateIndex::Err(err) => UpdateMvcc::Err(err),
                         };
                     } // otherwise, do nothing
                     page_guard.set_dirty(); // mark as dirty page.
@@ -2161,6 +2207,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                             UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
                             UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
                             UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                            UpdateIndex::Err(err) => UpdateMvcc::Err(err),
                         };
                     } else {
                         let res = self
@@ -2173,6 +2220,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                             UpdateIndex::Ok => UpdateMvcc::Ok(new_row_id),
                             UpdateIndex::DuplicateKey => UpdateMvcc::DuplicateKey,
                             UpdateIndex::WriteConflict => UpdateMvcc::WriteConflict,
+                            UpdateIndex::Err(err) => UpdateMvcc::Err(err),
                         };
                     }
                 }
@@ -2197,11 +2245,11 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
             {
                 None => return DeleteMvcc::NotFound,
                 Some((row_id, _)) => match self
-                    .find_row(stmt.pool_guards(), row_id, self.storage)
+                    .try_find_row(stmt.pool_guards(), row_id, self.storage)
                     .await
                 {
-                    RowLocation::NotFound => return DeleteMvcc::NotFound,
-                    RowLocation::LwcPage(..) => {
+                    Ok(RowLocation::NotFound) => return DeleteMvcc::NotFound,
+                    Ok(RowLocation::LwcPage(..)) => {
                         let deletion_buffer = self
                             .deletion_buffer()
                             .expect("catalog table should never have lwc page rows");
@@ -2235,12 +2283,18 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                             }
                         }
                     }
-                    RowLocation::RowPage(page_id) => {
-                        let page_guard = self
-                            .must_get_row_page_shared(stmt.pool_guards(), page_id)
-                            .await;
+                    Ok(RowLocation::RowPage(page_id)) => {
+                        let page_guard = match self
+                            .try_get_row_page_shared_result(stmt.pool_guards(), page_id)
+                            .await
+                        {
+                            Ok(Some(page_guard)) => page_guard,
+                            Ok(None) => continue,
+                            Err(err) => return DeleteMvcc::Err(err),
+                        };
                         (page_guard, row_id)
                     }
+                    Err(err) => return DeleteMvcc::Err(err),
                 },
             };
             match self
@@ -2269,7 +2323,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
-    ) -> bool {
+    ) -> Result<bool> {
         // todo: consider index drop.
         let index_schema = &self.metadata().index_specs[key.index_no];
         debug_assert_eq!(unique, index_schema.unique());

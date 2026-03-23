@@ -160,6 +160,16 @@ impl BufferPool for FixedBufferPool {
     }
 
     #[inline]
+    async fn try_get_page<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> Result<FacadePageGuard<T>> {
+        Ok(self.get_page(guard, page_id, mode).await)
+    }
+
+    #[inline]
     async fn try_get_page_versioned<T: BufferPage>(
         &self,
         guard: &PoolGuard,
@@ -178,6 +188,16 @@ impl BufferPool for FixedBufferPool {
             return None;
         }
         Some(g)
+    }
+
+    #[inline]
+    async fn try_get_page_versioned_result<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        id: VersionedPageID,
+        mode: LatchFallbackMode,
+    ) -> Result<Option<FacadePageGuard<T>>> {
+        Ok(self.try_get_page_versioned(guard, id, mode).await)
     }
 
     /// Deallocate page.
@@ -219,6 +239,17 @@ impl BufferPool for FixedBufferPool {
             g.rollback_exclusive_version_change();
         }
         Validation::Invalid
+    }
+
+    #[inline]
+    async fn try_get_child_page<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        p_guard: &FacadePageGuard<T>,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> Result<Validation<FacadePageGuard<T>>> {
+        Ok(self.get_child_page(guard, p_guard, page_id, mode).await)
     }
 }
 

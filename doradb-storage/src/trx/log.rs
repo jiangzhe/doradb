@@ -1,22 +1,26 @@
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
-use crate::io::{AIO, AIOError, AIOKind, DirectBuf, LibaioContext, io_event};
-use crate::notify::EventNotifyOnDrop;
+use crate::io::{
+    AIOClient, AIOError, AIOKind, Completion, DirectBuf, IOQueue, IOSubmission, IOWorkerBuilder,
+    LibaioContext, Operation,
+};
 use crate::serde::Ser;
 use crate::session::SessionState;
 use crate::trx::MIN_SNAPSHOT_TS;
-use crate::trx::group::{Commit, CommitGroup, GroupCommit, MutexGroupCommit};
+use crate::trx::group::{
+    Commit, CommitGroup, CommitJoin, CommitWaiter, GroupCommit, MutexGroupCommit,
+};
 use crate::trx::log_replay::{LogBuf, LogPartitionStream, MmapLogReader, TrxLog};
 use crate::trx::purge::{GC, GCBucket};
 use crate::trx::sys::GC_BUCKETS;
+use crate::trx::sys::TransactionSystem;
 use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx, TrxID};
 use crossbeam_utils::CachePadded;
-use event_listener::EventListener;
 use flume::{Receiver, Sender};
 use glob::{Pattern, glob};
-use parking_lot::MutexGuard;
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
@@ -28,6 +32,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const LOG_HEADER_PAGES: usize = 2;
+type EnqueuedCommit = (TrxID, Option<Arc<SessionState>>, Option<CommitWaiter>);
 
 pub struct LogPartitionInitializer {
     pub(super) ctx: LibaioContext,
@@ -115,6 +120,8 @@ impl LogPartitionInitializer {
         };
         let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
         let (gc_chan, gc_rx) = flume::unbounded();
+        let (completion_tx, completion_rx) = flume::unbounded();
+        let (io_worker, io_client) = self.ctx.io_worker();
         Ok((
             LogPartition {
                 group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
@@ -123,7 +130,10 @@ impl LogPartitionInitializer {
                 stats: CachePadded::new(LogPartitionStats::default()),
                 gc_chan,
                 gc_buckets: gc_info.into_boxed_slice(),
-                aio_ctx: self.ctx,
+                io_worker: CachePadded::new(Mutex::new(Some(io_worker))),
+                io_client,
+                completion_tx,
+                completion_rx: CachePadded::new(Mutex::new(Some(completion_rx))),
                 log_no: self.log_no,
                 max_io_size: self.page_size,
                 file_prefix: self.file_prefix,
@@ -148,6 +158,107 @@ pub enum LogPartitionMode {
     Done,
 }
 
+pub(super) struct LogWriteSubmission {
+    cts: TrxID,
+    operation: Operation,
+}
+
+impl LogWriteSubmission {
+    #[inline]
+    pub(super) fn new(cts: TrxID, fd: std::os::fd::RawFd, offset: usize, buf: DirectBuf) -> Self {
+        LogWriteSubmission {
+            cts,
+            operation: Operation::pwrite_owned(fd, offset, buf),
+        }
+    }
+}
+
+impl IOSubmission for LogWriteSubmission {
+    type Key = TrxID;
+
+    #[inline]
+    fn key(&self) -> &Self::Key {
+        &self.cts
+    }
+
+    #[inline]
+    fn operation(&mut self) -> &mut Operation {
+        &mut self.operation
+    }
+}
+
+enum LogIORequest {
+    Write(LogWriteSubmission),
+}
+
+struct LogWriteCompletion {
+    cts: TrxID,
+    buf: DirectBuf,
+    poison: Option<StoragePoisonSource>,
+}
+
+struct LogIOStateMachine {
+    done_tx: Sender<LogWriteCompletion>,
+}
+
+impl LogIOStateMachine {
+    #[inline]
+    fn new(done_tx: Sender<LogWriteCompletion>) -> Self {
+        LogIOStateMachine { done_tx }
+    }
+}
+
+impl crate::io::IOStateMachine for LogIOStateMachine {
+    type Request = LogIORequest;
+    type Key = TrxID;
+    type Submission = LogWriteSubmission;
+
+    #[inline]
+    fn prepare_request(
+        &mut self,
+        req: LogIORequest,
+        max_new: usize,
+        queue: &mut IOQueue<LogWriteSubmission>,
+    ) -> Option<LogIORequest> {
+        if max_new == 0 {
+            return Some(req);
+        }
+        match req {
+            LogIORequest::Write(submission) => queue.push(submission),
+        }
+        None
+    }
+
+    #[inline]
+    fn on_submit(&mut self, _sub: &LogWriteSubmission) {}
+
+    #[inline]
+    fn on_complete(&mut self, mut sub: LogWriteSubmission, res: std::io::Result<usize>) -> AIOKind {
+        let expected_len = sub.operation.len();
+        let buf = sub
+            .operation
+            .take_buf()
+            .expect("redo write submission must still own its direct buffer");
+        let result = match res {
+            Ok(len) if len == expected_len => None,
+            Ok(_len) => Some(StoragePoisonSource::RedoWrite),
+            Err(_err) => Some(StoragePoisonSource::RedoWrite),
+        };
+        let _ = self.done_tx.send(LogWriteCompletion {
+            cts: sub.cts,
+            buf,
+            poison: result,
+        });
+        AIOKind::Write
+    }
+
+    #[inline]
+    fn on_stats(&mut self, _stats: &crate::io::AIOStats) {}
+
+    #[inline]
+    fn end_loop(self) {}
+}
+
 pub(super) struct LogPartition {
     /// Group commit of this partition.
     pub(super) group_commit: CachePadded<MutexGroupCommit>,
@@ -163,8 +274,14 @@ pub(super) struct LogPartition {
     /// old transaction list.
     /// Split into multiple buckets in order to avoid bottleneck of global synchronization.
     pub(super) gc_buckets: Box<[GCBucket]>,
-    /// AIO manager to handle async IO with libaio.
-    pub(super) aio_ctx: LibaioContext,
+    /// Backend-neutral redo IO worker builder, taken exactly once during startup.
+    io_worker: CachePadded<Mutex<Option<IOWorkerBuilder<LogIORequest>>>>,
+    /// Sender to enqueue redo write requests into the dedicated worker.
+    io_client: AIOClient<LogIORequest>,
+    /// Completion channel used by the scheduler thread to observe redo write results.
+    completion_tx: Sender<LogWriteCompletion>,
+    /// Receiver side of redo write completions, taken by the scheduler thread at startup.
+    completion_rx: CachePadded<Mutex<Option<Receiver<LogWriteCompletion>>>>,
     /// Index of log partition in total partitions, starts from 0.
     pub(super) log_no: usize,
     /// Maximum IO size of each group.
@@ -255,7 +372,7 @@ impl LogPartition {
         mut trx: PrecommitTrx,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
         wait_sync: bool,
-    ) -> (Option<Arc<SessionState>>, Option<EventListener>) {
+    ) -> CommitJoin {
         let cts = trx.cts;
         let redo_bin = trx.redo_bin.take().unwrap();
         // Serialize redo log to buffer.
@@ -278,18 +395,18 @@ impl LogPartition {
             Err(_) => unreachable!(),
         };
         let session = trx.take_session();
-        let sync_ev = EventNotifyOnDrop::new();
-        let listener = wait_sync.then(|| sync_ev.listen());
+        let completion = Arc::new(Completion::new());
+        let waiter = wait_sync.then(|| Arc::clone(&completion));
         let new_group = CommitGroup {
             trx_list: vec![trx],
             max_cts: cts,
             fd,
             offset,
             log_buf,
-            sync_ev,
+            completion,
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
-        (session, listener)
+        (session, waiter)
     }
 
     #[inline]
@@ -298,17 +415,17 @@ impl LogPartition {
         trx: PreparedTrx,
         global_ts: &AtomicU64,
         wait_sync: bool,
-    ) -> Result<(TrxID, Option<Arc<SessionState>>, Option<EventListener>)> {
+    ) -> Result<EnqueuedCommit> {
         let mut group_commit_g = self.group_commit.lock();
         let cts = global_ts.fetch_add(1, Ordering::SeqCst);
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
-            let (session, listener) =
+            let (session, waiter) =
                 self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
             self.group_commit.notify_one(); // notify sync thread to work.
             drop(group_commit_g);
-            return Ok((cts, session, listener));
+            return Ok((cts, session, waiter));
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
             Commit::Shutdown => return Err(Error::StorageEngineShutdown),
@@ -319,15 +436,15 @@ impl LogPartition {
             }
         };
         if last_group.can_join(&precommit_trx) {
-            let (session, listener) = last_group.join(precommit_trx, wait_sync);
+            let (session, waiter) = last_group.join(precommit_trx, wait_sync);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
-            return Ok((cts, session, listener));
+            return Ok((cts, session, waiter));
         }
-        let (session, listener) =
+        let (session, waiter) =
             self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
         self.group_commit.notify_one(); // notify sync thread to work.
         drop(group_commit_g);
-        Ok((cts, session, listener))
+        Ok((cts, session, waiter))
     }
 
     #[inline]
@@ -347,13 +464,18 @@ impl LogPartition {
         global_ts: &AtomicU64,
         wait_sync: bool,
     ) -> Result<TrxID> {
-        let (cts, mut session, listener) = self.enqueue_commit(trx, global_ts, wait_sync)?;
+        let (cts, mut session, waiter) = self.enqueue_commit(trx, global_ts, wait_sync)?;
         if !wait_sync {
             debug_assert!(session.is_none());
             return Ok(cts);
         }
-        let listener = listener.expect("listener should exist when wait_sync");
-        listener.await; // wait for fsync
+        let waiter = waiter.expect("waiter should exist when wait_sync");
+        if let Err(err) = waiter.wait_result().await {
+            if let Some(s) = session.take() {
+                s.rollback();
+            }
+            return Err(err);
+        }
         assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
         if let Some(s) = session.as_mut() {
             s.commit(cts);
@@ -384,16 +506,47 @@ impl LogPartition {
     }
 
     #[inline]
-    fn file_processor(&self, config: &TrxSysConfig) -> FileProcessor<'_> {
-        let syncer = { self.group_commit.lock().log_file.as_ref().unwrap().syncer() };
-
-        FileProcessor::new(self, config, syncer)
+    fn take_io_worker(&self) -> IOWorkerBuilder<LogIORequest> {
+        self.io_worker
+            .lock()
+            .take()
+            .expect("redo IO worker builder must exist before startup")
     }
 
     #[inline]
-    pub(super) fn io_loop(&self, config: &TrxSysConfig) {
+    fn take_completion_rx(&self) -> Receiver<LogWriteCompletion> {
+        self.completion_rx
+            .lock()
+            .take()
+            .expect("redo completion receiver must exist before startup")
+    }
+
+    #[inline]
+    fn spawn_redo_worker(&self) -> std::thread::JoinHandle<()> {
+        let worker = self.take_io_worker();
+        worker
+            .bind(LogIOStateMachine::new(self.completion_tx.clone()))
+            .start_thread()
+    }
+
+    #[inline]
+    fn file_processor<'a>(
+        &'a self,
+        trx_sys: &'a TransactionSystem,
+        config: &TrxSysConfig,
+        completion_rx: &'a Receiver<LogWriteCompletion>,
+    ) -> FileProcessor<'a> {
+        let syncer = { self.group_commit.lock().log_file.as_ref().unwrap().syncer() };
+
+        FileProcessor::new(self, trx_sys, config, syncer, completion_rx)
+    }
+
+    #[inline]
+    pub(super) fn io_loop(&self, trx_sys: &TransactionSystem, config: &TrxSysConfig) {
+        let completion_rx = self.take_completion_rx();
+        let worker = self.spawn_redo_worker();
         loop {
-            let mut fp = self.file_processor(config);
+            let mut fp = self.file_processor(trx_sys, config, &completion_rx);
             if let Some(ended_log_file) = fp.process_single_file() {
                 fp.finish_pending_io();
 
@@ -409,6 +562,8 @@ impl LogPartition {
                 drop(ended_log_file);
             }
             if fp.shutdown {
+                self.io_client.shutdown();
+                worker.join().unwrap();
                 return;
             }
         }
@@ -425,12 +580,48 @@ pub(super) struct SyncGroup {
     pub(super) trx_list: Vec<PrecommitTrx>,
     pub(super) max_cts: TrxID,
     pub(super) log_bytes: usize,
-    pub(super) aio: AIO<DirectBuf>,
-    // Signal to notify transaction threads.
-    // This field won't be used, until the group is dropped.
-    #[allow(dead_code)]
-    pub(super) sync_ev: EventNotifyOnDrop,
+    pub(super) write: Option<LogWriteSubmission>,
+    pub(super) returned_buf: Option<DirectBuf>,
+    pub(super) completion: Arc<Completion<Result<()>>>,
     pub(super) finished: bool,
+    pub(super) failed: bool,
+}
+
+impl SyncGroup {
+    #[inline]
+    fn take_submission(&mut self) -> LogWriteSubmission {
+        self.write
+            .take()
+            .expect("redo sync group submission must exist before enqueue")
+    }
+
+    #[inline]
+    fn finish_write(&mut self, buf: DirectBuf) {
+        self.returned_buf = Some(buf);
+        self.finished = true;
+    }
+
+    #[inline]
+    fn take_any_buf(&mut self) -> Option<DirectBuf> {
+        if let Some(buf) = self.returned_buf.take() {
+            return Some(buf);
+        }
+        self.write
+            .as_mut()
+            .and_then(|submission| submission.operation.take_buf())
+    }
+
+    #[inline]
+    fn fail_waiters(&mut self, err: &Error) {
+        if self.failed {
+            return;
+        }
+        self.failed = true;
+        self.completion.complete(Err(err.clone()));
+        for trx in mem::take(&mut self.trx_list) {
+            trx.abort();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -479,41 +670,86 @@ impl FromStr for LogSync {
 
 struct FileProcessor<'a> {
     partition: &'a LogPartition,
+    trx_sys: &'a TransactionSystem,
+    completion_rx: &'a Receiver<LogWriteCompletion>,
     io_depth: usize,
     max_io_size: usize,
     inflight: BTreeMap<TrxID, SyncGroup>,
     in_progress: usize,
     sync_groups: VecDeque<SyncGroup>,
-    events: Box<[io_event]>,
     written: Vec<SyncGroup>,
     syncer: FileSyncer,
     log_sync: LogSync,
     shutdown: bool,
-    io_submit_count: usize,
-    io_submit_nanos: usize,
-    io_wait_count: usize,
-    io_wait_nanos: usize,
 }
 
 impl<'a> FileProcessor<'a> {
     #[inline]
-    fn new(partition: &'a LogPartition, config: &TrxSysConfig, syncer: FileSyncer) -> Self {
+    fn new(
+        partition: &'a LogPartition,
+        trx_sys: &'a TransactionSystem,
+        config: &TrxSysConfig,
+        syncer: FileSyncer,
+        completion_rx: &'a Receiver<LogWriteCompletion>,
+    ) -> Self {
         FileProcessor {
             partition,
+            trx_sys,
+            completion_rx,
             io_depth: config.io_depth_per_log,
             max_io_size: config.max_io_size.as_u64() as usize,
             inflight: BTreeMap::new(),
             in_progress: 0,
             sync_groups: VecDeque::new(),
-            events: partition.aio_ctx.events(),
             written: vec![],
             syncer,
             log_sync: config.log_sync,
             shutdown: false,
-            io_submit_count: 0,
-            io_submit_nanos: 0,
-            io_wait_count: 0,
-            io_wait_nanos: 0,
+        }
+    }
+
+    #[inline]
+    fn recycle_buf(&self, mut buf: DirectBuf) {
+        if buf.capacity() == self.max_io_size {
+            buf.reset();
+            self.partition.buf_free_list.push(buf);
+        }
+    }
+
+    #[inline]
+    fn fail_sync_group(&self, sync_group: &mut SyncGroup, err: &Error) {
+        sync_group.fail_waiters(err);
+        if let Some(buf) = sync_group.take_any_buf() {
+            self.recycle_buf(buf);
+        }
+    }
+
+    #[inline]
+    fn fail_pending(&mut self, err: Error) {
+        self.shutdown = true;
+        let drained_sync_groups: Vec<_> = self.sync_groups.drain(..).collect();
+        for mut sync_group in drained_sync_groups {
+            self.fail_sync_group(&mut sync_group, &err);
+        }
+
+        let mut queued = Vec::new();
+        {
+            let mut group_commit_g = self.partition.group_commit.lock();
+            while let Some(commit) = group_commit_g.queue.pop_front() {
+                match commit {
+                    Commit::Group(group) => queued.push(group),
+                    Commit::Switch(log_file) => drop(log_file),
+                    Commit::Shutdown => {}
+                }
+            }
+        }
+        for group in queued {
+            let mut sync_group = group.into_sync_group();
+            self.fail_sync_group(&mut sync_group, &err);
+        }
+
+        for sync_group in self.inflight.values_mut() {
+            sync_group.fail_waiters(&err);
         }
     }
 
@@ -534,19 +770,9 @@ impl<'a> FileProcessor<'a> {
                     return ended_log_file;
                 }
             }
-            self.reset_stats();
-
-            // submit IO requests if any.
             self.submit_io();
-
-            // wait for any request to be done.
             self.wait_io(false);
-
-            // Sync IO.
             self.sync_io();
-
-            // update stats.
-            self.update_stats();
 
             if self.shutdown && self.inflight.is_empty() {
                 return None;
@@ -558,12 +784,8 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn finish_pending_io(&mut self) {
         self.submit_io();
-
         self.wait_io(true);
-
         self.sync_io();
-
-        self.update_stats();
     }
 
     /// Fetch IO requests, returns ended log file if any.
@@ -641,24 +863,31 @@ impl<'a> FileProcessor<'a> {
             let max_cts = self.written.last().unwrap().max_cts;
 
             let start = Instant::now();
-            match self.log_sync {
+            let sync_res = match self.log_sync {
                 LogSync::Fsync => self.syncer.fsync(),
                 LogSync::Fdatasync => self.syncer.fdatasync(),
-                LogSync::None => (),
-            }
+                LogSync::None => Ok(()),
+            };
             let sync_dur = start.elapsed();
+            if sync_res.is_err() {
+                let err = self.trx_sys.poison_storage(StoragePoisonSource::RedoSync);
+                let drained_written: Vec<_> = self.written.drain(..).collect();
+                for mut sync_group in drained_written {
+                    self.fail_sync_group(&mut sync_group, &err);
+                }
+                self.fail_pending(err);
+                return;
+            }
 
             self.partition
                 .persisted_cts
                 .store(max_cts, Ordering::SeqCst);
 
             // Put IO buffer back into free list.
-            for mut sync_group in self.written.drain(..) {
-                if let Some(mut buf) = sync_group.aio.take_buf()
-                    && buf.capacity() == self.max_io_size
-                {
-                    buf.reset(); // reset buffer to zero
-                    self.partition.buf_free_list.push(buf); // return buf to free list for future reuse
+            let drained_written: Vec<_> = self.written.drain(..).collect();
+            for mut sync_group in drained_written {
+                if let Some(buf) = sync_group.take_any_buf() {
+                    self.recycle_buf(buf);
                 }
                 // commit transactions to let waiting read operations to continue
                 let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
@@ -671,7 +900,7 @@ impl<'a> FileProcessor<'a> {
                 }
                 // send committed transaction list to GC thread
                 let _ = self.partition.gc_chan.send(GC::Commit(committed_trx_list));
-                drop(sync_group); // notify transaction thread to continue.
+                sync_group.completion.complete(Ok(()));
             }
 
             self.partition.update_stats(
@@ -684,94 +913,66 @@ impl<'a> FileProcessor<'a> {
         }
     }
 
-    #[inline]
-    fn reset_stats(&mut self) {
-        self.io_submit_count = 0;
-        self.io_submit_nanos = 0;
-        self.io_wait_count = 0;
-        self.io_wait_nanos = 0;
-    }
-
-    #[inline]
-    fn update_stats(&mut self) {
-        if self.io_submit_count != 0 {
-            self.partition
-                .stats
-                .io_submit_count
-                .fetch_add(self.io_submit_count, Ordering::Relaxed);
-            self.partition
-                .stats
-                .io_submit_nanos
-                .fetch_add(self.io_submit_nanos, Ordering::Relaxed);
-        }
-        if self.io_wait_count != 0 {
-            self.partition
-                .stats
-                .io_wait_count
-                .fetch_add(self.io_wait_count, Ordering::Relaxed);
-            self.partition
-                .stats
-                .io_wait_nanos
-                .fetch_add(self.io_wait_nanos, Ordering::Relaxed);
-        }
-    }
-
     /// Submit IO requests, returns submitted count and elapsed time.
     #[inline]
     fn submit_io(&mut self) {
-        if !self.sync_groups.is_empty() {
-            let start = Instant::now();
-            // try to submit as many IO requests as possible
-            let limit = self.io_depth - self.in_progress;
-            let io_reqs: Vec<_> = self
+        if self.sync_groups.is_empty() {
+            return;
+        }
+        let limit = self.io_depth.saturating_sub(self.in_progress);
+        for _ in 0..limit.min(self.sync_groups.len()) {
+            let mut sync_group = self
                 .sync_groups
-                .iter()
-                .take(limit)
-                .map(|sync_group| sync_group.aio.iocb_raw())
-                .collect();
-            let submit_count = self.partition.aio_ctx.submit_limit(&io_reqs, limit);
-            // add sync groups to inflight tree.
-            for sync_group in self.sync_groups.drain(..submit_count) {
-                let res = self.inflight.insert(sync_group.max_cts, sync_group);
-                debug_assert!(res.is_none());
+                .pop_front()
+                .expect("redo sync group queue length was checked");
+            let submission = sync_group.take_submission();
+            if let Err(err) = self
+                .partition
+                .io_client
+                .send(LogIORequest::Write(submission))
+            {
+                let LogIORequest::Write(submission) = err.0;
+                sync_group.write = Some(submission);
+                let poison = self.trx_sys.poison_storage(StoragePoisonSource::RedoSubmit);
+                self.fail_sync_group(&mut sync_group, &poison);
+                self.fail_pending(poison);
+                return;
             }
-            self.in_progress += submit_count;
-            debug_assert!(self.in_progress <= self.io_depth);
-            self.io_submit_count = 1;
-            self.io_submit_nanos = start.elapsed().as_nanos() as usize;
+            let res = self.inflight.insert(sync_group.max_cts, sync_group);
+            debug_assert!(res.is_none());
+            self.in_progress += 1;
         }
     }
 
     /// Wait for any IO request to be done, returns finished count and elapsed time.
     #[inline]
     fn wait_io(&mut self, all: bool) {
-        if self.in_progress != 0 {
-            let start = Instant::now();
-            let wait_count = if all { self.in_progress } else { 1 };
-            let (read_count, write_count) =
-                self.partition
-                    .aio_ctx
-                    .wait_at_least(&mut self.events, wait_count, |cts, res| match res {
-                        Ok(len) => {
-                            let sg = self.inflight.get_mut(&cts).expect("finish inflight IO");
-                            debug_assert!(sg.aio.buf().unwrap().capacity() == len);
-                            sg.finished = true;
-                            // only write IO
-                            AIOKind::Write
-                        }
-                        Err(err) => {
-                            let sg = self.inflight.remove(&cts).unwrap();
-                            unimplemented!(
-                                "AIO error: task.cts={}, task.log_bytes={}, {}",
-                                sg.max_cts,
-                                sg.log_bytes,
-                                err
-                            )
-                        }
-                    });
-            self.in_progress -= read_count + write_count;
-            self.io_wait_count = 1;
-            self.io_wait_nanos = start.elapsed().as_nanos() as usize;
+        if self.in_progress == 0 {
+            return;
+        }
+        let wait_count = if all { self.in_progress } else { 1 };
+        for _ in 0..wait_count {
+            let completion = self
+                .completion_rx
+                .recv()
+                .expect("redo completion channel must stay alive until shutdown");
+            self.in_progress = self.in_progress.saturating_sub(1);
+            if let Some(source) = completion.poison {
+                let mut failed_group = self
+                    .inflight
+                    .remove(&completion.cts)
+                    .expect("redo completion must match one inflight sync group");
+                failed_group.finish_write(completion.buf);
+                let err = self.trx_sys.poison_storage(source);
+                self.fail_sync_group(&mut failed_group, &err);
+                self.fail_pending(err);
+                return;
+            }
+            let sync_group = self
+                .inflight
+                .get_mut(&completion.cts)
+                .expect("redo completion must match one inflight sync group");
+            sync_group.finish_write(completion.buf);
         }
     }
 }

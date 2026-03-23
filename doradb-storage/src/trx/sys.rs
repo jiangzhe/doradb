@@ -1,6 +1,6 @@
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
 use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
-use crate::error::Result;
+use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::table_fs::TableFileSystem;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::session::SessionState;
@@ -86,6 +86,10 @@ pub struct TransactionSystem {
     pub(super) config: CachePadded<TrxSysConfig>,
     /// Catalog of the database.
     pub(crate) catalog: CachePadded<QuiescentGuard<Catalog>>,
+    /// Storage-runtime poison flag for fatal redo/checkpoint durability failures.
+    storage_poisoned: CachePadded<AtomicBool>,
+    /// First fatal storage error that poisoned runtime admission.
+    storage_poison_err: CachePadded<Mutex<Option<Error>>>,
 }
 
 pub(crate) struct TransactionSystemWorkers;
@@ -113,7 +117,40 @@ impl TransactionSystem {
             log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
             config: CachePadded::new(config),
             catalog: CachePadded::new(catalog),
+            storage_poisoned: CachePadded::new(AtomicBool::new(false)),
+            storage_poison_err: CachePadded::new(Mutex::new(None)),
         }
+    }
+
+    /// Returns the first fatal storage poison error, if runtime admission has been poisoned.
+    #[inline]
+    pub fn storage_poison_error(&self) -> Option<Error> {
+        if !self.storage_poisoned.load(Ordering::Acquire) {
+            return None;
+        }
+        self.storage_poison_err.lock().clone()
+    }
+
+    /// Returns `Err` once a fatal redo/checkpoint failure poisoned runtime admission.
+    #[inline]
+    pub fn ensure_runtime_healthy(&self) -> Result<()> {
+        match self.storage_poison_error() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Records the first fatal storage poison source and returns the shared poison error.
+    #[inline]
+    pub fn poison_storage(&self, source: StoragePoisonSource) -> Error {
+        let err = Error::StorageEnginePoisoned(source);
+        if !self.storage_poisoned.swap(true, Ordering::AcqRel) {
+            let mut guard = self.storage_poison_err.lock();
+            if guard.is_none() {
+                *guard = Some(err.clone());
+            }
+        }
+        self.storage_poison_error().unwrap_or(err)
     }
 
     /// Create a new transaction.
@@ -169,6 +206,10 @@ impl TransactionSystem {
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
     pub async fn commit(&self, trx: ActiveTrx) -> Result<TrxID> {
+        if let Err(err) = self.ensure_runtime_healthy() {
+            self.rollback(trx).await;
+            return Err(err);
+        }
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_no];
@@ -195,6 +236,7 @@ impl TransactionSystem {
 
     #[inline]
     pub fn commit_sys(&self, trx: SysTrx) -> Result<TrxID> {
+        self.ensure_runtime_healthy()?;
         if trx.redo.is_empty() {
             // System transaction does not hold any active start timestamp
             // so we can just drop it if there is no change to replay.
@@ -332,7 +374,7 @@ impl TransactionSystem {
             let task_trx_sys = trx_sys.clone();
             let handle = thread::spawn_named(thread_name, move || {
                 let partition = &*task_trx_sys.log_partitions[idx];
-                partition.io_loop(&task_trx_sys.config);
+                partition.io_loop(&task_trx_sys, &task_trx_sys.config);
             });
             handles.push(handle);
         }

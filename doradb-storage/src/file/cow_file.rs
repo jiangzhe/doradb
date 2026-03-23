@@ -396,14 +396,14 @@ impl<M> CowFile<M> {
         let offset = new_root.page_no as usize * super_buf.capacity();
         self.write_at_offset(offset, super_buf).await?;
 
-        self.fsync();
+        self.fsync()?;
         Ok(self.swap_active_root(new_root))
     }
 
     /// Force all pending writes to disk.
     #[inline]
-    pub fn fsync(&self) {
-        self.file.syncer().fsync();
+    pub fn fsync(&self) -> Result<()> {
+        self.file.syncer().fsync()
     }
 
     /// Delete underlying file by fd path.

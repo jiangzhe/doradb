@@ -173,7 +173,7 @@ impl TransactionSystem {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
                     if let Some(table) = table_cache.get_table_ref(ip.table_id).await
-                        && table
+                        && let Ok(true) = table
                             .delete_index(guards, &ip.key, ip.row_id, ip.unique)
                             .await
                     {

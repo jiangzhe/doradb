@@ -183,7 +183,7 @@ impl InsertRow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum InsertMvcc {
     // PageGuard is required if table has unique index and
     // we may need to linke a deleted version to the new version.
@@ -192,7 +192,23 @@ pub enum InsertMvcc {
     Ok(RowID),
     WriteConflict,
     DuplicateKey,
+    Err(Error),
 }
+
+impl PartialEq for InsertMvcc {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (InsertMvcc::Ok(lhs), InsertMvcc::Ok(rhs)) => lhs == rhs,
+            (InsertMvcc::WriteConflict, InsertMvcc::WriteConflict)
+            | (InsertMvcc::DuplicateKey, InsertMvcc::DuplicateKey)
+            | (InsertMvcc::Err(_), InsertMvcc::Err(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for InsertMvcc {}
 
 impl InsertMvcc {
     #[inline]
@@ -204,6 +220,7 @@ impl InsertMvcc {
     pub fn unwrap(self) -> RowID {
         match self {
             InsertMvcc::Ok(row_id) => row_id,
+            InsertMvcc::Err(err) => panic!("insert error: {err}"),
             _ => panic!("insert not ok"),
         }
     }
@@ -214,6 +231,7 @@ pub enum LinkForUniqueIndex {
     None,
     WriteConflict,
     DuplicateKey,
+    Err(Error),
 }
 
 pub enum Update {
@@ -241,6 +259,7 @@ pub enum UpdateMvcc {
     NotFound,
     WriteConflict,
     DuplicateKey,
+    Err(Error),
 }
 
 impl UpdateMvcc {
@@ -256,6 +275,7 @@ pub enum UpdateIndex {
     Ok,
     WriteConflict,
     DuplicateKey,
+    Err(Error),
 }
 
 impl UpdateIndex {
@@ -269,6 +289,7 @@ pub enum InsertIndex {
     Ok,
     WriteConflict,
     DuplicateKey,
+    Err(Error),
 }
 
 pub trait UndoVal {
@@ -364,6 +385,7 @@ pub enum DeleteMvcc {
     Ok,
     NotFound,
     WriteConflict,
+    Err(Error),
 }
 
 impl DeleteMvcc {

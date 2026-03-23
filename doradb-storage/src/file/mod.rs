@@ -442,17 +442,23 @@ pub struct FileSyncer(RawFd);
 
 impl FileSyncer {
     #[inline]
-    pub fn fsync(&self) {
-        unsafe {
-            fsync(self.0);
+    pub fn fsync(&self) -> Result<()> {
+        let ret = unsafe { fsync(self.0) };
+        if ret == 0 {
+            return Ok(());
         }
+        debug_assert!(ret == -1);
+        Err(std::io::Error::last_os_error().into())
     }
 
     #[inline]
-    pub fn fdatasync(&self) {
-        unsafe {
-            fdatasync(self.0);
+    pub fn fdatasync(&self) -> Result<()> {
+        let ret = unsafe { fdatasync(self.0) };
+        if ret == 0 {
+            return Ok(());
         }
+        debug_assert!(ret == -1);
+        Err(std::io::Error::last_os_error().into())
     }
 }
 

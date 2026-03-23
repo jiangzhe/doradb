@@ -73,7 +73,7 @@ fn worker(id: usize, aio_mgr: Arc<LibaioContext>, args: Args, stop: Arc<AtomicBo
                 AIOKind::Write
             });
         if args.sync != 0 && read_count + write_count >= args.sync {
-            syncer.fdatasync();
+            let _ = syncer.fdatasync();
         }
     }
     log_bytes

@@ -225,6 +225,24 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
+    pub(crate) async fn try_get_row_page_shared_result(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> Result<Option<PageSharedGuard<RowPage>>> {
+        Ok(self
+            .mem_pool()
+            .try_get_page::<RowPage>(
+                self.row_pool_guard(guards),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
+            .await?
+            .lock_shared_async()
+            .await)
+    }
+
+    #[inline]
     pub(crate) async fn try_get_row_page_versioned_shared(
         &self,
         guards: &PoolGuards,
@@ -242,6 +260,26 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
+    pub(crate) async fn try_get_row_page_versioned_shared_result(
+        &self,
+        guards: &PoolGuards,
+        page_id: VersionedPageID,
+    ) -> Result<Option<PageSharedGuard<RowPage>>> {
+        let guard = self
+            .mem_pool()
+            .try_get_page_versioned_result::<RowPage>(
+                self.row_pool_guard(guards),
+                page_id,
+                LatchFallbackMode::Shared,
+            )
+            .await?;
+        Ok(match guard {
+            Some(guard) => guard.lock_shared_async().await,
+            None => None,
+        })
+    }
+
+    #[inline]
     pub(crate) async fn get_row_page_exclusive(
         &self,
         guards: &PoolGuards,
@@ -256,6 +294,24 @@ impl<P: BufferPool> GenericMemTable<P> {
             .await
             .lock_exclusive_async()
             .await
+    }
+
+    #[inline]
+    pub(crate) async fn try_get_row_page_exclusive_result(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> Result<Option<PageExclusiveGuard<RowPage>>> {
+        Ok(self
+            .mem_pool()
+            .try_get_page::<RowPage>(
+                self.row_pool_guard(guards),
+                page_id,
+                LatchFallbackMode::Exclusive,
+            )
+            .await?
+            .lock_exclusive_async()
+            .await)
     }
 
     #[inline]
