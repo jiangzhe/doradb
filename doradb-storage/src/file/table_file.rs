@@ -5,6 +5,7 @@ use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
+use crate::file::TableFsRequest;
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
     OldCowRoot, ParsedMeta, validate_active_meta_page_id,
@@ -19,7 +20,6 @@ use crate::file::super_page::{
     SUPER_PAGE_FOOTER_OFFSET, SUPER_PAGE_SIZE, SUPER_PAGE_VERSION, SuperPage, SuperPageBody,
     SuperPageFooter, SuperPageHeader, SuperPageSerView, parse_super_page,
 };
-use crate::file::{FixedSizeBufferFreeList, TableFsRequest};
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
@@ -228,7 +228,6 @@ impl TableFile {
         initial_size: usize,
         table_id: TableID,
         io_client: AIOClient<TableFsRequest>,
-        buf_list: FixedSizeBufferFreeList,
         trunc: bool,
     ) -> Result<Self> {
         debug_assert!(initial_size.is_multiple_of(COW_FILE_PAGE_SIZE));
@@ -237,7 +236,6 @@ impl TableFile {
             initial_size,
             table_id,
             io_client,
-            buf_list,
             table_codec(),
             trunc,
         )?;
@@ -249,9 +247,8 @@ impl TableFile {
         file_path: impl AsRef<str>,
         table_id: TableID,
         io_client: AIOClient<TableFsRequest>,
-        buf_list: FixedSizeBufferFreeList,
     ) -> Result<Self> {
-        let cow_file = CowFile::open(file_path, table_id, io_client, buf_list, table_codec())?;
+        let cow_file = CowFile::open(file_path, table_id, io_client, table_codec())?;
         Ok(TableFile(cow_file))
     }
 

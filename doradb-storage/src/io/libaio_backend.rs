@@ -114,9 +114,15 @@ impl LibaioContext {
             count != 0,
             "io_getevents with min_nr=1 and timeout=None should not return 0"
         );
+        #[cfg(test)]
+        let hook = tests::current_libaio_test_hook();
         let mut read_count = 0;
         let mut write_count = 0;
-        for ev in &events[..count] {
+        for ev in &mut events[..count] {
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook.on_completion(ev);
+            }
             let key = ev.data;
             let res = if ev.res >= 0 {
                 Ok(ev.res as usize)
@@ -146,24 +152,11 @@ impl LibaioContext {
 fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
     #[cfg(test)]
     {
-        let hook = *IO_SUBMIT_HOOK.lock().unwrap();
-        if let Some(hook) = hook {
+        if let Some(hook) = tests::current_io_submit_hook() {
             return hook(ctx, nr, ios);
         }
     }
     unsafe { io_submit(ctx, nr, ios) }
-}
-
-#[cfg(test)]
-type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
-
-#[cfg(test)]
-static IO_SUBMIT_HOOK: std::sync::Mutex<Option<IoSubmitHook>> = std::sync::Mutex::new(None);
-
-#[cfg(test)]
-pub(crate) fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
-    let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
-    std::mem::replace(&mut *guard, hook)
 }
 
 impl Drop for LibaioContext {
@@ -245,6 +238,10 @@ impl IOBackend for LibaioContext {
             .extend(batch.staged.iter().take(limit).copied());
         let submit_count = self.submit_limit(&batch.prefix, limit);
         if submit_count != 0 {
+            #[cfg(test)]
+            if let Some(hook) = tests::current_libaio_test_hook() {
+                hook.on_submit(&batch.prefix[..submit_count]);
+            }
             batch.staged.drain(0..submit_count);
         }
         submit_count
@@ -262,5 +259,52 @@ impl IOBackend for LibaioContext {
             AIOKind::Read
         });
         completed
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
+
+    /// Test-only hook for observing and controlling real libaio requests.
+    ///
+    /// Readonly-cache tests use this to stall or rewrite matching completions
+    /// while keeping the production submission path unchanged.
+    pub(crate) trait LibaioTestHook: Send + Sync {
+        /// Observes requests that were accepted by `io_submit`.
+        fn on_submit(&self, _submitted: &[*mut iocb]) {}
+
+        /// Observes and may rewrite one completion before the worker processes it.
+        fn on_completion(&self, _event: &mut io_event) {}
+    }
+
+    static IO_SUBMIT_HOOK: Mutex<Option<IoSubmitHook>> = Mutex::new(None);
+    static LIBAIO_TEST_HOOK: Mutex<Option<Arc<dyn LibaioTestHook>>> = Mutex::new(None);
+
+    #[inline]
+    pub(super) fn current_io_submit_hook() -> Option<IoSubmitHook> {
+        *IO_SUBMIT_HOOK.lock().unwrap()
+    }
+
+    #[inline]
+    pub(super) fn current_libaio_test_hook() -> Option<Arc<dyn LibaioTestHook>> {
+        LIBAIO_TEST_HOOK.lock().unwrap().clone()
+    }
+
+    #[inline]
+    pub(crate) fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
+        let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
+        std::mem::replace(&mut *guard, hook)
+    }
+
+    #[inline]
+    pub(crate) fn set_libaio_test_hook(
+        hook: Option<Arc<dyn LibaioTestHook>>,
+    ) -> Option<Arc<dyn LibaioTestHook>> {
+        let mut guard = LIBAIO_TEST_HOOK.lock().unwrap();
+        std::mem::replace(&mut *guard, hook)
     }
 }

@@ -5,6 +5,7 @@ use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
+use crate::file::TableFsRequest;
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
     OldCowRoot, ParsedMeta, validate_active_meta_page_id,
@@ -20,7 +21,6 @@ use crate::file::super_page::{
     SuperPageHeader, SuperPageSerView, parse_super_page,
 };
 use crate::file::table_file::TABLE_FILE_INITIAL_SIZE;
-use crate::file::{FixedSizeBufferFreeList, TableFsRequest};
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
@@ -232,7 +232,6 @@ impl MultiTableFile {
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,
         io_client: AIOClient<TableFsRequest>,
-        buf_list: FixedSizeBufferFreeList,
     ) -> Result<Arc<Self>> {
         let file_path = file_path.as_ref();
         let file_exists = Path::new(file_path).exists();
@@ -241,7 +240,6 @@ impl MultiTableFile {
                 file_path,
                 CATALOG_MTB_PERSISTED_FILE_ID,
                 io_client,
-                buf_list,
                 multi_table_codec(),
             )?
         } else {
@@ -250,7 +248,6 @@ impl MultiTableFile {
                 MULTI_TABLE_FILE_INITIAL_SIZE,
                 CATALOG_MTB_PERSISTED_FILE_ID,
                 io_client,
-                buf_list,
                 multi_table_codec(),
                 false,
             )?

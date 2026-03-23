@@ -7,7 +7,7 @@ use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MultiTableFile};
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
-use crate::file::{FixedSizeBufferFreeList, TableFsRequest, TableFsStateMachine};
+use crate::file::{TableFsRequest, TableFsStateMachine};
 use crate::io::{AIOClient, IOWorkerBuilder, LibaioContext};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::storage_path::{path_to_utf8, validate_catalog_file_name};
@@ -21,7 +21,6 @@ use std::thread::JoinHandle;
 /// creating, opening, closing and removing table files.
 pub struct TableFileSystem {
     io_client: AIOClient<TableFsRequest>,
-    buf_list: FixedSizeBufferFreeList,
     data_dir: PathBuf,
     // Catalog multi-table file name.
     catalog_file_name: String,
@@ -37,8 +36,8 @@ pub(crate) struct TableFileSystemWorkers;
 impl TableFileSystem {
     /// Create a new table-file subsystem.
     ///
-    /// This initializes one async IO context, its event loop thread, and a
-    /// shared direct-buffer free list for table and catalog files.
+    /// This initializes one async IO context and its event-loop thread for
+    /// table and catalog file reads and writes.
     #[inline]
     fn new(
         io_depth: usize,
@@ -46,12 +45,10 @@ impl TableFileSystem {
         catalog_file_name: String,
     ) -> Result<(Self, IOWorkerBuilder<TableFsRequest>)> {
         let ctx = LibaioContext::new(io_depth)?;
-        let buf_list = FixedSizeBufferFreeList::new(COW_FILE_PAGE_SIZE, io_depth, io_depth * 2);
         let (worker, io_client) = ctx.io_worker();
         Ok((
             TableFileSystem {
                 io_client,
-                buf_list,
                 data_dir,
                 catalog_file_name,
             },
@@ -75,7 +72,6 @@ impl TableFileSystem {
             TABLE_FILE_INITIAL_SIZE,
             table_id,
             self.io_client.clone(),
-            self.buf_list.clone(),
             trunc,
         )?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
@@ -95,7 +91,6 @@ impl TableFileSystem {
             &file_path,
             table_id,
             self.io_client.clone(),
-            self.buf_list.clone(),
         )?);
         let disk_pool = ReadonlyBufferPool::new(
             table_id,
@@ -138,12 +133,9 @@ impl TableFileSystem {
         &self,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<(Arc<MultiTableFile>, ReadonlyBufferPool)> {
-        let mtb = MultiTableFile::open_or_create(
-            self.catalog_mtb_file_path(),
-            self.io_client.clone(),
-            self.buf_list.clone(),
-        )
-        .await?;
+        let mtb =
+            MultiTableFile::open_or_create(self.catalog_mtb_file_path(), self.io_client.clone())
+                .await?;
         let disk_pool = ReadonlyBufferPool::new(
             CATALOG_MTB_PERSISTED_FILE_ID,
             PersistedFileKind::CatalogMultiTableFile,
@@ -162,11 +154,8 @@ impl TableFileSystem {
         Ok((mtb, disk_pool))
     }
 
-    fn start_worker(
-        fs: QuiescentGuard<Self>,
-        worker: IOWorkerBuilder<TableFsRequest>,
-    ) -> JoinHandle<()> {
-        let state_machine = TableFsStateMachine::new(fs.buf_list.clone());
+    fn start_worker(worker: IOWorkerBuilder<TableFsRequest>) -> JoinHandle<()> {
+        let state_machine = TableFsStateMachine::new();
         worker.bind(state_machine).start_thread()
     }
 }
@@ -218,7 +207,6 @@ impl Component for TableFileSystemWorkers {
     ) -> Result<()> {
         let fs = registry.dependency::<TableFileSystem>()?;
         let handle = TableFileSystem::start_worker(
-            fs.clone(),
             shelf.take::<TableFileSystem>().ok_or(Error::InvalidState)?,
         );
         registry.register::<Self>(TableFileSystemWorkersOwned {
@@ -392,7 +380,7 @@ pub(crate) mod tests {
     fn start_test_fs(config: TableFileSystemConfig) -> StartedTableFileSystem {
         let (fs, event_loop) = config.build_parts().unwrap();
         let owner = QuiescentBox::new(fs);
-        let handle = TableFileSystem::start_worker(owner.guard(), event_loop);
+        let handle = TableFileSystem::start_worker(event_loop);
         StartedTableFileSystem {
             owner,
             handle: Mutex::new(Some(handle)),

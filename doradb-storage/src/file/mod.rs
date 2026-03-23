@@ -9,7 +9,7 @@ pub mod table_fs;
 #[cfg(test)]
 pub(crate) use self::table_fs::tests::{build_test_fs, build_test_fs_in};
 
-use crate::buffer::{PersistedBlockKey, ReadonlyLoadSubmission};
+use crate::buffer::{PersistedBlockKey, ReadSubmission};
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::io_iocb_cmd;
@@ -260,45 +260,36 @@ pub fn sparse_file_size(fd: RawFd) -> std::io::Result<(usize, usize)> {
     }
 }
 
-/// Worker-owned file write submission for the table-filesystem IO worker.
+/// Worker-owned write submission for the table-filesystem IO worker.
 ///
 /// The submission keeps the persisted-block identity, the backend-agnostic IO
 /// operation, and the waiter notification state together until completion.
-pub struct FileIO {
+pub struct WriteSubmission {
     key: PersistedBlockKey,
-    operation: Option<Operation>,
-    done: Arc<Completion<Result<()>>>,
-    recycle: bool,
+    operation: Operation,
+    completion: Arc<Completion<Result<()>>>,
 }
 
-impl FileIO {
+impl WriteSubmission {
     #[inline]
-    fn prepare_write(
+    fn prepare(
         key: PersistedBlockKey,
         fd: RawFd,
         offset: usize,
         buf: DirectBuf,
-        recycle: bool,
     ) -> (Self, impl std::future::Future<Output = Result<()>> + Send) {
-        let done = Arc::new(Completion::new());
-        let waiter = Arc::clone(&done);
-        let fio = FileIO {
+        let completion = Arc::new(Completion::new());
+        let waiter = Arc::clone(&completion);
+        let fio = WriteSubmission {
             key,
-            operation: Some(Operation::pwrite_owned(fd, offset, buf)),
-            done,
-            recycle,
+            operation: Operation::pwrite_owned(fd, offset, buf),
+            completion,
         };
         (fio, async move { waiter.wait_result().await })
     }
-
-    /// Takes the owned direct buffer back out of this submission, if still present.
-    #[inline]
-    pub fn take_buf(mut self) -> Option<DirectBuf> {
-        self.operation.as_mut().and_then(Operation::take_buf)
-    }
 }
 
-impl IOSubmission for FileIO {
+impl IOSubmission for WriteSubmission {
     type Key = PersistedBlockKey;
 
     #[inline]
@@ -308,20 +299,18 @@ impl IOSubmission for FileIO {
 
     #[inline]
     fn operation(&mut self) -> &mut Operation {
-        self.operation
-            .as_mut()
-            .expect("file IO operation requested after submission ownership moved")
+        &mut self.operation
     }
 }
 
 pub(crate) enum TableFsRequest {
-    Write(FileIO),
-    Read(ReadonlyLoadSubmission),
+    Write(WriteSubmission),
+    Read(ReadSubmission),
 }
 
 pub(crate) enum TableFsSubmission {
-    Write(FileIO),
-    Read(ReadonlyLoadSubmission),
+    Write(WriteSubmission),
+    Read(ReadSubmission),
 }
 
 impl IOSubmission for TableFsSubmission {
@@ -349,28 +338,22 @@ impl IOSubmission for TableFsSubmission {
 /// `key` identifies the persisted block targeted by this write for higher-layer
 /// invalidation and inflight bookkeeping.
 ///
-/// When `recycle` is true, write buffers are recycled by IO completion path
-/// and also on request-submit failure.
 #[inline]
 pub(crate) async fn write_direct(
     key: PersistedBlockKey,
     fd: RawFd,
     offset: usize,
     buf: DirectBuf,
-    recycle: bool,
     io_client: &AIOClient<TableFsRequest>,
-    buf_list: &FixedSizeBufferFreeList,
 ) -> Result<()> {
-    let (fio, result) = FileIO::prepare_write(key, fd, offset, buf, recycle);
-    if let Err(err) = io_client.send_async(TableFsRequest::Write(fio)).await {
-        let TableFsRequest::Write(fio) = err.into_inner() else {
+    let (submission, result) = WriteSubmission::prepare(key, fd, offset, buf);
+    if let Err(err) = io_client
+        .send_async(TableFsRequest::Write(submission))
+        .await
+    {
+        let TableFsRequest::Write(_submission) = err.into_inner() else {
             unreachable!("write_direct received unexpected readonly-load send error");
         };
-        if let Some(buf) = fio.take_buf()
-            && recycle
-        {
-            buf_list.recycle(buf);
-        }
         return Err(Error::SendError);
     }
     result.await
@@ -378,16 +361,14 @@ pub(crate) async fn write_direct(
 
 pub(crate) struct TableFsStateMachine {
     stats: AIOStats,
-    buf_list: FixedSizeBufferFreeList,
 }
 
 impl TableFsStateMachine {
     /// Creates one state machine for the shared table-filesystem IO worker.
     #[inline]
-    pub fn new(buf_list: FixedSizeBufferFreeList) -> TableFsStateMachine {
+    pub fn new() -> TableFsStateMachine {
         TableFsStateMachine {
             stats: AIOStats::default(),
-            buf_list,
         }
     }
 }
@@ -398,11 +379,20 @@ impl IOStateMachine for TableFsStateMachine {
     type Submission = TableFsSubmission;
 
     #[inline]
-    fn prepare_request(&mut self, req: TableFsRequest, queue: &mut IOQueue<TableFsSubmission>) {
+    fn prepare_request(
+        &mut self,
+        req: TableFsRequest,
+        max_new: usize,
+        queue: &mut IOQueue<TableFsSubmission>,
+    ) -> Option<TableFsRequest> {
+        if max_new == 0 {
+            return Some(req);
+        }
         match req {
             TableFsRequest::Write(req) => queue.push(TableFsSubmission::Write(req)),
             TableFsRequest::Read(req) => queue.push(TableFsSubmission::Read(req)),
         }
+        None
     }
 
     #[inline]
@@ -414,24 +404,19 @@ impl IOStateMachine for TableFsStateMachine {
     fn on_complete(&mut self, sub: TableFsSubmission, res: std::io::Result<usize>) -> AIOKind {
         match sub {
             TableFsSubmission::Write(mut sub) => {
-                let mut operation = sub
+                let buf = sub
                     .operation
-                    .take()
-                    .expect("write submission must still own its operation during completion");
-                let buf = operation
                     .take_buf()
                     .expect("write operation must still own its direct buffer");
                 match res {
                     Ok(len) => {
                         debug_assert!(len == buf.capacity());
-                        if sub.recycle {
-                            self.buf_list.recycle(buf);
-                        }
-                        sub.done.complete(Ok(()));
+                        drop(buf);
+                        sub.completion.complete(Ok(()));
                     }
                     Err(err) => {
-                        self.buf_list.recycle(buf);
-                        sub.done.complete(Err(err.into()));
+                        drop(buf);
+                        sub.completion.complete(Err(err.into()));
                     }
                 }
                 AIOKind::Write

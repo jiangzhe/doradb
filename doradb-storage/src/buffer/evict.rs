@@ -616,15 +616,28 @@ impl IOStateMachine for EvictablePoolStateMachine {
     type Submission = EvictSubmission;
 
     #[inline]
-    fn prepare_request(&mut self, req: PoolRequest, queue: &mut IOQueue<EvictSubmission>) {
+    fn prepare_request(
+        &mut self,
+        req: PoolRequest,
+        max_new: usize,
+        queue: &mut IOQueue<EvictSubmission>,
+    ) -> Option<PoolRequest> {
+        if max_new == 0 {
+            return Some(req);
+        }
         match req {
             PoolRequest::Read(req) => {
                 let page_id = *req.key();
                 debug_assert!(self.pool.inflight_io.contains(page_id));
                 queue.push(EvictSubmission::Read(req));
+                None
             }
-            PoolRequest::BatchWrite(page_guards, done_ev) => {
-                let done_ev = Arc::new(done_ev);
+            PoolRequest::BatchWrite(mut page_guards, done_ev) => {
+                let remainder = if page_guards.len() > max_new {
+                    Some(page_guards.split_off(max_new))
+                } else {
+                    None
+                };
                 for mut page_guard in page_guards {
                     let page_id = page_guard.page_id();
                     debug_assert!(self.pool.inflight_io.contains(page_id));
@@ -638,6 +651,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                     };
                     queue.push(EvictSubmission::Write(req));
                 }
+                remainder.map(|page_guards| PoolRequest::BatchWrite(page_guards, done_ev))
             }
         }
     }
@@ -757,7 +771,7 @@ impl EvictableRuntime {
     #[inline]
     fn dispatch_io_writes(&self, page_guards: Vec<PageExclusiveGuard<Page>>) -> EventListener {
         self.inflight_io.batch_writes(&page_guards);
-        let done_ev = EventNotifyOnDrop::new();
+        let done_ev = Arc::new(EventNotifyOnDrop::new());
         let listener = done_ev.listen();
         let _ = self
             .io_client
@@ -1047,11 +1061,10 @@ impl PageReservation for EvictPageReservation {
     }
 
     #[inline]
-    /// Drops the exclusive page guard and releases the reserved memory slot.
+    /// Reclaims the reserved page memory and releases the reserved memory slot.
     fn rollback(mut self) {
         if let Some(page_guard) = self.page_guard.take() {
-            drop(page_guard);
-            self.in_mem.dec();
+            self.in_mem.mark_page_dontneed(page_guard);
         }
     }
 }
@@ -1505,7 +1518,7 @@ pub struct EvictableBufferPoolStats {
 /// batch of dirty pages selected by eviction.
 pub(crate) enum PoolRequest {
     Read(EvictReadSubmission),
-    BatchWrite(Vec<PageExclusiveGuard<Page>>, EventNotifyOnDrop),
+    BatchWrite(Vec<PageExclusiveGuard<Page>>, Arc<EventNotifyOnDrop>),
 }
 
 #[cfg(test)]
@@ -1710,6 +1723,44 @@ mod tests {
                 assert!(c.is_invalid());
             }
         })
+    }
+
+    #[test]
+    fn test_evict_page_reservation_rollback_reclaims_page_memory() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = EvictableBufferPoolConfig::default()
+                .role(crate::buffer::PoolRole::Mem)
+                .data_swap_file(temp_dir.path().join("data.bin"))
+                .max_mem_size(64u64 * 1024 * 1024)
+                .max_file_size(128u64 * 1024 * 1024)
+                .build()
+                .unwrap()
+                .0;
+            let pool_guard = pool.pool_guard();
+
+            let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+            let page_id = page_guard.page_id();
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+            pool.in_mem.evict_page(page_guard);
+
+            assert_eq!(pool.in_mem.count.load(Ordering::Acquire), 0);
+            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
+
+            assert!(pool.in_mem.try_inc());
+            let mut page_guard = pool.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
+            page_guard.page_mut()[0] = 0xAB;
+            drop(PageReservationGuard::new(EvictPageReservation::new(
+                page_guard,
+                Arc::clone(&pool.in_mem),
+            )));
+
+            assert_eq!(pool.in_mem.count.load(Ordering::Acquire), 0);
+            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
+
+            let page_guard = pool.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
+            assert_eq!(page_guard.page()[0], 0);
+        });
     }
 
     #[test]

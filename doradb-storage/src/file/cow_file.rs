@@ -2,13 +2,13 @@ use crate::bitmap::AllocMap;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::buffer::{
-    BufferPool, PersistedBlockKey, PersistedFileID, ReadonlyBufferPool, ReadonlyLoadSubmission,
+    BufferPool, PersistedBlockKey, PersistedFileID, ReadSubmission, ReadonlyBufferPool,
 };
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
 use crate::file::super_page::{SUPER_PAGE_SIZE, SuperPage};
-use crate::file::{FixedSizeBufferFreeList, SparseFile, TableFsRequest, write_direct};
+use crate::file::{SparseFile, TableFsRequest, write_direct};
 use crate::io::{AIOClient, DirectBuf};
 use crate::latch::LatchFallbackMode;
 use crate::trx::TrxID;
@@ -162,7 +162,6 @@ pub struct CowFile<M> {
     active_root: AtomicPtr<ActiveRoot<M>>,
     mutable_inflight: AtomicBool,
     io_client: AIOClient<TableFsRequest>,
-    buf_list: FixedSizeBufferFreeList,
     codec: CowCodec<M>,
 }
 
@@ -177,7 +176,6 @@ impl<M> CowFile<M> {
         initial_size: usize,
         file_id: PersistedFileID,
         io_client: AIOClient<TableFsRequest>,
-        buf_list: FixedSizeBufferFreeList,
         codec: CowCodec<M>,
         trunc: bool,
     ) -> Result<Self> {
@@ -192,7 +190,6 @@ impl<M> CowFile<M> {
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
             io_client,
-            buf_list,
             codec,
         })
     }
@@ -206,7 +203,6 @@ impl<M> CowFile<M> {
         file_path: impl AsRef<str>,
         file_id: PersistedFileID,
         io_client: AIOClient<TableFsRequest>,
-        buf_list: FixedSizeBufferFreeList,
         codec: CowCodec<M>,
     ) -> Result<Self> {
         let file = SparseFile::open(file_path)?;
@@ -216,7 +212,6 @@ impl<M> CowFile<M> {
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
             io_client,
-            buf_list,
             codec,
         })
     }
@@ -273,7 +268,7 @@ impl<M> CowFile<M> {
     pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
         debug_assert!(buf.capacity() == COW_FILE_PAGE_SIZE);
         let offset = page_id as usize * COW_FILE_PAGE_SIZE;
-        self.write_at_offset(offset, buf, true).await
+        self.write_at_offset(offset, buf).await
     }
 
     #[inline]
@@ -283,20 +278,13 @@ impl<M> CowFile<M> {
 
     /// Write one buffer at given byte offset.
     #[inline]
-    pub(crate) async fn write_at_offset(
-        &self,
-        offset: usize,
-        buf: DirectBuf,
-        recycle: bool,
-    ) -> Result<()> {
+    pub(crate) async fn write_at_offset(&self, offset: usize, buf: DirectBuf) -> Result<()> {
         write_direct(
             self.block_key(offset),
             self.file.as_raw_fd(),
             offset,
             buf,
-            recycle,
             &self.io_client,
-            &self.buf_list,
         )
         .await
     }
@@ -307,7 +295,7 @@ impl<M> CowFile<M> {
     }
 
     #[inline]
-    pub(crate) async fn queue_readonly_load(&self, req: ReadonlyLoadSubmission) -> Result<()> {
+    pub(crate) async fn queue_read(&self, req: ReadSubmission) -> Result<()> {
         match self.io_client.send_async(TableFsRequest::Read(req)).await {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -406,7 +394,7 @@ impl<M> CowFile<M> {
 
         let super_buf = (self.codec.build_super_page)(&new_root)?;
         let offset = new_root.page_no as usize * super_buf.capacity();
-        self.write_at_offset(offset, super_buf, false).await?;
+        self.write_at_offset(offset, super_buf).await?;
 
         self.fsync();
         Ok(self.swap_active_root(new_root))

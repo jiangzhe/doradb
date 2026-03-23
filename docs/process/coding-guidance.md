@@ -47,6 +47,10 @@ We rely on tooling to enforce style.
 ## 4. Testing
 
 *   **Unit Tests**: Place in `mod tests` within the source file or in `tests.rs`.
+    *   Prefer inline `#[cfg(test)] mod tests` in the same file as the code under test.
+    *   Keep test-only helpers and hook types inside that inline test module unless there is a strong reason to share them more broadly.
+    *   If cross-module test reuse is needed, prefer a narrow `#[cfg(test)] pub(crate) use ...::tests::{...};` re-export instead of expanding the production API or adding standalone test-support modules.
+*   **Production Shape First**: Do not widen or complicate production structs, traits, or control flow solely for tests. Prefer adapting tests to the production path, and use minimal `#[cfg(test)]` branches when test-only control is required.
 *   **Routine Validation**: Run `cargo nextest run -p doradb-storage`.
 *   **Doc Tests**: This project currently does not have doctests, and routine validation does not run `cargo test --doc`.
 

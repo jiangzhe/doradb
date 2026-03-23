@@ -46,7 +46,7 @@ pub enum AIOError {
 
 pub type AIOResult<T> = StdResult<T, AIOError>;
 #[cfg(test)]
-use libaio_backend::set_io_submit_hook;
+pub(crate) use libaio_backend::tests::{LibaioTestHook, set_io_submit_hook, set_libaio_test_hook};
 
 pub type IocbRawPtr = *mut iocb;
 
@@ -349,7 +349,8 @@ impl<T> IOQueue<T> {
 
     #[inline]
     pub fn drain_to(&mut self, n: usize) -> Vec<T> {
-        self.reqs.drain(0..n).collect()
+        let count = n.min(self.reqs.len());
+        self.reqs.drain(0..count).collect()
     }
 
     /// Checks consistency of this queue.
@@ -502,8 +503,18 @@ pub trait IOStateMachine {
     type Submission: IOSubmission<Key = Self::Key>;
 
     /// Called when receiving a new request from the worker channel.
-    /// Implementor should convert it to one or more concrete submissions.
-    fn prepare_request(&mut self, req: Self::Request, queue: &mut IOQueue<Self::Submission>);
+    ///
+    /// `max_new` is the remaining submission headroom for this worker
+    /// iteration. Implementations must enqueue at most `max_new`
+    /// submissions into `queue`. If the request expands into more
+    /// submissions than fit, return the unprocessed remainder so the worker
+    /// can resume it after local depth drops.
+    fn prepare_request(
+        &mut self,
+        req: Self::Request,
+        max_new: usize,
+        queue: &mut IOQueue<Self::Submission>,
+    ) -> Option<Self::Request>;
 
     /// Called after one submission is accepted by the kernel.
     fn on_submit(&mut self, sub: &Self::Submission);
@@ -594,6 +605,7 @@ where
             rx: self.rx,
             submitted: 0,
             shutdown: false,
+            deferred_req: None,
             staged_slots: VecDeque::new(),
             submit_batch,
             slots: InflightSlots::new(io_depth),
@@ -617,6 +629,7 @@ pub struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = LibaioCont
     rx: Receiver<AIOMessage<T>>,
     submitted: usize,
     shutdown: bool,
+    deferred_req: Option<T>,
     staged_slots: VecDeque<u32>,
     submit_batch: B::SubmitBatch,
     slots: InflightSlots<InflightEntry<S::Submission, B::Prepared>>,
@@ -647,45 +660,53 @@ where
     }
 
     #[inline]
+    fn local_depth(&self, queue: &IOQueue<S::Submission>) -> usize {
+        queue.len() + self.staged_slots.len() + self.submitted
+    }
+
+    #[inline]
     fn fetch_reqs(&mut self, queue: &mut IOQueue<S::Submission>, mut min_reqs: usize) {
-        let mut msg = if min_reqs > 0 {
-            // won't fail because we always send Shutdown message before
-            // we close sender side.
-            self.rx.recv().unwrap()
-        } else {
-            match self.rx.try_recv() {
-                Ok(m) => m,
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => unreachable!(),
-            }
-        };
-        min_reqs = min_reqs.saturating_sub(1);
         loop {
+            if self.local_depth(queue) >= self.io_depth() {
+                return;
+            }
+
+            if let Some(req) = self.deferred_req.take() {
+                let headroom = self.io_depth() - self.local_depth(queue);
+                self.deferred_req = self.state_machine.prepare_request(req, headroom, queue);
+                min_reqs = min_reqs.saturating_sub(1);
+                if self.deferred_req.is_some() || self.local_depth(queue) >= self.io_depth() {
+                    return;
+                }
+                continue;
+            }
+
+            let msg = if min_reqs > 0 {
+                // won't fail because we always send Shutdown message before
+                // we close sender side.
+                self.rx.recv().unwrap()
+            } else {
+                match self.rx.try_recv() {
+                    Ok(m) => m,
+                    Err(TryRecvError::Empty) => return,
+                    Err(TryRecvError::Disconnected) => unreachable!(),
+                }
+            };
+            min_reqs = min_reqs.saturating_sub(1);
+
             match msg {
                 AIOMessage::Shutdown => {
                     self.shutdown = true;
                     return;
                 }
                 AIOMessage::Req(req) => {
-                    self.state_machine.prepare_request(req, queue);
-                }
-            }
-            // collapse continuous messages
-            msg = if min_reqs > 0 {
-                // block until next message
-                // won't fail
-                self.rx.recv().unwrap()
-            } else {
-                match self.rx.try_recv() {
-                    Ok(m) => m,
-                    Err(TryRecvError::Empty) => {
-                        // no more messages
+                    let headroom = self.io_depth() - self.local_depth(queue);
+                    self.deferred_req = self.state_machine.prepare_request(req, headroom, queue);
+                    if self.deferred_req.is_some() || self.local_depth(queue) >= self.io_depth() {
                         return;
                     }
-                    Err(TryRecvError::Disconnected) => unreachable!(),
                 }
-            };
-            min_reqs = min_reqs.saturating_sub(1);
+            }
         }
     }
 
@@ -724,12 +745,16 @@ where
                 queue.consistent(),
                 "pending IO number equals to pending request number"
             );
-            // We only accept request if shutdown flag is false.
-            if !self.shutdown {
-                if queue.len() + self.staged_slots.len() + self.submitted == 0 {
+            // We only accept new channel requests if shutdown flag is false.
+            // Deferred request remainders are already worker-owned, so they
+            // must still be expanded and drained after shutdown.
+            if self.deferred_req.is_some() {
+                self.fetch_reqs(&mut queue, 0);
+            } else if !self.shutdown {
+                if self.local_depth(&queue) == 0 {
                     // there is no IO operation running.
                     self.fetch_reqs(&mut queue, 1);
-                } else if queue.len() < self.io_depth() {
+                } else if self.local_depth(&queue) < self.io_depth() {
                     self.fetch_reqs(&mut queue, 0);
                 } // otherwise, do not fetch
             }
@@ -801,6 +826,7 @@ where
             // and worker-owned request state are not dropped silently.
             if self.shutdown
                 && self.submitted == 0
+                && self.deferred_req.is_none()
                 && self.staged_slots.is_empty()
                 && queue.is_empty()
             {
@@ -940,6 +966,17 @@ mod tests {
         assert_eq!(submit_count, 0);
     }
 
+    #[test]
+    fn test_io_queue_drain_to_clamps_to_remaining_len() {
+        let mut queue = IOQueue::with_capacity(2);
+        queue.push(1u32);
+        queue.push(2u32);
+
+        let drained = queue.drain_to(5);
+        assert_eq!(drained, vec![1, 2]);
+        assert!(queue.is_empty());
+    }
+
     struct Request {
         kind: AIOKind,
         offset: usize,
@@ -970,7 +1007,15 @@ mod tests {
         type Key = u64;
         type Submission = Submission;
 
-        fn prepare_request(&mut self, req: Request, queue: &mut IOQueue<Submission>) {
+        fn prepare_request(
+            &mut self,
+            req: Request,
+            max_new: usize,
+            queue: &mut IOQueue<Submission>,
+        ) -> Option<Request> {
+            if max_new == 0 {
+                return Some(req);
+            }
             let key = self.next_key;
             self.next_key += 1;
             let operation = match req.kind {
@@ -983,7 +1028,8 @@ mod tests {
                 key,
                 kind: req.kind,
                 operation,
-            })
+            });
+            None
         }
 
         fn on_submit(&mut self, sub: &Submission) {
@@ -1020,5 +1066,171 @@ mod tests {
         fn end_loop(self) {
             drop(self.file);
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestBackend {
+        max_events: usize,
+    }
+
+    impl IOBackend for TestBackend {
+        type Prepared = ();
+        type SubmitBatch = ();
+        type Events = ();
+
+        fn max_events(&self) -> usize {
+            self.max_events
+        }
+
+        fn new_submit_batch(&self) -> Self::SubmitBatch {}
+
+        fn new_events(&self) -> Self::Events {}
+
+        fn prepare(&mut self, _token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
+            unreachable!("test backend does not stage kernel IO")
+        }
+
+        fn push_prepared(
+            &mut self,
+            _batch: &mut Self::SubmitBatch,
+            _prepared: &mut Self::Prepared,
+        ) {
+            unreachable!("test backend does not stage kernel IO")
+        }
+
+        fn submit_batch(&mut self, _batch: &mut Self::SubmitBatch, _limit: usize) -> usize {
+            unreachable!("test backend does not submit kernel IO")
+        }
+
+        fn wait_at_least(
+            &mut self,
+            _events: &mut Self::Events,
+            _min_nr: usize,
+        ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+            unreachable!("test backend does not wait for kernel IO")
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ExpandRequest {
+        remaining: usize,
+    }
+
+    struct ExpandSubmission {
+        key: u64,
+        operation: Operation,
+    }
+
+    impl IOSubmission for ExpandSubmission {
+        type Key = u64;
+
+        fn key(&self) -> &Self::Key {
+            &self.key
+        }
+
+        fn operation(&mut self) -> &mut Operation {
+            &mut self.operation
+        }
+    }
+
+    #[derive(Default)]
+    struct ExpandingStateMachine {
+        next_key: u64,
+    }
+
+    impl IOStateMachine for ExpandingStateMachine {
+        type Request = ExpandRequest;
+        type Key = u64;
+        type Submission = ExpandSubmission;
+
+        fn prepare_request(
+            &mut self,
+            mut req: ExpandRequest,
+            max_new: usize,
+            queue: &mut IOQueue<ExpandSubmission>,
+        ) -> Option<ExpandRequest> {
+            let emit = req.remaining.min(max_new);
+            for _ in 0..emit {
+                let key = self.next_key;
+                self.next_key += 1;
+                queue.push(ExpandSubmission {
+                    key,
+                    operation: Operation::pwrite_owned(
+                        -1,
+                        0,
+                        DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+                    ),
+                });
+            }
+            req.remaining -= emit;
+            (req.remaining != 0).then_some(req)
+        }
+
+        fn on_submit(&mut self, _sub: &ExpandSubmission) {}
+
+        fn on_complete(&mut self, _sub: ExpandSubmission, _res: std::io::Result<usize>) -> AIOKind {
+            unreachable!("fetch-only tests never complete IO")
+        }
+
+        fn on_stats(&mut self, _stats: &AIOStats) {}
+
+        fn end_loop(self) {}
+    }
+
+    #[test]
+    fn test_fetch_reqs_stops_after_request_expands_to_io_depth() {
+        let (tx, rx) = flume::unbounded();
+        let mut worker = IOWorker {
+            backend: TestBackend { max_events: 2 },
+            rx,
+            submitted: 0,
+            shutdown: false,
+            deferred_req: None,
+            staged_slots: VecDeque::new(),
+            submit_batch: (),
+            slots: InflightSlots::new(2),
+            state_machine: ExpandingStateMachine::default(),
+        };
+        let mut queue = IOQueue::with_capacity(2);
+
+        tx.send(AIOMessage::Req(ExpandRequest { remaining: 5 }))
+            .unwrap();
+        worker.fetch_reqs(&mut queue, 1);
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(worker.local_depth(&queue), 2);
+        assert_eq!(worker.deferred_req, Some(ExpandRequest { remaining: 3 }));
+    }
+
+    #[test]
+    fn test_fetch_reqs_counts_submitted_work_against_io_depth() {
+        let (tx, rx) = flume::unbounded();
+        let mut worker = IOWorker {
+            backend: TestBackend { max_events: 2 },
+            rx,
+            submitted: 1,
+            shutdown: false,
+            deferred_req: None,
+            staged_slots: VecDeque::new(),
+            submit_batch: (),
+            slots: InflightSlots::new(2),
+            state_machine: ExpandingStateMachine::default(),
+        };
+        let mut queue = IOQueue::with_capacity(2);
+
+        tx.send(AIOMessage::Req(ExpandRequest { remaining: 1 }))
+            .unwrap();
+        tx.send(AIOMessage::Req(ExpandRequest { remaining: 1 }))
+            .unwrap();
+
+        worker.fetch_reqs(&mut queue, 0);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(worker.local_depth(&queue), 2);
+        assert!(worker.deferred_req.is_none());
+
+        worker.submitted = 0;
+        worker.fetch_reqs(&mut queue, 0);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(worker.local_depth(&queue), 2);
     }
 }
