@@ -11,9 +11,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 const COVERAGE_WORK_DIR: &str = "target/coverage-focus";
-const PROFILE_DIR: &str = "target/coverage-focus/profiles";
 const TARGET_DIR: &str = "target/coverage-focus/cargo";
+const LLVM_COV_TARGET_DIR: &str = "target/coverage-focus/llvm-cov-target";
 const LCOV_OUT: &str = "target/coverage-focus/lcov.info";
+const COVERAGE_IGNORE_FILENAME_REGEX: &str =
+    r"(^|/)(target|legacy)(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/";
 
 #[derive(Debug)]
 struct Args {
@@ -57,14 +59,15 @@ fn usage() -> &'static str {
     "Usage: tools/coverage_focus.rs --path <repo-path> [--write <markdown-path>] [--top-uncovered <n>] [--verbose]\n\
 \n\
 Prerequisites:\n\
-- `grcov` available in PATH (`cargo install grcov`)\n\
-- LLVM tools with `llvm-profdata` (for example `rustup component add llvm-tools`)\n\
-- Optional `COVERAGE_FOCUS_LLVM_PATH` can point to the LLVM tools directory\n\
+- `cargo-nextest` available in PATH (`cargo install --locked cargo-nextest`)\n\
+- `cargo-llvm-cov` available in PATH (`cargo install --locked cargo-llvm-cov`)\n\
+- LLVM tools with `llvm-cov` and `llvm-profdata` (for example `rustup component add llvm-tools`)\n\
+- Optional `COVERAGE_FOCUS_LLVM_PATH` can point to the LLVM tools directory containing both tools\n\
 - Supported coverage runs require `libaio1` and `libaio-dev` in Linux environments\n\
 \n\
 Output:\n\
 - By default, command stdout/stderr is hidden and only step descriptions are printed\n\
-- Use `--verbose` to stream full build/test/grcov output"
+- Use `--verbose` to stream full build/test/report output"
 }
 
 fn main() {
@@ -83,12 +86,13 @@ fn run() -> Result<(), String> {
     let args = parse_args(&repo_root)?;
 
     precheck_repo_layout(&repo_root)?;
-    precheck_grcov()?;
+    precheck_cargo_nextest()?;
+    precheck_cargo_llvm_cov()?;
     let llvm_tools_dir = precheck_llvm_tools(&repo_root)?;
 
     prepare_coverage_dirs()?;
-    run_coverage_phases(&repo_root, args.show_output)?;
-    generate_merged_lcov(&repo_root, &llvm_tools_dir, args.show_output)?;
+    run_coverage_phases(&repo_root, &llvm_tools_dir, args.show_output)?;
+    validate_lcov_output()?;
 
     let lcov_rows = parse_lcov(Path::new(LCOV_OUT), &repo_root)?;
     let matched = focus_target(&lcov_rows, &args, &repo_root)?;
@@ -202,46 +206,73 @@ fn precheck_repo_layout(repo_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn precheck_grcov() -> Result<(), String> {
-    let status = Command::new("grcov")
-        .arg("--version")
+fn precheck_cargo_nextest() -> Result<(), String> {
+    let status = Command::new("cargo")
+        .args(["nextest", "--version"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|_| "`grcov` not found in PATH. Install with: cargo install grcov".to_string())?;
+        .map_err(|_| {
+            "`cargo-nextest` not found in PATH. Install with: cargo install --locked cargo-nextest"
+                .to_string()
+        })?;
     if !status.success() {
-        return Err("`grcov --version` failed. Ensure grcov is correctly installed.".to_string());
+        return Err(
+            "`cargo nextest --version` failed. Ensure cargo-nextest is correctly installed."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn precheck_cargo_llvm_cov() -> Result<(), String> {
+    let status = Command::new("cargo")
+        .args(["llvm-cov", "--version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| {
+            "`cargo-llvm-cov` not found in PATH. Install with: cargo install --locked cargo-llvm-cov"
+                .to_string()
+        })?;
+    if !status.success() {
+        return Err(
+            "`cargo llvm-cov --version` failed. Ensure cargo-llvm-cov is correctly installed."
+                .to_string(),
+        );
     }
     Ok(())
 }
 
 fn precheck_llvm_tools(repo_root: &Path) -> Result<PathBuf, String> {
     let llvm_dir = detect_llvm_tools_dir(repo_root).ok_or_else(|| {
-        "llvm tools not found. Install with `rustup component add llvm-tools` or set `COVERAGE_FOCUS_LLVM_PATH` to a directory containing `llvm-profdata`.".to_string()
+        "llvm tools not found. Install with `rustup component add llvm-tools` or set `COVERAGE_FOCUS_LLVM_PATH` to a directory containing both `llvm-cov` and `llvm-profdata`.".to_string()
     })?;
-    let status = Command::new(llvm_dir.join("llvm-profdata"))
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| {
-            format!(
-                "failed to execute `{}`: {e}",
-                llvm_dir.join("llvm-profdata").display()
-            )
-        })?;
-    if !status.success() {
-        return Err(format!(
-            "`{} --version` failed. Ensure LLVM tools are correctly installed.",
-            llvm_dir.join("llvm-profdata").display()
-        ));
+
+    for tool in ["llvm-cov", "llvm-profdata"] {
+        let tool_path = llvm_dir.join(tool);
+        let status = Command::new(&tool_path)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("failed to execute `{}`: {e}", tool_path.display()))?;
+        if !status.success() {
+            return Err(format!(
+                "`{} --version` failed. Ensure LLVM tools are correctly installed.",
+                tool_path.display()
+            ));
+        }
     }
     Ok(llvm_dir)
 }
 
 fn prepare_coverage_dirs() -> Result<(), String> {
-    remove_path_if_exists(Path::new(COVERAGE_WORK_DIR))?;
-    fs::create_dir_all(PROFILE_DIR).map_err(|e| format!("failed to create {PROFILE_DIR}: {e}"))?;
+    fs::create_dir_all(COVERAGE_WORK_DIR)
+        .map_err(|e| format!("failed to create {COVERAGE_WORK_DIR}: {e}"))?;
+    fs::create_dir_all(TARGET_DIR).map_err(|e| format!("failed to create {TARGET_DIR}: {e}"))?;
+    remove_path_if_exists(Path::new(LLVM_COV_TARGET_DIR))?;
+    remove_path_if_exists(Path::new(LCOV_OUT))?;
     Ok(())
 }
 
@@ -258,32 +289,71 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn run_coverage_phases(repo_root: &Path, show_output: bool) -> Result<(), String> {
-    println!("== coverage phase: supported libaio backend ==");
-    let profile = repo_root.join(PROFILE_DIR).join("coverage-%p-%m.profraw");
-    let target_dir = repo_root.join(TARGET_DIR);
-    let coverage_env = vec![
-        (
-            "RUSTFLAGS",
-            "-Cinstrument-coverage -Ctarget-cpu=native".to_string(),
-        ),
-        ("LLVM_PROFILE_FILE", profile.to_string_lossy().to_string()),
-        (
-            "CARGO_TARGET_DIR",
-            target_dir.to_string_lossy().to_string(),
-        ),
-        ("RUST_BACKTRACE", "full".to_string()),
-    ];
+fn run_coverage_phases(
+    repo_root: &Path,
+    llvm_tools_dir: &Path,
+    show_output: bool,
+) -> Result<(), String> {
+    println!("== coverage phase: supported libaio backend via cargo llvm-cov nextest ==");
     run_checked(
         repo_root,
         "cargo",
-        &["test", "--all"],
-        &coverage_env,
+        coverage_nextest_args(),
+        &coverage_env(repo_root, llvm_tools_dir),
         show_output,
     )
-    .map_err(|msg| format_coverage_phase_error(msg))?;
+    .map_err(format_coverage_phase_error)?;
 
     Ok(())
+}
+
+fn coverage_nextest_args() -> &'static [&'static str] {
+    &[
+        "llvm-cov",
+        "nextest",
+        "--no-clean",
+        "--lcov",
+        "--output-path",
+        LCOV_OUT,
+        "--no-default-ignore-filename-regex",
+        "--ignore-filename-regex",
+        COVERAGE_IGNORE_FILENAME_REGEX,
+        "-p",
+        "doradb-storage",
+        "--profile",
+        "ci",
+    ]
+}
+
+fn coverage_env(repo_root: &Path, llvm_tools_dir: &Path) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "CARGO_TARGET_DIR",
+            repo_root.join(TARGET_DIR).to_string_lossy().to_string(),
+        ),
+        (
+            "CARGO_LLVM_COV_TARGET_DIR",
+            repo_root
+                .join(LLVM_COV_TARGET_DIR)
+                .to_string_lossy()
+                .to_string(),
+        ),
+        (
+            "LLVM_COV",
+            llvm_tools_dir
+                .join("llvm-cov")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        (
+            "LLVM_PROFDATA",
+            llvm_tools_dir
+                .join("llvm-profdata")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        ("RUST_BACKTRACE", "full".to_string()),
+    ]
 }
 
 fn run_checked(
@@ -308,30 +378,6 @@ fn run_checked(
         .status()
         .map_err(|e| format!("failed to start `{program}`: {e}"))?;
     ensure_success(program, args, status, show_output)
-}
-
-fn run_checked_owned(
-    repo_root: &Path,
-    program: &str,
-    args: &[String],
-    envs: &[(&str, &str)],
-    show_output: bool,
-) -> Result<(), String> {
-    if show_output {
-        println!("$ {} {}", program, args.join(" "));
-    }
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(repo_root)
-        .envs(envs.iter().copied());
-    if !show_output {
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    }
-    let status = cmd
-        .status()
-        .map_err(|e| format!("failed to start `{program}`: {e}"))?;
-    let arg_slices = args.iter().map(String::as_str).collect::<Vec<_>>();
-    ensure_success(program, &arg_slices, status, show_output)
 }
 
 fn ensure_success(
@@ -362,42 +408,16 @@ fn format_coverage_phase_error(base: String) -> String {
     out
 }
 
-fn generate_merged_lcov(
-    repo_root: &Path,
-    llvm_tools_dir: &Path,
-    show_output: bool,
-) -> Result<(), String> {
-    println!("== generate coverage with grcov ==");
-    let mut args = vec![
-        PROFILE_DIR.to_string(),
-        "--binary-path".to_string(),
-        COVERAGE_WORK_DIR.to_string(),
-        "-s".to_string(),
-        ".".to_string(),
-        "-t".to_string(),
-        "lcov".to_string(),
-        "--branch".to_string(),
-        "--ignore-not-existing".to_string(),
-        "--ignore".to_string(),
-        "target/".to_string(),
-        "--ignore".to_string(),
-        "legacy/**".to_string(),
-        "--ignore".to_string(),
-        "**/legacy/**".to_string(),
-    ];
-    args.push("--llvm-path".to_string());
-    args.push(llvm_tools_dir.to_string_lossy().to_string());
-    args.push("-o".to_string());
-    args.push(LCOV_OUT.to_string());
-    run_checked_owned(repo_root, "grcov", &args, &[], show_output)?;
-
+fn validate_lcov_output() -> Result<(), String> {
     if !Path::new(LCOV_OUT).exists() {
-        return Err(format!("grcov finished but output not found: {LCOV_OUT}"));
+        return Err(format!(
+            "coverage run finished but output not found: {LCOV_OUT}"
+        ));
     }
     let lcov = fs::read_to_string(LCOV_OUT)
         .map_err(|e| format!("failed to read merged lcov output {LCOV_OUT}: {e}"))?;
     if !lcov.lines().any(|line| line.starts_with("SF:")) {
-        return Err("merged LCOV is empty. Check `grcov` logs for `llvm-profdata`/version mismatch and ensure llvm tools are available.".to_string());
+        return Err("generated LCOV is empty. Check `cargo llvm-cov nextest` logs, ensure llvm tools are available, and confirm ignore filters are not excluding the requested Rust sources.".to_string());
     }
     Ok(())
 }
@@ -676,10 +696,14 @@ fn rel_display_from_abs_key(source_path: &str, repo_root: &Path) -> String {
     normalize_path(source_path)
 }
 
+fn has_required_llvm_tools(dir: &Path) -> bool {
+    dir.join("llvm-cov").is_file() && dir.join("llvm-profdata").is_file()
+}
+
 fn detect_llvm_tools_dir(repo_root: &Path) -> Option<PathBuf> {
     if let Ok(value) = env::var("COVERAGE_FOCUS_LLVM_PATH") {
         let candidate = PathBuf::from(value);
-        if candidate.join("llvm-profdata").is_file() {
+        if has_required_llvm_tools(&candidate) {
             return Some(candidate);
         }
     }
@@ -697,7 +721,7 @@ fn detect_llvm_tools_dir(repo_root: &Path) -> Option<PathBuf> {
             let lib_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
             let rustlib_dir = lib_dir.parent()?;
             let bin_dir = rustlib_dir.join("bin");
-            if bin_dir.join("llvm-profdata").is_file() {
+            if has_required_llvm_tools(&bin_dir) {
                 Some(bin_dir)
             } else {
                 None
@@ -719,7 +743,7 @@ fn detect_llvm_tools_dir(repo_root: &Path) -> Option<PathBuf> {
             let lib_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
             let rustlib_dir = lib_dir.parent()?;
             let bin_dir = rustlib_dir.join("bin");
-            if bin_dir.join("llvm-profdata").is_file() {
+            if has_required_llvm_tools(&bin_dir) {
                 Some(bin_dir)
             } else {
                 None
@@ -730,7 +754,7 @@ fn detect_llvm_tools_dir(repo_root: &Path) -> Option<PathBuf> {
     }
 
     let system_bin = PathBuf::from("/usr/bin");
-    if system_bin.join("llvm-profdata").is_file() {
+    if has_required_llvm_tools(&system_bin) {
         return Some(system_bin);
     }
     None
@@ -789,6 +813,7 @@ mod tests {
             target_is_dir: false,
             write_path: None,
             top_uncovered: 10,
+            show_output: false,
         };
         let file_report = focus_target(&rows, &file_args, repo).unwrap();
         assert_eq!(file_report.files.len(), 1);
@@ -802,10 +827,45 @@ mod tests {
             target_is_dir: true,
             write_path: None,
             top_uncovered: 10,
+            show_output: false,
         };
         let dir_report = focus_target(&rows, &dir_args, repo).unwrap();
         assert_eq!(dir_report.files.len(), 2);
         assert_eq!(dir_report.totals.lines_found, 3);
         assert_eq!(dir_report.totals.lines_hit, 2);
+    }
+
+    #[test]
+    fn coverage_nextest_args_disable_default_filename_exclusions() {
+        let args = coverage_nextest_args();
+        assert!(args.contains(&"--no-default-ignore-filename-regex"));
+        assert!(args.contains(&"--ignore-filename-regex"));
+        assert!(args.contains(&COVERAGE_IGNORE_FILENAME_REGEX));
+    }
+
+    #[test]
+    fn coverage_nextest_args_preserve_warm_build_cache() {
+        let args = coverage_nextest_args();
+        assert!(args.contains(&"--no-clean"));
+        assert!(args.contains(&"--lcov"));
+        assert!(args.contains(&LCOV_OUT));
+        assert!(args.contains(&"--profile"));
+        assert!(args.contains(&"ci"));
+    }
+
+    #[test]
+    fn has_required_llvm_tools_requires_both_binaries() {
+        let fixture =
+            std::env::temp_dir().join(format!("coverage-focus-llvm-tools-{}", std::process::id()));
+        remove_path_if_exists(&fixture).unwrap();
+        fs::create_dir_all(&fixture).unwrap();
+
+        fs::write(fixture.join("llvm-cov"), "").unwrap();
+        assert!(!has_required_llvm_tools(&fixture));
+
+        fs::write(fixture.join("llvm-profdata"), "").unwrap();
+        assert!(has_required_llvm_tools(&fixture));
+
+        fs::remove_dir_all(fixture).ok();
     }
 }

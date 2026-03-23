@@ -79,30 +79,27 @@ jobs:
     if: needs.changes.outputs.run_build == 'true'
     runs-on: ubuntu-22.04
     steps:
-    - name: Install libaio & lcov
-      run: sudo apt-get install -y libaio1 libaio-dev lcov llvm
+    - name: Install libaio
+      run: sudo apt-get install -y libaio1 libaio-dev
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Setup Rust
       uses: actions-rs/toolchain@v1
       with:
         toolchain: stable
-        components: llvm-tools      
+        components: llvm-tools
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
-    - name: Install grcov
-      run: cargo install grcov
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
     - name: Clippy (all features / all targets)
       run: cargo clippy --all-features --all-targets -- -D warnings
-    - name: Validate with nextest
+    - name: Validate with cargo llvm-cov nextest
       env:
-        RUSTFLAGS: "-Cinstrument-coverage -Ctarget-cpu=native"
-        LLVM_PROFILE_FILE: "coverage/coverage-%p-%m.profraw"
         CARGO_TARGET_DIR: "target/coverage"
+        CARGO_LLVM_COV_TARGET_DIR: "target/coverage/llvm-cov-target"
         RUST_BACKTRACE: "full"
-      run: |
-        mkdir -p coverage
-        cargo nextest run -p doradb-storage --profile ci
+      run: cargo llvm-cov nextest --no-report -p doradb-storage --profile ci
     - name: Upload nextest JUnit reports
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
@@ -112,24 +109,20 @@ jobs:
         path: |
           target/**/nextest/ci/junit.xml
     - name: Generate coverage report
-      run: |
-        grcov . \
-          --binary-path ./target \
-          -s . -t lcov \
-          --branch --ignore-not-existing \
-          --ignore "target/" \
-          --ignore "legacy/**" \
-          --ignore "**/legacy/**" \
-          --ignore "/home/runner/.cargo/registry/*" \
-          --ignore "/home/runner/.cargo/git/*" \
-          --ignore "*/.cargo/registry/*" \
-          --ignore "*/.cargo/git/*" \
-          --ignore "doradb-tpch-tests" \
-          -o lcov.info
+      env:
+        CARGO_TARGET_DIR: "target/coverage"
+        CARGO_LLVM_COV_TARGET_DIR: "target/coverage/llvm-cov-target"
+      run: >
+        cargo llvm-cov report
+        --lcov
+        --output-path lcov.info
+        --no-default-ignore-filename-regex
+        --ignore-filename-regex '(^|/)(target|legacy)(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/'
+        -p doradb-storage
     - name: Upload to codecov.io
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v5
       with:
-        file: lcov.info
+        files: lcov.info
         token: ${{secrets.CODECOV_TOKEN}}
 
   docs-or-tools-only:
