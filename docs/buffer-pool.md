@@ -21,6 +21,22 @@ All pool implementations share these core ideas:
 4. **Clock-sweep primitives**
    - shared helpers in `buffer/util.rs` implement ordered clock traversal and candidate selection.
 
+### VersionedPageID and Recovery
+
+`VersionedPageID { page_id, generation }` is a runtime identity used when row-page
+undo or purge logic needs to refer back to a mutable page safely after
+deallocation and reuse become possible.
+
+The important rule is that `generation` is not durable metadata:
+
+1. redo and checkpoint/recovery persist physical `PageID`, not `VersionedPageID`
+2. undo logs are maintained in memory only
+3. recovery rebuilds row pages from redo and reconstructs fresh runtime frame generations
+
+In practice this means `VersionedPageID` protects rollback and purge from
+touching a reused page instance, but it is not part of the on-disk compatibility
+contract.
+
 ## FixedBufferPool
 
 `FixedBufferPool` is a non-evicting metadata pool.

@@ -38,3 +38,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: replaced
+- Detail: Superseded by RFC-0010 and task 000085, which introduced the broader backend-neutral completion core and migrated file, readonly, and evictable async IO onto it; remaining storage-IO error policy and redo follow-up are tracked separately.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-23
