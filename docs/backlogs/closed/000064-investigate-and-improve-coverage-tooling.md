@@ -33,3 +33,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by task 000086 after migrating CI and tools/coverage_focus.rs from grcov to cargo-llvm-cov.
+- Closed By: backlog close
+- Reference: docs/tasks/000086-adopt-cargo-llvm-cov-for-coverage-tooling.md
+- Closed At: 2026-03-22

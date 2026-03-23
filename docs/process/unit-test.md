@@ -86,10 +86,22 @@ Use the local coverage focus script when you need fast feedback for one file or 
 ### Prerequisites
 
 -   Nightly toolchain installed (scripts are directly executable via shebang).
--   `grcov` installed in `PATH`:
+-   `cargo-nextest` installed in `PATH`:
 
     ```bash
-    cargo install grcov
+    cargo install --locked cargo-nextest
+    ```
+
+-   `cargo-llvm-cov` installed in `PATH`:
+
+    ```bash
+    cargo install --locked cargo-llvm-cov
+    ```
+
+-   LLVM tools installed for the active Rust toolchain:
+
+    ```bash
+    rustup component add llvm-tools
     ```
 
 -   `libaio` packages must be installed in Linux environments:
@@ -116,11 +128,21 @@ tools/coverage_focus.rs \
 ```
 
 The script regenerates coverage artifacts for the supported `libaio`
-configuration, generates LCOV with `grcov`, then prints focused line-coverage
-summaries and uncovered-line hotspots.
+configuration and runs `cargo llvm-cov nextest --lcov` before printing focused
+line-coverage summaries and uncovered-line hotspots.
 
-All intermediate coverage artifacts are written under `target/coverage-focus/` so repository root is not polluted.
+The script keeps instrumented build artifacts under `target/coverage-focus/`
+for faster warmed reruns while regenerating fresh report output on each run.
 
-Coverage execution and coverage-tooling migration remain on the current path
-for now and are tracked separately by
-`docs/backlogs/000064-investigate-and-improve-coverage-tooling.md`.
+All intermediate coverage artifacts stay under `target/coverage-focus/`, so
+repository root is not polluted.
+
+### Troubleshooting
+
+-   If `cargo llvm-cov` reports missing LLVM tools, install them with
+    `rustup component add llvm-tools`.
+-   If you need to use non-default LLVM binaries, set
+    `COVERAGE_FOCUS_LLVM_PATH` to a directory containing both `llvm-cov` and
+    `llvm-profdata`.
+-   Re-run the script with `--verbose` to stream the underlying
+    `cargo llvm-cov nextest` command.
