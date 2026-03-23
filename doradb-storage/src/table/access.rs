@@ -312,12 +312,12 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
         mut index_branches: Vec<IndexBranch>,
-    ) -> (RowID, PageSharedGuard<RowPage>) {
+    ) -> Result<(RowID, PageSharedGuard<RowPage>)> {
         let metadata = self.metadata();
         let row_len = row_len(metadata, &insert);
         let row_count = estimate_max_row_count(row_len, metadata.col_count());
         loop {
-            let page_guard = self.get_insert_page(stmt, row_count).await;
+            let page_guard = self.get_insert_page(stmt, row_count).await?;
             match self.insert_row_to_page(stmt, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
                     stmt.save_active_insert_page(
@@ -325,7 +325,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                         page_guard.versioned_page_id(),
                         row_id,
                     );
-                    return (row_id, page_guard);
+                    return Ok((row_id, page_guard));
                 }
                 // this page cannot be inserted any more, just leave it and retry another page.
                 InsertRowIntoPage::NoSpaceOrFrozen(ins, uk, ib) => {
@@ -642,7 +642,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         update: Vec<UpdateCol>,
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
-    ) -> (RowID, HashMap<usize, Val>, PageSharedGuard<RowPage>) {
+    ) -> Result<(RowID, HashMap<usize, Val>, PageSharedGuard<RowPage>)> {
         // calculate new row and index changes.
         let (new_row, old_vals, index_change_cols) = {
             let mut index_change_cols = HashMap::new();
@@ -710,9 +710,9 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         old_guard.set_dirty(); // mark as dirty page.
         let (new_row_id, new_guard) = self
             .insert_row_internal(stmt, new_row, RowUndoKind::Insert, index_branches)
-            .await;
+            .await?;
         // do not unlock the page because we may need to update index
-        (new_row_id, index_change_cols, new_guard)
+        Ok((new_row_id, index_change_cols, new_guard))
     }
 
     #[inline]
@@ -1115,24 +1115,23 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         &self,
         stmt: &mut Statement,
         row_count: usize,
-    ) -> PageSharedGuard<RowPage> {
+    ) -> Result<PageSharedGuard<RowPage>> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
             let page_guard = self
                 .try_get_row_page_versioned_shared_result(stmt.pool_guards(), page_id)
-                .await
-                .expect("get_insert_page should not ignore row-page reload failures");
+                .await?;
             if let Some(page_guard) = page_guard {
                 // because we save last insert page in session and meanwhile other thread may access this page
                 // and do some modification, even worse, buffer pool may evict it and reload other data into
                 // this page. so here, we do not require that no change should happen, but if something change,
                 // we validate that page id and row id range is still valid.
                 if validate_page_row_range(&page_guard, page_id.page_id, row_id) {
-                    return page_guard;
+                    return Ok(page_guard);
                 }
             }
         }
         let redo_ctx = self.row_page_create_redo_ctx(stmt);
-        GenericMemTable::get_insert_page(self, stmt.pool_guards(), row_count, redo_ctx).await
+        GenericMemTable::try_get_insert_page(self, stmt.pool_guards(), row_count, redo_ctx).await
     }
 
     #[inline]
@@ -2094,9 +2093,13 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         });
         let keys = self.metadata().keys_for_insert(&cols);
         // insert row into page with undo log linked.
-        let (row_id, page_guard) = self
+        let (row_id, page_guard) = match self
             .insert_row_internal(stmt, cols, RowUndoKind::Insert, Vec::new())
-            .await;
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => return InsertMvcc::Err(err),
+        };
         // insert index
         for key in keys {
             match self.insert_index(stmt, key, row_id, &page_guard).await {
@@ -2188,9 +2191,13 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                 UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
                     // in-place update failed, we transfer update into
                     // move+update.
-                    let (new_row_id, index_change_cols, new_guard) = self
+                    let (new_row_id, index_change_cols, new_guard) = match self
                         .move_update_for_space(stmt, old_row, update, old_row_id, old_guard)
-                        .await;
+                        .await
+                    {
+                        Ok(res) => res,
+                        Err(err) => return UpdateMvcc::Err(err),
+                    };
                     if !index_change_cols.is_empty() {
                         let res = self
                             .update_indexes_may_both_change(

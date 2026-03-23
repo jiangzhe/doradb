@@ -96,7 +96,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
-        self.get_insert_page_with_redo(
+        self.try_get_insert_page_with_redo(
             meta_pool_guard,
             mem_pool,
             mem_pool_guard,
@@ -105,10 +105,11 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             None,
         )
         .await
+        .expect("block-index get_insert_page should not ignore row-page I/O failures")
     }
 
     #[inline]
-    pub(crate) async fn get_insert_page_with_redo<B: BufferPool>(
+    pub(crate) async fn try_get_insert_page_with_redo<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
@@ -116,9 +117,9 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> PageSharedGuard<RowPage> {
+    ) -> Result<PageSharedGuard<RowPage>> {
         self.row
-            .get_insert_page_with_redo(
+            .try_get_insert_page_with_redo(
                 meta_pool_guard,
                 mem_pool,
                 mem_pool_guard,

@@ -242,7 +242,11 @@ impl TransactionSystem {
             // so we can just drop it if there is no change to replay.
             return Ok(0);
         }
-        // system transactions are always submitted to first log partition.
+        // System transactions are always submitted to first log partition and
+        // use the no-wait piggyback flow intentionally. They publish internal
+        // state that becomes globally visible once the redo group commits, and
+        // they are not modeled as session-bound transactions that can later be
+        // rolled back through the normal user transaction API.
         const LOG_NO: usize = 0;
         let partition = &*self.log_partitions[LOG_NO];
         let prepared_trx = trx.prepare();

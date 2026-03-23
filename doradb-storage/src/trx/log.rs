@@ -394,6 +394,14 @@ impl LogPartition {
             }
             Err(_) => unreachable!(),
         };
+        // Session ownership is detached here for the normal user-transaction path.
+        // The caller keeps the returned session handle and is responsible for
+        // calling SessionState::commit()/rollback() after the durability wait.
+        //
+        // The no-wait path is intentionally reserved for sessionless system
+        // transactions submitted via TransactionSystem::commit_sys(). Those
+        // transactions piggyback on the redo scheduler and are not expected to
+        // support later rollback through a session-bound transaction handle.
         let session = trx.take_session();
         let completion = Arc::new(Completion::new());
         let waiter = wait_sync.then(|| Arc::clone(&completion));
@@ -449,6 +457,17 @@ impl LogPartition {
 
     #[inline]
     pub(super) fn commit_no_wait(&self, trx: PreparedTrx, global_ts: &AtomicU64) -> Result<TrxID> {
+        // This API is for sessionless system transactions only.
+        //
+        // System transactions are used to durably piggyback internal state
+        // changes that become globally visible once the redo group commits. They
+        // do not participate in user-session rollback semantics, so this path
+        // intentionally returns immediately without a waiter or a detached
+        // session handle.
+        //
+        // Do not route a session-bound user transaction here. The user path must
+        // wait for durability so the caller can commit/rollback the session
+        // explicitly.
         let (cts, session, listener) = self.enqueue_commit(trx, global_ts, false)?;
         debug_assert!(session.is_none());
         debug_assert!(listener.is_none());
@@ -466,6 +485,10 @@ impl LogPartition {
     ) -> Result<TrxID> {
         let (cts, mut session, waiter) = self.enqueue_commit(trx, global_ts, wait_sync)?;
         if !wait_sync {
+            // Non-waiting commit is the same contract as commit_no_wait(): it is
+            // only for sessionless/system callers. Sessionful user transactions
+            // must use wait_sync = true so the caller can finish session state
+            // after durability succeeds or fails.
             debug_assert!(session.is_none());
             return Ok(cts);
         }

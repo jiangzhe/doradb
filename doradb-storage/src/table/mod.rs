@@ -337,16 +337,16 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
-    pub(crate) async fn get_insert_page(
+    pub(crate) async fn try_get_insert_page(
         &self,
         guards: &PoolGuards,
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> PageSharedGuard<RowPage> {
+    ) -> Result<PageSharedGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
-            .get_insert_page_with_redo(
+            .try_get_insert_page_with_redo(
                 meta_pool_guard,
                 &self.mem_pool,
                 row_pool_guard,

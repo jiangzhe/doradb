@@ -103,6 +103,9 @@ impl CommitGroup {
             self.log_buf.ser(&redo_bin);
         }
         self.max_cts = trx.cts;
+        // Match LogPartition::create_new_group(): synchronous user commits hand
+        // session ownership back to the caller, while the no-wait path is only
+        // intended for sessionless system transactions.
         let session = trx.take_session();
         self.trx_list.push(trx);
         let waiter = wait_sync.then(|| Arc::clone(&self.completion));

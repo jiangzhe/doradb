@@ -94,6 +94,18 @@ impl EvictableBufferPool {
         &self.stats
     }
 
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn test_frame_kind(&self, page_id: PageID) -> FrameKind {
+        self.arena.frame(page_id).kind()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn test_raw_fd(&self) -> RawFd {
+        self.raw_fd
+    }
+
     #[inline]
     async fn try_wait_for_io_write(&self, page_id: PageID) -> Result<()> {
         self.inflight_io

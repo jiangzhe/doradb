@@ -1,4 +1,6 @@
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
+use crate::buffer::frame::FrameKind;
+use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
 use crate::error::{
@@ -8,6 +10,7 @@ use crate::file::build_test_fs_in;
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::table_fs::TableFileSystemConfig;
 use crate::index::{ColumnBlockIndex, RowLocation, UniqueIndex};
+use crate::io::{LibaioTestHook, io_event, io_iocb_cmd, iocb, set_libaio_test_hook};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol};
 use crate::row::{RowID, RowPage};
@@ -20,9 +23,92 @@ use crate::trx::{ActiveTrx, TrxID};
 use crate::value::Val;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::Arc;
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 use tempfile::TempDir;
+
+static LIBAIO_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct InstalledLibaioTestHook {
+    previous: Option<Arc<dyn LibaioTestHook>>,
+    guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl Drop for InstalledLibaioTestHook {
+    #[inline]
+    fn drop(&mut self) {
+        let _ = set_libaio_test_hook(self.previous.take());
+        drop(self.guard.take());
+    }
+}
+
+fn install_libaio_test_hook(hook: Arc<dyn LibaioTestHook>) -> InstalledLibaioTestHook {
+    let guard = LIBAIO_TEST_HOOK_LOCK.lock().unwrap();
+    InstalledLibaioTestHook {
+        previous: set_libaio_test_hook(Some(hook)),
+        guard: Some(guard),
+    }
+}
+
+struct FailingPageReadHook {
+    fd: RawFd,
+    offset: usize,
+    errno: i32,
+    calls: AtomicUsize,
+}
+
+impl FailingPageReadHook {
+    #[inline]
+    fn for_page(fd: RawFd, page_id: PageID, errno: i32) -> Self {
+        Self {
+            fd,
+            offset: page_id as usize * PAGE_SIZE,
+            errno,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    fn matches_iocb(&self, req: &iocb) -> bool {
+        req.aio_lio_opcode == io_iocb_cmd::IO_CMD_PREAD as u16
+            && req.aio_fildes == self.fd as u32
+            && req.offset as usize == self.offset
+    }
+
+    #[inline]
+    fn matches_completion(&self, event: &io_event) -> bool {
+        let Some(req) = (unsafe { event.obj.as_ref() }) else {
+            return false;
+        };
+        self.matches_iocb(req)
+    }
+}
+
+impl LibaioTestHook for FailingPageReadHook {
+    fn on_submit(&self, submitted: &[*mut iocb]) {
+        for &req in submitted {
+            let Some(req) = (unsafe { req.as_ref() }) else {
+                continue;
+            };
+            if self.matches_iocb(req) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn on_completion(&self, event: &mut io_event) {
+        if self.matches_completion(event) {
+            event.res = -(self.errno as i64);
+        }
+    }
+}
 
 #[test]
 fn test_mvcc_insert_normal() {
@@ -1733,6 +1819,78 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
 }
 
 #[test]
+fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_mem_size(9u64 * 1024 * 1024).await;
+        let mut session = sys.try_new_session().unwrap();
+
+        let large = "r".repeat(48 * 1024);
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(1), Val::from(&large[..])])
+                .await,
+        );
+        trx = stmt.succeed();
+        trx.commit().await.unwrap();
+
+        let (cached_page, cached_row_id) = session
+            .load_active_insert_page(sys.table.table_id())
+            .unwrap();
+        assert_eq!(cached_row_id, row_id);
+        session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
+
+        let mut writer = sys.try_new_session().unwrap();
+        for i in 2..258 {
+            sys.new_trx_insert(&mut writer, vec![Val::from(i), Val::from(&large[..])])
+                .await;
+            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+                break;
+            }
+        }
+        let mut evicted = false;
+        for _ in 0..20 {
+            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+                evicted = true;
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(50)).await;
+        }
+        assert!(
+            evicted,
+            "cached insert page should be evicted before repro insert"
+        );
+
+        let read_hook = Arc::new(FailingPageReadHook::for_page(
+            sys.table.mem.mem_pool.test_raw_fd(),
+            cached_page.page_id,
+            libc::EIO,
+        ));
+        let _hook = install_libaio_test_hook(read_hook.clone());
+
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let res = stmt
+            .insert_row(&sys.table, vec![Val::from(100), Val::from("reload-fails")])
+            .await;
+        let trx = stmt.fail().await;
+        trx.rollback().await;
+        assert!(
+            matches!(res, InsertMvcc::Err(Error::IOError)),
+            "expected insert-page reload failure, got {res:?}"
+        );
+        assert!(
+            read_hook.call_count() > 0,
+            "cached insert page should reload from disk"
+        );
+
+        drop(writer);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_data_checkpoint_error_rollback() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -1773,6 +1931,11 @@ struct TestSys {
 impl TestSys {
     #[inline]
     async fn new_evictable() -> Self {
+        Self::new_evictable_with_mem_size(64u64 * 1024 * 1024).await
+    }
+
+    #[inline]
+    async fn new_evictable_with_mem_size(max_mem_size: u64) -> Self {
         use crate::catalog::tests::table2;
         // 64KB * 16
         let temp_dir = TempDir::new().unwrap();
@@ -1782,7 +1945,7 @@ impl TestSys {
             .data_buffer(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
-                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_mem_size(max_mem_size)
                     .max_file_size(128u64 * 1024 * 1024),
             )
             .trx(
