@@ -1,7 +1,7 @@
 ---
 id: 000085
 title: Introduce IOCompletion-Based Async IO Framework
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-21
 github_issue: 467
 ---
@@ -180,6 +180,49 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented the backend-neutral completion core under `doradb-storage/src/io/`.
+   - Split common backend contracts into `src/io/backend.rs`, completion state
+     into `src/io/completion.rs`, and libaio-specific submit/wait logic into
+     `src/io/libaio_backend.rs`.
+   - Introduced `Completion<T>`, `Operation`, `BackendToken`, `IOBackend`,
+     `IOStateMachine`, and the generic `IOWorker` flow with backend-owned batch
+     staging.
+   - Kept legacy `AIO<T>`, `UnsafeAIO`, and raw `LibaioContext::submit_limit`
+     only as redo-log compatibility helpers.
+2. Migrated the file and buffer-pool async-I/O paths onto the new worker core.
+   - Removed the old listener-based file/evictable worker path in favor of
+     state-machine submissions.
+   - Moved readonly and evictable miss-load flows onto shared reservation and
+     completion primitives while keeping pool-specific mapping and residency
+     rules.
+   - Switched CoW root loading and readonly misses to the final readonly pool
+     path, and removed the old owned-read startup path plus callback seam.
+3. Simplified the surrounding storage interfaces while landing the refactor.
+   - Renamed readonly-specific persisted-block identity types to
+     `PersistedBlockKey` / `PersistedFileID`.
+   - Removed `FileIOPromise`, the owned-read half of the old file-I/O state,
+     several direct file-read helpers, and production `buf_list` plumbing from
+     the file subsystem.
+   - Reduced page-reservation state so the outer reservation guard is the only
+     armed/unarmed wrapper.
+4. Applied review-driven fixes on top of the core refactor.
+   - Evictable read rollback now reclaims resident page memory through the same
+     `mark_page_dontneed()` path used by normal eviction.
+   - `IOQueue::drain_to` and request-expansion backpressure now clamp to worker
+     depth correctly.
+   - Readonly submission completion is one-shot, libaio test-hook install is
+     serialized for parallel tests, and the affected readonly tests were
+     tightened to match the real inflight-removal ordering.
+5. Validation completed with:
+   - `cargo build -p doradb-storage`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+6. Deferred follow-up:
+   - Redo-log group commit in `doradb-storage/src/trx/log.rs` still uses raw
+     `AIO` / `LibaioContext::submit_limit` helpers.
+   - Tracked follow-up backlog:
+     `docs/backlogs/000067-redo-group-io-core.md`
+
 ## Impacts
 
 1. Generic I/O core:
@@ -234,9 +277,10 @@ Reference:
 
 ## Open Questions
 
-1. The exact internal file split for the backend-specific driver layer can be
-   decided during implementation as long as libaio ABI details remain below the
-   generic `IOCompletion` boundary.
+1. `docs/backlogs/000067-redo-group-io-core.md` tracks the remaining redo-log
+   migration onto the backend-neutral completion core. Until that follow-up
+   lands, `io::{AIO, UnsafeAIO}` and raw `LibaioContext::submit_limit` remain
+   as redo-only compatibility helpers.
 2. A later RFC-0010 phase still needs to add the `io_uring` backend and make
    it the default I/O mode on top of this completion core.
 3. A later RFC-0010 phase still needs to define storage-I/O error policy so
