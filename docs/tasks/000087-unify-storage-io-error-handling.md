@@ -199,6 +199,69 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented one explicit storage-poison runtime path for fatal persistence
+   failures.
+   - `doradb-storage/src/trx/sys.rs` now records the first fatal storage error
+     and publishes poison state in a way that keeps the canonical error visible
+     to concurrent readers.
+   - redo-log and checkpoint failure paths now poison runtime admission through
+     the shared transaction-system / engine lifecycle boundary instead of
+     relying on isolated fatal branches.
+2. Completed the redo-log migration and backlog `000067` scope.
+   - production redo group commit moved off raw `AIO` /
+     `LibaioContext::submit_limit()` usage onto the backend-neutral completion
+     core in `doradb-storage/src/trx/log.rs` and
+     `doradb-storage/src/trx/group.rs`;
+   - redo commit waiters are result-bearing and fatal redo write/sync failures
+     now fail queued/inflight commits while poisoning the runtime;
+   - checkpoint durability helpers now return `Result<()>`, and checkpoint
+     publish/write/sync failures poison runtime admission in the same fatal
+     path.
+3. Made supported data/index storage-I/O failures caller-visible across the
+   engine.
+   - readonly and evictable buffer-pool paths now return `Err(...)` for
+     supported page-I/O failures rather than panicking or deferring to TODO
+     branches;
+   - table MVCC DML/access APIs were refactored to outer `Result` returns so
+     storage failures are explicit while domain outcomes remain enum-based;
+   - row/block-index and table-access paths now retry stale page-range races
+     correctly and propagate real page-load failures instead of collapsing them
+     into `NotFound` or panic behavior.
+4. Applied review-driven follow-up fixes within task scope.
+   - normal `insert_mvcc()` and out-of-place update flows now bubble cached
+     row-page reload failures instead of panicking on `expect(...)`;
+   - storage-poison publication now records the first error before flipping the
+     poison flag;
+   - evictable writeback failure now preserves an explicit failed frame state
+     until readers observe the error or a later retry succeeds;
+   - task-scoped contract comments now document that no-wait commit is a
+     system-transaction piggyback flow rather than a rollback-capable user
+     transaction path.
+5. Validation completed for the implemented state:
+   - `cargo build -p doradb-storage`
+     - result: passed
+   - `cargo nextest run -p doradb-storage`
+     - result: `432/432` passed
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+     - result: passed
+6. Resolve-time follow-up boundary:
+   - the remaining cleanup to remove infallible buffer-pool access methods and
+     merge readonly validated-page access into the canonical trait-level buffer
+     interface is intentionally deferred to the new RFC-0010 phase 4 rather
+     than expanding this task further.
+7. Resolve-time tracking synchronization completed:
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000087-unify-storage-io-error-handling.md`
+     - result: updated local `docs/tasks/next-id` from `000087` to `000088`
+       using fetched `origin/main`
+   - `tools/backlog.rs close-doc --path docs/backlogs/000067-redo-group-io-core.md --type implemented --detail "Implemented via docs/tasks/000087-unify-storage-io-error-handling.md"`
+     - result: archived source backlog to
+       `docs/backlogs/closed/000067-redo-group-io-core.md`
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000087-unify-storage-io-error-handling.md`
+     - result: updated RFC-0010 phase 3 status and implementation summary from
+       the resolved task doc
+   - implementation tracked in GitHub issue `#471`
+   - pull request opened as `#472`
+
 ## Impacts
 
 1. Runtime poison and admission:
@@ -276,10 +339,10 @@ Reference:
 
 ## Open Questions
 
-1. Ordinary in-flight statement APIs currently use a mix of `Err(Error)`-style
-   enums and plain conflict enums. Implementation should keep the resulting
-   public/internal API shape compact and avoid nested `Result` layering where
-   existing enum-based error carriers already fit.
-2. If future work introduces a structured logging subsystem, checkpoint poison
-   points may want to emit richer operator diagnostics, but that is outside this
+1. RFC-0010 phase 4 now tracks the remaining interface cleanup: removing the
+   infallible buffer-pool access methods, finishing engine-level migration to
+   the canonical fallible access surface, and absorbing readonly
+   validated-page access into that trait-level API.
+2. If future work introduces a structured logging subsystem, redo/checkpoint
+   poison paths may want richer operator diagnostics, but that is outside this
    task scope.

@@ -17,13 +17,18 @@ refactors `crate::io` around a backend-neutral completion core so a future
 `io_uring` backend can be added without keeping `libaio` ABI details in the
 generic I/O interface. The short-term supported path becomes `libaio` only; the
 medium-term goal is to preserve the current completion-driven ownership model
-while making backend selection an implementation detail of the driver layer. A
-dedicated phase then unifies storage I/O error handling so fatal redo-log I/O
-shuts down the engine, while data/index I/O errors propagate back to clients
-through result-bearing interfaces. In the final delivery phase, `io_uring`
-becomes the default compile-time-selected I/O mode, with first adoption focused
-on correctness and completion semantics plus a performance floor that is not
-worse than `libaio`.
+while making backend selection an implementation detail of the driver layer.
+Two dedicated storage-facing phases then complete engine error handling before
+`io_uring` delivery: first, storage I/O policy is made explicit so fatal
+redo-log and checkpoint I/O shut down the engine while data/index I/O failures
+become caller-visible; second, the buffer-pool and engine-facing access
+interfaces are cleaned up so checkpoint, recovery, index, table, and related
+paths share one clear, unambiguous, result-bearing API surface. That follow-up
+phase also folds readonly validated-page access into the canonical buffer-pool
+interface instead of keeping overlapping ad hoc helpers. In the final delivery
+phase, `io_uring` becomes the default compile-time-selected I/O mode, with
+first adoption focused on correctness and completion semantics plus a
+performance floor that is not worse than `libaio`.
 
 ## Context
 
@@ -55,6 +60,15 @@ repository therefore needs an explicit storage-engine policy before a second
 backend is introduced: redo-log I/O errors are fatal to engine liveness, while
 data/index I/O errors must become observable by callers through proper
 `Result`-based interfaces. [D4], [D5], [D6], [C2], [C3], [C4], [C8], [U4]
+
+Task `000087` now implements that storage-policy phase, but it also made the
+remaining interface debt visible. The repository still mixes infallible and
+fallible page-access methods in `BufferPool`, keeps readonly validated-page
+access on a separate helper path, and still has engine-level callers across
+checkpoint, recovery, index, and table code that straddle old infallible
+helpers and newer `Result` paths. Before `io_uring` delivery, the repository
+therefore needs one follow-up cleanup phase focused on making the final storage
+access APIs clear and unambiguous. [C3], [C8], [C9], [C10], [U6]
 
 Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `Issue Labels:`
@@ -100,6 +114,16 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
   defaulted but still defines a supported no-default build.
 - [C8] `doradb-storage/src/engine.rs` - engine shutdown closes admission and
   tears down components in reverse registration order.
+- [C9] `doradb-storage/src/buffer/mod.rs` and
+  `doradb-storage/src/buffer/readonly.rs` - `BufferPool` still mixes
+  infallible and fallible page-access methods, while readonly validated-page
+  access is exposed through a separate helper family.
+- [C10] `doradb-storage/src/table/mod.rs`,
+  `doradb-storage/src/trx/recover.rs`, `doradb-storage/src/trx/purge.rs`,
+  `doradb-storage/src/index/block_index.rs`, and
+  `doradb-storage/src/index/btree.rs` - engine-level callers still mix explicit
+  `Result` propagation with older infallible helpers after the phase-3 policy
+  work.
 
 ### Conversation References
 
@@ -115,6 +139,11 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 - [U5] `io_uring` should become the default I/O mode once introduced, backend
   selection should remain compile-time, and initial adoption should prioritize
   correctness/completion semantics with performance not worse than `libaio`.
+- [U6] Add a follow-up phase immediately after the storage-I/O policy task to
+  remove infallible buffer-pool access methods, complete engine-level error
+  propagation across checkpoint/recovery/index/table paths, and merge readonly
+  validated-page access into the canonical buffer-pool interface so the final
+  APIs are clear and unambiguous.
 
 ### Source Backlogs (Optional)
 
@@ -125,8 +154,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 
 ## Decision
 
-We will use a staged transition with four decisions. [D1], [D2], [D3], [D4],
-[D6], [C1], [C4], [C8], [U1], [U2], [U3], [U4], [U5]
+We will use a staged transition with five decisions. [D1], [D2], [D3], [D4],
+[D6], [C1], [C4], [C8], [C9], [C10], [U1], [U2], [U3], [U4], [U5], [U6]
 
 1. Retire the thread-pool async-I/O fallback and the repository-wide
    no-`libaio` validation/coverage contract. Until a new backend is ready,
@@ -149,16 +178,25 @@ We will use a staged transition with four decisions. [D1], [D2], [D3], [D4],
    that is still centered on libaio submission objects. [D3], [C1], [C2], [C3],
    [U3]
 
-4. Introduce a dedicated storage-I/O error-handling phase before `io_uring`
-   delivery. Redo-log I/O failures are fatal and must transition the engine
-   toward shutdown because transactional progress depends on durable log I/O.
-   Data/index I/O failures must propagate back to callers through explicit
-   `Result` paths instead of panicking or remaining hidden in lower layers, and
-   this is expected to require buffer-pool and related storage-interface
-   changes. `io_uring` delivery then uses compile-time backend selection and
-   makes `io_uring` the default mode, with first adoption focused on correctness
-   and completion semantics plus a performance floor that is not worse than
-   `libaio`. [D4], [D5], [D6], [C2], [C3], [C4], [C8], [U4], [U5]
+4. Introduce a dedicated storage-I/O error-handling phase before interface
+   cleanup and `io_uring` delivery. This phase establishes the engine-level
+   policy: redo-log and checkpoint I/O failures are fatal and must transition
+   the engine toward shutdown, while supported data/index I/O failures become
+   caller-visible through explicit `Result` paths instead of panicking or
+   remaining hidden in lower layers. This is the phase implemented by task
+   `000087`. [D4], [D5], [D6], [C2], [C3], [C4], [C8], [U4]
+
+5. Immediately after that, run a dedicated API-cleanup phase before `io_uring`
+   delivery. This phase removes infallible buffer-pool page-access methods from
+   the shared interface, completes engine-level error propagation across
+   checkpoint, recovery, index, table, and related callers, and folds readonly
+   validated-page access into the canonical trait-level buffer-pool surface so
+   the final access APIs are clear and unambiguous rather than split across
+   overlapping helper families. `io_uring` delivery then uses compile-time
+   backend selection and makes `io_uring` the default mode, with first
+   adoption focused on correctness and completion semantics plus a performance
+   floor that is not worse than `libaio`. [D4], [D5], [D6], [C3], [C8], [C9],
+   [C10], [U4], [U5], [U6]
 
 This RFC supersedes the support-policy assumptions of RFC-0001 without
 discarding its safety rationale. We continue to reject a naive `Future`-based
@@ -274,17 +312,33 @@ This RFC changes code in an unsafe-sensitive area.
     for supported storage-I/O errors.
   - Non-goals: automatic retry policy, degraded read-only mode, or `io_uring`
     delivery itself.
+  - Task Doc: `docs/tasks/000087-unify-storage-io-error-handling.md`
+  - Task Issue: `#471`
+  - Phase Status: done
+  - Implementation Summary: 1. Implemented one explicit storage-poison runtime path for fatal persistence [Task Resolve Sync: docs/tasks/000087-unify-storage-io-error-handling.md @ 2026-03-23]
+
+- **Phase 4: Cleanup Buffer-Pool Interface And Complete Engine Error Propagation**
+  - Scope: remove infallible buffer-pool page-access methods, finish
+    engine-level storage error propagation across checkpoint, recovery, index,
+    table, purge, and related callers, and merge readonly validated-page
+    access into the canonical trait-level buffer-pool interface.
+  - Goals: end with one clear and unambiguous page-access API surface; make
+    fallible storage access explicit at engine boundaries; avoid overlapping
+    infallible, fallible, and readonly-specific access families for equivalent
+    operations.
+  - Non-goals: retry policy, degraded read-only behavior, `io_uring` delivery,
+    or unrelated MVCC/storage-format redesign.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 4: Add `io_uring` Backend And Make It Default**
+- **Phase 5: Add `io_uring` Backend And Make It Default**
   - Scope: implement `io_uring` driver support, keep backend selection
-    compile-time, and switch `io_uring` to the default engine I/O mode.
+  compile-time, and switch `io_uring` to the default engine I/O mode.
   - Goals: provide a completion-based backend that fits the refactored generic
-    model, establish `io_uring` as the default mode, and deliver initial
-    correctness/completion behavior with performance not worse than `libaio`.
+  model, establish `io_uring` as the default mode, and deliver initial
+  correctness/completion behavior with performance not worse than `libaio`.
   - Non-goals: runtime backend switching, reintroducing thread-pool fallback,
     or aggressive `io_uring`-specific tuning beyond the required performance
     floor for first adoption.
@@ -316,16 +370,18 @@ This RFC changes code in an unsafe-sensitive area.
   buffer-pool consumers all depend on the current I/O driver. [C2], [C3], [C4]
 - RFC-0001's support-policy assumptions must be superseded and related docs or
   backlogs synchronized. [D3], [B1]
-- Propagating data/index I/O failures will likely require interface churn in
-  buffer-pool and related storage APIs due to new `Result` return paths. [C2],
-  [C3], [U4]
+- Completing data/index I/O propagation now explicitly includes a second cleanup
+  phase with interface churn in buffer-pool and engine-facing storage APIs so
+  the final access surface is clear and unambiguous. [C3], [C9], [C10], [U4],
+  [U6]
 
 ## Open Questions
 
 - Should a later RFC retire `libaio` entirely after `io_uring` is proven as the
   default mode, or should both compile-time backends remain supported?
-- What exact public/internal error taxonomy should Phase 3 use when converting
-  data/index storage paths to `Result`-bearing interfaces?
+- What exact trait shape and naming should Phase 4 use to absorb readonly
+  validated-page access without preserving parallel overlapping buffer-pool
+  access families?
 
 ## Future Work
 
