@@ -628,7 +628,7 @@ mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::ColumnBlockIndex;
     use crate::row::RowRead;
-    use crate::row::ops::{SelectKey, UpdateCol};
+    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol, UpdateMvcc};
     use crate::table::{TableAccess, TablePersistence};
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys_conf::TrxSysConfig;
@@ -818,7 +818,7 @@ mod tests {
                     let res = stmt
                         .insert_row(&table, vec![Val::from(j as u32), Val::from(&s[..])])
                         .await;
-                    assert!(res.is_ok());
+                    assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                     trx = stmt.succeed();
                 }
                 trx.commit().await.unwrap();
@@ -834,7 +834,7 @@ mod tests {
                     val: Val::from(&s2[..]),
                 };
                 let res = stmt.update_row(&table, &key, vec![uc]).await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 stmt.succeed().commit().await.unwrap();
             }
             // delete
@@ -843,7 +843,7 @@ mod tests {
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as u32)]);
                 let res = stmt.delete_row(&table, &key).await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
                 stmt.succeed().commit().await.unwrap();
             }
 
@@ -1015,7 +1015,7 @@ mod tests {
             let insert = stmt
                 .insert_row(&table, vec![Val::from(7u32), Val::from("cold-row")])
                 .await;
-            assert!(insert.is_ok());
+            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1058,7 +1058,10 @@ mod tests {
             let stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
             let row = stmt.select_row_mvcc(&table, &key, &[0, 1]).await;
-            assert_eq!(row.unwrap(), vec![Val::from(7u32), Val::from("cold-row")]);
+            assert_eq!(
+                row.unwrap().unwrap_found(),
+                vec![Val::from(7u32), Val::from("cold-row")]
+            );
             stmt.succeed().commit().await.unwrap();
 
             drop(table);
@@ -1125,7 +1128,7 @@ mod tests {
             let insert = stmt
                 .insert_row(&table, vec![Val::from(7u32), Val::from("cold-row")])
                 .await;
-            assert!(insert.is_ok());
+            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1143,7 +1146,7 @@ mod tests {
             let insert = stmt
                 .insert_row(&table, vec![Val::from(8u32), Val::from("hot-row")])
                 .await;
-            assert!(insert.is_ok());
+            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1179,14 +1182,14 @@ mod tests {
             let cold_key = SelectKey::new(0, vec![Val::from(7u32)]);
             let cold_row = stmt.select_row_mvcc(&table, &cold_key, &[0, 1]).await;
             assert_eq!(
-                cold_row.unwrap(),
+                cold_row.unwrap().unwrap_found(),
                 vec![Val::from(7u32), Val::from("cold-row")]
             );
 
             let hot_key = SelectKey::new(0, vec![Val::from(8u32)]);
             let hot_row = stmt.select_row_mvcc(&table, &hot_key, &[0, 1]).await;
             assert_eq!(
-                hot_row.unwrap(),
+                hot_row.unwrap().unwrap_found(),
                 vec![Val::from(8u32), Val::from("hot-row")]
             );
 
@@ -1282,7 +1285,7 @@ mod tests {
                     vec![Val::from(7u32), Val::from("persisted-row")],
                 )
                 .await;
-            assert!(insert.is_ok());
+            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1301,7 +1304,7 @@ mod tests {
                     vec![Val::from(8u32), Val::from("replayed-row")],
                 )
                 .await;
-            assert!(insert.is_ok());
+            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1381,7 +1384,7 @@ mod tests {
                 .select_row_mvcc(&checkpointed_table, &checkpointed_key, &[0, 1])
                 .await;
             assert_eq!(
-                checkpointed_row.unwrap(),
+                checkpointed_row.unwrap().unwrap_found(),
                 vec![Val::from(7u32), Val::from("persisted-row")]
             );
 
@@ -1390,7 +1393,7 @@ mod tests {
                 .select_row_mvcc(&replay_only_table, &replay_only_key, &[0, 1])
                 .await;
             assert_eq!(
-                replay_only_row.unwrap(),
+                replay_only_row.unwrap().unwrap_found(),
                 vec![Val::from(8u32), Val::from("replayed-row")]
             );
 
@@ -1453,7 +1456,7 @@ mod tests {
             let insert = stmt
                 .insert_row(&table, vec![Val::from(7u32), Val::from("persisted-row")])
                 .await;
-            assert!(insert.is_ok());
+            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 

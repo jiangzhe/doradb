@@ -416,7 +416,7 @@ impl TableHandle {
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
-    ) -> bool {
+    ) -> Result<bool> {
         match self {
             TableHandle::User(table) => {
                 table

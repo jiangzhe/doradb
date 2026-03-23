@@ -71,6 +71,29 @@ impl fmt::Display for PersistedPageCorruptionCause {
     }
 }
 
+/// Classifies which fatal persistence path poisoned runtime admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoragePoisonSource {
+    RedoSubmit,
+    RedoWrite,
+    RedoSync,
+    CheckpointWrite,
+    CheckpointSync,
+}
+
+impl fmt::Display for StoragePoisonSource {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            StoragePoisonSource::RedoSubmit => "redo submit",
+            StoragePoisonSource::RedoWrite => "redo write",
+            StoragePoisonSource::RedoSync => "redo sync",
+            StoragePoisonSource::CheckpointWrite => "checkpoint write",
+            StoragePoisonSource::CheckpointSync => "checkpoint sync",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Error)]
 pub enum Error {
     #[error("invalid argument")]
@@ -117,6 +140,8 @@ pub enum Error {
     StorageEngineShutdown,
     #[error("storage engine shutdown is waiting for {0} extra engine refs to drop")]
     StorageEngineShutdownBusy(usize),
+    #[error("storage engine runtime is poisoned by fatal {0} failure")]
+    StorageEnginePoisoned(StoragePoisonSource),
     #[error("{0}")]
     AIOError(#[from] AIOError),
     #[error("table not found")]

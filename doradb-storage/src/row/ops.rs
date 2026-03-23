@@ -1,4 +1,3 @@
-use crate::error::Error;
 use crate::error::Result;
 use crate::row::{Row, RowID, RowMut};
 use crate::serde::{Deser, Ser, Serde};
@@ -96,17 +95,16 @@ impl SelectResult for SelectUncommitted {
     const NOT_FOUND: SelectUncommitted = SelectUncommitted::NotFound;
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SelectMvcc {
-    Ok(Vec<Val>),
+    Found(Vec<Val>),
     NotFound,
-    Err(Error),
 }
 
 impl SelectMvcc {
     #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, SelectMvcc::Ok(_))
+    pub fn is_found(&self) -> bool {
+        matches!(self, SelectMvcc::Found(_))
     }
 
     #[inline]
@@ -115,16 +113,10 @@ impl SelectMvcc {
     }
 
     #[inline]
-    pub fn is_err(&self) -> bool {
-        matches!(self, SelectMvcc::Err(_))
-    }
-
-    #[inline]
-    pub fn unwrap(self) -> Vec<Val> {
+    pub fn unwrap_found(self) -> Vec<Val> {
         match self {
-            SelectMvcc::Ok(vals) => vals,
+            SelectMvcc::Found(vals) => vals,
             SelectMvcc::NotFound => panic!("empty select result"),
-            SelectMvcc::Err(err) => panic!("select error: {err}"),
         }
     }
 }
@@ -133,28 +125,21 @@ impl SelectResult for SelectMvcc {
     const NOT_FOUND: SelectMvcc = SelectMvcc::NotFound;
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ScanMvcc {
-    Ok(Vec<Vec<Val>>),
-    Err(Error),
+    Rows(Vec<Vec<Val>>),
 }
 
 impl ScanMvcc {
     #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, ScanMvcc::Ok(_))
+    pub fn has_rows(&self) -> bool {
+        matches!(self, ScanMvcc::Rows(_))
     }
 
     #[inline]
-    pub fn is_err(&self) -> bool {
-        matches!(self, ScanMvcc::Err(_))
-    }
-
-    #[inline]
-    pub fn unwrap(self) -> Vec<Vec<Val>> {
+    pub fn unwrap_rows(self) -> Vec<Vec<Val>> {
         match self {
-            ScanMvcc::Ok(vals) => vals,
-            ScanMvcc::Err(err) => panic!("scan error: {err}"),
+            ScanMvcc::Rows(vals) => vals,
         }
     }
 }
@@ -189,29 +174,30 @@ pub enum InsertMvcc {
     // we may need to linke a deleted version to the new version.
     // In such scenario, we should keep the page for shared mode
     // and acquire row lock when we do the linking.
-    Ok(RowID),
+    Inserted(RowID),
     WriteConflict,
     DuplicateKey,
 }
 
 impl InsertMvcc {
     #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, InsertMvcc::Ok(_))
+    pub fn is_inserted(&self) -> bool {
+        matches!(self, InsertMvcc::Inserted(_))
     }
 
     #[inline]
-    pub fn unwrap(self) -> RowID {
+    pub fn unwrap_inserted(self) -> RowID {
         match self {
-            InsertMvcc::Ok(row_id) => row_id,
+            InsertMvcc::Inserted(row_id) => row_id,
             _ => panic!("insert not ok"),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkForUniqueIndex {
-    Ok,
-    None,
+    Linked,
+    NotNeeded,
     WriteConflict,
     DuplicateKey,
 }
@@ -235,9 +221,9 @@ impl Update {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum UpdateMvcc {
-    Ok(RowID),
+    Updated(RowID),
     NotFound,
     WriteConflict,
     DuplicateKey,
@@ -246,27 +232,29 @@ pub enum UpdateMvcc {
 impl UpdateMvcc {
     /// Returns if update with undo succeeds.
     #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, UpdateMvcc::Ok(_))
+    pub fn is_updated(&self) -> bool {
+        matches!(self, UpdateMvcc::Updated(_))
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateIndex {
     // sometimes we may get back page guard to update next index.
-    Ok,
+    Updated,
     WriteConflict,
     DuplicateKey,
 }
 
 impl UpdateIndex {
     #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, UpdateIndex::Ok)
+    pub fn is_updated(&self) -> bool {
+        matches!(self, UpdateIndex::Updated)
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertIndex {
-    Ok,
+    Inserted,
     WriteConflict,
     DuplicateKey,
 }
@@ -359,17 +347,17 @@ pub enum Delete {
     AlreadyDeleted,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteMvcc {
-    Ok,
+    Deleted,
     NotFound,
     WriteConflict,
 }
 
 impl DeleteMvcc {
     #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, DeleteMvcc::Ok)
+    pub fn is_deleted(&self) -> bool {
+        matches!(self, DeleteMvcc::Deleted)
     }
 
     #[inline]

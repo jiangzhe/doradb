@@ -1,5 +1,5 @@
 use crate::catalog::{Catalog, TableID, is_catalog_obj_id, is_user_obj_id};
-use crate::error::Result;
+use crate::error::{Error, Result, StoragePoisonSource};
 use crate::trx::TrxID;
 use crate::trx::log::{LogPartitionInitializer, list_log_files};
 use crate::trx::log_replay::LogMerger;
@@ -60,7 +60,13 @@ impl Catalog {
     #[inline]
     pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let batch = self.scan_checkpoint_batch(trx_sys)?;
-        self.apply_checkpoint_batch(batch).await
+        match self.apply_checkpoint_batch(batch).await {
+            Ok(()) => Ok(()),
+            Err(Error::IOError | Error::AIOError(_) | Error::SendError) => {
+                Err(trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Scan persisted redo logs and collect one safe catalog checkpoint batch.

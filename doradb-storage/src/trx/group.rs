@@ -1,12 +1,11 @@
+use crate::error::Result;
 use crate::file::SparseFile;
-use crate::io::pwrite;
-use crate::notify::EventNotifyOnDrop;
+use crate::io::Completion;
 use crate::serde::Ser;
 use crate::session::SessionState;
-use crate::trx::log::SyncGroup;
+use crate::trx::log::{LogWriteSubmission, SyncGroup};
 use crate::trx::log_replay::LogBuf;
 use crate::trx::{PrecommitTrx, TrxID};
-use event_listener::EventListener;
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
@@ -71,6 +70,9 @@ pub(super) enum Commit {
     Shutdown,
 }
 
+pub(super) type CommitWaiter = Arc<Completion<Result<()>>>;
+pub(super) type CommitJoin = (Option<Arc<SessionState>>, Option<CommitWaiter>);
+
 /// CommitGroup groups multiple transactions with only
 /// one logical log IO and at most one fsync() call.
 /// It is controlled by two parameters:
@@ -82,7 +84,7 @@ pub(super) struct CommitGroup {
     pub(super) fd: RawFd,
     pub(super) offset: usize,
     pub(super) log_buf: LogBuf,
-    pub(super) sync_ev: EventNotifyOnDrop,
+    pub(super) completion: Arc<Completion<Result<()>>>,
 }
 
 impl CommitGroup {
@@ -95,20 +97,19 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn join(
-        &mut self,
-        mut trx: PrecommitTrx,
-        wait_sync: bool,
-    ) -> (Option<Arc<SessionState>>, Option<EventListener>) {
+    pub(super) fn join(&mut self, mut trx: PrecommitTrx, wait_sync: bool) -> CommitJoin {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.redo_bin.take() {
             self.log_buf.ser(&redo_bin);
         }
         self.max_cts = trx.cts;
+        // Match LogPartition::create_new_group(): synchronous user commits hand
+        // session ownership back to the caller, while the no-wait path is only
+        // intended for sessionless system transactions.
         let session = trx.take_session();
         self.trx_list.push(trx);
-        let listener = wait_sync.then(|| self.sync_ev.listen());
-        (session, listener)
+        let waiter = wait_sync.then(|| Arc::clone(&self.completion));
+        (session, waiter)
     }
 
     #[inline]
@@ -117,14 +118,20 @@ impl CommitGroup {
         let buf = self.log_buf.finish();
         // we always write a complete page instead of partial data.
         let log_bytes = buf.capacity();
-        let aio = pwrite(self.max_cts, self.fd, self.offset, buf);
         SyncGroup {
             trx_list: self.trx_list,
             max_cts: self.max_cts,
             log_bytes,
-            aio,
-            sync_ev: self.sync_ev,
+            write: Some(LogWriteSubmission::new(
+                self.max_cts,
+                self.fd,
+                self.offset,
+                buf,
+            )),
+            returned_buf: None,
+            completion: self.completion,
             finished: false,
+            failed: false,
         }
     }
 }
@@ -132,7 +139,7 @@ impl CommitGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notify::EventNotifyOnDrop;
+    use crate::io::Completion;
     use crate::trx::log_replay::TrxLog;
     use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::value::Val;
@@ -197,14 +204,14 @@ mod tests {
     fn test_commit_group_join_without_sync_listener() {
         let mut log_buf = LogBuf::new(64);
         log_buf.ser(&redo_bin(1));
-        let sync_ev = EventNotifyOnDrop::new();
+        let completion = Arc::new(Completion::new());
         let mut group = CommitGroup {
             trx_list: vec![precommit(1)],
             max_cts: 1,
             fd: 0,
             offset: 0,
             log_buf,
-            sync_ev,
+            completion,
         };
 
         let (session, listener) = group.join(precommit(2), false);
@@ -221,14 +228,14 @@ mod tests {
     fn test_commit_group_can_join_respects_capacity() {
         let mut log_buf = LogBuf::new(64);
         log_buf.ser(&redo_bin(100));
-        let sync_ev = EventNotifyOnDrop::new();
+        let completion = Arc::new(Completion::new());
         let mut group = CommitGroup {
             trx_list: vec![precommit(1)],
             max_cts: 1,
             fd: 0,
             offset: 0,
             log_buf,
-            sync_ev,
+            completion,
         };
 
         let candidate1 = precommit_large(2);

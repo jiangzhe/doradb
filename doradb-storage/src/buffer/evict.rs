@@ -94,8 +94,20 @@ impl EvictableBufferPool {
         &self.stats
     }
 
+    #[cfg(test)]
     #[inline]
-    async fn try_wait_for_io_write(&self, page_id: PageID) {
+    pub(crate) fn test_frame_kind(&self, page_id: PageID) -> FrameKind {
+        self.arena.frame(page_id).kind()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn test_raw_fd(&self) -> RawFd {
+        self.raw_fd
+    }
+
+    #[inline]
+    async fn try_wait_for_io_write(&self, page_id: PageID) -> Result<()> {
         self.inflight_io
             .wait_for_write(page_id, self.arena.frame(page_id))
             .await
@@ -104,7 +116,7 @@ impl EvictableBufferPool {
     /// Try to dispatch read IO on given page.
     /// This method may not succeed, and client should retry.
     #[inline]
-    async fn try_dispatch_io_read(&self, guard: &PoolGuard, page_id: PageID) {
+    async fn try_dispatch_io_read(&self, guard: &PoolGuard, page_id: PageID) -> Result<()> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         enum DispatchAction {
             RetryYield,
@@ -194,9 +206,7 @@ impl EvictableBufferPool {
                 smol::future::yield_now().await;
             }
             DispatchAction::Wait(completion) => {
-                completion.wait_result().await.unwrap_or_else(|err| {
-                    panic!("evictable page load failed: page_id={page_id}, {err}")
-                });
+                completion.wait_result().await?;
             }
             DispatchAction::WaitForLoad(listener) => {
                 listener.await;
@@ -210,16 +220,12 @@ impl EvictableBufferPool {
                     };
                     failed_req.fail(Error::SendError);
                     self.in_mem.load_ev.notify(1);
-                    unreachable!(
-                        "failed to enqueue read IO request after inflight install; shutdown ordering is violated (page_id={})",
-                        page_id
-                    );
+                    return Err(Error::SendError);
                 }
-                completion.wait_result().await.unwrap_or_else(|err| {
-                    panic!("evictable page load failed: page_id={page_id}, {err}")
-                });
+                completion.wait_result().await?;
             }
         }
+        Ok(())
     }
 
     #[inline]
@@ -352,6 +358,18 @@ impl BufferPool for EvictableBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> FacadePageGuard<T> {
+        self.try_get_page(guard, page_id, mode)
+            .await
+            .expect("evictable buffer pool get_page should not ignore page-I/O failures")
+    }
+
+    #[inline]
+    async fn try_get_page<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> Result<FacadePageGuard<T>> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(page_id);
@@ -362,8 +380,9 @@ impl BufferPool for EvictableBufferPool {
                 }
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
-                    return FacadePageGuard::new(guard.clone(), bf, g);
+                    return Ok(FacadePageGuard::new(guard.clone(), bf, g));
                 }
+                FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
                     // Try to mark this page as HOT.
                     if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
@@ -373,21 +392,21 @@ impl BufferPool for EvictableBufferPool {
                         continue;
                     }
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
-                    return FacadePageGuard::new(guard.clone(), bf, g);
+                    return Ok(FacadePageGuard::new(guard.clone(), bf, g));
                 }
                 FrameKind::Evicting => {
                     // The page is marked evicting in order to be evicted to disk in near future.
                     // Here we do not break the write operation,
                     // Instead, we wait for it to complete.
                     // And then, reload it in memory.
-                    self.try_wait_for_io_write(page_id).await;
+                    self.try_wait_for_io_write(page_id).await?;
                 }
                 FrameKind::Evicted => {
                     // The page is already on disk.
                     // This means we should let one thread to exclusively lock this page
                     // and initiate a IO read.
                     // Other threads can wait for the initiator to finish.
-                    self.try_dispatch_io_read(guard, page_id).await;
+                    self.try_dispatch_io_read(guard, page_id).await?;
                 }
             }
         }
@@ -400,15 +419,29 @@ impl BufferPool for EvictableBufferPool {
         id: VersionedPageID,
         mode: LatchFallbackMode,
     ) -> Option<FacadePageGuard<T>> {
+        self.try_get_page_versioned_result(guard, id, mode)
+            .await
+            .expect(
+                "evictable buffer pool try_get_page_versioned should not ignore page-I/O failures",
+            )
+    }
+
+    #[inline]
+    async fn try_get_page_versioned_result<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        id: VersionedPageID,
+        mode: LatchFallbackMode,
+    ) -> Result<Option<FacadePageGuard<T>>> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(id.page_id);
             let frame = self.arena.frame(id.page_id);
             if frame.generation() != id.generation {
-                return None;
+                return Ok(None);
             }
             match frame.kind() {
-                FrameKind::Uninitialized => return None,
+                FrameKind::Uninitialized => return Ok(None),
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     let g = FacadePageGuard::new(guard.clone(), bf, g);
@@ -417,10 +450,11 @@ impl BufferPool for EvictableBufferPool {
                         if g.is_exclusive() {
                             g.rollback_exclusive_version_change();
                         }
-                        return None;
+                        return Ok(None);
                     }
-                    return Some(g);
+                    return Ok(Some(g));
                 }
+                FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
@@ -434,15 +468,15 @@ impl BufferPool for EvictableBufferPool {
                         if g.is_exclusive() {
                             g.rollback_exclusive_version_change();
                         }
-                        return None;
+                        return Ok(None);
                     }
-                    return Some(g);
+                    return Ok(Some(g));
                 }
                 FrameKind::Evicting => {
-                    self.try_wait_for_io_write(id.page_id).await;
+                    self.try_wait_for_io_write(id.page_id).await?;
                 }
                 FrameKind::Evicted => {
-                    self.try_dispatch_io_read(guard, id.page_id).await;
+                    self.try_dispatch_io_read(guard, id.page_id).await?;
                 }
             }
         }
@@ -469,6 +503,19 @@ impl BufferPool for EvictableBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> Validation<FacadePageGuard<T>> {
+        self.try_get_child_page(guard, p_guard, page_id, mode)
+            .await
+            .expect("evictable buffer pool get_child_page should not ignore page-I/O failures")
+    }
+
+    #[inline]
+    async fn try_get_child_page<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+        p_guard: &FacadePageGuard<T>,
+        page_id: PageID,
+        mode: LatchFallbackMode,
+    ) -> Result<Validation<FacadePageGuard<T>>> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(page_id);
@@ -483,13 +530,14 @@ impl BufferPool for EvictableBufferPool {
                     // the validation make sure parent page does not change until child
                     // page is acquired.
                     if p_guard.validate_bool() {
-                        return Valid(FacadePageGuard::new(guard.clone(), bf, g));
+                        return Ok(Valid(FacadePageGuard::new(guard.clone(), bf, g)));
                     }
                     if g.state == GuardState::Exclusive {
                         g.rollback_exclusive_bit();
                     }
-                    return Validation::Invalid;
+                    return Ok(Validation::Invalid);
                 }
+                FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     // Try to mark this page as HOT.
@@ -502,20 +550,20 @@ impl BufferPool for EvictableBufferPool {
                     // apply lock coupling.
                     // the validation make sure parent page does not change until child
                     // page is acquired.
-                    return p_guard
+                    return Ok(p_guard
                         .validate()
-                        .and_then(|_| Valid(FacadePageGuard::new(guard.clone(), bf, g)));
+                        .and_then(|_| Valid(FacadePageGuard::new(guard.clone(), bf, g))));
                 }
                 FrameKind::Evicting => {
                     // The page is being evicted to disk.
-                    self.try_wait_for_io_write(page_id).await;
+                    self.try_wait_for_io_write(page_id).await?;
                 }
                 FrameKind::Evicted => {
                     // The page is already on disk.
                     // This means we should let one thread to exclusively lock this page
                     // and initiate a IO read.
                     // Other threads can wait for the initiator to finish.
-                    self.try_dispatch_io_read(guard, page_id).await;
+                    self.try_dispatch_io_read(guard, page_id).await?;
                 }
             }
         }
@@ -671,24 +719,29 @@ impl IOStateMachine for EvictablePoolStateMachine {
             EvictSubmission::Read(sub) => sub.complete(res),
             EvictSubmission::Write(sub) => {
                 let page_id = sub.page_id();
-                let len = res.unwrap_or_else(|err| {
-                    panic!("evictable page IO failed: page_id={page_id}, {err}")
-                });
-                // Page IO always succeeds with exact page size.
-                debug_assert!(len == PAGE_SIZE);
                 let mut g = self.pool.inflight_io.map.lock();
                 let mut status = g.remove(&page_id).unwrap();
                 match status.kind {
                     IOKind::Write => {
-                        let page_guard = sub.page_guard;
-                        let bf = page_guard.bf();
-                        debug_assert!(bf.kind() == FrameKind::Evicting);
                         let completion = status.completion.take();
                         self.pool.inflight_io.writes.fetch_sub(1, Ordering::Relaxed);
-                        self.pool.in_mem.evict_page(page_guard);
+                        let mut page_guard = sub.page_guard;
+                        let bf = page_guard.bf();
+                        debug_assert!(bf.kind() == FrameKind::Evicting);
+                        let result = match res {
+                            Ok(len) if len == PAGE_SIZE => {
+                                self.pool.in_mem.evict_page(page_guard);
+                                Ok(page_id)
+                            }
+                            Ok(_) | Err(_) => {
+                                page_guard.bf_mut().set_kind(FrameKind::EvictionFailed);
+                                drop(page_guard);
+                                Err(Error::IOError)
+                            }
+                        };
                         drop(g);
                         if let Some(completion) = completion {
-                            completion.complete(Ok(page_id));
+                            completion.complete(result);
                         }
                         drop(sub.batch_done);
                         AIOKind::Write
@@ -1415,7 +1468,7 @@ impl Default for InflightIO {
 impl InflightIO {
     #[allow(clippy::await_holding_lock)]
     #[inline]
-    async fn wait_for_write(&self, page_id: PageID, frame: &BufferFrame) {
+    async fn wait_for_write(&self, page_id: PageID, frame: &BufferFrame) -> Result<()> {
         let mut g = self.map.lock();
         match g.entry(page_id) {
             Entry::Vacant(vac) => {
@@ -1432,16 +1485,18 @@ impl InflightIO {
                             completion: Some(Arc::clone(&completion)),
                         });
                         drop(g); // explicit drop guard before await.
-                        completion.wait_result().await.unwrap_or_else(|err| {
-                            panic!("evictable write wait failed: page_id={page_id}, {err}")
-                        });
+                        completion.wait_result().await.map(|_| ())?;
+                    }
+                    FrameKind::EvictionFailed => {
+                        drop(g);
+                        return Err(Error::IOError);
                     }
                     // In any other kind, we let caller retry.
                     FrameKind::Cool
                     | FrameKind::Hot
                     | FrameKind::Fixed
                     | FrameKind::Uninitialized
-                    | FrameKind::Evicted => (),
+                    | FrameKind::Evicted => {}
                 }
             }
             Entry::Occupied(mut occ) => {
@@ -1457,11 +1512,10 @@ impl InflightIO {
                     .get_or_insert_with(|| Arc::new(PageIOCompletion::new()))
                     .clone();
                 drop(g); // explicitly drop guard before await.
-                completion.wait_result().await.unwrap_or_else(|err| {
-                    panic!("evictable write wait failed: page_id={page_id}, {err}")
-                });
+                completion.wait_result().await.map(|_| ())?;
             }
         }
+        Ok(())
     }
 
     #[inline]
@@ -1756,6 +1810,154 @@ mod tests {
 
             let page_guard = pool.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
             assert_eq!(page_guard.page()[0], 0);
+        });
+    }
+
+    #[test]
+    fn test_writeback_failure_preserves_failed_frame_kind_and_surfaces_error() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (pool, pending) = EvictableBufferPoolConfig::default()
+                .role(crate::buffer::PoolRole::Mem)
+                .data_swap_file(temp_dir.path().join("data.bin"))
+                .max_mem_size(64u64 * 1024 * 1024)
+                .max_file_size(128u64 * 1024 * 1024)
+                .build()
+                .unwrap();
+            let owner = QuiescentBox::new(pool);
+            let pool_guard = owner.pool_guard();
+            let sync_pool = owner.guard().into_sync();
+            let mut state_machine = EvictablePoolStateMachine {
+                pool: sync_pool,
+                file_io: pending.file_io,
+                prev_queuing: 0,
+                prev_running: 0,
+            };
+
+            let mut page_guard = owner.allocate_page::<Page>(&pool_guard).await;
+            let page_id = page_guard.page_id();
+            page_guard.page_mut()[0] = 0xAB;
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+
+            let completion = Arc::new(PageIOCompletion::new());
+            {
+                let mut g = owner.inflight_io.map.lock();
+                g.insert(
+                    page_id,
+                    IOStatus {
+                        kind: IOKind::Write,
+                        completion: Some(Arc::clone(&completion)),
+                    },
+                );
+            }
+            owner.inflight_io.writes.store(1, Ordering::Relaxed);
+
+            let operation = state_machine
+                .file_io
+                .prepare_write(page_id, page_guard.page_mut());
+            let kind = state_machine.on_complete(
+                EvictSubmission::Write(PageIO {
+                    key: page_id,
+                    operation,
+                    page_guard,
+                    batch_done: None,
+                }),
+                Err(std::io::Error::other("writeback failed")),
+            );
+
+            assert_eq!(kind, AIOKind::Write);
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::EvictionFailed);
+            assert!(matches!(
+                completion.wait_result().await,
+                Err(Error::IOError)
+            ));
+            assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
+            assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
+
+            drop(state_machine);
+            drop(pool_guard);
+            drop(owner);
+        });
+    }
+
+    #[test]
+    fn test_failed_eviction_frame_returns_error_to_readers() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = EvictableBufferPoolConfig::default()
+                .role(crate::buffer::PoolRole::Mem)
+                .data_swap_file(temp_dir.path().join("data.bin"))
+                .max_mem_size(64u64 * 1024 * 1024)
+                .max_file_size(128u64 * 1024 * 1024)
+                .build()
+                .unwrap()
+                .0;
+            let pool_guard = pool.pool_guard();
+            let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+            let page_id = page_guard.page_id();
+            let versioned = page_guard.versioned_page_id();
+            page_guard.bf_mut().set_kind(FrameKind::EvictionFailed);
+            drop(page_guard);
+
+            assert!(matches!(
+                pool.inflight_io
+                    .wait_for_write(page_id, pool.arena.frame(page_id))
+                    .await,
+                Err(Error::IOError)
+            ));
+            assert!(matches!(
+                pool.try_get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                    .await,
+                Err(Error::IOError)
+            ));
+            assert!(matches!(
+                pool.try_get_page_versioned_result::<Page>(
+                    &pool_guard,
+                    versioned,
+                    LatchFallbackMode::Shared,
+                )
+                .await,
+                Err(Error::IOError)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_failed_eviction_frame_can_retry_and_clear_on_success() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = EvictableBufferPoolConfig::default()
+                .role(crate::buffer::PoolRole::Mem)
+                .data_swap_file(temp_dir.path().join("data.bin"))
+                .max_mem_size(64u64 * 1024 * 1024)
+                .max_file_size(128u64 * 1024 * 1024)
+                .build()
+                .unwrap()
+                .0;
+            let pool_guard = pool.pool_guard();
+            let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+            let page_id = page_guard.page_id();
+            page_guard.bf_mut().set_kind(FrameKind::EvictionFailed);
+            drop(page_guard);
+
+            let arena_guard = pool.arena.arena_guard(pool_guard.clone());
+            let page_guard = clock_sweep_candidate(&arena_guard, page_id)
+                .expect("failed eviction should remain retryable");
+            assert_eq!(page_guard.bf().kind(), FrameKind::Evicting);
+
+            pool.in_mem.evict_page(page_guard);
+            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
+            assert_eq!(pool.in_mem.count.load(Ordering::Acquire), 0);
+
+            assert!(pool.in_mem.try_inc());
+            let page_guard = pool.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
+            let reservation = PageReservationGuard::new(EvictPageReservation::new(
+                page_guard,
+                Arc::clone(&pool.in_mem),
+            ));
+            assert_eq!(reservation.publish().unwrap(), page_id);
+            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Hot);
+            assert_eq!(pool.in_mem.count.load(Ordering::Acquire), 1);
         });
     }
 

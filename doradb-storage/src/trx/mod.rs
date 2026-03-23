@@ -512,6 +512,20 @@ impl PrecommitTrx {
             }
         }
     }
+
+    /// Abort this transaction after it entered prepare but before redo durability succeeded.
+    #[inline]
+    pub fn abort(mut self) {
+        self.redo_bin.take();
+        if let Some(PrecommitTrxPayload { status, .. }) = self.payload.take() {
+            status.preparing.store(false, Ordering::SeqCst);
+            let mut g = status.prepare_ev.lock();
+            drop(g.take());
+        }
+        if let Some(s) = self.session.take() {
+            s.rollback();
+        }
+    }
 }
 
 impl Drop for PrecommitTrx {

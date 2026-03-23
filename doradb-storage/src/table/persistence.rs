@@ -1,5 +1,5 @@
 use crate::buffer::page::PageID;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::table_file::MutableTableFile;
 use crate::index::{
     ColumnBlockIndex, ColumnLeafEntry, OffloadedBitmapPatch, encode_deletion_deltas_to_bytes,
@@ -141,7 +141,18 @@ impl Table {
         }
 
         // Step 9: publish new table-file root and then commit checkpoint transaction.
-        let (table_file, old_root) = mutable_file.commit(checkpoint_ts, false).await?;
+        let (table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
+            Ok(res) => res,
+            Err(Error::IOError | Error::AIOError(_) | Error::SendError) => {
+                trx_sys.rollback(trx).await;
+                let poison = trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite);
+                return Err(poison);
+            }
+            Err(err) => {
+                trx_sys.rollback(trx).await;
+                return Err(err);
+            }
+        };
         let active_root = table_file.active_root();
         self.blk_idx()
             .update_column_root(

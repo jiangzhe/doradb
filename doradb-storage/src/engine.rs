@@ -268,6 +268,7 @@ impl EngineInner {
         if self.lifecycle.state() != EngineLifecycleState::Running {
             return Err(Error::StorageEngineShutdown);
         }
+        self.trx_sys.ensure_runtime_healthy()?;
         Ok(f())
     }
 }

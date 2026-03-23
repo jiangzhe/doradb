@@ -96,7 +96,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
     ) -> PageSharedGuard<RowPage> {
-        self.get_insert_page_with_redo(
+        self.try_get_insert_page_with_redo(
             meta_pool_guard,
             mem_pool,
             mem_pool_guard,
@@ -105,10 +105,11 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             None,
         )
         .await
+        .expect("block-index get_insert_page should not ignore row-page I/O failures")
     }
 
     #[inline]
-    pub(crate) async fn get_insert_page_with_redo<B: BufferPool>(
+    pub(crate) async fn try_get_insert_page_with_redo<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
@@ -116,9 +117,9 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> PageSharedGuard<RowPage> {
+    ) -> Result<PageSharedGuard<RowPage>> {
         self.row
-            .get_insert_page_with_redo(
+            .try_get_insert_page_with_redo(
                 meta_pool_guard,
                 mem_pool,
                 mem_pool_guard,
@@ -223,14 +224,9 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         row_id: RowID,
         storage: Option<&ColumnStorage>,
     ) -> RowLocation {
-        match self.try_find_row(meta_pool_guard, row_id, storage).await {
-            Ok(location) => location,
-            Err(err) => todo!(
-                "block-index column-path error policy is deferred (row_id={}, err={})",
-                row_id,
-                err
-            ),
-        }
+        self.try_find_row(meta_pool_guard, row_id, storage)
+            .await
+            .expect("block-index find_row should not ignore persisted lookup I/O failures")
     }
 
     /// Finds the physical location of one row id with persisted column-path errors surfaced.
@@ -387,6 +383,16 @@ mod tests {
         }
 
         #[inline]
+        fn try_get_page<T: BufferPage>(
+            &self,
+            guard: &PoolGuard,
+            page_id: PageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Result<FacadePageGuard<T>>> + Send {
+            self.inner.try_get_page(guard, page_id, mode)
+        }
+
+        #[inline]
         fn try_get_page_versioned<T: BufferPage>(
             &self,
             guard: &PoolGuard,
@@ -394,6 +400,16 @@ mod tests {
             mode: LatchFallbackMode,
         ) -> impl Future<Output = Option<FacadePageGuard<T>>> + Send {
             self.inner.try_get_page_versioned(guard, id, mode)
+        }
+
+        #[inline]
+        fn try_get_page_versioned_result<T: BufferPage>(
+            &self,
+            guard: &PoolGuard,
+            id: VersionedPageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send {
+            self.inner.try_get_page_versioned_result(guard, id, mode)
         }
 
         #[inline]
@@ -410,6 +426,17 @@ mod tests {
             mode: LatchFallbackMode,
         ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send {
             self.inner.get_child_page(guard, p_guard, page_id, mode)
+        }
+
+        #[inline]
+        fn try_get_child_page<T: BufferPage>(
+            &self,
+            guard: &PoolGuard,
+            p_guard: &FacadePageGuard<T>,
+            page_id: PageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send {
+            self.inner.try_get_child_page(guard, p_guard, page_id, mode)
         }
     }
 
