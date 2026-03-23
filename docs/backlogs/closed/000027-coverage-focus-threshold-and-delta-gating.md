@@ -19,3 +19,10 @@ Extend `tools/coverage_focus.rs` with optional threshold/delta gating to support
 
 Coverage focus tool supports optional gating with clear CLI semantics and tests.
 
+## Close Reason
+
+- Type: wontfix
+- Detail: Coverage enforcement is intentionally deferred for the short and medium term. The coverage_focus tool remains report-only, and threshold/delta gating is not planned as an active follow-up.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-23
