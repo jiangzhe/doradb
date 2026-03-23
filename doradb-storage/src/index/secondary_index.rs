@@ -324,7 +324,7 @@ mod tests {
     use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table4;
     use crate::engine::EngineConfig;
-    use crate::row::ops::{SelectKey, UpdateCol};
+    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::table::TableAccess;
     use crate::trx::sys_conf::TrxSysConfig;
     use tempfile::TempDir;
@@ -362,7 +362,7 @@ mod tests {
                         .accessor()
                         .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
                         .await;
-                    assert!(res.is_ok());
+                    assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 }
                 stmt.succeed().commit().await.unwrap();
                 // select ... where id = 1
@@ -374,7 +374,7 @@ mod tests {
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
                 // select ... where val = 1
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
@@ -384,7 +384,7 @@ mod tests {
                     .index_scan_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.unwrap().len() == 1);
+                assert!(res.unwrap().unwrap_rows().len() == 1);
                 // update val = 0 where id = 1
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
@@ -398,7 +398,7 @@ mod tests {
                     .update_unique_mvcc(&mut stmt, &key, update)
                     .await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 // select ... where val = 0
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
@@ -408,7 +408,7 @@ mod tests {
                     .index_scan_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.unwrap().len() == 2);
+                assert!(res.unwrap().unwrap_rows().len() == 2);
                 // delete where id = 0
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
@@ -418,7 +418,7 @@ mod tests {
                     .delete_unique_mvcc(&mut stmt, &key, false)
                     .await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
                 // select ... where val = 0
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
@@ -428,7 +428,7 @@ mod tests {
                     .index_scan_mvcc(&stmt, &key, user_read_set)
                     .await;
                 _ = stmt.succeed().commit().await.unwrap();
-                assert!(res.unwrap().len() == 1);
+                assert!(res.unwrap().unwrap_rows().len() == 1);
             }
             drop(engine);
         })
@@ -467,7 +467,7 @@ mod tests {
                         .accessor()
                         .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
                         .await;
-                    assert!(res.is_ok());
+                    assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 }
                 stmt.succeed().commit().await.unwrap();
                 // insert 5,5 and rollback
@@ -477,7 +477,7 @@ mod tests {
                     .accessor()
                     .insert_mvcc(&mut stmt, vec![Val::from(5i32), Val::from(5i32)])
                     .await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 stmt.succeed().rollback().await;
                 // select ... where id = 5
                 let trx = session.try_begin_trx().unwrap().unwrap();
@@ -488,7 +488,7 @@ mod tests {
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.not_found());
+                assert!(matches!(res, Ok(SelectMvcc::NotFound)));
                 // update val = 0 where id = 1
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
@@ -501,7 +501,7 @@ mod tests {
                     .accessor()
                     .update_unique_mvcc(&mut stmt, &key, update)
                     .await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 stmt.succeed().rollback().await;
                 // select ... where id = 1
                 let trx = session.try_begin_trx().unwrap().unwrap();
@@ -512,8 +512,8 @@ mod tests {
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.is_ok());
-                let vals = res.unwrap();
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+                let vals = res.unwrap().unwrap_found();
                 assert!(vals[0] == Val::from(1i32) && vals[1] == Val::from(1i32));
                 // delete where id = 0
                 let trx = session.try_begin_trx().unwrap().unwrap();
@@ -523,7 +523,7 @@ mod tests {
                     .accessor()
                     .delete_unique_mvcc(&mut stmt, &key, false)
                     .await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
                 stmt.succeed().rollback().await;
                 // select ... where val = 0
                 let trx = session.try_begin_trx().unwrap().unwrap();
@@ -534,8 +534,8 @@ mod tests {
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 stmt.succeed().commit().await.unwrap();
-                assert!(res.is_ok());
-                let vals = res.unwrap();
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+                let vals = res.unwrap().unwrap_found();
                 assert!(vals[0] == Val::from(0i32) && vals[1] == Val::from(0i32));
 
                 // delete where id = 3, then insert 3,3, then rollback
@@ -546,14 +546,14 @@ mod tests {
                     .accessor()
                     .delete_unique_mvcc(&mut stmt, &key, false)
                     .await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
                 trx = stmt.succeed();
                 stmt = trx.start_stmt();
                 let res = table
                     .accessor()
                     .insert_mvcc(&mut stmt, vec![Val::from(3), Val::from(3)])
                     .await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 trx = stmt.succeed();
                 // manual rollback.
                 trx.rollback().await;
@@ -566,8 +566,8 @@ mod tests {
                     .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
                     .await;
                 _ = stmt.succeed().commit().await.unwrap();
-                assert!(res.is_ok());
-                let vals = res.unwrap();
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+                let vals = res.unwrap().unwrap_found();
                 assert!(vals[0] == Val::from(3i32) && vals[1] == Val::from(3i32));
             }
             drop(engine);

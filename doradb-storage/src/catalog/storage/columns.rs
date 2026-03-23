@@ -4,7 +4,7 @@ use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
-use crate::row::ops::SelectKey;
+use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
 use crate::table::TableAccess;
@@ -119,7 +119,10 @@ impl Columns<'_> {
             Val::from(obj.column_type as u32),
             Val::from(obj.column_attributes.bits()),
         ];
-        self.table.accessor().insert_mvcc(stmt, cols).await.is_ok()
+        matches!(
+            self.table.accessor().insert_mvcc(stmt, cols).await,
+            Ok(InsertMvcc::Inserted(_))
+        )
     }
 
     /// List all columns of one table from uncommitted-visible catalog rows.
@@ -162,7 +165,7 @@ impl Columns<'_> {
             .accessor()
             .delete_unique_mvcc(stmt, &key, true)
             .await
-            .is_ok()
+            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
 }
 

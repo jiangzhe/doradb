@@ -178,8 +178,13 @@ pub enum FrameKind {
     Cool = 3,
     /// EVICTING means this page is being evicted.
     Evicting = 4,
-    /// EVICTING means this page is spilled to disk.
+    /// EVICTED means this page is spilled to disk and must be reloaded before use.
     Evicted = 5,
+    /// EVICTIONFAILED means the last dirty-page writeback failed.
+    ///
+    /// The frame stays resident and dirty, but readers must not treat it as a
+    /// normal `Hot` page until a later successful retry clears the failure.
+    EvictionFailed = 6,
 }
 
 impl From<u8> for FrameKind {
@@ -192,6 +197,7 @@ impl From<u8> for FrameKind {
             3 => FrameKind::Cool,
             4 => FrameKind::Evicting,
             5 => FrameKind::Evicted,
+            6 => FrameKind::EvictionFailed,
             _ => unreachable!("invalid frame kind"),
         }
     }

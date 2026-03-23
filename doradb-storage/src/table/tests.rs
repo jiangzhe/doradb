@@ -12,7 +12,7 @@ use crate::file::table_fs::TableFileSystemConfig;
 use crate::index::{ColumnBlockIndex, RowLocation, UniqueIndex};
 use crate::io::{LibaioTestHook, io_event, io_iocb_cmd, iocb, set_libaio_test_hook};
 use crate::latch::LatchFallbackMode;
-use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol};
+use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage};
 use crate::session::Session;
 use crate::table::{DeleteMarker, Table, TableAccess, TablePersistence};
@@ -166,7 +166,7 @@ fn test_mvcc_insert_dup_key() {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let res = stmt.insert_row(&sys.table, insert).await;
-            assert!(res == InsertMvcc::DuplicateKey);
+            assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
             trx = stmt.fail().await;
             trx.rollback().await;
         }
@@ -177,7 +177,7 @@ fn test_mvcc_insert_dup_key() {
             let mut trx1 = session.try_begin_trx().unwrap().unwrap();
             let mut stmt1 = trx1.start_stmt();
             let res = stmt1.insert_row(&sys.table, insert1).await;
-            assert!(res.is_ok());
+            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
             trx1 = stmt1.succeed();
 
             // begin concurrent transaction and insert [2, "world"]
@@ -187,7 +187,7 @@ fn test_mvcc_insert_dup_key() {
             let mut stmt2 = trx2.start_stmt();
             let res = stmt2.insert_row(&sys.table, insert2).await;
             // still dup key because circuit breaker on index search.
-            assert!(res == InsertMvcc::DuplicateKey);
+            assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
             stmt2.fail().await.rollback().await;
             drop(session2);
 
@@ -319,7 +319,7 @@ fn test_column_delete_basic() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let res = stmt.delete_row(&sys.table, &key).await;
-        assert!(res.is_ok());
+        assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx = stmt.succeed();
         trx.commit().await.unwrap();
 
@@ -404,7 +404,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
         match res {
-            SelectMvcc::Err(Error::PersistedPageCorrupted {
+            Err(Error::PersistedPageCorrupted {
                 file_kind: PersistedFileKind::TableFile,
                 page_kind: PersistedPageKind::LwcPage,
                 page_id,
@@ -438,7 +438,7 @@ fn test_column_delete_rollback() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let res = stmt.delete_row(&sys.table, &key).await;
-        assert!(res.is_ok());
+        assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx = stmt.succeed();
         trx.rollback().await;
 
@@ -467,7 +467,7 @@ fn test_column_delete_rollback_after_checkpoint() {
         let mut trx_delete = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx_delete.start_stmt();
         let res = stmt.delete_row(&sys.table, &key).await;
-        assert!(res.is_ok());
+        assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx_delete = stmt.succeed();
 
         sys.table.freeze(&session, usize::MAX).await;
@@ -484,7 +484,7 @@ fn test_column_delete_rollback_after_checkpoint() {
 
         let stmt = trx_delete.start_stmt();
         let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
-        assert!(res.not_found());
+        assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         trx_delete = stmt.succeed();
         trx_delete.rollback().await;
 
@@ -520,14 +520,14 @@ fn test_column_delete_write_conflict() {
         let mut trx1 = session.try_begin_trx().unwrap().unwrap();
         let mut stmt1 = trx1.start_stmt();
         let res1 = stmt1.delete_row(&sys.table, &key).await;
-        assert!(res1.is_ok());
+        assert!(matches!(res1, Ok(DeleteMvcc::Deleted)));
         trx1 = stmt1.succeed();
 
         let mut session2 = sys.try_new_session().unwrap();
         let mut trx2 = session2.try_begin_trx().unwrap().unwrap();
         let mut stmt2 = trx2.start_stmt();
         let res2 = stmt2.delete_row(&sys.table, &key).await;
-        assert!(matches!(res2, DeleteMvcc::WriteConflict));
+        assert!(matches!(res2, Ok(DeleteMvcc::WriteConflict)));
         trx2 = stmt2.fail().await;
         trx2.rollback().await;
         drop(session2);
@@ -560,7 +560,7 @@ fn test_column_delete_mvcc_visibility() {
         let mut trx_delete = delete_session.try_begin_trx().unwrap().unwrap();
         let mut stmt_delete = trx_delete.start_stmt();
         let res = stmt_delete.delete_row(&sys.table, &key).await;
-        assert!(res.is_ok());
+        assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx_delete = stmt_delete.succeed();
         trx_delete.commit().await.unwrap();
 
@@ -1173,7 +1173,7 @@ fn test_string_index_updates() {
                 let insert = vec![Val::from(&s[..0])];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
                 let res = stmt.insert_row(&table, insert).await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 stmt.succeed().commit().await.unwrap();
             }
             // perform updates.
@@ -1185,7 +1185,7 @@ fn test_string_index_updates() {
                 }];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
                 let res = stmt.update_row(&table, &key, update).await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 stmt.succeed().commit().await.unwrap();
             }
         }
@@ -1212,7 +1212,7 @@ fn test_mvcc_out_of_place_update() {
                 let insert = vec![Val::from(&s[..BASE + i])];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
                 let res = stmt.insert_row(&table, insert).await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 stmt.succeed().commit().await.unwrap();
             }
             // perform updates to trigger out-of-place update.
@@ -1225,7 +1225,7 @@ fn test_mvcc_out_of_place_update() {
                 }];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
                 let res = stmt.update_row(&table, &key, update).await;
-                assert!(res.is_ok());
+                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 stmt.succeed().commit().await.unwrap();
             }
         }
@@ -1417,7 +1417,7 @@ fn test_table_freeze() {
                     }],
                 )
                 .await;
-            assert!(res.is_ok());
+            assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
             stmt.succeed().commit().await.unwrap();
         }
         let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
@@ -1437,7 +1437,7 @@ fn test_table_freeze() {
                     }],
                 )
                 .await;
-            assert!(res.is_ok());
+            assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
             stmt.succeed().commit().await.unwrap();
         }
         let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
@@ -1561,7 +1561,7 @@ fn test_data_checkpoint_snapshot_consistency() {
             let key = SelectKey::new(0, vec![Val::from(1)]);
             let stmt = read_trx.start_stmt();
             let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
-            assert!(res.is_ok());
+            assert!(matches!(res, Ok(SelectMvcc::Found(_))));
             read_trx = stmt.succeed();
         }
 
@@ -1571,7 +1571,7 @@ fn test_data_checkpoint_snapshot_consistency() {
             let mut stmt = write_trx.start_stmt();
             let insert = vec![Val::from(10_000i32), Val::from("new")];
             let res = stmt.insert_row(&sys.table, insert).await;
-            assert!(res.is_ok());
+            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
             write_trx = stmt.succeed();
         }
 
@@ -1585,7 +1585,7 @@ fn test_data_checkpoint_snapshot_consistency() {
             let key = SelectKey::new(0, vec![Val::from(10_000i32)]);
             let stmt = read_trx.start_stmt();
             let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
-            assert!(res.not_found());
+            assert!(matches!(res, Ok(SelectMvcc::NotFound)));
             read_trx = stmt.succeed();
         }
 
@@ -1819,6 +1819,113 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
 }
 
 #[test]
+fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let stale_row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(1), Val::from("cached-row")])
+                .await,
+        );
+        trx = stmt.succeed();
+        trx.commit().await.unwrap();
+
+        let (stale_page, cached_row_id) = session
+            .load_active_insert_page(sys.table.table_id())
+            .unwrap();
+        assert_eq!(cached_row_id, stale_row_id);
+
+        sys.table.freeze(&session, usize::MAX).await;
+        let mut checkpoint_session = sys.try_new_session().unwrap();
+        sys.table
+            .data_checkpoint(&mut checkpoint_session)
+            .await
+            .unwrap();
+
+        let mut reclaimed = false;
+        for _ in 0..20 {
+            if sys
+                .table
+                .try_get_row_page_versioned_shared(session.pool_guards(), stale_page)
+                .await
+                .is_none()
+            {
+                reclaimed = true;
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(200)).await;
+        }
+        assert!(
+            reclaimed,
+            "row page should be reclaimed before stale-range validation"
+        );
+
+        let large = "r".repeat(48 * 1024);
+        let mut reused_row_id = None;
+        for key in 2..258 {
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let row_id = unwrap_insert_result(
+                stmt.insert_row(&sys.table, vec![Val::from(key), Val::from(&large[..])])
+                    .await,
+            );
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+            match sys.table.find_row(session.pool_guards(), row_id).await {
+                RowLocation::RowPage(page_id) if page_id == stale_page.page_id => {
+                    reused_row_id = Some(row_id);
+                    break;
+                }
+                RowLocation::RowPage(..) => (),
+                RowLocation::LwcPage(..) | RowLocation::NotFound => {
+                    panic!("newly inserted row should stay in a row page")
+                }
+            }
+        }
+        let reused_row_id = reused_row_id.expect("stale row-page slot should be reused");
+
+        let stale_guard = sys
+            .table
+            .accessor()
+            .try_get_validated_row_page_shared_result(
+                session.pool_guards(),
+                stale_page.page_id,
+                stale_row_id,
+            )
+            .await
+            .unwrap();
+        assert!(
+            stale_guard.is_none(),
+            "stale row id should not validate against the reused page range"
+        );
+
+        let reused_guard = sys
+            .table
+            .accessor()
+            .try_get_validated_row_page_shared_result(
+                session.pool_guards(),
+                stale_page.page_id,
+                reused_row_id,
+            )
+            .await
+            .unwrap();
+        assert!(
+            reused_guard.is_some(),
+            "reused row should validate on the reused page"
+        );
+
+        drop(reused_guard);
+        drop(stale_guard);
+        drop(checkpoint_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
     smol::block_on(async {
         let sys = TestSys::new_evictable_with_mem_size(9u64 * 1024 * 1024).await;
@@ -1876,7 +1983,7 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         let trx = stmt.fail().await;
         trx.rollback().await;
         assert!(
-            matches!(res, InsertMvcc::Err(Error::IOError)),
+            matches!(res, Err(Error::IOError)),
             "expected insert-page reload failure, got {res:?}"
         );
         assert!(
@@ -1989,7 +2096,7 @@ impl TestSys {
     async fn trx_insert(&self, trx: ActiveTrx, insert: Vec<Val>) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
         let res = stmt.insert_row(&self.table, insert).await;
-        if !res.is_ok() {
+        if !matches!(res, Ok(InsertMvcc::Inserted(_))) {
             panic!("res={:?}", res);
         }
         // assert!(res.is_ok());
@@ -2007,7 +2114,7 @@ impl TestSys {
     async fn trx_delete(&self, trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
         let res = stmt.delete_row(&self.table, key).await;
-        if !res.is_ok() {
+        if !matches!(res, Ok(DeleteMvcc::Deleted)) {
             panic!("res={:?}", res);
         }
         // assert!(res.is_ok());
@@ -2030,7 +2137,7 @@ impl TestSys {
     ) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
         let res = stmt.update_row(&self.table, key, update).await;
-        if !res.is_ok() {
+        if !matches!(res, Ok(UpdateMvcc::Updated(_))) {
             panic!("res={:?}", res);
         }
         // assert!(res.is_ok());
@@ -2060,7 +2167,7 @@ impl TestSys {
     async fn trx_select_not_found(&self, trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&self.table, key, &[0, 1]).await;
-        assert!(res.not_found());
+        assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         stmt.succeed()
     }
 
@@ -2073,11 +2180,11 @@ impl TestSys {
     ) -> ActiveTrx {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&self.table, key, &[0, 1]).await;
-        if !res.is_ok() {
+        if !matches!(res, Ok(SelectMvcc::Found(_))) {
             panic!("res={:?}", res);
         }
         // assert!(res.is_ok());
-        action(res.unwrap());
+        action(res.unwrap().unwrap_found());
         stmt.succeed()
     }
 
@@ -2094,9 +2201,9 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
     }
 }
 
-fn unwrap_insert_result(res: InsertMvcc) -> RowID {
+fn unwrap_insert_result(res: Result<InsertMvcc>) -> RowID {
     match res {
-        InsertMvcc::Ok(row_id) => row_id,
+        Ok(InsertMvcc::Inserted(row_id)) => row_id,
         res => panic!("unexpected insert result: {res:?}"),
     }
 }
@@ -2167,7 +2274,7 @@ async fn insert_rows_direct(
         let insert = vec![Val::from(start + i), Val::from(name)];
         let mut stmt = trx.start_stmt();
         let res = stmt.insert_row(table, insert).await;
-        assert!(res.is_ok());
+        assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
         trx = stmt.succeed();
     }
     trx.commit().await.unwrap();

@@ -168,6 +168,19 @@ pub(super) fn clock_sweep_candidate(
             }
             None
         }
+        FrameKind::EvictionFailed => {
+            if let Some(page_guard) = arena.try_lock_page_exclusive(page_id) {
+                if page_guard
+                    .bf()
+                    .compare_exchange_kind(FrameKind::EvictionFailed, FrameKind::Evicting)
+                    != FrameKind::EvictionFailed
+                {
+                    return None;
+                }
+                return Some(page_guard);
+            }
+            None
+        }
         FrameKind::Hot => {
             let _ = arena.compare_exchange_frame_kind(page_id, FrameKind::Hot, FrameKind::Cool);
             None

@@ -2,6 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 
 use crate::catalog::{TableCache, TableID, TableSpec};
+use crate::error::Result;
 use crate::row::RowID;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::table::{Table, TableAccess};
@@ -114,12 +115,12 @@ impl Statement {
 
     /// Insert a row into a table.
     #[inline]
-    pub async fn insert_row(&mut self, table: &Table, cols: Vec<Val>) -> InsertMvcc {
+    pub async fn insert_row(&mut self, table: &Table, cols: Vec<Val>) -> Result<InsertMvcc> {
         table.accessor().insert_mvcc(self, cols).await
     }
 
     #[inline]
-    pub async fn delete_row(&mut self, table: &Table, key: &SelectKey) -> DeleteMvcc {
+    pub async fn delete_row(&mut self, table: &Table, key: &SelectKey) -> Result<DeleteMvcc> {
         table.accessor().delete_unique_mvcc(self, key, false).await
     }
 
@@ -129,7 +130,7 @@ impl Statement {
         table: &Table,
         key: &SelectKey,
         user_read_set: &[usize],
-    ) -> SelectMvcc {
+    ) -> Result<SelectMvcc> {
         table
             .accessor()
             .index_lookup_unique_mvcc(self, key, user_read_set)
@@ -142,7 +143,7 @@ impl Statement {
         table: &Table,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> UpdateMvcc {
+    ) -> Result<UpdateMvcc> {
         table.accessor().update_unique_mvcc(self, key, update).await
     }
 
