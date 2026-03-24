@@ -357,18 +357,6 @@ impl BufferPool for EvictableBufferPool {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> FacadePageGuard<T> {
-        self.try_get_page(guard, page_id, mode)
-            .await
-            .expect("evictable buffer pool get_page should not ignore page-I/O failures")
-    }
-
-    #[inline]
-    async fn try_get_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
     ) -> Result<FacadePageGuard<T>> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
@@ -413,21 +401,7 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    async fn try_get_page_versioned<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
-    ) -> Option<FacadePageGuard<T>> {
-        self.try_get_page_versioned_result(guard, id, mode)
-            .await
-            .expect(
-                "evictable buffer pool try_get_page_versioned should not ignore page-I/O failures",
-            )
-    }
-
-    #[inline]
-    async fn try_get_page_versioned_result<T: BufferPage>(
+    async fn get_page_versioned<T: BufferPage>(
         &self,
         guard: &PoolGuard,
         id: VersionedPageID,
@@ -497,19 +471,6 @@ impl BufferPool for EvictableBufferPool {
 
     #[inline]
     async fn get_child_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<T>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> Validation<FacadePageGuard<T>> {
-        self.try_get_child_page(guard, p_guard, page_id, mode)
-            .await
-            .expect("evictable buffer pool get_child_page should not ignore page-I/O failures")
-    }
-
-    #[inline]
-    async fn try_get_child_page<T: BufferPage>(
         &self,
         guard: &PoolGuard,
         p_guard: &FacadePageGuard<T>,
@@ -1691,21 +1652,23 @@ mod tests {
                 drop(g);
 
                 let g = pool
-                    .try_get_page_versioned::<RowPage>(
+                    .get_page_versioned::<RowPage>(
                         &pool_guard,
                         current_versioned,
                         LatchFallbackMode::Shared,
                     )
-                    .await;
+                    .await
+                    .unwrap();
                 assert!(g.is_some());
 
                 let g = pool
-                    .try_get_page_versioned::<RowPage>(
+                    .get_page_versioned::<RowPage>(
                         &pool_guard,
                         stale_versioned,
                         LatchFallbackMode::Shared,
                     )
-                    .await;
+                    .await
+                    .unwrap();
                 assert!(g.is_none());
             }
             {
@@ -1716,16 +1679,18 @@ mod tests {
 
                 // Keep an optimistic guard, then reuse the page slot.
                 let stale_guard = pool
-                    .try_get_page_versioned::<RowPage>(
+                    .get_page_versioned::<RowPage>(
                         &pool_guard,
                         versioned,
                         LatchFallbackMode::Shared,
                     )
                     .await
+                    .unwrap()
                     .unwrap();
                 let g = pool
                     .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .lock_exclusive_async()
                     .await
                     .unwrap();
@@ -1740,6 +1705,7 @@ mod tests {
                 let g = pool
                     .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Spin)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .downgrade();
                 assert_eq!(g.page_id(), 0);
                 let p = g.facade();
@@ -1754,6 +1720,7 @@ mod tests {
                 let g = pool
                     .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Spin)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .downgrade();
                 assert_eq!(g.page_id(), 0);
                 let p = g.facade();
@@ -1762,6 +1729,7 @@ mod tests {
                 let g = pool
                     .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Exclusive)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .verify_exclusive_async::<false>()
                     .await;
                 drop(g.unwrap());
@@ -1770,7 +1738,7 @@ mod tests {
                 let c = pool
                     .get_child_page::<RowPage>(&pool_guard, &p, 1, LatchFallbackMode::Exclusive)
                     .await;
-                assert!(c.is_invalid());
+                assert!(c.unwrap().is_invalid());
             }
         })
     }
@@ -1906,17 +1874,13 @@ mod tests {
                 Err(Error::IOError)
             ));
             assert!(matches!(
-                pool.try_get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                pool.get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
                     .await,
                 Err(Error::IOError)
             ));
             assert!(matches!(
-                pool.try_get_page_versioned_result::<Page>(
-                    &pool_guard,
-                    versioned,
-                    LatchFallbackMode::Shared,
-                )
-                .await,
+                pool.get_page_versioned::<Page>(&pool_guard, versioned, LatchFallbackMode::Shared,)
+                    .await,
                 Err(Error::IOError)
             ));
         });
@@ -1999,6 +1963,7 @@ mod tests {
                 let g = pool
                     .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .lock_exclusive_async()
                     .await
                     .unwrap();
@@ -2063,7 +2028,8 @@ mod tests {
 
             let g = pool
                 .get_page::<Page>(&pool_guard, 0, LatchFallbackMode::Shared)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let g = g.lock_shared_async().await.unwrap();
             assert_eq!(&g.page()[..6], b"page-0");
             drop(g);

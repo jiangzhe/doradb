@@ -63,10 +63,10 @@ impl Table {
                 self.collect_frozen_pages(pool_guards).await;
             if !frozen_pages.is_empty() {
                 self.wait_for_frozen_pages_stable(pool_guards, &trx_sys, &frozen_pages)
-                    .await;
+                    .await?;
                 cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
                 self.set_frozen_pages_to_transition(pool_guards, &frozen_pages, cutoff_ts)
-                    .await;
+                    .await?;
             }
 
             // Step 4: build LWC pages from transition pages using the cutoff snapshot.
@@ -84,7 +84,7 @@ impl Table {
                     heap_redo_start_ts = next_heap_redo_start_ts.unwrap_or(checkpoint_ts);
                 }
                 Err(err) => {
-                    trx_sys.rollback(trx).await;
+                    trx_sys.rollback(trx).await?;
                     return Err(err);
                 }
             }
@@ -127,7 +127,7 @@ impl Table {
             {
                 Ok(changed) => changed,
                 Err(err) => {
-                    trx_sys.rollback(trx).await;
+                    trx_sys.rollback(trx).await?;
                     return Err(err);
                 }
             };
@@ -136,7 +136,7 @@ impl Table {
 
         // Step 8: rollback no-op checkpoint transactions to avoid empty commits.
         if !table_file_changed {
-            trx_sys.rollback(trx).await;
+            trx_sys.rollback(trx).await?;
             return Ok(());
         }
 
@@ -144,12 +144,12 @@ impl Table {
         let (table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
             Ok(res) => res,
             Err(Error::IOError | Error::AIOError(_) | Error::SendError) => {
-                trx_sys.rollback(trx).await;
+                let _ = trx_sys.rollback(trx).await;
                 let poison = trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite);
                 return Err(poison);
             }
             Err(err) => {
-                trx_sys.rollback(trx).await;
+                trx_sys.rollback(trx).await?;
                 return Err(err);
             }
         };

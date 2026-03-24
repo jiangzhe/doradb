@@ -348,7 +348,7 @@ impl PersistedLwcPage {
     pub async fn load(disk_pool: &ReadonlyBufferPool, page_id: PageID) -> Result<Self> {
         let file_kind = disk_pool.persisted_file_kind();
         let guard = disk_pool
-            .try_get_validated_page_shared(page_id, validate_persisted_lwc_page)
+            .get_validated_page_shared(page_id, validate_persisted_lwc_page)
             .await?;
         Ok(PersistedLwcPage {
             guard,

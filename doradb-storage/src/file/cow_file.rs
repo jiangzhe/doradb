@@ -1,6 +1,6 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::guard::PageGuard;
-use crate::buffer::page::{PAGE_SIZE, PageID};
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
+use crate::buffer::page::{PAGE_SIZE, Page, PageID};
 use crate::buffer::{
     BufferPool, PersistedBlockKey, PersistedFileID, ReadSubmission, ReadonlyBufferPool,
 };
@@ -329,10 +329,10 @@ impl<M> CowFile<M> {
     ) -> Result<ActiveRoot<M>> {
         let _ = disk_pool.invalidate_block_id(0);
         let pool_guard = disk_pool.pool_guard();
-        let super_page_guard: crate::buffer::guard::PageSharedGuard<crate::buffer::page::Page> = loop {
+        let super_page_guard: PageSharedGuard<Page> = loop {
             let guard = disk_pool
-                .get_page::<crate::buffer::page::Page>(&pool_guard, 0, LatchFallbackMode::Shared)
-                .await;
+                .get_page::<Page>(&pool_guard, 0, LatchFallbackMode::Shared)
+                .await?;
             if let Some(shared) = guard.lock_shared_async().await {
                 break shared;
             }
@@ -342,14 +342,14 @@ impl<M> CowFile<M> {
         drop(super_page_guard);
 
         let _ = disk_pool.invalidate_block_id(super_page.body.meta_page_id);
-        let meta_page_guard: crate::buffer::guard::PageSharedGuard<crate::buffer::page::Page> = loop {
+        let meta_page_guard: PageSharedGuard<Page> = loop {
             let guard = disk_pool
-                .get_page::<crate::buffer::page::Page>(
+                .get_page::<Page>(
                     &pool_guard,
                     super_page.body.meta_page_id,
                     LatchFallbackMode::Shared,
                 )
-                .await;
+                .await?;
             if let Some(shared) = guard.lock_shared_async().await {
                 break shared;
             }

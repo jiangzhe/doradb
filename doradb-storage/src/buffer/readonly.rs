@@ -9,7 +9,9 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageS
 use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
-use crate::buffer::{BufferPool, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole};
+use crate::buffer::{
+    BufferPool, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole, ReadonlyPageValidator,
+};
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Validation::Valid;
 use crate::error::{Error, PersistedFileKind, Result, Validation};
@@ -53,8 +55,6 @@ impl PersistedBlockKey {
         PersistedBlockKey { file_id, block_id }
     }
 }
-
-type ReadonlyPageValidator = fn(&[u8], PersistedFileKind, PageID) -> Result<()>;
 
 /// Keepalive handle for one real readonly backing file.
 ///
@@ -1217,13 +1217,26 @@ impl ReadonlyBufferPool {
         }
     }
 
+    /// Invalidates one block for this file from the global readonly cache.
+    #[inline]
+    pub fn invalidate_block_id(&self, block_id: PageID) -> Option<PageID> {
+        self.global.invalidate_file_block(self.file_id, block_id)
+    }
+
+    /// Invalidates one block for this file with strict GC ordering preconditions.
+    #[inline]
+    pub fn invalidate_block_id_strict(&self, block_id: PageID) -> Option<PageID> {
+        self.global
+            .invalidate_file_block_strict(self.file_id, block_id)
+    }
+
     /// Returns a shared guard for one persisted page after validating its page-kind contract.
     ///
     /// On cache miss, validation runs before the new frame becomes resident.
     /// On cached hits, validation is re-run against the resident bytes and a
     /// failed validation invalidates the mapping before returning the error.
     #[inline]
-    pub(crate) async fn try_get_validated_page_shared(
+    pub(crate) async fn get_validated_page_shared(
         &self,
         page_id: PageID,
         validator: ReadonlyPageValidator,
@@ -1249,19 +1262,6 @@ impl ReadonlyBufferPool {
                 return Ok(shared);
             }
         }
-    }
-
-    /// Invalidates one block for this file from the global readonly cache.
-    #[inline]
-    pub fn invalidate_block_id(&self, block_id: PageID) -> Option<PageID> {
-        self.global.invalidate_file_block(self.file_id, block_id)
-    }
-
-    /// Invalidates one block for this file with strict GC ordering preconditions.
-    #[inline]
-    pub fn invalidate_block_id_strict(&self, block_id: PageID) -> Option<PageID> {
-        self.global
-            .invalidate_file_block_strict(self.file_id, block_id)
     }
 }
 
@@ -1301,41 +1301,19 @@ impl BufferPool for ReadonlyBufferPool {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> FacadePageGuard<T> {
-        self.get_page_facade(guard, page_id, mode)
-            .await
-            .expect("readonly buffer pool get_page should not ignore page-I/O failures")
-    }
-
-    #[inline]
-    async fn try_get_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
     ) -> Result<FacadePageGuard<T>> {
         self.get_page_facade(guard, page_id, mode).await
     }
 
     #[inline]
-    async fn try_get_page_versioned<T: BufferPage>(
+    async fn get_page_versioned<T: BufferPage>(
         &self,
         guard: &PoolGuard,
         _id: VersionedPageID,
         _mode: LatchFallbackMode,
-    ) -> Option<FacadePageGuard<T>> {
-        self.global.validate_guard(guard);
-        None
-    }
-
-    #[inline]
-    async fn try_get_page_versioned_result<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
     ) -> Result<Option<FacadePageGuard<T>>> {
-        Ok(self.try_get_page_versioned(guard, id, mode).await)
+        self.global.validate_guard(guard);
+        Ok(None)
     }
 
     #[inline]
@@ -1350,26 +1328,8 @@ impl BufferPool for ReadonlyBufferPool {
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Validation<FacadePageGuard<T>> {
-        let g = <Self as BufferPool>::get_page(self, guard, page_id, mode).await;
-        if p_guard.validate_bool() {
-            return Valid(g);
-        }
-        if g.is_exclusive() {
-            g.rollback_exclusive_version_change();
-        }
-        Validation::Invalid
-    }
-
-    #[inline]
-    async fn try_get_child_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<T>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
     ) -> Result<Validation<FacadePageGuard<T>>> {
-        let g = self.try_get_page(guard, page_id, mode).await?;
+        let g = self.get_page(guard, page_id, mode).await?;
         if p_guard.validate_bool() {
             return Ok(Valid(g));
         }
@@ -2020,7 +1980,8 @@ pub(crate) mod tests {
             let pool_guard = (*pool).pool_guard();
             let page: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..6], b"reload");
             drop(page);
@@ -2051,14 +2012,16 @@ pub(crate) mod tests {
             let pool_guard = (*pool).pool_guard();
             let page: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 3, LatchFallbackMode::Shared)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..5], b"hello");
             drop(page);
 
             let page: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 3, LatchFallbackMode::Shared)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..5], b"hello");
             assert_eq!(global.allocated(), 1);
@@ -2093,7 +2056,8 @@ pub(crate) mod tests {
                 tasks.push(smol::spawn(async move {
                     let g: FacadePageGuard<Page> = pool
                         .get_page::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
-                        .await;
+                        .await
+                        .expect("buffer-pool read failed in test");
                     g.lock_shared_async().await.unwrap().page()[0]
                 }));
             }
@@ -2403,13 +2367,13 @@ pub(crate) mod tests {
             let pool_1 = (*pool).clone();
             let waiter1 = smol::spawn(async move {
                 pool_1
-                    .try_get_validated_page_shared(8, validate_persisted_lwc_page)
+                    .get_validated_page_shared(8, validate_persisted_lwc_page)
                     .await
             });
             let pool_2 = (*pool).clone();
             let waiter2 = smol::spawn(async move {
                 pool_2
-                    .try_get_validated_page_shared(8, validate_persisted_lwc_page)
+                    .get_validated_page_shared(8, validate_persisted_lwc_page)
                     .await
             });
 
@@ -2475,7 +2439,7 @@ pub(crate) mod tests {
             let key = PersistedBlockKey::new(107, 9);
 
             let err = match pool
-                .try_get_validated_page_shared(9, validate_persisted_lwc_page)
+                .get_validated_page_shared(9, validate_persisted_lwc_page)
                 .await
             {
                 Ok(_) => panic!("expected persisted LWC corruption"),
@@ -2518,7 +2482,7 @@ pub(crate) mod tests {
             let key = PersistedBlockKey::new(108, 10);
 
             let err = match pool
-                .try_get_validated_page_shared(10, validate_persisted_column_block_index_page)
+                .get_validated_page_shared(10, validate_persisted_column_block_index_page)
                 .await
             {
                 Ok(_) => panic!("expected persisted column-block corruption"),
@@ -2561,7 +2525,7 @@ pub(crate) mod tests {
             let key = PersistedBlockKey::new(109, 11);
 
             let err = match pool
-                .try_get_validated_page_shared(11, validate_persisted_blob_page)
+                .get_validated_page_shared(11, validate_persisted_blob_page)
                 .await
             {
                 Ok(_) => panic!("expected persisted deletion-blob corruption"),
@@ -2612,7 +2576,8 @@ pub(crate) mod tests {
                 let expected = format!("page-{i}");
                 let g: FacadePageGuard<Page> = pool
                     .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
-                    .await;
+                    .await
+                    .expect("buffer-pool read failed in test");
                 let g = g.lock_shared_async().await.unwrap();
                 assert_eq!(&g.page()[..expected.len()], expected.as_bytes());
                 drop(g);
@@ -2630,7 +2595,8 @@ pub(crate) mod tests {
             // Reload the first page after cache pressure; this should still return correct data.
             let g: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, base_page_id, LatchFallbackMode::Shared)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let g = g.lock_shared_async().await.unwrap();
             assert_eq!(&g.page()[..6], b"page-0");
             drop(g);
@@ -2663,7 +2629,8 @@ pub(crate) mod tests {
 
             let g: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let g = g.lock_shared_async().await.unwrap();
             assert_eq!(&g.page()[..10], b"drop-order");
             drop(g);

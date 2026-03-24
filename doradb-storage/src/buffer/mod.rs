@@ -33,11 +33,10 @@ use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
     MetaPoolConfig, ShelfScope,
 };
-use crate::error::Result;
 use crate::error::Validation;
+use crate::error::{PersistedFileKind, Result};
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
-use crate::quiescent::QuiescentGuard;
 use std::future::Future;
 
 /// Shared terminal-status cell for one page-sized buffer-pool IO operation.
@@ -46,6 +45,9 @@ use std::future::Future;
 /// waiters. Evictable pools use the same cell for read reloads and for readers
 /// waiting behind writeback of the same page.
 pub(crate) type PageIOCompletion = Completion<Result<PageID>>;
+
+/// Validation callback for one persisted readonly-cache page image.
+pub(crate) type ReadonlyPageValidator = fn(&[u8], PersistedFileKind, PageID) -> Result<()>;
 
 /// Abstraction of buffer pool.
 pub trait BufferPool: Send + Sync {
@@ -80,27 +82,11 @@ pub trait BufferPool: Send + Sync {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = FacadePageGuard<T>> + Send;
-
-    /// Get page and surface any underlying storage-I/O failure.
-    fn try_get_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
     ) -> impl Future<Output = Result<FacadePageGuard<T>>> + Send;
 
     /// Get page by versioned page identity.
     /// Returns None if page is unavailable or version mismatches.
-    fn try_get_page_versioned<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Option<FacadePageGuard<T>>> + Send;
-
-    /// Get page by versioned page identity and surface any underlying storage-I/O failure.
-    fn try_get_page_versioned_result<T: BufferPage>(
+    fn get_page_versioned<T: BufferPage>(
         &self,
         guard: &PoolGuard,
         id: VersionedPageID,
@@ -120,117 +106,7 @@ pub trait BufferPool: Send + Sync {
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send;
-
-    /// Get child page and surface any underlying storage-I/O failure.
-    fn try_get_child_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<T>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
     ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send;
-}
-
-impl<T: BufferPool> BufferPool for QuiescentGuard<T> {
-    #[inline]
-    fn capacity(&self) -> usize {
-        T::capacity(&**self)
-    }
-
-    #[inline]
-    fn allocated(&self) -> usize {
-        T::allocated(&**self)
-    }
-
-    #[inline]
-    fn pool_guard(&self) -> PoolGuard {
-        T::pool_guard(&**self)
-    }
-
-    #[inline]
-    fn allocate_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-    ) -> impl Future<Output = PageExclusiveGuard<U>> + Send {
-        T::allocate_page(&**self, guard)
-    }
-
-    #[inline]
-    fn allocate_page_at<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-    ) -> impl Future<Output = Result<PageExclusiveGuard<U>>> + Send {
-        T::allocate_page_at(&**self, guard, page_id)
-    }
-
-    #[inline]
-    fn get_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = FacadePageGuard<U>> + Send {
-        T::get_page(&**self, guard, page_id, mode)
-    }
-
-    #[inline]
-    fn try_get_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<FacadePageGuard<U>>> + Send {
-        T::try_get_page(&**self, guard, page_id, mode)
-    }
-
-    #[inline]
-    fn try_get_page_versioned<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Option<FacadePageGuard<U>>> + Send {
-        T::try_get_page_versioned(&**self, guard, id, mode)
-    }
-
-    #[inline]
-    fn try_get_page_versioned_result<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<Option<FacadePageGuard<U>>>> + Send {
-        T::try_get_page_versioned_result(&**self, guard, id, mode)
-    }
-
-    #[inline]
-    fn deallocate_page<U: BufferPage>(&self, g: PageExclusiveGuard<U>) {
-        T::deallocate_page(&**self, g)
-    }
-
-    #[inline]
-    fn get_child_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<U>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Validation<FacadePageGuard<U>>> + Send {
-        T::get_child_page(&**self, guard, p_guard, page_id, mode)
-    }
-
-    #[inline]
-    fn try_get_child_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<U>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<Validation<FacadePageGuard<U>>>> + Send {
-        T::try_get_child_page(&**self, guard, p_guard, page_id, mode)
-    }
 }
 
 impl Component for MetaPool {

@@ -5,6 +5,7 @@ use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+    StoragePoisonSource,
 };
 use crate::file::build_test_fs_in;
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -167,8 +168,8 @@ fn test_mvcc_insert_dup_key() {
             let mut stmt = trx.start_stmt();
             let res = stmt.insert_row(&sys.table, insert).await;
             assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
-            trx = stmt.fail().await;
-            trx.rollback().await;
+            trx = stmt.fail().await.unwrap();
+            trx.rollback().await.unwrap();
         }
         // write conflict
         {
@@ -188,7 +189,7 @@ fn test_mvcc_insert_dup_key() {
             let res = stmt2.insert_row(&sys.table, insert2).await;
             // still dup key because circuit breaker on index search.
             assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
-            stmt2.fail().await.rollback().await;
+            stmt2.fail().await.unwrap().rollback().await.unwrap();
             drop(session2);
 
             trx1.commit().await.unwrap();
@@ -412,8 +413,8 @@ fn test_lwc_select_surfaces_persisted_corruption() {
             }) => assert_eq!(page_id, entry.payload.block_id),
             other => panic!("expected persisted LWC corruption, got {other:?}"),
         }
-        trx = stmt.fail().await;
-        trx.rollback().await;
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
 
         drop(session);
         sys.clean_all();
@@ -440,7 +441,7 @@ fn test_column_delete_rollback() {
         let res = stmt.delete_row(&sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx = stmt.succeed();
-        trx.rollback().await;
+        trx.rollback().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx = sys
@@ -486,7 +487,7 @@ fn test_column_delete_rollback_after_checkpoint() {
         let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
         assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         trx_delete = stmt.succeed();
-        trx_delete.rollback().await;
+        trx_delete.rollback().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx = sys
@@ -528,11 +529,11 @@ fn test_column_delete_write_conflict() {
         let mut stmt2 = trx2.start_stmt();
         let res2 = stmt2.delete_row(&sys.table, &key).await;
         assert!(matches!(res2, Ok(DeleteMvcc::WriteConflict)));
-        trx2 = stmt2.fail().await;
-        trx2.rollback().await;
+        trx2 = stmt2.fail().await.unwrap();
+        trx2.rollback().await.unwrap();
         drop(session2);
 
-        trx1.rollback().await;
+        trx1.rollback().await.unwrap();
 
         drop(session);
         sys.clean_all();
@@ -704,7 +705,7 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
             .expect("payload should exist");
         assert!(entry.payload.offloaded_ref().is_none());
 
-        hold_trx.rollback().await;
+        hold_trx.rollback().await.unwrap();
         drop(checkpoint_session);
         drop(writer_session);
         drop(hold_session);
@@ -731,6 +732,7 @@ fn test_row_page_transition_retries_update_delete() {
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
             .await
+            .unwrap()
             .unwrap();
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
@@ -746,6 +748,7 @@ fn test_row_page_transition_retries_update_delete() {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("buffer-pool read failed in test")
             .lock_shared_async()
             .await
             .unwrap();
@@ -763,6 +766,7 @@ fn test_row_page_transition_retries_update_delete() {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("buffer-pool read failed in test")
             .lock_shared_async()
             .await
             .unwrap();
@@ -789,8 +793,8 @@ fn test_row_page_transition_retries_update_delete() {
             .update_row_inplace(&mut stmt, page_guard, &key, row_id, update)
             .await;
         assert!(matches!(res, UpdateRowInplace::RetryInTransition));
-        trx = stmt.fail().await;
-        trx.rollback().await;
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
@@ -803,6 +807,7 @@ fn test_row_page_transition_retries_update_delete() {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("buffer-pool read failed in test")
             .lock_shared_async()
             .await
             .unwrap();
@@ -812,8 +817,8 @@ fn test_row_page_transition_retries_update_delete() {
             .delete_row_internal(&mut stmt, page_guard, row_id, &key, false)
             .await;
         assert!(matches!(res, DeleteInternal::RetryInTransition));
-        trx = stmt.fail().await;
-        trx.rollback().await;
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
 
         drop(session);
         sys.clean_all();
@@ -831,7 +836,7 @@ fn test_mvcc_rollback_insert_normal() {
             let insert = vec![Val::from(1i32), Val::from("hello")];
             trx = sys.trx_insert(trx, insert).await;
             // explicit rollback
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
@@ -867,7 +872,7 @@ fn test_mvcc_insert_link_unique_index() {
             let insert = vec![Val::from(1i32), Val::from("world")];
             sys.new_trx_insert(&mut session, insert).await;
 
-            trx_to_prevent_gc.rollback().await;
+            trx_to_prevent_gc.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
@@ -901,7 +906,7 @@ fn test_mvcc_rollback_insert_link_unique_index() {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             trx = sys.trx_insert(trx, insert).await;
             // explicit rollback
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
@@ -1462,6 +1467,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
             .await
+            .unwrap()
             .unwrap();
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
@@ -1478,6 +1484,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("buffer-pool read failed in test")
             .lock_shared_async()
             .await
             .unwrap();
@@ -1502,7 +1509,8 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         ctx.row_ver().unwrap().set_frozen();
         sys.table
             .set_frozen_pages_to_transition(session.pool_guards(), &[frozen_page], stmt.trx.sts)
-            .await;
+            .await
+            .unwrap();
 
         let marker = sys.table.deletion_buffer().get(row_id).unwrap();
         match marker {
@@ -1512,8 +1520,8 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             DeleteMarker::Committed(_) => panic!("uncommitted lock should remain as marker ref"),
         }
 
-        trx = stmt.fail().await;
-        trx.rollback().await;
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
 
         drop(lock_row);
         drop(page_guard);
@@ -1589,7 +1597,7 @@ fn test_data_checkpoint_snapshot_consistency() {
             read_trx = stmt.succeed();
         }
 
-        write_trx.rollback().await;
+        write_trx.rollback().await.unwrap();
         read_trx.commit().await.unwrap();
 
         drop(session);
@@ -1711,8 +1719,9 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
         assert_eq!(cached_row_id, row_id);
         assert!(
             sys.table
-                .try_get_row_page_versioned_shared(session.pool_guards(), cached_page)
+                .get_row_page_versioned_shared(session.pool_guards(), cached_page)
                 .await
+                .unwrap()
                 .is_some()
         );
         session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
@@ -1777,8 +1786,9 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
         for _ in 0..20 {
             if sys
                 .table
-                .try_get_row_page_versioned_shared(session.pool_guards(), cached_page)
+                .get_row_page_versioned_shared(session.pool_guards(), cached_page)
                 .await
+                .unwrap()
                 .is_none()
             {
                 reclaimed = true;
@@ -1849,8 +1859,9 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         for _ in 0..20 {
             if sys
                 .table
-                .try_get_row_page_versioned_shared(session.pool_guards(), stale_page)
+                .get_row_page_versioned_shared(session.pool_guards(), stale_page)
                 .await
+                .unwrap()
                 .is_none()
             {
                 reclaimed = true;
@@ -1980,8 +1991,8 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         let res = stmt
             .insert_row(&sys.table, vec![Val::from(100), Val::from("reload-fails")])
             .await;
-        let trx = stmt.fail().await;
-        trx.rollback().await;
+        let trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
         assert!(
             matches!(res, Err(Error::IOError)),
             "expected insert-page reload failure, got {res:?}"
@@ -1990,6 +2001,79 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
             read_hook.call_count() > 0,
             "cached insert page should reload from disk"
         );
+
+        drop(writer);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_mem_size(9u64 * 1024 * 1024).await;
+        let mut session = sys.try_new_session().unwrap();
+
+        let large = "r".repeat(48 * 1024);
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let row_id = match stmt
+            .insert_row(&sys.table, vec![Val::from(1), Val::from(&large[..])])
+            .await
+        {
+            Ok(InsertMvcc::Inserted(row_id)) => row_id,
+            res => panic!("res={res:?}"),
+        };
+        trx = stmt.succeed();
+
+        let (cached_page, cached_row_id) = session
+            .load_active_insert_page(sys.table.table_id())
+            .unwrap();
+        assert_eq!(cached_row_id, row_id);
+
+        let mut writer = sys.try_new_session().unwrap();
+        for i in 2..258 {
+            sys.new_trx_insert(&mut writer, vec![Val::from(i), Val::from(&large[..])])
+                .await;
+            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+                break;
+            }
+        }
+        let mut evicted = false;
+        for _ in 0..20 {
+            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+                evicted = true;
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(50)).await;
+        }
+        assert!(evicted, "rollback row page should be evicted before repro");
+
+        let read_hook = Arc::new(FailingPageReadHook::for_page(
+            sys.table.mem.mem_pool.test_raw_fd(),
+            cached_page.page_id,
+            libc::EIO,
+        ));
+        let _hook = install_libaio_test_hook(read_hook);
+
+        assert!(matches!(
+            trx.rollback().await,
+            Err(Error::StorageEnginePoisoned(
+                StoragePoisonSource::RollbackAccess
+            ))
+        ));
+        assert!(matches!(
+            sys.engine.trx_sys.storage_poison_error(),
+            Some(Error::StorageEnginePoisoned(
+                StoragePoisonSource::RollbackAccess
+            ))
+        ));
+        assert!(matches!(
+            sys.engine.trx_sys.ensure_runtime_healthy(),
+            Err(Error::StorageEnginePoisoned(
+                StoragePoisonSource::RollbackAccess
+            ))
+        ));
 
         drop(writer);
         drop(session);
@@ -2215,10 +2299,13 @@ async fn assert_row_in_lwc(
     sts: TrxID,
 ) -> RowID {
     let index = table.sec_idx()[key.index_no].unique().unwrap();
-    let (row_id, _) = index
+    let Some((row_id, _)) = index
         .lookup(guards.index_guard(), &key.vals, sts)
         .await
-        .expect("row should exist");
+        .expect("index lookup should succeed")
+    else {
+        panic!("row should exist");
+    };
     match table.find_row(guards, row_id).await {
         RowLocation::LwcPage(..) => row_id,
         RowLocation::RowPage(..) => panic!("row should be in lwc"),

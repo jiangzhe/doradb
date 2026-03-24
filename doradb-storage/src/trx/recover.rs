@@ -354,14 +354,14 @@ impl<'a> LogRecovery<'a> {
                     table
                         .populate_index_via_row_page(&self.pool_guards, *page_id)
                         .await?;
-                    self.refresh_page(Arc::clone(&metadata), *page_id).await;
+                    self.refresh_page(Arc::clone(&metadata), *page_id).await?;
                 }
             }
         }
         Ok(())
     }
 
-    async fn refresh_page(&self, metadata: Arc<TableMetadata>, page_id: PageID) {
+    async fn refresh_page(&self, metadata: Arc<TableMetadata>, page_id: PageID) -> Result<()> {
         let mut page_guard = self
             .mem_pool
             .get_page::<RowPage>(
@@ -369,7 +369,7 @@ impl<'a> LogRecovery<'a> {
                 page_id,
                 LatchFallbackMode::Exclusive,
             )
-            .await
+            .await?
             .lock_exclusive_async()
             .await
             .unwrap();
@@ -386,6 +386,7 @@ impl<'a> LogRecovery<'a> {
         if let Some(row_ver) = page_guard.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver()) {
             row_ver.set_create_cts(create_cts);
         }
+        Ok(())
     }
 
     async fn replay_ddl(
@@ -506,7 +507,7 @@ impl<'a> LogRecovery<'a> {
                     .get_catalog_table(table_id)
                     .ok_or(Error::TableNotFound)?;
                 self.replay_catalog_table_modifications(&table, &table_dml.rows)
-                    .await;
+                    .await?;
                 continue;
             }
             if cts < self.table_heap_redo_start_ts(table_id)? {
@@ -535,7 +536,7 @@ impl<'a> LogRecovery<'a> {
                 .get_catalog_table(table_id)
                 .ok_or(Error::TableNotFound)?;
             self.replay_catalog_table_modifications(&table, &table_dml.rows)
-                .await;
+                .await?;
         }
         Ok(())
     }
@@ -544,14 +545,14 @@ impl<'a> LogRecovery<'a> {
         &mut self,
         table: &CatalogTable,
         rows: &BTreeMap<RowID, RowRedo>,
-    ) {
+    ) -> crate::error::Result<()> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
-                    table.insert_no_trx(&self.pool_guards, vals).await;
+                    table.insert_no_trx(&self.pool_guards, vals).await?;
                 }
                 RowRedoKind::DeleteByUniqueKey(key) => {
-                    table.delete_unique_no_trx(&self.pool_guards, key).await;
+                    table.delete_unique_no_trx(&self.pool_guards, key).await?;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     // updates of catalog are implemented as DeleteByUniqueKey and Insert.
@@ -559,6 +560,7 @@ impl<'a> LogRecovery<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     async fn replay_table_dml(
@@ -580,7 +582,7 @@ impl<'a> LogRecovery<'a> {
                             cts,
                             disable_index,
                         )
-                        .await;
+                        .await?;
                 }
                 RowRedoKind::Update(vals) => {
                     table
@@ -592,7 +594,7 @@ impl<'a> LogRecovery<'a> {
                             cts,
                             disable_index,
                         )
-                        .await;
+                        .await?;
                 }
                 RowRedoKind::Delete => {
                     table
@@ -603,7 +605,7 @@ impl<'a> LogRecovery<'a> {
                             cts,
                             disable_index,
                         )
-                        .await;
+                        .await?;
                 }
                 RowRedoKind::DeleteByUniqueKey(_) => {
                     // We do not allow DeleteByUniqueKey log on data tables.

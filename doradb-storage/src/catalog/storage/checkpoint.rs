@@ -1,4 +1,4 @@
-use crate::buffer::guard::PageGuard;
+use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
 use crate::buffer::page::{BufferPage, PageID};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuards};
 use crate::catalog::storage::CatalogStorage;
@@ -71,7 +71,7 @@ impl CatalogStorage {
                 .load_visible_rows_from_root(self.tables[idx].metadata(), root)
                 .await?;
             for row in rows {
-                self.tables[idx].insert_no_trx(guards, &row.vals).await;
+                self.tables[idx].insert_no_trx(guards, &row.vals).await?;
             }
         }
         Ok(())
@@ -563,7 +563,7 @@ impl CatalogStorage {
 
 fn append_single_row_to_builder(
     metadata: &TableMetadata,
-    temp_page: &mut crate::buffer::guard::PageExclusiveGuard<RowPage>,
+    temp_page: &mut PageExclusiveGuard<RowPage>,
     builder: &mut LwcBuilder<'_>,
     row: &RowRecord,
 ) -> Result<bool> {

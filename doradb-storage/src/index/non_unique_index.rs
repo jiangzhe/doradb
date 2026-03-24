@@ -1,5 +1,6 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
+use crate::error::Result;
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
 use crate::index::btree_key::BTreeKeyEncoder;
 use crate::index::btree_node::{BTreeNode, BTreeSlot};
@@ -22,7 +23,7 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
         key: &[Val],
         res: &mut Vec<RowID>,
         ts: TrxID,
-    ) -> impl Future<Output = ()>;
+    ) -> impl Future<Output = Result<()>>;
 
     /// Lookup key and value(row_id) uniquely.
     /// Return None if not found.
@@ -33,7 +34,7 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> impl Future<Output = Option<bool>>;
+    ) -> impl Future<Output = Result<Option<bool>>>;
 
     /// Insert key value pair into the index.
     /// Value is always RowID.
@@ -44,7 +45,7 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> impl Future<Output = IndexInsert>;
+    ) -> impl Future<Output = Result<IndexInsert>>;
 
     /// Mask a given key value as deleted.
     fn mask_as_deleted(
@@ -53,7 +54,7 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> impl Future<Output = bool>;
+    ) -> impl Future<Output = Result<bool>>;
 
     /// Mask a given key value as not deleted.
     fn mask_as_active(
@@ -62,7 +63,7 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> impl Future<Output = bool>;
+    ) -> impl Future<Output = Result<bool>>;
 
     /// Delete key value pair from the index.
     /// Value is always RowID.
@@ -73,7 +74,7 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> impl Future<Output = bool>;
+    ) -> impl Future<Output = Result<bool>>;
 
     /// Scan values into given collection.
     fn scan_values(
@@ -81,7 +82,7 @@ pub trait NonUniqueIndex: Send + Sync + 'static {
         pool_guard: &PoolGuard,
         values: &mut Vec<RowID>,
         ts: TrxID,
-    ) -> impl Future<Output = ()>;
+    ) -> impl Future<Output = Result<()>>;
 }
 
 /// Generic non-unique-index implementation backed by a generic B-Tree.
@@ -103,12 +104,18 @@ impl<P: BufferPool> GenericNonUniqueBTreeIndex<P> {
 
 impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {
     #[inline]
-    async fn lookup(&self, pool_guard: &PoolGuard, key: &[Val], res: &mut Vec<RowID>, _ts: TrxID) {
+    async fn lookup(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        res: &mut Vec<RowID>,
+        _ts: TrxID,
+    ) -> Result<()> {
         let k = self
             .encoder
             .encode_prefix(key, Some(mem::size_of::<RowID>()));
         let mut scanner = self.tree.prefix_scanner(pool_guard, CollectRowID(res));
-        scanner.scan_prefix(k.as_bytes()).await;
+        scanner.scan_prefix(k.as_bytes()).await
     }
 
     #[inline]
@@ -118,12 +125,13 @@ impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {
         key: &[Val],
         row_id: RowID,
         _ts: TrxID,
-    ) -> Option<bool> {
+    ) -> Result<Option<bool>> {
         let k = self.encoder.encode_pair(key, Val::from(row_id));
-        self.tree
+        Ok(self
+            .tree
             .lookup_optimistic::<BTreeByte>(pool_guard, k.as_bytes())
-            .await
-            .map(|v| !v.is_deleted())
+            .await?
+            .map(|v| !v.is_deleted()))
     }
 
     #[inline]
@@ -134,23 +142,25 @@ impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> IndexInsert {
+    ) -> Result<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
         let k = self.encoder.encode_pair(key, Val::from(row_id));
-        match self
-            .tree
-            .insert::<BTreeByte>(
-                pool_guard,
-                k.as_bytes(),
-                BTREE_BYTE_ZERO,
-                merge_if_match_deleted,
-                ts,
-            )
-            .await
-        {
-            BTreeInsert::Ok(merged) => IndexInsert::Ok(merged),
-            BTreeInsert::DuplicateKey(v) => IndexInsert::DuplicateKey(row_id, v.is_deleted()),
-        }
+        Ok(
+            match self
+                .tree
+                .insert::<BTreeByte>(
+                    pool_guard,
+                    k.as_bytes(),
+                    BTREE_BYTE_ZERO,
+                    merge_if_match_deleted,
+                    ts,
+                )
+                .await?
+            {
+                BTreeInsert::Ok(merged) => IndexInsert::Ok(merged),
+                BTreeInsert::DuplicateKey(v) => IndexInsert::DuplicateKey(row_id, v.is_deleted()),
+            },
+        )
     }
 
     #[inline]
@@ -160,23 +170,25 @@ impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> bool {
+    ) -> Result<bool> {
         debug_assert!(!row_id.is_deleted());
         let k = self.encoder.encode_pair(key, Val::from(row_id));
-        match self
-            .tree
-            .update(
-                pool_guard,
-                k.as_bytes(),
-                BTREE_BYTE_ZERO,
-                BTREE_BYTE_ZERO.deleted(),
-                ts,
-            )
-            .await
-        {
-            BTreeUpdate::Ok(_) => true,
-            BTreeUpdate::NotFound | BTreeUpdate::ValueMismatch(_) => false,
-        }
+        Ok(
+            match self
+                .tree
+                .update(
+                    pool_guard,
+                    k.as_bytes(),
+                    BTREE_BYTE_ZERO,
+                    BTREE_BYTE_ZERO.deleted(),
+                    ts,
+                )
+                .await?
+            {
+                BTreeUpdate::Ok(_) => true,
+                BTreeUpdate::NotFound | BTreeUpdate::ValueMismatch(_) => false,
+            },
+        )
     }
 
     #[inline]
@@ -186,23 +198,25 @@ impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> bool {
+    ) -> Result<bool> {
         debug_assert!(!row_id.is_deleted());
         let k = self.encoder.encode_pair(key, Val::from(row_id));
-        match self
-            .tree
-            .update(
-                pool_guard,
-                k.as_bytes(),
-                BTREE_BYTE_ZERO.deleted(),
-                BTREE_BYTE_ZERO,
-                ts,
-            )
-            .await
-        {
-            BTreeUpdate::Ok(_) => true,
-            BTreeUpdate::NotFound | BTreeUpdate::ValueMismatch(_) => false,
-        }
+        Ok(
+            match self
+                .tree
+                .update(
+                    pool_guard,
+                    k.as_bytes(),
+                    BTREE_BYTE_ZERO.deleted(),
+                    BTREE_BYTE_ZERO,
+                    ts,
+                )
+                .await?
+            {
+                BTreeUpdate::Ok(_) => true,
+                BTreeUpdate::NotFound | BTreeUpdate::ValueMismatch(_) => false,
+            },
+        )
     }
 
     #[inline]
@@ -213,36 +227,44 @@ impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> bool {
+    ) -> Result<bool> {
         debug_assert!(!row_id.is_deleted());
         let k = self.encoder.encode_pair(key, Val::from(row_id));
-        match self
-            .tree
-            .delete(
-                pool_guard,
-                k.as_bytes(),
-                BTREE_BYTE_ZERO,
-                ignore_del_mask,
-                ts,
-            )
-            .await
-        {
-            BTreeDelete::Ok | BTreeDelete::NotFound => true,
-            BTreeDelete::ValueMismatch => false,
-        }
+        Ok(
+            match self
+                .tree
+                .delete(
+                    pool_guard,
+                    k.as_bytes(),
+                    BTREE_BYTE_ZERO,
+                    ignore_del_mask,
+                    ts,
+                )
+                .await?
+            {
+                BTreeDelete::Ok | BTreeDelete::NotFound => true,
+                BTreeDelete::ValueMismatch => false,
+            },
+        )
     }
 
     #[inline]
-    async fn scan_values(&self, pool_guard: &PoolGuard, values: &mut Vec<RowID>, _ts: TrxID) -> () {
+    async fn scan_values(
+        &self,
+        pool_guard: &PoolGuard,
+        values: &mut Vec<RowID>,
+        _ts: TrxID,
+    ) -> Result<()> {
         let mut cursor = self.tree.cursor(pool_guard, 0);
-        cursor.seek(&[]).await;
-        while let Some(g) = cursor.next().await {
+        cursor.seek(&[]).await?;
+        while let Some(g) = cursor.next().await? {
             let node = g.page();
             for slot in node.slots() {
                 let value = node.unpack_value::<BTreeU64>(slot);
                 values.push(value.to_u64());
             }
         }
+        Ok(())
     }
 }
 
@@ -309,11 +331,12 @@ mod tests {
         // 测试插入
         index
             .insert_if_not_exists(pool_guard, &key, row_id, false, 100)
-            .await;
+            .await
+            .unwrap();
 
         // 测试查找
         let mut res = vec![];
-        index.lookup(pool_guard, &key, &mut res, 100).await;
+        index.lookup(pool_guard, &key, &mut res, 100).await.unwrap();
         assert_eq!(res.len(), 1);
 
         // 测试不存在的键
@@ -321,17 +344,19 @@ mod tests {
         res.clear();
         index
             .lookup(pool_guard, &non_existent_key, &mut res, 100)
-            .await;
+            .await
+            .unwrap();
         assert!(res.is_empty());
 
         // 测试用例2：重复插入
         let new_row_id = 200u64;
         index
             .insert_if_not_exists(pool_guard, &key, new_row_id, false, 100)
-            .await;
+            .await
+            .unwrap();
         // non-unique index allow duplicate key, but row id must be different.
         res.clear();
-        index.lookup(pool_guard, &key, &mut res, 100).await;
+        index.lookup(pool_guard, &key, &mut res, 100).await.unwrap();
         assert_eq!(res.len(), 2);
 
         // 测试用例3：删除操作
@@ -339,9 +364,10 @@ mod tests {
             index
                 .compare_delete(pool_guard, &key, row_id, true, 100)
                 .await
+                .unwrap()
         );
         res.clear();
-        index.lookup(pool_guard, &key, &mut res, 100).await;
+        index.lookup(pool_guard, &key, &mut res, 100).await.unwrap();
         assert_eq!(res.len(), 1);
 
         // 测试删除不存在的键 still ok
@@ -349,12 +375,16 @@ mod tests {
             index
                 .compare_delete(pool_guard, &key, 1000, false, 100)
                 .await
+                .unwrap()
         );
 
         // 测试用例4：scan_values 操作
         res.clear();
         let mut values = vec![];
-        index.scan_values(pool_guard, &mut values, 100).await;
+        index
+            .scan_values(pool_guard, &mut values, 100)
+            .await
+            .unwrap();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0], new_row_id);
 
@@ -370,29 +400,44 @@ mod tests {
         // 插入多个键值对
         index
             .insert_if_not_exists(pool_guard, &key1, row_id1, false, 100)
-            .await;
+            .await
+            .unwrap();
         index
             .insert_if_not_exists(pool_guard, &key2, row_id2, false, 100)
-            .await;
+            .await
+            .unwrap();
         index
             .insert_if_not_exists(pool_guard, &key3, row_id3, false, 100)
-            .await;
+            .await
+            .unwrap();
 
         // 验证所有键都能正确查找
         res.clear();
-        index.lookup(pool_guard, &key1, &mut res, 100).await;
+        index
+            .lookup(pool_guard, &key1, &mut res, 100)
+            .await
+            .unwrap();
         assert_eq!(res.len(), 1);
         res.clear();
-        index.lookup(pool_guard, &key2, &mut res, 100).await;
+        index
+            .lookup(pool_guard, &key2, &mut res, 100)
+            .await
+            .unwrap();
         assert_eq!(res.len(), 1);
         res.clear();
-        index.lookup(pool_guard, &key3, &mut res, 100).await;
+        index
+            .lookup(pool_guard, &key3, &mut res, 100)
+            .await
+            .unwrap();
         assert_eq!(res.len(), 1);
 
         // 验证 scan_values 包含所有值
         res.clear();
         let mut values = vec![];
-        index.scan_values(pool_guard, &mut values, 100).await;
+        index
+            .scan_values(pool_guard, &mut values, 100)
+            .await
+            .unwrap();
         assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
 
         // 验证insert覆盖
@@ -400,16 +445,24 @@ mod tests {
         let row_id4 = 800u64;
         let inserted = index
             .insert_if_not_exists(pool_guard, &key4, row_id4, false, 100)
-            .await;
+            .await
+            .unwrap();
         assert!(inserted.is_ok());
-        let masked = index.mask_as_deleted(pool_guard, &key4, row_id4, 100).await;
+        let masked = index
+            .mask_as_deleted(pool_guard, &key4, row_id4, 100)
+            .await
+            .unwrap();
         assert!(masked);
         let inserted = index
             .insert_if_not_exists(pool_guard, &key4, row_id4, true, 100)
-            .await;
+            .await
+            .unwrap();
         assert!(inserted.is_merged());
         res.clear();
-        index.lookup(pool_guard, &key4, &mut res, 100).await;
+        index
+            .lookup(pool_guard, &key4, &mut res, 100)
+            .await
+            .unwrap();
         assert_eq!(res[0], row_id4);
     }
 }

@@ -97,6 +97,7 @@ fn main() {
             let g = pool
                 .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_shared_async()
                 .await
                 .unwrap();
@@ -116,6 +117,7 @@ fn main() {
             let g = pool
                 .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_shared_async()
                 .await
                 .unwrap();

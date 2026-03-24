@@ -442,7 +442,7 @@ impl<'a> ColumnBlockIndex<'a> {
     async fn read_node(&self, page_id: PageID) -> Result<ValidatedColumnBlockNode> {
         let g = self
             .disk_pool
-            .try_get_validated_page_shared(page_id, validate_persisted_column_block_index_page)
+            .get_validated_page_shared(page_id, validate_persisted_column_block_index_page)
             .await?;
         ValidatedColumnBlockNode::try_from_guard(g, self.file_kind(), page_id)
     }
@@ -1173,7 +1173,7 @@ mod tests {
         page_id: PageID,
     ) -> Result<Box<ColumnBlockNode>> {
         let page = disk_pool
-            .try_get_validated_page_shared(page_id, validate_persisted_column_block_index_page)
+            .get_validated_page_shared(page_id, validate_persisted_column_block_index_page)
             .await?;
         copy_persisted_node(page.page(), PersistedFileKind::TableFile, page_id)
     }

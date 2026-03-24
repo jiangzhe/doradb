@@ -77,7 +77,7 @@ impl Tables<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Option<TableObject> {
+    ) -> crate::error::Result<Option<TableObject>> {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
         self.table
             .accessor()
@@ -172,6 +172,7 @@ mod tests {
                     .tables()
                     .find_uncommitted_by_id(session.pool_guards(), table100.table_id)
                     .await
+                    .unwrap()
                     .is_none()
             );
             assert!(
@@ -181,6 +182,7 @@ mod tests {
                     .tables()
                     .find_uncommitted_by_id(session.pool_guards(), table101.table_id)
                     .await
+                    .unwrap()
                     .is_some()
             );
 

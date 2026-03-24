@@ -162,7 +162,7 @@ impl Session {
             .await;
         if !inserted {
             uninit_table_file.try_delete();
-            stmt.fail().await.rollback().await;
+            stmt.fail().await?.rollback().await?;
             return Err(Error::TableAlreadyExists);
         }
 

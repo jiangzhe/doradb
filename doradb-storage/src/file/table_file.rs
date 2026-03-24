@@ -588,7 +588,7 @@ mod tests {
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
         let disk_pool = table_readonly_pool(&global, 0, table_file);
         let page = disk_pool
-            .try_get_validated_page_shared(page_id, accept_any_page)
+            .get_validated_page_shared(page_id, accept_any_page)
             .await?;
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(page.page());
@@ -664,7 +664,7 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, 145, &table_file);
             let out_of_range_page_id = 1_000_000;
             let res = disk_pool
-                .try_get_validated_page_shared(out_of_range_page_id, accept_any_page)
+                .get_validated_page_shared(out_of_range_page_id, accept_any_page)
                 .await;
             assert!(res.is_err());
 

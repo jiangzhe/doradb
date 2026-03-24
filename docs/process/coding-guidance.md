@@ -18,6 +18,7 @@ We rely on tooling to enforce style.
 
 *   **Formatting**: `cargo fmt` is the authority.
 *   **Linting**: `cargo clippy --all-features --all-targets -- -D warnings` must pass.
+*   **Imports & Type Names**: Prefer `use` imports plus short type names to keep code concise and readable. Use fully qualified type names only when they are actually needed, such as resolving name conflicts or clarifying ambiguous paths.
 *   **Public API Documentation**: Every public `struct`, `trait`, `enum`, `const`, and `method/function` **MUST** have a descriptive `///` doc comment.
 *   **Doc Placement**: Documentation comments (`///` or `//!`) must always be placed **above** any attributes (e.g., `#[derive(...)]`, `#[must_use]`).
 

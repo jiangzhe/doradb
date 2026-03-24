@@ -1,6 +1,7 @@
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
+use crate::error::{Result, StoragePoisonSource};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
@@ -26,6 +27,17 @@ fn promote_delete_marker_if_needed(table: &TableHandle, undo: &OwnedRowUndo) {
         && let Some(deletion_buffer) = table.deletion_buffer()
     {
         deletion_buffer.promote_delete_marker_if_committed(undo.row_id);
+    }
+}
+
+#[inline]
+fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Result<()>) -> bool {
+    match res {
+        Ok(()) => true,
+        Err(_) => {
+            trx_sys.poison_storage(StoragePoisonSource::PurgeDeallocate);
+            false
+        }
     }
 }
 
@@ -148,8 +160,9 @@ impl TransactionSystem {
                     };
                     let page_guard = if let Some(page_id) = undo.page_id {
                         table
-                            .try_get_row_page_versioned_shared(guards, page_id)
+                            .get_row_page_versioned_shared(guards, page_id)
                             .await
+                            .expect("purge should not ignore row-page access failures")
                     } else {
                         None
                     };
@@ -213,16 +226,17 @@ impl TransactionSystem {
         mem_pool: &EvictableBufferPool,
         guards: &PoolGuards,
         gc_row_pages: HashSet<PageID>,
-    ) {
+    ) -> Result<()> {
         for page_id in gc_row_pages {
             let page_guard = mem_pool
                 .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Exclusive)
-                .await
+                .await?
                 .lock_exclusive_async()
                 .await
                 .unwrap();
             mem_pool.deallocate_page(page_guard);
         }
+        Ok(())
     }
 }
 
@@ -482,9 +496,14 @@ impl PurgeLoop for PurgeSingleThreaded {
                                 .await;
                             gc_row_pages.extend(partition_gc_pages);
                         }
-                        trx_sys
-                            .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
-                            .await;
+                        if !handle_gc_row_page_deallocation_result(
+                            trx_sys,
+                            trx_sys
+                                .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
+                                .await,
+                        ) {
+                            return;
+                        }
                     }
                     // Once GC is finished, update global_visible_sts so other threads can use it to
                     // speed up visibility check.
@@ -555,9 +574,14 @@ impl PurgeLoop for PurgeDispatcher {
                             let mut g = gc_row_pages.lock();
                             g.drain(..).collect::<HashSet<PageID>>()
                         };
-                        trx_sys
-                            .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
-                            .await;
+                        if !handle_gc_row_page_deallocation_result(
+                            trx_sys,
+                            trx_sys
+                                .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
+                                .await,
+                        ) {
+                            return;
+                        }
 
                         // Once GC is finished, update global_visible_sts so other threads can use it to
                         // speed up visibility check.
@@ -617,6 +641,7 @@ mod tests {
     use crate::buffer::{BufferPool, EvictableBufferPoolConfig, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::engine::EngineConfig;
+    use crate::error::{Error, StoragePoisonSource};
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
@@ -669,6 +694,54 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_gc_row_page_deallocation_result_poisons_runtime() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .purge_threads(1)
+                        .log_file_stem("redo_purge_poison")
+                        .skip_recovery(true),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            assert!(handle_gc_row_page_deallocation_result(
+                &engine.trx_sys,
+                Ok(())
+            ));
+            assert!(engine.trx_sys.storage_poison_error().is_none());
+
+            assert!(!handle_gc_row_page_deallocation_result(
+                &engine.trx_sys,
+                Err(Error::IOError)
+            ));
+            assert!(matches!(
+                engine.trx_sys.storage_poison_error(),
+                Some(Error::StorageEnginePoisoned(
+                    StoragePoisonSource::PurgeDeallocate
+                ))
+            ));
+            assert!(matches!(
+                engine.trx_sys.ensure_runtime_healthy(),
+                Err(Error::StorageEnginePoisoned(
+                    StoragePoisonSource::PurgeDeallocate
+                ))
+            ));
+        });
+    }
+
+    #[test]
     fn test_purge_promote_delete_marker_if_committed_for_delete_without_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -704,12 +777,15 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1001i32)];
-            let (row_id, _) = table.sec_idx()[0]
+            let Some((row_id, _)) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("row should exist");
+            };
             let status = Arc::new(SharedTrxStatus::global_visible());
             table
                 .deletion_buffer()
@@ -791,12 +867,15 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1002i32)];
-            let (row_id, _) = table.sec_idx()[0]
+            let Some((row_id, _)) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("row should exist");
+            };
             let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
             table
                 .deletion_buffer()
@@ -882,12 +961,15 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1003i32)];
-            let (row_id, _) = table.sec_idx()[0]
+            let Some((row_id, _)) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("row should exist");
+            };
             let page_id = match table.find_row(&pool_guards, row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcPage(..) | RowLocation::NotFound => unreachable!(),
@@ -899,7 +981,8 @@ mod tests {
                     page_id,
                     LatchFallbackMode::Shared,
                 )
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let stale_page_id = VersionedPageID {
                 page_id,
                 generation: page_guard.bf().generation().saturating_add(1),
@@ -986,12 +1069,15 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1004i32)];
-            let (row_id, _) = table.sec_idx()[0]
+            let Some((row_id, _)) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("row should exist");
+            };
             let page_id = match table.find_row(&pool_guards, row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcPage(..) | RowLocation::NotFound => unreachable!(),
@@ -1003,7 +1089,8 @@ mod tests {
                     page_id,
                     LatchFallbackMode::Shared,
                 )
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let stale_page_id = VersionedPageID {
                 page_id,
                 generation: page_guard.bf().generation().saturating_add(1),
@@ -1232,7 +1319,8 @@ mod tests {
                 let mut remained_row_ids = vec![];
                 index
                     .scan_values(pool_guards.index_guard(), &mut remained_row_ids, 100)
-                    .await;
+                    .await
+                    .unwrap();
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
                 let location = table.find_row(&pool_guards, row_id).await;
@@ -1245,6 +1333,7 @@ mod tests {
                     .mem_pool
                     .get_page(&mem_guard, page_id, LatchFallbackMode::Shared)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .lock_shared_async()
                     .await
                     .unwrap();
