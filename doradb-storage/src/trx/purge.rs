@@ -1,6 +1,7 @@
 use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
+use crate::error::Result;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
@@ -213,16 +214,17 @@ impl TransactionSystem {
         mem_pool: &EvictableBufferPool,
         guards: &PoolGuards,
         gc_row_pages: HashSet<PageID>,
-    ) {
+    ) -> Result<()> {
         for page_id in gc_row_pages {
             let page_guard = mem_pool
                 .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Exclusive)
-                .await
+                .await?
                 .lock_exclusive_async()
                 .await
                 .unwrap();
             mem_pool.deallocate_page(page_guard);
         }
+        Ok(())
     }
 }
 
@@ -484,7 +486,10 @@ impl PurgeLoop for PurgeSingleThreaded {
                         }
                         trx_sys
                             .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
-                            .await;
+                            .await
+                            .expect(
+                                "purge row-page deallocation should not ignore buffer-pool errors",
+                            );
                     }
                     // Once GC is finished, update global_visible_sts so other threads can use it to
                     // speed up visibility check.
@@ -557,7 +562,10 @@ impl PurgeLoop for PurgeDispatcher {
                         };
                         trx_sys
                             .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
-                            .await;
+                            .await
+                            .expect(
+                                "purge row-page deallocation should not ignore buffer-pool errors",
+                            );
 
                         // Once GC is finished, update global_visible_sts so other threads can use it to
                         // speed up visibility check.
@@ -899,7 +907,8 @@ mod tests {
                     page_id,
                     LatchFallbackMode::Shared,
                 )
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let stale_page_id = VersionedPageID {
                 page_id,
                 generation: page_guard.bf().generation().saturating_add(1),
@@ -1003,7 +1012,8 @@ mod tests {
                     page_id,
                     LatchFallbackMode::Shared,
                 )
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let stale_page_id = VersionedPageID {
                 page_id,
                 generation: page_guard.bf().generation().saturating_add(1),
@@ -1245,6 +1255,7 @@ mod tests {
                     .mem_pool
                     .get_page(&mem_guard, page_id, LatchFallbackMode::Shared)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .lock_shared_async()
                     .await
                     .unwrap();

@@ -118,6 +118,7 @@ impl<P: BufferPool> GenericBTree<P> {
         self.pool
             .get_page::<BTreeNode>(pool_guard, page_id, mode)
             .await
+            .expect("btree node read should not ignore buffer-pool errors")
     }
 
     /// Destroy the tree.
@@ -450,7 +451,8 @@ impl<P: BufferPool> GenericBTree<P> {
             let g = self
                 .pool
                 .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
-                .await;
+                .await
+                .expect("btree root read should not ignore buffer-pool errors");
             let (height, count) =
                 verify_continue!(g.with_page_ref_validated(|page| (page.height(), page.count())));
             if height == 0 || count > 0 {
@@ -469,6 +471,7 @@ impl<P: BufferPool> GenericBTree<P> {
                 .pool
                 .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
+                .expect("btree child read should not ignore buffer-pool errors")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -675,6 +678,7 @@ impl<P: BufferPool> GenericBTree<P> {
                                 LatchFallbackMode::Exclusive,
                             )
                             .await
+                            .expect("btree split should not ignore buffer-pool errors")
                             .lock_exclusive_async()
                             .await
                             .unwrap();
@@ -970,7 +974,8 @@ impl<P: BufferPool> GenericBTree<P> {
         let mut p_guard = self
             .pool
             .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
-            .await;
+            .await
+            .expect("btree leaf search should not ignore buffer-pool errors");
         // check root page separately.
         let height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
         if height == 0 {
@@ -992,7 +997,8 @@ impl<P: BufferPool> GenericBTree<P> {
                         let c_guard = self
                             .pool
                             .get_child_page(pool_guard, &p_guard, page_id, S::MODE)
-                            .await;
+                            .await
+                            .expect("btree child search should not ignore buffer-pool errors");
                         let c_guard = verify!(c_guard);
                         let c_guard = S::verify_lock_async::<false>(c_guard).await;
                         let c_guard = verify!(c_guard);
@@ -1002,7 +1008,8 @@ impl<P: BufferPool> GenericBTree<P> {
                     let c_guard = self
                         .pool
                         .get_child_page(pool_guard, &p_guard, page_id, LatchFallbackMode::Spin)
-                        .await;
+                        .await
+                        .expect("btree child search should not ignore buffer-pool errors");
                     let c_guard = verify!(c_guard);
                     p_guard = c_guard;
                 }
@@ -1022,7 +1029,8 @@ impl<P: BufferPool> GenericBTree<P> {
         let mut p_guard = self
             .pool
             .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
-            .await;
+            .await
+            .expect("btree leaf search should not ignore buffer-pool errors");
         // check root page separately.
         let height = verify!(p_guard.with_page_ref_validated(|page| page.height()));
         if height == 0 {
@@ -1044,7 +1052,8 @@ impl<P: BufferPool> GenericBTree<P> {
                         let c_guard = self
                             .pool
                             .get_child_page(pool_guard, &p_guard, page_id, S::MODE)
-                            .await;
+                            .await
+                            .expect("btree child search should not ignore buffer-pool errors");
                         let c_guard = verify!(c_guard);
                         let c_guard = S::verify_lock_async::<false>(c_guard).await;
                         let c_guard = verify!(c_guard);
@@ -1054,7 +1063,8 @@ impl<P: BufferPool> GenericBTree<P> {
                     let c_guard = self
                         .pool
                         .get_child_page(pool_guard, &p_guard, page_id, LatchFallbackMode::Spin)
-                        .await;
+                        .await
+                        .expect("btree child search should not ignore buffer-pool errors");
                     let c_guard = verify!(c_guard);
                     p_guard = c_guard;
                 }
@@ -1091,7 +1101,8 @@ impl<P: BufferPool> GenericBTree<P> {
         let mut g = self
             .pool
             .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
-            .await;
+            .await
+            .expect("btree branch search should not ignore buffer-pool errors");
         let mut height = verify!(g.with_page_ref_validated(|page| page.height()));
         if height == 0 {
             // single-node tree
@@ -1117,7 +1128,8 @@ impl<P: BufferPool> GenericBTree<P> {
                     let c_guard = self
                         .pool
                         .get_child_page(pool_guard, &g, c_page_id, LatchFallbackMode::Spin)
-                        .await;
+                        .await
+                        .expect("btree branch search should not ignore buffer-pool errors");
                     g = verify!(c_guard);
                 }
                 LookupChild::NotFound => {
@@ -1139,6 +1151,7 @@ impl<P: BufferPool> GenericBTree<P> {
                 .pool
                 .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
+                .expect("btree node deallocation should not ignore buffer-pool errors")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -1151,6 +1164,7 @@ impl<P: BufferPool> GenericBTree<P> {
                 .pool
                 .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
+                .expect("btree node deallocation should not ignore buffer-pool errors")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -1196,7 +1210,8 @@ where
             let g = tree
                 .pool
                 .get_page::<BTreeNode>(pool_guard, tree.root, LatchFallbackMode::Spin)
-                .await;
+                .await
+                .expect("btree coupling should not ignore buffer-pool errors");
             let res = self
                 .try_seek_and_lock(tree, pool_guard, height, key, g)
                 .await;
@@ -1246,7 +1261,8 @@ where
                 let c_guard = tree
                     .pool
                     .get_page::<BTreeNode>(pool_guard, c_page_id, S::MODE)
-                    .await;
+                    .await
+                    .expect("btree coupling should not ignore buffer-pool errors");
                 let res = S::verify_lock_async::<false>(c_guard).await;
                 let c_guard = verify!(res);
                 self.parent = Some(ParentPosition { g: p_guard, idx });
@@ -1270,7 +1286,8 @@ where
                     c_page_id,
                     LatchFallbackMode::Spin,
                 )
-                .await;
+                .await
+                .expect("btree coupling should not ignore buffer-pool errors");
             p_guard = verify!(c_guard);
         }
     }
@@ -1431,6 +1448,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
                             LatchFallbackMode::Shared,
                         )
                         .await
+                        .expect("btree scan should not ignore buffer-pool errors")
                         .lock_shared_async()
                         .await
                         .unwrap();
@@ -1763,6 +1781,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                 .pool
                 .get_page(self.pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
+                .expect("btree cursor should not ignore buffer-pool errors")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -1788,6 +1807,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                 .pool
                 .get_page(self.pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
+                .expect("btree cursor should not ignore buffer-pool errors")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -1813,6 +1833,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                 .pool
                 .get_page(self.pool_guard, c_page_id, LatchFallbackMode::Exclusive)
                 .await
+                .expect("btree cursor should not ignore buffer-pool errors")
                 .lock_exclusive_async()
                 .await
                 .unwrap();

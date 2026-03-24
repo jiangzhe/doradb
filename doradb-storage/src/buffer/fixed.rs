@@ -151,33 +151,23 @@ impl BufferPool for FixedBufferPool {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> FacadePageGuard<T> {
+    ) -> Result<FacadePageGuard<T>> {
         debug_assert!(
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
         );
-        self.get_page_internal(guard, page_id, mode).await
+        Ok(self.get_page_internal(guard, page_id, mode).await)
     }
 
     #[inline]
-    async fn try_get_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> Result<FacadePageGuard<T>> {
-        Ok(self.get_page(guard, page_id, mode).await)
-    }
-
-    #[inline]
-    async fn try_get_page_versioned<T: BufferPage>(
+    async fn get_page_versioned<T: BufferPage>(
         &self,
         guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
-    ) -> Option<FacadePageGuard<T>> {
+    ) -> Result<Option<FacadePageGuard<T>>> {
         if !self.alloc_map.is_allocated(id.page_id as usize) {
-            return None;
+            return Ok(None);
         }
         let g = self.get_page_internal(guard, id.page_id, mode).await;
         let bf = g.bf();
@@ -185,19 +175,9 @@ impl BufferPool for FixedBufferPool {
             if g.is_exclusive() {
                 g.rollback_exclusive_version_change();
             }
-            return None;
+            return Ok(None);
         }
-        Some(g)
-    }
-
-    #[inline]
-    async fn try_get_page_versioned_result<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
-    ) -> Result<Option<FacadePageGuard<T>>> {
-        Ok(self.try_get_page_versioned(guard, id, mode).await)
+        Ok(Some(g))
     }
 
     /// Deallocate page.
@@ -223,7 +203,7 @@ impl BufferPool for FixedBufferPool {
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Validation<FacadePageGuard<T>> {
+    ) -> Result<Validation<FacadePageGuard<T>>> {
         debug_assert!(
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
@@ -233,23 +213,12 @@ impl BufferPool for FixedBufferPool {
         // the validation make sure parent page does not change until child
         // page is acquired.
         if p_guard.validate_bool() {
-            return Valid(g);
+            return Ok(Valid(g));
         }
         if g.is_exclusive() {
             g.rollback_exclusive_version_change();
         }
-        Validation::Invalid
-    }
-
-    #[inline]
-    async fn try_get_child_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<T>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> Result<Validation<FacadePageGuard<T>>> {
-        Ok(self.get_child_page(guard, p_guard, page_id, mode).await)
+        Ok(Validation::Invalid)
     }
 }
 
@@ -291,6 +260,7 @@ mod tests {
                 let g = pool
                     .get_page::<BlockNode>(&pool_guard, 0, LatchFallbackMode::Spin)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .downgrade();
                 assert_eq!(g.page_id(), 0);
             }
@@ -329,21 +299,23 @@ mod tests {
                 drop(g);
 
                 let g = pool
-                    .try_get_page_versioned::<BlockNode>(
+                    .get_page_versioned::<BlockNode>(
                         &pool_guard,
                         current_versioned,
                         LatchFallbackMode::Shared,
                     )
-                    .await;
+                    .await
+                    .unwrap();
                 assert!(g.is_some());
 
                 let g = pool
-                    .try_get_page_versioned::<BlockNode>(
+                    .get_page_versioned::<BlockNode>(
                         &pool_guard,
                         stale_versioned,
                         LatchFallbackMode::Shared,
                     )
-                    .await;
+                    .await
+                    .unwrap();
                 assert!(g.is_none());
             }
             {
@@ -354,16 +326,18 @@ mod tests {
 
                 // Keep an optimistic guard, then reuse the page slot.
                 let stale_guard = pool
-                    .try_get_page_versioned::<BlockNode>(
+                    .get_page_versioned::<BlockNode>(
                         &pool_guard,
                         versioned,
                         LatchFallbackMode::Shared,
                     )
                     .await
+                    .unwrap()
                     .unwrap();
                 let g = pool
                     .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
                     .await
+                    .expect("buffer-pool read failed in test")
                     .lock_exclusive_async()
                     .await
                     .unwrap();
@@ -388,7 +362,8 @@ mod tests {
 
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let g = g.lock_shared_async().await;
             assert!(g.is_some());
             let g = g.unwrap();
@@ -403,12 +378,14 @@ mod tests {
 
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             assert!(g.try_into_shared().is_none());
 
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -416,17 +393,15 @@ mod tests {
             drop(g);
 
             let stale_guard = pool
-                .try_get_page_versioned::<BlockNode>(
-                    &pool_guard,
-                    versioned,
-                    LatchFallbackMode::Shared,
-                )
+                .get_page_versioned::<BlockNode>(&pool_guard, versioned, LatchFallbackMode::Shared)
                 .await
+                .unwrap()
                 .unwrap();
 
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -450,7 +425,8 @@ mod tests {
 
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             let g = g.lock_exclusive_async().await;
             assert!(g.is_some());
             let g = g.unwrap();
@@ -469,12 +445,14 @@ mod tests {
 
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await;
+                .await
+                .expect("buffer-pool read failed in test");
             assert!(g.try_into_exclusive().is_none());
 
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -482,17 +460,15 @@ mod tests {
             drop(g);
 
             let stale_guard = pool
-                .try_get_page_versioned::<BlockNode>(
-                    &pool_guard,
-                    versioned,
-                    LatchFallbackMode::Shared,
-                )
+                .get_page_versioned::<BlockNode>(&pool_guard, versioned, LatchFallbackMode::Shared)
                 .await
+                .unwrap()
                 .unwrap();
 
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -518,6 +494,7 @@ mod tests {
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_shared_async()
                 .await
                 .unwrap();
@@ -540,6 +517,7 @@ mod tests {
             let g = pool
                 .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_exclusive_async()
                 .await
                 .unwrap();

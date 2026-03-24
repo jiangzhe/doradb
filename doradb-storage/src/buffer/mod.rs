@@ -27,14 +27,14 @@ pub use readonly::{GlobalReadonlyBufferPool, PersistedBlockKey, ReadonlyBufferPo
 /// Physical file identity used by persisted-block mappings and cache invalidation.
 pub type PersistedFileID = u64;
 
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, PageID, VersionedPageID};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
+use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
 use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
     MetaPoolConfig, ShelfScope,
 };
-use crate::error::Result;
 use crate::error::Validation;
+use crate::error::{PersistedFileKind, Result};
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
@@ -46,6 +46,9 @@ use std::future::Future;
 /// waiters. Evictable pools use the same cell for read reloads and for readers
 /// waiting behind writeback of the same page.
 pub(crate) type PageIOCompletion = Completion<Result<PageID>>;
+
+/// Validation callback for one persisted readonly-cache page image.
+pub(crate) type ReadonlyPageValidator = fn(&[u8], PersistedFileKind, PageID) -> Result<()>;
 
 /// Abstraction of buffer pool.
 pub trait BufferPool: Send + Sync {
@@ -80,27 +83,11 @@ pub trait BufferPool: Send + Sync {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = FacadePageGuard<T>> + Send;
-
-    /// Get page and surface any underlying storage-I/O failure.
-    fn try_get_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
     ) -> impl Future<Output = Result<FacadePageGuard<T>>> + Send;
 
     /// Get page by versioned page identity.
     /// Returns None if page is unavailable or version mismatches.
-    fn try_get_page_versioned<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Option<FacadePageGuard<T>>> + Send;
-
-    /// Get page by versioned page identity and surface any underlying storage-I/O failure.
-    fn try_get_page_versioned_result<T: BufferPage>(
+    fn get_page_versioned<T: BufferPage>(
         &self,
         guard: &PoolGuard,
         id: VersionedPageID,
@@ -120,16 +107,17 @@ pub trait BufferPool: Send + Sync {
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send;
-
-    /// Get child page and surface any underlying storage-I/O failure.
-    fn try_get_child_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<T>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
     ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send;
+}
+
+/// Readonly buffer-pool extension for validated persisted-page shared reads.
+pub(crate) trait ReadonlyBufferPoolExt: Send + Sync {
+    /// Returns a shared guard for one persisted page after validating its page-kind contract.
+    fn get_validated_page_shared(
+        &self,
+        page_id: PageID,
+        validator: ReadonlyPageValidator,
+    ) -> impl Future<Output = Result<PageSharedGuard<Page>>> + Send;
 }
 
 impl<T: BufferPool> BufferPool for QuiescentGuard<T> {
@@ -171,38 +159,18 @@ impl<T: BufferPool> BufferPool for QuiescentGuard<T> {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = FacadePageGuard<U>> + Send {
+    ) -> impl Future<Output = Result<FacadePageGuard<U>>> + Send {
         T::get_page(&**self, guard, page_id, mode)
     }
 
     #[inline]
-    fn try_get_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<FacadePageGuard<U>>> + Send {
-        T::try_get_page(&**self, guard, page_id, mode)
-    }
-
-    #[inline]
-    fn try_get_page_versioned<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Option<FacadePageGuard<U>>> + Send {
-        T::try_get_page_versioned(&**self, guard, id, mode)
-    }
-
-    #[inline]
-    fn try_get_page_versioned_result<U: BufferPage>(
+    fn get_page_versioned<U: BufferPage>(
         &self,
         guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
     ) -> impl Future<Output = Result<Option<FacadePageGuard<U>>>> + Send {
-        T::try_get_page_versioned_result(&**self, guard, id, mode)
+        T::get_page_versioned(&**self, guard, id, mode)
     }
 
     #[inline]
@@ -217,19 +185,19 @@ impl<T: BufferPool> BufferPool for QuiescentGuard<T> {
         p_guard: &FacadePageGuard<U>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = Validation<FacadePageGuard<U>>> + Send {
+    ) -> impl Future<Output = Result<Validation<FacadePageGuard<U>>>> + Send {
         T::get_child_page(&**self, guard, p_guard, page_id, mode)
     }
+}
 
+impl<T: ReadonlyBufferPoolExt> ReadonlyBufferPoolExt for QuiescentGuard<T> {
     #[inline]
-    fn try_get_child_page<U: BufferPage>(
+    fn get_validated_page_shared(
         &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<U>,
         page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<Validation<FacadePageGuard<U>>>> + Send {
-        T::try_get_child_page(&**self, guard, p_guard, page_id, mode)
+        validator: ReadonlyPageValidator,
+    ) -> impl Future<Output = Result<PageSharedGuard<Page>>> + Send {
+        T::get_validated_page_shared(&**self, page_id, validator)
     }
 }
 

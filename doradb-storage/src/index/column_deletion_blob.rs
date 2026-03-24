@@ -1,6 +1,6 @@
-use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
+use crate::buffer::{ReadonlyBufferPool, ReadonlyBufferPoolExt};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
@@ -263,7 +263,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         while remaining > 0 {
             let g = self
                 .disk_pool
-                .try_get_validated_page_shared(page_id, validate_persisted_blob_page)
+                .get_validated_page_shared(page_id, validate_persisted_blob_page)
                 .await?;
             let payload = validated_blob_page_payload(g.page());
             let header = decode_blob_page_header(payload).map_err(|err| match err {

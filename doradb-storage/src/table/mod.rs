@@ -220,6 +220,7 @@ impl<P: BufferPool> GenericMemTable<P> {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("table row-page shared read should not ignore buffer-pool errors")
             .lock_shared_async()
             .await
     }
@@ -232,7 +233,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     ) -> Result<Option<PageSharedGuard<RowPage>>> {
         Ok(self
             .mem_pool()
-            .try_get_page::<RowPage>(
+            .get_page::<RowPage>(
                 self.row_pool_guard(guards),
                 page_id,
                 LatchFallbackMode::Shared,
@@ -249,12 +250,13 @@ impl<P: BufferPool> GenericMemTable<P> {
         page_id: VersionedPageID,
     ) -> Option<PageSharedGuard<RowPage>> {
         self.mem_pool()
-            .try_get_page_versioned::<RowPage>(
+            .get_page_versioned::<RowPage>(
                 self.row_pool_guard(guards),
                 page_id,
                 LatchFallbackMode::Shared,
             )
-            .await?
+            .await
+            .expect("table versioned shared row-page read should not ignore buffer-pool errors")?
             .lock_shared_async()
             .await
     }
@@ -267,7 +269,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     ) -> Result<Option<PageSharedGuard<RowPage>>> {
         let guard = self
             .mem_pool()
-            .try_get_page_versioned_result::<RowPage>(
+            .get_page_versioned::<RowPage>(
                 self.row_pool_guard(guards),
                 page_id,
                 LatchFallbackMode::Shared,
@@ -292,6 +294,7 @@ impl<P: BufferPool> GenericMemTable<P> {
                 LatchFallbackMode::Exclusive,
             )
             .await
+            .expect("table row-page exclusive read should not ignore buffer-pool errors")
             .lock_exclusive_async()
             .await
     }
@@ -304,7 +307,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     ) -> Result<Option<PageExclusiveGuard<RowPage>>> {
         Ok(self
             .mem_pool()
-            .try_get_page::<RowPage>(
+            .get_page::<RowPage>(
                 self.row_pool_guard(guards),
                 page_id,
                 LatchFallbackMode::Exclusive,

@@ -332,7 +332,7 @@ impl<M> CowFile<M> {
         let super_page_guard: crate::buffer::guard::PageSharedGuard<crate::buffer::page::Page> = loop {
             let guard = disk_pool
                 .get_page::<crate::buffer::page::Page>(&pool_guard, 0, LatchFallbackMode::Shared)
-                .await;
+                .await?;
             if let Some(shared) = guard.lock_shared_async().await {
                 break shared;
             }
@@ -349,7 +349,7 @@ impl<M> CowFile<M> {
                     super_page.body.meta_page_id,
                     LatchFallbackMode::Shared,
                 )
-                .await;
+                .await?;
             if let Some(shared) = guard.lock_shared_async().await {
                 break shared;
             }

@@ -557,7 +557,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
             g.pop().unwrap()
         };
         let page_guard = mem_pool
-            .try_get_page::<RowPage>(mem_pool_guard, page_id, LatchFallbackMode::Shared)
+            .get_page::<RowPage>(mem_pool_guard, page_id, LatchFallbackMode::Shared)
             .await?
             .lock_shared_async()
             .await;
@@ -580,6 +580,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         let page_guard = mem_pool
             .get_page::<RowPage>(mem_pool_guard, page_id, LatchFallbackMode::Exclusive)
             .await
+            .expect("row-block-index free-list exclusive read should not ignore buffer-pool errors")
             .lock_exclusive_async()
             .await
             .unwrap();
@@ -812,7 +813,8 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         let mut p_guard = self
             .pool
             .get_page::<BlockNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
-            .await;
+            .await
+            .expect("row-block-index traversal should not ignore buffer-pool errors");
         loop {
             let step = verify!(p_guard.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -830,6 +832,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
                 self.pool
                     .get_child_page::<BlockNode>(pool_guard, &p_guard, page_id, mode)
                     .await
+                    .expect("row-block-index traversal should not ignore buffer-pool errors")
             } else {
                 self.pool
                     .get_child_page::<BlockNode>(
@@ -839,6 +842,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
                         LatchFallbackMode::Spin,
                     )
                     .await
+                    .expect("row-block-index traversal should not ignore buffer-pool errors")
             };
             stack.push(p_guard.downgrade());
             p_guard = verify!(c_guard);
@@ -855,7 +859,8 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         let mut g = self
             .pool
             .get_page::<BlockNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
-            .await;
+            .await
+            .expect("row-block-index lookup should not ignore buffer-pool errors");
         loop {
             let step = verify!(g.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -910,6 +915,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
                         self.pool
                             .get_child_page(pool_guard, &g, page_id, LatchFallbackMode::Spin)
                             .await
+                            .expect("row-block-index lookup should not ignore buffer-pool errors")
                     );
                 }
             }
@@ -986,6 +992,7 @@ impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
                 .pool
                 .get_page::<BlockNode>(self.pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
+                .expect("row-block-index cursor should not ignore buffer-pool errors")
                 .lock_shared_async()
                 .await
                 .unwrap();
@@ -1016,7 +1023,8 @@ impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
                 self.blk_idx.root_page_id,
                 LatchFallbackMode::Shared,
             )
-            .await;
+            .await
+            .expect("row-block-index cursor should not ignore buffer-pool errors");
         'SEARCH: loop {
             let step = verify!(g.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -1062,7 +1070,8 @@ impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
                 .blk_idx
                 .pool
                 .get_child_page::<BlockNode>(self.pool_guard, &g, page_id, LatchFallbackMode::Spin)
-                .await;
+                .await
+                .expect("row-block-index cursor should not ignore buffer-pool errors");
             let c = verify!(c);
             let Some(parent_g) = g.lock_shared_async().await else {
                 return Invalid;
@@ -1153,17 +1162,7 @@ mod tests {
         }
 
         #[inline]
-        fn get_page<T: BufferPage>(
-            &self,
-            guard: &PoolGuard,
-            page_id: PageID,
-            mode: LatchFallbackMode,
-        ) -> impl Future<Output = FacadePageGuard<T>> + Send {
-            self.inner.get_page(guard, page_id, mode)
-        }
-
-        #[inline]
-        async fn try_get_page<T: BufferPage>(
+        async fn get_page<T: BufferPage>(
             &self,
             guard: &PoolGuard,
             page_id: PageID,
@@ -1172,27 +1171,17 @@ mod tests {
             if page_id == self.fail_page_id.load(Ordering::Acquire) {
                 return Err(Error::IOError);
             }
-            self.inner.try_get_page(guard, page_id, mode).await
+            self.inner.get_page(guard, page_id, mode).await
         }
 
         #[inline]
-        fn try_get_page_versioned<T: BufferPage>(
-            &self,
-            guard: &PoolGuard,
-            id: VersionedPageID,
-            mode: LatchFallbackMode,
-        ) -> impl Future<Output = Option<FacadePageGuard<T>>> + Send {
-            self.inner.try_get_page_versioned(guard, id, mode)
-        }
-
-        #[inline]
-        fn try_get_page_versioned_result<T: BufferPage>(
+        fn get_page_versioned<T: BufferPage>(
             &self,
             guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
         ) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send {
-            self.inner.try_get_page_versioned_result(guard, id, mode)
+            self.inner.get_page_versioned(guard, id, mode)
         }
 
         #[inline]
@@ -1207,19 +1196,8 @@ mod tests {
             p_guard: &FacadePageGuard<T>,
             page_id: PageID,
             mode: LatchFallbackMode,
-        ) -> impl Future<Output = Validation<FacadePageGuard<T>>> + Send {
-            self.inner.get_child_page(guard, p_guard, page_id, mode)
-        }
-
-        #[inline]
-        fn try_get_child_page<T: BufferPage>(
-            &self,
-            guard: &PoolGuard,
-            p_guard: &FacadePageGuard<T>,
-            page_id: PageID,
-            mode: LatchFallbackMode,
         ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send {
-            self.inner.try_get_child_page(guard, p_guard, page_id, mode)
+            self.inner.get_child_page(guard, p_guard, page_id, mode)
         }
     }
 
@@ -1528,6 +1506,7 @@ mod tests {
                     LatchFallbackMode::Exclusive,
                 )
                 .await
+                .expect("buffer-pool read failed in test")
                 .lock_exclusive_async()
                 .await
                 .unwrap();

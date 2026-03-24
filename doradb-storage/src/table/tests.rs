@@ -746,6 +746,7 @@ fn test_row_page_transition_retries_update_delete() {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("buffer-pool read failed in test")
             .lock_shared_async()
             .await
             .unwrap();
@@ -763,6 +764,7 @@ fn test_row_page_transition_retries_update_delete() {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("buffer-pool read failed in test")
             .lock_shared_async()
             .await
             .unwrap();
@@ -803,6 +805,7 @@ fn test_row_page_transition_retries_update_delete() {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("buffer-pool read failed in test")
             .lock_shared_async()
             .await
             .unwrap();
@@ -1478,6 +1481,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                 LatchFallbackMode::Shared,
             )
             .await
+            .expect("buffer-pool read failed in test")
             .lock_shared_async()
             .await
             .unwrap();
