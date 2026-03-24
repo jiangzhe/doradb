@@ -321,6 +321,17 @@ impl ActiveTrx {
             },
         )
     }
+
+    #[inline]
+    pub(crate) fn discard_after_fatal_rollback(&mut self) {
+        self.redo.clear();
+        self.row_undo = RowUndoLogs::empty();
+        self.index_undo = IndexUndoLogs::empty();
+        self.gc_row_pages.clear();
+        if let Some(session) = self.session.take() {
+            session.rollback();
+        }
+    }
 }
 
 impl Drop for ActiveTrx {
@@ -421,6 +432,15 @@ impl PreparedTrx {
                 .as_ref()
                 .map(|p| p.row_undo.is_empty() && p.gc_row_pages.is_empty())
                 .unwrap_or(true)
+    }
+
+    #[inline]
+    pub(crate) fn discard_after_fatal_rollback(&mut self) {
+        self.redo_bin.take();
+        self.payload.take();
+        if let Some(session) = self.session.take() {
+            session.rollback();
+        }
     }
 }
 

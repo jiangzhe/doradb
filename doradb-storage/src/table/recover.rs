@@ -83,7 +83,7 @@ impl TableRecover for Table {
         });
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
-        let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await;
+        let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
 
         let res = self.recover_row_insert_to_page(&mut page_guard, row_id, cols, cts);
         assert!(res.is_ok());
@@ -110,7 +110,7 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) -> Result<()> {
-        let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await;
+        let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
 
         if disable_index {
             let res = self.recover_row_update_to_page(&mut page_guard, row_id, update, cts, None);
@@ -130,7 +130,7 @@ impl TableRecover for Table {
 
             if !index_change_cols.is_empty() {
                 // There is index change, we need to update index.
-                let page_guard = self.must_get_row_page_shared(guards, page_id).await;
+                let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
 
                 let metadata = self.metadata();
                 for (index, index_schema) in self.sec_idx().iter().zip(&metadata.index_specs) {
@@ -167,7 +167,7 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) -> Result<()> {
-        let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await;
+        let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
 
         if disable_index {
             let res = self.recover_row_delete_to_page(&mut page_guard, row_id, cts, None);
@@ -205,7 +205,7 @@ impl TableRecover for Table {
         guards: &PoolGuards,
         page_id: PageID,
     ) -> Result<()> {
-        let page_guard = self.must_get_row_page_shared(guards, page_id).await;
+        let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
         let metadata = self.metadata();
         let index_pool_guard = guards.index_guard();
         let (ctx, page) = page_guard.ctx_and_page();

@@ -5,6 +5,7 @@ use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
 use crate::engine::{Engine, EngineConfig};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+    StoragePoisonSource,
 };
 use crate::file::build_test_fs_in;
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -1508,7 +1509,8 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         ctx.row_ver().unwrap().set_frozen();
         sys.table
             .set_frozen_pages_to_transition(session.pool_guards(), &[frozen_page], stmt.trx.sts)
-            .await;
+            .await
+            .unwrap();
 
         let marker = sys.table.deletion_buffer().get(row_id).unwrap();
         match marker {
@@ -1717,8 +1719,9 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
         assert_eq!(cached_row_id, row_id);
         assert!(
             sys.table
-                .try_get_row_page_versioned_shared(session.pool_guards(), cached_page)
+                .get_row_page_versioned_shared(session.pool_guards(), cached_page)
                 .await
+                .unwrap()
                 .is_some()
         );
         session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
@@ -1783,8 +1786,9 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
         for _ in 0..20 {
             if sys
                 .table
-                .try_get_row_page_versioned_shared(session.pool_guards(), cached_page)
+                .get_row_page_versioned_shared(session.pool_guards(), cached_page)
                 .await
+                .unwrap()
                 .is_none()
             {
                 reclaimed = true;
@@ -1855,8 +1859,9 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         for _ in 0..20 {
             if sys
                 .table
-                .try_get_row_page_versioned_shared(session.pool_guards(), stale_page)
+                .get_row_page_versioned_shared(session.pool_guards(), stale_page)
                 .await
+                .unwrap()
                 .is_none()
             {
                 reclaimed = true;
@@ -1996,6 +2001,79 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
             read_hook.call_count() > 0,
             "cached insert page should reload from disk"
         );
+
+        drop(writer);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_mem_size(9u64 * 1024 * 1024).await;
+        let mut session = sys.try_new_session().unwrap();
+
+        let large = "r".repeat(48 * 1024);
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let row_id = match stmt
+            .insert_row(&sys.table, vec![Val::from(1), Val::from(&large[..])])
+            .await
+        {
+            Ok(InsertMvcc::Inserted(row_id)) => row_id,
+            res => panic!("res={res:?}"),
+        };
+        trx = stmt.succeed();
+
+        let (cached_page, cached_row_id) = session
+            .load_active_insert_page(sys.table.table_id())
+            .unwrap();
+        assert_eq!(cached_row_id, row_id);
+
+        let mut writer = sys.try_new_session().unwrap();
+        for i in 2..258 {
+            sys.new_trx_insert(&mut writer, vec![Val::from(i), Val::from(&large[..])])
+                .await;
+            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+                break;
+            }
+        }
+        let mut evicted = false;
+        for _ in 0..20 {
+            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+                evicted = true;
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(50)).await;
+        }
+        assert!(evicted, "rollback row page should be evicted before repro");
+
+        let read_hook = Arc::new(FailingPageReadHook::for_page(
+            sys.table.mem.mem_pool.test_raw_fd(),
+            cached_page.page_id,
+            libc::EIO,
+        ));
+        let _hook = install_libaio_test_hook(read_hook);
+
+        assert!(matches!(
+            trx.rollback().await,
+            Err(Error::StorageEnginePoisoned(
+                StoragePoisonSource::RollbackAccess
+            ))
+        ));
+        assert!(matches!(
+            sys.engine.trx_sys.storage_poison_error(),
+            Some(Error::StorageEnginePoisoned(
+                StoragePoisonSource::RollbackAccess
+            ))
+        ));
+        assert!(matches!(
+            sys.engine.trx_sys.ensure_runtime_healthy(),
+            Err(Error::StorageEnginePoisoned(
+                StoragePoisonSource::RollbackAccess
+            ))
+        ));
 
         drop(writer);
         drop(session);

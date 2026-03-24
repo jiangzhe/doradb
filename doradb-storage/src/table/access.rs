@@ -227,14 +227,12 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                     };
                 }
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = match self
-                        .try_get_row_page_shared_result(stmt.pool_guards(), page_id)
-                        .await
-                    {
-                        Ok(Some(page_guard)) => page_guard,
-                        Ok(None) => continue,
-                        Err(err) => return Err(err),
-                    };
+                    let page_guard =
+                        match self.get_row_page_shared(stmt.pool_guards(), page_id).await {
+                            Ok(Some(page_guard)) => page_guard,
+                            Ok(None) => continue,
+                            Err(err) => return Err(err),
+                        };
                     let page = page_guard.page();
                     if !page.row_id_in_valid_range(row_id) {
                         continue;
@@ -411,7 +409,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self
-                        .try_get_row_page_exclusive_result(guards, page_id)
+                        .get_row_page_exclusive(guards, page_id)
                         .await
                         .expect("delete_unique_no_trx_inner should not ignore page-I/O failures")
                         .expect("failed to lock exclusive row page");
@@ -1124,7 +1122,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         page_id: PageID,
         row_id: RowID,
     ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        let Some(page_guard) = self.try_get_row_page_shared_result(guards, page_id).await? else {
+        let Some(page_guard) = self.get_row_page_shared(guards, page_id).await? else {
             return Ok(None);
         };
         if validate_page_row_range(&page_guard, page_id, row_id) {
@@ -1142,7 +1140,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
     ) -> Result<PageSharedGuard<RowPage>> {
         if let Some((page_id, row_id)) = stmt.load_active_insert_page(self.table_id()) {
             let page_guard = self
-                .try_get_row_page_versioned_shared_result(stmt.pool_guards(), page_id)
+                .get_row_page_versioned_shared(stmt.pool_guards(), page_id)
                 .await?;
             if let Some(page_guard) = page_guard {
                 // because we save last insert page in session and meanwhile other thread may access this page
@@ -2050,7 +2048,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
                 RowLocation::NotFound => return Ok(None),
                 RowLocation::LwcPage(..) => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.must_get_row_page_shared(guards, page_id).await;
+                    let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
                     (page_guard, row_id)
                 }
             },

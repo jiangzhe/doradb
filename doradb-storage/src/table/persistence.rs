@@ -63,10 +63,10 @@ impl Table {
                 self.collect_frozen_pages(pool_guards).await;
             if !frozen_pages.is_empty() {
                 self.wait_for_frozen_pages_stable(pool_guards, &trx_sys, &frozen_pages)
-                    .await;
+                    .await?;
                 cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
                 self.set_frozen_pages_to_transition(pool_guards, &frozen_pages, cutoff_ts)
-                    .await;
+                    .await?;
             }
 
             // Step 4: build LWC pages from transition pages using the cutoff snapshot.

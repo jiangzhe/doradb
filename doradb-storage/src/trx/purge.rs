@@ -160,8 +160,9 @@ impl TransactionSystem {
                     };
                     let page_guard = if let Some(page_id) = undo.page_id {
                         table
-                            .try_get_row_page_versioned_shared(guards, page_id)
+                            .get_row_page_versioned_shared(guards, page_id)
                             .await
+                            .expect("purge should not ignore row-page access failures")
                     } else {
                         None
                     };

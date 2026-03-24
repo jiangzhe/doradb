@@ -376,21 +376,15 @@ impl TableHandle {
 
     /// Load a versioned row page in shared mode if the requested generation still matches.
     #[inline]
-    pub async fn try_get_row_page_versioned_shared(
+    pub async fn get_row_page_versioned_shared(
         &self,
         guards: &PoolGuards,
         page_id: VersionedPageID,
-    ) -> Option<PageSharedGuard<RowPage>> {
+    ) -> Result<Option<PageSharedGuard<RowPage>>> {
         match self {
-            TableHandle::User(table) => {
-                table
-                    .try_get_row_page_versioned_shared(guards, page_id)
-                    .await
-            }
+            TableHandle::User(table) => table.get_row_page_versioned_shared(guards, page_id).await,
             TableHandle::Catalog(table) => {
-                table
-                    .try_get_row_page_versioned_shared(guards, page_id)
-                    .await
+                table.get_row_page_versioned_shared(guards, page_id).await
             }
         }
     }
@@ -401,7 +395,7 @@ impl TableHandle {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> Option<PageSharedGuard<RowPage>> {
+    ) -> Result<Option<PageSharedGuard<RowPage>>> {
         match self {
             TableHandle::User(table) => table.get_row_page_shared(guards, page_id).await,
             TableHandle::Catalog(table) => table.get_row_page_shared(guards, page_id).await,

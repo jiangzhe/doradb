@@ -269,12 +269,24 @@ impl TransactionSystem {
             .pool_guards()
             .clone();
         let mut table_cache = TableCache::new(&self.catalog);
-        trx.index_undo
+        if trx
+            .index_undo
             .rollback(&mut table_cache, &pool_guards, trx.sts)
-            .await?;
-        trx.row_undo
+            .await
+            .is_err()
+        {
+            trx.discard_after_fatal_rollback();
+            return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
+        }
+        if trx
+            .row_undo
             .rollback(&mut table_cache, &pool_guards, Some(trx.sts))
-            .await;
+            .await
+            .is_err()
+        {
+            trx.discard_after_fatal_rollback();
+            return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
+        }
         trx.redo.clear();
         trx.gc_row_pages.clear();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
@@ -300,14 +312,24 @@ impl TransactionSystem {
         // Note: rollback can only happens to user transaction, so payload is always non-empty.
         let mut payload = trx.payload.take().unwrap();
         let mut table_cache = TableCache::new(&self.catalog);
-        payload
+        if payload
             .row_undo
             .rollback(&mut table_cache, &pool_guards, trx.sts)
-            .await;
-        payload
+            .await
+            .is_err()
+        {
+            trx.discard_after_fatal_rollback();
+            return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
+        }
+        if payload
             .index_undo
             .rollback(&mut table_cache, &pool_guards, payload.sts)
-            .await?;
+            .await
+            .is_err()
+        {
+            trx.discard_after_fatal_rollback();
+            return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
+        }
         trx.redo_bin.take();
         self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
             .gc_analyze_rollback(payload.sts);

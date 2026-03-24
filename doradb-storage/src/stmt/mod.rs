@@ -2,7 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 
 use crate::catalog::{TableCache, TableID, TableSpec};
-use crate::error::Result;
+use crate::error::{Result, StoragePoisonSource};
 use crate::row::RowID;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::table::{Table, TableAccess};
@@ -64,20 +64,36 @@ impl Statement {
     pub async fn fail(mut self) -> Result<ActiveTrx> {
         // rollback row data.
         // todo: group by page level may be better.
-        let engine = self.trx.engine().unwrap();
+        let engine = self.trx.engine().cloned().unwrap();
         let pool_guards = self
             .trx
             .pool_guards()
             .expect("statement rollback requires session pool guards")
             .clone();
         let mut table_cache = TableCache::new(engine.catalog());
-        self.row_undo
+        if self
+            .row_undo
             .rollback(&mut table_cache, &pool_guards, Some(self.trx.sts))
-            .await;
+            .await
+            .is_err()
+        {
+            self.trx.discard_after_fatal_rollback();
+            return Err(engine
+                .trx_sys
+                .poison_storage(StoragePoisonSource::RollbackAccess));
+        }
         // rollback index data.
-        self.index_undo
+        if self
+            .index_undo
             .rollback(&mut table_cache, &pool_guards, self.trx.sts)
-            .await?;
+            .await
+            .is_err()
+        {
+            self.trx.discard_after_fatal_rollback();
+            return Err(engine
+                .trx_sys
+                .poison_storage(StoragePoisonSource::RollbackAccess));
+        }
         // clear redo logs.
         self.redo.clear();
         Ok(self.trx)

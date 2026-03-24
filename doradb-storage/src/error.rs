@@ -80,6 +80,7 @@ pub enum StoragePoisonSource {
     CheckpointWrite,
     CheckpointSync,
     PurgeDeallocate,
+    RollbackAccess,
 }
 
 impl fmt::Display for StoragePoisonSource {
@@ -92,6 +93,7 @@ impl fmt::Display for StoragePoisonSource {
             StoragePoisonSource::CheckpointWrite => "checkpoint write",
             StoragePoisonSource::CheckpointSync => "checkpoint sync",
             StoragePoisonSource::PurgeDeallocate => "purge deallocate",
+            StoragePoisonSource::RollbackAccess => "rollback access",
         })
     }
 }

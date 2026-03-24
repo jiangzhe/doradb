@@ -18,7 +18,7 @@ use crate::buffer::{
 };
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
@@ -212,24 +212,6 @@ impl<P: BufferPool> GenericMemTable<P> {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> Option<PageSharedGuard<RowPage>> {
-        self.mem_pool()
-            .get_page::<RowPage>(
-                self.row_pool_guard(guards),
-                page_id,
-                LatchFallbackMode::Shared,
-            )
-            .await
-            .expect("table row-page shared read should not ignore buffer-pool errors")
-            .lock_shared_async()
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn try_get_row_page_shared_result(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
     ) -> Result<Option<PageSharedGuard<RowPage>>> {
         Ok(self
             .mem_pool()
@@ -244,25 +226,7 @@ impl<P: BufferPool> GenericMemTable<P> {
     }
 
     #[inline]
-    pub(crate) async fn try_get_row_page_versioned_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: VersionedPageID,
-    ) -> Option<PageSharedGuard<RowPage>> {
-        self.mem_pool()
-            .get_page_versioned::<RowPage>(
-                self.row_pool_guard(guards),
-                page_id,
-                LatchFallbackMode::Shared,
-            )
-            .await
-            .expect("table versioned shared row-page read should not ignore buffer-pool errors")?
-            .lock_shared_async()
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn try_get_row_page_versioned_shared_result(
+    pub(crate) async fn get_row_page_versioned_shared(
         &self,
         guards: &PoolGuards,
         page_id: VersionedPageID,
@@ -286,24 +250,6 @@ impl<P: BufferPool> GenericMemTable<P> {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> Option<PageExclusiveGuard<RowPage>> {
-        self.mem_pool()
-            .get_page::<RowPage>(
-                self.row_pool_guard(guards),
-                page_id,
-                LatchFallbackMode::Exclusive,
-            )
-            .await
-            .expect("table row-page exclusive read should not ignore buffer-pool errors")
-            .lock_exclusive_async()
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn try_get_row_page_exclusive_result(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
     ) -> Result<Option<PageExclusiveGuard<RowPage>>> {
         Ok(self
             .mem_pool()
@@ -322,10 +268,10 @@ impl<P: BufferPool> GenericMemTable<P> {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> PageSharedGuard<RowPage> {
+    ) -> Result<PageSharedGuard<RowPage>> {
         self.get_row_page_shared(guards, page_id)
             .await
-            .expect("failed to lock shared row page")
+            .and_then(|guard| guard.ok_or(Error::InvalidState))
     }
 
     #[inline]
@@ -333,10 +279,10 @@ impl<P: BufferPool> GenericMemTable<P> {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         self.get_row_page_exclusive(guards, page_id)
             .await
-            .expect("failed to lock exclusive row page")
+            .and_then(|guard| guard.ok_or(Error::InvalidState))
     }
 
     #[inline]
@@ -421,7 +367,8 @@ impl<P: BufferPool> GenericMemTable<P> {
             for page_entry in entries {
                 let page_guard = self
                     .must_get_row_page_shared(guards, page_entry.page_id)
-                    .await;
+                    .await
+                    .expect("table mem scan should not ignore row-page access failures");
                 if !page_action(page_guard) {
                     return;
                 }
@@ -587,7 +534,7 @@ impl Table {
         guards: &PoolGuards,
         trx_sys: &TransactionSystem,
         frozen_pages: &[FrozenPage],
-    ) {
+    ) -> Result<()> {
         loop {
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             let mut stabilized = true;
@@ -596,7 +543,7 @@ impl Table {
                 // row page back. This requires interface change of buffer pool.
                 let page_guard = self
                     .must_get_row_page_shared(guards, page_info.page_id)
-                    .await;
+                    .await?;
                 let (ctx, _) = page_guard.ctx_and_page();
                 let row_ver = ctx.row_ver().unwrap();
                 // Check whether all insert and updates on this page are committed.
@@ -612,6 +559,7 @@ impl Table {
             }
             smol::Timer::after(Duration::from_secs(1)).await;
         }
+        Ok(())
     }
 
     async fn set_frozen_pages_to_transition(
@@ -619,15 +567,16 @@ impl Table {
         guards: &PoolGuards,
         frozen_pages: &[FrozenPage],
         cutoff_ts: TrxID,
-    ) {
+    ) -> Result<()> {
         for page_info in frozen_pages {
             let page_guard = self
                 .must_get_row_page_shared(guards, page_info.page_id)
-                .await;
+                .await?;
             let (ctx, page) = page_guard.ctx_and_page();
             ctx.row_ver().unwrap().set_transition();
             self.capture_delete_markers_for_transition(page, ctx, cutoff_ts);
         }
+        Ok(())
     }
 
     async fn build_lwc_pages(
@@ -651,7 +600,7 @@ impl Table {
             for page_info in frozen_pages {
                 let page_guard = self
                     .must_get_row_page_shared(guards, page_info.page_id)
-                    .await;
+                    .await?;
                 let (ctx, page) = page_guard.ctx_and_page();
                 let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                 if view.rows_non_deleted() == 0 {
@@ -797,7 +746,8 @@ impl Table {
             for page_entry in entries {
                 let page_guard = self
                     .must_get_row_page_shared(guards, page_entry.page_id)
-                    .await;
+                    .await
+                    .expect("table mem scan should not ignore row-page access failures");
                 if !page_action(page_guard) {
                     return;
                 }
@@ -995,7 +945,7 @@ impl Table {
                 IndexInsert::DuplicateKey(old_row_id, deleted) => {
                     debug_assert!(old_row_id != row_id);
                     // Find CTS of old row.
-                    match self.find_recover_cts_for_row_id(guards, old_row_id).await {
+                    match self.find_recover_cts_for_row_id(guards, old_row_id).await? {
                         Some(old_cts) => {
                             if cts < old_cts {
                                 // Current row has smaller CTS, that means this insert
@@ -1096,19 +1046,19 @@ impl Table {
         &self,
         guards: &PoolGuards,
         row_id: RowID,
-    ) -> Option<TrxID> {
-        match self.find_row(guards, row_id).await {
+    ) -> Result<Option<TrxID>> {
+        Ok(match self.find_row(guards, row_id).await {
             RowLocation::NotFound => None,
             RowLocation::LwcPage(..) => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
-                let page_guard = self.must_get_row_page_shared(guards, page_id).await;
+                let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
                 debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));
                 let (ctx, page) = page_guard.ctx_and_page();
                 let row_idx = page.row_idx(row_id);
                 let access = RowReadAccess::new(page, ctx, row_idx);
                 access.ts()
             }
-        }
+        })
     }
 }
 

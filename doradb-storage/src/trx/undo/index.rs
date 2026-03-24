@@ -124,7 +124,8 @@ impl IndexUndoLogs {
                         RowLocation::NotFound => unreachable!(),
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
-                            let Some(page_guard) = table.get_row_page_shared(guards, page_id).await
+                            let Some(page_guard) =
+                                table.get_row_page_shared(guards, page_id).await?
                             else {
                                 return Ok(());
                             };

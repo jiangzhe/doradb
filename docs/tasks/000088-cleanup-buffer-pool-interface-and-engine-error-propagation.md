@@ -228,18 +228,42 @@ Reference:
    - added focused regression coverage for that purge failure path so the
      shared poison state is asserted without relying on a background-task
      panic.
-5. Validation completed for the implemented state.
+5. Completed the remaining row-page helper and rollback-access refactor that
+   the initial API sweep missed.
+   - `GenericMemTable` and `TableHandle` row-page access now use one
+     canonical result-bearing helper family for shared, exclusive, and
+     versioned shared reads; the parallel infallible wrappers and duplicate
+     `*_result` names were removed from the runtime-facing access surface;
+   - row undo rollback, the index-undo old-row reread path, active
+     transaction rollback, prepared rollback, and statement rollback now use
+     those canonical fallible row-page helpers rather than panicking on
+     rollback-time reload failures;
+   - rollback access failures are now treated as fatal runtime corruption:
+     they poison the storage engine with
+     `StoragePoisonSource::RollbackAccess` and return immediately instead of
+     continuing cleanup after a failed row-page reload;
+   - `ActiveTrx` and `PreparedTrx` gained fatal-discard helpers so poisoned
+     rollback returns still clear local transaction state and preserve the
+     existing `Drop` invariants.
+6. Added a follow-up backlog item for the application-level mitigation that
+   avoids rollback reload I/O in steady state.
+   - created `docs/backlogs/000068-pin-in-transaction-evictable-row-pages-to-avoid-rollback-reload-io.md`
+     to track pinning in-transaction evictable row pages until commit or
+     rollback so ordinary rollback no longer depends on row-page reload I/O.
+7. Validation completed for the implemented state.
    - `cargo fmt --all`
      - result: passed
    - `cargo build -p doradb-storage`
      - result: passed
    - `cargo test -p doradb-storage trx::purge::tests::test_handle_gc_row_page_deallocation_result_poisons_runtime -- --exact`
      - result: passed
+   - `cargo test -p doradb-storage table::tests::test_mvcc_rollback_poisons_runtime_on_row_page_reload_error -- --exact`
+     - result: passed
    - `cargo nextest run -p doradb-storage`
-     - result: `433/433` passed
+     - result: `434/434` passed
    - `cargo clippy --all-features --all-targets -- -D warnings`
      - result: passed
-6. Tracking and review state at resolve time.
+8. Tracking and review state at resolve time.
    - task issue: `#473`
    - implementation PR: `#474`
 
@@ -262,6 +286,10 @@ Related modules, files, structs, traits and functions:
   - row-page shared/exclusive helper family
 - `doradb-storage/src/catalog/mod.rs`
   - catalog table-handle row-page wrappers
+- `doradb-storage/src/error.rs`
+  - `StoragePoisonSource::RollbackAccess`
+- `doradb-storage/src/stmt/mod.rs`
+  - statement rollback poison-on-access-failure handling
 - `doradb-storage/src/table/access.rs`
   - `TableAccess` consumer paths
   - index delete/rollback maintenance propagation
@@ -299,10 +327,19 @@ Related modules, files, structs, traits and functions:
   - persisted-data index rebuild
 - `doradb-storage/src/trx/undo/index.rs`
   - index undo rollback propagation
+  - old-row reread path uses canonical fallible table row-page access
+- `doradb-storage/src/trx/undo/row.rs`
+  - row undo rollback propagation
+- `doradb-storage/src/trx/mod.rs`
+  - fatal rollback discard helpers for `ActiveTrx` and `PreparedTrx`
+- `doradb-storage/src/trx/sys.rs`
+  - rollback and prepared-rollback fatal poison handling
 - `doradb-storage/src/trx/recover.rs`
   - row-page refresh during log recovery
 - `doradb-storage/src/trx/purge.rs`
   - row-page reload, purge validation, and fatal deallocation handling
+- `docs/backlogs/000068-pin-in-transaction-evictable-row-pages-to-avoid-rollback-reload-io.md`
+  - follow-up application-level mitigation for rollback reload I/O
 
 ## Test Cases
 
@@ -345,6 +382,10 @@ Related modules, files, structs, traits and functions:
      pages;
    - recovery row-page refresh and purge row-page reloads surface page-load
      failures explicitly;
+   - rollback on an evicted user-table row page now returns
+     `Error::StorageEnginePoisoned(StoragePoisonSource::RollbackAccess)` and
+     poisons runtime admission instead of panicking during row undo or
+     statement rollback;
    - purge row-page deallocation failures poison the runtime and stop the
      worker cleanly instead of panicking in the background task;
    - existing restart/bootstrap corruption tests continue to pass or are
