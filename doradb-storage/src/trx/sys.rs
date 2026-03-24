@@ -213,7 +213,7 @@ impl TransactionSystem {
     #[inline]
     pub async fn commit(&self, trx: ActiveTrx) -> Result<TrxID> {
         if let Err(err) = self.ensure_runtime_healthy() {
-            self.rollback(trx).await;
+            self.rollback(trx).await?;
             return Err(err);
         }
         // Prepare redo log first, this may take some time,
@@ -233,7 +233,7 @@ impl TransactionSystem {
             // page-level undo maps.
             // In such case, we can just rollback this transaction because it actually
             // do nothing.
-            self.rollback_prepared(prepared_trx).await;
+            self.rollback_prepared(prepared_trx).await?;
             return Ok(0);
         }
         // start group commit
@@ -261,7 +261,7 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub async fn rollback(&self, mut trx: ActiveTrx) {
+    pub async fn rollback(&self, mut trx: ActiveTrx) -> Result<()> {
         let pool_guards = trx
             .session
             .as_ref()
@@ -271,7 +271,7 @@ impl TransactionSystem {
         let mut table_cache = TableCache::new(&self.catalog);
         trx.index_undo
             .rollback(&mut table_cache, &pool_guards, trx.sts)
-            .await;
+            .await?;
         trx.row_undo
             .rollback(&mut table_cache, &pool_guards, Some(trx.sts))
             .await;
@@ -281,6 +281,7 @@ impl TransactionSystem {
         if let Some(s) = trx.session.take() {
             s.rollback();
         }
+        Ok(())
     }
 
     /// Rollback prepared transaction.
@@ -288,7 +289,7 @@ impl TransactionSystem {
     /// In such case, we do not need to go through entire commit process but just
     /// rollback the transaction, because it actually do nothing.
     #[inline]
-    async fn rollback_prepared(&self, mut trx: PreparedTrx) {
+    async fn rollback_prepared(&self, mut trx: PreparedTrx) -> Result<()> {
         debug_assert!(trx.redo_bin.is_none());
         let pool_guards = trx
             .session
@@ -306,13 +307,14 @@ impl TransactionSystem {
         payload
             .index_undo
             .rollback(&mut table_cache, &pool_guards, payload.sts)
-            .await;
+            .await?;
         trx.redo_bin.take();
         self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
             .gc_analyze_rollback(payload.sts);
         if let Some(s) = trx.session.take() {
             s.rollback();
         }
+        Ok(())
     }
 
     /// Returns statistics of group commit.

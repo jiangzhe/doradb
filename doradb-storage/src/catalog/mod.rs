@@ -172,7 +172,7 @@ impl Catalog {
             .storage
             .tables()
             .find_uncommitted_by_id(guards, table_id)
-            .await;
+            .await?;
         match res {
             Some(table) => {
                 // Phase 2 allocator semantics: only table ids consume global user object ids.

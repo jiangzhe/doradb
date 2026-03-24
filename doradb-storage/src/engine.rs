@@ -674,7 +674,7 @@ mod tests {
             assert!(session.in_trx());
             assert!(session.try_begin_trx().unwrap().is_none());
 
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
             assert!(!session.in_trx());
         });
     }
@@ -693,7 +693,7 @@ mod tests {
             assert!(!session.in_trx());
 
             let trx = session.try_begin_trx().unwrap().unwrap();
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
         });
     }
 
@@ -705,11 +705,11 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
 
             let trx = session.try_begin_trx().unwrap().unwrap();
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
             assert!(!session.in_trx());
 
             let trx = session.try_begin_trx().unwrap().unwrap();
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
         });
     }
 
@@ -726,7 +726,7 @@ mod tests {
             assert!(!session.in_trx());
 
             let trx = session.try_begin_trx().unwrap().unwrap();
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
         });
     }
 
@@ -744,8 +744,8 @@ mod tests {
             assert!(session1.in_trx());
             assert!(session2.in_trx());
 
-            trx1.rollback().await;
-            trx2.rollback().await;
+            trx1.rollback().await.unwrap();
+            trx2.rollback().await.unwrap();
         });
     }
 

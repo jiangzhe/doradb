@@ -566,7 +566,7 @@ pub type OldRoot = OldCowRoot<TableMeta>;
 mod tests {
     use super::*;
     use crate::buffer::guard::PageGuard;
-    use crate::buffer::{ReadonlyBufferPoolExt, global_readonly_pool_scope, table_readonly_pool};
+    use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::page_integrity::PAGE_INTEGRITY_TRAILER_SIZE;

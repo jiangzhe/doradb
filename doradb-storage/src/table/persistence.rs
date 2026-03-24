@@ -84,7 +84,7 @@ impl Table {
                     heap_redo_start_ts = next_heap_redo_start_ts.unwrap_or(checkpoint_ts);
                 }
                 Err(err) => {
-                    trx_sys.rollback(trx).await;
+                    trx_sys.rollback(trx).await?;
                     return Err(err);
                 }
             }
@@ -127,7 +127,7 @@ impl Table {
             {
                 Ok(changed) => changed,
                 Err(err) => {
-                    trx_sys.rollback(trx).await;
+                    trx_sys.rollback(trx).await?;
                     return Err(err);
                 }
             };
@@ -136,7 +136,7 @@ impl Table {
 
         // Step 8: rollback no-op checkpoint transactions to avoid empty commits.
         if !table_file_changed {
-            trx_sys.rollback(trx).await;
+            trx_sys.rollback(trx).await?;
             return Ok(());
         }
 
@@ -144,12 +144,12 @@ impl Table {
         let (table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
             Ok(res) => res,
             Err(Error::IOError | Error::AIOError(_) | Error::SendError) => {
-                trx_sys.rollback(trx).await;
+                let _ = trx_sys.rollback(trx).await;
                 let poison = trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite);
                 return Err(poison);
             }
             Err(err) => {
-                trx_sys.rollback(trx).await;
+                trx_sys.rollback(trx).await?;
                 return Err(err);
             }
         };

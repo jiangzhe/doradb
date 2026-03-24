@@ -1,5 +1,6 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
+use crate::error::Result;
 use crate::index::btree::{BTreeNodeCursor, GenericBTree};
 use crate::index::btree_node::{BTreeNode, BTreeSlot};
 use std::ops::{Deref, DerefMut};
@@ -69,11 +70,11 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
     }
 
     #[inline]
-    pub async fn scan_prefix(&mut self, key: &[u8]) {
+    pub async fn scan_prefix(&mut self, key: &[u8]) -> Result<()> {
         // find first leaf node of prefix key.
-        self.cursor.seek(key).await;
-        let Some(first_g) = self.cursor.next().await else {
-            return;
+        self.cursor.seek(key).await?;
+        let Some(first_g) = self.cursor.next().await? else {
+            return Ok(());
         };
         let first_node = first_g.page();
         let start_idx = match first_node.search_key(key) {
@@ -81,7 +82,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
                 let slot = first_node.slot(idx);
                 let res = self.callback.apply(first_node, slot);
                 if !res {
-                    return;
+                    return Ok(());
                 }
                 idx + 1
             }
@@ -93,50 +94,51 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
             if first_node.slot_matches_k(slot, k) {
                 let res = self.callback.apply(first_node, slot);
                 if !res {
-                    return;
+                    return Ok(());
                 }
             } else {
-                return; // mismatch
+                return Ok(()); // mismatch
             }
         }
         // first node exhausted
         // check if prefix matches upper fence.
         if first_node.has_no_upper_fence() {
-            return; // tree exhausted.
+            return Ok(()); // tree exhausted.
         }
         if !first_node.slot_matches_k(first_node.upper_fence_slot(), k) {
-            return; // mismatch
+            return Ok(()); // mismatch
         }
         drop(first_g); // release lock on first node.
         // try next node.
-        while let Some(g) = self.cursor.next().await {
+        while let Some(g) = self.cursor.next().await? {
             let node = g.page();
             // As node changes, common prefix may also change.
             if key.len() < node.prefix_len() {
-                return; // mismatch
+                return Ok(()); // mismatch
             }
             if node.common_prefix() != &key[..node.prefix_len()] {
-                return; // mismatch
+                return Ok(()); // mismatch
             }
             let k = &key[node.prefix_len()..];
             for slot in node.slots() {
                 if node.slot_matches_k(slot, k) {
                     let res = self.callback.apply(node, slot);
                     if !res {
-                        return;
+                        return Ok(());
                     }
                 } else {
-                    return; // mismatch
+                    return Ok(()); // mismatch
                 }
             }
             if node.has_no_upper_fence() {
-                return; // tree exhausted.
+                return Ok(()); // tree exhausted.
             }
             if !node.slot_matches_k(node.upper_fence_slot(), k) {
-                return; // mismtach
+                return Ok(()); // mismtach
             }
         }
         // tree exhausted.
+        Ok(())
     }
 }
 
@@ -176,15 +178,15 @@ mod tests {
                     assert!(res.is_ok());
                 }
                 let mut scanner = tree.prefix_scanner(&pool_guard, Count(0));
-                scanner.scan_prefix(b"a").await;
+                scanner.scan_prefix(b"a").await.unwrap();
                 assert!(scanner.count() == 3);
 
                 scanner.reset();
-                scanner.scan_prefix(b"e").await;
+                scanner.scan_prefix(b"e").await.unwrap();
                 assert!(scanner.count() == 0);
 
                 scanner.reset();
-                scanner.scan_prefix(b"bb").await;
+                scanner.scan_prefix(b"bb").await.unwrap();
                 assert!(scanner.count() == 2);
 
                 let res = tree
@@ -192,7 +194,7 @@ mod tests {
                     .await;
                 assert!(res.is_ok());
                 scanner.reset();
-                scanner.scan_prefix(b"a").await;
+                scanner.scan_prefix(b"a").await.unwrap();
                 // because the counter does not check delete flag, we still get 3 keys.
                 assert!(scanner.count() == 3);
 
@@ -201,7 +203,7 @@ mod tests {
                     .await;
                 assert!(res.is_ok()); // actual deletion.
                 scanner.reset();
-                scanner.scan_prefix(b"a").await;
+                scanner.scan_prefix(b"a").await.unwrap();
                 assert!(scanner.count() == 2);
             }
         })
@@ -245,7 +247,7 @@ mod tests {
                 for b in ALPHABETA {
                     let k = std::slice::from_ref(b);
                     scanner.reset();
-                    scanner.scan_prefix(k).await;
+                    scanner.scan_prefix(k).await.unwrap();
                     println!("prefix={}, count={}", *b as char, scanner.count());
                     assert_eq!(map[b], scanner.count());
                 }

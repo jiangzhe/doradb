@@ -10,8 +10,7 @@ use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{
-    BufferPool, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole, ReadonlyBufferPoolExt,
-    ReadonlyPageValidator,
+    BufferPool, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole, ReadonlyPageValidator,
 };
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Validation::Valid;
@@ -1230,16 +1229,14 @@ impl ReadonlyBufferPool {
         self.global
             .invalidate_file_block_strict(self.file_id, block_id)
     }
-}
 
-impl ReadonlyBufferPoolExt for ReadonlyBufferPool {
     /// Returns a shared guard for one persisted page after validating its page-kind contract.
     ///
     /// On cache miss, validation runs before the new frame becomes resident.
     /// On cached hits, validation is re-run against the resident bytes and a
     /// failed validation invalidates the mapping before returning the error.
     #[inline]
-    async fn get_validated_page_shared(
+    pub(crate) async fn get_validated_page_shared(
         &self,
         page_id: PageID,
         validator: ReadonlyPageValidator,
@@ -1332,7 +1329,7 @@ impl BufferPool for ReadonlyBufferPool {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> Result<Validation<FacadePageGuard<T>>> {
-        let g = <Self as BufferPool>::get_page(self, guard, page_id, mode).await?;
+        let g = self.get_page(guard, page_id, mode).await?;
         if p_guard.validate_bool() {
             return Ok(Valid(g));
         }
@@ -1349,7 +1346,6 @@ unsafe impl Sync for ReadonlyBufferPool {}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::ReadonlyBufferPoolExt;
     use crate::buffer::guard::{FacadePageGuard, PageGuard};
     use crate::buffer::page::Page;
     use crate::catalog::TableID;

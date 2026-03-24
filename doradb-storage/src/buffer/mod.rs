@@ -27,8 +27,8 @@ pub use readonly::{GlobalReadonlyBufferPool, PersistedBlockKey, ReadonlyBufferPo
 /// Physical file identity used by persisted-block mappings and cache invalidation.
 pub type PersistedFileID = u64;
 
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
-use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+use crate::buffer::page::{BufferPage, PageID, VersionedPageID};
 use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
     MetaPoolConfig, ShelfScope,
@@ -37,7 +37,6 @@ use crate::error::Validation;
 use crate::error::{PersistedFileKind, Result};
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
-use crate::quiescent::QuiescentGuard;
 use std::future::Future;
 
 /// Shared terminal-status cell for one page-sized buffer-pool IO operation.
@@ -108,97 +107,6 @@ pub trait BufferPool: Send + Sync {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send;
-}
-
-/// Readonly buffer-pool extension for validated persisted-page shared reads.
-pub(crate) trait ReadonlyBufferPoolExt: Send + Sync {
-    /// Returns a shared guard for one persisted page after validating its page-kind contract.
-    fn get_validated_page_shared(
-        &self,
-        page_id: PageID,
-        validator: ReadonlyPageValidator,
-    ) -> impl Future<Output = Result<PageSharedGuard<Page>>> + Send;
-}
-
-impl<T: BufferPool> BufferPool for QuiescentGuard<T> {
-    #[inline]
-    fn capacity(&self) -> usize {
-        T::capacity(&**self)
-    }
-
-    #[inline]
-    fn allocated(&self) -> usize {
-        T::allocated(&**self)
-    }
-
-    #[inline]
-    fn pool_guard(&self) -> PoolGuard {
-        T::pool_guard(&**self)
-    }
-
-    #[inline]
-    fn allocate_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-    ) -> impl Future<Output = PageExclusiveGuard<U>> + Send {
-        T::allocate_page(&**self, guard)
-    }
-
-    #[inline]
-    fn allocate_page_at<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-    ) -> impl Future<Output = Result<PageExclusiveGuard<U>>> + Send {
-        T::allocate_page_at(&**self, guard, page_id)
-    }
-
-    #[inline]
-    fn get_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<FacadePageGuard<U>>> + Send {
-        T::get_page(&**self, guard, page_id, mode)
-    }
-
-    #[inline]
-    fn get_page_versioned<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        id: VersionedPageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<Option<FacadePageGuard<U>>>> + Send {
-        T::get_page_versioned(&**self, guard, id, mode)
-    }
-
-    #[inline]
-    fn deallocate_page<U: BufferPage>(&self, g: PageExclusiveGuard<U>) {
-        T::deallocate_page(&**self, g)
-    }
-
-    #[inline]
-    fn get_child_page<U: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<U>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<Validation<FacadePageGuard<U>>>> + Send {
-        T::get_child_page(&**self, guard, p_guard, page_id, mode)
-    }
-}
-
-impl<T: ReadonlyBufferPoolExt> ReadonlyBufferPoolExt for QuiescentGuard<T> {
-    #[inline]
-    fn get_validated_page_shared(
-        &self,
-        page_id: PageID,
-        validator: ReadonlyPageValidator,
-    ) -> impl Future<Output = Result<PageSharedGuard<Page>>> + Send {
-        T::get_validated_page_shared(&**self, page_id, validator)
-    }
 }
 
 impl Component for MetaPool {

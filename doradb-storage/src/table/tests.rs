@@ -167,8 +167,8 @@ fn test_mvcc_insert_dup_key() {
             let mut stmt = trx.start_stmt();
             let res = stmt.insert_row(&sys.table, insert).await;
             assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
-            trx = stmt.fail().await;
-            trx.rollback().await;
+            trx = stmt.fail().await.unwrap();
+            trx.rollback().await.unwrap();
         }
         // write conflict
         {
@@ -188,7 +188,7 @@ fn test_mvcc_insert_dup_key() {
             let res = stmt2.insert_row(&sys.table, insert2).await;
             // still dup key because circuit breaker on index search.
             assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
-            stmt2.fail().await.rollback().await;
+            stmt2.fail().await.unwrap().rollback().await.unwrap();
             drop(session2);
 
             trx1.commit().await.unwrap();
@@ -412,8 +412,8 @@ fn test_lwc_select_surfaces_persisted_corruption() {
             }) => assert_eq!(page_id, entry.payload.block_id),
             other => panic!("expected persisted LWC corruption, got {other:?}"),
         }
-        trx = stmt.fail().await;
-        trx.rollback().await;
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
 
         drop(session);
         sys.clean_all();
@@ -440,7 +440,7 @@ fn test_column_delete_rollback() {
         let res = stmt.delete_row(&sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx = stmt.succeed();
-        trx.rollback().await;
+        trx.rollback().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx = sys
@@ -486,7 +486,7 @@ fn test_column_delete_rollback_after_checkpoint() {
         let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
         assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         trx_delete = stmt.succeed();
-        trx_delete.rollback().await;
+        trx_delete.rollback().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx = sys
@@ -528,11 +528,11 @@ fn test_column_delete_write_conflict() {
         let mut stmt2 = trx2.start_stmt();
         let res2 = stmt2.delete_row(&sys.table, &key).await;
         assert!(matches!(res2, Ok(DeleteMvcc::WriteConflict)));
-        trx2 = stmt2.fail().await;
-        trx2.rollback().await;
+        trx2 = stmt2.fail().await.unwrap();
+        trx2.rollback().await.unwrap();
         drop(session2);
 
-        trx1.rollback().await;
+        trx1.rollback().await.unwrap();
 
         drop(session);
         sys.clean_all();
@@ -704,7 +704,7 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
             .expect("payload should exist");
         assert!(entry.payload.offloaded_ref().is_none());
 
-        hold_trx.rollback().await;
+        hold_trx.rollback().await.unwrap();
         drop(checkpoint_session);
         drop(writer_session);
         drop(hold_session);
@@ -731,6 +731,7 @@ fn test_row_page_transition_retries_update_delete() {
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
             .await
+            .unwrap()
             .unwrap();
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
@@ -791,8 +792,8 @@ fn test_row_page_transition_retries_update_delete() {
             .update_row_inplace(&mut stmt, page_guard, &key, row_id, update)
             .await;
         assert!(matches!(res, UpdateRowInplace::RetryInTransition));
-        trx = stmt.fail().await;
-        trx.rollback().await;
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
@@ -815,8 +816,8 @@ fn test_row_page_transition_retries_update_delete() {
             .delete_row_internal(&mut stmt, page_guard, row_id, &key, false)
             .await;
         assert!(matches!(res, DeleteInternal::RetryInTransition));
-        trx = stmt.fail().await;
-        trx.rollback().await;
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
 
         drop(session);
         sys.clean_all();
@@ -834,7 +835,7 @@ fn test_mvcc_rollback_insert_normal() {
             let insert = vec![Val::from(1i32), Val::from("hello")];
             trx = sys.trx_insert(trx, insert).await;
             // explicit rollback
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
@@ -870,7 +871,7 @@ fn test_mvcc_insert_link_unique_index() {
             let insert = vec![Val::from(1i32), Val::from("world")];
             sys.new_trx_insert(&mut session, insert).await;
 
-            trx_to_prevent_gc.rollback().await;
+            trx_to_prevent_gc.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
@@ -904,7 +905,7 @@ fn test_mvcc_rollback_insert_link_unique_index() {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             trx = sys.trx_insert(trx, insert).await;
             // explicit rollback
-            trx.rollback().await;
+            trx.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
@@ -1465,6 +1466,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
             .await
+            .unwrap()
             .unwrap();
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
@@ -1516,8 +1518,8 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             DeleteMarker::Committed(_) => panic!("uncommitted lock should remain as marker ref"),
         }
 
-        trx = stmt.fail().await;
-        trx.rollback().await;
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
 
         drop(lock_row);
         drop(page_guard);
@@ -1593,7 +1595,7 @@ fn test_data_checkpoint_snapshot_consistency() {
             read_trx = stmt.succeed();
         }
 
-        write_trx.rollback().await;
+        write_trx.rollback().await.unwrap();
         read_trx.commit().await.unwrap();
 
         drop(session);
@@ -1984,8 +1986,8 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         let res = stmt
             .insert_row(&sys.table, vec![Val::from(100), Val::from("reload-fails")])
             .await;
-        let trx = stmt.fail().await;
-        trx.rollback().await;
+        let trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
         assert!(
             matches!(res, Err(Error::IOError)),
             "expected insert-page reload failure, got {res:?}"
@@ -2219,10 +2221,13 @@ async fn assert_row_in_lwc(
     sts: TrxID,
 ) -> RowID {
     let index = table.sec_idx()[key.index_no].unique().unwrap();
-    let (row_id, _) = index
+    let Some((row_id, _)) = index
         .lookup(guards.index_guard(), &key.vals, sts)
         .await
-        .expect("row should exist");
+        .expect("index lookup should succeed")
+    else {
+        panic!("row should exist");
+    };
     match table.find_row(guards, row_id).await {
         RowLocation::LwcPage(..) => row_id,
         RowLocation::RowPage(..) => panic!("row should be in lwc"),

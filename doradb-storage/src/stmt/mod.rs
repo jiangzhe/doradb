@@ -61,7 +61,7 @@ impl Statement {
     /// This will trigger statement-level rollback based on its undo.
     /// Redo logs will be discarded.
     #[inline]
-    pub async fn fail(mut self) -> ActiveTrx {
+    pub async fn fail(mut self) -> Result<ActiveTrx> {
         // rollback row data.
         // todo: group by page level may be better.
         let engine = self.trx.engine().unwrap();
@@ -77,10 +77,10 @@ impl Statement {
         // rollback index data.
         self.index_undo
             .rollback(&mut table_cache, &pool_guards, self.trx.sts)
-            .await;
+            .await?;
         // clear redo logs.
         self.redo.clear();
-        self.trx
+        Ok(self.trx)
     }
 
     #[inline]

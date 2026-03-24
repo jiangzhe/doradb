@@ -1,6 +1,6 @@
+use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::{Page, PageID};
-use crate::buffer::{ReadonlyBufferPool, ReadonlyBufferPoolExt};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };

@@ -507,7 +507,7 @@ impl<'a> LogRecovery<'a> {
                     .get_catalog_table(table_id)
                     .ok_or(Error::TableNotFound)?;
                 self.replay_catalog_table_modifications(&table, &table_dml.rows)
-                    .await;
+                    .await?;
                 continue;
             }
             if cts < self.table_heap_redo_start_ts(table_id)? {
@@ -536,7 +536,7 @@ impl<'a> LogRecovery<'a> {
                 .get_catalog_table(table_id)
                 .ok_or(Error::TableNotFound)?;
             self.replay_catalog_table_modifications(&table, &table_dml.rows)
-                .await;
+                .await?;
         }
         Ok(())
     }
@@ -545,14 +545,14 @@ impl<'a> LogRecovery<'a> {
         &mut self,
         table: &CatalogTable,
         rows: &BTreeMap<RowID, RowRedo>,
-    ) {
+    ) -> crate::error::Result<()> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
-                    table.insert_no_trx(&self.pool_guards, vals).await;
+                    table.insert_no_trx(&self.pool_guards, vals).await?;
                 }
                 RowRedoKind::DeleteByUniqueKey(key) => {
-                    table.delete_unique_no_trx(&self.pool_guards, key).await;
+                    table.delete_unique_no_trx(&self.pool_guards, key).await?;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     // updates of catalog are implemented as DeleteByUniqueKey and Insert.
@@ -560,6 +560,7 @@ impl<'a> LogRecovery<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     async fn replay_table_dml(
@@ -581,7 +582,7 @@ impl<'a> LogRecovery<'a> {
                             cts,
                             disable_index,
                         )
-                        .await;
+                        .await?;
                 }
                 RowRedoKind::Update(vals) => {
                     table
@@ -593,7 +594,7 @@ impl<'a> LogRecovery<'a> {
                             cts,
                             disable_index,
                         )
-                        .await;
+                        .await?;
                 }
                 RowRedoKind::Delete => {
                     table
@@ -604,7 +605,7 @@ impl<'a> LogRecovery<'a> {
                             cts,
                             disable_index,
                         )
-                        .await;
+                        .await?;
                 }
                 RowRedoKind::DeleteByUniqueKey(_) => {
                     // We do not allow DeleteByUniqueKey log on data tables.

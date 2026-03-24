@@ -1,5 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::{TableCache, TableHandle, TableID};
+use crate::error::Result;
 use crate::index::util::Maskable;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::row::ops::SelectKey;
@@ -47,11 +48,12 @@ impl IndexUndoLogs {
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
         ts: TrxID,
-    ) {
+    ) -> Result<()> {
         while let Some(entry) = self.0.pop() {
             let table = table_cache.must_get_table(entry.table_id).await;
-            Self::rollback_entry_in_table(entry, table, guards, ts).await;
+            Self::rollback_entry_in_table(entry, table, guards, ts).await?;
         }
+        Ok(())
     }
 
     #[inline]
@@ -60,7 +62,7 @@ impl IndexUndoLogs {
         table: &TableHandle,
         guards: &PoolGuards,
         ts: TrxID,
-    ) {
+    ) -> Result<()> {
         let index_pool_guard = guards.index_guard();
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
@@ -70,12 +72,12 @@ impl IndexUndoLogs {
                     // so we just mask it back to deleted.
                     let res = index
                         .mask_as_deleted(index_pool_guard, &key.vals, entry.row_id, ts)
-                        .await;
+                        .await?;
                     assert!(res);
                 } else {
                     let res = index
                         .compare_delete(index_pool_guard, &key.vals, entry.row_id, true, ts)
-                        .await;
+                        .await?;
                     assert!(res);
                 }
             }
@@ -84,12 +86,12 @@ impl IndexUndoLogs {
                 if merge_old_deleted {
                     let res = index
                         .mask_as_deleted(index_pool_guard, &key.vals, entry.row_id, ts)
-                        .await;
+                        .await?;
                     assert!(res);
                 } else {
                     let res = index
                         .compare_delete(index_pool_guard, &key.vals, entry.row_id, true, ts)
-                        .await;
+                        .await?;
                     assert!(res);
                 }
             }
@@ -102,7 +104,7 @@ impl IndexUndoLogs {
                     let index = table.sec_idx()[key.index_no].unique().unwrap();
                     let res = index
                         .compare_exchange(index_pool_guard, &key.vals, new_row_id, old_row_id, ts)
-                        .await;
+                        .await?;
                     debug_assert!(res.is_ok());
                 } else {
                     // There is a race condition:
@@ -124,7 +126,7 @@ impl IndexUndoLogs {
                         RowLocation::RowPage(page_id) => {
                             let Some(page_guard) = table.get_row_page_shared(guards, page_id).await
                             else {
-                                return;
+                                return Ok(());
                             };
                             // acquire row latch to avoid race condition.
                             let (ctx, page) = page_guard.ctx_and_page();
@@ -141,7 +143,7 @@ impl IndexUndoLogs {
                                         true,
                                         ts,
                                     )
-                                    .await;
+                                    .await?;
                                 assert!(res);
                             } else {
                                 // old row must be seen for one transaction.
@@ -157,7 +159,7 @@ impl IndexUndoLogs {
                                         old_row_id.deleted(),
                                         ts,
                                     )
-                                    .await;
+                                    .await?;
                                 assert!(res.is_ok());
                             }
                         }
@@ -177,17 +179,18 @@ impl IndexUndoLogs {
                             entry.row_id,
                             ts,
                         )
-                        .await;
+                        .await?;
                     assert!(res.is_ok());
                 } else {
                     let index = table.sec_idx()[key.index_no].non_unique().unwrap();
                     let res = index
                         .mask_as_active(index_pool_guard, &key.vals, entry.row_id, ts)
-                        .await;
+                        .await?;
                     assert!(res);
                 }
             }
         }
+        Ok(())
     }
 
     /// Merge another undo log buffer.

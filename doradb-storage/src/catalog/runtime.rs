@@ -1,5 +1,6 @@
 use crate::buffer::{FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{TableID, TableMetadata};
+use crate::error::Result;
 use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::SelectKey;
@@ -46,15 +47,19 @@ impl CatalogTable {
     }
 
     #[inline]
-    pub(crate) async fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) {
-        self.accessor().insert_catalog_no_trx(guards, cols).await;
+    pub(crate) async fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) -> Result<()> {
+        self.accessor().insert_catalog_no_trx(guards, cols).await
     }
 
     #[inline]
-    pub(crate) async fn delete_unique_no_trx(&self, guards: &PoolGuards, key: &SelectKey) {
+    pub(crate) async fn delete_unique_no_trx(
+        &self,
+        guards: &PoolGuards,
+        key: &SelectKey,
+    ) -> Result<()> {
         self.accessor()
             .delete_catalog_unique_no_trx(guards, key)
-            .await;
+            .await
     }
 
     #[inline]

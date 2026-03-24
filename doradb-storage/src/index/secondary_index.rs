@@ -478,7 +478,7 @@ mod tests {
                     .insert_mvcc(&mut stmt, vec![Val::from(5i32), Val::from(5i32)])
                     .await;
                 assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
-                stmt.succeed().rollback().await;
+                stmt.succeed().rollback().await.unwrap();
                 // select ... where id = 5
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
@@ -502,7 +502,7 @@ mod tests {
                     .update_unique_mvcc(&mut stmt, &key, update)
                     .await;
                 assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
-                stmt.succeed().rollback().await;
+                stmt.succeed().rollback().await.unwrap();
                 // select ... where id = 1
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
@@ -524,7 +524,7 @@ mod tests {
                     .delete_unique_mvcc(&mut stmt, &key, false)
                     .await;
                 assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
-                stmt.succeed().rollback().await;
+                stmt.succeed().rollback().await.unwrap();
                 // select ... where val = 0
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();
@@ -556,7 +556,7 @@ mod tests {
                 assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 trx = stmt.succeed();
                 // manual rollback.
-                trx.rollback().await;
+                trx.rollback().await.unwrap();
                 // select ... where id = 3
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let stmt = trx.start_stmt();

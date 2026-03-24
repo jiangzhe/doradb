@@ -294,7 +294,7 @@ impl ActiveTrx {
 
     /// Rollback the transaction.
     #[inline]
-    pub async fn rollback(self) {
+    pub async fn rollback(self) -> Result<()> {
         let engine = self.engine().cloned().unwrap();
         engine.trx_sys.rollback(self).await
     }

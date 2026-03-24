@@ -351,7 +351,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         self.blk_idx
             .try_get_insert_page_with_redo(
                 meta_pool_guard,
-                &self.mem_pool,
+                self.mem_pool(),
                 row_pool_guard,
                 &self.metadata,
                 count,
@@ -372,7 +372,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         self.blk_idx
             .get_insert_page_exclusive_with_redo(
                 meta_pool_guard,
-                &self.mem_pool,
+                self.mem_pool(),
                 row_pool_guard,
                 &self.metadata,
                 count,
@@ -393,7 +393,7 @@ impl<P: BufferPool> GenericMemTable<P> {
         self.blk_idx
             .allocate_row_page_at(
                 meta_pool_guard,
-                &self.mem_pool,
+                self.mem_pool(),
                 row_pool_guard,
                 &self.metadata,
                 count,
@@ -846,7 +846,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
-    ) -> RecoverIndex {
+    ) -> Result<RecoverIndex> {
         if self.metadata().index_specs[key.index_no].unique() {
             self.recover_unique_index_insert(guards, key, row_id, cts)
                 .await
@@ -862,7 +862,7 @@ impl Table {
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
-    ) -> RecoverIndex {
+    ) -> Result<RecoverIndex> {
         if self.metadata().index_specs[key.index_no].unique() {
             self.recover_unique_index_delete(guards, key, row_id).await
         } else {
@@ -980,17 +980,17 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
-    ) -> RecoverIndex {
+    ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         let index_pool_guard = guards.index_guard();
         loop {
             match index
                 .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
-                .await
+                .await?
             {
                 IndexInsert::Ok(_) => {
                     // insert index success.
-                    return RecoverIndex::Ok;
+                    return Ok(RecoverIndex::Ok);
                 }
                 IndexInsert::DuplicateKey(old_row_id, deleted) => {
                     debug_assert!(old_row_id != row_id);
@@ -1001,7 +1001,7 @@ impl Table {
                                 // Current row has smaller CTS, that means this insert
                                 // can be skipped, and probably there is a followed DELETE
                                 // operation on it.
-                                return RecoverIndex::InsertOutdated;
+                                return Ok(RecoverIndex::InsertOutdated);
                             }
                             // Current row is newer, we should update the index entry.
                             let old_row_id = if deleted {
@@ -1017,10 +1017,10 @@ impl Table {
                                     row_id,
                                     MIN_SNAPSHOT_TS,
                                 )
-                                .await
+                                .await?
                             {
                                 IndexCompareExchange::Ok => {
-                                    return RecoverIndex::Ok;
+                                    return Ok(RecoverIndex::Ok);
                                 }
                                 // retry the insert.
                                 IndexCompareExchange::Mismatch
@@ -1042,15 +1042,15 @@ impl Table {
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
-    ) -> RecoverIndex {
+    ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].non_unique().unwrap();
         let index_pool_guard = guards.index_guard();
         // The recovery should make sure no duplicate key.
         let res = index
             .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
-            .await;
+            .await?;
         debug_assert!(matches!(res, IndexInsert::Ok(_)));
-        RecoverIndex::Ok
+        Ok(RecoverIndex::Ok)
     }
 
     #[inline]
@@ -1059,18 +1059,18 @@ impl Table {
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
-    ) -> RecoverIndex {
+    ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         let index_pool_guard = guards.index_guard();
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
-            .await
+            .await?
         {
             // Another recover thread concurrently insert index entry with same key, probably with greater CTS.
             // We just skip this deletion.
-            return RecoverIndex::DeleteOutdated;
+            return Ok(RecoverIndex::DeleteOutdated);
         }
-        RecoverIndex::Ok
+        Ok(RecoverIndex::Ok)
     }
 
     #[inline]
@@ -1079,16 +1079,16 @@ impl Table {
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
-    ) -> RecoverIndex {
+    ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].non_unique().unwrap();
         let index_pool_guard = guards.index_guard();
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
-            .await
+            .await?
         {
-            return RecoverIndex::DeleteOutdated;
+            return Ok(RecoverIndex::DeleteOutdated);
         }
-        RecoverIndex::Ok
+        Ok(RecoverIndex::Ok)
     }
 
     #[inline]

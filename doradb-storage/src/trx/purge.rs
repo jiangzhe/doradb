@@ -776,12 +776,15 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1001i32)];
-            let (row_id, _) = table.sec_idx()[0]
+            let Some((row_id, _)) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("row should exist");
+            };
             let status = Arc::new(SharedTrxStatus::global_visible());
             table
                 .deletion_buffer()
@@ -863,12 +866,15 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1002i32)];
-            let (row_id, _) = table.sec_idx()[0]
+            let Some((row_id, _)) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("row should exist");
+            };
             let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
             table
                 .deletion_buffer()
@@ -954,12 +960,15 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1003i32)];
-            let (row_id, _) = table.sec_idx()[0]
+            let Some((row_id, _)) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("row should exist");
+            };
             let page_id = match table.find_row(&pool_guards, row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcPage(..) | RowLocation::NotFound => unreachable!(),
@@ -1059,12 +1068,15 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1004i32)];
-            let (row_id, _) = table.sec_idx()[0]
+            let Some((row_id, _)) = table.sec_idx()[0]
                 .unique()
                 .unwrap()
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("row should exist");
+            };
             let page_id = match table.find_row(&pool_guards, row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcPage(..) | RowLocation::NotFound => unreachable!(),
@@ -1306,7 +1318,8 @@ mod tests {
                 let mut remained_row_ids = vec![];
                 index
                     .scan_values(pool_guards.index_guard(), &mut remained_row_ids, 100)
-                    .await;
+                    .await
+                    .unwrap();
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
                 let location = table.find_row(&pool_guards, row_id).await;

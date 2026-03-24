@@ -12,7 +12,7 @@ github_issue: 473
 
 Implement phase 4 of RFC-0010 by removing infallible buffer-pool read APIs,
 making the canonical page-access contract result-bearing, folding readonly
-validated-page access into a trait-level readonly capability, and propagating
+validated-page access into the readonly pool API itself, and propagating
 that contract through index, table, checkpoint, recovery, purge, and file-root
 loading paths. This task completes the interface cleanup that task `000087`
 intentionally deferred so engine-facing storage access no longer mixes
@@ -53,8 +53,8 @@ Parent RFC:
 1. Make shared buffer-pool read operations unambiguously result-bearing.
 2. Remove infallible page-read wrappers from production paths that can surface
    storage I/O failures.
-3. Move validated readonly persisted-page reads into a canonical trait-level
-   readonly capability.
+3. Move validated readonly persisted-page reads into the canonical readonly
+   pool API.
 4. Update index, table, checkpoint, recovery, purge, and file/root-loading
    code to use the canonical access surface.
 5. Preserve domain-specific outcomes such as `Option` misses and
@@ -190,9 +190,11 @@ Reference:
      result-bearing, with `get_page_versioned(...)` preserving
      `Result<Option<...>>` so stale page/version mismatches remain distinct
      from storage errors;
-   - validated persisted-page reads moved behind the crate-private
-     `ReadonlyBufferPoolExt` trait and its `QuiescentGuard<T>` forwarding impl
-     instead of staying on readonly-only inherent helpers.
+   - validated persisted-page reads now live on `ReadonlyBufferPool` itself as
+     the crate-private inherent async method
+     `get_validated_page_shared(...)`; the temporary
+     `ReadonlyBufferPoolExt` layer and `QuiescentGuard<T>` trait-forwarding
+     impls were removed after follow-up cleanup.
 2. Propagated the canonical contract through the concrete pools and engine
    consumers named in the task scope.
    - `FixedBufferPool`, `EvictableBufferPool`, and `ReadonlyBufferPool` were
@@ -202,15 +204,31 @@ Reference:
      checkpoint/bootstrap flows, recovery, and purge now use the canonical
      result-bearing access path rather than keeping parallel infallible helper
      families in production code.
-3. Completed review-driven follow-up within the task boundary.
+3. Completed runtime B-tree and index error propagation within the same task
+   boundary.
+   - `doradb-storage/src/index/btree.rs` no longer hides buffer-pool failures
+     behind `expect(...)` in runtime lookup, insert, delete/update, split,
+     cursor, compaction, or destroy paths; those operations now return
+     `Result<...>` while preserving logical outcomes such as
+     `BTreeInsert`, `BTreeDelete`, `BTreeUpdate`, `Option`, and
+     `Validation::Invalid` inside the success domain;
+   - unique and non-unique index wrappers, table access/index maintenance
+     paths, recovery/undo callers, and B-tree prefix scan callers were updated
+     to propagate those storage failures to their callers instead of relying on
+     hidden panics in `btree.rs`.
+4. Completed review-driven follow-up within the task boundary.
    - purge row-page deallocation in `doradb-storage/src/trx/purge.rs` no
      longer panics on `expect(...)`; fatal deallocation failures now poison the
      runtime with `StoragePoisonSource::PurgeDeallocate` and stop the purge
      loop cleanly instead;
+   - checkpoint write failure handling in
+     `doradb-storage/src/table/persistence.rs` now treats rollback as
+     best-effort before `poison_storage(...)` so the poison path still runs
+     even if rollback itself returns an error;
    - added focused regression coverage for that purge failure path so the
      shared poison state is asserted without relying on a background-task
      panic.
-4. Validation completed for the implemented state.
+5. Validation completed for the implemented state.
    - `cargo fmt --all`
      - result: passed
    - `cargo build -p doradb-storage`
@@ -221,7 +239,7 @@ Reference:
      - result: `433/433` passed
    - `cargo clippy --all-features --all-targets -- -D warnings`
      - result: passed
-5. Tracking and review state at resolve time.
+6. Tracking and review state at resolve time.
    - task issue: `#473`
    - implementation PR: `#474`
 
@@ -230,15 +248,15 @@ Reference:
 Related modules, files, structs, traits and functions:
 - `doradb-storage/src/buffer/mod.rs`
   - `BufferPool`
-  - new readonly validated-page extension trait
-  - `QuiescentGuard<T>` blanket forwarding
+  - canonical shared-read API only
+  - removal of `QuiescentGuard<T>` blanket trait forwarding
 - `doradb-storage/src/buffer/fixed.rs`
   - `impl BufferPool for FixedBufferPool`
 - `doradb-storage/src/buffer/evict.rs`
   - `impl BufferPool for EvictableBufferPool`
 - `doradb-storage/src/buffer/readonly.rs`
   - `ReadonlyBufferPool`
-  - validated-page load helpers
+  - `get_validated_page_shared(...)`
   - readonly cache invalidation and miss-join paths
 - `doradb-storage/src/table/mod.rs`
   - row-page shared/exclusive helper family
@@ -246,12 +264,20 @@ Related modules, files, structs, traits and functions:
   - catalog table-handle row-page wrappers
 - `doradb-storage/src/table/access.rs`
   - `TableAccess` consumer paths
+  - index delete/rollback maintenance propagation
 - `doradb-storage/src/index/row_block_index.rs`
   - insert-page reload and node traversal helpers
 - `doradb-storage/src/index/block_index.rs`
   - insert-page wrapper surface
 - `doradb-storage/src/index/btree.rs`
-  - node acquisition/navigation helpers
+  - runtime lookup/insert/delete/update APIs
+  - node acquisition/navigation, split, cursor, compaction, and destroy helpers
+- `doradb-storage/src/index/btree_scan.rs`
+  - prefix scan result propagation
+- `doradb-storage/src/index/unique_index.rs`
+  - unique index wrapper result propagation
+- `doradb-storage/src/index/non_unique_index.rs`
+  - non-unique index wrapper result propagation
 - `doradb-storage/src/lwc/page.rs`
   - `PersistedLwcPage::load`
 - `doradb-storage/src/index/column_block_index.rs`
@@ -266,14 +292,17 @@ Related modules, files, structs, traits and functions:
   - multi-table root load helpers
 - `doradb-storage/src/table/persistence.rs`
   - data/deletion checkpoint persisted-page reads
+  - checkpoint poison-on-write failure path
 - `doradb-storage/src/catalog/storage/checkpoint.rs`
   - catalog checkpoint bootstrap/apply persisted-page reads
 - `doradb-storage/src/table/recover.rs`
   - persisted-data index rebuild
+- `doradb-storage/src/trx/undo/index.rs`
+  - index undo rollback propagation
 - `doradb-storage/src/trx/recover.rs`
   - row-page refresh during log recovery
 - `doradb-storage/src/trx/purge.rs`
-  - row-page reload and purge validation paths
+  - row-page reload, purge validation, and fatal deallocation handling
 
 ## Test Cases
 
@@ -281,12 +310,13 @@ Related modules, files, structs, traits and functions:
    - `FixedBufferPool`, `EvictableBufferPool`, and `ReadonlyBufferPool` should
      compile and pass unit tests under the canonical result-bearing
      signatures.
-   - The `QuiescentGuard<T>` blanket impl should forward the new signatures
-     correctly.
+   - `QuiescentGuard<T>` autoderef and explicit underlying-pool references
+     should remain sufficient without blanket trait-forwarding impls.
 
 2. Readonly validated persisted-page behavior.
-   - cache-miss validated loads still reject corruption before residency is
-     published;
+   - cache-miss validated loads through
+     `ReadonlyBufferPool::get_validated_page_shared(...)` still reject
+     corruption before residency is published;
    - cached-hit revalidation still invalidates stale/corrupt mappings and
      returns `Err(...)`;
    - persisted LWC, column-index, and deletion-blob readers still decode valid
@@ -295,6 +325,9 @@ Related modules, files, structs, traits and functions:
 3. Index and table helper behavior.
    - row/block-index and B-tree helpers preserve miss/version-mismatch/
      validation behavior while surfacing true storage I/O failures separately;
+   - runtime B-tree operations and unique/non-unique index wrappers preserve
+     logical outcomes inside `Result<...>` instead of panicking on page-load
+     failures;
    - table and catalog row-page helper families no longer depend on infallible
      wrappers.
 
@@ -303,13 +336,17 @@ Related modules, files, structs, traits and functions:
      return `Err(...)` on corrupted or unreadable persisted pages instead of
      panicking through buffer access;
    - table data/deletion checkpoint and catalog checkpoint paths still succeed
-     on valid data and surface persisted-page failures explicitly.
+     on valid data and surface persisted-page failures explicitly;
+   - checkpoint write failures still publish `poison_storage(...)` even when
+     rollback itself fails.
 
 5. Recovery and purge flows.
    - table persisted-data index rebuild continues to work on valid checkpointed
      pages;
    - recovery row-page refresh and purge row-page reloads surface page-load
      failures explicitly;
+   - purge row-page deallocation failures poison the runtime and stop the
+     worker cleanly instead of panicking in the background task;
    - existing restart/bootstrap corruption tests continue to pass or are
      updated to assert the new explicit error path.
 

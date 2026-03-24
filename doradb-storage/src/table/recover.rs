@@ -28,7 +28,7 @@ pub trait TableRecover {
         cols: &[Val],
         cts: TrxID,
         disable_index: bool,
-    ) -> impl Future<Output = ()>;
+    ) -> impl Future<Output = Result<()>>;
 
     /// Recover row update from redo log.
     fn recover_row_update(
@@ -39,7 +39,7 @@ pub trait TableRecover {
         update: &[UpdateCol],
         cts: TrxID,
         disable_index: bool,
-    ) -> impl Future<Output = ()>;
+    ) -> impl Future<Output = Result<()>>;
 
     /// Recover row delete from redo log.
     fn recover_row_delete(
@@ -49,7 +49,7 @@ pub trait TableRecover {
         row_id: RowID,
         cts: TrxID,
         disable_index: bool,
-    ) -> impl Future<Output = ()>;
+    ) -> impl Future<Output = Result<()>>;
 
     /// Populate index using data on row page.
     fn populate_index_via_row_page(
@@ -74,7 +74,7 @@ impl TableRecover for Table {
         cols: &[Val],
         cts: TrxID,
         disable_index: bool,
-    ) {
+    ) -> Result<()> {
         debug_assert!(cols.len() == self.metadata().col_count());
         debug_assert!({
             cols.iter()
@@ -92,12 +92,13 @@ impl TableRecover for Table {
         if !disable_index {
             let keys = self.metadata().keys_for_insert(cols);
             for key in keys {
-                match self.recover_index_insert(guards, key, row_id, cts).await {
+                match self.recover_index_insert(guards, key, row_id, cts).await? {
                     RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
                     RecoverIndex::DeleteOutdated => unreachable!(),
                 }
             }
         }
+        Ok(())
     }
 
     async fn recover_row_update(
@@ -108,7 +109,7 @@ impl TableRecover for Table {
         update: &[UpdateCol],
         cts: TrxID,
         disable_index: bool,
-    ) {
+    ) -> Result<()> {
         let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await;
 
         if disable_index {
@@ -141,13 +142,13 @@ impl TableRecover for Table {
                         // insert new index entry.
                         match self
                             .recover_index_insert(guards, new_key, row_id, cts)
-                            .await
+                            .await?
                         {
                             RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
                             RecoverIndex::DeleteOutdated => unreachable!(),
                         }
                         // delete old index entry.
-                        match self.recover_index_delete(guards, old_key, row_id).await {
+                        match self.recover_index_delete(guards, old_key, row_id).await? {
                             RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
                             RecoverIndex::InsertOutdated => unreachable!(),
                         }
@@ -155,6 +156,7 @@ impl TableRecover for Table {
                 }
             }
         }
+        Ok(())
     }
 
     async fn recover_row_delete(
@@ -164,7 +166,7 @@ impl TableRecover for Table {
         row_id: RowID,
         cts: TrxID,
         disable_index: bool,
-    ) {
+    ) -> Result<()> {
         let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await;
 
         if disable_index {
@@ -189,12 +191,13 @@ impl TableRecover for Table {
                     .map(|ik| index_cols[&(ik.col_no as usize)].clone())
                     .collect();
                 let key = SelectKey::new(index.index_no, vals);
-                match self.recover_index_delete(guards, key, row_id).await {
+                match self.recover_index_delete(guards, key, row_id).await? {
                     RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
                     RecoverIndex::InsertOutdated => unreachable!(),
                 }
             }
         }
+        Ok(())
     }
 
     async fn populate_index_via_row_page(
@@ -226,7 +229,7 @@ impl TableRecover for Table {
                                     false,
                                     MIN_SNAPSHOT_TS,
                                 )
-                                .await;
+                                .await?;
                             ensure_recovery_index_insert(sec_idx.index_no, res)?;
                         } else {
                             let index = sec_idx.non_unique().unwrap();
@@ -238,7 +241,7 @@ impl TableRecover for Table {
                                     false,
                                     MIN_SNAPSHOT_TS,
                                 )
-                                .await;
+                                .await?;
                             ensure_recovery_index_insert(sec_idx.index_no, res)?;
                         }
                     }
@@ -295,7 +298,7 @@ impl TableRecover for Table {
                                 false,
                                 MIN_SNAPSHOT_TS,
                             )
-                            .await;
+                            .await?;
                         ensure_recovery_index_insert(key.index_no, res)?;
                     } else {
                         let res = self.sec_idx()[key.index_no]
@@ -308,7 +311,7 @@ impl TableRecover for Table {
                                 false,
                                 MIN_SNAPSHOT_TS,
                             )
-                            .await;
+                            .await?;
                         ensure_recovery_index_insert(key.index_no, res)?;
                     }
                 }
