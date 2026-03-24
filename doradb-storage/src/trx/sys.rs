@@ -86,7 +86,7 @@ pub struct TransactionSystem {
     pub(super) config: CachePadded<TrxSysConfig>,
     /// Catalog of the database.
     pub(crate) catalog: CachePadded<QuiescentGuard<Catalog>>,
-    /// Storage-runtime poison flag for fatal redo/checkpoint durability failures.
+    /// Storage-runtime poison flag for fatal storage background or durability failures.
     storage_poisoned: CachePadded<AtomicBool>,
     /// First fatal storage error that poisoned runtime admission.
     storage_poison_err: CachePadded<Mutex<Option<Error>>>,
@@ -136,7 +136,7 @@ impl TransactionSystem {
         guard.clone()
     }
 
-    /// Returns `Err` once a fatal redo/checkpoint failure poisoned runtime admission.
+    /// Returns `Err` once a fatal storage failure poisoned runtime admission.
     #[inline]
     pub fn ensure_runtime_healthy(&self) -> Result<()> {
         match self.storage_poison_error() {

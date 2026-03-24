@@ -71,7 +71,7 @@ impl fmt::Display for PersistedPageCorruptionCause {
     }
 }
 
-/// Classifies which fatal persistence path poisoned runtime admission.
+/// Classifies which fatal storage path poisoned runtime admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoragePoisonSource {
     RedoSubmit,
@@ -79,6 +79,7 @@ pub enum StoragePoisonSource {
     RedoSync,
     CheckpointWrite,
     CheckpointSync,
+    PurgeDeallocate,
 }
 
 impl fmt::Display for StoragePoisonSource {
@@ -90,6 +91,7 @@ impl fmt::Display for StoragePoisonSource {
             StoragePoisonSource::RedoSync => "redo sync",
             StoragePoisonSource::CheckpointWrite => "checkpoint write",
             StoragePoisonSource::CheckpointSync => "checkpoint sync",
+            StoragePoisonSource::PurgeDeallocate => "purge deallocate",
         })
     }
 }
