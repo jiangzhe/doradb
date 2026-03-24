@@ -328,10 +328,10 @@ This RFC changes code in an unsafe-sensitive area.
     operations.
   - Non-goals: retry policy, degraded read-only behavior, `io_uring` delivery,
     or unrelated MVCC/storage-format redesign.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000088-cleanup-buffer-pool-interface-and-engine-error-propagation.md`
+  - Task Issue: `#473`
+  - Phase Status: done
+  - Implementation Summary: Canonical buffer-pool read interfaces are now result-bearing, readonly validated reads moved into ReadonlyBufferPoolExt, and checkpoint/recovery/index/table/purge consumers use the unified access contract. [Task Resolve Sync: docs/tasks/000088-cleanup-buffer-pool-interface-and-engine-error-propagation.md @ 2026-03-24]
 
 - **Phase 5: Add `io_uring` Backend And Make It Default**
   - Scope: implement `io_uring` driver support, keep backend selection

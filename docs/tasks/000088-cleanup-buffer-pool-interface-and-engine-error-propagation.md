@@ -1,7 +1,7 @@
 ---
 id: 000088
 title: Clean Up Buffer-Pool Interface And Complete Engine Error Propagation
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-24
 github_issue: 473
 ---
@@ -120,9 +120,9 @@ Reference:
 1. Canonicalize the buffer-pool read traits.
    - Update `doradb-storage/src/buffer/mod.rs` so the shared read-style
      operations become:
-     - `get_page(...) -> Result<FacadePageGuard<T>>`
-     - `get_page_versioned(...) -> Result<Option<FacadePageGuard<T>>>`
-     - `get_child_page(...) -> Result<Validation<FacadePageGuard<T>>>`
+     - `get_page(...) -> impl Future<Output = Result<FacadePageGuard<T>>> + Send`
+     - `get_page_versioned(...) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send`
+     - `get_child_page(...) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send`
    - Remove the duplicated infallible/fallible read families from the shared
      trait.
    - Keep allocation-oriented methods unchanged in this task.
@@ -181,6 +181,49 @@ Reference:
      to `task resolve`.
 
 ## Implementation Notes
+
+1. Canonicalized the shared buffer-pool read contract and readonly validated
+   read capability.
+   - `doradb-storage/src/buffer/mod.rs` now keeps one canonical shared-read
+     surface: `get_page(...)`, `get_page_versioned(...)`, and
+     `get_child_page(...)` all return futures whose outputs are
+     result-bearing, with `get_page_versioned(...)` preserving
+     `Result<Option<...>>` so stale page/version mismatches remain distinct
+     from storage errors;
+   - validated persisted-page reads moved behind the crate-private
+     `ReadonlyBufferPoolExt` trait and its `QuiescentGuard<T>` forwarding impl
+     instead of staying on readonly-only inherent helpers.
+2. Propagated the canonical contract through the concrete pools and engine
+   consumers named in the task scope.
+   - `FixedBufferPool`, `EvictableBufferPool`, and `ReadonlyBufferPool` were
+     updated to the canonical signatures;
+   - table/catalog row-page helpers, row/block-index and B-tree navigation,
+     persisted LWC and column-index/blob readers, file root loading,
+     checkpoint/bootstrap flows, recovery, and purge now use the canonical
+     result-bearing access path rather than keeping parallel infallible helper
+     families in production code.
+3. Completed review-driven follow-up within the task boundary.
+   - purge row-page deallocation in `doradb-storage/src/trx/purge.rs` no
+     longer panics on `expect(...)`; fatal deallocation failures now poison the
+     runtime with `StoragePoisonSource::PurgeDeallocate` and stop the purge
+     loop cleanly instead;
+   - added focused regression coverage for that purge failure path so the
+     shared poison state is asserted without relying on a background-task
+     panic.
+4. Validation completed for the implemented state.
+   - `cargo fmt --all`
+     - result: passed
+   - `cargo build -p doradb-storage`
+     - result: passed
+   - `cargo test -p doradb-storage trx::purge::tests::test_handle_gc_row_page_deallocation_result_poisons_runtime -- --exact`
+     - result: passed
+   - `cargo nextest run -p doradb-storage`
+     - result: `433/433` passed
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+     - result: passed
+5. Tracking and review state at resolve time.
+   - task issue: `#473`
+   - implementation PR: `#474`
 
 ## Impacts
 
