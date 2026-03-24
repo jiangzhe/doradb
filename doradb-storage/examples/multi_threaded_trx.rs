@@ -4,10 +4,9 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
-use doradb_storage::buffer::EvictableBufferPoolConfig;
-use doradb_storage::engine::{EngineConfig, EngineRef};
+use doradb_storage::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+use doradb_storage::engine::EngineRef;
 use doradb_storage::trx::log::LogSync;
-use doradb_storage::trx::sys_conf::TrxSysConfig;
 use easy_parallel::Parallel;
 use std::str::FromStr;
 use std::sync::Arc;

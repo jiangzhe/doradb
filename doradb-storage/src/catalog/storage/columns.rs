@@ -172,8 +172,7 @@ impl Columns<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineConfig;
-    use crate::trx::sys_conf::TrxSysConfig;
+    use crate::conf::{EngineConfig, TrxSysConfig};
     use tempfile::TempDir;
 
     #[test]

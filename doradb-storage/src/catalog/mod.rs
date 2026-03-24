@@ -17,11 +17,10 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
     PoolRole,
 };
-use crate::component::{Component, ComponentRegistry, IndexPool, MetaPool, ShelfScope};
+use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
 use crate::error::{Error, Result};
 use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
-use crate::index::SecondaryIndex;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage};
@@ -73,16 +72,11 @@ impl Component for Catalog {
         _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let meta_pool = registry.dependency::<MetaPool>()?;
-        let index_pool = registry.dependency::<IndexPool>()?;
         let table_fs = registry.dependency::<TableFileSystem>()?;
         let disk_pool = registry.dependency::<crate::DiskPool>()?;
-        let storage = CatalogStorage::new(
-            meta_pool.clone_inner(),
-            index_pool.clone_inner(),
-            &table_fs,
-            disk_pool.clone_inner(),
-        )
-        .await?;
+        let storage =
+            CatalogStorage::new(meta_pool.clone_inner(), &table_fs, disk_pool.clone_inner())
+                .await?;
         registry.register::<Self>(Catalog::new(storage).await?)
     }
 
@@ -101,7 +95,6 @@ impl Catalog {
     pub async fn new(storage: CatalogStorage) -> Result<Self> {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, storage.meta_pool.pool_guard())
-            .push(PoolRole::Index, storage.index_pool.pool_guard())
             .build();
         let snapshot = storage.checkpoint_snapshot()?;
         storage
@@ -159,7 +152,7 @@ impl Catalog {
     pub(crate) async fn reload_create_table(
         &self,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
-        index_pool: QuiescentGuard<FixedBufferPool>,
+        index_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: &TableFileSystem,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         guards: &PoolGuards,
@@ -343,15 +336,6 @@ impl TableHandle {
 
     /// Returns the secondary indexes exposed by this table handle.
     #[inline]
-    pub fn sec_idx(&self) -> &[SecondaryIndex] {
-        match self {
-            TableHandle::User(table) => &table.sec_idx,
-            TableHandle::Catalog(table) => &table.sec_idx,
-        }
-    }
-
-    /// Returns the row-id boundary between persisted and in-memory data.
-    #[inline]
     pub fn pivot_row_id(&self) -> RowID {
         self.blk_idx().pivot_row_id()
     }
@@ -502,14 +486,14 @@ impl<'a> TableCache<'a> {
 pub mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
-    use crate::engine::{Engine, EngineConfig};
+    use crate::conf::{EngineConfig, TrxSysConfig};
+    use crate::engine::Engine;
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::ColumnBlockIndex;
     use crate::table::TablePersistence;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
-    use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
     use std::fs::OpenOptions;

@@ -117,7 +117,7 @@ mod basic_tests {
     }
 }
 
-pub(super) async fn log_recover(
+pub(crate) async fn log_recover(
     meta_pool: &FixedBufferPool,
     deps: RecoveryDeps,
     catalog: &Catalog,
@@ -167,16 +167,16 @@ pub(super) async fn log_recover(
     Ok((partitions, gc_rxs))
 }
 
-pub(super) struct RecoveryDeps {
-    pub(super) index_pool: QuiescentGuard<FixedBufferPool>,
-    pub(super) mem_pool: QuiescentGuard<EvictableBufferPool>,
-    pub(super) table_fs: QuiescentGuard<TableFileSystem>,
-    pub(super) global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+pub(crate) struct RecoveryDeps {
+    pub(crate) index_pool: QuiescentGuard<EvictableBufferPool>,
+    pub(crate) mem_pool: QuiescentGuard<EvictableBufferPool>,
+    pub(crate) table_fs: QuiescentGuard<TableFileSystem>,
+    pub(crate) global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
 }
 
 /// Redo-log recovery coordinator for catalog metadata and user tables.
 pub struct LogRecovery<'a> {
-    index_pool: QuiescentGuard<FixedBufferPool>,
+    index_pool: QuiescentGuard<EvictableBufferPool>,
     mem_pool: QuiescentGuard<EvictableBufferPool>,
     table_fs: QuiescentGuard<TableFileSystem>,
     global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
@@ -199,7 +199,7 @@ impl<'a> LogRecovery<'a> {
     #[inline]
     fn new(
         meta_pool: &FixedBufferPool,
-        index_pool: QuiescentGuard<FixedBufferPool>,
+        index_pool: QuiescentGuard<EvictableBufferPool>,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: QuiescentGuard<TableFileSystem>,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
@@ -619,12 +619,11 @@ impl<'a> LogRecovery<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
         TableMetadata, TableSpec,
     };
-    use crate::engine::EngineConfig;
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::build_test_fs_in;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -633,7 +632,6 @@ mod tests {
     use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol, UpdateMvcc};
     use crate::table::{TableAccess, TablePersistence};
     use crate::trx::MIN_SNAPSHOT_TS;
-    use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::Val;
     use crate::value::ValKind;
     use std::fs::OpenOptions;

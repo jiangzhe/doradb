@@ -13,8 +13,8 @@ mod util;
 
 #[cfg(test)]
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
-pub(crate) use evict::MemPoolWorkers;
-pub use evict::{EvictableBufferPool, EvictableBufferPoolConfig};
+pub use evict::EvictableBufferPool;
+pub(crate) use evict::{IndexPoolWorkers, MemPoolWorkers};
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
 pub use identity::PoolRole;
@@ -33,6 +33,7 @@ use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
     MetaPoolConfig, ShelfScope,
 };
+use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
 use crate::error::{PersistedFileKind, Result};
 use crate::io::Completion;
@@ -139,7 +140,7 @@ impl Component for MetaPool {
 
 impl Component for IndexPool {
     type Config = IndexPoolConfig;
-    type Owned = FixedBufferPool;
+    type Owned = EvictableBufferPool;
     type Access = Self;
 
     const NAME: &'static str = "index_pool";
@@ -148,12 +149,17 @@ impl Component for IndexPool {
     async fn build(
         config: Self::Config,
         registry: &mut ComponentRegistry,
-        _shelf: ShelfScope<'_, Self>,
+        mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        registry.register::<Self>(FixedBufferPool::with_capacity(
-            PoolRole::Index,
-            config.bytes,
-        )?)
+        let (pool, pending) = EvictableBufferPoolConfig::default()
+            .role(PoolRole::Index)
+            .max_mem_size(config.bytes)
+            .max_file_size(config.max_file_size)
+            .data_swap_file(config.swap_file)
+            .build()?;
+        registry.register::<Self>(pool)?;
+        shelf.put::<IndexPoolWorkers>(pending)?;
+        IndexPoolWorkers::build((), registry, shelf.scope::<IndexPoolWorkers>()).await
     }
 
     #[inline]

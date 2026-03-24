@@ -4,24 +4,20 @@
 //! including start, stop, recover, and execute commands. See
 //! `docs/engine-component-lifetime.md` for the runtime-versus-owner lifetime
 //! model that this module and [`crate::component::ComponentRegistry`] enforce.
-use crate::buffer::{EvictableBufferPoolConfig, PoolRole};
+use crate::buffer::PoolRole;
 use crate::catalog::Catalog;
 use crate::component::{
     ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
 };
+use crate::conf::EngineConfig;
 use crate::error::{Error, Result};
-use crate::file::table_fs::{TableFileSystem, TableFileSystemConfig};
+use crate::file::table_fs::TableFileSystem;
 use crate::quiescent::QuiescentGuard;
 use crate::session::Session;
-use crate::storage_path::ResolvedStoragePaths;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::sys_conf::TrxSysConfig;
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
-use byte_unit::Byte;
 use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
 use std::ops::Deref;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -273,89 +269,11 @@ impl EngineInner {
     }
 }
 
-const DEFAULT_META_BUFFER: usize = 32 * 1024 * 1024;
-const DEFAULT_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
-
-/// Storage-engine configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineConfig {
-    storage_root: PathBuf,
-    trx: TrxSysConfig,
-    meta_buffer: Byte,
-    index_buffer: Byte,
-    data_buffer: EvictableBufferPoolConfig,
-    file: TableFileSystemConfig,
-}
-
-impl Default for EngineConfig {
-    #[inline]
-    fn default() -> Self {
-        EngineConfig {
-            storage_root: PathBuf::from("."),
-            trx: TrxSysConfig::default(),
-            meta_buffer: Byte::from_u64(DEFAULT_META_BUFFER as u64),
-            index_buffer: Byte::from_u64(DEFAULT_INDEX_BUFFER as u64),
-            data_buffer: EvictableBufferPoolConfig::default(),
-            file: TableFileSystemConfig::default(),
-        }
-    }
-}
-
 impl EngineConfig {
-    /// Set the storage root directory.
-    #[inline]
-    pub fn storage_root(mut self, storage_root: impl Into<PathBuf>) -> Self {
-        self.storage_root = storage_root.into();
-        self
-    }
-
-    /// Set the transaction-system configuration.
-    #[inline]
-    pub fn trx(mut self, trx: TrxSysConfig) -> Self {
-        self.trx = trx;
-        self
-    }
-
-    /// Set the metadata-pool size.
-    #[inline]
-    pub fn meta_buffer(mut self, meta_buffer: impl Into<Byte>) -> Self {
-        self.meta_buffer = meta_buffer.into();
-        self
-    }
-
-    /// Set the secondary-index-pool size.
-    #[inline]
-    pub fn index_buffer(mut self, index_buffer: impl Into<Byte>) -> Self {
-        self.index_buffer = index_buffer.into();
-        self
-    }
-
-    /// Set the row-data buffer-pool configuration.
-    #[inline]
-    pub fn data_buffer(mut self, data_buffer: EvictableBufferPoolConfig) -> Self {
-        self.data_buffer = data_buffer;
-        self
-    }
-
-    /// Set the table-file subsystem configuration.
-    #[inline]
-    pub fn file(mut self, file: TableFileSystemConfig) -> Self {
-        self.file = file;
-        self
-    }
-
     /// Build the storage engine and all registered components.
     #[inline]
     pub async fn build(self) -> Result<Engine> {
-        let resolved = ResolvedStoragePaths::resolve(
-            &self.storage_root,
-            &self.file.data_dir,
-            &self.file.catalog_file_name,
-            self.trx.log_dir_ref(),
-            self.trx.log_file_stem_ref(),
-            self.trx.log_partitions,
-            self.data_buffer.data_swap_file_ref(),
-        )?;
+        let resolved = self.resolve_storage_paths()?;
         resolved.validate_marker_if_present()?;
         resolved.ensure_directories()?;
 
@@ -374,7 +292,11 @@ impl EngineConfig {
             .build::<MetaPool>(MetaPoolConfig::new(self.meta_buffer.as_u64() as usize))
             .await?;
         builder
-            .build::<IndexPool>(IndexPoolConfig::new(self.index_buffer.as_u64() as usize))
+            .build::<IndexPool>(IndexPoolConfig::new(
+                self.index_buffer.as_u64() as usize,
+                resolved.index_swap_file_path(),
+                self.index_max_file_size.as_u64() as usize,
+            ))
             .await?;
         builder
             .build::<MemPool>(
@@ -422,9 +344,12 @@ mod tests {
     use crate::buffer::{FixedBufferPool, GlobalReadonlyBufferPool};
     use crate::catalog::storage::CatalogStorage;
     use crate::catalog::tests::table1;
+    use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
+    use crate::conf::{
+        EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
+    };
     use crate::error::Error;
     use crate::file::build_test_fs_in;
-    use crate::storage_path::STORAGE_LAYOUT_FILE_NAME;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc as StdArc, Barrier};
@@ -437,6 +362,7 @@ mod tests {
             .storage_root(root)
             .meta_buffer(TEST_POOL_BYTES)
             .index_buffer(TEST_POOL_BYTES)
+            .index_max_file_size(128usize * 1024 * 1024)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
                     .role(PoolRole::Mem)
@@ -452,6 +378,7 @@ mod tests {
         let config = EngineConfig::default();
         let config_str = toml::to_string(&config).unwrap();
         assert!(config_str.contains("storage_root"));
+        assert!(config_str.contains("index_swap_file"));
         assert!(config_str.contains("data_swap_file"));
         assert!(config_str.contains("log_dir"));
         assert!(config_str.contains("log_file_stem"));
@@ -476,6 +403,34 @@ mod tests {
                 .await
                 .unwrap();
             drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_storage_layout_marker_allows_index_swap_change() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            drop(engine);
+
+            let engine = test_engine_config_for(root.path())
+                .index_swap_file("alt-index.bin")
+                .build()
+                .await
+                .unwrap();
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_engine_startup_creates_default_swap_files() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            drop(engine);
+
+            assert!(root.path().join("data.bin").exists());
+            assert!(root.path().join("index.bin").exists());
         });
     }
 
@@ -847,7 +802,14 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Meta, TEST_POOL_BYTES).unwrap(),
             );
             let index_pool = crate::quiescent::QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Index, TEST_POOL_BYTES).unwrap(),
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Index)
+                    .data_swap_file(temp_dir.path().join("index.bin"))
+                    .max_mem_size(TEST_POOL_BYTES)
+                    .max_file_size(128usize * 1024 * 1024)
+                    .build()
+                    .unwrap()
+                    .0,
             );
             let mem_pool = crate::quiescent::QuiescentBox::new(
                 EvictableBufferPoolConfig::default()
@@ -864,14 +826,9 @@ mod tests {
             );
             let catalog = crate::quiescent::QuiescentBox::new(
                 Catalog::new(
-                    CatalogStorage::new(
-                        meta_pool.guard(),
-                        index_pool.guard(),
-                        &table_fs,
-                        disk_pool.guard(),
-                    )
-                    .await
-                    .unwrap(),
+                    CatalogStorage::new(meta_pool.guard(), &table_fs, disk_pool.guard())
+                        .await
+                        .unwrap(),
                 )
                 .await
                 .unwrap(),

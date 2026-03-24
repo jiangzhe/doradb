@@ -13,7 +13,7 @@ pub use recover::*;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool,
+    BufferPool, EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool,
     RowPoolRole,
 };
 use crate::catalog::TableMetadata;
@@ -22,8 +22,8 @@ use crate::error::{Error, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    BlockIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, SecondaryIndex,
-    UniqueIndex,
+    BlockIndex, GenericSecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex,
+    RowLocation, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
 use crate::lwc::LwcBuilder;
@@ -87,13 +87,14 @@ pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
 /// Additional key validation is performed if index lookup is used, because
 /// index does not contain version information, and out-of-date index entry
 /// should ignored if visible data version does not match index key.
-pub struct GenericMemTable<P: 'static> {
+pub struct GenericMemTable<D: 'static, I: 'static> {
     pub(crate) table_id: TableID,
     pub(crate) metadata: Arc<TableMetadata>,
-    pub(crate) mem_pool: QuiescentGuard<P>,
+    pub(crate) mem_pool: QuiescentGuard<D>,
     pub(crate) row_pool_role: RowPoolRole,
+    pub(crate) index_pool_role: PoolRole,
     pub(crate) blk_idx: BlockIndex,
-    pub(crate) sec_idx: Box<[SecondaryIndex]>,
+    pub(crate) sec_idx: Box<[GenericSecondaryIndex<I>]>,
 }
 
 /// Persisted column-store attachments associated with a user table runtime.
@@ -105,7 +106,7 @@ pub struct ColumnStorage {
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
 pub struct Table {
-    pub(crate) mem: GenericMemTable<EvictableBufferPool>,
+    pub(crate) mem: GenericMemTable<EvictableBufferPool, EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
 }
 
@@ -116,16 +117,16 @@ struct FrozenPage {
 }
 
 #[inline]
-pub(crate) async fn build_secondary_indexes(
-    index_pool: QuiescentGuard<FixedBufferPool>,
+pub(crate) async fn build_secondary_indexes<I: BufferPool + 'static>(
+    index_pool: QuiescentGuard<I>,
     index_pool_guard: &PoolGuard,
     metadata: &TableMetadata,
     index_ts: TrxID,
-) -> Box<[SecondaryIndex]> {
+) -> Box<[GenericSecondaryIndex<I>]> {
     let mut sec_idx = Vec::with_capacity(metadata.index_specs.len());
     for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
         let ty_infer = |col_no: usize| metadata.col_type(col_no);
-        let si = SecondaryIndex::new(
+        let si = GenericSecondaryIndex::new(
             index_pool.clone(),
             index_pool_guard,
             index_no,
@@ -139,13 +140,14 @@ pub(crate) async fn build_secondary_indexes(
     sec_idx.into_boxed_slice()
 }
 
-impl<P: BufferPool> GenericMemTable<P> {
+impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
-        mem_pool: QuiescentGuard<P>,
+        mem_pool: QuiescentGuard<D>,
         row_pool_role: RowPoolRole,
-        index_pool: QuiescentGuard<FixedBufferPool>,
+        index_pool: QuiescentGuard<I>,
+        index_pool_role: PoolRole,
         index_pool_guard: &crate::buffer::PoolGuard,
         table_id: TableID,
         metadata: Arc<TableMetadata>,
@@ -159,6 +161,7 @@ impl<P: BufferPool> GenericMemTable<P> {
             metadata,
             mem_pool,
             row_pool_role,
+            index_pool_role,
             blk_idx,
             sec_idx,
         }
@@ -178,7 +181,7 @@ impl<P: BufferPool> GenericMemTable<P> {
 
     /// Returns the buffer pool used for in-memory row pages.
     #[inline]
-    pub fn mem_pool(&self) -> &P {
+    pub fn mem_pool(&self) -> &D {
         &self.mem_pool
     }
 
@@ -190,7 +193,7 @@ impl<P: BufferPool> GenericMemTable<P> {
 
     /// Returns the secondary-index array owned by this table.
     #[inline]
-    pub fn sec_idx(&self) -> &[SecondaryIndex] {
+    pub fn sec_idx(&self) -> &[GenericSecondaryIndex<I>] {
         &self.sec_idx
     }
 
@@ -205,6 +208,13 @@ impl<P: BufferPool> GenericMemTable<P> {
         guards
             .try_row_guard(self.row_pool_role)
             .expect("missing row-page pool guard")
+    }
+
+    #[inline]
+    pub(crate) fn index_pool_guard<'a>(&self, guards: &'a PoolGuards) -> &'a PoolGuard {
+        guards
+            .try_guard(self.index_pool_role)
+            .expect("missing secondary-index pool guard")
     }
 
     #[inline]
@@ -437,7 +447,7 @@ impl Table {
     #[inline]
     pub(crate) async fn new(
         mem_pool: QuiescentGuard<EvictableBufferPool>,
-        index_pool: QuiescentGuard<FixedBufferPool>,
+        index_pool: QuiescentGuard<EvictableBufferPool>,
         index_pool_guard: &crate::buffer::PoolGuard,
         table_id: TableID,
         blk_idx: BlockIndex,
@@ -450,6 +460,7 @@ impl Table {
             mem_pool.clone(),
             mem_pool.row_pool_role(),
             index_pool,
+            PoolRole::Index,
             index_pool_guard,
             table_id,
             metadata,
@@ -932,7 +943,7 @@ impl Table {
         cts: TrxID,
     ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         loop {
             match index
                 .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -994,7 +1005,7 @@ impl Table {
         row_id: RowID,
     ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].non_unique().unwrap();
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         // The recovery should make sure no duplicate key.
         let res = index
             .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -1011,7 +1022,7 @@ impl Table {
         row_id: RowID,
     ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await?
@@ -1031,7 +1042,7 @@ impl Table {
         row_id: RowID,
     ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].non_unique().unwrap();
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await?
@@ -1063,7 +1074,7 @@ impl Table {
 }
 
 impl Deref for Table {
-    type Target = GenericMemTable<EvictableBufferPool>;
+    type Target = GenericMemTable<EvictableBufferPool, EvictableBufferPool>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {

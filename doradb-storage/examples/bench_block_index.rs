@@ -1,11 +1,10 @@
 use clap::Parser;
-use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig};
+use doradb_storage::buffer::BufferPool;
 use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
 };
-use doradb_storage::engine::EngineConfig;
+use doradb_storage::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
 use doradb_storage::index::{RowBlockIndex, RowLocation};
-use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::ValKind;
 use parking_lot::RwLock;
 

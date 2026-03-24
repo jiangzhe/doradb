@@ -4,13 +4,13 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
-use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig};
+use doradb_storage::buffer::BufferPool;
 use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableSpec,
 };
-use doradb_storage::engine::{Engine, EngineConfig, EngineRef};
+use doradb_storage::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+use doradb_storage::engine::{Engine, EngineRef};
 use doradb_storage::trx::log::LogSync;
-use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::Val;
 use doradb_storage::value::ValKind;
 use easy_parallel::Parallel;

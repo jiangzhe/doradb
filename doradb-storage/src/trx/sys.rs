@@ -1,5 +1,6 @@
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
 use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
+use crate::conf::TrxSysConfig;
 use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::table_fs::TableFileSystem;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
@@ -10,7 +11,6 @@ use crate::trx::log::{LOG_HEADER_PAGES, LogPartition};
 use crate::trx::log_replay::MmapLogReader;
 use crate::trx::purge::{GC, Purge};
 use crate::trx::redo::RedoLogs;
-use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
     ActiveTrx, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, TrxID,
@@ -105,7 +105,7 @@ pub(crate) struct TransactionSystemWorkersOwned {
 
 impl TransactionSystem {
     #[inline]
-    pub(super) fn new(
+    pub(crate) fn new(
         config: TrxSysConfig,
         catalog: QuiescentGuard<Catalog>,
         log_partitions: Vec<CachePadded<LogPartition>>,
@@ -378,7 +378,7 @@ impl TransactionSystem {
 
     /// Start background GC threads.
     #[inline]
-    pub(super) fn start_gc_threads(
+    pub(crate) fn start_gc_threads(
         trx_sys: QuiescentGuard<Self>,
         gc_rxs: Vec<Receiver<GC>>,
         purge_chan: Sender<Purge>,
@@ -400,7 +400,7 @@ impl TransactionSystem {
 
     /// Start background IO threads.
     #[inline]
-    pub(super) fn start_io_threads(trx_sys: QuiescentGuard<Self>) -> Vec<JoinHandle<()>> {
+    pub(crate) fn start_io_threads(trx_sys: QuiescentGuard<Self>) -> Vec<JoinHandle<()>> {
         let trx_sys = trx_sys.into_sync();
         let mut handles = Vec::with_capacity(trx_sys.log_partitions.len());
         for idx in 0..trx_sys.log_partitions.len() {
@@ -578,9 +578,8 @@ impl Component for TransactionSystemWorkers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table2;
-    use crate::engine::EngineConfig;
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
     use crate::value::Val;
     use crossbeam_utils::CachePadded;
     use parking_lot::Mutex;
