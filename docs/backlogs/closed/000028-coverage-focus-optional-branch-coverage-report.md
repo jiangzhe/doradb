@@ -19,3 +19,10 @@ Add optional branch-coverage output to `tools/coverage_focus.rs` after line-focu
 
 Tool can produce branch-coverage report on demand with validated parser/report behavior.
 
+## Close Reason
+
+- Type: wontfix
+- Detail: Branch coverage is currently unstable and not required for this project.
+- Closed By: backlog close
+- Reference: User direction on 2026-03-24 during backlog close request.
+- Closed At: 2026-03-24
