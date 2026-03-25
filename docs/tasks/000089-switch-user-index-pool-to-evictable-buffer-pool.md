@@ -1,7 +1,7 @@
 ---
 id: 000089
 title: Switch User Index Pool To Evictable Buffer Pool
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-24
 github_issue: 475
 ---
@@ -80,7 +80,8 @@ to existing mmap, direct-I/O, and page-latch code.
    - `doradb-storage/src/buffer/mod.rs`
    - `doradb-storage/src/buffer/evict.rs`
    - `doradb-storage/src/buffer/fixed.rs`
-   - `doradb-storage/src/storage_path.rs`
+   - `doradb-storage/src/conf/engine.rs`
+   - `doradb-storage/src/conf/path.rs`
 2. Keep the change at the pool-family, config, and runtime-wiring boundary. Do
    not widen the `unsafe` surface or add new raw pointer or file descriptor
    ownership paths if existing helpers can be reused.
@@ -152,36 +153,57 @@ Reference:
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve` after implementation, tests, review, and verification are completed.
+1. Switched user `IndexPool` from `FixedBufferPool` to `EvictableBufferPool`
+   while preserving explicit worker lifecycle management. `component.rs` and
+   `buffer/mod.rs` now register dedicated index-pool workers, user-table
+   secondary indexes run on `PoolRole::Index`, and catalog rows/indexes remain
+   on `meta_pool`.
+2. Refactored storage-engine startup configuration into `doradb-storage/src/conf/`
+   and moved storage-path resolution behind `EngineConfig`. The implementation
+   now centers on `conf/engine.rs`, `conf/buffer.rs`, `conf/table_fs.rs`,
+   `conf/trx.rs`, `conf/path.rs`, and `conf/consts.rs`; the old
+   `storage_path.rs` and `trx/sys_conf.rs` modules were removed.
+3. Added dedicated user-index swap-file config and path resolution:
+   `index_swap_file`, `index_max_file_size`, and resolved startup wiring for the
+   evictable index pool. The runtime split now keeps user tables on evictable
+   row/index pools while catalog runtime stays fully memory resident on
+   `meta_pool`.
+4. Renamed ephemeral swap files from `.bin` to `.swp`, added an index-specific
+   evictable-pool builder path so validation errors report `index_swap_file`,
+   and tightened path validation for swap-file overlap, reserved-file ancestry,
+   and directory alias cases. Startup now documents the intended safety model:
+   failures may happen after directory preparation, but they must not clobber
+   durable files or persist `storage-layout.toml` before full engine startup.
+5. Updated examples and regression coverage across startup, restart, catalog,
+   and table/index behavior. Verification completed with:
+   - `cargo clippy --all-features --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage` with `445/445` passing
+6. Review-driven follow-up fixes included:
+   - correcting swap-file error attribution for index-pool builds;
+   - enforcing `.swp` suffixes consistently across defaults and validation;
+   - tightening reserved-path and directory-alias checks while preserving the
+     default root-level swap-file layout.
 
 ## Impacts
 
 1. `doradb-storage/src/component.rs`
-2. `doradb-storage/src/buffer/mod.rs`
-3. `doradb-storage/src/buffer/evict.rs`
+2. `doradb-storage/src/buffer/{mod.rs,evict.rs}`
+3. `doradb-storage/src/conf/{mod.rs,engine.rs,buffer.rs,table_fs.rs,trx.rs,path.rs,consts.rs}`
 4. `doradb-storage/src/engine.rs`
-5. `doradb-storage/src/storage_path.rs`
-6. `doradb-storage/src/table/mod.rs`
-7. `doradb-storage/src/table/access.rs`
-8. `doradb-storage/src/index/secondary_index.rs`
-9. `doradb-storage/src/index/unique_index.rs`
-10. `doradb-storage/src/index/non_unique_index.rs`
-11. `doradb-storage/src/catalog/runtime.rs`
-12. `doradb-storage/src/catalog/storage/mod.rs`
-13. `doradb-storage/src/catalog/mod.rs`
-14. `doradb-storage/src/session.rs`
-15. `doradb-storage/src/trx/sys_conf.rs`
-16. `doradb-storage/src/trx/recover.rs`
-17. `doradb-storage/src/trx/purge.rs`
-18. `doradb-storage/src/trx/undo/index.rs`
-19. Related examples and tests that construct engine config or assume fixed user
-    secondary indexes.
+5. `doradb-storage/src/catalog/{mod.rs,runtime.rs,storage/{mod.rs,checkpoint.rs,tables.rs,columns.rs,indexes.rs}}`
+6. `doradb-storage/src/table/{mod.rs,access.rs,recover.rs,tests.rs}`
+7. `doradb-storage/src/index/{row_block_index.rs,secondary_index.rs}`
+8. `doradb-storage/src/trx/{mod.rs,log.rs,purge.rs,recover.rs,sys.rs,undo/index.rs}`
+9. `doradb-storage/src/file/table_fs.rs`
+10. `doradb-storage/examples/{bench_block_index.rs,bench_insert.rs,bench_readonly_buffer_pool.rs,multi_threaded_trx.rs}`
+11. `docs/unsafe-usage-baseline.md`
 
 ## Test Cases
 
 1. `ResolvedStoragePaths` validates `index_swap_file` as a root-relative
-   `.swp` file and rejects overlap with `data_swap_file`, `catalog.mtb`,
-   `storage-layout.toml`, durable table-file paths, and the redo-log family.
+   `.swp` file and rejects overlap or reserved-path aliasing with
+   `data_swap_file`, `catalog.mtb`, `storage-layout.toml`, durable table-file
+   paths, conflicting directory aliases, and the redo-log family.
 2. Fresh engine startup with default config resolves and uses both `data.swp`
    and `index.swp`.
 3. Restart with changed `index_swap_file` succeeds because the file is
@@ -195,7 +217,8 @@ Keep this section blank in design phase. Fill this section during `task resolve`
    indexes on `meta_pool` and without requiring `PoolRole::Index`.
 7. Recovery reopens checkpointed user tables, replays redo, and rebuilds user
    secondary indexes correctly with the evictable user index pool.
-8. Supported validation pass: `cargo nextest run -p doradb-storage`
+8. Invalid swap-path startup failure does not persist `storage-layout.toml`.
+9. Supported validation pass: `cargo nextest run -p doradb-storage`
 
 ## Open Questions
 
