@@ -362,10 +362,10 @@ This RFC changes code in an unsafe-sensitive area.
   - Non-goals: switching `io_uring` to the default mode, runtime backend
     switching, reintroducing thread-pool fallback, or proving the final
     performance floor required for default adoption.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000090-add-io-uring-backend.md`
+  - Task Issue: `#478`
+  - Phase Status: done
+  - Implementation Summary: Added the io_uring backend, canonical StorageBackend naming, backend-neutral test hooks, and alternate-backend validation while keeping libaio as the default backend. [Task Resolve Sync: docs/tasks/000090-add-io-uring-backend.md @ 2026-03-25]
 
 - **Phase 6: Make `io_uring` Default, Cleanup, And Document Async IO**
   - Scope: switch the default compile-time backend to `io_uring`, complete the

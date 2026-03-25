@@ -197,6 +197,70 @@ Reference:
 
 ## Implementation Notes
 
+1. Added the compile-time backend-selection contract and canonical backend
+   naming.
+   - `doradb-storage/Cargo.toml` now defines explicit `libaio` and `iouring`
+     features with `libaio` kept as the default backend for this phase;
+   - `doradb-storage/src/io/mod.rs` now rejects invalid backend-feature
+     combinations at compile time, re-exports `LibaioBackend` and
+     `IouringBackend`, and exposes `StorageBackend` as the canonical
+     feature-selected backend alias;
+   - the old `LibaioContext` naming was retired in favor of
+     `LibaioBackend`.
+2. Landed `IouringBackend` on top of the existing completion core without
+   changing higher-level storage semantics.
+   - `doradb-storage/src/io/iouring_backend.rs` implements `IOBackend` using
+     the existing `Operation` ownership model for both owned direct buffers and
+     borrowed page memory;
+   - the backend keeps worker-owned staged SQEs, backend-token round-tripping,
+     and completion-driven lifetime management aligned with the generic worker
+     contract rather than introducing a separate `io_uring`-specific request
+     API.
+3. Moved production storage startup paths to the canonical backend alias.
+   - table-file, evictable-buffer-pool, transaction config, and redo-log
+     startup now construct `StorageBackend` instead of wiring the libaio
+     implementation type directly;
+   - this keeps backend selection compile-time while making the later
+     default-switch task a bounded follow-up instead of another repository-wide
+     rename.
+4. Replaced libaio-only failure-injection seams with backend-neutral test
+   support.
+   - readonly-buffer and table tests now use a storage-backend hook surface
+     instead of `iocb`-specific inspection;
+   - the test-only hook types were later moved under `io::tests` and
+     re-exported narrowly from `crate::io` to match the repository's inline
+     test-helper style.
+5. Completed review-driven follow-up fixes and cleanup within task scope.
+   - `submit_pending_sqes(...)` in `iouring_backend.rs` now falls back to
+     blocking `submit_and_wait(1)` on `EAGAIN` / `EBUSY` when SQEs are already
+     pending, so worker-side submitted-count bookkeeping stays consistent with
+     what the kernel actually accepted;
+   - the old libaio-only benchmark example
+     `doradb-storage/examples/bench_aio.rs` was removed;
+   - dead `SparseFile` `pread*` / `pwrite*` wrappers and their unused
+     file-level forwarding helpers were removed after the backend-neutral path
+     made them obsolete.
+6. Kept phase-5 validation and workflow policy aligned with the approved scope.
+   - CI and pre-commit stayed default-backend-only for this task rather than
+     making `io_uring` a primary quality gate;
+   - process docs and local validation guidance now describe the alternate
+     `io_uring` pass as an explicit backend-change validation step instead of a
+     default branch requirement.
+7. Validation completed for the implemented state.
+   - `cargo fmt --all --check`
+     - result: passed
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+     - result: passed
+   - `cargo nextest run -p doradb-storage`
+     - result: passed
+   - `cargo clippy -p doradb-storage --no-default-features --features iouring --all-targets -- -D warnings`
+     - result: passed
+   - `cargo nextest run -p doradb-storage --no-default-features --features iouring`
+     - result: passed
+8. Tracking and review state at resolve time.
+   - task issue: `#478`
+   - implementation PR: `#479`
+
 ## Impacts
 
 1. `doradb-storage/Cargo.toml`
