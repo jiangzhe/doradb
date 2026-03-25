@@ -65,6 +65,10 @@ pub enum AIOError {
 }
 
 pub type AIOResult<T> = StdResult<T, AIOError>;
+#[cfg(test)]
+pub(crate) use self::tests::{
+    StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook,
+};
 #[cfg(all(test, feature = "libaio"))]
 pub(crate) use libaio_backend::tests::set_io_submit_hook;
 
@@ -175,61 +179,6 @@ impl UnsafeAIO {
     pub fn iocb_raw(&self) -> IocbRawPtr {
         self.iocb.as_mut_ptr()
     }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StorageBackendOp {
-    kind: AIOKind,
-    fd: RawFd,
-    offset: usize,
-}
-
-#[cfg(test)]
-impl StorageBackendOp {
-    #[inline]
-    pub(crate) fn kind(&self) -> AIOKind {
-        self.kind
-    }
-
-    #[inline]
-    pub(crate) fn fd(&self) -> RawFd {
-        self.fd
-    }
-
-    #[inline]
-    pub(crate) fn offset(&self) -> usize {
-        self.offset
-    }
-}
-
-#[cfg(test)]
-pub(crate) trait StorageBackendTestHook: Send + Sync {
-    fn on_submit(&self, _op: StorageBackendOp) {}
-
-    fn on_complete(&self, _op: StorageBackendOp, _res: &mut StdResult<usize, std::io::Error>) {}
-}
-
-#[cfg(test)]
-type StorageBackendHook = std::sync::Arc<dyn StorageBackendTestHook>;
-
-#[cfg(test)]
-static STORAGE_BACKEND_TEST_HOOK: std::sync::Mutex<Option<StorageBackendHook>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-#[inline]
-fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
-    STORAGE_BACKEND_TEST_HOOK.lock().unwrap().clone()
-}
-
-#[cfg(test)]
-#[inline]
-pub(crate) fn set_storage_backend_test_hook(
-    hook: Option<StorageBackendHook>,
-) -> Option<StorageBackendHook> {
-    let mut guard = STORAGE_BACKEND_TEST_HOOK.lock().unwrap();
-    std::mem::replace(&mut *guard, hook)
 }
 
 /// Buffer ownership model for one backend-agnostic IO operation.
@@ -847,7 +796,7 @@ where
                 let limit = self.io_depth() - self.submitted;
                 let submit_count = self.backend.submit_batch(&mut self.submit_batch, limit);
                 #[cfg(test)]
-                let hook = current_storage_backend_test_hook();
+                let hook = tests::current_storage_backend_test_hook();
                 for _ in 0..submit_count {
                     let slot = self
                         .staged_slots
@@ -858,11 +807,7 @@ where
                     #[cfg(test)]
                     if let Some(hook) = &hook {
                         let op = entry.submission.operation();
-                        hook.on_submit(StorageBackendOp {
-                            kind: op.kind(),
-                            fd: op.fd(),
-                            offset: op.offset(),
-                        });
+                        hook.on_submit(StorageBackendOp::new(op.kind(), op.fd(), op.offset()));
                     }
                     self.state_machine.on_submit(&entry.submission);
                     entry.submitted = true;
@@ -891,14 +836,10 @@ where
                         let (entry, res) = {
                             let mut entry = entry;
                             let mut res = res;
-                            if let Some(hook) = current_storage_backend_test_hook() {
+                            if let Some(hook) = tests::current_storage_backend_test_hook() {
                                 let op = entry.submission.operation();
                                 hook.on_complete(
-                                    StorageBackendOp {
-                                        kind: op.kind(),
-                                        fd: op.fd(),
-                                        offset: op.offset(),
-                                    },
+                                    StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
                                     &mut res,
                                 );
                             }
@@ -986,30 +927,61 @@ mod tests {
     use libc::EAGAIN;
     #[cfg(feature = "libaio")]
     use std::os::fd::AsRawFd;
+    use std::sync::Arc;
     #[cfg(feature = "libaio")]
     use tempfile::TempDir;
 
-    #[test]
-    #[cfg(feature = "libaio")]
-    fn test_aio_file_ops() {
-        let ctx = LibaioBackend::try_default().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("aio_file1.txt");
-        let file_path = file_path.to_string_lossy().into_owned();
-        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
-        let buf = DirectBuf::with_data(b"hello, world");
-        let (offset, _) = file.alloc(buf.capacity()).unwrap();
-        let aio = file.pwrite_direct(100, offset, buf);
-        let reqs = vec![aio.iocb_raw()];
-        let limit = reqs.len();
-        let submit_count = ctx.submit_limit(&reqs, limit);
-        println!("submit_count={}", submit_count);
-        let mut events = ctx.events();
-        ctx.wait_at_least(&mut events, 1, |key, res| {
-            println!("key={}, res={:?}", key, res);
-            AIOKind::Write
-        });
-        drop(file);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct StorageBackendOp {
+        kind: AIOKind,
+        fd: RawFd,
+        offset: usize,
+    }
+
+    impl StorageBackendOp {
+        #[inline]
+        pub(super) fn new(kind: AIOKind, fd: RawFd, offset: usize) -> Self {
+            Self { kind, fd, offset }
+        }
+
+        #[inline]
+        pub(crate) fn kind(&self) -> AIOKind {
+            self.kind
+        }
+
+        #[inline]
+        pub(crate) fn fd(&self) -> RawFd {
+            self.fd
+        }
+
+        #[inline]
+        pub(crate) fn offset(&self) -> usize {
+            self.offset
+        }
+    }
+
+    pub(crate) trait StorageBackendTestHook: Send + Sync {
+        fn on_submit(&self, _op: StorageBackendOp) {}
+
+        fn on_complete(&self, _op: StorageBackendOp, _res: &mut StdResult<usize, std::io::Error>) {}
+    }
+
+    type StorageBackendHook = Arc<dyn StorageBackendTestHook>;
+
+    static STORAGE_BACKEND_TEST_HOOK: std::sync::Mutex<Option<StorageBackendHook>> =
+        std::sync::Mutex::new(None);
+
+    #[inline]
+    pub(super) fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
+        STORAGE_BACKEND_TEST_HOOK.lock().unwrap().clone()
+    }
+
+    #[inline]
+    pub(crate) fn set_storage_backend_test_hook(
+        hook: Option<StorageBackendHook>,
+    ) -> Option<StorageBackendHook> {
+        let mut guard = STORAGE_BACKEND_TEST_HOOK.lock().unwrap();
+        std::mem::replace(&mut *guard, hook)
     }
 
     #[test]
