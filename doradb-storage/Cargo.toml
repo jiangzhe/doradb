@@ -9,6 +9,11 @@ keywords = ["database", "encoding"]
 categories = ["database-implementations"]
 repository = "https://github.com/jiangzhe/doradb/doradb-storage/"
 
+[features]
+default = ["libaio"]
+libaio = []
+iouring = ["dep:io-uring"]
+
 [dependencies]
 smallvec = {version = "1.8", features = ["union"]}
 thiserror = "1.0"
@@ -35,6 +40,7 @@ scopeguard = "1.2"
 blake3 = "1.8"
 ordered-float = {version = "5.1", features = ["serde"] }
 dashmap = "6.1"
+io-uring = { version = "0.7.11", optional = true }
 
 [dev-dependencies]
 rand = "0.9"

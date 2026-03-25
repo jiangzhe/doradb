@@ -12,10 +12,13 @@ pub(crate) use self::table_fs::tests::{build_test_fs, build_test_fs_in};
 use crate::buffer::{PersistedBlockKey, ReadSubmission};
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
+#[cfg(feature = "libaio")]
 use crate::io::io_iocb_cmd;
+#[cfg(feature = "libaio")]
+use crate::io::{AIO, AIOBuf, AIOKey, UnsafeAIO};
 use crate::io::{
-    AIO, AIOBuf, AIOClient, AIOError, AIOKey, AIOKind, AIOResult, AIOStats, Completion, IOQueue,
-    IOStateMachine, IOSubmission, Operation, STORAGE_SECTOR_SIZE, UnsafeAIO, align_to_sector_size,
+    AIOClient, AIOError, AIOKind, AIOResult, AIOStats, Completion, IOQueue, IOStateMachine,
+    IOSubmission, Operation, STORAGE_SECTOR_SIZE, align_to_sector_size,
 };
 use crate::{error::Error, error::Result};
 use libc::{
@@ -155,6 +158,7 @@ impl SparseFile {
     /// Returns a pread IO request.
     /// User should make sure key is unique.
     #[inline]
+    #[cfg(feature = "libaio")]
     pub fn pread_direct<T: AIOBuf>(&self, key: AIOKey, offset: usize, buf: T) -> AIO<T> {
         pread_direct(key, self.fd, offset, buf)
     }
@@ -166,6 +170,7 @@ impl SparseFile {
     /// Caller must guarantee the pointer is valid during
     /// syscall, and pointer is correctly aligned.
     #[inline]
+    #[cfg(feature = "libaio")]
     pub unsafe fn pread_unchecked(
         &self,
         key: AIOKey,
@@ -179,6 +184,7 @@ impl SparseFile {
     /// Returns a pwrite IO request.
     /// User should make sure key is unique.
     #[inline]
+    #[cfg(feature = "libaio")]
     pub fn pwrite_direct<T: AIOBuf>(&self, key: AIOKey, offset: usize, buf: T) -> AIO<T> {
         pwrite_direct(key, self.fd, offset, buf)
     }
@@ -190,6 +196,7 @@ impl SparseFile {
     /// Caller must guarantee the pointer is valid during
     /// syscall, and pointer is correctly aligned.
     #[inline]
+    #[cfg(feature = "libaio")]
     pub unsafe fn pwrite_unchecked(
         &self,
         key: AIOKey,
@@ -500,6 +507,7 @@ impl Deref for FixedSizeBufferFreeList {
 }
 
 #[inline]
+#[cfg(feature = "libaio")]
 pub fn pread_direct<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
@@ -521,6 +529,7 @@ pub fn pread_direct<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) ->
 /// Caller must guarantee the pointer is valid during
 /// syscall, and pointer is correctly aligned.
 #[inline]
+#[cfg(feature = "libaio")]
 pub unsafe fn pread_unchecked(
     key: AIOKey,
     fd: RawFd,
@@ -545,6 +554,7 @@ pub unsafe fn pread_unchecked(
 }
 
 #[inline]
+#[cfg(feature = "libaio")]
 pub fn pwrite_direct<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
@@ -566,6 +576,7 @@ pub fn pwrite_direct<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -
 /// Caller must guarantee the pointer is valid during
 /// syscall, and pointer is correctly aligned.
 #[inline]
+#[cfg(feature = "libaio")]
 pub unsafe fn pwrite_unchecked(
     key: AIOKey,
     fd: RawFd,

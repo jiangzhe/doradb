@@ -10,7 +10,7 @@ use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MultiTableFil
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{TableFsRequest, TableFsStateMachine};
-use crate::io::{AIOClient, IOWorkerBuilder, LibaioContext};
+use crate::io::{AIOClient, IOWorkerBuilder, StorageBackend};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use parking_lot::Mutex;
 use std::path::{Component as PathComponent, Path, PathBuf};
@@ -44,7 +44,7 @@ impl TableFileSystem {
         data_dir: PathBuf,
         catalog_file_name: String,
     ) -> Result<(Self, IOWorkerBuilder<TableFsRequest>)> {
-        let ctx = LibaioContext::new(io_depth)?;
+        let ctx = StorageBackend::new(io_depth)?;
         let (worker, io_client) = ctx.io_worker();
         Ok((
             TableFileSystem {

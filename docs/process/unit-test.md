@@ -21,8 +21,8 @@ enforces:
 
 ## `libaio` Requirement
 
-The storage engine uses `libaio` for asynchronous I/O operations, and that is
-the only supported backend at the moment.
+The storage engine uses `libaio` for the default asynchronous I/O backend and
+also supports a non-default `io_uring` backend build.
 
 Install the Linux packages before running routine validation locally or in CI:
 
@@ -30,8 +30,8 @@ Install the Linux packages before running routine validation locally or in CI:
 sudo apt-get install -y libaio1 libaio-dev
 ```
 
-The repository no longer supports `--no-default-features` as an alternate
-validation path.
+Default local validation still uses the default `libaio` feature set. Backend
+changes should also validate the alternate `io_uring` build explicitly.
 
 ## Running Tests
 
@@ -39,6 +39,13 @@ Run the supported validation pass:
 
 ```bash
 cargo nextest run -p doradb-storage
+```
+
+When changing storage backend code or backend-neutral IO paths, also run the
+alternate-backend pass:
+
+```bash
+cargo nextest run -p doradb-storage --no-default-features --features iouring
 ```
 
 ## Doc Tests
@@ -127,7 +134,7 @@ tools/coverage_focus.rs \
   --write target/coverage/table-focus.md
 ```
 
-The script regenerates coverage artifacts for the supported `libaio`
+The script regenerates coverage artifacts for the default `libaio`
 configuration and runs `cargo llvm-cov nextest --lcov` before printing focused
 line-coverage summaries and uncovered-line hotspots.
 

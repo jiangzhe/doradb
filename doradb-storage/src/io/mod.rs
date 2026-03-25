@@ -1,7 +1,16 @@
+#[cfg(all(feature = "libaio", feature = "iouring"))]
+compile_error!("Enable exactly one storage IO backend feature: `libaio` or `iouring`.");
+#[cfg(not(any(feature = "libaio", feature = "iouring")))]
+compile_error!("One storage IO backend feature must be enabled: `libaio` or `iouring`.");
+
 mod backend;
 mod buf;
 mod completion;
+#[cfg(feature = "iouring")]
+mod iouring_backend;
+#[cfg(feature = "libaio")]
 mod libaio_abi;
+#[cfg(feature = "libaio")]
 mod libaio_backend;
 
 use crate::thread;
@@ -16,8 +25,19 @@ use thiserror::Error;
 pub use backend::*;
 pub use buf::*;
 pub use completion::*;
+#[cfg(feature = "iouring")]
+pub use iouring_backend::IouringBackend;
+#[cfg(feature = "libaio")]
 pub use libaio_abi::*;
-pub use libaio_backend::*;
+#[cfg(feature = "libaio")]
+pub use libaio_backend::LibaioBackend;
+
+#[cfg(feature = "iouring")]
+/// Canonical storage backend selected by cargo features.
+pub use iouring_backend::IouringBackend as StorageBackend;
+#[cfg(feature = "libaio")]
+/// Canonical storage backend selected by cargo features.
+pub use libaio_backend::LibaioBackend as StorageBackend;
 
 pub const MIN_PAGE_SIZE: usize = 4096;
 pub const STORAGE_SECTOR_SIZE: usize = 4096;
@@ -45,12 +65,14 @@ pub enum AIOError {
 }
 
 pub type AIOResult<T> = StdResult<T, AIOError>;
-#[cfg(test)]
-pub(crate) use libaio_backend::tests::{LibaioTestHook, set_io_submit_hook, set_libaio_test_hook};
+#[cfg(all(test, feature = "libaio"))]
+pub(crate) use libaio_backend::tests::set_io_submit_hook;
 
+#[cfg(feature = "libaio")]
 pub type IocbRawPtr = *mut iocb;
 
 /// AIO backed by an owned aligned buffer.
+#[cfg(feature = "libaio")]
 pub struct AIO<T> {
     iocb: Box<iocb>,
     // this is essential because libaio requires the pointer
@@ -59,6 +81,7 @@ pub struct AIO<T> {
     pub key: AIOKey,
 }
 
+#[cfg(feature = "libaio")]
 impl<T: AIOBuf> AIO<T> {
     #[inline]
     pub fn new(
@@ -110,11 +133,13 @@ impl<T: AIOBuf> AIO<T> {
 /// Which pre-assign many pages through mmap() call and do
 /// not release any of them. So the IO request is guaranteed
 /// to be safe.
+#[cfg(feature = "libaio")]
 pub struct UnsafeAIO {
     iocb: Box<iocb>,
     pub key: AIOKey,
 }
 
+#[cfg(feature = "libaio")]
 impl UnsafeAIO {
     /// Create a new unsafe IO.
     ///
@@ -150,6 +175,61 @@ impl UnsafeAIO {
     pub fn iocb_raw(&self) -> IocbRawPtr {
         self.iocb.as_mut_ptr()
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageBackendOp {
+    kind: AIOKind,
+    fd: RawFd,
+    offset: usize,
+}
+
+#[cfg(test)]
+impl StorageBackendOp {
+    #[inline]
+    pub(crate) fn kind(&self) -> AIOKind {
+        self.kind
+    }
+
+    #[inline]
+    pub(crate) fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    #[inline]
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait StorageBackendTestHook: Send + Sync {
+    fn on_submit(&self, _op: StorageBackendOp) {}
+
+    fn on_complete(&self, _op: StorageBackendOp, _res: &mut StdResult<usize, std::io::Error>) {}
+}
+
+#[cfg(test)]
+type StorageBackendHook = std::sync::Arc<dyn StorageBackendTestHook>;
+
+#[cfg(test)]
+static STORAGE_BACKEND_TEST_HOOK: std::sync::Mutex<Option<StorageBackendHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[inline]
+fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
+    STORAGE_BACKEND_TEST_HOOK.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+#[inline]
+pub(crate) fn set_storage_backend_test_hook(
+    hook: Option<StorageBackendHook>,
+) -> Option<StorageBackendHook> {
+    let mut guard = STORAGE_BACKEND_TEST_HOOK.lock().unwrap();
+    std::mem::replace(&mut *guard, hook)
 }
 
 /// Buffer ownership model for one backend-agnostic IO operation.
@@ -583,7 +663,7 @@ impl<T> Clone for AIOClient<T> {
 ///
 /// The builder fixes the backend and request channel first, then binds one
 /// concrete [`IOStateMachine`] later.
-pub struct IOWorkerBuilder<T, B = LibaioContext> {
+pub struct IOWorkerBuilder<T, B = StorageBackend> {
     backend: B,
     rx: Receiver<AIOMessage<T>>,
 }
@@ -624,7 +704,7 @@ where
 ///
 /// Domain-level dedupe and same-key conflict policy remain inside the state
 /// machine and its owning subsystem.
-pub struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = LibaioContext> {
+pub struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = StorageBackend> {
     backend: B,
     rx: Receiver<AIOMessage<T>>,
     submitted: usize,
@@ -766,6 +846,8 @@ where
                 debug_assert!(self.io_depth() >= self.submitted);
                 let limit = self.io_depth() - self.submitted;
                 let submit_count = self.backend.submit_batch(&mut self.submit_batch, limit);
+                #[cfg(test)]
+                let hook = current_storage_backend_test_hook();
                 for _ in 0..submit_count {
                     let slot = self
                         .staged_slots
@@ -773,6 +855,15 @@ where
                         .expect("submitted slots must have queued staging order");
                     let entry = self.slots.get_mut(slot);
                     debug_assert!(!entry.submitted);
+                    #[cfg(test)]
+                    if let Some(hook) = &hook {
+                        let op = entry.submission.operation();
+                        hook.on_submit(StorageBackendOp {
+                            kind: op.kind(),
+                            fd: op.fd(),
+                            offset: op.offset(),
+                        });
+                    }
                     self.state_machine.on_submit(&entry.submission);
                     entry.submitted = true;
                 }
@@ -796,6 +887,23 @@ where
                     for (token, res) in completions {
                         let entry = self.slots.take(token);
                         debug_assert!(entry.submitted);
+                        #[cfg(test)]
+                        let (entry, res) = {
+                            let mut entry = entry;
+                            let mut res = res;
+                            if let Some(hook) = current_storage_backend_test_hook() {
+                                let op = entry.submission.operation();
+                                hook.on_complete(
+                                    StorageBackendOp {
+                                        kind: op.kind(),
+                                        fd: op.fd(),
+                                        offset: op.offset(),
+                                    },
+                                    &mut res,
+                                );
+                            }
+                            (entry, res)
+                        };
                         match self.state_machine.on_complete(entry.submission, res) {
                             AIOKind::Read => read_count += 1,
                             AIOKind::Write => write_count += 1,
@@ -838,6 +946,7 @@ where
 }
 
 #[inline]
+#[cfg(feature = "libaio")]
 pub fn pread<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
@@ -853,6 +962,7 @@ pub fn pread<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T>
 }
 
 #[inline]
+#[cfg(feature = "libaio")]
 pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
@@ -870,14 +980,19 @@ pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "libaio")]
     use crate::file::{FixedSizeBufferFreeList, SparseFile};
+    #[cfg(feature = "libaio")]
     use libc::EAGAIN;
+    #[cfg(feature = "libaio")]
     use std::os::fd::AsRawFd;
+    #[cfg(feature = "libaio")]
     use tempfile::TempDir;
 
     #[test]
+    #[cfg(feature = "libaio")]
     fn test_aio_file_ops() {
-        let ctx = LibaioContext::try_default().unwrap();
+        let ctx = LibaioBackend::try_default().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file1.txt");
         let file_path = file_path.to_string_lossy().into_owned();
@@ -898,6 +1013,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "libaio")]
     fn test_aio_file_extend() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file2.txt");
@@ -916,8 +1032,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "libaio")]
     fn test_io_worker() {
-        let ctx = LibaioContext::new(16).unwrap();
+        let ctx = LibaioBackend::new(16).unwrap();
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file3.txt");
         let file_path = file_path.to_string_lossy().into_owned();
@@ -956,8 +1073,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "libaio")]
     fn test_submit_limit_eagain_no_panic() {
-        let ctx = LibaioContext::try_default().unwrap();
+        let ctx = LibaioBackend::try_default().unwrap();
         let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
         let iocb = iocb::boxed();
         let reqs = vec![iocb.as_mut_ptr()];
@@ -977,16 +1095,19 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    #[cfg(feature = "libaio")]
     struct Request {
         kind: AIOKind,
         offset: usize,
         buf: DirectBuf,
     }
+    #[cfg(feature = "libaio")]
     struct Submission {
         key: u64,
         kind: AIOKind,
         operation: Operation,
     }
+    #[cfg(feature = "libaio")]
     impl IOSubmission for Submission {
         type Key = u64;
 
@@ -998,10 +1119,12 @@ mod tests {
             &mut self.operation
         }
     }
+    #[cfg(feature = "libaio")]
     struct SimpleListener {
         file: SparseFile,
         next_key: u64,
     }
+    #[cfg(feature = "libaio")]
     impl IOStateMachine for SimpleListener {
         type Request = Request;
         type Key = u64;

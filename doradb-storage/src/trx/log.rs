@@ -4,7 +4,7 @@ use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
 use crate::io::{
     AIOClient, AIOError, AIOKind, Completion, DirectBuf, IOQueue, IOSubmission, IOWorkerBuilder,
-    LibaioContext, Operation,
+    Operation, StorageBackend,
 };
 use crate::serde::Ser;
 use crate::session::SessionState;
@@ -35,7 +35,7 @@ pub const LOG_HEADER_PAGES: usize = 2;
 type EnqueuedCommit = (TrxID, Option<Arc<SessionState>>, Option<CommitWaiter>);
 
 pub struct LogPartitionInitializer {
-    pub(crate) ctx: LibaioContext,
+    pub(crate) ctx: StorageBackend,
     pub(crate) mode: LogPartitionMode,
     pub(crate) file_prefix: String,
     pub(crate) file_max_size: usize,
@@ -58,7 +58,7 @@ impl LogPartitionInitializer {
         logs: Vec<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
-            ctx: LibaioContext::new(io_depth_per_log)?,
+            ctx: StorageBackend::new(io_depth_per_log)?,
             mode: LogPartitionMode::Recovery(VecDeque::from(logs)),
             file_prefix,
             file_max_size,

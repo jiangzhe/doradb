@@ -8,7 +8,7 @@ This document defines lint usage and enforcement for this repository.
 - Lint gate command:
 
 ```bash
-cargo clippy --all-features --all-targets -- -D warnings
+cargo clippy -p doradb-storage --all-targets -- -D warnings
 ```
 
 ## Local Development
@@ -24,7 +24,7 @@ cargo fmt
 2. Run strict clippy:
 
 ```bash
-cargo clippy --all-features --all-targets -- -D warnings
+cargo clippy -p doradb-storage --all-targets -- -D warnings
 ```
 
 3. Run tests:
@@ -38,7 +38,7 @@ cargo nextest run -p doradb-storage
 Repository hook (`.githooks/pre-commit`) enforces:
 
 1. `cargo fmt`
-2. `cargo clippy --all-features --all-targets -- -D warnings`
+2. `cargo clippy -p doradb-storage --all-targets -- -D warnings`
 
 If staged paths touch unsafe-sensitive modules, the hook also refreshes unsafe baseline docs.
 
@@ -47,7 +47,7 @@ If staged paths touch unsafe-sensitive modules, the hook also refreshes unsafe b
 CI build workflow runs the same strict clippy command:
 
 ```bash
-cargo clippy --all-features --all-targets -- -D warnings
+cargo clippy -p doradb-storage --all-targets -- -D warnings
 ```
 
 This keeps local and CI lint behavior aligned.

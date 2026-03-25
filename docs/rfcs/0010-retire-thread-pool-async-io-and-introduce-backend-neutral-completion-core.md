@@ -19,16 +19,18 @@ generic I/O interface. The short-term supported path becomes `libaio` only; the
 medium-term goal is to preserve the current completion-driven ownership model
 while making backend selection an implementation detail of the driver layer.
 Two dedicated storage-facing phases then complete engine error handling before
-`io_uring` delivery: first, storage I/O policy is made explicit so fatal
-redo-log and checkpoint I/O shut down the engine while data/index I/O failures
-become caller-visible; second, the buffer-pool and engine-facing access
-interfaces are cleaned up so checkpoint, recovery, index, table, and related
-paths share one clear, unambiguous, result-bearing API surface. That follow-up
-phase also folds readonly validated-page access into the canonical buffer-pool
-interface instead of keeping overlapping ad hoc helpers. In the final delivery
-phase, `io_uring` becomes the default compile-time-selected I/O mode, with
-first adoption focused on correctness and completion semantics plus a
-performance floor that is not worse than `libaio`.
+`io_uring` backend delivery: first, storage I/O policy is made explicit so
+fatal redo-log and checkpoint I/O shut down the engine while data/index I/O
+failures become caller-visible; second, the buffer-pool and engine-facing
+access interfaces are cleaned up so checkpoint, recovery, index, table, and
+related paths share one clear, unambiguous, result-bearing API surface. That
+follow-up phase also folds readonly validated-page access into the canonical
+buffer-pool interface instead of keeping overlapping ad hoc helpers. A fifth
+phase then adds `io_uring` as an alternate compile-time backend on top of the
+completion core and canonical backend naming. A sixth phase switches the
+default backend to `io_uring`, completes the remaining post-adoption cleanup,
+and adds `docs/async-io.md` as the repository-level async-I/O design
+reference.
 
 ## Context
 
@@ -69,6 +71,14 @@ checkpoint, recovery, index, and table code that straddle old infallible
 helpers and newer `Result` paths. Before `io_uring` delivery, the repository
 therefore needs one follow-up cleanup phase focused on making the final storage
 access APIs clear and unambiguous. [C3], [C8], [C9], [C10], [U6]
+
+After that cleanup, backend delivery and backend-default switching no longer
+need to land in the same task wave. The repository can first add an
+`io_uring` backend under the existing completion core and canonical backend
+naming while keeping `libaio` as the default. A final follow-up phase can then
+switch the default backend, complete the remaining backend-selection cleanup,
+and add `docs/async-io.md` to explain the complete async-I/O design and how
+storage modules consume it. [C1], [C2], [C3], [C4], [U5], [U7]
 
 Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `Issue Labels:`
@@ -144,6 +154,9 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
   propagation across checkpoint/recovery/index/table paths, and merge readonly
   validated-page access into the canonical buffer-pool interface so the final
   APIs are clear and unambiguous.
+- [U7] Split the original `io_uring` delivery endgame into two phases: phase 5
+  adds the backend only, while phase 6 switches the default backend, performs
+  follow-up cleanup, and adds `docs/async-io.md`.
 
 ### Source Backlogs (Optional)
 
@@ -154,8 +167,9 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 
 ## Decision
 
-We will use a staged transition with five decisions. [D1], [D2], [D3], [D4],
-[D6], [C1], [C4], [C8], [C9], [C10], [U1], [U2], [U3], [U4], [U5], [U6]
+We will use a staged transition with six decisions. [D1], [D2], [D3], [D4],
+[D6], [C1], [C4], [C8], [C9], [C10], [U1], [U2], [U3], [U4], [U5], [U6],
+[U7]
 
 1. Retire the thread-pool async-I/O fallback and the repository-wide
    no-`libaio` validation/coverage contract. Until a new backend is ready,
@@ -186,17 +200,21 @@ We will use a staged transition with five decisions. [D1], [D2], [D3], [D4],
    remaining hidden in lower layers. This is the phase implemented by task
    `000087`. [D4], [D5], [D6], [C2], [C3], [C4], [C8], [U4]
 
-5. Immediately after that, run a dedicated API-cleanup phase before `io_uring`
-   delivery. This phase removes infallible buffer-pool page-access methods from
-   the shared interface, completes engine-level error propagation across
-   checkpoint, recovery, index, table, and related callers, and folds readonly
-   validated-page access into the canonical trait-level buffer-pool surface so
-   the final access APIs are clear and unambiguous rather than split across
-   overlapping helper families. `io_uring` delivery then uses compile-time
-   backend selection and makes `io_uring` the default mode, with first
-   adoption focused on correctness and completion semantics plus a performance
-   floor that is not worse than `libaio`. [D4], [D5], [D6], [C3], [C8], [C9],
-   [C10], [U4], [U5], [U6]
+5. Immediately after that, add `io_uring` as an alternate compile-time
+   backend before making it the default. This phase implements the new backend
+   on top of the completion core, introduces canonical backend naming and
+   selection seams for production startup paths, and keeps `libaio` as the
+   default while the new backend is validated in isolation. [D3], [D4], [D5],
+   [C1], [C2], [C3], [C4], [U3], [U5], [U7]
+
+6. Use a final follow-up phase to switch the default backend to `io_uring`,
+   complete remaining backend-selection cleanup, and add `docs/async-io.md` as
+   the repository-level async-I/O design reference. That phase establishes the
+   default-mode support policy, documents the completion object, state-machine,
+   backend, and storage-module integration model, and proves the initial
+   correctness/completion behavior with a performance floor that is not worse
+   than `libaio`. [D3], [D4], [D5], [D6], [C1], [C2], [C3], [C4], [C8], [C9],
+   [C10], [U5], [U7]
 
 This RFC supersedes the support-policy assumptions of RFC-0001 without
 discarding its safety rationale. We continue to reject a naive `Future`-based
@@ -333,15 +351,33 @@ This RFC changes code in an unsafe-sensitive area.
   - Phase Status: done
   - Implementation Summary: Canonical buffer-pool read interfaces are now result-bearing, readonly validated reads moved into ReadonlyBufferPoolExt, and checkpoint/recovery/index/table/purge consumers use the unified access contract. [Task Resolve Sync: docs/tasks/000088-cleanup-buffer-pool-interface-and-engine-error-propagation.md @ 2026-03-24]
 
-- **Phase 5: Add `io_uring` Backend And Make It Default**
+- **Phase 5: Add `io_uring` Backend**
   - Scope: implement `io_uring` driver support, keep backend selection
-  compile-time, and switch `io_uring` to the default engine I/O mode.
+    compile-time, and migrate production startup paths onto canonical backend
+    naming without switching the default backend yet.
   - Goals: provide a completion-based backend that fits the refactored generic
-  model, establish `io_uring` as the default mode, and deliver initial
-  correctness/completion behavior with performance not worse than `libaio`.
-  - Non-goals: runtime backend switching, reintroducing thread-pool fallback,
-    or aggressive `io_uring`-specific tuning beyond the required performance
-    floor for first adoption.
+    model, keep the first backend landing reviewable on its own, and make
+    non-default `io_uring` validation possible before any support-policy
+    change.
+  - Non-goals: switching `io_uring` to the default mode, runtime backend
+    switching, reintroducing thread-pool fallback, or proving the final
+    performance floor required for default adoption.
+  - Task Doc: `docs/tasks/TBD.md`
+  - Task Issue: `#0`
+  - Phase Status: `pending`
+  - Implementation Summary: `pending`
+
+- **Phase 6: Make `io_uring` Default, Cleanup, And Document Async IO**
+  - Scope: switch the default compile-time backend to `io_uring`, complete the
+    remaining backend-selection and naming cleanup that should wait until after
+    backend delivery, and add `docs/async-io.md` as the overall async-I/O
+    design document.
+  - Goals: establish `io_uring` as the default engine I/O mode, document the
+    completion/state-machine/backend framework plus its table/index/log/
+    checkpoint/recovery usage, and prove an initial performance floor that is
+    not worse than `libaio`.
+  - Non-goals: runtime backend switching, removing `libaio` entirely, or broad
+    post-adoption tuning beyond the default-switch acceptance bar.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -374,6 +410,10 @@ This RFC changes code in an unsafe-sensitive area.
   phase with interface churn in buffer-pool and engine-facing storage APIs so
   the final access surface is clear and unambiguous. [C3], [C9], [C10], [U4],
   [U6]
+- `io_uring` adoption is now intentionally split into backend-delivery and
+  later default-switch/documentation phases, so the final support-policy
+  change lands later in exchange for a narrower first backend task. [C1], [C2],
+  [C3], [C4], [U5], [U7]
 
 ## Open Questions
 

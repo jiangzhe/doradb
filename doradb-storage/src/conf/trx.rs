@@ -6,7 +6,7 @@ use crate::catalog::Catalog;
 use crate::component::Supplier;
 use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
-use crate::io::{LibaioContext, align_to_sector_size};
+use crate::io::{StorageBackend, align_to_sector_size};
 use crate::quiescent::QuiescentGuard;
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
 use crate::trx::purge::{GC, Purge};
@@ -203,7 +203,7 @@ impl TrxSysConfig {
     #[inline]
     pub fn log_partition_initializer(&self, log_no: usize) -> Result<LogPartitionInitializer> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
-        let ctx = LibaioContext::new(self.io_depth_per_log)?;
+        let ctx = StorageBackend::new(self.io_depth_per_log)?;
         let file_prefix = self.file_prefix()?;
 
         let mode = if self.skip_recovery {

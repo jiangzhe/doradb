@@ -11,7 +11,7 @@ use crate::error::{
 use crate::file::build_test_fs_in;
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::index::{ColumnBlockIndex, RowLocation, UniqueIndex};
-use crate::io::{LibaioTestHook, io_event, io_iocb_cmd, iocb, set_libaio_test_hook};
+use crate::io::{AIOKind, StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
@@ -29,25 +29,27 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 use tempfile::TempDir;
 
-static LIBAIO_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-struct InstalledLibaioTestHook {
-    previous: Option<Arc<dyn LibaioTestHook>>,
+struct InstalledStorageBackendTestHook {
+    previous: Option<Arc<dyn StorageBackendTestHook>>,
     guard: Option<MutexGuard<'static, ()>>,
 }
 
-impl Drop for InstalledLibaioTestHook {
+impl Drop for InstalledStorageBackendTestHook {
     #[inline]
     fn drop(&mut self) {
-        let _ = set_libaio_test_hook(self.previous.take());
+        let _ = set_storage_backend_test_hook(self.previous.take());
         drop(self.guard.take());
     }
 }
 
-fn install_libaio_test_hook(hook: Arc<dyn LibaioTestHook>) -> InstalledLibaioTestHook {
-    let guard = LIBAIO_TEST_HOOK_LOCK.lock().unwrap();
-    InstalledLibaioTestHook {
-        previous: set_libaio_test_hook(Some(hook)),
+fn install_storage_backend_test_hook(
+    hook: Arc<dyn StorageBackendTestHook>,
+) -> InstalledStorageBackendTestHook {
+    let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock().unwrap();
+    InstalledStorageBackendTestHook {
+        previous: set_storage_backend_test_hook(Some(hook)),
         guard: Some(guard),
     }
 }
@@ -76,36 +78,21 @@ impl FailingPageReadHook {
     }
 
     #[inline]
-    fn matches_iocb(&self, req: &iocb) -> bool {
-        req.aio_lio_opcode == io_iocb_cmd::IO_CMD_PREAD as u16
-            && req.aio_fildes == self.fd as u32
-            && req.offset as usize == self.offset
-    }
-
-    #[inline]
-    fn matches_completion(&self, event: &io_event) -> bool {
-        let Some(req) = (unsafe { event.obj.as_ref() }) else {
-            return false;
-        };
-        self.matches_iocb(req)
+    fn matches(&self, op: StorageBackendOp) -> bool {
+        op.kind() == AIOKind::Read && op.fd() == self.fd && op.offset() == self.offset
     }
 }
 
-impl LibaioTestHook for FailingPageReadHook {
-    fn on_submit(&self, submitted: &[*mut iocb]) {
-        for &req in submitted {
-            let Some(req) = (unsafe { req.as_ref() }) else {
-                continue;
-            };
-            if self.matches_iocb(req) {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-            }
+impl StorageBackendTestHook for FailingPageReadHook {
+    fn on_submit(&self, op: StorageBackendOp) {
+        if self.matches(op) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    fn on_completion(&self, event: &mut io_event) {
-        if self.matches_completion(event) {
-            event.res = -(self.errno as i64);
+    fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+        if self.matches(op) {
+            *res = Err(std::io::Error::from_raw_os_error(self.errno));
         }
     }
 }
@@ -1983,7 +1970,7 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
             cached_page.page_id,
             libc::EIO,
         ));
-        let _hook = install_libaio_test_hook(read_hook.clone());
+        let _hook = install_storage_backend_test_hook(read_hook.clone());
 
         let trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
@@ -2053,7 +2040,7 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
             cached_page.page_id,
             libc::EIO,
         ));
-        let _hook = install_libaio_test_hook(read_hook);
+        let _hook = install_storage_backend_test_hook(read_hook);
 
         assert!(matches!(
             trx.rollback().await,

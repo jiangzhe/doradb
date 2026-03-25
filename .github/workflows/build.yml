@@ -92,8 +92,8 @@ jobs:
       uses: taiki-e/install-action@nextest
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
-    - name: Clippy (all features / all targets)
-      run: cargo clippy --all-features --all-targets -- -D warnings
+    - name: Clippy (default backend)
+      run: cargo clippy -p doradb-storage --all-targets -- -D warnings
     - name: Validate with cargo llvm-cov nextest
       env:
         CARGO_TARGET_DIR: "target/coverage"

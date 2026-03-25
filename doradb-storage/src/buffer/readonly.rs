@@ -1364,7 +1364,8 @@ pub(crate) mod tests {
         validate_persisted_column_block_index_page,
     };
     use crate::io::{
-        AIOBuf, DirectBuf, LibaioTestHook, io_event, io_iocb_cmd, iocb, set_libaio_test_hook,
+        AIOBuf, AIOKind, DirectBuf, StorageBackendOp, StorageBackendTestHook,
+        set_storage_backend_test_hook,
     };
     use crate::lwc::{LWC_PAGE_PAYLOAD_SIZE, LwcPage, LwcPageHeader, validate_persisted_lwc_page};
     use crate::ptr::UnsafePtr;
@@ -1616,31 +1617,33 @@ pub(crate) mod tests {
         buf
     }
 
-    /// Serializes ownership of the process-global libaio test hook.
+    /// Serializes ownership of the process-global storage-backend test hook.
     ///
-    /// The hook itself is stored in `io::libaio_backend` as one process-global
+    /// The hook itself is stored in `io` as one process-global
     /// slot, so readonly tests must not interleave install/restore across
     /// different test cases.
-    static LIBAIO_TEST_HOOK_LOCK: LazyLock<parking_lot::Mutex<()>> =
+    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<parking_lot::Mutex<()>> =
         LazyLock::new(|| parking_lot::Mutex::new(()));
 
-    struct InstalledLibaioTestHook {
-        previous: Option<Arc<dyn LibaioTestHook>>,
+    struct InstalledStorageBackendTestHook {
+        previous: Option<Arc<dyn StorageBackendTestHook>>,
         guard: Option<parking_lot::MutexGuard<'static, ()>>,
     }
 
-    impl Drop for InstalledLibaioTestHook {
+    impl Drop for InstalledStorageBackendTestHook {
         #[inline]
         fn drop(&mut self) {
-            let _ = set_libaio_test_hook(self.previous.take());
+            let _ = set_storage_backend_test_hook(self.previous.take());
             drop(self.guard.take());
         }
     }
 
-    fn install_libaio_test_hook(hook: Arc<dyn LibaioTestHook>) -> InstalledLibaioTestHook {
-        let guard = LIBAIO_TEST_HOOK_LOCK.lock();
-        InstalledLibaioTestHook {
-            previous: set_libaio_test_hook(Some(hook)),
+    fn install_storage_backend_test_hook(
+        hook: Arc<dyn StorageBackendTestHook>,
+    ) -> InstalledStorageBackendTestHook {
+        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock();
+        InstalledStorageBackendTestHook {
+            previous: set_storage_backend_test_hook(Some(hook)),
             guard: Some(guard),
         }
     }
@@ -1651,7 +1654,7 @@ pub(crate) mod tests {
         Errno(i32),
     }
 
-    // Test-only libaio hook that controls one real persisted-page read by
+    // Test-only backend hook that controls one real persisted-page read by
     // `(fd, offset)`. Tests use this to wait until a miss read has been
     // submitted, then cancel or attach additional waiters before releasing the
     // completion.
@@ -1726,36 +1729,23 @@ pub(crate) mod tests {
             }
         }
 
-        fn matches_iocb(&self, req: &iocb) -> bool {
-            req.aio_lio_opcode == io_iocb_cmd::IO_CMD_PREAD as u16
-                && req.aio_fildes == self.inner.fd as u32
-                && req.offset as usize == self.inner.offset
-        }
-
-        #[inline]
-        fn matches_completion(&self, event: &io_event) -> bool {
-            let Some(req) = (unsafe { event.obj.as_ref() }) else {
-                return false;
-            };
-            self.matches_iocb(req)
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            op.kind() == AIOKind::Read
+                && op.fd() == self.inner.fd
+                && op.offset() == self.inner.offset
         }
     }
 
-    impl LibaioTestHook for ControlledReadHook {
-        fn on_submit(&self, submitted: &[*mut iocb]) {
-            for &req in submitted {
-                let Some(req) = (unsafe { req.as_ref() }) else {
-                    continue;
-                };
-                if self.matches_iocb(req) {
-                    self.inner.calls.fetch_add(1, Ordering::SeqCst);
-                    self.inner.start_ev.notify(usize::MAX);
-                }
+    impl StorageBackendTestHook for ControlledReadHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.inner.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.start_ev.notify(usize::MAX);
             }
         }
 
-        fn on_completion(&self, event: &mut io_event) {
-            if !self.matches_completion(event) {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+            if !self.matches(op) {
                 return;
             }
             loop {
@@ -1769,7 +1759,7 @@ pub(crate) mod tests {
                 smol::block_on(listener);
             }
             if let ControlledReadResult::Errno(errno) = self.inner.result {
-                event.res = -(errno as i64);
+                *res = Err(std::io::Error::from_raw_os_error(errno));
             }
         }
     }
@@ -2079,7 +2069,7 @@ pub(crate) mod tests {
             drop(old_root);
             write_payload(&table_file, 5, b"hello").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(table_file.raw_fd(), 5));
-            let _hook = install_libaio_test_hook(read_hook.clone());
+            let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
@@ -2136,7 +2126,7 @@ pub(crate) mod tests {
             drop(old_root);
             write_payload(&table_file, 9, b"solo").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(table_file.raw_fd(), 9));
-            let _hook = install_libaio_test_hook(read_hook.clone());
+            let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
@@ -2189,7 +2179,7 @@ pub(crate) mod tests {
             drop(old_root);
             write_payload(&table_file, 12, b"drop").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(table_file.raw_fd(), 12));
-            let _hook = install_libaio_test_hook(read_hook.clone());
+            let _hook = install_storage_backend_test_hook(read_hook.clone());
             let key = PersistedBlockKey::new(116, 12);
 
             let global = owned_global_pool(frame_page_bytes(2));
@@ -2298,7 +2288,7 @@ pub(crate) mod tests {
                 7,
                 libc::EIO,
             ));
-            let _hook = install_libaio_test_hook(read_hook.clone());
+            let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
@@ -2352,7 +2342,7 @@ pub(crate) mod tests {
             page[last_idx] ^= 0xFF;
             write_page_bytes(&table_file, 8, &page).await;
             let read_hook = Arc::new(ControlledReadHook::for_page(table_file.raw_fd(), 8));
-            let _hook = install_libaio_test_hook(read_hook.clone());
+            let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
