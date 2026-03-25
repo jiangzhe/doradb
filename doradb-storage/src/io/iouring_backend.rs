@@ -70,6 +70,67 @@ pub struct IouringSubmitBatch {
 // the worker inflight table.
 unsafe impl Send for IouringSubmitBatch {}
 
+#[inline]
+fn finish_submit(batch: &mut IouringSubmitBatch, submitted: usize) -> usize {
+    assert!(
+        submitted <= batch.pending_sqes,
+        "io_uring submit reported more accepted SQEs than staged pending entries"
+    );
+    if submitted != 0 {
+        batch.staged.drain(0..submitted);
+        batch.pending_sqes -= submitted;
+    }
+    submitted
+}
+
+#[inline]
+fn submit_pending_sqes<Submit, SubmitAndWait>(
+    batch: &mut IouringSubmitBatch,
+    limit: usize,
+    mut submit: Submit,
+    mut submit_and_wait: SubmitAndWait,
+) -> usize
+where
+    Submit: FnMut() -> std::io::Result<usize>,
+    SubmitAndWait: FnMut(usize) -> std::io::Result<usize>,
+{
+    debug_assert!(batch.pending_sqes != 0);
+
+    let submitted = loop {
+        match submit() {
+            Ok(submitted) => break submitted,
+            Err(err) if err.raw_os_error() == Some(EINTR) => continue,
+            Err(err) if matches!(err.raw_os_error(), Some(EAGAIN | EBUSY)) => {
+                let submitted = loop {
+                    match submit_and_wait(1) {
+                        Ok(submitted) => break submitted,
+                        Err(err) if err.raw_os_error() == Some(EINTR) => continue,
+                        Err(err) => {
+                            panic!(
+                                "io_uring blocking submit failed: err={err} pending_sqes={} limit={} staged_len={}",
+                                batch.pending_sqes,
+                                limit,
+                                batch.staged.len()
+                            );
+                        }
+                    }
+                };
+                break submitted;
+            }
+            Err(err) => {
+                panic!(
+                    "io_uring submit failed: err={err} pending_sqes={} limit={} staged_len={}",
+                    batch.pending_sqes,
+                    limit,
+                    batch.staged.len()
+                );
+            }
+        }
+    };
+
+    finish_submit(batch, submitted)
+}
+
 impl IOBackend for IouringBackend {
     type Prepared = squeue::Entry;
     type SubmitBatch = IouringSubmitBatch;
@@ -137,31 +198,12 @@ impl IOBackend for IouringBackend {
             return 0;
         }
 
-        let submitted = loop {
-            match self.ring.submit() {
-                Ok(submitted) => break submitted,
-                Err(err) if err.raw_os_error() == Some(EINTR) => continue,
-                Err(err) if matches!(err.raw_os_error(), Some(EAGAIN | EBUSY)) => return 0,
-                Err(err) => {
-                    panic!(
-                        "io_uring submit failed: err={err} pending_sqes={} limit={} staged_len={}",
-                        batch.pending_sqes,
-                        limit,
-                        batch.staged.len()
-                    );
-                }
-            }
-        };
-
-        assert!(
-            submitted <= batch.pending_sqes,
-            "io_uring submit reported more accepted SQEs than staged pending entries"
-        );
-        if submitted != 0 {
-            batch.staged.drain(0..submitted);
-            batch.pending_sqes -= submitted;
-        }
-        submitted
+        submit_pending_sqes(
+            batch,
+            limit,
+            || self.ring.submit(),
+            |min_nr| self.ring.submit_and_wait(min_nr),
+        )
     }
 
     #[inline]
@@ -189,5 +231,79 @@ impl IOBackend for IouringBackend {
             completed.push((BackendToken::from_raw(cqe.user_data()), res));
         }
         completed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use io_uring::opcode;
+
+    fn nop_entry() -> squeue::Entry {
+        opcode::Nop::new().build()
+    }
+
+    fn submit_batch_with_pending(staged_len: usize, pending_sqes: usize) -> IouringSubmitBatch {
+        let mut staged = VecDeque::with_capacity(staged_len);
+        for _ in 0..staged_len {
+            staged.push_back(nop_entry());
+        }
+        IouringSubmitBatch {
+            staged,
+            pending_sqes,
+        }
+    }
+
+    #[test]
+    fn test_submit_pending_sqes_applies_successful_submit_bookkeeping() {
+        let mut batch = submit_batch_with_pending(3, 3);
+        let submitted = submit_pending_sqes(
+            &mut batch,
+            3,
+            || Ok(2),
+            |_| panic!("blocking fallback should not run on successful submit"),
+        );
+        assert_eq!(submitted, 2);
+        assert_eq!(batch.pending_sqes, 1);
+        assert_eq!(batch.staged.len(), 1);
+    }
+
+    #[test]
+    fn test_submit_pending_sqes_falls_back_to_blocking_submit_on_eagain() {
+        let mut batch = submit_batch_with_pending(2, 2);
+        let mut submit_calls = 0;
+        let submitted = submit_pending_sqes(
+            &mut batch,
+            2,
+            || {
+                submit_calls += 1;
+                Err(std::io::Error::from_raw_os_error(EAGAIN))
+            },
+            |min_nr| {
+                assert_eq!(min_nr, 1);
+                Ok(2)
+            },
+        );
+        assert_eq!(submitted, 2);
+        assert_eq!(submit_calls, 1);
+        assert_eq!(batch.pending_sqes, 0);
+        assert!(batch.staged.is_empty());
+    }
+
+    #[test]
+    fn test_submit_pending_sqes_preserves_unaccepted_suffix_after_blocking_fallback() {
+        let mut batch = submit_batch_with_pending(3, 3);
+        let submitted = submit_pending_sqes(
+            &mut batch,
+            3,
+            || Err(std::io::Error::from_raw_os_error(EBUSY)),
+            |min_nr| {
+                assert_eq!(min_nr, 1);
+                Ok(1)
+            },
+        );
+        assert_eq!(submitted, 1);
+        assert_eq!(batch.pending_sqes, 2);
+        assert_eq!(batch.staged.len(), 2);
     }
 }
