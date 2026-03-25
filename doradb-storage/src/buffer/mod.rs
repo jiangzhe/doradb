@@ -156,7 +156,7 @@ impl Component for IndexPool {
             .max_mem_size(config.bytes)
             .max_file_size(config.max_file_size)
             .data_swap_file(config.swap_file)
-            .build()?;
+            .build_index()?;
         registry.register::<Self>(pool)?;
         shelf.put::<IndexPoolWorkers>(pending)?;
         IndexPoolWorkers::build((), registry, shelf.scope::<IndexPoolWorkers>()).await

@@ -1,3 +1,4 @@
+use crate::conf::consts::SWAP_FILE_SUFFIX;
 use crate::error::{Error, Result};
 use std::path::Path;
 
@@ -24,13 +25,13 @@ pub(crate) fn validate_swap_file_path_candidate(field: &str, path: impl AsRef<Pa
     let path = path.as_ref();
     if path.as_os_str().is_empty() {
         return Err(Error::InvalidStoragePath(format!(
-            "{field} must end with `.bin`: {}",
+            "{field} must end with `{SWAP_FILE_SUFFIX}`: {}",
             path.display()
         )));
     }
-    if !path_to_utf8(path, field)?.ends_with(".bin") {
+    if !path_to_utf8(path, field)?.ends_with(SWAP_FILE_SUFFIX) {
         return Err(Error::InvalidStoragePath(format!(
-            "{field} must end with `.bin`: {}",
+            "{field} must end with `{SWAP_FILE_SUFFIX}`: {}",
             path.display()
         )));
     }

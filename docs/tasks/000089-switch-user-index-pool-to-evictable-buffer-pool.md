@@ -11,7 +11,7 @@ github_issue: 475
 ## Summary
 
 Switch user secondary-index runtime pages from the fixed `IndexPool` to an
-evictable pool backed by `index.bin`, so large indexes no longer crash on fixed
+evictable pool backed by `index.swp`, so large indexes no longer crash on fixed
 pool exhaustion. Keep catalog table rows and catalog indexes on `meta_pool` so
 catalog metadata remains fully memory resident by design.
 
@@ -28,7 +28,7 @@ secondary indexes.
 2. `FixedBufferPool::allocate_page()` panics when the pool is full, so large
    user secondary indexes can fail with a fatal `buffer pool full`.
 3. Task `000063` intentionally left future index-swap design out of scope after
-   making the row `data.bin` contract reusable for a later follow-up.
+   making the row `data.swp` contract reusable for a later follow-up.
 4. Task `000052` specialized catalog runtime to fixed-pool semantics. Catalog
    rows and catalog indexes should remain memory resident instead of joining the
    user-table evictable pool path.
@@ -45,9 +45,9 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 ## Goals
 
 1. Move user secondary-index runtime pages from the fixed `IndexPool` to an
-   evictable pool with default backing file `index.bin`.
+   evictable pool with default backing file `index.swp`.
 2. Keep catalog table rows and catalog secondary indexes on `meta_pool`.
-3. Preserve existing durable table, catalog, and redo formats. `index.bin`
+3. Preserve existing durable table, catalog, and redo formats. `index.swp`
    stays ephemeral and restart continues to rebuild volatile index state from
    checkpointed DiskTree plus redo.
 4. Keep engine config narrow by retaining `index_buffer` as the in-memory
@@ -61,7 +61,7 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 ## Non-Goals
 
 1. Changing table-file, catalog-file, or redo-log record formats.
-2. Making recovery depend on `index.bin` contents.
+2. Making recovery depend on `index.swp` contents.
 3. Moving catalog indexes onto the user evictable index pool.
 4. Exposing full public `EvictableBufferPoolConfig` parity for the user index
    pool in this task.
@@ -104,7 +104,7 @@ Reference:
 2. Extend engine config and storage-path resolution for an ephemeral user-index
    swap file.
    - Keep `index_buffer` as the in-memory budget knob.
-   - Add `index_swap_file` with default `index.bin`.
+   - Add `index_swap_file` with default `index.swp`.
    - Add `index_max_file_size` with a conservative default sized for evictable
      user indexes.
    - Extend `ResolvedStoragePaths` to resolve `index_swap_file`, create its
@@ -143,7 +143,7 @@ Reference:
      established.
 7. Update tests and examples.
    - Add storage-path coverage for `index_swap_file`.
-   - Add startup and restart coverage for `index.bin`.
+   - Add startup and restart coverage for `index.swp`.
    - Add user-index eviction coverage with a small `index_buffer` and larger
      `index_max_file_size`.
    - Add catalog regression coverage proving catalog index operations do not
@@ -180,10 +180,10 @@ Keep this section blank in design phase. Fill this section during `task resolve`
 ## Test Cases
 
 1. `ResolvedStoragePaths` validates `index_swap_file` as a root-relative
-   `.bin` file and rejects overlap with `data_swap_file`, `catalog.mtb`,
+   `.swp` file and rejects overlap with `data_swap_file`, `catalog.mtb`,
    `storage-layout.toml`, durable table-file paths, and the redo-log family.
-2. Fresh engine startup with default config resolves and uses both `data.bin`
-   and `index.bin`.
+2. Fresh engine startup with default config resolves and uses both `data.swp`
+   and `index.swp`.
 3. Restart with changed `index_swap_file` succeeds because the file is
    ephemeral and excluded from the durable layout marker.
 4. A user table with a small `index_buffer` and larger `index_max_file_size`
@@ -201,6 +201,6 @@ Keep this section blank in design phase. Fill this section during `task resolve`
 
 1. Should a follow-up expose full public tuning parity between the user index
    pool and `data_buffer` once operational experience with the default
-   `index.bin` settings is available?
+   `index.swp` settings is available?
 2. Should future alias cleanup add more explicit names for the user and catalog
    index-pool families once this pool split lands?

@@ -397,7 +397,7 @@ mod tests {
                         .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024)
-                        .data_swap_file("alt-data.bin"),
+                        .data_swap_file("alt-data.swp"),
                 )
                 .build()
                 .await
@@ -414,7 +414,7 @@ mod tests {
             drop(engine);
 
             let engine = test_engine_config_for(root.path())
-                .index_swap_file("alt-index.bin")
+                .index_swap_file("alt-index.swp")
                 .build()
                 .await
                 .unwrap();
@@ -429,8 +429,8 @@ mod tests {
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             drop(engine);
 
-            assert!(root.path().join("data.bin").exists());
-            assert!(root.path().join("index.bin").exists());
+            assert!(root.path().join("data.swp").exists());
+            assert!(root.path().join("index.swp").exists());
         });
     }
 
@@ -794,7 +794,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let data_dir = temp_dir.path().join("data");
             let log_dir = temp_dir.path().join("log");
-            let swap_file = temp_dir.path().join("data.bin");
+            let swap_file = temp_dir.path().join("data.swp");
             fs::create_dir_all(&data_dir).unwrap();
             fs::create_dir_all(&log_dir).unwrap();
             let table_fs = build_test_fs_in(&data_dir);
@@ -804,10 +804,10 @@ mod tests {
             let index_pool = crate::quiescent::QuiescentBox::new(
                 EvictableBufferPoolConfig::default()
                     .role(PoolRole::Index)
-                    .data_swap_file(temp_dir.path().join("index.bin"))
+                    .data_swap_file(temp_dir.path().join("index.swp"))
                     .max_mem_size(TEST_POOL_BYTES)
                     .max_file_size(128usize * 1024 * 1024)
-                    .build()
+                    .build_index()
                     .unwrap()
                     .0,
             );

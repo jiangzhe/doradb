@@ -25,7 +25,7 @@ fn main() {
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(2usize * 1024 * 1024 * 1024)
                     .max_file_size(3usize * 1024 * 1024 * 1024)
-                    .data_swap_file("data_bench1.bin"),
+                    .data_swap_file("data_bench1.swp"),
             )
             .trx(TrxSysConfig::default().skip_recovery(true))
             .build()
@@ -100,7 +100,7 @@ fn main() {
         }
         drop(engine);
 
-        let _ = std::fs::remove_file("data_bench1.bin");
+        let _ = std::fs::remove_file("data_bench1.swp");
         remove_files("*.tbl");
     });
 

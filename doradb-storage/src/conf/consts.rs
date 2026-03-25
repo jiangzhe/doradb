@@ -11,7 +11,7 @@ pub(crate) const DEFAULT_ENGINE_META_BUFFER: usize = 32 * 1024 * 1024;
 /// Default in-memory budget for the user secondary-index buffer pool.
 pub(crate) const DEFAULT_ENGINE_INDEX_BUFFER: usize = 1024 * 1024 * 1024;
 /// Default ephemeral swap file for the user secondary-index buffer pool.
-pub(crate) const DEFAULT_ENGINE_INDEX_SWAP_FILE: &str = "index.bin";
+pub(crate) const DEFAULT_ENGINE_INDEX_SWAP_FILE: &str = "index.swp";
 /// Default on-disk size cap for the user secondary-index swap file.
 pub(crate) const DEFAULT_ENGINE_INDEX_MAX_FILE_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
@@ -24,8 +24,10 @@ pub(crate) const DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE: usize = 256 * 1024 * 1
 /// Default unified catalog multi-table file name under `data_dir`.
 pub(crate) const DEFAULT_CATALOG_FILE_NAME: &str = "catalog.mtb";
 
+/// Required suffix for ephemeral swap files managed by evictable buffer pools.
+pub(crate) const SWAP_FILE_SUFFIX: &str = ".swp";
 /// Default ephemeral swap file name for a generic evictable buffer pool.
-pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE: &str = "data.bin";
+pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE: &str = "data.swp";
 /// Default sparse-file size cap for a generic evictable buffer pool.
 pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE: Byte =
     Byte::from_u64(2 * 1024 * 1024 * 1024);

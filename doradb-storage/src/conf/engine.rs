@@ -198,6 +198,30 @@ impl ResolvedStoragePaths {
     }
 
     fn validate_swap_file_non_overlap(&self, field: &str, path: &Path) -> Result<()> {
+        if path == self.data_dir {
+            return Err(Error::InvalidStoragePath(format!(
+                "{field} must not overlap data_dir: {}",
+                path.display()
+            )));
+        }
+        if path == self.log_dir {
+            return Err(Error::InvalidStoragePath(format!(
+                "{field} must not overlap log_dir: {}",
+                path.display()
+            )));
+        }
+        if self.data_dir != self.storage_root && path.parent() == Some(self.data_dir.as_path()) {
+            return Err(Error::InvalidStoragePath(format!(
+                "{field} must not use data_dir as its parent directory: {}",
+                path.display()
+            )));
+        }
+        if self.log_dir != self.storage_root && path.parent() == Some(self.log_dir.as_path()) {
+            return Err(Error::InvalidStoragePath(format!(
+                "{field} must not use log_dir as its parent directory: {}",
+                path.display()
+            )));
+        }
         if path == self.catalog_file_path {
             return Err(Error::InvalidStoragePath(format!(
                 "{field} must not overlap catalog file: {}",
@@ -421,17 +445,19 @@ mod tests {
         assert_eq!(paths.durable_layout.catalog_file_name, "catalog.mtb");
         assert!(paths.data_dir.starts_with(root.path()));
         assert!(paths.log_dir.starts_with(root.path()));
-        assert!(paths.data_swap_file.ends_with("data.bin"));
-        assert!(paths.index_swap_file.ends_with("index.bin"));
+        assert!(paths.data_swap_file.ends_with("data.swp"));
+        assert!(paths.index_swap_file.ends_with("index.swp"));
     }
 
     #[test]
     fn test_validate_swap_file_suffix_and_escape() {
-        let err = validate_swap_file_path_candidate("data_swap_file", "data.swap").unwrap_err();
+        validate_swap_file_path_candidate("data_swap_file", "data.swp").unwrap();
+
+        let err = validate_swap_file_path_candidate("data_swap_file", "data.bin").unwrap_err();
         assert!(matches!(err, Error::InvalidStoragePath(_)));
 
         let err = EngineConfig::default()
-            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("../data.bin"))
+            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("../data.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert!(matches!(err, Error::InvalidStoragePath(_)));
@@ -461,8 +487,42 @@ mod tests {
     #[test]
     fn test_swap_files_reject_overlap() {
         let err = EngineConfig::default()
-            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("shared.bin"))
-            .index_swap_file("shared.bin")
+            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("shared.swp"))
+            .index_swap_file("shared.swp")
+            .resolve_storage_paths()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
+    }
+
+    #[test]
+    fn test_swap_files_reject_data_dir_aliases() {
+        let err = EngineConfig::default()
+            .file(TableFileSystemConfig::default().data_dir("data.swp"))
+            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("data.swp"))
+            .resolve_storage_paths()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
+
+        let err = EngineConfig::default()
+            .file(TableFileSystemConfig::default().data_dir("data.swp"))
+            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("data.swp/heap.swp"))
+            .resolve_storage_paths()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
+    }
+
+    #[test]
+    fn test_swap_files_reject_log_dir_aliases() {
+        let err = EngineConfig::default()
+            .trx(TrxSysConfig::default().log_dir("log.swp"))
+            .index_swap_file("log.swp")
+            .resolve_storage_paths()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
+
+        let err = EngineConfig::default()
+            .trx(TrxSysConfig::default().log_dir("log.swp"))
+            .index_swap_file("log.swp/index.swp")
             .resolve_storage_paths()
             .unwrap_err();
         assert!(matches!(err, Error::InvalidStoragePath(_)));
