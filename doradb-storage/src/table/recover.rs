@@ -207,7 +207,7 @@ impl TableRecover for Table {
     ) -> Result<()> {
         let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
         let metadata = self.metadata();
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         let (ctx, page) = page_guard.ctx_and_page();
         for (index_spec, sec_idx) in metadata.index_specs.iter().zip(self.sec_idx()) {
             let read_set: Vec<_> = index_spec
@@ -254,7 +254,7 @@ impl TableRecover for Table {
     }
 
     async fn populate_index_via_persisted_data(&self, _guards: &PoolGuards) -> Result<()> {
-        let index_pool_guard = _guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(_guards);
         if self.sec_idx().is_empty() {
             return Ok(());
         }

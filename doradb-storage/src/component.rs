@@ -82,12 +82,13 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// 4. `TableFileSystemWorkers` -> `TableFileSystem`
 /// 5. `MetaPool`
 /// 6. `IndexPool`
-/// 7. `MemPool`
-/// 8. `MemPoolWorkers` -> `MemPool`
-/// 9. `Catalog` -> `MetaPool`, `IndexPool`, `TableFileSystem`, `DiskPool`
-/// 10. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`,
+/// 7. `IndexPoolWorkers` -> `IndexPool`
+/// 8. `MemPool`
+/// 9. `MemPoolWorkers` -> `MemPool`
+/// 10. `Catalog` -> `MetaPool`, `TableFileSystem`, `DiskPool`
+/// 11. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`,
 ///     `TableFileSystem`, `DiskPool`, `Catalog`
-/// 11. `TransactionSystemWorkers` -> `TransactionSystem`
+/// 12. `TransactionSystemWorkers` -> `TransactionSystem`
 ///
 /// In addition to the direct component edges above, `Catalog` owns user-table
 /// runtimes that retain guards into `MemPool`, `IndexPool`, `TableFileSystem`,
@@ -376,7 +377,7 @@ macro_rules! pool_access_newtype {
 }
 
 pool_access_newtype!(MetaPool, FixedBufferPool);
-pool_access_newtype!(IndexPool, FixedBufferPool);
+pool_access_newtype!(IndexPool, EvictableBufferPool);
 pool_access_newtype!(MemPool, EvictableBufferPool);
 pool_access_newtype!(DiskPool, GlobalReadonlyBufferPool);
 
@@ -392,15 +393,25 @@ impl MetaPoolConfig {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct IndexPoolConfig {
     pub(crate) bytes: usize,
+    pub(crate) swap_file: std::path::PathBuf,
+    pub(crate) max_file_size: usize,
 }
 
 impl IndexPoolConfig {
     #[inline]
-    pub(crate) fn new(bytes: usize) -> Self {
-        Self { bytes }
+    pub(crate) fn new(
+        bytes: usize,
+        swap_file: impl Into<std::path::PathBuf>,
+        max_file_size: usize,
+    ) -> Self {
+        Self {
+            bytes,
+            swap_file: swap_file.into(),
+            max_file_size,
+        }
     }
 }
 

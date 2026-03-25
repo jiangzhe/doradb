@@ -599,9 +599,8 @@ fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bo
 mod tests {
     use crate::buffer::PersistedBlockKey;
     use crate::catalog::tests::{table1, table2};
-    use crate::engine::EngineConfig;
+    use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::file::multi_table_file::CATALOG_MTB_PERSISTED_FILE_ID;
-    use crate::trx::sys_conf::TrxSysConfig;
     use tempfile::TempDir;
 
     #[test]

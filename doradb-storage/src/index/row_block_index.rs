@@ -1088,19 +1088,17 @@ impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::EvictableBufferPoolConfig;
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
     use crate::buffer::page::{BufferPage, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use crate::engine::EngineConfig;
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::Validation;
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::trx::log::list_log_files;
     use crate::trx::log_replay::ReadLog;
     use crate::trx::redo::DDLRedo;
-    use crate::trx::sys_conf::TrxSysConfig;
     use crate::value::ValKind;
     use semistr::SemiStr;
     use std::future::Future;

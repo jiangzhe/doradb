@@ -23,7 +23,6 @@ pub mod recover;
 pub mod redo;
 pub mod row;
 pub mod sys;
-pub mod sys_conf;
 pub mod sys_trx;
 pub mod undo;
 pub mod ver_map;

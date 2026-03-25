@@ -43,7 +43,7 @@ fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Resu
 
 impl TransactionSystem {
     #[inline]
-    pub(super) fn start_purge_threads(
+    pub(crate) fn start_purge_threads(
         trx_sys: QuiescentGuard<Self>,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         pool_guards: PoolGuards,
@@ -638,9 +638,9 @@ mod tests {
     use super::*;
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::VersionedPageID;
-    use crate::buffer::{BufferPool, EvictableBufferPoolConfig, PoolGuards, PoolRole};
+    use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
-    use crate::engine::EngineConfig;
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{Error, StoragePoisonSource};
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
@@ -648,7 +648,6 @@ mod tests {
     use crate::row::ops::SelectKey;
     use crate::table::DeleteMarker;
     use crate::trx::row::RowReadAccess;
-    use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus};
     use crate::value::Val;

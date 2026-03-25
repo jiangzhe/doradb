@@ -1,15 +1,15 @@
 use clap::Parser;
 use doradb_storage::buffer::guard::PageGuard;
 use doradb_storage::buffer::page::{PAGE_SIZE, Page, PageID};
-use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig, PoolRole, ReadonlyBufferPool};
+use doradb_storage::buffer::{BufferPool, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
-use doradb_storage::engine::EngineConfig;
+use doradb_storage::conf::{
+    EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
+};
 use doradb_storage::error::PersistedFileKind;
-use doradb_storage::file::table_fs::TableFileSystemConfig;
 use doradb_storage::io::{AIOBuf, DirectBuf};
 use doradb_storage::latch::LatchFallbackMode;
 use doradb_storage::quiescent::QuiescentBox;
-use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::ValKind;
 use rand::RngCore;
 use std::sync::Arc;

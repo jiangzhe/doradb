@@ -1,24 +1,23 @@
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
+use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::page::{PAGE_SIZE, PageID};
-use crate::buffer::{BufferPool, EvictableBufferPoolConfig};
-use crate::engine::{Engine, EngineConfig};
+use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig};
+use crate::engine::Engine;
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
     StoragePoisonSource,
 };
 use crate::file::build_test_fs_in;
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::table_fs::TableFileSystemConfig;
 use crate::index::{ColumnBlockIndex, RowLocation, UniqueIndex};
 use crate::io::{LibaioTestHook, io_event, io_iocb_cmd, iocb, set_libaio_test_hook};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-use crate::row::{RowID, RowPage};
+use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
 use crate::table::{DeleteMarker, Table, TableAccess, TablePersistence};
 use crate::trx::row::LockRowForWrite;
-use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::{ActiveTrx, TrxID};
 use crate::value::Val;
@@ -2110,6 +2109,134 @@ fn test_data_checkpoint_error_rollback() {
 
         drop(session);
         sys.clean_all();
+    });
+}
+
+#[test]
+fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
+    smol::block_on(async {
+        use crate::catalog::{
+            ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+        };
+        use crate::value::ValKind;
+
+        let temp_dir = TempDir::new().unwrap();
+        let engine = EngineConfig::default()
+            .storage_root(temp_dir.path())
+            .index_buffer(16u64 * 1024 * 1024)
+            .index_max_file_size(32u64 * 1024 * 1024)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(crate::buffer::PoolRole::Mem)
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_stem("redo_index_evict")
+                    .skip_recovery(true),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        let mut ddl_session = engine.try_new_session().unwrap();
+        let mut index_specs = vec![IndexSpec::new(
+            "idx_pk",
+            vec![IndexKey::new(0)],
+            IndexAttributes::PK,
+        )];
+        for idx in 0..12 {
+            let name = format!("idx_name_{idx}");
+            index_specs.push(IndexSpec::new(
+                &name,
+                vec![IndexKey::new(1)],
+                IndexAttributes::empty(),
+            ));
+        }
+        let table_id = ddl_session
+            .create_table(
+                TableSpec::new(vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                ]),
+                index_specs,
+            )
+            .await
+            .unwrap();
+        drop(ddl_session);
+
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        let mut session = engine.try_new_session().unwrap();
+        let mut inserted = Vec::new();
+
+        for batch in 0..96usize {
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            for i in 0..64usize {
+                let row_id = (batch * 64 + i) as i32;
+                let seed = format!("{:08x}", row_id);
+                let key = seed.repeat(64);
+                let mut stmt = trx.start_stmt();
+                let res = stmt
+                    .insert_row(&table, vec![Val::from(row_id), Val::from(&key[..])])
+                    .await;
+                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))), "res={res:?}");
+                trx = stmt.succeed();
+                inserted.push((row_id, key));
+            }
+            trx.commit().await.unwrap();
+            if engine.index_pool.stats().finished_writes() > 0 {
+                break;
+            }
+        }
+
+        for _ in 0..20 {
+            if engine.index_pool.stats().finished_writes() > 0 {
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            engine.index_pool.stats().finished_writes() > 0,
+            "user secondary-index pool should evict with a small index buffer"
+        );
+
+        for key_idx in [0usize, inserted.len() / 2, inserted.len() - 1] {
+            let key = SelectKey::new(0, vec![Val::from(inserted[key_idx].0)]);
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let res = stmt.select_row_mvcc(&table, &key, &[0, 1]).await;
+            match res {
+                Ok(SelectMvcc::Found(vals)) => {
+                    assert_eq!(
+                        vals,
+                        vec![
+                            Val::from(inserted[key_idx].0),
+                            Val::from(&inserted[key_idx].1[..]),
+                        ]
+                    );
+                }
+                other => panic!("unexpected lookup result: {other:?}"),
+            }
+            stmt.succeed().commit().await.unwrap();
+        }
+
+        let mut visible_rows = 0usize;
+        table
+            .accessor()
+            .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
+                if !row.is_deleted() {
+                    visible_rows += 1;
+                }
+                true
+            })
+            .await;
+        assert_eq!(visible_rows, inserted.len());
+
+        drop(session);
+        drop(table);
+        drop(engine);
     });
 }
 

@@ -108,8 +108,9 @@ impl Tables<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineConfig;
-    use crate::trx::sys_conf::TrxSysConfig;
+    use crate::buffer::{BufferPool, PoolGuards, PoolRole};
+    use crate::catalog::tests::table1;
+    use crate::conf::{EngineConfig, TrxSysConfig};
     use tempfile::TempDir;
 
     #[test]
@@ -187,6 +188,39 @@ mod tests {
             );
 
             drop(session);
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_catalog_lookup_uses_meta_guard_only() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default().skip_recovery(true))
+                .build()
+                .await
+                .unwrap();
+
+            let table_id = table1(&engine).await;
+            {
+                let guards = PoolGuards::builder()
+                    .push(PoolRole::Meta, engine.meta_pool.pool_guard())
+                    .build();
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .tables()
+                        .find_uncommitted_by_id(&guards, table_id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+
             drop(engine);
         });
     }

@@ -1,3 +1,4 @@
+use crate::conf::TrxSysConfig;
 use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
@@ -15,7 +16,6 @@ use crate::trx::log_replay::{LogBuf, LogPartitionStream, MmapLogReader, TrxLog};
 use crate::trx::purge::{GC, GCBucket};
 use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::sys_conf::TrxSysConfig;
 use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx, TrxID};
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
@@ -35,14 +35,14 @@ pub const LOG_HEADER_PAGES: usize = 2;
 type EnqueuedCommit = (TrxID, Option<Arc<SessionState>>, Option<CommitWaiter>);
 
 pub struct LogPartitionInitializer {
-    pub(super) ctx: LibaioContext,
-    pub(super) mode: LogPartitionMode,
-    pub(super) file_prefix: String,
-    pub(super) file_max_size: usize,
-    pub(super) file_header_size: usize,
-    pub(super) page_size: usize,
-    pub(super) io_depth_per_log: usize,
-    pub(super) log_no: usize,
+    pub(crate) ctx: LibaioContext,
+    pub(crate) mode: LogPartitionMode,
+    pub(crate) file_prefix: String,
+    pub(crate) file_max_size: usize,
+    pub(crate) file_header_size: usize,
+    pub(crate) page_size: usize,
+    pub(crate) io_depth_per_log: usize,
+    pub(crate) log_no: usize,
     // sequence of last log file.
     pub(crate) file_seq: Option<u32>,
 }
@@ -259,7 +259,7 @@ impl crate::io::IOStateMachine for LogIOStateMachine {
     fn end_loop(self) {}
 }
 
-pub(super) struct LogPartition {
+pub(crate) struct LogPartition {
     /// Group commit of this partition.
     pub(super) group_commit: CachePadded<MutexGroupCommit>,
     /// Maximum persisted CTS of this partition.
@@ -1078,12 +1078,10 @@ pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table2;
-    use crate::engine::EngineConfig;
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::trx::log_replay::{LogMerger, ReadLog};
     use crate::trx::redo::RedoLogs;
-    use crate::trx::sys_conf::TrxSysConfig;
     use crate::trx::sys_trx::SysTrx;
     use crate::value::Val;
     use std::fs::{self, File};

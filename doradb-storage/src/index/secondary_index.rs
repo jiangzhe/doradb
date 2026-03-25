@@ -321,12 +321,10 @@ impl PartitionMultiKeyIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::EvictableBufferPoolConfig;
     use crate::catalog::tests::table4;
-    use crate::engine::EngineConfig;
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::table::TableAccess;
-    use crate::trx::sys_conf::TrxSysConfig;
     use tempfile::TempDir;
 
     #[test]

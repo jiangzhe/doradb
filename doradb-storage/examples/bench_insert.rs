@@ -4,13 +4,13 @@
 use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
-use doradb_storage::buffer::{BufferPool, EvictableBufferPoolConfig};
+use doradb_storage::buffer::BufferPool;
 use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID, TableSpec,
 };
-use doradb_storage::engine::{Engine, EngineConfig, EngineRef};
+use doradb_storage::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+use doradb_storage::engine::{Engine, EngineRef};
 use doradb_storage::trx::log::LogSync;
-use doradb_storage::trx::sys_conf::TrxSysConfig;
 use doradb_storage::value::Val;
 use doradb_storage::value::ValKind;
 use easy_parallel::Parallel;
@@ -36,7 +36,7 @@ fn main() {
                 EvictableBufferPoolConfig::default()
                     .max_mem_size(2usize * 1024 * 1024 * 1024)
                     .max_file_size(3usize * 1024 * 1024 * 1024)
-                    .data_swap_file("data_bench2.bin"),
+                    .data_swap_file("data_bench2.swp"),
             )
             .trx(
                 TrxSysConfig::default()
@@ -150,7 +150,7 @@ fn main() {
         }
         drop(engine);
 
-        let _ = std::fs::remove_file("data_bench2.bin");
+        let _ = std::fs::remove_file("data_bench2.swp");
         remove_files("*.tbl");
     })
 }

@@ -145,15 +145,15 @@ pub trait TableAccess {
 
 /// Thin operation wrapper that exposes `TableAccess` over a table reference.
 ///
-/// `D` is the buffer-pool type for row-page (in-memory) operations.
-/// In runtime, this is usually bound via [`HybridTableAccessor`], while tests
-/// or alternative runtimes can bind different pool implementations.
-pub struct TableAccessor<'a, D: 'static> {
-    mem: &'a GenericMemTable<D>,
+/// `D` is the row-page pool type and `I` is the secondary-index pool type.
+/// Runtime aliases bind user tables to evictable row/index pools and catalog
+/// tables to the fixed metadata pool for both roles.
+pub struct TableAccessor<'a, D: 'static, I: 'static> {
+    mem: &'a GenericMemTable<D, I>,
     storage: Option<&'a ColumnStorage>,
 }
 
-impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool> {
+impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool, EvictableBufferPool> {
     #[inline]
     fn from(table: &'a Table) -> Self {
         TableAccessor {
@@ -163,7 +163,7 @@ impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool> {
     }
 }
 
-impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool> {
+impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool, FixedBufferPool> {
     #[inline]
     fn from(table: &'a CatalogTable) -> Self {
         TableAccessor {
@@ -173,7 +173,7 @@ impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool> {
     }
 }
 
-impl<'a, D: BufferPool> TableAccessor<'a, D> {
+impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
     fn deletion_buffer(&self) -> Option<&ColumnDeletionBuffer> {
         self.storage.map(ColumnStorage::deletion_buffer)
@@ -278,7 +278,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<()> {
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         if self.metadata().index_specs[key.index_no].unique() {
             let res = self.sec_idx()[key.index_no]
                 .unique()
@@ -398,7 +398,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let index = self.sec_idx()[key.index_no].unique().unwrap();
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         let (mut page_guard, row_id) = match index
             .lookup(index_pool_guard, &key.vals, MIN_SNAPSHOT_TS)
             .await?
@@ -975,7 +975,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
     ) -> Result<bool> {
         let index_schema = &self.metadata().index_specs[key.index_no];
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         if index_schema.unique() {
             let index = self.sec_idx()[key.index_no].unique().unwrap();
             index
@@ -997,7 +997,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         key: &SelectKey,
         row_id: RowID,
     ) -> Result<bool> {
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         let (page_guard, row_id) = loop {
             match index
                 .lookup(index_pool_guard, &key.vals, MIN_SNAPSHOT_TS)
@@ -1060,7 +1060,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         key: &SelectKey,
         row_id: RowID,
     ) -> Result<bool> {
-        let index_pool_guard = guards.index_guard();
+        let index_pool_guard = self.index_pool_guard(guards);
         let (page_guard, row_id) = loop {
             match index
                 .lookup_unique(index_pool_guard, &key.vals, row_id, MIN_SNAPSHOT_TS)
@@ -1309,7 +1309,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> Result<InsertIndex> {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         loop {
             match index
                 .insert_if_not_exists(index_pool_guard, &key.vals, row_id, false, stmt.trx.sts)
@@ -1423,7 +1423,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
     ) -> Result<InsertIndex> {
         let index = self.sec_idx()[key.index_no].non_unique().unwrap();
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         // For non-unique index, it's guaranteed to be success.
         match index
             .insert_if_not_exists(index_pool_guard, &key.vals, row_id, false, stmt.trx.sts)
@@ -1446,7 +1446,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
         key: SelectKey,
     ) -> Result<()> {
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         let res = index
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, stmt.trx.sts)
             .await?;
@@ -1463,7 +1463,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
         key: SelectKey,
     ) -> Result<()> {
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         let res = index
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, stmt.trx.sts)
             .await?;
@@ -1485,7 +1485,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_guard: &PageSharedGuard<RowPage>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         loop {
             // new_row_id is guaranteed to be not in the index.
             match index
@@ -1675,7 +1675,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_row_id: RowID,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         // new_row_id is guaranteed to be not in the index.
         match index
             .insert_if_not_exists(
@@ -1710,7 +1710,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_row_id: RowID,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         match index
             .compare_exchange(
                 index_pool_guard,
@@ -1747,7 +1747,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_row_id: RowID,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         // insert new entry.
         let res = index
             .insert_if_not_exists(index_pool_guard, &key.vals, new_row_id, false, stmt.trx.sts)
@@ -1774,7 +1774,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> Result<UpdateIndex> {
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         loop {
             // This is case for one transaction or multiple transactions to update
             // key of the same row back and forth.
@@ -1897,7 +1897,7 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
         new_key: SelectKey,
         row_id: RowID,
     ) -> Result<UpdateIndex> {
-        let index_pool_guard = stmt.pool_guards().index_guard();
+        let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         // This is case for one transaction or multiple transactions to update
         // key of the same row back and forth.
         // e.g. update k=1 to k=2, then update k=2 to k=1, ...
@@ -1926,15 +1926,15 @@ impl<'a, D: BufferPool> TableAccessor<'a, D> {
 
 /// Runtime accessor type binding for user tables:
 /// - `D = EvictableBufferPool` for row pages
-/// - `I = FixedBufferPool` for secondary indexes
-pub type HybridTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool>;
+/// - `I = EvictableBufferPool` for secondary indexes
+pub type HybridTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool, EvictableBufferPool>;
 
 /// Runtime accessor type binding for in-memory catalog tables:
 /// - `D = FixedBufferPool` for row pages
 /// - `I = FixedBufferPool` for secondary indexes
-pub type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool>;
+pub type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool, FixedBufferPool>;
 
-impl TableAccessor<'_, FixedBufferPool> {
+impl TableAccessor<'_, FixedBufferPool, FixedBufferPool> {
     #[inline]
     pub(crate) async fn insert_catalog_no_trx(
         &self,
@@ -1954,7 +1954,7 @@ impl TableAccessor<'_, FixedBufferPool> {
     }
 }
 
-impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
+impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
     async fn table_scan_uncommitted<F>(&self, guards: &PoolGuards, mut row_action: F)
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
@@ -2014,7 +2014,11 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         match self.sec_idx()[key.index_no]
             .unique()
             .unwrap()
-            .lookup(stmt.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+            .lookup(
+                self.index_pool_guard(stmt.pool_guards()),
+                &key.vals,
+                stmt.trx.sts,
+            )
             .await?
         {
             None => Ok(SelectMvcc::NotFound),
@@ -2040,7 +2044,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         let (page_guard, row_id) = match self.sec_idx()[key.index_no]
             .unique()
             .unwrap()
-            .lookup(guards.index_guard(), &key.vals, MIN_SNAPSHOT_TS)
+            .lookup(self.index_pool_guard(guards), &key.vals, MIN_SNAPSHOT_TS)
             .await?
         {
             None => return Ok(None),
@@ -2094,7 +2098,7 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
             .non_unique()
             .unwrap()
             .lookup(
-                stmt.pool_guards().index_guard(),
+                self.index_pool_guard(stmt.pool_guards()),
                 &key.vals,
                 &mut row_ids,
                 stmt.trx.sts,
@@ -2156,7 +2160,11 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
             let (page_guard, row_id) = match index
-                .lookup(stmt.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+                .lookup(
+                    self.index_pool_guard(stmt.pool_guards()),
+                    &key.vals,
+                    stmt.trx.sts,
+                )
                 .await?
             {
                 None => return Ok(UpdateMvcc::NotFound),
@@ -2269,7 +2277,11 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
             let (page_guard, row_id) = match index
-                .lookup(stmt.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+                .lookup(
+                    self.index_pool_guard(stmt.pool_guards()),
+                    &key.vals,
+                    stmt.trx.sts,
+                )
                 .await?
             {
                 None => return Ok(DeleteMvcc::NotFound),
@@ -2369,8 +2381,8 @@ impl<D: BufferPool> TableAccess for TableAccessor<'_, D> {
     }
 }
 
-impl<D: BufferPool> Deref for TableAccessor<'_, D> {
-    type Target = GenericMemTable<D>;
+impl<D: BufferPool, I: BufferPool> Deref for TableAccessor<'_, D, I> {
+    type Target = GenericMemTable<D, I>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {

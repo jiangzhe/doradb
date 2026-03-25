@@ -26,7 +26,6 @@ use std::sync::Arc;
 /// Runtime storage container for all catalog logical tables.
 pub struct CatalogStorage {
     pub(super) meta_pool: QuiescentGuard<FixedBufferPool>,
-    pub(super) index_pool: QuiescentGuard<FixedBufferPool>,
     tables: Box<[Arc<CatalogTable>]>,
     next_user_obj_id: ObjID,
     mtb: Arc<MultiTableFile>,
@@ -38,12 +37,10 @@ impl CatalogStorage {
     #[inline]
     pub(crate) async fn new(
         meta_pool: QuiescentGuard<FixedBufferPool>,
-        index_pool: QuiescentGuard<FixedBufferPool>,
         table_fs: &TableFileSystem,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<Self> {
         let meta_pool_guard = meta_pool.pool_guard();
-        let index_pool_guard = index_pool.pool_guard();
         let (mtb, disk_pool) = table_fs
             .open_or_create_multi_table_file(global_disk_pool)
             .await?;
@@ -63,8 +60,7 @@ impl CatalogStorage {
             let table = Arc::new(
                 CatalogTable::new(
                     meta_pool.clone(),
-                    index_pool.clone(),
-                    &index_pool_guard,
+                    &meta_pool_guard,
                     *table_id,
                     blk_idx,
                     metadata,
@@ -75,7 +71,6 @@ impl CatalogStorage {
         }
         let storage = CatalogStorage {
             meta_pool,
-            index_pool,
             tables: cat.into_boxed_slice(),
             next_user_obj_id: mtb_snapshot.meta.next_user_obj_id,
             mtb,

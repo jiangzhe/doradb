@@ -1,8 +1,8 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::arena::QuiescentArena;
 use crate::buffer::evictor::{
-    ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
-    FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
+    ClockHand, EvictionArbiter, EvictionRuntime, Evictor, FailureRateTracker,
+    PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard};
@@ -11,6 +11,8 @@ use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, V
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{BufferPool, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole, RowPoolRole};
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
+use crate::conf::EvictableBufferPoolConfig;
+use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
@@ -21,16 +23,12 @@ use crate::io::{
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
-use crate::storage_path::{path_to_utf8, validate_swap_file_path_candidate};
-use byte_unit::Byte;
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -63,6 +61,14 @@ pub struct EvictableBufferPool {
 pub(crate) struct MemPoolWorkers;
 
 pub(crate) struct MemPoolWorkersOwned {
+    pool: SyncQuiescentGuard<EvictableBufferPool>,
+    io_thread: Mutex<Option<JoinHandle<()>>>,
+    evict_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(crate) struct IndexPoolWorkers;
+
+pub(crate) struct IndexPoolWorkersOwned {
     pool: SyncQuiescentGuard<EvictableBufferPool>,
     io_thread: Mutex<Option<JoinHandle<()>>>,
     evict_thread: Mutex<Option<JoinHandle<()>>>,
@@ -580,6 +586,56 @@ impl Component for MemPoolWorkers {
 }
 
 impl Supplier<MemPoolWorkers> for crate::MemPool {
+    type Provision = PendingIOThread;
+}
+
+impl Component for IndexPoolWorkers {
+    type Config = ();
+    type Owned = IndexPoolWorkersOwned;
+    type Access = ();
+
+    const NAME: &'static str = "index_pool_workers";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let pool = registry.dependency::<crate::IndexPool>()?;
+        let pending = shelf
+            .take::<crate::IndexPool>()
+            .ok_or(Error::InvalidState)?;
+        let sync_pool = pool.clone_inner().into_sync();
+        let io_thread = EvictableBufferPool::spawn_io_thread_guarded(
+            sync_pool.clone(),
+            pending.worker,
+            pending.file_io,
+        );
+        let evict_thread = EvictableBufferPool::spawn_evict_thread_guarded(sync_pool.clone());
+        registry.register::<Self>(IndexPoolWorkersOwned {
+            pool: sync_pool,
+            io_thread: Mutex::new(Some(io_thread)),
+            evict_thread: Mutex::new(Some(evict_thread)),
+        })
+    }
+
+    #[inline]
+    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.pool.signal_shutdown();
+        if let Some(handle) = component.io_thread.lock().take() {
+            handle.join().unwrap();
+        }
+        if let Some(handle) = component.evict_thread.lock().take() {
+            handle.join().unwrap();
+        }
+    }
+}
+
+impl Supplier<IndexPoolWorkers> for crate::IndexPool {
     type Provision = PendingIOThread;
 }
 
@@ -1227,133 +1283,28 @@ pub(crate) struct PendingIOThread {
     file_io: SingleFileIO,
 }
 
-const DEFAULT_DATA_SWAP_FILE: &str = "data.bin";
-const DEFAULT_MAX_FILE_SIZE: Byte = Byte::from_u64(2 * 1024 * 1024 * 1024); // by default 2GB
-const DEFAULT_MAX_MEM_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // by default 1GB
-const DEFAULT_MAX_IO_DEPTH: usize = 64;
-
-/// Builder-style configuration for [`EvictableBufferPool`].
-///
-/// Besides file and memory sizing, this type carries eviction-arbiter tuning
-/// used to build the background evictor policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvictableBufferPoolConfig {
-    #[serde(default)]
-    role: PoolRole,
-    data_swap_file: PathBuf,
-    max_file_size: Byte,
-    max_mem_size: Byte,
-    max_io_depth: usize,
-    eviction_arbiter_builder: EvictionArbiterBuilder,
-}
-
-impl Default for EvictableBufferPoolConfig {
-    #[inline]
-    fn default() -> Self {
-        EvictableBufferPoolConfig {
-            role: PoolRole::Invalid,
-            data_swap_file: PathBuf::from(DEFAULT_DATA_SWAP_FILE),
-            max_file_size: DEFAULT_MAX_FILE_SIZE,
-            max_mem_size: DEFAULT_MAX_MEM_SIZE,
-            max_io_depth: DEFAULT_MAX_IO_DEPTH,
-            eviction_arbiter_builder: EvictionArbiter::builder(),
-        }
-    }
-}
-
 impl EvictableBufferPoolConfig {
-    #[inline]
-    pub fn role(mut self, role: PoolRole) -> Self {
-        self.role = role;
-        self
-    }
-
-    #[inline]
-    pub fn data_swap_file(mut self, data_swap_file: impl Into<PathBuf>) -> Self {
-        self.data_swap_file = data_swap_file.into();
-        self
-    }
-
-    #[inline]
-    pub(crate) fn data_swap_file_ref(&self) -> &Path {
-        &self.data_swap_file
-    }
-
-    #[inline]
-    pub fn max_file_size<T>(mut self, max_file_size: T) -> Self
-    where
-        Byte: From<T>,
-    {
-        self.max_file_size = Byte::from(max_file_size);
-        self
-    }
-
-    #[inline]
-    pub fn max_mem_size<T>(mut self, max_mem_size: T) -> Self
-    where
-        Byte: From<T>,
-    {
-        self.max_mem_size = Byte::from(max_mem_size);
-        self
-    }
-
-    #[inline]
-    pub fn max_io_depth(mut self, max_io_depth: usize) -> Self {
-        self.max_io_depth = max_io_depth;
-        self
-    }
-
-    #[inline]
-    pub fn eviction_arbiter_builder(
-        mut self,
-        eviction_arbiter_builder: EvictionArbiterBuilder,
-    ) -> Self {
-        self.eviction_arbiter_builder = eviction_arbiter_builder;
-        self
-    }
-
-    #[inline]
-    pub fn target_free(mut self, target_free: usize) -> Self {
-        self.eviction_arbiter_builder = self.eviction_arbiter_builder.target_free(target_free);
-        self
-    }
-
-    #[inline]
-    pub fn hysteresis(mut self, hysteresis: usize) -> Self {
-        self.eviction_arbiter_builder = self.eviction_arbiter_builder.hysteresis(hysteresis);
-        self
-    }
-
-    #[inline]
-    pub fn failure_rate_threshold(mut self, threshold: f64) -> Self {
-        self.eviction_arbiter_builder = self
-            .eviction_arbiter_builder
-            .failure_rate_threshold(threshold);
-        self
-    }
-
-    #[inline]
-    pub fn failure_window(mut self, window: usize) -> Self {
-        self.eviction_arbiter_builder = self.eviction_arbiter_builder.failure_window(window);
-        self
-    }
-
-    #[inline]
-    pub fn dynamic_batch_bounds(mut self, min_batch: usize, max_batch: usize) -> Self {
-        self.eviction_arbiter_builder = self
-            .eviction_arbiter_builder
-            .dynamic_batch_bounds(min_batch, max_batch);
-        self
-    }
-
     /// Builds a raw evictable buffer pool without starting background workers.
     ///
     /// Worker startup must happen only after the pool has reached a stable
     /// owner address in [`QuiescentBox`].
     #[inline]
     pub(crate) fn build(self) -> Result<(EvictableBufferPool, PendingIOThread)> {
+        self.build_with_swap_file_field("data_swap_file")
+    }
+
+    /// Builds a raw evictable index buffer pool without starting background workers.
+    #[inline]
+    pub(crate) fn build_index(self) -> Result<(EvictableBufferPool, PendingIOThread)> {
+        self.build_with_swap_file_field("index_swap_file")
+    }
+
+    fn build_with_swap_file_field(
+        self,
+        swap_file_field_name: &'static str,
+    ) -> Result<(EvictableBufferPool, PendingIOThread)> {
         self.role.assert_valid("evictable buffer pool");
-        validate_swap_file_path_candidate(&self.data_swap_file)?;
+        validate_swap_file_path_candidate(swap_file_field_name, &self.data_swap_file)?;
         // 1. Calculate memory usage.
         let max_file_size = self.max_file_size.as_u64() as usize;
         let max_mem_size = self.max_mem_size.as_u64() as usize;
@@ -1382,8 +1333,8 @@ impl EvictableBufferPoolConfig {
         let io_ctx = LibaioContext::new(self.max_io_depth)?;
         let (worker, io_client) = io_ctx.io_worker();
 
-        let data_swap_file = path_to_utf8(&self.data_swap_file, "data_swap_file")?;
-        let file = SparseFile::create_or_trunc(data_swap_file, max_file_size)?;
+        let swap_file_path = path_to_utf8(&self.data_swap_file, swap_file_field_name)?;
+        let file = SparseFile::create_or_trunc(swap_file_path, max_file_size)?;
         let raw_fd = file.as_raw_fd();
         let file_io = SingleFileIO::new(file);
 
@@ -1523,6 +1474,20 @@ pub struct EvictableBufferPoolStats {
     io_wait_nanos: AtomicUsize,
 }
 
+impl EvictableBufferPoolStats {
+    /// Returns the number of completed page reload reads.
+    #[inline]
+    pub fn finished_reads(&self) -> usize {
+        self.finished_reads.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of completed page writebacks.
+    #[inline]
+    pub fn finished_writes(&self) -> usize {
+        self.finished_writes.load(Ordering::Relaxed)
+    }
+}
+
 /// Internal request channel payload consumed by the IO event loop.
 ///
 /// `Read` schedules a single-page load; `BatchWrite` schedules writeback for a
@@ -1535,6 +1500,7 @@ pub(crate) enum PoolRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::EvictionArbiterBuilder;
     use crate::buffer::guard::PageGuard;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
@@ -1613,7 +1579,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let pool = EvictableBufferPoolConfig::default()
             .role(crate::buffer::PoolRole::Mem)
-            .data_swap_file(temp_dir.path().join("data.bin"))
+            .data_swap_file(temp_dir.path().join("data.swp"))
             .max_mem_size(64u64 * 1024 * 1024)
             .max_file_size(128u64 * 1024 * 1024)
             .build()
@@ -1631,7 +1597,7 @@ mod tests {
             let pool = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.bin"))
+                    .data_swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256),
             );
@@ -1749,7 +1715,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
+                .data_swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(128u64 * 1024 * 1024)
                 .build()
@@ -1787,7 +1753,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (pool, pending) = EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
+                .data_swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(128u64 * 1024 * 1024)
                 .build()
@@ -1854,7 +1820,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
+                .data_swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(128u64 * 1024 * 1024)
                 .build()
@@ -1892,7 +1858,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
+                .data_swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(128u64 * 1024 * 1024)
                 .build()
@@ -1932,7 +1898,7 @@ mod tests {
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
+                .data_swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 130)
                 .max_file_size(128u64 * 1024 * 130),
         );
@@ -1982,7 +1948,7 @@ mod tests {
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
+                .data_swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(1024u64 * 1024 * 64)
                 .max_file_size(1024u64 * 1024 * 128),
         );
@@ -2010,7 +1976,7 @@ mod tests {
             let pool = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.bin"))
+                    .data_swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 130)
                     .max_file_size(128u64 * 1024 * 130),
             );
@@ -2047,7 +2013,7 @@ mod tests {
             let pool = QuiescentBox::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.bin"))
+                    .data_swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64)
                     .build()
@@ -2084,7 +2050,7 @@ mod tests {
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
+                .data_swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(64u64 * 1024 * 2048),
         );
@@ -2161,7 +2127,7 @@ mod tests {
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
                 .role(crate::buffer::PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.bin"))
+                .data_swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(1024u64 * 1024 * 10)
                 .max_file_size(1024u64 * 1024 * 16)
                 .eviction_arbiter_builder(
@@ -2206,14 +2172,14 @@ mod tests {
             let pool1 = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
-                    .data_swap_file(temp_dir1.path().join("data1.bin"))
+                    .data_swap_file(temp_dir1.path().join("data1.swp"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64),
             );
             let pool2 = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
                     .role(crate::buffer::PoolRole::Mem)
-                    .data_swap_file(temp_dir2.path().join("data2.bin"))
+                    .data_swap_file(temp_dir2.path().join("data2.swp"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64),
             );
@@ -2228,5 +2194,43 @@ mod tests {
                 .get_page::<RowPage>(&pool2_guard, page_id, LatchFallbackMode::Shared)
                 .await;
         });
+    }
+
+    #[test]
+    fn test_evictable_buffer_pool_build_reports_data_swap_file_label() {
+        let err = match EvictableBufferPoolConfig::default()
+            .role(crate::buffer::PoolRole::Mem)
+            .data_swap_file("data.bin")
+            .build()
+        {
+            Ok(_) => panic!("expected invalid storage path"),
+            Err(err) => err,
+        };
+        match err {
+            Error::InvalidStoragePath(msg) => {
+                assert!(msg.contains("data_swap_file"));
+                assert!(msg.contains(".swp"));
+            }
+            err => panic!("expected invalid storage path, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_evictable_buffer_pool_build_reports_index_swap_file_label() {
+        let err = match EvictableBufferPoolConfig::default()
+            .role(crate::buffer::PoolRole::Index)
+            .data_swap_file("index.bin")
+            .build_index()
+        {
+            Ok(_) => panic!("expected invalid storage path"),
+            Err(err) => err,
+        };
+        match err {
+            Error::InvalidStoragePath(msg) => {
+                assert!(msg.contains("index_swap_file"));
+                assert!(msg.contains(".swp"));
+            }
+            err => panic!("expected invalid storage path, got {err:?}"),
+        }
     }
 }

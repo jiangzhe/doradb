@@ -1,10 +1,11 @@
-use crate::buffer::PoolGuards;
+use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{TableCache, TableHandle, TableID};
 use crate::error::Result;
 use crate::index::util::Maskable;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowRead};
+use crate::table::{ColumnStorage, GenericMemTable};
 use crate::trx::TrxID;
 use crate::trx::row::RowReadAccess;
 
@@ -63,7 +64,25 @@ impl IndexUndoLogs {
         guards: &PoolGuards,
         ts: TrxID,
     ) -> Result<()> {
-        let index_pool_guard = guards.index_guard();
+        match table {
+            TableHandle::User(table) => {
+                Self::rollback_entry_in_mem_table(entry, table, Some(&table.storage), guards, ts)
+                    .await
+            }
+            TableHandle::Catalog(table) => {
+                Self::rollback_entry_in_mem_table(entry, table, None, guards, ts).await
+            }
+        }
+    }
+
+    async fn rollback_entry_in_mem_table<D: BufferPool, I: BufferPool>(
+        entry: IndexUndo,
+        table: &GenericMemTable<D, I>,
+        storage: Option<&ColumnStorage>,
+        guards: &PoolGuards,
+        ts: TrxID,
+    ) -> Result<()> {
+        let index_pool_guard = table.index_pool_guard(guards);
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
                 let index = table.sec_idx()[key.index_no].unique().unwrap();
@@ -120,7 +139,7 @@ impl IndexUndoLogs {
                     //
                     // To solve this, we need to re-check original row with row latch and delete
                     // index entry if it is deleted and does not have any old version (already GCed).
-                    match table.find_row(guards, old_row_id).await {
+                    match table.find_row(guards, old_row_id, storage).await {
                         RowLocation::NotFound => unreachable!(),
                         RowLocation::LwcPage(..) => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {

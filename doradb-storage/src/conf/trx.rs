@@ -8,7 +8,6 @@ use crate::error::Result;
 use crate::file::table_fs::TableFileSystem;
 use crate::io::{LibaioContext, align_to_sector_size};
 use crate::quiescent::QuiescentGuard;
-use crate::storage_path::{path_to_utf8, validate_log_file_stem};
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
 use crate::trx::purge::{GC, Purge};
 use crate::trx::recover::log_recover;
@@ -19,18 +18,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
-use super::log::list_log_files;
+use super::consts::{
+    DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_IO_DEPTH,
+    DEFAULT_LOG_IO_MAX_SIZE, DEFAULT_LOG_PARTITIONS, DEFAULT_LOG_SYNC, DEFAULT_PURGE_THREADS,
+    DEFAULT_SKIP_RECOVERY, MAX_LOG_PARTITIONS,
+};
+use super::path::{path_to_utf8, validate_log_file_stem};
 
-pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
-pub const DEFAULT_LOG_IO_MAX_SIZE: Byte = Byte::from_u64(8192);
-pub const DEFAULT_LOG_DIR: &str = ".";
-pub const DEFAULT_LOG_FILE_STEM: &str = "redo.log";
-pub const DEFAULT_LOG_PARTITIONS: usize = 1;
-pub const MAX_LOG_PARTITIONS: usize = 99; // big enough for log partitions, so fix two digits in file name.
-pub const DEFAULT_LOG_FILE_MAX_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024); // 1GB, sparse file will not occupy space until actual write.
-pub const DEFAULT_LOG_SYNC: LogSync = LogSync::Fsync;
-pub const DEFAULT_PURGE_THREADS: usize = 2;
-pub const DEFAULT_SKIP_RECOVERY: bool = false;
+use crate::trx::log::list_log_files;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrxSysConfig {
@@ -190,12 +185,27 @@ impl TrxSysConfig {
     }
 
     #[inline]
+    pub(crate) fn log_dir_ref(&self) -> &Path {
+        &self.log_dir
+    }
+
+    #[inline]
+    pub(crate) fn log_file_stem_ref(&self) -> &str {
+        &self.log_file_stem
+    }
+
+    #[inline]
+    pub(crate) fn file_prefix(&self) -> Result<String> {
+        let file_prefix = self.log_dir.join(&self.log_file_stem);
+        Ok(path_to_utf8(&file_prefix, "redo log path")?.to_owned())
+    }
+
+    #[inline]
     pub fn log_partition_initializer(&self, log_no: usize) -> Result<LogPartitionInitializer> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let ctx = LibaioContext::new(self.io_depth_per_log)?;
         let file_prefix = self.file_prefix()?;
 
-        // determine whether we should recovery from previous logs.
         let mode = if self.skip_recovery {
             LogPartitionMode::Done
         } else {
@@ -219,26 +229,10 @@ impl TrxSysConfig {
         })
     }
 
-    #[inline]
-    pub(crate) fn log_dir_ref(&self) -> &Path {
-        &self.log_dir
-    }
-
-    #[inline]
-    pub(crate) fn log_file_stem_ref(&self) -> &str {
-        &self.log_file_stem
-    }
-
-    #[inline]
-    pub(crate) fn file_prefix(&self) -> Result<String> {
-        let file_prefix = self.log_dir.join(&self.log_file_stem);
-        Ok(path_to_utf8(&file_prefix, "redo log path")?.to_owned())
-    }
-
     pub(crate) async fn prepare(
         self,
         meta_pool: QuiescentGuard<FixedBufferPool>,
-        index_pool: QuiescentGuard<FixedBufferPool>,
+        index_pool: QuiescentGuard<EvictableBufferPool>,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: QuiescentGuard<TableFileSystem>,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
@@ -257,8 +251,6 @@ impl TrxSysConfig {
             .push(PoolRole::Disk, global_disk_pool.pool_guard())
             .build();
 
-        // Now we have an empty catalog, all log partitions and buffer pool.
-        // Recover all committed data if required.
         let (log_partitions, gc_rxs) = log_recover(
             &meta_pool,
             crate::trx::recover::RecoveryDeps {
