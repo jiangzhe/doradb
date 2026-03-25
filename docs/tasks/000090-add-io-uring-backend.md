@@ -3,6 +3,7 @@ id: 000090
 title: Add io_uring Backend
 status: implemented  # proposal | implemented | superseded
 created: 2026-03-25
+github_issue: 478
 ---
 
 # Task: Add io_uring Backend
