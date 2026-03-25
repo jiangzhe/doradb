@@ -43,7 +43,7 @@ Code structure of storage engine:
 - [compression](./doradb-storage/src/compression): Compression algorithms for column store.
 - [file](./doradb-storage/src/file): Storage of table data, index and delete bitmap. The file is page based and organized as CoW B+Tree, to enable simple recovery and fast access.
 - [index](./doradb-storage/src/index): Block index and B+Tree index.
-- [io](./doradb-storage/src/io): Async direct IO system backed by libaio. May introduce io-uring in future.
+- [io](./doradb-storage/src/io): Async direct IO system with compile-time-selected `libaio` and `io_uring` backends. `libaio` remains the default.
 - [latch](./doradb-storage/src/latch): Async latch primitives including Mutex, RWLock and HybridLatch(enhanced RWLock with optimistic mode).
 - [lwc](./doradb-storage/src/lwc): LightWeight Columnar format for on-disk warm data.
 - [row](./doradb-storage/src/row): In-memory row store and operations.

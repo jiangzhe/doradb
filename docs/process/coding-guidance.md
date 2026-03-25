@@ -17,7 +17,7 @@ We follow a strict priority order for all engineering decisions:
 We rely on tooling to enforce style.
 
 *   **Formatting**: `cargo fmt` is the authority.
-*   **Linting**: `cargo clippy --all-features --all-targets -- -D warnings` must pass.
+*   **Linting**: `cargo clippy -p doradb-storage --all-targets -- -D warnings` must pass.
 *   **Imports & Type Names**: Prefer `use` imports plus short type names to keep code concise and readable. Use fully qualified type names only when they are actually needed, such as resolving name conflicts or clarifying ambiguous paths.
 *   **Public API Documentation**: Every public `struct`, `trait`, `enum`, `const`, and `method/function` **MUST** have a descriptive `///` doc comment.
 *   **Doc Placement**: Documentation comments (`///` or `//!`) must always be placed **above** any attributes (e.g., `#[derive(...)]`, `#[must_use]`).
@@ -42,7 +42,7 @@ We rely on tooling to enforce style.
 ### I/O Abstraction
 *   **Use `crate::io`**: All file I/O must go through the `crate::io` module.
     *   **Do not** use `std::fs` or `tokio::fs` for data path operations.
-*   **`libaio` Backend**: The current repository supports the `libaio`-backed `crate::io` path only. Ensure Linux development environments provide `libaio1` and `libaio-dev`.
+*   **Compile-Time Backends**: `crate::io` supports compile-time-selected `libaio` and `io_uring` backends. `libaio` remains the default in this repository, and `io_uring` is the non-default alternate path.
 *   **Alignment**: Respect `crate::io::MIN_PAGE_SIZE` (4096 bytes) for Direct I/O buffers.
 
 ## 4. Testing
@@ -53,6 +53,7 @@ We rely on tooling to enforce style.
     *   If cross-module test reuse is needed, prefer a narrow `#[cfg(test)] pub(crate) use ...::tests::{...};` re-export instead of expanding the production API or adding standalone test-support modules.
 *   **Production Shape First**: Do not widen or complicate production structs, traits, or control flow solely for tests. Prefer adapting tests to the production path, and use minimal `#[cfg(test)]` branches when test-only control is required.
 *   **Routine Validation**: Run `cargo nextest run -p doradb-storage`.
+*   **Alternate Backend Validation**: Run `cargo nextest run -p doradb-storage --no-default-features --features iouring` manually when you need to validate the non-default backend path.
 *   **Doc Tests**: This project currently does not have doctests, and routine validation does not run `cargo test --doc`.
 
 ## 5. Unsafe Code

@@ -35,8 +35,8 @@ if ! cmp -s "${tmp_before_fmt}" "${tmp_after_fmt}"; then
   exit 1
 fi
 
-echo "[pre-commit] Running cargo clippy --all-features --all-targets -- -D warnings"
-if ! cargo clippy --all-features --all-targets -- -D warnings >"${tmp_clippy_log}" 2>&1; then
+echo "[pre-commit] Running cargo clippy -p doradb-storage --all-targets -- -D warnings"
+if ! cargo clippy -p doradb-storage --all-targets -- -D warnings >"${tmp_clippy_log}" 2>&1; then
   echo "[pre-commit] cargo clippy failed."
   cat "${tmp_clippy_log}"
   exit 1

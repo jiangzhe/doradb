@@ -12,10 +12,9 @@ pub(crate) use self::table_fs::tests::{build_test_fs, build_test_fs_in};
 use crate::buffer::{PersistedBlockKey, ReadSubmission};
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
-use crate::io::io_iocb_cmd;
 use crate::io::{
-    AIO, AIOBuf, AIOClient, AIOError, AIOKey, AIOKind, AIOResult, AIOStats, Completion, IOQueue,
-    IOStateMachine, IOSubmission, Operation, STORAGE_SECTOR_SIZE, UnsafeAIO, align_to_sector_size,
+    AIOClient, AIOError, AIOKind, AIOResult, AIOStats, Completion, IOQueue, IOStateMachine,
+    IOSubmission, Operation, STORAGE_SECTOR_SIZE, align_to_sector_size,
 };
 use crate::{error::Error, error::Result};
 use libc::{
@@ -150,54 +149,6 @@ impl SparseFile {
                 return Ok((offset, new_offset));
             }
         }
-    }
-
-    /// Returns a pread IO request.
-    /// User should make sure key is unique.
-    #[inline]
-    pub fn pread_direct<T: AIOBuf>(&self, key: AIOKey, offset: usize, buf: T) -> AIO<T> {
-        pread_direct(key, self.fd, offset, buf)
-    }
-
-    /// Returns a pread IO request.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee the pointer is valid during
-    /// syscall, and pointer is correctly aligned.
-    #[inline]
-    pub unsafe fn pread_unchecked(
-        &self,
-        key: AIOKey,
-        offset: usize,
-        ptr: *mut u8,
-        len: usize,
-    ) -> UnsafeAIO {
-        unsafe { pread_unchecked(key, self.fd, offset, ptr, len) }
-    }
-
-    /// Returns a pwrite IO request.
-    /// User should make sure key is unique.
-    #[inline]
-    pub fn pwrite_direct<T: AIOBuf>(&self, key: AIOKey, offset: usize, buf: T) -> AIO<T> {
-        pwrite_direct(key, self.fd, offset, buf)
-    }
-
-    /// Returns a pwrite IO request.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee the pointer is valid during
-    /// syscall, and pointer is correctly aligned.
-    #[inline]
-    pub unsafe fn pwrite_unchecked(
-        &self,
-        key: AIOKey,
-        offset: usize,
-        ptr: *mut u8,
-        len: usize,
-    ) -> UnsafeAIO {
-        unsafe { pwrite_unchecked(key, self.fd, offset, ptr, len) }
     }
 
     /// Returns the file syncer.
@@ -496,96 +447,6 @@ impl Deref for FixedSizeBufferFreeList {
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-#[inline]
-pub fn pread_direct<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    AIO::new(
-        key,
-        fd,
-        offset,
-        buf,
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PREAD,
-    )
-}
-
-/// pread.
-///
-/// # Safety
-///
-/// Caller must guarantee the pointer is valid during
-/// syscall, and pointer is correctly aligned.
-#[inline]
-pub unsafe fn pread_unchecked(
-    key: AIOKey,
-    fd: RawFd,
-    offset: usize,
-    ptr: *mut u8,
-    len: usize,
-) -> UnsafeAIO {
-    unsafe {
-        const PRIORITY: u16 = 0;
-        const FLAGS: u32 = 0;
-        UnsafeAIO::new(
-            key,
-            fd,
-            offset,
-            ptr,
-            len,
-            PRIORITY,
-            FLAGS,
-            io_iocb_cmd::IO_CMD_PREAD,
-        )
-    }
-}
-
-#[inline]
-pub fn pwrite_direct<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    AIO::new(
-        key,
-        fd,
-        offset,
-        buf,
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PWRITE,
-    )
-}
-
-/// pwrite.
-///
-/// # Safety
-///
-/// Caller must guarantee the pointer is valid during
-/// syscall, and pointer is correctly aligned.
-#[inline]
-pub unsafe fn pwrite_unchecked(
-    key: AIOKey,
-    fd: RawFd,
-    offset: usize,
-    ptr: *mut u8,
-    len: usize,
-) -> UnsafeAIO {
-    unsafe {
-        const PRIORITY: u16 = 0;
-        const FLAGS: u32 = 0;
-        UnsafeAIO::new(
-            key,
-            fd,
-            offset,
-            ptr,
-            len,
-            PRIORITY,
-            FLAGS,
-            io_iocb_cmd::IO_CMD_PWRITE,
-        )
     }
 }
 

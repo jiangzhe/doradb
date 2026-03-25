@@ -18,7 +18,7 @@ use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
 use crate::io::{
     AIOClient, AIOKind, AIOStats, IOQueue, IOStateMachine, IOSubmission, IOWorkerBuilder,
-    LibaioContext, Operation,
+    Operation, StorageBackend,
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::notify::EventNotifyOnDrop;
@@ -1330,7 +1330,7 @@ impl EvictableBufferPoolConfig {
         let arena = QuiescentArena::new(max_nbr)?;
 
         // 3. Create file and initialize AIO manager.
-        let io_ctx = LibaioContext::new(self.max_io_depth)?;
+        let io_ctx = StorageBackend::new(self.max_io_depth)?;
         let (worker, io_client) = io_ctx.io_worker();
 
         let swap_file_path = path_to_utf8(&self.data_swap_file, swap_file_field_name)?;
