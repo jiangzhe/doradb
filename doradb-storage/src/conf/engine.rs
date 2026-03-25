@@ -222,13 +222,14 @@ impl ResolvedStoragePaths {
                 path.display()
             )));
         }
-        if path == self.catalog_file_path {
+        if aliases_reserved_path(path, &self.catalog_file_path) {
             return Err(Error::InvalidStoragePath(format!(
                 "{field} must not overlap catalog file: {}",
                 path.display()
             )));
         }
-        if path == self.marker_path() {
+        let marker_path = self.marker_path();
+        if aliases_reserved_path(path, &marker_path) {
             return Err(Error::InvalidStoragePath(format!(
                 "{field} must not overlap storage marker: {}",
                 path.display()
@@ -245,7 +246,7 @@ impl ResolvedStoragePaths {
             )));
         }
         let log_family_base = self.log_family_base_path();
-        if path == log_family_base {
+        if aliases_reserved_path(path, &log_family_base) {
             return Err(Error::InvalidStoragePath(format!(
                 "{field} must not overlap redo log family: {}",
                 path.display()
@@ -267,6 +268,10 @@ impl ResolvedStoragePaths {
         }
         Ok(())
     }
+}
+
+fn aliases_reserved_path(path: &Path, reserved: &Path) -> bool {
+    path == reserved || path.starts_with(reserved) || reserved.starts_with(path)
 }
 
 /// Storage-engine configuration.
@@ -523,6 +528,29 @@ mod tests {
         let err = EngineConfig::default()
             .trx(TrxSysConfig::default().log_dir("log.swp"))
             .index_swap_file("log.swp/index.swp")
+            .resolve_storage_paths()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
+    }
+
+    #[test]
+    fn test_swap_files_reject_reserved_file_descendants() {
+        let err = EngineConfig::default()
+            .data_buffer(
+                EvictableBufferPoolConfig::default().data_swap_file("catalog.mtb/data.swp"),
+            )
+            .resolve_storage_paths()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
+
+        let err = EngineConfig::default()
+            .index_swap_file(format!("{STORAGE_LAYOUT_FILE_NAME}/index.swp"))
+            .resolve_storage_paths()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidStoragePath(_)));
+
+        let err = EngineConfig::default()
+            .index_swap_file("redo.log/index.swp")
             .resolve_storage_paths()
             .unwrap_err();
         assert!(matches!(err, Error::InvalidStoragePath(_)));

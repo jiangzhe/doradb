@@ -275,6 +275,10 @@ impl EngineConfig {
     pub async fn build(self) -> Result<Engine> {
         let resolved = self.resolve_storage_paths()?;
         resolved.validate_marker_if_present()?;
+        // Startup prefers a small, durable-safety-focused preflight over trying
+        // to exhaust every possible path conflict up front. It is acceptable for
+        // later setup steps to fail, but those failures must not clobber durable
+        // files or persist `storage-layout.toml` before the engine is fully built.
         resolved.ensure_directories()?;
 
         let file = self.file.data_dir(resolved.data_dir_path());
@@ -531,6 +535,31 @@ mod tests {
                 .unwrap();
             drop(engine);
             assert!(marker_path.exists());
+        });
+    }
+
+    #[test]
+    fn test_invalid_swap_path_startup_does_not_persist_storage_layout_marker() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let marker_path = root.path().join(STORAGE_LAYOUT_FILE_NAME);
+
+            let err = match test_engine_config_for(root.path())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(TEST_POOL_BYTES)
+                        .max_file_size(128usize * 1024 * 1024)
+                        .data_swap_file("catalog.mtb/data.swp"),
+                )
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected startup failure"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::InvalidStoragePath(_)));
+            assert!(!marker_path.exists());
         });
     }
 
