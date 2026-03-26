@@ -1,7 +1,7 @@
 ---
 id: 000091
 title: Make io_uring Default and Finish Async IO Cleanup
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-25
 github_issue: 480
 ---
@@ -237,6 +237,80 @@ cargo run -p doradb-storage --example multi_threaded_trx -- --threads 1 --sessio
 
 ## Implementation Notes
 
+1. Switched the repository-default storage backend to `io_uring` while keeping
+   `libaio` as the explicit legacy-kernel alternate path.
+   - `doradb-storage/Cargo.toml` now uses `default = ["iouring"]`.
+   - `crate::io` still enforces compile-time mutual exclusion between
+     `iouring` and `libaio`.
+2. Updated repository process docs, CI, and local tooling to match the new
+   support policy.
+   - `.github/workflows/build.yml`, `docs/process/unit-test.md`,
+     `docs/process/coding-guidance.md`, and `tools/coverage_focus.rs` now
+     treat the default validation path as `io_uring` and keep one explicit
+     `libaio` validation path.
+   - Added `docs/async-io.md` as the repository-level design and operational
+     reference for the completion core, backend contract, and storage-engine
+     integration points.
+3. Finished the remaining libaio-only compatibility cleanup in the shared
+   async-I/O layer.
+   - Moved `AIO<T>`, `UnsafeAIO`, `IocbRawPtr`, and libaio-only `pread` /
+     `pwrite` helpers into `doradb-storage/src/io/libaio_backend.rs`.
+   - Kept `AIOBuf` and `DirectBuf` in the shared generic layer.
+   - Review follow-up also moved libaio-only tests and their helper
+     state-machine types out of `doradb-storage/src/io/mod.rs` and into
+     `doradb-storage/src/io/libaio_backend.rs` so `io/mod.rs` keeps only
+     backend-neutral tests and hook exports.
+4. Completed redo/log cleanup without changing commit ordering or durability
+   semantics.
+   - `LogIOStateMachine::on_stats(...)` now merges worker `io_submit_*` and
+     `io_wait_*` counters into `LogPartitionStats`.
+   - Added a narrow test-only `FileSyncer` hook so redo `fsync` /
+     `fdatasync` failure paths can be covered without changing production
+     behavior.
+   - Removed stale “AIO manager” and libaio-specific wording from redo-related
+     comments and config/docs.
+5. Added backend-neutral redo failure coverage and kept review-driven readonly
+   cleanup test-only.
+   - Redo write, `fsync`, and `fdatasync` failure paths are covered under both
+     the default `io_uring` build and the explicit alternate `libaio` build.
+   - `commit_no_wait` / system-transaction CTS behavior is covered.
+   - Review follow-up found readonly shared-failure tests were assuming
+     synchronous inflight-map cleanup immediately after
+     `Completion::wait_result()`. Production ordering was left unchanged; the
+     tests were updated to wait for eventual inflight cleanup instead.
+6. Recorded the manual benchmark outcome on 2026-03-26.
+   - `multi_threaded_trx` median: `io_uring` `16910 trx/s` vs `libaio`
+     `16625 trx/s` (`+1.7%`).
+   - `bench_readonly_buffer_pool` median: `io_uring` was slower than `libaio`
+     by `48.5%` on cold reads and `36.9%` on the benchmark's current “warm”
+     phase on this machine.
+   - The readonly benchmark/perf gap was not folded into this landing.
+     Follow-up backlog
+     `docs/backlogs/000070-correct-readonly-buffer-pool-warm-benchmark-and-investigate-iouring-cold-read-latency.md`
+     tracks correcting the benchmark methodology and investigating the
+     remaining cold-read latency gap.
+7. Validation completed for the implemented state.
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+     - result: passed
+   - `cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings`
+     - result: passed
+   - `cargo nextest run -p doradb-storage`
+     - result: passed
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+     - result: passed
+   - targeted follow-up checks:
+     - `cargo test -p doradb-storage buffer::readonly::tests::test_readonly_pool_shared_io_failure_propagates_to_all_waiters -- --exact --nocapture`
+       - result: passed
+     - `cargo test -p doradb-storage buffer::readonly::tests::test_readonly_pool_shared_validated_load_propagates_validation_failure -- --exact --nocapture`
+       - result: passed
+     - `cargo test -p doradb-storage buffer::readonly::tests::test_readonly_pool_cancelled_loader_keeps_shared_miss_attempt_alive -- --exact --nocapture`
+       - result: passed
+     - `cargo test -p doradb-storage --no-default-features --features libaio io::libaio_backend::tests -- --nocapture`
+       - result: passed
+8. Tracking and review state at resolve time.
+   - task issue: `#480`
+   - implementation PR: `#481`
+
 ## Impacts
 
 1. Backend feature contract and repository default:
@@ -293,10 +367,14 @@ cargo run -p doradb-storage --example multi_threaded_trx -- --threads 1 --sessio
 
 ## Open Questions
 
-1. After phase 6 is fully implemented and validated, should a later follow-up
-   retire the remaining backend-private raw libaio compatibility helpers
-   entirely, or are they expected to remain indefinitely as part of long-term
-   legacy-kernel support?
-2. How broad should routine CI coverage for the explicit alternate `libaio`
-   backend become after the default switch is complete: full parity with the
-   default branch, or targeted backend-sensitive validation only?
+1. Readonly benchmark methodology cleanup and the remaining `io_uring`
+   cold-read latency investigation are deferred to
+   `docs/backlogs/000070-correct-readonly-buffer-pool-warm-benchmark-and-investigate-iouring-cold-read-latency.md`.
+2. After the default switch stabilizes, should a later follow-up retire the
+   remaining backend-private raw libaio compatibility helpers entirely, or are
+   they expected to remain indefinitely as part of long-term legacy-kernel
+   support?
+3. How broad should routine CI coverage for the explicit alternate `libaio`
+   backend become after the default switch is complete: targeted
+   backend-sensitive validation only, or broader parity with the default
+   branch?

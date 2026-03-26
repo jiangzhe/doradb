@@ -378,10 +378,10 @@ This RFC changes code in an unsafe-sensitive area.
     not worse than `libaio`.
   - Non-goals: runtime backend switching, removing `libaio` entirely, or broad
     post-adoption tuning beyond the default-switch acceptance bar.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000091-make-io-uring-default-and-finish-async-io-cleanup.md`
+  - Task Issue: `#480`
+  - Phase Status: done
+  - Implementation Summary: Switched the default backend to io_uring, completed the remaining async-I/O cleanup/docs, and deferred readonly benchmark/cold-read perf follow-up to docs/backlogs/000070-correct-readonly-buffer-pool-warm-benchmark-and-investigate-iouring-cold-read-latency.md [Task Resolve Sync: docs/tasks/000091-make-io-uring-default-and-finish-async-io-cleanup.md @ 2026-03-26]
 
 ## Consequences
 
