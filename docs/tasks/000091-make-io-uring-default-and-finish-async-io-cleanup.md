@@ -3,6 +3,7 @@ id: 000091
 title: Make io_uring Default and Finish Async IO Cleanup
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-25
+github_issue: 480
 ---
 
 # Task: Make io_uring Default and Finish Async IO Cleanup
