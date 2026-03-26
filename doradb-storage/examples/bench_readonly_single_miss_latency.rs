@@ -196,7 +196,7 @@ fn main() {
             readonly_frame_bytes(),
         );
 
-        let cold_pool_start = pool.stats();
+        let cold_pool_start = pool.global_stats();
         let cold_backend_start = engine.table_fs.io_backend_stats();
         let cold_start = std::time::Instant::now();
         let mut cold_checksum = 0u64;
@@ -214,7 +214,7 @@ fn main() {
             drop(g);
         }
         let cold_elapsed = cold_start.elapsed();
-        let cold_pool_end = pool.stats();
+        let cold_pool_end = pool.global_stats();
         let cold_backend_end = engine.table_fs.io_backend_stats();
         print_phase(
             "cold_miss",
@@ -244,7 +244,7 @@ fn main() {
             drop(g);
         }
         let warm_elapsed = warm_start.elapsed();
-        let warm_pool_end = pool.stats();
+        let warm_pool_end = pool.global_stats();
         let warm_backend_end = engine.table_fs.io_backend_stats();
         print_phase(
             "warm_hit",

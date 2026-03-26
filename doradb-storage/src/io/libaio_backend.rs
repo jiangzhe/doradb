@@ -211,17 +211,31 @@ impl LibaioBackend {
     where
         F: FnMut(AIOKey, StdResult<usize, std::io::Error>) -> AIOKind,
     {
+        let (_, read_count, write_count) =
+            self.wait_at_least_with_attempts(events, min_nr, |key, res| callback(key, res));
+        (read_count, write_count)
+    }
+
+    #[inline]
+    fn wait_at_least_with_attempts<F>(
+        &self,
+        events: &mut [io_event],
+        min_nr: usize,
+        mut callback: F,
+    ) -> (usize, usize, usize)
+    where
+        F: FnMut(AIOKey, StdResult<usize, std::io::Error>) -> AIOKind,
+    {
         let max_nwait = events.len();
+        let mut wait_calls = 0;
         let count = loop {
-            let ret = unsafe {
-                io_getevents(
-                    self.ctx,
-                    min_nr as c_long,
-                    max_nwait as c_long,
-                    events.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                )
-            };
+            wait_calls += 1;
+            let ret = io_getevents_impl(
+                self.ctx,
+                min_nr as c_long,
+                max_nwait as c_long,
+                events.as_mut_ptr(),
+            );
             if ret < 0 {
                 let errcode = -ret;
                 if errcode == EINTR {
@@ -250,7 +264,7 @@ impl LibaioBackend {
                 AIOKind::Write => write_count += 1,
             }
         }
-        (read_count, write_count)
+        (wait_calls, read_count, write_count)
     }
 
     /// Build an IO worker builder.
@@ -302,6 +316,17 @@ fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
         }
     }
     unsafe { io_submit(ctx, nr, ios) }
+}
+
+#[inline]
+fn io_getevents_impl(ctx: io_context_t, min_nr: c_long, nr: c_long, events: *mut io_event) -> i32 {
+    #[cfg(test)]
+    {
+        if let Some(hook) = tests::current_io_getevents_hook() {
+            return hook(ctx, min_nr, nr, events);
+        }
+    }
+    unsafe { io_getevents(ctx, min_nr, nr, events, std::ptr::null_mut()) }
 }
 
 impl Drop for LibaioBackend {
@@ -399,12 +424,16 @@ impl IOBackend for LibaioBackend {
     ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
         let start = Instant::now();
         let mut completed = Vec::new();
-        LibaioBackend::wait_at_least(self, events, min_nr, |token, res| {
-            completed.push((BackendToken::from_raw(token), res));
-            AIOKind::Read
-        });
-        self.stats
-            .record_wait(1, completed.len(), start.elapsed().as_nanos() as usize);
+        let (wait_calls, _read_count, _write_count) =
+            self.wait_at_least_with_attempts(events, min_nr, |token, res| {
+                completed.push((BackendToken::from_raw(token), res));
+                AIOKind::Read
+            });
+        self.stats.record_wait(
+            wait_calls,
+            completed.len(),
+            start.elapsed().as_nanos() as usize,
+        );
         completed
     }
 }
@@ -417,11 +446,15 @@ pub(crate) mod tests {
     use libc::EAGAIN;
     use std::os::fd::AsRawFd;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     pub(crate) type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
+    pub(crate) type IoGeteventsHook = fn(io_context_t, c_long, c_long, *mut io_event) -> i32;
 
     static IO_SUBMIT_HOOK: Mutex<Option<IoSubmitHook>> = Mutex::new(None);
+    static IO_GETEVENTS_HOOK: Mutex<Option<IoGeteventsHook>> = Mutex::new(None);
+    static IO_GETEVENTS_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     #[inline]
     pub(super) fn current_io_submit_hook() -> Option<IoSubmitHook> {
@@ -431,6 +464,17 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
         let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
+        std::mem::replace(&mut *guard, hook)
+    }
+
+    #[inline]
+    pub(super) fn current_io_getevents_hook() -> Option<IoGeteventsHook> {
+        *IO_GETEVENTS_HOOK.lock().unwrap()
+    }
+
+    #[inline]
+    pub(crate) fn set_io_getevents_hook(hook: Option<IoGeteventsHook>) -> Option<IoGeteventsHook> {
+        let mut guard = IO_GETEVENTS_HOOK.lock().unwrap();
         std::mem::replace(&mut *guard, hook)
     }
 
@@ -499,6 +543,55 @@ pub(crate) mod tests {
         let submit_count = ctx.submit_limit(&reqs, 1);
         set_io_submit_hook(previous);
         assert_eq!(submit_count, 0);
+    }
+
+    #[test]
+    fn test_wait_at_least_stats_count_eintr_retries() {
+        fn eintr_then_one_completion(
+            _ctx: io_context_t,
+            min_nr: c_long,
+            nr: c_long,
+            events: *mut io_event,
+        ) -> i32 {
+            assert_eq!(min_nr, 1);
+            assert!(nr >= 1);
+            let call = IO_GETEVENTS_CALLS.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return -EINTR;
+            }
+            assert_eq!(call, 1);
+            // SAFETY: the hook only writes one completion into the caller-provided
+            // event buffer after asserting there is room for at least one entry.
+            unsafe {
+                (*events).data = BackendToken::new(7, 3).raw();
+                (*events).obj = std::ptr::null_mut();
+                (*events).res = 4096;
+                (*events).res2 = 0;
+            }
+            1
+        }
+
+        let mut backend = LibaioBackend::try_default().unwrap();
+        let mut events = backend.events();
+        let token = BackendToken::new(7, 3);
+
+        IO_GETEVENTS_CALLS.store(0, Ordering::SeqCst);
+        let previous = set_io_getevents_hook(Some(eintr_then_one_completion));
+        let baseline = backend.stats();
+        let completions = <LibaioBackend as IOBackend>::wait_at_least(&mut backend, &mut events, 1);
+        set_io_getevents_hook(previous);
+
+        assert_eq!(IO_GETEVENTS_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, token);
+        match &completions[0].1 {
+            Ok(len) => assert_eq!(*len, 4096),
+            Err(err) => panic!("expected successful completion, got error: {err}"),
+        }
+
+        let delta = backend.stats().delta_since(baseline);
+        assert_eq!(delta.wait_calls, 2);
+        assert_eq!(delta.wait_completions, 1);
     }
 
     struct Request {

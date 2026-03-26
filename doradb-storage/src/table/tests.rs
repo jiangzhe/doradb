@@ -2172,20 +2172,23 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
                 inserted.push((row_id, key));
             }
             trx.commit().await.unwrap();
-            if engine.index_pool.stats().completed_writes > 0 {
+            let stats = engine.index_pool.stats();
+            if stats.completed_writes > 0 && stats.write_errors == 0 {
                 break;
             }
         }
 
         for _ in 0..20 {
-            if engine.index_pool.stats().completed_writes > 0 {
+            let stats = engine.index_pool.stats();
+            if stats.completed_writes > 0 && stats.write_errors == 0 {
                 break;
             }
             smol::Timer::after(Duration::from_millis(50)).await;
         }
 
+        let stats = engine.index_pool.stats();
         assert!(
-            engine.index_pool.stats().completed_writes > 0,
+            stats.completed_writes > 0 && stats.write_errors == 0,
             "user secondary-index pool should evict with a small index buffer"
         );
 

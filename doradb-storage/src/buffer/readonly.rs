@@ -185,7 +185,7 @@ impl GlobalReadonlyBufferPool {
         self.mappings.len()
     }
 
-    /// Returns one snapshot of readonly-pool access and load counters.
+    /// Returns one snapshot of shared readonly-pool access and load counters.
     #[inline]
     pub fn stats(&self) -> BufferPoolStats {
         self.stats.snapshot()
@@ -1142,9 +1142,9 @@ impl ReadonlyBufferPool {
         self.file_kind
     }
 
-    /// Returns one snapshot of readonly-pool access and load counters.
+    /// Returns one snapshot of the shared readonly-pool access and load counters.
     #[inline]
-    pub fn stats(&self) -> BufferPoolStats {
+    pub fn global_stats(&self) -> BufferPoolStats {
         self.global.stats()
     }
 
@@ -1198,16 +1198,18 @@ impl ReadonlyBufferPool {
     }
 
     #[inline]
-    async fn get_or_load_frame_id(&self, key: PersistedBlockKey) -> Result<PageID> {
+    async fn get_or_load_frame_id(&self, key: PersistedBlockKey) -> Result<(PageID, bool)> {
         if let Some(frame_id) = self.global.try_get_frame_id(&key) {
-            self.global.stats.record_cache_hit();
-            return Ok(frame_id);
+            return Ok((frame_id, true));
         }
         let inflight = self.join_or_start_inflight_load(key, None).await;
         if let Some(frame_id) = self.global.try_get_frame_id(&key) {
-            return Ok(frame_id);
+            return Ok((frame_id, false));
         }
-        inflight.wait_result().await
+        inflight
+            .wait_result()
+            .await
+            .map(|frame_id| (frame_id, false))
     }
 
     #[inline]
@@ -1215,10 +1217,9 @@ impl ReadonlyBufferPool {
         &self,
         key: PersistedBlockKey,
         validator: ReadonlyPageValidator,
-    ) -> Result<PageID> {
+    ) -> Result<(PageID, bool)> {
         if let Some(frame_id) = self.global.try_get_frame_id(&key) {
-            self.global.stats.record_cache_hit();
-            return Ok(frame_id);
+            return Ok((frame_id, true));
         }
         let inflight = self
             .join_or_start_inflight_load(
@@ -1230,9 +1231,12 @@ impl ReadonlyBufferPool {
             )
             .await;
         if let Some(frame_id) = self.global.try_get_frame_id(&key) {
-            return Ok(frame_id);
+            return Ok((frame_id, false));
         }
-        inflight.wait_result().await
+        inflight
+            .wait_result()
+            .await
+            .map(|frame_id| (frame_id, false))
     }
 
     #[inline]
@@ -1246,9 +1250,12 @@ impl ReadonlyBufferPool {
         let global = &self.global;
         global.validate_guard(guard);
         loop {
-            let frame_id = self.get_or_load_frame_id(key).await?;
+            let (frame_id, resident_hit) = self.get_or_load_frame_id(key).await?;
             let page_guard = global.get_page_internal(guard, frame_id, mode).await?;
             if global.validate_guarded_frame_key(&page_guard, key) {
+                if resident_hit {
+                    global.stats.record_cache_hit();
+                }
                 return Ok(page_guard);
             }
             global.invalidate_stale_mapping_if_same_frame(key, frame_id);
@@ -1282,7 +1289,8 @@ impl ReadonlyBufferPool {
         let key = self.block_key(page_id);
         let global = &self.global;
         loop {
-            let frame_id = self.get_or_load_frame_id_validated(key, validator).await?;
+            let (frame_id, resident_hit) =
+                self.get_or_load_frame_id_validated(key, validator).await?;
             let guard = global.pool_guard();
             let guard = global
                 .get_page_internal::<Page>(&guard, frame_id, LatchFallbackMode::Shared)
@@ -1296,6 +1304,9 @@ impl ReadonlyBufferPool {
                     drop(shared);
                     let _ = self.invalidate_block_id(page_id);
                     return Err(err);
+                }
+                if resident_hit {
+                    global.stats.record_cache_hit();
                 }
                 return Ok(shared);
             }
@@ -1617,7 +1628,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_readonly_pool_stats_track_single_miss_then_warm_hit() {
+    fn test_readonly_pool_global_stats_track_single_miss_then_warm_hit() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(120, make_metadata(), false).unwrap();
@@ -1629,7 +1640,7 @@ pub(crate) mod tests {
             let pool = table_readonly_pool(&scope, 120, &table_file);
             let pool_guard = pool.pool_guard();
 
-            let cold_start = pool.stats();
+            let cold_start = pool.global_stats();
             let cold_guard = pool
                 .get_page::<Page>(&pool_guard, 0, crate::latch::LatchFallbackMode::Shared)
                 .await
@@ -1640,7 +1651,7 @@ pub(crate) mod tests {
             assert_eq!(&cold_guard.page()[..14], b"readonly-stats");
             drop(cold_guard);
 
-            let cold_delta = pool.stats().delta_since(cold_start);
+            let cold_delta = pool.global_stats().delta_since(cold_start);
             assert_eq!(cold_delta.cache_hits, 0);
             assert_eq!(cold_delta.cache_misses, 1);
             assert_eq!(cold_delta.miss_joins, 0);
@@ -1649,7 +1660,7 @@ pub(crate) mod tests {
             assert_eq!(cold_delta.completed_reads, 1);
             assert_eq!(cold_delta.read_errors, 0);
 
-            let warm_start = pool.stats();
+            let warm_start = pool.global_stats();
             let warm_guard = pool
                 .get_page::<Page>(&pool_guard, 0, crate::latch::LatchFallbackMode::Shared)
                 .await
@@ -1660,12 +1671,58 @@ pub(crate) mod tests {
             assert_eq!(&warm_guard.page()[..14], b"readonly-stats");
             drop(warm_guard);
 
-            let warm_delta = pool.stats().delta_since(warm_start);
+            let warm_delta = pool.global_stats().delta_since(warm_start);
             assert_eq!(warm_delta.cache_hits, 1);
             assert_eq!(warm_delta.cache_misses, 0);
             assert_eq!(warm_delta.queued_reads, 0);
             assert_eq!(warm_delta.running_reads, 0);
             assert_eq!(warm_delta.completed_reads, 0);
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_global_stats_are_shared_across_file_wrappers() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file_a = fs.create_table_file(121, make_metadata(), false).unwrap();
+            let (table_file_a, old_root_a) = table_file_a.commit(1, false).await.unwrap();
+            drop(old_root_a);
+            write_payload(&table_file_a, 0, b"readonly-shared-a").await;
+
+            let table_file_b = fs.create_table_file(122, make_metadata(), false).unwrap();
+            let (table_file_b, old_root_b) = table_file_b.commit(1, false).await.unwrap();
+            drop(old_root_b);
+            write_payload(&table_file_b, 0, b"readonly-shared-b").await;
+
+            let scope = global_readonly_pool_scope(frame_page_bytes(4));
+            let pool_a = table_readonly_pool(&scope, 121, &table_file_a);
+            let pool_b = table_readonly_pool(&scope, 122, &table_file_b);
+            let pool_guard_a = pool_a.pool_guard();
+
+            let start_a = pool_a.global_stats();
+            let start_b = pool_b.global_stats();
+            assert_eq!(start_a, start_b);
+
+            let guard_a = pool_a
+                .get_page::<Page>(&pool_guard_a, 0, crate::latch::LatchFallbackMode::Shared)
+                .await
+                .expect("readonly shared global read failed in test")
+                .lock_shared_async()
+                .await
+                .unwrap();
+            assert_eq!(&guard_a.page()[..17], b"readonly-shared-a");
+            drop(guard_a);
+
+            let delta_a = pool_a.global_stats().delta_since(start_a);
+            let delta_b = pool_b.global_stats().delta_since(start_b);
+            assert_eq!(delta_a, delta_b);
+            assert_eq!(delta_a.cache_hits, 0);
+            assert_eq!(delta_a.cache_misses, 1);
+            assert_eq!(delta_a.miss_joins, 0);
+            assert_eq!(delta_a.queued_reads, 1);
+            assert_eq!(delta_a.running_reads, 1);
+            assert_eq!(delta_a.completed_reads, 1);
+            assert_eq!(delta_a.read_errors, 0);
         });
     }
 
@@ -2059,6 +2116,7 @@ pub(crate) mod tests {
                 &global,
             );
             let pool_guard = (*pool).pool_guard();
+            let reload_start = pool.global_stats();
             let page: FacadePageGuard<Page> = pool
                 .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
                 .await
@@ -2067,10 +2125,84 @@ pub(crate) mod tests {
             assert_eq!(&page.page()[..6], b"reload");
             drop(page);
 
+            let reload_delta = pool.global_stats().delta_since(reload_start);
+            assert_eq!(reload_delta.cache_hits, 0);
+            assert_eq!(reload_delta.cache_misses, 1);
+            assert_eq!(reload_delta.miss_joins, 0);
+            assert_eq!(reload_delta.queued_reads, 1);
+            assert_eq!(reload_delta.running_reads, 1);
+            assert_eq!(reload_delta.completed_reads, 1);
+            assert_eq!(reload_delta.read_errors, 0);
+
             let reloaded_frame_id = global.try_get_frame_id(&key).unwrap();
             assert_ne!(reloaded_frame_id, 0);
             drop(table_file);
             drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_validated_reload_counts_miss_then_warm_hit() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs.create_table_file(123, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let persisted_page = build_valid_persisted_lwc_page();
+            write_page_bytes(&table_file, 12, &persisted_page).await;
+
+            let global = owned_global_pool(frame_page_bytes(2));
+            let global_guard = (*global).pool_guard();
+            let key = PersistedBlockKey::new(123, 12);
+
+            let mut g0 = global.try_lock_page_exclusive(&global_guard, 0).unwrap();
+            global.bind_frame(key, &mut g0).unwrap();
+            g0.page_mut().zero();
+            let frame = g0.bf_mut();
+            frame.clear_persisted_block_key();
+            frame.bump_generation();
+            frame.set_kind(FrameKind::Uninitialized);
+            drop(g0);
+
+            let pool = owned_readonly_pool(
+                123,
+                PersistedFileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
+
+            let reload_start = pool.global_stats();
+            let page = pool
+                .get_validated_page_shared(12, validate_persisted_lwc_page)
+                .await
+                .expect("validated readonly reload failed in test");
+            drop(page);
+
+            let reload_delta = pool.global_stats().delta_since(reload_start);
+            assert_eq!(reload_delta.cache_hits, 0);
+            assert_eq!(reload_delta.cache_misses, 1);
+            assert_eq!(reload_delta.miss_joins, 0);
+            assert_eq!(reload_delta.queued_reads, 1);
+            assert_eq!(reload_delta.running_reads, 1);
+            assert_eq!(reload_delta.completed_reads, 1);
+            assert_eq!(reload_delta.read_errors, 0);
+
+            let warm_start = pool.global_stats();
+            let page = pool
+                .get_validated_page_shared(12, validate_persisted_lwc_page)
+                .await
+                .expect("validated readonly warm hit failed in test");
+            drop(page);
+
+            let warm_delta = pool.global_stats().delta_since(warm_start);
+            assert_eq!(warm_delta.cache_hits, 1);
+            assert_eq!(warm_delta.cache_misses, 0);
+            assert_eq!(warm_delta.miss_joins, 0);
+            assert_eq!(warm_delta.queued_reads, 0);
+            assert_eq!(warm_delta.running_reads, 0);
+            assert_eq!(warm_delta.completed_reads, 0);
+            assert_eq!(warm_delta.read_errors, 0);
         });
     }
 
