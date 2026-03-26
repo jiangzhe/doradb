@@ -9,7 +9,10 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard};
 use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
-use crate::buffer::{BufferPool, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole, RowPoolRole};
+use crate::buffer::{
+    BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity,
+    PoolRole, RowPoolRole,
+};
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::EvictableBufferPoolConfig;
 use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
@@ -17,8 +20,8 @@ use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
 use crate::io::{
-    AIOClient, AIOKind, AIOStats, IOQueue, IOStateMachine, IOSubmission, IOWorkerBuilder,
-    Operation, StorageBackend,
+    AIOClient, AIOKind, IOBackendStats, IOBackendStatsHandle, IOQueue, IOStateMachine,
+    IOSubmission, IOWorkerBuilder, Operation, StorageBackend,
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::notify::EventNotifyOnDrop;
@@ -52,8 +55,10 @@ pub struct EvictableBufferPool {
     raw_fd: RawFd,
     // Inflight IO map.
     inflight_io: Arc<InflightIO>,
-    // statistics of IO submit/wait.
-    stats: Arc<EvictableBufferPoolStats>,
+    // Pool-owned access and IO lifecycle counters.
+    stats: BufferPoolStatsHandle,
+    // Backend-owned submit/wait counters for the dedicated IO worker.
+    io_backend_stats: IOBackendStatsHandle,
     role: PoolRole,
     arena: QuiescentArena,
 }
@@ -94,10 +99,16 @@ impl EvictableBufferPool {
         self.arena.try_lock_page_exclusive(guard, page_id)
     }
 
-    /// Returns AIO statistics.
+    /// Returns one snapshot of evictable-pool access and IO lifecycle counters.
     #[inline]
-    pub fn stats(&self) -> &EvictableBufferPoolStats {
-        &self.stats
+    pub fn stats(&self) -> BufferPoolStats {
+        self.stats.snapshot()
+    }
+
+    /// Returns one snapshot of backend-owned submit/wait activity for this pool.
+    #[inline]
+    pub fn io_backend_stats(&self) -> IOBackendStats {
+        self.io_backend_stats.snapshot()
     }
 
     #[cfg(test)]
@@ -124,6 +135,7 @@ impl EvictableBufferPool {
     #[inline]
     async fn try_dispatch_io_read(&self, guard: &PoolGuard, page_id: PageID) -> Result<()> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
+        self.stats.record_cache_miss();
         enum DispatchAction {
             RetryYield,
             Wait(Arc<PageIOCompletion>),
@@ -170,6 +182,7 @@ impl EvictableBufferPool {
                                         page_id,
                                         self.raw_fd,
                                         Arc::clone(&self.inflight_io),
+                                        self.stats.clone(),
                                         reservation,
                                     );
                                     DispatchAction::SendRead { req, completion }
@@ -189,6 +202,7 @@ impl EvictableBufferPool {
                                     page_id,
                                     self.raw_fd,
                                     Arc::clone(&self.inflight_io),
+                                    self.stats.clone(),
                                     reservation,
                                 );
                                 DispatchAction::SendRead { req, completion }
@@ -197,6 +211,7 @@ impl EvictableBufferPool {
                     }
                 }
                 Entry::Occupied(mut occ) => {
+                    self.stats.record_miss_join();
                     let status = occ.get_mut();
                     let completion = status
                         .completion
@@ -243,8 +258,6 @@ impl EvictableBufferPool {
         let state_machine = EvictablePoolStateMachine {
             pool: pool.clone(),
             file_io,
-            prev_queuing: 0,
-            prev_running: 0,
         };
         worker.bind(state_machine).start_thread()
     }
@@ -256,6 +269,7 @@ impl EvictableBufferPool {
             in_mem: Arc::clone(&pool.in_mem),
             io_client: pool.io_client.clone(),
             inflight_io: Arc::clone(&pool.inflight_io),
+            stats: pool.stats.clone(),
             _pool: Some(pool.clone()),
         };
         let policy =
@@ -374,6 +388,7 @@ impl BufferPool for EvictableBufferPool {
                 }
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
+                    self.stats.record_cache_hit();
                     return Ok(FacadePageGuard::new(guard.clone(), bf, g));
                 }
                 FrameKind::EvictionFailed => return Err(Error::IOError),
@@ -386,6 +401,7 @@ impl BufferPool for EvictableBufferPool {
                         continue;
                     }
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
+                    self.stats.record_cache_hit();
                     return Ok(FacadePageGuard::new(guard.clone(), bf, g));
                 }
                 FrameKind::Evicting => {
@@ -432,6 +448,7 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
+                    self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
                 FrameKind::EvictionFailed => return Err(Error::IOError),
@@ -450,6 +467,7 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
+                    self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
                 FrameKind::Evicting => {
@@ -497,6 +515,7 @@ impl BufferPool for EvictableBufferPool {
                     // the validation make sure parent page does not change until child
                     // page is acquired.
                     if p_guard.validate_bool() {
+                        self.stats.record_cache_hit();
                         return Ok(Valid(FacadePageGuard::new(guard.clone(), bf, g)));
                     }
                     if g.state == GuardState::Exclusive {
@@ -517,9 +536,13 @@ impl BufferPool for EvictableBufferPool {
                     // apply lock coupling.
                     // the validation make sure parent page does not change until child
                     // page is acquired.
-                    return Ok(p_guard
+                    let validated = p_guard
                         .validate()
-                        .and_then(|_| Valid(FacadePageGuard::new(guard.clone(), bf, g))));
+                        .and_then(|_| Valid(FacadePageGuard::new(guard.clone(), bf, g)));
+                    if matches!(validated, Validation::Valid(_)) {
+                        self.stats.record_cache_hit();
+                    }
+                    return Ok(validated);
                 }
                 FrameKind::Evicting => {
                     // The page is being evicted to disk.
@@ -646,8 +669,6 @@ impl Supplier<IndexPoolWorkers> for crate::IndexPool {
 pub(crate) struct EvictablePoolStateMachine {
     pool: SyncQuiescentGuard<EvictableBufferPool>,
     file_io: SingleFileIO,
-    prev_queuing: usize,
-    prev_running: usize,
 }
 
 pub(crate) enum EvictSubmission {
@@ -723,11 +744,16 @@ impl IOStateMachine for EvictablePoolStateMachine {
 
     #[inline]
     fn on_submit(&mut self, sub: &EvictSubmission) {
-        let page_id = match sub {
-            EvictSubmission::Read(sub) => *sub.key(),
-            EvictSubmission::Write(sub) => sub.page_id(),
-        };
-        debug_assert!(self.pool.inflight_io.contains(page_id));
+        match sub {
+            EvictSubmission::Read(sub) => {
+                debug_assert!(self.pool.inflight_io.contains(*sub.key()));
+                sub.record_running();
+            }
+            EvictSubmission::Write(sub) => {
+                debug_assert!(self.pool.inflight_io.contains(sub.page_id()));
+                self.pool.stats.add_running_writes(1);
+            }
+        }
     }
 
     #[inline]
@@ -756,6 +782,10 @@ impl IOStateMachine for EvictablePoolStateMachine {
                                 Err(Error::IOError)
                             }
                         };
+                        self.pool.stats.add_completed_writes(1);
+                        if result.is_err() {
+                            self.pool.stats.add_write_errors(1);
+                        }
                         drop(g);
                         if let Some(completion) = completion {
                             completion.complete(result);
@@ -774,56 +804,6 @@ impl IOStateMachine for EvictablePoolStateMachine {
     }
 
     #[inline]
-    fn on_stats(&mut self, stats: &AIOStats) {
-        if stats.queuing != self.prev_queuing {
-            self.pool
-                .stats
-                .queuing
-                .store(stats.queuing, Ordering::Release);
-            self.prev_queuing = stats.queuing;
-        }
-        if stats.running != self.prev_running {
-            self.pool
-                .stats
-                .running
-                .store(stats.running, Ordering::Release);
-            self.prev_running = stats.running;
-        }
-        if stats.finished_reads != 0 {
-            self.pool
-                .stats
-                .finished_reads
-                .fetch_add(stats.finished_reads, Ordering::Relaxed);
-        }
-        if stats.finished_writes != 0 {
-            self.pool
-                .stats
-                .finished_writes
-                .fetch_add(stats.finished_writes, Ordering::Relaxed);
-        }
-        if stats.io_submit_count != 0 {
-            self.pool
-                .stats
-                .io_submit_calls
-                .fetch_add(stats.io_submit_count, Ordering::Relaxed);
-            self.pool
-                .stats
-                .io_submit_nanos
-                .fetch_add(stats.io_submit_nanos, Ordering::Relaxed);
-        }
-        if stats.io_wait_count != 0 {
-            self.pool
-                .stats
-                .io_wait_calls
-                .fetch_add(stats.io_wait_count, Ordering::Relaxed);
-            self.pool
-                .stats
-                .io_wait_nanos
-                .fetch_add(stats.io_wait_nanos, Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
     fn end_loop(self) {
         // do nothing
     }
@@ -834,12 +814,14 @@ struct EvictableRuntime {
     in_mem: Arc<InMemPageSet>,
     inflight_io: Arc<InflightIO>,
     io_client: AIOClient<PoolRequest>,
+    stats: BufferPoolStatsHandle,
     _pool: Option<SyncQuiescentGuard<EvictableBufferPool>>,
 }
 
 impl EvictableRuntime {
     #[inline]
     fn dispatch_io_writes(&self, page_guards: Vec<PageExclusiveGuard<Page>>) -> EventListener {
+        self.stats.add_queued_writes(page_guards.len());
         self.inflight_io.batch_writes(&page_guards);
         let done_ev = Arc::new(EventNotifyOnDrop::new());
         let listener = done_ev.listen();
@@ -1144,6 +1126,7 @@ pub(crate) struct EvictReadSubmission {
     key: PageID,
     operation: Operation,
     inflight_io: Arc<InflightIO>,
+    stats: BufferPoolStatsHandle,
     reservation: Option<PageReservationGuard<EvictPageReservation>>,
     completed: bool,
 }
@@ -1155,16 +1138,19 @@ impl EvictReadSubmission {
         page_id: PageID,
         raw_fd: RawFd,
         inflight_io: Arc<InflightIO>,
+        stats: BufferPoolStatsHandle,
         mut reservation: PageReservationGuard<EvictPageReservation>,
     ) -> Self {
         let ptr = reservation.page_mut() as *mut Page as *mut u8;
         let operation = unsafe {
             Operation::pread_borrowed(raw_fd, page_id as usize * PAGE_SIZE, ptr, PAGE_SIZE)
         };
+        stats.add_queued_reads(1);
         EvictReadSubmission {
             key: page_id,
             operation,
             inflight_io,
+            stats,
             reservation: Some(reservation),
             completed: false,
         }
@@ -1198,7 +1184,14 @@ impl EvictReadSubmission {
     /// Fails the reload before worker completion and wakes joined readers.
     pub(crate) fn fail(mut self, err: Error) {
         drop(self.reservation.take());
+        self.stats.add_completed_reads(1);
+        self.stats.add_read_errors(1);
         self.complete_waiters(Err(err));
+    }
+
+    #[inline]
+    pub(crate) fn record_running(&self) {
+        self.stats.add_running_reads(1);
     }
 
     #[inline]
@@ -1224,6 +1217,10 @@ impl EvictReadSubmission {
                 Err(err.into())
             }
         };
+        self.stats.add_completed_reads(1);
+        if result.is_err() {
+            self.stats.add_read_errors(1);
+        }
         self.complete_waiters(result);
         AIOKind::Read
     }
@@ -1250,6 +1247,8 @@ impl Drop for EvictReadSubmission {
             return;
         }
         drop(self.reservation.take());
+        self.stats.add_completed_reads(1);
+        self.stats.add_read_errors(1);
         self.complete_waiters(Err(Error::InternalError));
     }
 }
@@ -1331,6 +1330,7 @@ impl EvictableBufferPoolConfig {
 
         // 3. Create file and initialize the backend-neutral IO worker.
         let io_ctx = StorageBackend::new(self.max_io_depth)?;
+        let io_backend_stats = io_ctx.stats_handle();
         let (worker, io_client) = io_ctx.io_worker();
 
         let swap_file_path = path_to_utf8(&self.data_swap_file, swap_file_field_name)?;
@@ -1346,7 +1346,8 @@ impl EvictableBufferPoolConfig {
             in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             raw_fd,
             inflight_io: Arc::new(InflightIO::default()),
-            stats: Arc::new(EvictableBufferPoolStats::default()),
+            stats: BufferPoolStatsHandle::default(),
+            io_backend_stats,
             role: self.role,
             arena,
         };
@@ -1458,33 +1459,6 @@ impl InflightIO {
     fn contains(&self, page_id: PageID) -> bool {
         let g = self.map.lock();
         g.contains_key(&page_id)
-    }
-}
-
-/// Runtime counters for evictable-pool IO scheduling and completion.
-#[derive(Default)]
-pub struct EvictableBufferPoolStats {
-    running: AtomicUsize,
-    queuing: AtomicUsize,
-    finished_reads: AtomicUsize,
-    finished_writes: AtomicUsize,
-    io_submit_calls: AtomicUsize,
-    io_submit_nanos: AtomicUsize,
-    io_wait_calls: AtomicUsize,
-    io_wait_nanos: AtomicUsize,
-}
-
-impl EvictableBufferPoolStats {
-    /// Returns the number of completed page reload reads.
-    #[inline]
-    pub fn finished_reads(&self) -> usize {
-        self.finished_reads.load(Ordering::Relaxed)
-    }
-
-    /// Returns the number of completed page writebacks.
-    #[inline]
-    pub fn finished_writes(&self) -> usize {
-        self.finished_writes.load(Ordering::Relaxed)
     }
 }
 
@@ -1764,8 +1738,6 @@ mod tests {
             let mut state_machine = EvictablePoolStateMachine {
                 pool: sync_pool,
                 file_io: pending.file_io,
-                prev_queuing: 0,
-                prev_running: 0,
             };
 
             let mut page_guard = owner.allocate_page::<Page>(&pool_guard).await;

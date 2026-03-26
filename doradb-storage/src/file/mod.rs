@@ -15,8 +15,8 @@ use crate::buffer::{PersistedBlockKey, ReadSubmission};
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::{
-    AIOClient, AIOError, AIOKind, AIOResult, AIOStats, Completion, IOQueue, IOStateMachine,
-    IOSubmission, Operation, STORAGE_SECTOR_SIZE, align_to_sector_size,
+    AIOClient, AIOError, AIOKind, AIOResult, Completion, IOQueue, IOStateMachine, IOSubmission,
+    Operation, STORAGE_SECTOR_SIZE, align_to_sector_size,
 };
 use crate::{error::Error, error::Result};
 use libc::{
@@ -312,17 +312,13 @@ pub(crate) async fn write_direct(
     result.await
 }
 
-pub(crate) struct TableFsStateMachine {
-    stats: AIOStats,
-}
+pub(crate) struct TableFsStateMachine;
 
 impl TableFsStateMachine {
     /// Creates one state machine for the shared table-filesystem IO worker.
     #[inline]
     pub fn new() -> TableFsStateMachine {
-        TableFsStateMachine {
-            stats: AIOStats::default(),
-        }
+        TableFsStateMachine
     }
 }
 
@@ -349,8 +345,10 @@ impl IOStateMachine for TableFsStateMachine {
     }
 
     #[inline]
-    fn on_submit(&mut self, _sub: &TableFsSubmission) {
-        // Submission ownership is retained by the worker inflight table.
+    fn on_submit(&mut self, sub: &TableFsSubmission) {
+        if let TableFsSubmission::Read(sub) = sub {
+            sub.record_running();
+        }
     }
 
     #[inline]
@@ -376,11 +374,6 @@ impl IOStateMachine for TableFsStateMachine {
             }
             TableFsSubmission::Read(sub) => sub.complete(res),
         }
-    }
-
-    #[inline]
-    fn on_stats(&mut self, stats: &AIOStats) {
-        self.stats.merge(stats);
     }
 
     #[inline]

@@ -19,9 +19,9 @@ use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
 use std::thread::JoinHandle;
-use std::time::Instant;
 use thiserror::Error;
 
+pub(crate) use backend::IOBackendStatsHandle;
 pub use backend::*;
 pub use buf::*;
 pub use completion::*;
@@ -441,9 +441,6 @@ pub trait IOStateMachine {
     /// The result contains number of bytes read/write, or the IO error.
     fn on_complete(&mut self, sub: Self::Submission, res: std::io::Result<usize>) -> AIOKind;
 
-    /// Called when stats is collected.
-    fn on_stats(&mut self, stats: &AIOStats);
-
     /// Called when event loop is ended.
     fn end_loop(self);
 }
@@ -678,8 +675,7 @@ where
             }
             self.prepare_staged(&mut queue);
             // Event if shutdown flag is set to true, we still process queued requests.
-            let (io_submit_count, io_submit_nanos) = if !self.staged_slots.is_empty() {
-                let start = Instant::now();
+            if !self.staged_slots.is_empty() {
                 // Try to submit as many IO requests as possible
                 debug_assert!(self.io_depth() >= self.submitted);
                 let limit = self.io_depth() - self.submitted;
@@ -704,62 +700,34 @@ where
                 debug_assert!(queue.consistent());
                 self.submitted += submit_count;
                 debug_assert!(self.submitted <= self.io_depth());
-                (1, start.elapsed().as_nanos() as usize)
-            } else {
-                (0, 0)
-            };
+            }
 
             // wait for any request to be done.
             // Note: even if we received shutdown message, we should wait all submitted IO finish before quiting.
             // This will prevent kernel from accessing a freed memory via async IO processing.
-            let (io_wait_count, io_wait_nanos, finished_reads, finished_writes) =
-                if self.submitted != 0 {
-                    let start = Instant::now();
-                    let completions = self.backend.wait_at_least(&mut results, 1);
-                    let mut read_count = 0;
-                    let mut write_count = 0;
-                    for (token, res) in completions {
-                        let entry = self.slots.take(token);
-                        debug_assert!(entry.submitted);
-                        #[cfg(test)]
-                        let (entry, res) = {
-                            let mut entry = entry;
-                            let mut res = res;
-                            if let Some(hook) = tests::current_storage_backend_test_hook() {
-                                let op = entry.submission.operation();
-                                hook.on_complete(
-                                    StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
-                                    &mut res,
-                                );
-                            }
-                            (entry, res)
-                        };
-                        match self.state_machine.on_complete(entry.submission, res) {
-                            AIOKind::Read => read_count += 1,
-                            AIOKind::Write => write_count += 1,
+            if self.submitted != 0 {
+                let completions = self.backend.wait_at_least(&mut results, 1);
+                let completed_count = completions.len();
+                for (token, res) in completions {
+                    let entry = self.slots.take(token);
+                    debug_assert!(entry.submitted);
+                    #[cfg(test)]
+                    let (entry, res) = {
+                        let mut entry = entry;
+                        let mut res = res;
+                        if let Some(hook) = tests::current_storage_backend_test_hook() {
+                            let op = entry.submission.operation();
+                            hook.on_complete(
+                                StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
+                                &mut res,
+                            );
                         }
-                    }
-                    self.submitted -= read_count + write_count;
-                    (
-                        1,
-                        start.elapsed().as_nanos() as usize,
-                        read_count,
-                        write_count,
-                    )
-                } else {
-                    (0, 0, 0, 0)
-                };
-
-            self.state_machine.on_stats(&AIOStats {
-                queuing: queue.len() + self.staged_slots.len(),
-                running: self.submitted,
-                finished_reads,
-                finished_writes,
-                io_submit_count,
-                io_submit_nanos,
-                io_wait_count,
-                io_wait_nanos,
-            });
+                        (entry, res)
+                    };
+                    let _ = self.state_machine.on_complete(entry.submission, res);
+                }
+                self.submitted -= completed_count;
+            }
             // Drain local queues before quitting so backend-staged submissions
             // and worker-owned request state are not dropped silently.
             if self.shutdown
@@ -947,8 +915,6 @@ mod tests {
         fn on_complete(&mut self, _sub: ExpandSubmission, _res: std::io::Result<usize>) -> AIOKind {
             unreachable!("fetch-only tests never complete IO")
         }
-
-        fn on_stats(&mut self, _stats: &AIOStats) {}
 
         fn end_loop(self) {}
     }

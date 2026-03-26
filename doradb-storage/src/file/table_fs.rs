@@ -10,7 +10,7 @@ use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MultiTableFil
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{TableFsRequest, TableFsStateMachine};
-use crate::io::{AIOClient, IOWorkerBuilder, StorageBackend};
+use crate::io::{AIOClient, IOBackendStats, IOBackendStatsHandle, IOWorkerBuilder, StorageBackend};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use parking_lot::Mutex;
 use std::path::{Component as PathComponent, Path, PathBuf};
@@ -21,6 +21,7 @@ use std::thread::JoinHandle;
 /// creating, opening, closing and removing table files.
 pub struct TableFileSystem {
     io_client: AIOClient<TableFsRequest>,
+    io_backend_stats: IOBackendStatsHandle,
     data_dir: PathBuf,
     // Catalog multi-table file name.
     catalog_file_name: String,
@@ -45,10 +46,12 @@ impl TableFileSystem {
         catalog_file_name: String,
     ) -> Result<(Self, IOWorkerBuilder<TableFsRequest>)> {
         let ctx = StorageBackend::new(io_depth)?;
+        let io_backend_stats = ctx.stats_handle();
         let (worker, io_client) = ctx.io_worker();
         Ok((
             TableFileSystem {
                 io_client,
+                io_backend_stats,
                 data_dir,
                 catalog_file_name,
             },
@@ -125,6 +128,12 @@ impl TableFileSystem {
             &self.data_dir.join(&self.catalog_file_name),
             "catalog multi-table file path",
         )
+    }
+
+    /// Returns one snapshot of backend-owned submit/wait activity.
+    #[inline]
+    pub fn io_backend_stats(&self) -> IOBackendStats {
+        self.io_backend_stats.snapshot()
     }
 
     /// Open existing catalog multi-table file or create a new one.

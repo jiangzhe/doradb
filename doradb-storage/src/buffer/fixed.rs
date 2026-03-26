@@ -3,7 +3,10 @@ use crate::buffer::arena::QuiescentArena;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
-use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, PoolRole, RowPoolRole};
+use crate::buffer::{
+    BufferPool, BufferPoolStats, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole,
+    RowPoolRole,
+};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::latch::LatchFallbackMode;
@@ -16,6 +19,7 @@ pub struct FixedBufferPool {
     // free_list: Mutex<PageID>,
     alloc_map: AllocMap,
     role: PoolRole,
+    stats: BufferPoolStatsHandle,
     arena: QuiescentArena,
 }
 
@@ -35,6 +39,7 @@ impl FixedBufferPool {
             size,
             alloc_map: AllocMap::new(size),
             role,
+            stats: BufferPoolStatsHandle::default(),
             arena,
         })
     }
@@ -53,6 +58,12 @@ impl FixedBufferPool {
     #[inline]
     pub(crate) fn row_pool_role(&self) -> RowPoolRole {
         self.role.row_pool_role()
+    }
+
+    /// Returns one snapshot of fixed-pool access counters.
+    #[inline]
+    pub fn stats(&self) -> BufferPoolStats {
+        self.stats.snapshot()
     }
 
     #[inline]
@@ -86,7 +97,9 @@ impl FixedBufferPool {
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
         );
-        self.get_page_spin_internal(guard, page_id)
+        let guard = self.get_page_spin_internal(guard, page_id);
+        self.stats.record_cache_hit();
+        guard
     }
 
     #[inline]
@@ -156,7 +169,9 @@ impl BufferPool for FixedBufferPool {
             self.alloc_map.is_allocated(page_id as usize),
             "page not allocated"
         );
-        Ok(self.get_page_internal(guard, page_id, mode).await)
+        let guard = self.get_page_internal(guard, page_id, mode).await;
+        self.stats.record_cache_hit();
+        Ok(guard)
     }
 
     #[inline]
@@ -177,6 +192,7 @@ impl BufferPool for FixedBufferPool {
             }
             return Ok(None);
         }
+        self.stats.record_cache_hit();
         Ok(Some(g))
     }
 
@@ -213,6 +229,7 @@ impl BufferPool for FixedBufferPool {
         // the validation make sure parent page does not change until child
         // page is acquired.
         if p_guard.validate_bool() {
+            self.stats.record_cache_hit();
             return Ok(Valid(g));
         }
         if g.is_exclusive() {
@@ -349,6 +366,31 @@ mod tests {
                 assert!(stale_guard.lock_shared_async().await.is_none());
             }
         })
+    }
+
+    #[test]
+    fn test_fixed_buffer_pool_stats_track_resident_hits_only() {
+        smol::block_on(async {
+            let pool = test_pool();
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let page = pool.allocate_page::<BlockNode>(&pool_guard).await;
+            let page_id = page.page_id();
+            drop(page);
+
+            let baseline = pool.stats();
+            let guard = pool
+                .get_page::<BlockNode>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                .await
+                .expect("fixed-pool read failed in test");
+            drop(guard);
+
+            let delta = pool.stats().delta_since(baseline);
+            assert_eq!(delta.cache_hits, 1);
+            assert_eq!(delta.cache_misses, 0);
+            assert_eq!(delta.queued_reads, 0);
+            assert_eq!(delta.running_reads, 0);
+            assert_eq!(delta.completed_reads, 0);
+        });
     }
 
     #[test]

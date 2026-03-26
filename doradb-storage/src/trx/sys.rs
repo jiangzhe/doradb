@@ -349,10 +349,11 @@ impl TransactionSystem {
             stats.log_bytes += partition.stats.log_bytes.load(Ordering::Relaxed);
             stats.sync_count += partition.stats.sync_count.load(Ordering::Relaxed);
             stats.sync_nanos += partition.stats.sync_nanos.load(Ordering::Relaxed);
-            stats.io_submit_count += partition.stats.io_submit_count.load(Ordering::Relaxed);
-            stats.io_submit_nanos += partition.stats.io_submit_nanos.load(Ordering::Relaxed);
-            stats.io_wait_count += partition.stats.io_wait_count.load(Ordering::Relaxed);
-            stats.io_wait_nanos += partition.stats.io_wait_nanos.load(Ordering::Relaxed);
+            let io_stats = partition.io_backend_stats();
+            stats.io_submit_count += io_stats.submit_calls;
+            stats.io_submit_nanos += io_stats.submit_nanos;
+            stats.io_wait_count += io_stats.wait_calls;
+            stats.io_wait_nanos += io_stats.wait_nanos;
             stats.purge_trx_count += partition.stats.purge_trx_count.load(Ordering::Relaxed);
             stats.purge_row_count += partition.stats.purge_row_count.load(Ordering::Relaxed);
             stats.purge_index_count += partition.stats.purge_index_count.load(Ordering::Relaxed);

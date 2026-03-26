@@ -1,13 +1,14 @@
 use super::{
     AIOBuf, AIOClient, AIOError, AIOKey, AIOKind, AIOResult, BackendToken, IOBackend,
-    IOWorkerBuilder, Operation, io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd,
-    io_setup, io_submit, iocb,
+    IOBackendStats, IOBackendStatsHandle, IOWorkerBuilder, Operation, io_context_t, io_destroy,
+    io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
 };
 use flume::bounded;
 use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
+use std::time::Instant;
 
 const DEFAULT_AIO_MAX_EVENTS: usize = 32;
 
@@ -19,6 +20,7 @@ const DEFAULT_AIO_MAX_EVENTS: usize = 32;
 pub struct LibaioBackend {
     ctx: io_context_t,
     max_events: usize,
+    stats: IOBackendStatsHandle,
 }
 
 unsafe impl Sync for LibaioBackend {}
@@ -135,7 +137,11 @@ impl LibaioBackend {
         let mut ctx = std::ptr::null_mut();
         unsafe {
             match io_setup(max_events as i32, &mut ctx) {
-                0 => Ok(LibaioBackend { ctx, max_events }),
+                0 => Ok(LibaioBackend {
+                    ctx,
+                    max_events,
+                    stats: IOBackendStatsHandle::default(),
+                }),
                 _ => Err(AIOError::SetupError),
             }
         }
@@ -151,6 +157,17 @@ impl LibaioBackend {
     #[inline]
     pub fn max_events(&self) -> usize {
         self.max_events
+    }
+
+    /// Returns one snapshot of backend-owned submit/wait activity.
+    #[inline]
+    pub fn stats(&self) -> IOBackendStats {
+        self.stats.snapshot()
+    }
+
+    #[inline]
+    pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
+        self.stats.clone()
     }
 
     /// Create a heap-allocated event array for IO submit and wait.
@@ -364,7 +381,10 @@ impl IOBackend for LibaioBackend {
         batch
             .prefix
             .extend(batch.staged.iter().take(limit).copied());
+        let start = Instant::now();
         let submit_count = self.submit_limit(&batch.prefix, limit);
+        self.stats
+            .record_submit(1, submit_count, start.elapsed().as_nanos() as usize);
         if submit_count != 0 {
             batch.staged.drain(0..submit_count);
         }
@@ -377,11 +397,14 @@ impl IOBackend for LibaioBackend {
         events: &mut Self::Events,
         min_nr: usize,
     ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+        let start = Instant::now();
         let mut completed = Vec::new();
         LibaioBackend::wait_at_least(self, events, min_nr, |token, res| {
             completed.push((BackendToken::from_raw(token), res));
             AIOKind::Read
         });
+        self.stats
+            .record_wait(1, completed.len(), start.elapsed().as_nanos() as usize);
         completed
     }
 }
@@ -390,7 +413,7 @@ impl IOBackend for LibaioBackend {
 pub(crate) mod tests {
     use super::*;
     use crate::file::{FixedSizeBufferFreeList, SparseFile};
-    use crate::io::{AIOStats, DirectBuf, IOQueue, IOStateMachine, IOSubmission};
+    use crate::io::{DirectBuf, IOQueue, IOStateMachine, IOSubmission};
     use libc::EAGAIN;
     use std::os::fd::AsRawFd;
     use std::sync::Mutex;
@@ -561,10 +584,6 @@ pub(crate) mod tests {
                     panic!("{:?}", err);
                 }
             }
-        }
-
-        fn on_stats(&mut self, stats: &AIOStats) {
-            println!("stats: {:?}", stats);
         }
 
         fn end_loop(self) {

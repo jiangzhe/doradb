@@ -3,8 +3,8 @@ use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
 use crate::io::{
-    AIOClient, AIOError, AIOKind, Completion, DirectBuf, IOQueue, IOSubmission, IOWorkerBuilder,
-    Operation, StorageBackend,
+    AIOClient, AIOError, AIOKind, Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle,
+    IOQueue, IOSubmission, IOWorkerBuilder, Operation, StorageBackend,
 };
 use crate::serde::Ser;
 use crate::session::SessionState;
@@ -121,6 +121,7 @@ impl LogPartitionInitializer {
         let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
         let (gc_chan, gc_rx) = flume::unbounded();
         let (completion_tx, completion_rx) = flume::unbounded();
+        let io_backend_stats = self.ctx.stats_handle();
         let (io_worker, io_client) = self.ctx.io_worker();
         Ok((
             LogPartition {
@@ -132,6 +133,7 @@ impl LogPartitionInitializer {
                 gc_buckets: gc_info.into_boxed_slice(),
                 io_worker: CachePadded::new(Mutex::new(Some(io_worker))),
                 io_client,
+                io_backend_stats,
                 completion_tx,
                 completion_rx: CachePadded::new(Mutex::new(Some(completion_rx))),
                 log_no: self.log_no,
@@ -199,16 +201,12 @@ struct LogWriteCompletion {
 
 struct LogIOStateMachine {
     done_tx: Sender<LogWriteCompletion>,
-    stats: Arc<CachePadded<LogPartitionStats>>,
 }
 
 impl LogIOStateMachine {
     #[inline]
-    fn new(
-        done_tx: Sender<LogWriteCompletion>,
-        stats: Arc<CachePadded<LogPartitionStats>>,
-    ) -> Self {
-        LogIOStateMachine { done_tx, stats }
+    fn new(done_tx: Sender<LogWriteCompletion>) -> Self {
+        LogIOStateMachine { done_tx }
     }
 }
 
@@ -257,11 +255,6 @@ impl crate::io::IOStateMachine for LogIOStateMachine {
     }
 
     #[inline]
-    fn on_stats(&mut self, stats: &crate::io::AIOStats) {
-        self.stats.merge_worker_stats(stats);
-    }
-
-    #[inline]
     fn end_loop(self) {}
 }
 
@@ -284,6 +277,8 @@ pub(crate) struct LogPartition {
     io_worker: CachePadded<Mutex<Option<IOWorkerBuilder<LogIORequest>>>>,
     /// Sender to enqueue redo write requests into the dedicated worker.
     io_client: AIOClient<LogIORequest>,
+    /// Backend-owned submit/wait statistics for the redo worker.
+    io_backend_stats: IOBackendStatsHandle,
     /// Completion channel used by the scheduler thread to observe redo write results.
     completion_tx: Sender<LogWriteCompletion>,
     /// Receiver side of redo write completions, taken by the scheduler thread at startup.
@@ -554,11 +549,13 @@ impl LogPartition {
     fn spawn_redo_worker(&self) -> std::thread::JoinHandle<()> {
         let worker = self.take_io_worker();
         worker
-            .bind(LogIOStateMachine::new(
-                self.completion_tx.clone(),
-                Arc::clone(&self.stats),
-            ))
+            .bind(LogIOStateMachine::new(self.completion_tx.clone()))
             .start_thread()
+    }
+
+    #[inline]
+    pub(crate) fn io_backend_stats(&self) -> IOBackendStats {
+        self.io_backend_stats.snapshot()
     }
 
     #[inline]
@@ -663,27 +660,9 @@ pub struct LogPartitionStats {
     pub log_bytes: AtomicUsize,
     pub sync_count: AtomicUsize,
     pub sync_nanos: AtomicUsize,
-    pub io_submit_count: AtomicUsize,
-    pub io_submit_nanos: AtomicUsize,
-    pub io_wait_count: AtomicUsize,
-    pub io_wait_nanos: AtomicUsize,
     pub purge_trx_count: AtomicUsize,
     pub purge_row_count: AtomicUsize,
     pub purge_index_count: AtomicUsize,
-}
-
-impl LogPartitionStats {
-    #[inline]
-    fn merge_worker_stats(&self, stats: &crate::io::AIOStats) {
-        self.io_submit_count
-            .fetch_add(stats.io_submit_count, Ordering::Relaxed);
-        self.io_submit_nanos
-            .fetch_add(stats.io_submit_nanos, Ordering::Relaxed);
-        self.io_wait_count
-            .fetch_add(stats.io_wait_count, Ordering::Relaxed);
-        self.io_wait_nanos
-            .fetch_add(stats.io_wait_nanos, Ordering::Relaxed);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

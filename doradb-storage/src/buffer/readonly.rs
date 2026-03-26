@@ -10,7 +10,8 @@ use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{
-    BufferPool, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole, ReadonlyPageValidator,
+    BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity,
+    PoolRole, ReadonlyPageValidator,
 };
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Validation::Valid;
@@ -119,6 +120,7 @@ pub struct GlobalReadonlyBufferPool {
     eviction_arbiter: EvictionArbiter,
     shutdown_flag: Arc<AtomicBool>,
     role: PoolRole,
+    stats: BufferPoolStatsHandle,
     arena: QuiescentArena,
 }
 
@@ -165,6 +167,7 @@ impl GlobalReadonlyBufferPool {
             eviction_arbiter,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             role,
+            stats: BufferPoolStatsHandle::default(),
             arena,
         };
         Ok(pool)
@@ -180,6 +183,12 @@ impl GlobalReadonlyBufferPool {
     #[inline]
     pub fn allocated(&self) -> usize {
         self.mappings.len()
+    }
+
+    /// Returns one snapshot of readonly-pool access and load counters.
+    #[inline]
+    pub fn stats(&self) -> BufferPoolStats {
+        self.stats.snapshot()
     }
 
     #[inline]
@@ -750,6 +759,7 @@ impl ReadSubmission {
         mut reservation: ReadonlyReservedPage,
     ) -> Self {
         let ptr = reservation.page_mut() as *mut Page as *mut u8;
+        pool.stats.add_queued_reads(1);
         ReadSubmission {
             key,
             operation: backing.read_operation(key, ptr, PAGE_SIZE),
@@ -780,7 +790,14 @@ impl ReadSubmission {
     /// Fails the miss before worker completion and wakes all joined waiters.
     pub(crate) fn fail(mut self, err: Error) {
         drop(self.reservation.take());
+        self.pool.stats.add_completed_reads(1);
+        self.pool.stats.add_read_errors(1);
         self.complete_inflight_once(Err(err));
+    }
+
+    #[inline]
+    pub(crate) fn record_running(&self) {
+        self.pool.stats.add_running_reads(1);
     }
 
     #[inline]
@@ -822,6 +839,10 @@ impl ReadSubmission {
                 Err(err.into())
             }
         };
+        self.pool.stats.add_completed_reads(1);
+        if result.is_err() {
+            self.pool.stats.add_read_errors(1);
+        }
         self.complete_inflight_once(result);
         AIOKind::Read
     }
@@ -844,7 +865,12 @@ impl IOSubmission for ReadSubmission {
 impl Drop for ReadSubmission {
     #[inline]
     fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
         drop(self.reservation.take());
+        self.pool.stats.add_completed_reads(1);
+        self.pool.stats.add_read_errors(1);
         self.complete_inflight_once(Err(Error::InternalError));
     }
 }
@@ -1116,6 +1142,12 @@ impl ReadonlyBufferPool {
         self.file_kind
     }
 
+    /// Returns one snapshot of readonly-pool access and load counters.
+    #[inline]
+    pub fn stats(&self) -> BufferPoolStats {
+        self.global.stats()
+    }
+
     #[inline]
     fn block_key(&self, block_id: PageID) -> PersistedBlockKey {
         PersistedBlockKey::new(self.file_id, block_id)
@@ -1128,6 +1160,7 @@ impl ReadonlyBufferPool {
         validation: Option<InflightLoadValidation>,
     ) -> Arc<PageIOCompletion> {
         let global = &self.global;
+        global.stats.record_cache_miss();
         match global.inflight_loads.entry(key) {
             Entry::Vacant(vac) => {
                 let inflight = Arc::new(PageIOCompletion::new());
@@ -1157,13 +1190,17 @@ impl ReadonlyBufferPool {
                 }
                 inflight
             }
-            Entry::Occupied(occ) => Arc::clone(occ.get()),
+            Entry::Occupied(occ) => {
+                global.stats.record_miss_join();
+                Arc::clone(occ.get())
+            }
         }
     }
 
     #[inline]
     async fn get_or_load_frame_id(&self, key: PersistedBlockKey) -> Result<PageID> {
         if let Some(frame_id) = self.global.try_get_frame_id(&key) {
+            self.global.stats.record_cache_hit();
             return Ok(frame_id);
         }
         let inflight = self.join_or_start_inflight_load(key, None).await;
@@ -1180,6 +1217,7 @@ impl ReadonlyBufferPool {
         validator: ReadonlyPageValidator,
     ) -> Result<PageID> {
         if let Some(frame_id) = self.global.try_get_frame_id(&key) {
+            self.global.stats.record_cache_hit();
             return Ok(frame_id);
         }
         let inflight = self
@@ -1576,6 +1614,59 @@ pub(crate) mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(bytes);
         table_file.write_page(page_id, buf).await.unwrap();
+    }
+
+    #[test]
+    fn test_readonly_pool_stats_track_single_miss_then_warm_hit() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs.create_table_file(120, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+            write_payload(&table_file, 0, b"readonly-stats").await;
+
+            let scope = global_readonly_pool_scope(frame_page_bytes(4));
+            let pool = table_readonly_pool(&scope, 120, &table_file);
+            let pool_guard = pool.pool_guard();
+
+            let cold_start = pool.stats();
+            let cold_guard = pool
+                .get_page::<Page>(&pool_guard, 0, crate::latch::LatchFallbackMode::Shared)
+                .await
+                .expect("readonly cold read failed in test")
+                .lock_shared_async()
+                .await
+                .unwrap();
+            assert_eq!(&cold_guard.page()[..14], b"readonly-stats");
+            drop(cold_guard);
+
+            let cold_delta = pool.stats().delta_since(cold_start);
+            assert_eq!(cold_delta.cache_hits, 0);
+            assert_eq!(cold_delta.cache_misses, 1);
+            assert_eq!(cold_delta.miss_joins, 0);
+            assert_eq!(cold_delta.queued_reads, 1);
+            assert_eq!(cold_delta.running_reads, 1);
+            assert_eq!(cold_delta.completed_reads, 1);
+            assert_eq!(cold_delta.read_errors, 0);
+
+            let warm_start = pool.stats();
+            let warm_guard = pool
+                .get_page::<Page>(&pool_guard, 0, crate::latch::LatchFallbackMode::Shared)
+                .await
+                .expect("readonly warm read failed in test")
+                .lock_shared_async()
+                .await
+                .unwrap();
+            assert_eq!(&warm_guard.page()[..14], b"readonly-stats");
+            drop(warm_guard);
+
+            let warm_delta = pool.stats().delta_since(warm_start);
+            assert_eq!(warm_delta.cache_hits, 1);
+            assert_eq!(warm_delta.cache_misses, 0);
+            assert_eq!(warm_delta.queued_reads, 0);
+            assert_eq!(warm_delta.running_reads, 0);
+            assert_eq!(warm_delta.completed_reads, 0);
+        });
     }
 
     fn build_valid_persisted_lwc_page() -> Vec<u8> {
