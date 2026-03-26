@@ -2324,7 +2324,7 @@ pub(crate) mod tests {
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
-            assert!(!global.inflight_loads.contains_key(&key));
+            wait_for(|| !global.inflight_loads.contains_key(&key)).await;
             drop(table_file);
             drop(fs);
         });
@@ -2400,7 +2400,7 @@ pub(crate) mod tests {
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
-            assert!(!global.inflight_loads.contains_key(&key));
+            wait_for(|| !global.inflight_loads.contains_key(&key)).await;
             drop(table_file);
             drop(fs);
         });

@@ -34,7 +34,7 @@ pub struct TrxSysConfig {
     // Controls maximum IO size of each IO request.
     // This only limit the combination of multiple transactions.
     // If single transaction has very large redo log. It is kept
-    // what it is and send to AIO manager as one IO request.
+    // what it is and sent to the redo IO worker as one request.
     pub max_io_size: Byte,
     // Directory where redo log files live.
     pub log_dir: PathBuf,

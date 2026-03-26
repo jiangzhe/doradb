@@ -30,7 +30,7 @@ pub use iouring_backend::IouringBackend;
 #[cfg(feature = "libaio")]
 pub use libaio_abi::*;
 #[cfg(feature = "libaio")]
-pub use libaio_backend::LibaioBackend;
+pub use libaio_backend::{AIO, IocbRawPtr, LibaioBackend, UnsafeAIO, pread, pwrite};
 
 #[cfg(feature = "iouring")]
 /// Canonical storage backend selected by cargo features.
@@ -69,117 +69,6 @@ pub type AIOResult<T> = StdResult<T, AIOError>;
 pub(crate) use self::tests::{
     StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook,
 };
-#[cfg(all(test, feature = "libaio"))]
-pub(crate) use libaio_backend::tests::set_io_submit_hook;
-
-#[cfg(feature = "libaio")]
-pub type IocbRawPtr = *mut iocb;
-
-/// AIO backed by an owned aligned buffer.
-#[cfg(feature = "libaio")]
-pub struct AIO<T> {
-    iocb: Box<iocb>,
-    // this is essential because libaio requires the pointer
-    // to buffer keep valid during async processing.
-    buf: Option<T>,
-    pub key: AIOKey,
-}
-
-#[cfg(feature = "libaio")]
-impl<T: AIOBuf> AIO<T> {
-    #[inline]
-    pub fn new(
-        key: AIOKey,
-        fd: RawFd,
-        offset: usize,
-        mut buf: T,
-        priority: u16,
-        flags: u32,
-        opcode: io_iocb_cmd,
-    ) -> Self {
-        let mut iocb = iocb::boxed();
-        iocb.aio_fildes = fd as u32;
-        iocb.aio_lio_opcode = opcode as u16;
-        iocb.aio_reqprio = priority;
-        iocb.buf = buf.as_bytes_mut().as_mut_ptr();
-        iocb.count = buf.as_bytes().len() as u64;
-        iocb.offset = offset as u64;
-        iocb.flags = flags;
-        iocb.data = key; // store and send back via io_event
-        AIO {
-            key,
-            buf: Some(buf),
-            iocb,
-        }
-    }
-
-    #[inline]
-    pub fn iocb_raw(&self) -> IocbRawPtr {
-        self.iocb.as_mut_ptr()
-    }
-
-    #[inline]
-    pub fn take_buf(&mut self) -> Option<T> {
-        self.buf.take()
-    }
-
-    #[inline]
-    pub fn buf(&self) -> Option<&T> {
-        self.buf.as_ref()
-    }
-}
-
-/// AIO backed by a raw pointer.
-/// The raw pointer must be aigned to page and
-/// has outlive the async IO call.
-///
-/// This struct is mainly used for page IO in a buffer pool,
-/// Which pre-assign many pages through mmap() call and do
-/// not release any of them. So the IO request is guaranteed
-/// to be safe.
-#[cfg(feature = "libaio")]
-pub struct UnsafeAIO {
-    iocb: Box<iocb>,
-    pub key: AIOKey,
-}
-
-#[cfg(feature = "libaio")]
-impl UnsafeAIO {
-    /// Create a new unsafe IO.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee pointer is valid during
-    /// syscall and correctly aligned.
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    pub unsafe fn new(
-        key: AIOKey,
-        fd: RawFd,
-        offset: usize,
-        ptr: *mut u8,
-        len: usize,
-        priority: u16,
-        flags: u32,
-        opcode: io_iocb_cmd,
-    ) -> Self {
-        let mut iocb = iocb::boxed();
-        iocb.aio_fildes = fd as u32;
-        iocb.aio_lio_opcode = opcode as u16;
-        iocb.aio_reqprio = priority;
-        iocb.buf = ptr;
-        iocb.count = len as u64;
-        iocb.offset = offset as u64;
-        iocb.flags = flags;
-        iocb.data = key; // store and send back via io_event
-        UnsafeAIO { iocb, key }
-    }
-
-    #[inline]
-    pub fn iocb_raw(&self) -> IocbRawPtr {
-        self.iocb.as_mut_ptr()
-    }
-}
 
 /// Buffer ownership model for one backend-agnostic IO operation.
 ///
@@ -886,50 +775,10 @@ where
     }
 }
 
-#[inline]
-#[cfg(feature = "libaio")]
-pub fn pread<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    AIO::new(
-        key,
-        fd,
-        offset,
-        buf,
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PREAD,
-    )
-}
-
-#[inline]
-#[cfg(feature = "libaio")]
-pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    AIO::new(
-        key,
-        fd,
-        offset,
-        buf,
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PWRITE,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "libaio")]
-    use crate::file::{FixedSizeBufferFreeList, SparseFile};
-    #[cfg(feature = "libaio")]
-    use libc::EAGAIN;
-    #[cfg(feature = "libaio")]
-    use std::os::fd::AsRawFd;
     use std::sync::Arc;
-    #[cfg(feature = "libaio")]
-    use tempfile::TempDir;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct StorageBackendOp {
@@ -985,78 +834,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "libaio")]
-    fn test_aio_file_extend() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("aio_file2.txt");
-        let file_path = file_path.to_string_lossy().into_owned();
-        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
-        let (logical_size, allocated_size) = file.size().unwrap();
-        println!("file created, logical size={logical_size}, allocated size={allocated_size}");
-        assert_eq!(logical_size, 1024 * 1024);
-        assert_eq!(allocated_size, 0);
-        file.extend_to(1024 * 1024 * 2).unwrap();
-        let (logical_size, allocated_size) = file.size().unwrap();
-        println!("file grown, logical size={logical_size}, allocated_size={allocated_size}");
-        assert_eq!(logical_size, 2 * 1024 * 1024);
-        assert_eq!(allocated_size, 0);
-        drop(file);
-    }
-
-    #[test]
-    #[cfg(feature = "libaio")]
-    fn test_io_worker() {
-        let ctx = LibaioBackend::new(16).unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("aio_file3.txt");
-        let file_path = file_path.to_string_lossy().into_owned();
-        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
-
-        let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
-        let listener = SimpleListener { file, next_key: 0 };
-        let (worker, client) = ctx.io_worker();
-        let handle = worker.bind(listener).start_thread();
-
-        let mut buf = buf_free_list.pop(false);
-        buf.reset();
-        buf.extend_from_slice(b"hello, world");
-
-        client
-            .send(Request {
-                kind: AIOKind::Write,
-                offset: 0,
-                buf,
-            })
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let mut elem2 = buf_free_list.pop(false);
-        elem2.reset();
-        let _ = client.send(Request {
-            kind: AIOKind::Read,
-            offset: 0,
-            buf: elem2,
-        });
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        // IO operations here
-
-        client.shutdown();
-        // wait for executor to quit.
-        handle.join().unwrap();
-    }
-
-    #[test]
-    #[cfg(feature = "libaio")]
-    fn test_submit_limit_eagain_no_panic() {
-        let ctx = LibaioBackend::try_default().unwrap();
-        let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
-        let iocb = iocb::boxed();
-        let reqs = vec![iocb.as_mut_ptr()];
-        let submit_count = ctx.submit_limit(&reqs, 1);
-        set_io_submit_hook(previous);
-        assert_eq!(submit_count, 0);
-    }
-
-    #[test]
     fn test_io_queue_drain_to_clamps_to_remaining_len() {
         let mut queue = IOQueue::with_capacity(2);
         queue.push(1u32);
@@ -1065,102 +842,6 @@ mod tests {
         let drained = queue.drain_to(5);
         assert_eq!(drained, vec![1, 2]);
         assert!(queue.is_empty());
-    }
-
-    #[cfg(feature = "libaio")]
-    struct Request {
-        kind: AIOKind,
-        offset: usize,
-        buf: DirectBuf,
-    }
-    #[cfg(feature = "libaio")]
-    struct Submission {
-        key: u64,
-        kind: AIOKind,
-        operation: Operation,
-    }
-    #[cfg(feature = "libaio")]
-    impl IOSubmission for Submission {
-        type Key = u64;
-
-        fn key(&self) -> &Self::Key {
-            &self.key
-        }
-
-        fn operation(&mut self) -> &mut Operation {
-            &mut self.operation
-        }
-    }
-    #[cfg(feature = "libaio")]
-    struct SimpleListener {
-        file: SparseFile,
-        next_key: u64,
-    }
-    #[cfg(feature = "libaio")]
-    impl IOStateMachine for SimpleListener {
-        type Request = Request;
-        type Key = u64;
-        type Submission = Submission;
-
-        fn prepare_request(
-            &mut self,
-            req: Request,
-            max_new: usize,
-            queue: &mut IOQueue<Submission>,
-        ) -> Option<Request> {
-            if max_new == 0 {
-                return Some(req);
-            }
-            let key = self.next_key;
-            self.next_key += 1;
-            let operation = match req.kind {
-                AIOKind::Read => Operation::pread_owned(self.file.as_raw_fd(), req.offset, req.buf),
-                AIOKind::Write => {
-                    Operation::pwrite_owned(self.file.as_raw_fd(), req.offset, req.buf)
-                }
-            };
-            queue.push(Submission {
-                key,
-                kind: req.kind,
-                operation,
-            });
-            None
-        }
-
-        fn on_submit(&mut self, sub: &Submission) {
-            // here we must hold the IO buffer until syscall returns.
-            debug_assert!(*sub.key() < u64::MAX);
-        }
-
-        fn on_complete(&mut self, sub: Submission, res: std::io::Result<usize>) -> AIOKind {
-            match res {
-                Ok(len) => {
-                    match sub.kind {
-                        AIOKind::Read => {
-                            println!("read {} bytes", len);
-                        }
-                        AIOKind::Write => {
-                            println!("write {} bytes", len);
-                        }
-                    }
-                    let buf = sub.operation.buf().unwrap();
-                    let n = buf.data().len().min(20);
-                    println!("leading {} bytes: {:?}", n, &buf.data()[..n]);
-                    sub.kind
-                }
-                Err(err) => {
-                    panic!("{:?}", err);
-                }
-            }
-        }
-
-        fn on_stats(&mut self, stats: &AIOStats) {
-            println!("stats: {:?}", stats);
-        }
-
-        fn end_loop(self) {
-            drop(self.file);
-        }
     }
 
     #[derive(Clone, Copy)]

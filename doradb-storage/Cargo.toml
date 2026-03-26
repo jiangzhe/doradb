@@ -10,7 +10,7 @@ categories = ["database-implementations"]
 repository = "https://github.com/jiangzhe/doradb/doradb-storage/"
 
 [features]
-default = ["libaio"]
+default = ["iouring"]
 libaio = []
 iouring = ["dep:io-uring"]
 

@@ -8,6 +8,8 @@ pub mod table_fs;
 
 #[cfg(test)]
 pub(crate) use self::table_fs::tests::{build_test_fs, build_test_fs_in};
+#[cfg(test)]
+pub(crate) use self::tests::{FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
 
 use crate::buffer::{PersistedBlockKey, ReadSubmission};
 use crate::free_list::FreeList;
@@ -391,20 +393,46 @@ impl IOStateMachine for TableFsStateMachine {
 /// of fsync() and fdatasync().
 pub struct FileSyncer(RawFd);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileSyncKind {
+    Fsync,
+    Fdatasync,
+}
+
 impl FileSyncer {
     #[inline]
     pub fn fsync(&self) -> Result<()> {
-        let ret = unsafe { fsync(self.0) };
-        if ret == 0 {
-            return Ok(());
-        }
-        debug_assert!(ret == -1);
-        Err(std::io::Error::last_os_error().into())
+        self.sync(FileSyncKind::Fsync)
     }
 
     #[inline]
     pub fn fdatasync(&self) -> Result<()> {
-        let ret = unsafe { fdatasync(self.0) };
+        self.sync(FileSyncKind::Fdatasync)
+    }
+
+    #[inline]
+    fn sync(&self, kind: FileSyncKind) -> Result<()> {
+        #[cfg(test)]
+        {
+            let op = tests::FileSyncOp::new(self.0, kind);
+            if let Some(hook) = tests::current_file_sync_test_hook() {
+                let mut override_res = None;
+                hook.on_sync(op, &mut override_res);
+                if let Some(res) = override_res {
+                    return res;
+                }
+            }
+        }
+
+        // SAFETY: `self.0` is an owned live file descriptor for the lifetime of
+        // this `FileSyncer`, and the libc sync calls do not retain borrowed
+        // memory beyond the syscall.
+        let ret = unsafe {
+            match kind {
+                FileSyncKind::Fsync => fsync(self.0),
+                FileSyncKind::Fdatasync => fdatasync(self.0),
+            }
+        };
         if ret == 0 {
             return Ok(());
         }
@@ -453,7 +481,50 @@ impl Deref for FixedSizeBufferFreeList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct FileSyncOp {
+        fd: RawFd,
+        kind: FileSyncKind,
+    }
+
+    impl FileSyncOp {
+        #[inline]
+        pub(super) fn new(fd: RawFd, kind: FileSyncKind) -> Self {
+            Self { fd, kind }
+        }
+
+        #[inline]
+        pub(crate) fn fd(&self) -> RawFd {
+            self.fd
+        }
+
+        #[inline]
+        pub(crate) fn kind(&self) -> FileSyncKind {
+            self.kind
+        }
+    }
+
+    pub(crate) trait FileSyncTestHook: Send + Sync {
+        fn on_sync(&self, _op: FileSyncOp, _override_res: &mut Option<Result<()>>) {}
+    }
+
+    type FileSyncHook = Arc<dyn FileSyncTestHook>;
+
+    static FILE_SYNC_TEST_HOOK: Mutex<Option<FileSyncHook>> = Mutex::new(None);
+
+    #[inline]
+    pub(super) fn current_file_sync_test_hook() -> Option<FileSyncHook> {
+        FILE_SYNC_TEST_HOOK.lock().unwrap().clone()
+    }
+
+    #[inline]
+    pub(crate) fn set_file_sync_test_hook(hook: Option<FileSyncHook>) -> Option<FileSyncHook> {
+        let mut guard = FILE_SYNC_TEST_HOOK.lock().unwrap();
+        std::mem::replace(&mut *guard, hook)
+    }
 
     #[test]
     fn test_sparse_file_open_and_create() {

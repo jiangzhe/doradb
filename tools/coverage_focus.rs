@@ -63,7 +63,7 @@ Prerequisites:\n\
 - `cargo-llvm-cov` available in PATH (`cargo install --locked cargo-llvm-cov`)\n\
 - LLVM tools with `llvm-cov` and `llvm-profdata` (for example `rustup component add llvm-tools`)\n\
 - Optional `COVERAGE_FOCUS_LLVM_PATH` can point to the LLVM tools directory containing both tools\n\
-- Supported coverage runs require `libaio1` and `libaio-dev` in Linux environments\n\
+- Default coverage runs use the repository-default `io_uring` backend; install `libaio1` and `libaio-dev` separately when you also need to validate the alternate `libaio` backend on Linux\n\
 \n\
 Output:\n\
 - By default, command stdout/stderr is hidden and only step descriptions are printed\n\
@@ -294,7 +294,7 @@ fn run_coverage_phases(
     llvm_tools_dir: &Path,
     show_output: bool,
 ) -> Result<(), String> {
-    println!("== coverage phase: supported libaio backend via cargo llvm-cov nextest ==");
+    println!("== coverage phase: default io_uring backend via cargo llvm-cov nextest ==");
     run_checked(
         repo_root,
         "cargo",
@@ -404,7 +404,7 @@ fn format_coverage_phase_error(base: String) -> String {
     let mut out = String::new();
     out.push_str(&base);
     out.push_str("\n");
-    out.push_str("supported coverage phase failed. If this environment is missing libaio, install `libaio1` and `libaio-dev` (Ubuntu: `sudo apt-get install -y libaio1 libaio-dev`) and rerun.");
+    out.push_str("default coverage phase failed. Confirm this machine supports io_uring for the repository-default backend. If you also need alternate libaio validation, install `libaio1` and `libaio-dev` (Ubuntu: `sudo apt-get install -y libaio1 libaio-dev`) and run that path separately.");
     out
 }
 
