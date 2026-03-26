@@ -240,7 +240,32 @@ Reference:
    readonly pools, including readonly miss/hit tracking and evictable
    writeback counters used by existing tests.
 4. Narrowed the `io_uring` single-miss path by draining already-visible CQEs
-   before issuing another blocking `submit_and_wait(...)` call.
+   before issuing another blocking `submit_and_wait(...)` call, then corrected
+   wait-path stats attribution so flushed SQEs from `submit_and_wait(...)`
+   still contribute to backend submit counters.
+5. Post-implementation review fixes tightened correctness around the new stats
+   surfaces:
+   - renamed readonly wrapper `stats()` to `global_stats()` so the shared-cache
+     semantics are explicit;
+   - delayed readonly cache-hit accounting until guarded-frame validation and
+     validator success, preventing stale resident mappings from counting as
+     hits;
+   - counted `libaio` `io_getevents` retry attempts in `wait_calls`, including
+     `EINTR` retries;
+   - tightened the secondary-index eviction regression test to require
+     `write_errors == 0` in addition to `completed_writes > 0`.
+6. Validation completed after implementation and review:
+   - `cargo fmt --all`
+   - `cargo check -p doradb-storage --all-targets`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo check -p doradb-storage --all-targets --no-default-features --features libaio`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+   - `cargo run -p doradb-storage --example bench_readonly_single_miss_latency -- --pages 128 --warm-reads 1000 --cache-bytes 33554432`
+   - `cargo run -p doradb-storage --no-default-features --features libaio --example bench_readonly_single_miss_latency -- --pages 128 --warm-reads 1000 --cache-bytes 33554432`
+7. Manual smoke runs on `2026-03-26` showed the expected post-fix behavior:
+   warm hits reported zero backend activity on both backends, and `io_uring`
+   cold-phase wait stats showed fewer blocking waits than completions because
+   some CQEs were drained without another blocking wait syscall.
 
 ## Impacts
 
@@ -289,7 +314,8 @@ Reference:
 
 ## Open Questions
 
-1. If a narrow backend-local `io_uring` fix does not close the corrected
-   single-miss latency gap, `task resolve` should record the validated root
-   cause and create a follow-up backlog instead of broadening this task into a
-   generic worker or async-I/O redesign.
+1. Private evictor runtime wrappers in `evict.rs` and `readonly.rs` still cache
+   selected pool sub-handles even though the worker can retain `ArenaGuard +
+   SyncQuiescentGuard<Pool>` and derive the rest on demand. This cleanup is
+   deferred to backlog `000071`:
+   `docs/backlogs/000071-collapse-evictor-runtime-wrappers-to-arena-plus-pool-guards.md`.

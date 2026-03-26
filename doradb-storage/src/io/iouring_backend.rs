@@ -169,7 +169,6 @@ where
     finish_submit(batch, submitted, submit_calls)
 }
 
-#[inline]
 fn blocking_submit_and_wait<SubmitAndWait>(
     min_nr: usize,
     mut submit_and_wait: SubmitAndWait,
@@ -200,6 +199,49 @@ fn record_blocking_wait_stats(
 ) {
     stats.record_submit(outcome.wait_calls, outcome.submitted, elapsed_nanos);
     stats.record_wait(outcome.wait_calls, 0, elapsed_nanos);
+}
+
+impl IouringBackend {
+    #[inline]
+    fn stage_pending_sqes(&mut self, batch: &mut IouringSubmitBatch, limit: usize) {
+        let target = limit.min(batch.staged.len());
+        if target == 0 {
+            return;
+        }
+
+        while batch.pending_sqes < target {
+            let Some(entry) = batch.staged.get(batch.pending_sqes) else {
+                break;
+            };
+            let push_res = {
+                let mut sq = self.ring.submission();
+                // SAFETY: the SQE is copied into the ring submission queue. The
+                // pointed-to IO memory is owned by the worker inflight entry and
+                // stays valid until completion is processed.
+                unsafe { sq.push(entry) }
+            };
+            if push_res.is_err() {
+                break;
+            }
+            batch.pending_sqes += 1;
+        }
+    }
+
+    #[inline]
+    fn take_completions(&mut self) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+        let mut completed = Vec::new();
+        let cq = self.ring.completion();
+        for cqe in cq {
+            let res = if cqe.result() >= 0 {
+                Ok(cqe.result() as usize)
+            } else {
+                Err(std::io::Error::from_raw_os_error(-cqe.result()))
+            };
+            completed.push((BackendToken::from_raw(cqe.user_data()), res));
+        }
+        self.stats.record_wait(0, completed.len(), 0);
+        completed
+    }
 }
 
 impl IOBackend for IouringBackend {
@@ -243,27 +285,7 @@ impl IOBackend for IouringBackend {
 
     #[inline]
     fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
-        let target = limit.min(batch.staged.len());
-        if target == 0 {
-            return 0;
-        }
-
-        while batch.pending_sqes < target {
-            let Some(entry) = batch.staged.get(batch.pending_sqes) else {
-                break;
-            };
-            let push_res = {
-                let mut sq = self.ring.submission();
-                // SAFETY: the SQE is copied into the ring submission queue. The
-                // pointed-to IO memory is owned by the worker inflight entry and
-                // stays valid until completion is processed.
-                unsafe { sq.push(entry) }
-            };
-            if push_res.is_err() {
-                break;
-            }
-            batch.pending_sqes += 1;
-        }
+        self.stage_pending_sqes(batch, limit);
 
         if batch.pending_sqes == 0 {
             return 0;
@@ -304,19 +326,7 @@ impl IOBackend for IouringBackend {
                 );
             }
         }
-
-        let mut completed = Vec::new();
-        let cq = self.ring.completion();
-        for cqe in cq {
-            let res = if cqe.result() >= 0 {
-                Ok(cqe.result() as usize)
-            } else {
-                Err(std::io::Error::from_raw_os_error(-cqe.result()))
-            };
-            completed.push((BackendToken::from_raw(cqe.user_data()), res));
-        }
-        self.stats.record_wait(0, completed.len(), 0);
-        completed
+        self.take_completions()
     }
 }
 

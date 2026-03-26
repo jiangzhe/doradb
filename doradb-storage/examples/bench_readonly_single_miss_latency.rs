@@ -13,9 +13,10 @@ use doradb_storage::latch::LatchFallbackMode;
 use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::value::ValKind;
 use rand::RngCore;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
+use tempfile::{Builder, TempDir};
 
 const DEFAULT_PAGES: usize = 8192;
 const DEFAULT_WARM_READS: usize = 1_000_000;
@@ -37,6 +38,11 @@ struct Args {
     /// Capacity of the global readonly pool in bytes.
     #[arg(long, default_value_t = DEFAULT_CACHE_BYTES)]
     cache_bytes: usize,
+    /// Parent directory used for the temporary benchmark storage root.
+    ///
+    /// If omitted, the system temp directory is used.
+    #[arg(long)]
+    temp_dir: Option<PathBuf>,
 }
 
 fn make_metadata() -> Arc<TableMetadata> {
@@ -147,9 +153,24 @@ fn main() {
         );
         std::process::exit(2);
     }
+    if let Some(temp_dir) = &args.temp_dir
+        && !temp_dir.is_dir()
+    {
+        eprintln!(
+            "temp_dir={} is not an existing directory",
+            temp_dir.display(),
+        );
+        std::process::exit(2);
+    }
 
     smol::block_on(async move {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = match &args.temp_dir {
+            Some(temp_dir) => Builder::new()
+                .prefix("doradb-storage-bench.")
+                .tempdir_in(temp_dir)
+                .unwrap(),
+            None => TempDir::new().unwrap(),
+        };
         let engine = EngineConfig::default()
             .storage_root(temp_dir.path())
             .file(
@@ -187,7 +208,8 @@ fn main() {
         let pool_guard = (*pool).pool_guard();
 
         println!(
-            "readonly-single-miss-latency pages={} page_size={} dataset_bytes={} cache_bytes={} required_cache_bytes={} frame_bytes={}",
+            "readonly-single-miss-latency storage_root={} pages={} page_size={} dataset_bytes={} cache_bytes={} required_cache_bytes={} frame_bytes={}",
+            temp_dir.path().display(),
             args.pages,
             PAGE_SIZE,
             args.pages * PAGE_SIZE,
