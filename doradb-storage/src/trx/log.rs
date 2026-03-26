@@ -127,7 +127,7 @@ impl LogPartitionInitializer {
                 group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
                 persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
                 rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
-                stats: CachePadded::new(LogPartitionStats::default()),
+                stats: Arc::new(CachePadded::new(LogPartitionStats::default())),
                 gc_chan,
                 gc_buckets: gc_info.into_boxed_slice(),
                 io_worker: CachePadded::new(Mutex::new(Some(io_worker))),
@@ -199,12 +199,16 @@ struct LogWriteCompletion {
 
 struct LogIOStateMachine {
     done_tx: Sender<LogWriteCompletion>,
+    stats: Arc<CachePadded<LogPartitionStats>>,
 }
 
 impl LogIOStateMachine {
     #[inline]
-    fn new(done_tx: Sender<LogWriteCompletion>) -> Self {
-        LogIOStateMachine { done_tx }
+    fn new(
+        done_tx: Sender<LogWriteCompletion>,
+        stats: Arc<CachePadded<LogPartitionStats>>,
+    ) -> Self {
+        LogIOStateMachine { done_tx, stats }
     }
 }
 
@@ -253,7 +257,9 @@ impl crate::io::IOStateMachine for LogIOStateMachine {
     }
 
     #[inline]
-    fn on_stats(&mut self, _stats: &crate::io::AIOStats) {}
+    fn on_stats(&mut self, stats: &crate::io::AIOStats) {
+        self.stats.merge_worker_stats(stats);
+    }
 
     #[inline]
     fn end_loop(self) {}
@@ -267,7 +273,7 @@ pub(crate) struct LogPartition {
     /// Round-robin GC number generator.
     rr_gc_no: CachePadded<AtomicUsize>,
     /// Stats of transaction system.
-    pub(super) stats: CachePadded<LogPartitionStats>,
+    pub(super) stats: Arc<CachePadded<LogPartitionStats>>,
     /// GC channel to send committed transactions to GC threads.
     pub(super) gc_chan: Sender<GC>,
     /// Each GC bucket contains active sts list, committed transaction list and
@@ -548,7 +554,10 @@ impl LogPartition {
     fn spawn_redo_worker(&self) -> std::thread::JoinHandle<()> {
         let worker = self.take_io_worker();
         worker
-            .bind(LogIOStateMachine::new(self.completion_tx.clone()))
+            .bind(LogIOStateMachine::new(
+                self.completion_tx.clone(),
+                Arc::clone(&self.stats),
+            ))
             .start_thread()
     }
 
@@ -661,6 +670,20 @@ pub struct LogPartitionStats {
     pub purge_trx_count: AtomicUsize,
     pub purge_row_count: AtomicUsize,
     pub purge_index_count: AtomicUsize,
+}
+
+impl LogPartitionStats {
+    #[inline]
+    fn merge_worker_stats(&self, stats: &crate::io::AIOStats) {
+        self.io_submit_count
+            .fetch_add(stats.io_submit_count, Ordering::Relaxed);
+        self.io_submit_nanos
+            .fetch_add(stats.io_submit_nanos, Ordering::Relaxed);
+        self.io_wait_count
+            .fetch_add(stats.io_wait_count, Ordering::Relaxed);
+        self.io_wait_nanos
+            .fetch_add(stats.io_wait_nanos, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1080,13 +1103,276 @@ mod tests {
     use super::*;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::engine::EngineRef;
+    use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
+    use crate::io::{
+        AIOKind, StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook,
+    };
     use crate::trx::log_replay::{LogMerger, ReadLog};
-    use crate::trx::redo::RedoLogs;
-    use crate::trx::sys_trx::SysTrx;
     use crate::value::Val;
     use std::fs::{self, File};
-    use std::sync::atomic::AtomicU64;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    const TEST_WAIT_RETRIES: usize = 100;
+    const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+
+    async fn wait_for<F>(mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..TEST_WAIT_RETRIES {
+            if predicate() {
+                return;
+            }
+            smol::Timer::after(TEST_WAIT_INTERVAL).await;
+        }
+        panic!("condition was not satisfied before timeout");
+    }
+
+    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    static FILE_SYNC_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct InstalledStorageBackendTestHook {
+        previous: Option<Arc<dyn StorageBackendTestHook>>,
+        guard: Option<MutexGuard<'static, ()>>,
+    }
+
+    impl Drop for InstalledStorageBackendTestHook {
+        #[inline]
+        fn drop(&mut self) {
+            let _ = set_storage_backend_test_hook(self.previous.take());
+            drop(self.guard.take());
+        }
+    }
+
+    fn install_storage_backend_test_hook(
+        hook: Arc<dyn StorageBackendTestHook>,
+    ) -> InstalledStorageBackendTestHook {
+        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock().unwrap();
+        InstalledStorageBackendTestHook {
+            previous: set_storage_backend_test_hook(Some(hook)),
+            guard: Some(guard),
+        }
+    }
+
+    struct InstalledFileSyncTestHook {
+        previous: Option<Arc<dyn FileSyncTestHook>>,
+        guard: Option<MutexGuard<'static, ()>>,
+    }
+
+    impl Drop for InstalledFileSyncTestHook {
+        #[inline]
+        fn drop(&mut self) {
+            let _ = set_file_sync_test_hook(self.previous.take());
+            drop(self.guard.take());
+        }
+    }
+
+    fn install_file_sync_test_hook(hook: Arc<dyn FileSyncTestHook>) -> InstalledFileSyncTestHook {
+        let guard = FILE_SYNC_TEST_HOOK_LOCK.lock().unwrap();
+        InstalledFileSyncTestHook {
+            previous: set_file_sync_test_hook(Some(hook)),
+            guard: Some(guard),
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledRedoWriteHook {
+        inner: Arc<ControlledRedoWriteHookInner>,
+    }
+
+    struct ControlledRedoWriteHookInner {
+        fd: std::os::fd::RawFd,
+        errno: i32,
+        calls: AtomicUsize,
+        started: event_listener::Event,
+        released: AtomicBool,
+        release: event_listener::Event,
+    }
+
+    impl ControlledRedoWriteHook {
+        fn new(fd: std::os::fd::RawFd, errno: i32) -> Self {
+            Self {
+                inner: Arc::new(ControlledRedoWriteHookInner {
+                    fd,
+                    errno,
+                    calls: AtomicUsize::new(0),
+                    started: event_listener::Event::new(),
+                    released: AtomicBool::new(false),
+                    release: event_listener::Event::new(),
+                }),
+            }
+        }
+
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            op.kind() == AIOKind::Write && op.fd() == self.inner.fd
+        }
+
+        async fn wait_started(&self, expected_calls: usize) {
+            loop {
+                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
+                    return;
+                }
+                event_listener::listener!(self.inner.started => listener);
+                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
+                    return;
+                }
+                listener.await;
+            }
+        }
+
+        fn release(&self) {
+            self.inner.released.store(true, Ordering::SeqCst);
+            self.inner.release.notify(usize::MAX);
+        }
+    }
+
+    impl StorageBackendTestHook for ControlledRedoWriteHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.inner.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.started.notify(usize::MAX);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+            if !self.matches(op) {
+                return;
+            }
+            loop {
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                event_listener::listener!(self.inner.release => listener);
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                smol::block_on(listener);
+            }
+            *res = Err(std::io::Error::from_raw_os_error(self.inner.errno));
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledFileSyncHook {
+        inner: Arc<ControlledFileSyncHookInner>,
+    }
+
+    struct ControlledFileSyncHookInner {
+        fd: std::os::fd::RawFd,
+        kind: FileSyncKind,
+        errno: i32,
+        calls: AtomicUsize,
+        started: event_listener::Event,
+        released: AtomicBool,
+        release: event_listener::Event,
+    }
+
+    impl ControlledFileSyncHook {
+        fn new(fd: std::os::fd::RawFd, kind: FileSyncKind, errno: i32) -> Self {
+            Self {
+                inner: Arc::new(ControlledFileSyncHookInner {
+                    fd,
+                    kind,
+                    errno,
+                    calls: AtomicUsize::new(0),
+                    started: event_listener::Event::new(),
+                    released: AtomicBool::new(false),
+                    release: event_listener::Event::new(),
+                }),
+            }
+        }
+
+        fn matches(&self, op: FileSyncOp) -> bool {
+            op.fd() == self.inner.fd && op.kind() == self.inner.kind
+        }
+
+        async fn wait_started(&self, expected_calls: usize) {
+            loop {
+                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
+                    return;
+                }
+                event_listener::listener!(self.inner.started => listener);
+                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
+                    return;
+                }
+                listener.await;
+            }
+        }
+
+        fn release(&self) {
+            self.inner.released.store(true, Ordering::SeqCst);
+            self.inner.release.notify(usize::MAX);
+        }
+    }
+
+    impl FileSyncTestHook for ControlledFileSyncHook {
+        fn on_sync(&self, op: FileSyncOp, override_res: &mut Option<crate::error::Result<()>>) {
+            if !self.matches(op) {
+                return;
+            }
+            self.inner.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.started.notify(usize::MAX);
+            loop {
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                event_listener::listener!(self.inner.release => listener);
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                smol::block_on(listener);
+            }
+            *override_res = Some(Err(
+                std::io::Error::from_raw_os_error(self.inner.errno).into()
+            ));
+        }
+    }
+
+    fn spawn_sys_commit_wait(engine: EngineRef, marker: u64) -> JoinHandle<Result<TrxID>> {
+        std::thread::spawn(move || {
+            smol::block_on(async move {
+                let mut sys_trx = engine.trx_sys.begin_sys_trx();
+                sys_trx.create_row_page(marker as _, marker as _, 0, 1);
+                let prepared = sys_trx.prepare();
+                engine.trx_sys.log_partitions[0]
+                    .commit(prepared, &engine.trx_sys.ts, true)
+                    .await
+            })
+        })
+    }
+
+    async fn build_redo_test_engine(
+        log_file_stem: &str,
+        log_sync: LogSync,
+    ) -> (TempDir, crate::engine::Engine) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = EngineConfig::default()
+            .storage_root(temp_dir.path().to_path_buf())
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_stem(log_file_stem)
+                    .log_partitions(1)
+                    .io_depth_per_log(1)
+                    .log_sync(log_sync)
+                    .skip_recovery(true),
+            )
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(crate::buffer::PoolRole::Mem)
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .build()
+            .await
+            .unwrap();
+        (temp_dir, engine)
+    }
 
     #[test]
     fn test_list_log_files_escapes_directory_metacharacters() {
@@ -1273,23 +1559,134 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_no_wait_returns_cts() {
+    fn test_redo_write_failure_poison_runtime_and_fail_waiters() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let config = TrxSysConfig::default()
-                .log_dir(temp_dir.path())
-                .log_file_stem("redo_no_wait")
-                .skip_recovery(true);
-            let initializer = config.log_partition_initializer(0).unwrap();
-            let (partition, _gc_rx) = initializer.finish().unwrap();
-
-            let mut sys_trx = SysTrx {
-                redo: RedoLogs::default(),
+            let (_temp_dir, engine) =
+                build_redo_test_engine("redo_write_failure", LogSync::None).await;
+            let redo_fd = {
+                engine.trx_sys.log_partitions[0]
+                    .group_commit
+                    .lock()
+                    .log_file
+                    .as_ref()
+                    .unwrap()
+                    .as_raw_fd()
             };
+            let hook = ControlledRedoWriteHook::new(redo_fd, libc::EIO);
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
+
+            let commit1 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 1);
+            hook.wait_started(1).await;
+
+            let commit2 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 2);
+            wait_for(|| {
+                !engine.trx_sys.log_partitions[0]
+                    .group_commit
+                    .lock()
+                    .queue
+                    .is_empty()
+            })
+            .await;
+
+            hook.release();
+
+            let res1 = commit1.join().unwrap();
+            let res2 = commit2.join().unwrap();
+            assert!(matches!(
+                res1,
+                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
+            ));
+            assert!(matches!(
+                res2,
+                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
+            ));
+            assert!(matches!(
+                engine.trx_sys.ensure_runtime_healthy(),
+                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
+            ));
+        });
+    }
+
+    async fn assert_redo_sync_failure_poison_runtime_and_fail_waiters(
+        log_sync: LogSync,
+        sync_kind: FileSyncKind,
+        log_file_stem: &str,
+    ) {
+        let (_temp_dir, engine) = build_redo_test_engine(log_file_stem, log_sync).await;
+        let redo_fd = {
+            engine.trx_sys.log_partitions[0]
+                .group_commit
+                .lock()
+                .log_file
+                .as_ref()
+                .unwrap()
+                .as_raw_fd()
+        };
+        let hook = ControlledFileSyncHook::new(redo_fd, sync_kind, libc::EIO);
+        let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+
+        let commit1 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 10);
+        hook.wait_started(1).await;
+
+        let commit2 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 11);
+        wait_for(|| {
+            !engine.trx_sys.log_partitions[0]
+                .group_commit
+                .lock()
+                .queue
+                .is_empty()
+        })
+        .await;
+
+        hook.release();
+
+        let res1 = commit1.join().unwrap();
+        let res2 = commit2.join().unwrap();
+        assert!(matches!(
+            res1,
+            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
+        ));
+        assert!(matches!(
+            res2,
+            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
+        ));
+        assert!(matches!(
+            engine.trx_sys.ensure_runtime_healthy(),
+            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
+        ));
+    }
+
+    #[test]
+    fn test_redo_fsync_failure_poison_runtime_and_fail_waiters() {
+        smol::block_on(async {
+            assert_redo_sync_failure_poison_runtime_and_fail_waiters(
+                LogSync::Fsync,
+                FileSyncKind::Fsync,
+                "redo_fsync_failure",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_redo_fdatasync_failure_poison_runtime_and_fail_waiters() {
+        smol::block_on(async {
+            assert_redo_sync_failure_poison_runtime_and_fail_waiters(
+                LogSync::Fdatasync,
+                FileSyncKind::Fdatasync,
+                "redo_fdatasync_failure",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_commit_sys_returns_cts() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = build_redo_test_engine("redo_no_wait", LogSync::None).await;
+            let mut sys_trx = engine.trx_sys.begin_sys_trx();
             sys_trx.create_row_page(1, 1, 0, 1);
-            let prepared = sys_trx.prepare();
-            let global_ts = AtomicU64::new(MIN_SNAPSHOT_TS);
-            let cts = partition.commit(prepared, &global_ts, false).await.unwrap();
+            let cts = engine.trx_sys.commit_sys(sys_trx).unwrap();
             assert!(cts >= MIN_SNAPSHOT_TS);
         });
     }

@@ -1,11 +1,12 @@
 use super::{
-    AIOClient, AIOError, AIOKey, AIOKind, AIOResult, BackendToken, IOBackend, IOWorkerBuilder,
-    Operation, io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd, io_setup, io_submit,
-    iocb,
+    AIOBuf, AIOClient, AIOError, AIOKey, AIOKind, AIOResult, BackendToken, IOBackend,
+    IOWorkerBuilder, Operation, io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd,
+    io_setup, io_submit, iocb,
 };
 use flume::bounded;
 use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
+use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
 
 const DEFAULT_AIO_MAX_EVENTS: usize = 32;
@@ -22,6 +23,109 @@ pub struct LibaioBackend {
 
 unsafe impl Sync for LibaioBackend {}
 unsafe impl Send for LibaioBackend {}
+
+pub type IocbRawPtr = *mut iocb;
+
+/// Raw libaio request backed by an owned aligned buffer.
+pub struct AIO<T> {
+    iocb: Box<iocb>,
+    // libaio keeps the raw buffer pointer until completion, so the owned
+    // buffer must stay attached to the request object for the full inflight
+    // lifetime.
+    buf: Option<T>,
+    pub key: AIOKey,
+}
+
+impl<T: AIOBuf> AIO<T> {
+    #[inline]
+    pub fn new(
+        key: AIOKey,
+        fd: RawFd,
+        offset: usize,
+        mut buf: T,
+        priority: u16,
+        flags: u32,
+        opcode: io_iocb_cmd,
+    ) -> Self {
+        let mut iocb = iocb::boxed();
+        iocb.aio_fildes = fd as u32;
+        iocb.aio_lio_opcode = opcode as u16;
+        iocb.aio_reqprio = priority;
+        iocb.buf = buf.as_bytes_mut().as_mut_ptr();
+        iocb.count = buf.as_bytes().len() as u64;
+        iocb.offset = offset as u64;
+        iocb.flags = flags;
+        iocb.data = key;
+        AIO {
+            key,
+            buf: Some(buf),
+            iocb,
+        }
+    }
+
+    #[inline]
+    pub fn iocb_raw(&self) -> IocbRawPtr {
+        self.iocb.as_mut_ptr()
+    }
+
+    #[inline]
+    pub fn take_buf(&mut self) -> Option<T> {
+        self.buf.take()
+    }
+
+    #[inline]
+    pub fn buf(&self) -> Option<&T> {
+        self.buf.as_ref()
+    }
+}
+
+/// Raw libaio request backed by a borrowed page-aligned pointer.
+///
+/// The pointer must outlive the kernel request. This compatibility wrapper is
+/// still used for buffer-pool page memory that remains allocated for the whole
+/// async submission lifetime.
+pub struct UnsafeAIO {
+    iocb: Box<iocb>,
+    pub key: AIOKey,
+}
+
+impl UnsafeAIO {
+    /// Creates one libaio request from a borrowed aligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee the pointer remains valid until the kernel
+    /// reports completion and that the pointer plus length satisfy direct-I/O
+    /// alignment rules.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub unsafe fn new(
+        key: AIOKey,
+        fd: RawFd,
+        offset: usize,
+        ptr: *mut u8,
+        len: usize,
+        priority: u16,
+        flags: u32,
+        opcode: io_iocb_cmd,
+    ) -> Self {
+        let mut iocb = iocb::boxed();
+        iocb.aio_fildes = fd as u32;
+        iocb.aio_lio_opcode = opcode as u16;
+        iocb.aio_reqprio = priority;
+        iocb.buf = ptr;
+        iocb.count = len as u64;
+        iocb.offset = offset as u64;
+        iocb.flags = flags;
+        iocb.data = key;
+        UnsafeAIO { iocb, key }
+    }
+
+    #[inline]
+    pub fn iocb_raw(&self) -> IocbRawPtr {
+        self.iocb.as_mut_ptr()
+    }
+}
 
 impl LibaioBackend {
     /// Create a new AIO context with max events(io depth).
@@ -143,6 +247,36 @@ impl LibaioBackend {
 }
 
 #[inline]
+pub fn pread<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
+    const PRIORITY: u16 = 0;
+    const FLAGS: u32 = 0;
+    AIO::new(
+        key,
+        fd,
+        offset,
+        buf,
+        PRIORITY,
+        FLAGS,
+        io_iocb_cmd::IO_CMD_PREAD,
+    )
+}
+
+#[inline]
+pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
+    const PRIORITY: u16 = 0;
+    const FLAGS: u32 = 0;
+    AIO::new(
+        key,
+        fd,
+        offset,
+        buf,
+        PRIORITY,
+        FLAGS,
+        io_iocb_cmd::IO_CMD_PWRITE,
+    )
+}
+
+#[inline]
 fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
     #[cfg(test)]
     {
@@ -255,7 +389,12 @@ impl IOBackend for LibaioBackend {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::file::{FixedSizeBufferFreeList, SparseFile};
+    use crate::io::{AIOStats, DirectBuf, IOQueue, IOStateMachine, IOSubmission};
+    use libc::EAGAIN;
+    use std::os::fd::AsRawFd;
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     pub(crate) type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
 
@@ -270,5 +409,166 @@ pub(crate) mod tests {
     pub(crate) fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
         let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
         std::mem::replace(&mut *guard, hook)
+    }
+
+    #[test]
+    fn test_aio_file_extend() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("aio_file2.txt");
+        let file_path = file_path.to_string_lossy().into_owned();
+        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
+        let (logical_size, allocated_size) = file.size().unwrap();
+        println!("file created, logical size={logical_size}, allocated size={allocated_size}");
+        assert_eq!(logical_size, 1024 * 1024);
+        assert_eq!(allocated_size, 0);
+        file.extend_to(1024 * 1024 * 2).unwrap();
+        let (logical_size, allocated_size) = file.size().unwrap();
+        println!("file grown, logical size={logical_size}, allocated_size={allocated_size}");
+        assert_eq!(logical_size, 2 * 1024 * 1024);
+        assert_eq!(allocated_size, 0);
+        drop(file);
+    }
+
+    #[test]
+    fn test_io_worker() {
+        let ctx = LibaioBackend::new(16).unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("aio_file3.txt");
+        let file_path = file_path.to_string_lossy().into_owned();
+        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
+
+        let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
+        let listener = SimpleListener { file, next_key: 0 };
+        let (worker, client) = ctx.io_worker();
+        let handle = worker.bind(listener).start_thread();
+
+        let mut buf = buf_free_list.pop(false);
+        buf.reset();
+        buf.extend_from_slice(b"hello, world");
+
+        client
+            .send(Request {
+                kind: AIOKind::Write,
+                offset: 0,
+                buf,
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut elem2 = buf_free_list.pop(false);
+        elem2.reset();
+        let _ = client.send(Request {
+            kind: AIOKind::Read,
+            offset: 0,
+            buf: elem2,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        client.shutdown();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_submit_limit_eagain_no_panic() {
+        let ctx = LibaioBackend::try_default().unwrap();
+        let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
+        let iocb = iocb::boxed();
+        let reqs = vec![iocb.as_mut_ptr()];
+        let submit_count = ctx.submit_limit(&reqs, 1);
+        set_io_submit_hook(previous);
+        assert_eq!(submit_count, 0);
+    }
+
+    struct Request {
+        kind: AIOKind,
+        offset: usize,
+        buf: DirectBuf,
+    }
+
+    struct Submission {
+        key: u64,
+        kind: AIOKind,
+        operation: Operation,
+    }
+
+    impl IOSubmission for Submission {
+        type Key = u64;
+
+        fn key(&self) -> &Self::Key {
+            &self.key
+        }
+
+        fn operation(&mut self) -> &mut Operation {
+            &mut self.operation
+        }
+    }
+
+    struct SimpleListener {
+        file: SparseFile,
+        next_key: u64,
+    }
+
+    impl IOStateMachine for SimpleListener {
+        type Request = Request;
+        type Key = u64;
+        type Submission = Submission;
+
+        fn prepare_request(
+            &mut self,
+            req: Request,
+            max_new: usize,
+            queue: &mut IOQueue<Submission>,
+        ) -> Option<Request> {
+            if max_new == 0 {
+                return Some(req);
+            }
+            let key = self.next_key;
+            self.next_key += 1;
+            let operation = match req.kind {
+                AIOKind::Read => Operation::pread_owned(self.file.as_raw_fd(), req.offset, req.buf),
+                AIOKind::Write => {
+                    Operation::pwrite_owned(self.file.as_raw_fd(), req.offset, req.buf)
+                }
+            };
+            queue.push(Submission {
+                key,
+                kind: req.kind,
+                operation,
+            });
+            None
+        }
+
+        fn on_submit(&mut self, sub: &Submission) {
+            debug_assert!(*sub.key() < u64::MAX);
+        }
+
+        fn on_complete(&mut self, sub: Submission, res: std::io::Result<usize>) -> AIOKind {
+            match res {
+                Ok(len) => {
+                    match sub.kind {
+                        AIOKind::Read => {
+                            println!("read {} bytes", len);
+                        }
+                        AIOKind::Write => {
+                            println!("write {} bytes", len);
+                        }
+                    }
+                    let buf = sub.operation.buf().unwrap();
+                    let n = buf.data().len().min(20);
+                    println!("leading {} bytes: {:?}", n, &buf.data()[..n]);
+                    sub.kind
+                }
+                Err(err) => {
+                    panic!("{:?}", err);
+                }
+            }
+        }
+
+        fn on_stats(&mut self, stats: &AIOStats) {
+            println!("stats: {:?}", stats);
+        }
+
+        fn end_loop(self) {
+            drop(self.file);
+        }
     }
 }

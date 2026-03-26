@@ -19,10 +19,11 @@ enforces:
 - `15s` global test-execution timeout
 - fail-fast local behavior for quick feedback
 
-## `libaio` Requirement
+## Linux Packages
 
-The storage engine uses `libaio` for the default asynchronous I/O backend and
-also supports a non-default `io_uring` backend build.
+The storage engine uses `io_uring` for the default asynchronous I/O backend and
+keeps `libaio` as an explicitly supported alternate backend for older Linux
+kernels.
 
 Install the Linux packages before running routine validation locally or in CI:
 
@@ -30,8 +31,9 @@ Install the Linux packages before running routine validation locally or in CI:
 sudo apt-get install -y libaio1 libaio-dev
 ```
 
-Default local validation still uses the default `libaio` feature set. Backend
-changes should also validate the alternate `io_uring` build explicitly.
+Default local validation now uses the repository-default `io_uring` feature
+set. Backend changes should also validate the alternate `libaio` build
+explicitly.
 
 ## Running Tests
 
@@ -45,7 +47,7 @@ When changing storage backend code or backend-neutral IO paths, also run the
 alternate-backend pass:
 
 ```bash
-cargo nextest run -p doradb-storage --no-default-features --features iouring
+cargo nextest run -p doradb-storage --no-default-features --features libaio
 ```
 
 ## Doc Tests
@@ -69,8 +71,9 @@ path above.
 
 -   When making code changes, you must ensure that all existing tests continue to pass.
 -   All new features or bug fixes should be accompanied by well-designed unit tests to cover the new logic.
--   If your changes touch I/O-related code, ensure the supported `libaio`
-    validation path still passes.
+-   If your changes touch I/O-related code, ensure the default `io_uring`
+    validation path and the supported alternate `libaio` validation path still
+    pass.
 
 ## Test Structure Conventions
 
@@ -111,7 +114,8 @@ Use the local coverage focus script when you need fast feedback for one file or 
     rustup component add llvm-tools
     ```
 
--   `libaio` packages must be installed in Linux environments:
+-   `libaio` packages are required when you also need to validate the alternate
+    `libaio` backend on Linux:
 
     ```bash
     sudo apt-get install -y libaio1 libaio-dev
@@ -134,7 +138,7 @@ tools/coverage_focus.rs \
   --write target/coverage/table-focus.md
 ```
 
-The script regenerates coverage artifacts for the default `libaio`
+The script regenerates coverage artifacts for the default `io_uring`
 configuration and runs `cargo llvm-cov nextest --lcov` before printing focused
 line-coverage summaries and uncovered-line hotspots.
 

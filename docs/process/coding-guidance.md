@@ -42,7 +42,7 @@ We rely on tooling to enforce style.
 ### I/O Abstraction
 *   **Use `crate::io`**: All file I/O must go through the `crate::io` module.
     *   **Do not** use `std::fs` or `tokio::fs` for data path operations.
-*   **Compile-Time Backends**: `crate::io` supports compile-time-selected `libaio` and `io_uring` backends. `libaio` remains the default in this repository, and `io_uring` is the non-default alternate path.
+*   **Compile-Time Backends**: `crate::io` supports compile-time-selected `io_uring` and `libaio` backends. `io_uring` is the repository default, and `libaio` remains the explicitly supported alternate path for older kernels that cannot run `io_uring`.
 *   **Alignment**: Respect `crate::io::MIN_PAGE_SIZE` (4096 bytes) for Direct I/O buffers.
 
 ## 4. Testing
@@ -53,7 +53,7 @@ We rely on tooling to enforce style.
     *   If cross-module test reuse is needed, prefer a narrow `#[cfg(test)] pub(crate) use ...::tests::{...};` re-export instead of expanding the production API or adding standalone test-support modules.
 *   **Production Shape First**: Do not widen or complicate production structs, traits, or control flow solely for tests. Prefer adapting tests to the production path, and use minimal `#[cfg(test)]` branches when test-only control is required.
 *   **Routine Validation**: Run `cargo nextest run -p doradb-storage`.
-*   **Alternate Backend Validation**: Run `cargo nextest run -p doradb-storage --no-default-features --features iouring` manually when you need to validate the non-default backend path.
+*   **Alternate Backend Validation**: Run `cargo nextest run -p doradb-storage --no-default-features --features libaio` manually when you need to validate the legacy-kernel alternate backend path.
 *   **Doc Tests**: This project currently does not have doctests, and routine validation does not run `cargo test --doc`.
 
 ## 5. Unsafe Code
@@ -67,4 +67,4 @@ We rely on tooling to enforce style.
 - [ ] **Visibility**: Is this new method actually needed to be `pub`?
 - [ ] **Documentation**: Do all public entities have `///` comments?
 - [ ] **Locking**: Did you use `parking_lot` for small, fast blocking sections?
-- [ ] **I/O**: Does it preserve the supported `libaio` backend contract?
+- [ ] **I/O**: Does it preserve the default `io_uring` path and the supported alternate `libaio` backend contract?

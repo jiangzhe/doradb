@@ -56,8 +56,8 @@ impl MutexGroupCommit {
 /// and perform single IO to speed up overall commit performance.
 pub(super) struct GroupCommit {
     // Commit group queue, there can be multiple groups in commit phase.
-    // Each of them submit IO request to AIO manager and then wait for
-    // pwrite & fsync done.
+    // Each of them submits one redo write into the backend-neutral worker and
+    // then waits for write completion plus the configured sync step.
     pub(super) queue: VecDeque<Commit>,
     // Current log file.
     pub(super) log_file: Option<SparseFile>,

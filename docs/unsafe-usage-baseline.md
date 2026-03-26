@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-03-25`
+- Generated on: `2026-03-26`
 - Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
 
@@ -12,11 +12,11 @@
 | latch | 4 | 48 | 0 | 0 | 0 | 7 |
 | row | 3 | 5 | 0 | 0 | 0 | 3 |
 | index | 18 | 18 | 0 | 0 | 3 | 6 |
-| io | 7 | 21 | 0 | 0 | 0 | 6 |
+| io | 7 | 20 | 0 | 0 | 0 | 6 |
 | trx | 14 | 6 | 0 | 0 | 0 | 2 |
 | lwc | 2 | 2 | 0 | 0 | 0 | 2 |
-| file | 8 | 13 | 0 | 0 | 2 | 6 |
-| **total** | **69** | **168** | **0** | **0** | **5** | **48** |
+| file | 8 | 12 | 0 | 0 | 2 | 7 |
+| **total** | **69** | **166** | **0** | **0** | **5** | **49** |
 
 ## File Hotspots (top 40)
 
@@ -27,19 +27,19 @@
 | `doradb-storage/src/buffer/guard.rs` | buffer | 15 | 6 |
 | `doradb-storage/src/buffer/util.rs` | buffer | 12 | 0 |
 | `doradb-storage/src/buffer/readonly.rs` | buffer | 9 | 2 |
-| `doradb-storage/src/file/mod.rs` | file | 9 | 3 |
 | `doradb-storage/src/latch/hybrid.rs` | latch | 9 | 7 |
 | `doradb-storage/src/buffer/arena.rs` | buffer | 8 | 8 |
-| `doradb-storage/src/io/libaio_backend.rs` | io | 7 | 1 |
+| `doradb-storage/src/file/mod.rs` | file | 8 | 4 |
+| `doradb-storage/src/io/libaio_backend.rs` | io | 8 | 1 |
 | `doradb-storage/src/buffer/evict.rs` | buffer | 6 | 0 |
 | `doradb-storage/src/index/btree_hint.rs` | index | 6 | 0 |
-| `doradb-storage/src/io/mod.rs` | io | 5 | 1 |
 | `doradb-storage/src/row/mod.rs` | row | 5 | 3 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 5 | 2 |
 | `doradb-storage/src/file/cow_file.rs` | file | 4 | 3 |
 | `doradb-storage/src/index/block_index_root.rs` | index | 4 | 2 |
 | `doradb-storage/src/io/buf.rs` | io | 4 | 0 |
 | `doradb-storage/src/io/iouring_backend.rs` | io | 3 | 3 |
+| `doradb-storage/src/io/mod.rs` | io | 3 | 1 |
 | `doradb-storage/src/buffer/fixed.rs` | buffer | 2 | 0 |
 | `doradb-storage/src/buffer/frame.rs` | buffer | 2 | 0 |
 | `doradb-storage/src/index/block_index.rs` | index | 2 | 0 |

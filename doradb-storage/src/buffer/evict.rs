@@ -1329,7 +1329,7 @@ impl EvictableBufferPoolConfig {
         // 2. Initialize memory of frames and pages.
         let arena = QuiescentArena::new(max_nbr)?;
 
-        // 3. Create file and initialize AIO manager.
+        // 3. Create file and initialize the backend-neutral IO worker.
         let io_ctx = StorageBackend::new(self.max_io_depth)?;
         let (worker, io_client) = io_ctx.io_worker();
 
