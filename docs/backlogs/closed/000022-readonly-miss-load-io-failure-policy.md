@@ -19,3 +19,10 @@ Define stable runtime policy for readonly cache miss-load IO failures (panic vs 
 
 Readonly miss-load failure behavior is explicit, implemented, and covered by tests.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000087-unify-storage-io-error-handling.md, which made readonly miss-load failures explicit, caller-visible, and covered by tests.
+- Closed By: backlog close
+- Reference: docs/tasks/000087-unify-storage-io-error-handling.md
+- Closed At: 2026-03-27

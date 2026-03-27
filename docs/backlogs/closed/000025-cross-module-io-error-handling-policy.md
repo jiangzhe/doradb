@@ -19,3 +19,10 @@ Define unified IO error handling policy across storage modules to replace ad-hoc
 
 A documented cross-module policy exists and core paths align with it in code/tests.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000087-unify-storage-io-error-handling.md and RFC-0010 phase 3, which established unified fatal-vs-propagated storage IO policy across redo, checkpoint, and data/index paths.
+- Closed By: backlog close
+- Reference: docs/tasks/000087-unify-storage-io-error-handling.md; docs/rfcs/0010-retire-thread-pool-async-io-and-introduce-backend-neutral-completion-core.md
+- Closed At: 2026-03-27

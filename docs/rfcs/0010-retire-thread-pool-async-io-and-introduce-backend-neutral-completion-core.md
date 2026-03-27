@@ -1,7 +1,7 @@
 ---
 id: 0010
 title: Retire Thread-Pool Async IO and Introduce Backend-Neutral Completion Core
-status: proposal
+status: implemented
 tags: [io, async, libaio, io_uring]
 created: 2026-03-21
 github_issue: 460
@@ -316,9 +316,9 @@ This RFC changes code in an unsafe-sensitive area.
   - Task Doc: `docs/tasks/000085-introduce-iocompletion-based-async-io-framework.md`
   - Task Issue: `#467`
   - Phase Status: done
-  - Implementation Summary: Backend-neutral completion core landed for io, file, and buffer-pool paths; redo-log migration remains tracked in docs/backlogs/000067-redo-group-io-core.md [Task Resolve Sync: docs/tasks/000085-introduce-iocompletion-based-async-io-framework.md @ 2026-03-23]
+  - Implementation Summary: Backend-neutral completion core landed for io, file, and buffer-pool paths, and the redo-log migration follow-up was tracked through docs/backlogs/closed/000067-redo-group-io-core.md before phase 3 completed it. [Task Resolve Sync: docs/tasks/000085-introduce-iocompletion-based-async-io-framework.md @ 2026-03-23]
   - Related Backlogs:
-    - `docs/backlogs/000067-redo-group-io-core.md`
+    - `docs/backlogs/closed/000067-redo-group-io-core.md`
 
 - **Phase 3: Unify Storage I/O Error Handling**
   - Scope: define and implement storage-engine-wide I/O error policy after the
@@ -334,6 +334,9 @@ This RFC changes code in an unsafe-sensitive area.
   - Task Issue: `#471`
   - Phase Status: done
   - Implementation Summary: 1. Implemented one explicit storage-poison runtime path for fatal persistence [Task Resolve Sync: docs/tasks/000087-unify-storage-io-error-handling.md @ 2026-03-23]
+  - Related Backlogs:
+    - `docs/backlogs/closed/000022-readonly-miss-load-io-failure-policy.md`
+    - `docs/backlogs/closed/000025-cross-module-io-error-handling-policy.md`
 
 - **Phase 4: Cleanup Buffer-Pool Interface And Complete Engine Error Propagation**
   - Scope: remove infallible buffer-pool page-access methods, finish
@@ -349,7 +352,7 @@ This RFC changes code in an unsafe-sensitive area.
   - Task Doc: `docs/tasks/000088-cleanup-buffer-pool-interface-and-engine-error-propagation.md`
   - Task Issue: `#473`
   - Phase Status: done
-  - Implementation Summary: Canonical buffer-pool read interfaces are now result-bearing, readonly validated reads moved into ReadonlyBufferPoolExt, and checkpoint/recovery/index/table/purge consumers use the unified access contract. [Task Resolve Sync: docs/tasks/000088-cleanup-buffer-pool-interface-and-engine-error-propagation.md @ 2026-03-24]
+  - Implementation Summary: Canonical buffer-pool read interfaces are now result-bearing, readonly validated reads live on `ReadonlyBufferPool`, and checkpoint/recovery/index/table/purge consumers use the unified access contract. [Task Resolve Sync: docs/tasks/000088-cleanup-buffer-pool-interface-and-engine-error-propagation.md @ 2026-03-24]
 
 - **Phase 5: Add `io_uring` Backend**
   - Scope: implement `io_uring` driver support, keep backend selection
@@ -381,7 +384,9 @@ This RFC changes code in an unsafe-sensitive area.
   - Task Doc: `docs/tasks/000091-make-io-uring-default-and-finish-async-io-cleanup.md`
   - Task Issue: `#480`
   - Phase Status: done
-  - Implementation Summary: Switched the default backend to io_uring, completed the remaining async-I/O cleanup/docs, and deferred readonly benchmark/cold-read perf follow-up to docs/backlogs/000070-correct-readonly-buffer-pool-warm-benchmark-and-investigate-iouring-cold-read-latency.md [Task Resolve Sync: docs/tasks/000091-make-io-uring-default-and-finish-async-io-cleanup.md @ 2026-03-26]
+  - Implementation Summary: Switched the default backend to io_uring, completed the remaining async-I/O cleanup/docs, and recorded the readonly benchmark/cold-read follow-up in docs/backlogs/closed/000070-correct-readonly-buffer-pool-warm-benchmark-and-investigate-iouring-cold-read-latency.md. [Task Resolve Sync: docs/tasks/000091-make-io-uring-default-and-finish-async-io-cleanup.md @ 2026-03-26]
+  - Related Backlogs:
+    - `docs/backlogs/closed/000070-correct-readonly-buffer-pool-warm-benchmark-and-investigate-iouring-cold-read-latency.md`
 
 ## Consequences
 
