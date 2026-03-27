@@ -3,6 +3,7 @@ id: 000093
 title: Enforce Clippy Safety Comment Policy in doradb-storage
 status: implemented  # proposal | implemented | superseded
 created: 2026-03-27
+github_issue: 486
 ---
 
 # Task: Enforce Clippy Safety Comment Policy in doradb-storage
