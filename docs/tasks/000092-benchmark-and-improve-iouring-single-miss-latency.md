@@ -166,12 +166,14 @@ Reference:
 3. Split the current mixed `AIOStats` contract by responsibility.
    - Introduce backend-owned `IOBackendStats` in `doradb-storage/src/io/`.
    - `IOBackendStats` should expose snapshot/delta-friendly fields:
-     - `submit_calls`
+     - `submit_and_wait_calls`
      - `submitted_ops`
-     - `submit_nanos`
-     - `wait_calls`
+     - `submit_and_wait_nanos`
      - `wait_completions`
-     - `wait_nanos`
+   - `submit_and_wait_*` should be one non-overlapping backend-call metric
+     aligned with default `io_uring` fused submit/wait behavior. `libaio`
+     should contribute its separate submit and wait syscalls to the same
+     combined metric, so one logical IO may count as two backend calls.
    - Move externally meaningful submit/wait accounting out of the current
      public `AIOStats` shape and into backend-owned stats populated by
      `IouringBackend` and `LibaioBackend`.
@@ -232,17 +234,22 @@ Reference:
    `bench_readonly_single_miss_latency`, added cache-fit validation based on
    `size_of::<BufferFrame>() + size_of::<Page>()`, and printed per-phase pool
    and backend stat deltas.
-2. Split backend submit/wait accounting into `IOBackendStats` owned by
-   `IouringBackend` / `LibaioBackend`, and exposed snapshots through
+2. Split backend activity accounting into `IOBackendStats` owned by
+   `IouringBackend` / `LibaioBackend`, exposed snapshots through
    `TableFileSystem`, `EvictableBufferPool`, and redo-log partition stats
-   aggregation.
+   aggregation, and finalized the surface as one non-overlapping
+   `submit_and_wait_calls` / `submit_and_wait_nanos` metric plus separate
+   `submitted_ops` and `wait_completions`. This aligns the metric with default
+   `io_uring` fused submit/wait behavior while letting `libaio` contribute its
+   separate submit and wait syscalls to the same combined counter.
 3. Introduced shared `BufferPoolStats` snapshots for fixed, evictable, and
    readonly pools, including readonly miss/hit tracking and evictable
    writeback counters used by existing tests.
 4. Narrowed the `io_uring` single-miss path by draining already-visible CQEs
    before issuing another blocking `submit_and_wait(...)` call, then corrected
-   wait-path stats attribution so flushed SQEs from `submit_and_wait(...)`
-   still contribute to backend submit counters.
+   wait-path stats attribution so fused `submit_and_wait(...)` work
+   contributes once to the combined backend call/timing metric while CQ
+   draining contributes completion counts separately.
 5. Post-implementation review fixes tightened correctness around the new stats
    surfaces:
    - renamed readonly wrapper `stats()` to `global_stats()` so the shared-cache
@@ -250,8 +257,8 @@ Reference:
    - delayed readonly cache-hit accounting until guarded-frame validation and
      validator success, preventing stale resident mappings from counting as
      hits;
-   - counted `libaio` `io_getevents` retry attempts in `wait_calls`, including
-     `EINTR` retries;
+   - counted `libaio` `io_getevents` retry attempts in the combined
+     `submit_and_wait_calls` metric, including `EINTR` retries;
    - tightened the secondary-index eviction regression test to require
      `write_errors == 0` in addition to `completed_writes > 0`.
 6. Validation completed after implementation and review:
@@ -260,12 +267,19 @@ Reference:
    - `cargo nextest run -p doradb-storage`
    - `cargo check -p doradb-storage --all-targets --no-default-features --features libaio`
    - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
-   - `cargo run -p doradb-storage --example bench_readonly_single_miss_latency -- --pages 128 --warm-reads 1000 --cache-bytes 33554432`
-   - `cargo run -p doradb-storage --no-default-features --features libaio --example bench_readonly_single_miss_latency -- --pages 128 --warm-reads 1000 --cache-bytes 33554432`
-7. Manual smoke runs on `2026-03-26` showed the expected post-fix behavior:
-   warm hits reported zero backend activity on both backends, and `io_uring`
-   cold-phase wait stats showed fewer blocking waits than completions because
-   some CQEs were drained without another blocking wait syscall.
+   - `cargo run -p doradb-storage --example bench_readonly_single_miss_latency -- --temp-dir /home/jiangzhe/benchfs.xCRy2r`
+   - `cargo run -p doradb-storage --no-default-features --features libaio --example bench_readonly_single_miss_latency -- --temp-dir /home/jiangzhe/benchfs.xCRy2r`
+7. Manual block-backed comparison on `2026-03-27` with benchmark defaults and
+   `--temp-dir /home/jiangzhe/benchfs.xCRy2r` showed:
+   - warm-hit control worked on both backends with zero backend activity
+     (`io_uring` `1307.04 ns/read`, `libaio` `1290.49 ns/read`);
+   - the remaining cold serialized miss gap was modest on btrfs
+     (`io_uring` `58280.17 ns/read`, `libaio` `53718.54 ns/read`, about
+     `1.08x` slower on `io_uring`);
+   - backend call counts reflected API shape rather than logical IO count
+     (`io_uring` `submit_and_wait_calls=15410`, `libaio`
+     `submit_and_wait_calls=16384`, both with `submitted_ops=8192` and
+     `wait_completions=8192`).
 
 ## Impacts
 
@@ -293,9 +307,12 @@ Reference:
    - A cache-fitting run reports a warm-hit phase with near-zero backend I/O
      deltas.
 2. Backend-stats correctness.
-   - `IOBackendStats` accumulates submit/wait counts and timings on both
-     `io_uring` and `libaio`.
-   - Backend stats do not double-count completions when a wait call reaps
+   - `IOBackendStats` accumulates one combined backend-call count/timing metric
+     (`submit_and_wait_*`) on both `io_uring` and `libaio` while keeping
+     `submitted_ops` and `wait_completions` separate.
+   - `libaio` may report more combined calls than `io_uring` for the same
+     logical workload because submit and wait are separate syscalls.
+   - Backend stats do not double-count completions when one wait call reaps
      multiple CQEs.
 3. Pool-stats correctness.
    - `FixedBufferPool`, `EvictableBufferPool`, and `ReadonlyBufferPool` all
@@ -310,7 +327,9 @@ Reference:
 5. Manual single-miss comparison.
    - Run the renamed example under default `io_uring` and explicit `libaio`
      with the same cache-fitting parameters and compare cold-miss plus warm-hit
-     summaries from both stats surfaces.
+     summaries from both stats surfaces, interpreting
+     `submit_and_wait_calls` as backend API-shape activity rather than logical
+     IO count.
 
 ## Open Questions
 
