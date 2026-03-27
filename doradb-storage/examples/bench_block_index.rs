@@ -148,6 +148,9 @@ fn bench_btreemap(args: Args) {
             op_nanos
         );
     }
+    // SAFETY: the benchmark leaked exactly one boxed `RwLock<BTreeMap<..>>`
+    // into all worker threads above, and they have all joined before this
+    // one-time reclamation.
     unsafe {
         drop(Box::from_raw(
             btreemap as *const _ as *mut RwLock<BTreeMap<u64, u64>>,

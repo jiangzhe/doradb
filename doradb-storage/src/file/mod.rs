@@ -84,6 +84,9 @@ impl SparseFile {
     /// Note that space is allocated only when data is written to this file.
     #[inline]
     pub fn create_or_fail(file_path: impl AsRef<str>, max_size: usize) -> AIOResult<SparseFile> {
+        // SAFETY: libc calls (`open`, `ftruncate`, `close`) are issued with a
+        // validated C string and checked return codes before constructing
+        // `SparseFile`.
         unsafe {
             let c_string =
                 CString::new(file_path.as_ref()).map_err(|_| AIOError::CreateFileError)?;
@@ -107,6 +110,8 @@ impl SparseFile {
     /// Open an existing sparse file with given maximum length.
     #[inline]
     pub fn open(file_path: impl AsRef<str>) -> AIOResult<SparseFile> {
+        // SAFETY: `open` is called with a validated C string, and the returned
+        // fd is checked before it is used or wrapped.
         unsafe {
             let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
             let fd = open(c_string.as_ptr(), O_RDWR | O_DIRECT, 0o644);
@@ -164,12 +169,16 @@ impl SparseFile {
     pub fn extend_to(&self, max_len: usize) -> std::io::Result<()> {
         self.size_lock.lock();
         defer! {
+            // SAFETY: this path holds `size_lock`, so the matching unlock is
+            // paired with the successful lock above.
             unsafe { self.size_lock.unlock(); }
         }
         let curr_len = self.max_len.load(Ordering::Acquire);
         if max_len <= curr_len {
             return Ok(());
         }
+        // SAFETY: `self.fd` is a live owned file descriptor and `max_len` is
+        // the requested logical file length for this sparse file.
         let retcode = unsafe { ftruncate(self.fd, max_len as i64) };
         if retcode == 0 {
             return Ok(());

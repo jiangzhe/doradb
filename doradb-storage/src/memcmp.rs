@@ -427,8 +427,11 @@ impl MemCmpKey {
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         if self.0.len <= MEM_CMP_KEY_INLINE {
+            // SAFETY: the inline representation stores `len` bytes in `u.i`.
             unsafe { &self.0.u.i[..self.0.len] }
         } else {
+            // SAFETY: when `len` exceeds the inline threshold, the heap
+            // representation owns at least `len` initialized bytes in `u.h.data`.
             unsafe { &self.0.u.h.data[..self.0.len] }
         }
     }
@@ -469,8 +472,11 @@ impl MemCmpKey {
     #[inline]
     fn as_bytes_mut(&mut self) -> &mut [u8] {
         if self.0.len <= MEM_CMP_KEY_INLINE {
+            // SAFETY: the inline representation stores `len` bytes in `u.i`.
             unsafe { &mut self.0.u.i[..self.0.len] }
         } else {
+            // SAFETY: when `len` exceeds the inline threshold, the heap
+            // representation owns at least `len` initialized bytes in `u.h.data`.
             unsafe { &mut (*self.0.u.h).data[..self.0.len] }
         }
     }
@@ -701,6 +707,9 @@ impl Inner {
     #[inline]
     fn heap(value: &[u8]) -> Inner {
         debug_assert!(value.len() > MEM_CMP_KEY_INLINE);
+        // SAFETY: this allocates `value.len()` bytes, copies exactly that many
+        // initialized bytes into the allocation, then initializes the heap
+        // variant before assuming `Inner` is initialized.
         unsafe {
             let ptr = alloc(Layout::from_size_align_unchecked(value.len(), 1));
             std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
@@ -719,6 +728,8 @@ impl Inner {
     #[inline]
     fn heap_alloc(len: usize, zeroed: bool) -> Inner {
         debug_assert!(len > MEM_CMP_KEY_INLINE);
+        // SAFETY: this allocates a heap buffer of `len` bytes and immediately
+        // transfers ownership of that allocation into the heap variant.
         unsafe {
             let layout = Layout::from_size_align_unchecked(len, 1);
             let ptr = if zeroed {
@@ -743,6 +754,8 @@ impl Inner {
     fn heap_with_nullable_byte(value: &[u8], b: u8) -> Inner {
         let len = value.len() + 1;
         debug_assert!(len > MEM_CMP_KEY_INLINE);
+        // SAFETY: this allocates `len` bytes, writes the nullable flag plus the
+        // copied payload bytes, and initializes the heap variant before use.
         unsafe {
             let ptr = alloc(Layout::from_size_align_unchecked(len, 1));
             // update first byte.
@@ -763,6 +776,8 @@ impl Inner {
     #[inline]
     fn update_prefix_if_on_heap(&mut self) {
         if self.len > MEM_CMP_KEY_INLINE {
+            // SAFETY: when `len` exceeds the inline threshold, `u.h` is the
+            // active representation and contains at least the prefix bytes.
             unsafe {
                 let h = &mut *self.u.h;
                 let bs = &h.data[..MEM_CMP_KEY_HEAP_PREFIX];
@@ -777,11 +792,16 @@ impl BytesExtendable for Inner {
     fn push_byte(&mut self, value: u8) {
         match self.len.cmp(&MEM_CMP_KEY_INLINE) {
             Ordering::Less => {
+                // SAFETY: the inline variant is active and `self.len <
+                // MEM_CMP_KEY_INLINE`, so indexing `u.i[self.len]` stays in
+                // bounds.
                 unsafe { self.u.i[self.len] = value };
                 self.len += 1;
             }
             Ordering::Equal => {
                 // allocate twice size as current.
+                // SAFETY: the inline variant is active, and this path allocates
+                // a fresh heap buffer before initializing the heap variant.
                 unsafe {
                     let ptr = alloc(Layout::from_size_align_unchecked(self.len * 2, 1));
                     std::ptr::copy_nonoverlapping(self.u.i.as_ptr(), ptr, self.len);
@@ -792,32 +812,38 @@ impl BytesExtendable for Inner {
                     // it's ok to not update prefix, because prefix has same layout as inline bytes.
                 }
             }
-            Ordering::Greater => unsafe {
-                let len = self.len;
-                let data = &mut (*self.u.h).data;
-                if data.len() > len {
-                    // sufficient capacity.
-                    data[len] = value;
-                    self.len += 1;
-                } else {
-                    let new_len = len * 2;
-                    let ptr = alloc(Layout::from_size_align_unchecked(new_len, 1));
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, len);
-                    *ptr.add(len) = value;
-                    self.len += 1;
-                    let old_box = std::mem::replace(
-                        data,
-                        Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice(),
-                    );
-                    drop(old_box); // explicitly drop the old box.
-                    // prefix not changed.
+            Ordering::Greater => {
+                // SAFETY: the heap variant is active in this branch, and all raw
+                // copies stay within the old and newly allocated heap buffers.
+                unsafe {
+                    let len = self.len;
+                    let data = &mut (*self.u.h).data;
+                    if data.len() > len {
+                        // sufficient capacity.
+                        data[len] = value;
+                        self.len += 1;
+                    } else {
+                        let new_len = len * 2;
+                        let ptr = alloc(Layout::from_size_align_unchecked(new_len, 1));
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, len);
+                        *ptr.add(len) = value;
+                        self.len += 1;
+                        let old_box = std::mem::replace(
+                            data,
+                            Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice(),
+                        );
+                        drop(old_box); // explicitly drop the old box.
+                        // prefix not changed.
+                    }
                 }
-            },
+            }
         }
     }
 
     #[inline]
     fn extend_from_byte_slice(&mut self, values: &[u8]) {
+        // SAFETY: each branch either writes within the active inline buffer or
+        // allocates/replaces a heap buffer large enough for the copied bytes.
         unsafe {
             let old_len = self.len;
             let new_len = old_len + values.len();
@@ -865,6 +891,8 @@ impl BytesExtendable for Inner {
 
     #[inline]
     fn extend_repeat_n(&mut self, val: u8, n: usize) {
+        // SAFETY: each branch either writes within the active inline buffer or
+        // allocates/replaces a heap buffer large enough for the repeated bytes.
         unsafe {
             let old_len = self.len;
             let new_len = old_len + n;
@@ -912,6 +940,8 @@ impl BytesExtendable for Inner {
 
     #[inline]
     fn update_last_byte(&mut self, value: u8) {
+        // SAFETY: callers only invoke this helper on non-empty keys, so
+        // `self.len - 1` is in bounds for the active representation.
         unsafe {
             if self.len <= MEM_CMP_KEY_INLINE {
                 self.u.i[self.len - 1] = value;
@@ -929,13 +959,19 @@ impl Drop for Inner {
         if self.len <= MEM_CMP_KEY_INLINE {
             return;
         }
+        // SAFETY: when `len` exceeds the inline threshold, `u.h` is the active
+        // union variant and owns the heap allocation to drop.
         unsafe {
             ManuallyDrop::drop(&mut self.u.h);
         }
     }
 }
 
+// SAFETY: `Inner` stores only plain bytes or owned heap data with no
+// thread-affine state.
 unsafe impl Send for Inner {}
+// SAFETY: shared references only expose immutable access to that inline/heap
+// storage.
 unsafe impl Sync for Inner {}
 
 union InlineOrHeap {
@@ -950,12 +986,16 @@ impl InlineOrHeap {
     /// This method will not read or drop old value in data field.
     #[inline]
     unsafe fn init_heap_data(&mut self, data: Box<[u8]>) {
+        // SAFETY: the caller guarantees `h.data` is currently uninitialized, so
+        // this writes the first initialized heap payload into that field.
         unsafe { std::ptr::write(&mut (*self.h).data, data) };
     }
 
     #[inline]
     fn update_heap_prefix(&mut self, prefix: &[u8]) {
         debug_assert!(prefix.len() == MEM_CMP_KEY_HEAP_PREFIX);
+        // SAFETY: callers invoke this only when the heap variant is active, and
+        // `prefix` has the exact fixed prefix length.
         unsafe { (*self.h).prefix.copy_from_slice(prefix) };
     }
 
@@ -966,6 +1006,8 @@ impl InlineOrHeap {
     /// data immediately.
     #[inline]
     unsafe fn replace_heap_data(&mut self, data: Box<[u8]>) {
+        // SAFETY: the caller guarantees `h.data` is initialized, so replacing it
+        // and dropping the old boxed slice preserves ownership correctly.
         unsafe {
             let old_data = std::ptr::replace(&mut (*self.h).data, data);
             drop(old_data);

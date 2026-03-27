@@ -88,6 +88,8 @@ impl ReadonlyBackingFile {
     #[inline]
     fn read_operation(&self, key: PersistedBlockKey, ptr: *mut u8, len: usize) -> Operation {
         let offset = key.block_id as usize * PAGE_SIZE;
+        // SAFETY: readonly loads borrow frame-owned page memory that remains
+        // live until IO completion, and offsets are page-aligned by construction.
         unsafe { Operation::pread_borrowed(self.raw_fd(), offset, ptr, len) }
     }
 }
@@ -568,7 +570,11 @@ impl Drop for GlobalReadonlyBufferPool {
     }
 }
 
+// SAFETY: the global pool coordinates shared state with atomics, dashmaps, and
+// page latches, while the arena keeps frame/page memory stable.
 unsafe impl Send for GlobalReadonlyBufferPool {}
+// SAFETY: shared references only access thread-safe coordination state and
+// latch-protected frames.
 unsafe impl Sync for GlobalReadonlyBufferPool {}
 
 impl Component for DiskPoolWorkers {
@@ -1080,6 +1086,8 @@ impl EvictionRuntime for ReadonlyRuntime {
     }
 }
 
+// SAFETY: the runtime only contains thread-safe handles (`Arc`, atomics,
+// keepalive guards, and worker-safe stats state).
 unsafe impl Send for ReadonlyRuntime {}
 
 /// Per-file readonly wrapper implementing the `BufferPool` contract.
@@ -1389,7 +1397,11 @@ impl BufferPool for ReadonlyBufferPool {
     }
 }
 
+// SAFETY: the per-file wrapper is a thin cloneable handle over the global pool
+// plus immutable file identity metadata.
 unsafe impl Send for ReadonlyBufferPool {}
+// SAFETY: sharing `&ReadonlyBufferPool` delegates to the thread-safe global
+// readonly pool and immutable wrapper fields.
 unsafe impl Sync for ReadonlyBufferPool {}
 
 #[cfg(test)]
@@ -2470,6 +2482,8 @@ pub(crate) mod tests {
                 listener!(global.residency.evict_ev => evict_listener);
                 let reserve_waiter = smol::spawn(async move {
                     let global_ptr = global_ptr;
+                    // SAFETY: the spawned task holds `task_arena`, which keeps
+                    // the pool allocation alive until the waiter finishes.
                     let global = unsafe { &*global_ptr.0 };
                     match ReadonlyPageReservation::reserve_page(global, key, task_arena).await {
                         Ok((_frame_id, _page_guard)) => {

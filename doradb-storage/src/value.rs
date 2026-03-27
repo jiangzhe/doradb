@@ -183,7 +183,11 @@ pub enum Val {
     VarByte(MemVar),
 }
 
+// SAFETY: `Val` contains plain scalar values or `MemVar`, whose owned heap
+// storage is self-contained and not thread-affine.
 unsafe impl Send for Val {}
+// SAFETY: shared references to `Val` only expose immutable access to those
+// scalar fields or immutable byte storage.
 unsafe impl Sync for Val {}
 
 impl PartialEq for Val {
@@ -672,12 +676,18 @@ impl Deser for Val {
 pub(crate) trait Value: Sized {
     /// Store self value into target position in atomic way.
     ///
-    /// # Safety: This method is only used for atomic update on page.
+    /// # Safety
+    ///
+    /// `ptr` must point to a properly aligned page slot whose inline layout
+    /// matches `Self`.
     unsafe fn atomic_store(&self, ptr: *const u8);
 
     /// Store self value into target position.
     ///
-    /// # Safety: This method is only used for atomic update on page.
+    /// # Safety
+    ///
+    /// `ptr` must point to a properly aligned writable page slot whose inline
+    /// layout matches `Self`.
     unsafe fn store(&self, ptr: *mut u8);
 }
 
@@ -687,6 +697,9 @@ macro_rules! impl_value_fixed_size {
             #[inline]
             unsafe fn atomic_store(&self, ptr: *const u8) {
                 debug_assert!((ptr as usize).is_multiple_of($size));
+                // SAFETY: the trait contract guarantees `ptr` is a properly
+                // aligned slot for `$t`, so the atomic view aliases exactly that
+                // storage.
                 unsafe {
                     let atom = $at::from_ptr(ptr as *mut u8 as *mut $t);
                     atom.store(*self, Ordering::Release);
@@ -695,6 +708,8 @@ macro_rules! impl_value_fixed_size {
 
             #[inline]
             unsafe fn store(&self, ptr: *mut u8) {
+                // SAFETY: the trait contract guarantees `ptr` points to a
+                // writable slot laid out as `$t`.
                 unsafe {
                     *(ptr as *mut $t) = *self;
                 }
@@ -716,6 +731,8 @@ impl Value for f32 {
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
         debug_assert!((ptr as usize).is_multiple_of(4));
+        // SAFETY: the trait contract guarantees `ptr` is a properly aligned
+        // 4-byte slot for storing the raw bits of this `f32`.
         unsafe {
             let atom = AtomicU32::from_ptr(ptr as *mut u8 as *mut u32);
             atom.store(self.to_bits(), Ordering::Release);
@@ -724,6 +741,8 @@ impl Value for f32 {
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
+        // SAFETY: the trait contract guarantees `ptr` points to a writable
+        // 4-byte slot for storing the raw bits of this `f32`.
         unsafe {
             *(ptr as *mut u32) = self.to_bits();
         }
@@ -734,6 +753,8 @@ impl Value for f64 {
     #[inline]
     unsafe fn atomic_store(&self, ptr: *const u8) {
         debug_assert!((ptr as usize).is_multiple_of(8));
+        // SAFETY: the trait contract guarantees `ptr` is a properly aligned
+        // 8-byte slot for storing the raw bits of this `f64`.
         unsafe {
             let atom = AtomicU64::from_ptr(ptr as *mut u8 as *mut u64);
             atom.store(self.to_bits(), Ordering::Release);
@@ -742,6 +763,8 @@ impl Value for f64 {
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
+        // SAFETY: the trait contract guarantees `ptr` points to a writable
+        // 8-byte slot for storing the raw bits of this `f64`.
         unsafe {
             *(ptr as *mut u64) = self.to_bits();
         }
@@ -857,6 +880,8 @@ impl PageVar {
     #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
+        // SAFETY: all `PageVar` union variants store `len` in the same leading
+        // position.
         unsafe { self.i.len as usize }
     }
 
@@ -866,6 +891,8 @@ impl PageVar {
         if self.is_inlined() {
             return None;
         }
+        // SAFETY: the `!is_inlined()` branch means the outlined layout is the
+        // active interpretation and stores `offset`.
         unsafe { Some(self.o.offset as usize) }
     }
 
@@ -890,9 +917,14 @@ impl PageVar {
     ///
     /// # Safety
     ///
-    /// Caller should make sure ptr is valid.
+    /// If this value is outlined, `ptr` must point at the start of the page
+    /// backing this `PageVar`, and the outlined payload range
+    /// `ptr.add(self.offset().unwrap())..ptr.add(self.offset().unwrap() + self.len())`
+    /// must be valid for reads.
     #[inline]
     pub unsafe fn as_bytes_unchecked(&self, ptr: *const u8) -> &[u8] {
+        // SAFETY: the function contract guarantees `ptr` covers the outlined
+        // payload when needed, and the inline/outline tag is derived from `len`.
         unsafe {
             let len = self.len();
             if len <= PAGE_VAR_LEN_INLINE {
@@ -909,8 +941,12 @@ impl PageVar {
     pub fn as_bytes<'a>(&'a self, page_data: &'a [u8]) -> &'a [u8] {
         let len = self.len();
         if len <= PAGE_VAR_LEN_INLINE {
+            // SAFETY: the inline representation stores the payload bytes in the
+            // union's fixed-size inline field.
             unsafe { &self.i.data[..len] }
         } else {
+            // SAFETY: the outlined representation is active when `len` exceeds
+            // the inline threshold.
             let offset = unsafe { self.o.offset as usize };
             &page_data[offset..offset + len]
         }
@@ -921,9 +957,15 @@ impl PageVar {
     ///
     /// # Safety
     ///
-    /// Caller should make sure ptr is valid.
+    /// If this value is currently outlined, `ptr` must point at the start of
+    /// the page backing this `PageVar`, and the existing outlined payload range
+    /// must be valid for writes. The caller must also ensure `val` fits within
+    /// the currently reserved inline or outlined storage.
     #[inline]
     pub unsafe fn update_in_place(&mut self, ptr: *mut u8, val: &[u8]) {
+        // SAFETY: the function contract guarantees `ptr` covers the current
+        // outlined payload, and this helper only writes within the existing
+        // inline bytes or reserved outlined storage.
         unsafe {
             debug_assert!(val.len() <= PAGE_VAR_LEN_INLINE || val.len() <= self.len());
 
@@ -957,7 +999,11 @@ impl PageVar {
     }
 }
 
+// SAFETY: `PageVar` is an 8-byte union of integer/byte-array layouts without
+// references or niche-invalid bit patterns.
 unsafe impl Zeroable for PageVar {}
+// SAFETY: every 8-byte pattern is a valid structural representation for the
+// plain-data fields in `PageVar`.
 unsafe impl AnyBitPattern for PageVar {}
 
 #[derive(Debug, Clone, Copy, AnyBitPattern)]
@@ -988,6 +1034,8 @@ impl MemVar {
     #[inline]
     pub fn inline(data: &[u8]) -> Self {
         debug_assert!(data.len() <= MEM_VAR_LEN_INLINE);
+        // SAFETY: we initialize only the inline variant fields before assuming
+        // the union is initialized.
         unsafe {
             let mut var = MaybeUninit::<MemVar>::uninit();
             let i = &mut var.assume_init_mut().i;
@@ -1001,6 +1049,8 @@ impl MemVar {
     #[inline]
     pub fn outline(data: &[u8]) -> Self {
         debug_assert!(data.len() > MEM_VAR_LEN_INLINE && data.len() <= 0xffff); // must be in range of u16
+        // SAFETY: this initializes the outlined variant fields plus a freshly
+        // allocated payload buffer before assuming the union is initialized.
         unsafe {
             let mut var = MaybeUninit::<MemVar>::uninit();
             let o = &mut var.assume_init_mut().o;
@@ -1016,6 +1066,8 @@ impl MemVar {
     #[inline]
     pub fn outline_boxed_slice(data: Box<[u8]>) -> Self {
         debug_assert!(data.len() > MEM_VAR_LEN_INLINE && data.len() <= 0xffff);
+        // SAFETY: this initializes the outlined variant fields and stores the
+        // leaked boxed-slice pointer as the owned payload pointer.
         unsafe {
             let mut var = MaybeUninit::<MemVar>::uninit();
             let o = &mut var.assume_init_mut().o;
@@ -1031,6 +1083,8 @@ impl MemVar {
     #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
+        // SAFETY: both `MemVar` union variants store `len` in the same leading
+        // position.
         unsafe { self.i.len as usize }
     }
 
@@ -1056,8 +1110,12 @@ impl MemVar {
     pub fn as_bytes(&self) -> &[u8] {
         let len = self.len();
         if len <= MEM_VAR_LEN_INLINE {
+            // SAFETY: the inline representation stores the payload bytes in the
+            // union's inline field.
             unsafe { &self.i.data[..len] }
         } else {
+            // SAFETY: when `len` exceeds the inline threshold, the outlined
+            // representation owns `ptr..ptr+len`.
             unsafe { std::slice::from_raw_parts(self.o.ptr, len) }
         }
     }
@@ -1067,8 +1125,13 @@ impl MemVar {
     pub fn as_str(&self) -> &str {
         let len = self.len();
         if len <= MEM_VAR_LEN_INLINE {
+            // SAFETY: callers only use `as_str` for values known to have been
+            // constructed from valid UTF-8 bytes.
             unsafe { std::str::from_utf8_unchecked(&self.i.data[..len]) }
         } else {
+            // SAFETY: callers only use `as_str` for values known to have been
+            // constructed from valid UTF-8 bytes, and the outlined payload is
+            // live for `self`'s lifetime.
             unsafe {
                 let bytes = std::slice::from_raw_parts(self.o.ptr, len);
                 std::str::from_utf8_unchecked(bytes)
@@ -1096,6 +1159,8 @@ impl Eq for MemVar {}
 impl Clone for MemVar {
     #[inline]
     fn clone(&self) -> Self {
+        // SAFETY: `len` selects the active union layout, and the outlined path
+        // clones the owned heap payload before constructing the new union.
         unsafe {
             if self.len() > MEM_VAR_LEN_INLINE {
                 MemVar {
@@ -1113,6 +1178,8 @@ impl Drop for MemVar {
     fn drop(&mut self) {
         let len = self.len();
         if len > MEM_VAR_LEN_INLINE {
+            // SAFETY: outlined values own a heap allocation of exactly `len`
+            // bytes stored in `self.o.ptr`.
             unsafe {
                 let layout = AllocLayout::from_size_align_unchecked(len, 1);
                 dealloc(self.o.ptr, layout);
@@ -1252,6 +1319,8 @@ struct MemVarOutline {
 impl Clone for MemVarOutline {
     #[inline]
     fn clone(&self) -> Self {
+        // SAFETY: this allocates a fresh buffer of `self.len` bytes and copies
+        // exactly that many bytes from the live source pointer.
         unsafe {
             let layout = AllocLayout::from_size_align_unchecked(self.len as usize, 1);
             let ptr = alloc(layout);
@@ -1281,6 +1350,7 @@ mod tests {
         let var1 = PageVar::inline(b"hello");
         assert!(var1.is_inlined());
         assert!(var1.len() == 5);
+        // SAFETY: inline `PageVar` values ignore the page pointer argument.
         assert!(unsafe { var1.as_bytes_unchecked(std::ptr::null()) } == b"hello");
     }
 
@@ -1555,6 +1625,7 @@ mod tests {
         let var = PageVar::inline(data);
         assert!(var.is_inlined());
         assert_eq!(var.len(), data.len());
+        // SAFETY: inline `PageVar` values ignore the page pointer argument.
         assert_eq!(unsafe { var.as_bytes_unchecked(std::ptr::null()) }, data);
         assert_eq!(var.offset(), None);
     }
@@ -1573,6 +1644,8 @@ mod tests {
         assert!(!var.is_inlined());
         assert_eq!(var.len(), data.len());
         assert_eq!(var.offset(), Some(offset));
+        // SAFETY: `page_data` contains the outlined bytes at the recorded
+        // offset for this test value.
         assert_eq!(unsafe { var.as_bytes_unchecked(page_data.as_ptr()) }, data);
     }
 
@@ -1632,18 +1705,24 @@ mod tests {
         );
 
         // Update with shorter data (should not switch to inline)
+        // SAFETY: `page_data` backs the outlined payload referenced by `var`.
         unsafe { var.update_in_place(page_data.as_mut_ptr(), updated_data) };
         assert!(!var.is_inlined());
         assert_eq!(var.len(), updated_data.len());
         assert_eq!(
+            // SAFETY: `page_data` still backs the outlined payload after the
+            // in-place update above.
             unsafe { var.as_bytes_unchecked(page_data.as_ptr()) },
             updated_data
         );
         // Update with shorter data (should not switch to inline)
+        // SAFETY: `page_data` backs the outlined payload referenced by `var`.
         unsafe { var.update_in_place(page_data.as_mut_ptr(), short_data) };
         assert!(var.is_inlined());
         assert_eq!(var.len(), short_data.len());
         assert_eq!(
+            // SAFETY: after shrinking to inline storage, the page pointer is
+            // unused.
             unsafe { var.as_bytes_unchecked(std::ptr::null()) },
             short_data
         );

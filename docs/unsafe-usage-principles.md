@@ -17,12 +17,31 @@ If a safe equivalent exists with acceptable behavior/performance, prefer the saf
 
 ## 2. Local Safety Contract
 
-Every new or modified `unsafe` block/function must include an adjacent `// SAFETY:` comment that states:
+Every new or modified `unsafe` block and `unsafe impl` must include an adjacent
+`// SAFETY:` comment that states:
 1. concrete preconditions/invariants,
 2. ownership/lifetime/alignment assumptions,
 3. why those assumptions hold at the call site.
 
-Generic comments are not acceptable.
+Every public `unsafe fn` must document its caller obligations in a `/// # Safety`
+section. Use the function doc comment for that contract instead of adding an
+adjacent `// SAFETY:` comment on the function signature itself.
+
+Generic comments are not acceptable. The block/impl rule is mechanically
+enforced in active production crate roots with:
+
+```bash
+#![warn(clippy::undocumented_unsafe_blocks)]
+```
+
+Routine validation uses:
+
+```bash
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+```
+
+Any new production target crate that should carry the same policy must add the
+same crate-level lint attribute.
 
 ## 3. Invariant Enforcement
 
@@ -40,6 +59,7 @@ For unsafe-touching changes:
 2. refresh baseline inventory:
    - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
 3. run behavior-preserving tests:
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
    - `cargo nextest run -p doradb-storage`
 
 ## 5. Planning Compliance

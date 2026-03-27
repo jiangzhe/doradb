@@ -560,8 +560,12 @@ impl BufferPool for EvictableBufferPool {
     }
 }
 
+// SAFETY: the pool only exposes concurrent access through thread-safe
+// primitives (atomics, events, mutexes, quiescent guards, and page latches).
 unsafe impl Send for EvictableBufferPool {}
 
+// SAFETY: shared references coordinate all mutable state through the same
+// thread-safe primitives and stable arena-owned frame/page memory.
 unsafe impl Sync for EvictableBufferPool {}
 
 impl Component for MemPoolWorkers {
@@ -923,6 +927,8 @@ impl EvictionRuntime for EvictableRuntime {
     }
 }
 
+// SAFETY: the eviction runtime only contains thread-safe handles and stable
+// arena/page ownership required by the eviction worker thread.
 unsafe impl Send for EvictableRuntime {}
 
 struct InMemPageSet {
@@ -1032,6 +1038,8 @@ impl InMemPageSet {
     /// This method is invoked after page eviction.
     #[inline]
     fn mark_page_dontneed<T: BufferPage>(&self, mut page_guard: PageExclusiveGuard<T>) {
+        // SAFETY: the exclusive page guard yields a live page pointer owned by
+        // the arena, and `PAGE_SIZE` matches the mapped page allocation size.
         unsafe {
             assert!(madvise_dontneed(
                 page_guard.page_mut() as *mut T as *mut u8,
@@ -1142,6 +1150,8 @@ impl EvictReadSubmission {
         mut reservation: PageReservationGuard<EvictPageReservation>,
     ) -> Self {
         let ptr = reservation.page_mut() as *mut Page as *mut u8;
+        // SAFETY: the reservation keeps the page slot alive and exclusively
+        // owned until the read completes or rolls back.
         let operation = unsafe {
             Operation::pread_borrowed(raw_fd, page_id as usize * PAGE_SIZE, ptr, PAGE_SIZE)
         };
@@ -1266,6 +1276,8 @@ impl SingleFileIO {
 
     #[inline]
     fn prepare_write(&self, page_id: PageID, ptr: *mut Page) -> Operation {
+        // SAFETY: evict writes borrow one live page-sized arena allocation that
+        // stays owned by the page guard until IO completion.
         unsafe {
             Operation::pwrite_borrowed(
                 self.file.as_raw_fd(),

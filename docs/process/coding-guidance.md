@@ -58,7 +58,9 @@ We rely on tooling to enforce style.
 
 ## 5. Unsafe Code
 
-*   **Comments**: Every `unsafe` block **MUST** have a preceding `// SAFETY:` comment explaining the concrete invariants.
+*   **Unsafe Blocks and Impls**: Every `unsafe` block and `unsafe impl` **MUST** have a preceding `// SAFETY:` comment explaining the concrete invariants.
+*   **Public Unsafe Functions**: Every public `unsafe fn` **MUST** document its caller contract in a `/// # Safety` section. Do not replace that function-level contract with an adjacent `// SAFETY:` comment on the signature itself.
+*   **Mechanical Gate**: The active production crate root enables `#![warn(clippy::undocumented_unsafe_blocks)]`, and `cargo clippy -p doradb-storage --all-targets -- -D warnings` turns violations there into hard failures. Any new production target crate should add the same crate-level lint.
 *   **Inventory**: Update the unsafe baseline if usage changes.
 
 ## 6. Development Checklist

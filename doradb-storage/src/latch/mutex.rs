@@ -11,7 +11,11 @@ pub struct Mutex<T> {
     data: UnsafeCell<T>,
 }
 
+// SAFETY: `Mutex<T>` transfers ownership of `T` behind the raw mutex and only
+// exposes it through lock-guard access.
 unsafe impl<T: Send> Send for Mutex<T> {}
+// SAFETY: shared references are safe because the raw mutex serializes access to
+// the inner `UnsafeCell<T>`.
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
@@ -81,7 +85,11 @@ pub struct RawMutex {
     event: Event,
 }
 
+// SAFETY: `RawMutex` is a thin wrapper over `parking_lot::RawMutex` plus an
+// event listener, both of which are thread-safe to move between threads.
 unsafe impl Send for RawMutex {}
+// SAFETY: shared references coordinate all mutation through the underlying raw
+// mutex and event primitive.
 unsafe impl Sync for RawMutex {}
 
 impl RawMutex {
@@ -113,8 +121,15 @@ impl RawMutex {
     }
 
     /// Unlock the mutex.
+    ///
+    /// # Safety
+    ///
+    /// Callers must have acquired this mutex and must pair each unlock with a
+    /// previous successful lock operation.
     #[inline]
     pub unsafe fn unlock(&self) {
+        // SAFETY: the caller upholds the lock/unlock pairing contract, and the
+        // event notification happens only after releasing the raw mutex.
         unsafe {
             self.inner.unlock();
             self.event.notify(1usize.relaxed());
@@ -146,12 +161,16 @@ pub struct MutexGuard<'a, T> {
     marker: PhantomData<&'a mut T>,
 }
 
+// SAFETY: the guard only exposes shared access to `T` when `T: Sync`, and it
+// retains the mutex ownership for the whole guard lifetime.
 unsafe impl<'a, T: Sync + 'a> Sync for MutexGuard<'a, T> {}
 
 impl<'a, T: 'a> Deref for MutexGuard<'a, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &Self::Target {
+        // SAFETY: holding the guard proves the mutex is locked, so shared access
+        // to the inner `UnsafeCell<T>` is valid for the guard lifetime.
         unsafe { &*self.mutex.data.get() }
     }
 }
@@ -159,6 +178,8 @@ impl<'a, T: 'a> Deref for MutexGuard<'a, T> {
 impl<'a, T: 'a> DerefMut for MutexGuard<'a, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: `&mut self` plus the held mutex lock guarantees unique access
+        // to the inner `UnsafeCell<T>`.
         unsafe { &mut *self.mutex.data.get() }
     }
 }
@@ -166,6 +187,8 @@ impl<'a, T: 'a> DerefMut for MutexGuard<'a, T> {
 impl<'a, T: 'a> Drop for MutexGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: `MutexGuard` is only created after a successful lock and drops
+        // exactly once, so this unlock is correctly paired.
         unsafe { self.mutex.raw.unlock() }
     }
 }
@@ -419,6 +442,8 @@ mod tests {
 
         #[inline]
         fn inc(&self) -> usize {
+            // SAFETY: this helper acquires `mu` before touching `data` and
+            // releases it before returning.
             unsafe {
                 self.mu.lock();
                 *self.data.get() += 1;
@@ -430,6 +455,8 @@ mod tests {
 
         #[inline]
         async fn inc_async(&self) -> usize {
+            // SAFETY: this helper acquires `mu` asynchronously before touching
+            // `data` and releases it before returning.
             unsafe {
                 self.mu.lock_async().await;
                 *self.data.get() += 1;
@@ -441,10 +468,14 @@ mod tests {
 
         #[inline]
         fn val(&self) -> usize {
+            // SAFETY: tests only read the counter after all worker activity is
+            // quiesced, so no concurrent mutation remains.
             unsafe { *self.data.get() }
         }
     }
+    // SAFETY: `Counter` protects its `UnsafeCell` with `RawMutex`.
     unsafe impl Send for Counter {}
+    // SAFETY: shared references are synchronized by `RawMutex`.
     unsafe impl Sync for Counter {}
 
     struct ParkingLotCounter {
@@ -463,6 +494,8 @@ mod tests {
 
         #[inline]
         fn inc(&self) -> usize {
+            // SAFETY: this helper holds the parking_lot raw mutex while it
+            // mutates and reads the counter.
             unsafe {
                 self.mu.lock();
                 *self.data.get() += 1;
@@ -473,6 +506,9 @@ mod tests {
         }
     }
 
+    // SAFETY: `ParkingLotCounter` protects its `UnsafeCell` with
+    // `parking_lot::RawMutex`.
     unsafe impl Send for ParkingLotCounter {}
+    // SAFETY: shared references are synchronized by `parking_lot::RawMutex`.
     unsafe impl Sync for ParkingLotCounter {}
 }

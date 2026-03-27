@@ -52,6 +52,11 @@ cargo clippy -p doradb-storage --all-targets -- -D warnings
 
 This keeps local and CI lint behavior aligned.
 
+The undocumented-unsafe-block policy is enabled in the active production crate
+root with `#![warn(clippy::undocumented_unsafe_blocks)]`, and `-D warnings`
+turns any violation there into a hard failure. New production target crates
+must add the same crate-level lint if they should carry the same policy.
+
 ## Lint Attribute Policy
 
 - Prefer fixing lint warnings instead of suppressing them.

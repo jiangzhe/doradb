@@ -161,8 +161,12 @@ impl Default for BufferFrame {
     }
 }
 
+// SAFETY: `BufferFrame` mutation is externally synchronized by the frame latch,
+// and its raw page pointer always targets stable arena-owned page memory.
 unsafe impl Send for BufferFrame {}
 
+// SAFETY: sharing `&BufferFrame` across threads is safe because interior
+// mutation goes through atomics or latch-protected metadata.
 unsafe impl Sync for BufferFrame {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

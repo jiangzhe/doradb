@@ -31,6 +31,8 @@ pub trait BufferPage: Sized + Send + Sync + 'static {
     #[inline]
     fn zero(&mut self) {
         let bytes = mem::size_of::<Self>();
+        // SAFETY: `self` points to a live page-sized plain-data value, and
+        // zeroing `size_of::<Self>()` bytes stays within that allocation.
         unsafe {
             let ptr = self as *mut Self as *mut u8;
             ptr.write_bytes(0, bytes);

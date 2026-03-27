@@ -518,6 +518,8 @@ impl<M> Drop for OldCowRoot<M> {
     }
 }
 
+// SAFETY: `OldCowRoot` only owns a reclaim-on-drop pointer returned from the
+// active-root swap path; moving it transfers that one-shot ownership.
 unsafe impl<M: Send> Send for OldCowRoot<M> {}
 
 #[inline]

@@ -100,7 +100,11 @@ impl BlockIndexRoot {
     }
 }
 
+// SAFETY: mutable access to the interior cells is serialized by `latch`, which
+// guards all pivot/root updates.
 unsafe impl Send for BlockIndexRoot {}
+// SAFETY: shared references only observe values through latch-validated reads
+// or exclusive-latch-protected updates.
 unsafe impl Sync for BlockIndexRoot {}
 
 #[cfg(test)]
