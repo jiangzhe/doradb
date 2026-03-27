@@ -1,11 +1,13 @@
 use super::{
-    AIOClient, AIOError, AIOKind, AIOResult, BackendToken, IOBackend, IOWorkerBuilder, Operation,
+    AIOClient, AIOError, AIOKind, AIOResult, BackendToken, IOBackend, IOBackendStats,
+    IOBackendStatsHandle, IOWorkerBuilder, Operation,
 };
 use flume::bounded;
 use io_uring::{IoUring, opcode, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
 use std::result::Result as StdResult;
+use std::time::Instant;
 
 const DEFAULT_AIO_MAX_EVENTS: usize = 32;
 
@@ -13,6 +15,7 @@ const DEFAULT_AIO_MAX_EVENTS: usize = 32;
 pub struct IouringBackend {
     ring: IoUring,
     max_events: usize,
+    stats: IOBackendStatsHandle,
 }
 
 // SAFETY: the backend owns one io_uring instance and is moved as a whole onto
@@ -30,7 +33,11 @@ impl IouringBackend {
             .checked_next_power_of_two()
             .ok_or(AIOError::SetupError)?;
         let ring = IoUring::new(ring_entries as u32).map_err(|_| AIOError::SetupError)?;
-        Ok(IouringBackend { ring, max_events })
+        Ok(IouringBackend {
+            ring,
+            max_events,
+            stats: IOBackendStatsHandle::default(),
+        })
     }
 
     /// Creates a default io_uring backend.
@@ -43,6 +50,17 @@ impl IouringBackend {
     #[inline]
     pub fn max_events(&self) -> usize {
         self.max_events
+    }
+
+    /// Returns one snapshot of backend-owned submit/wait activity.
+    #[inline]
+    pub fn stats(&self) -> IOBackendStats {
+        self.stats.snapshot()
+    }
+
+    #[inline]
+    pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
+        self.stats.clone()
     }
 
     /// Builds an IO worker builder.
@@ -70,8 +88,22 @@ pub struct IouringSubmitBatch {
 // the worker inflight table.
 unsafe impl Send for IouringSubmitBatch {}
 
+struct SubmitOutcome {
+    submitted: usize,
+    call_count: usize,
+}
+
+struct BlockingWaitOutcome {
+    submitted: usize,
+    call_count: usize,
+}
+
 #[inline]
-fn finish_submit(batch: &mut IouringSubmitBatch, submitted: usize) -> usize {
+fn finish_submit(
+    batch: &mut IouringSubmitBatch,
+    submitted: usize,
+    call_count: usize,
+) -> SubmitOutcome {
     assert!(
         submitted <= batch.pending_sqes,
         "io_uring submit reported more accepted SQEs than staged pending entries"
@@ -80,7 +112,10 @@ fn finish_submit(batch: &mut IouringSubmitBatch, submitted: usize) -> usize {
         batch.staged.drain(0..submitted);
         batch.pending_sqes -= submitted;
     }
-    submitted
+    SubmitOutcome {
+        submitted,
+        call_count,
+    }
 }
 
 #[inline]
@@ -89,19 +124,22 @@ fn submit_pending_sqes<Submit, SubmitAndWait>(
     limit: usize,
     mut submit: Submit,
     mut submit_and_wait: SubmitAndWait,
-) -> usize
+) -> SubmitOutcome
 where
     Submit: FnMut() -> std::io::Result<usize>,
     SubmitAndWait: FnMut(usize) -> std::io::Result<usize>,
 {
     debug_assert!(batch.pending_sqes != 0);
 
+    let mut call_count = 0usize;
     let submitted = loop {
+        call_count += 1;
         match submit() {
             Ok(submitted) => break submitted,
             Err(err) if err.raw_os_error() == Some(EINTR) => continue,
             Err(err) if matches!(err.raw_os_error(), Some(EAGAIN | EBUSY)) => {
                 let submitted = loop {
+                    call_count += 1;
                     match submit_and_wait(1) {
                         Ok(submitted) => break submitted,
                         Err(err) if err.raw_os_error() == Some(EINTR) => continue,
@@ -128,7 +166,82 @@ where
         }
     };
 
-    finish_submit(batch, submitted)
+    finish_submit(batch, submitted, call_count)
+}
+
+fn blocking_submit_and_wait<SubmitAndWait>(
+    min_nr: usize,
+    mut submit_and_wait: SubmitAndWait,
+) -> BlockingWaitOutcome
+where
+    SubmitAndWait: FnMut(usize) -> std::io::Result<usize>,
+{
+    let mut call_count = 0usize;
+    let submitted = loop {
+        call_count += 1;
+        match submit_and_wait(min_nr) {
+            Ok(submitted) => break submitted,
+            Err(err) if err.raw_os_error() == Some(EINTR) => continue,
+            Err(err) => panic!("io_uring wait failed: err={err} min_nr={min_nr}"),
+        }
+    };
+    BlockingWaitOutcome {
+        submitted,
+        call_count,
+    }
+}
+
+#[inline]
+fn record_blocking_wait_stats(
+    stats: &IOBackendStatsHandle,
+    outcome: BlockingWaitOutcome,
+    elapsed_nanos: usize,
+) {
+    stats.record_submit_and_wait(outcome.call_count, elapsed_nanos);
+    stats.record_submitted_ops(outcome.submitted);
+}
+
+impl IouringBackend {
+    #[inline]
+    fn stage_pending_sqes(&mut self, batch: &mut IouringSubmitBatch, limit: usize) {
+        let target = limit.min(batch.staged.len());
+        if target == 0 {
+            return;
+        }
+
+        while batch.pending_sqes < target {
+            let Some(entry) = batch.staged.get(batch.pending_sqes) else {
+                break;
+            };
+            let push_res = {
+                let mut sq = self.ring.submission();
+                // SAFETY: the SQE is copied into the ring submission queue. The
+                // pointed-to IO memory is owned by the worker inflight entry and
+                // stays valid until completion is processed.
+                unsafe { sq.push(entry) }
+            };
+            if push_res.is_err() {
+                break;
+            }
+            batch.pending_sqes += 1;
+        }
+    }
+
+    #[inline]
+    fn take_completions(&mut self) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+        let mut completed = Vec::new();
+        let cq = self.ring.completion();
+        for cqe in cq {
+            let res = if cqe.result() >= 0 {
+                Ok(cqe.result() as usize)
+            } else {
+                Err(std::io::Error::from_raw_os_error(-cqe.result()))
+            };
+            completed.push((BackendToken::from_raw(cqe.user_data()), res));
+        }
+        self.stats.record_wait_completions(completed.len());
+        completed
+    }
 }
 
 impl IOBackend for IouringBackend {
@@ -172,38 +285,23 @@ impl IOBackend for IouringBackend {
 
     #[inline]
     fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
-        let target = limit.min(batch.staged.len());
-        if target == 0 {
-            return 0;
-        }
-
-        while batch.pending_sqes < target {
-            let Some(entry) = batch.staged.get(batch.pending_sqes) else {
-                break;
-            };
-            let push_res = {
-                let mut sq = self.ring.submission();
-                // SAFETY: the SQE is copied into the ring submission queue. The
-                // pointed-to IO memory is owned by the worker inflight entry and
-                // stays valid until completion is processed.
-                unsafe { sq.push(entry) }
-            };
-            if push_res.is_err() {
-                break;
-            }
-            batch.pending_sqes += 1;
-        }
+        let start = Instant::now();
+        self.stage_pending_sqes(batch, limit);
 
         if batch.pending_sqes == 0 {
             return 0;
         }
 
-        submit_pending_sqes(
+        let outcome = submit_pending_sqes(
             batch,
             limit,
             || self.ring.submit(),
             |min_nr| self.ring.submit_and_wait(min_nr),
-        )
+        );
+        self.stats
+            .record_submit_and_wait(outcome.call_count, start.elapsed().as_nanos() as usize);
+        self.stats.record_submitted_ops(outcome.submitted);
+        outcome.submitted
     }
 
     #[inline]
@@ -212,25 +310,21 @@ impl IOBackend for IouringBackend {
         _events: &mut Self::Events,
         min_nr: usize,
     ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
-        loop {
-            match self.ring.submit_and_wait(min_nr) {
-                Ok(_) => break,
-                Err(err) if err.raw_os_error() == Some(EINTR) => continue,
-                Err(err) => panic!("io_uring wait failed: err={err} min_nr={min_nr}"),
+        {
+            let cq = self.ring.completion();
+            if cq.len() < min_nr {
+                drop(cq);
+                let start = Instant::now();
+                let outcome =
+                    blocking_submit_and_wait(min_nr, |min_nr| self.ring.submit_and_wait(min_nr));
+                record_blocking_wait_stats(
+                    &self.stats,
+                    outcome,
+                    start.elapsed().as_nanos() as usize,
+                );
             }
         }
-
-        let mut completed = Vec::new();
-        let cq = self.ring.completion();
-        for cqe in cq {
-            let res = if cqe.result() >= 0 {
-                Ok(cqe.result() as usize)
-            } else {
-                Err(std::io::Error::from_raw_os_error(-cqe.result()))
-            };
-            completed.push((BackendToken::from_raw(cqe.user_data()), res));
-        }
-        completed
+        self.take_completions()
     }
 }
 
@@ -257,13 +351,14 @@ mod tests {
     #[test]
     fn test_submit_pending_sqes_applies_successful_submit_bookkeeping() {
         let mut batch = submit_batch_with_pending(3, 3);
-        let submitted = submit_pending_sqes(
+        let outcome = submit_pending_sqes(
             &mut batch,
             3,
             || Ok(2),
             |_| panic!("blocking fallback should not run on successful submit"),
         );
-        assert_eq!(submitted, 2);
+        assert_eq!(outcome.submitted, 2);
+        assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 1);
         assert_eq!(batch.staged.len(), 1);
     }
@@ -272,7 +367,7 @@ mod tests {
     fn test_submit_pending_sqes_falls_back_to_blocking_submit_on_eagain() {
         let mut batch = submit_batch_with_pending(2, 2);
         let mut submit_calls = 0;
-        let submitted = submit_pending_sqes(
+        let outcome = submit_pending_sqes(
             &mut batch,
             2,
             || {
@@ -284,7 +379,8 @@ mod tests {
                 Ok(2)
             },
         );
-        assert_eq!(submitted, 2);
+        assert_eq!(outcome.submitted, 2);
+        assert_eq!(outcome.call_count, 2);
         assert_eq!(submit_calls, 1);
         assert_eq!(batch.pending_sqes, 0);
         assert!(batch.staged.is_empty());
@@ -293,7 +389,7 @@ mod tests {
     #[test]
     fn test_submit_pending_sqes_preserves_unaccepted_suffix_after_blocking_fallback() {
         let mut batch = submit_batch_with_pending(3, 3);
-        let submitted = submit_pending_sqes(
+        let outcome = submit_pending_sqes(
             &mut batch,
             3,
             || Err(std::io::Error::from_raw_os_error(EBUSY)),
@@ -302,8 +398,59 @@ mod tests {
                 Ok(1)
             },
         );
-        assert_eq!(submitted, 1);
+        assert_eq!(outcome.submitted, 1);
+        assert_eq!(outcome.call_count, 2);
         assert_eq!(batch.pending_sqes, 2);
         assert_eq!(batch.staged.len(), 2);
+    }
+
+    #[test]
+    fn test_blocking_submit_and_wait_counts_successful_attempt() {
+        let mut calls = 0usize;
+        let outcome = blocking_submit_and_wait(3, |min_nr| {
+            calls += 1;
+            assert_eq!(min_nr, 3);
+            Ok(2)
+        });
+        assert_eq!(outcome.submitted, 2);
+        assert_eq!(outcome.call_count, 1);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn test_blocking_submit_and_wait_retries_on_eintr() {
+        let mut calls = 0usize;
+        let outcome = blocking_submit_and_wait(4, |min_nr| {
+            calls += 1;
+            assert_eq!(min_nr, 4);
+            if calls == 1 {
+                Err(std::io::Error::from_raw_os_error(EINTR))
+            } else {
+                Ok(3)
+            }
+        });
+        assert_eq!(outcome.submitted, 3);
+        assert_eq!(outcome.call_count, 2);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn test_record_blocking_wait_stats_counts_combined_fields() {
+        let stats = IOBackendStatsHandle::default();
+        record_blocking_wait_stats(
+            &stats,
+            BlockingWaitOutcome {
+                submitted: 5,
+                call_count: 2,
+            },
+            17,
+        );
+        stats.record_wait_completions(3);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.submit_and_wait_calls, 2);
+        assert_eq!(snapshot.submitted_ops, 5);
+        assert_eq!(snapshot.submit_and_wait_nanos, 17);
+        assert_eq!(snapshot.wait_completions, 3);
     }
 }

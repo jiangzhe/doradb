@@ -1,4 +1,6 @@
 use std::result::Result as StdResult;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Worker-owned completion token stored in backend user-data fields.
 ///
@@ -40,31 +42,98 @@ impl BackendToken {
     }
 }
 
-/// Per-iteration statistics reported by an [`super::IOWorker`].
-#[derive(Debug, Default)]
-pub struct AIOStats {
-    pub queuing: usize,
-    pub running: usize,
-    pub finished_reads: usize,
-    pub finished_writes: usize,
-    pub io_submit_count: usize,
-    pub io_submit_nanos: usize,
-    pub io_wait_count: usize,
-    pub io_wait_nanos: usize,
+/// Snapshot of backend-owned submit/wait activity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IOBackendStats {
+    /// Number of backend kernel-entry calls spent submitting work or waiting.
+    ///
+    /// On `libaio`, one logical IO commonly contributes one submit call and
+    /// one wait call, so this count can be roughly doubled compared with
+    /// `io_uring` for serialized workloads.
+    pub submit_and_wait_calls: usize,
+    /// Number of operations accepted by the backend submit path.
+    pub submitted_ops: usize,
+    /// Total nanoseconds spent in backend submit-or-wait calls.
+    ///
+    /// This is a non-overlapping total. `libaio` contributes separate submit
+    /// and wait syscall time, while `io_uring` contributes fused
+    /// `submit_and_wait()` time once.
+    pub submit_and_wait_nanos: usize,
+    /// Number of completions observed by the backend wait path.
+    pub wait_completions: usize,
 }
 
-impl AIOStats {
-    /// Accumulates another statistics snapshot into `self`.
+impl IOBackendStats {
+    /// Returns the saturating delta from one earlier snapshot.
     #[inline]
-    pub fn merge(&mut self, other: &AIOStats) {
-        self.queuing += other.queuing;
-        self.running += other.running;
-        self.finished_reads += other.finished_reads;
-        self.finished_writes += other.finished_writes;
-        self.io_submit_count += other.io_submit_count;
-        self.io_submit_nanos += other.io_submit_nanos;
-        self.io_wait_count += other.io_wait_count;
-        self.io_wait_nanos += other.io_wait_nanos;
+    pub fn delta_since(self, earlier: IOBackendStats) -> IOBackendStats {
+        IOBackendStats {
+            submit_and_wait_calls: self
+                .submit_and_wait_calls
+                .saturating_sub(earlier.submit_and_wait_calls),
+            submitted_ops: self.submitted_ops.saturating_sub(earlier.submitted_ops),
+            submit_and_wait_nanos: self
+                .submit_and_wait_nanos
+                .saturating_sub(earlier.submit_and_wait_nanos),
+            wait_completions: self
+                .wait_completions
+                .saturating_sub(earlier.wait_completions),
+        }
+    }
+}
+
+#[derive(Default)]
+struct IOBackendStatsCounters {
+    submit_and_wait_calls: AtomicUsize,
+    submitted_ops: AtomicUsize,
+    submit_and_wait_nanos: AtomicUsize,
+    wait_completions: AtomicUsize,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct IOBackendStatsHandle(Arc<IOBackendStatsCounters>);
+
+impl IOBackendStatsHandle {
+    #[inline]
+    pub(crate) fn snapshot(&self) -> IOBackendStats {
+        IOBackendStats {
+            submit_and_wait_calls: self.0.submit_and_wait_calls.load(Ordering::Relaxed),
+            submitted_ops: self.0.submitted_ops.load(Ordering::Relaxed),
+            submit_and_wait_nanos: self.0.submit_and_wait_nanos.load(Ordering::Relaxed),
+            wait_completions: self.0.wait_completions.load(Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_submit_and_wait(&self, submit_and_wait_calls: usize, nanos: usize) {
+        if submit_and_wait_calls != 0 {
+            self.0
+                .submit_and_wait_calls
+                .fetch_add(submit_and_wait_calls, Ordering::Relaxed);
+        }
+        if nanos != 0 {
+            self.0
+                .submit_and_wait_nanos
+                .fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_submitted_ops(&self, submitted_ops: usize) {
+        if submitted_ops != 0 {
+            self.0
+                .submitted_ops
+                .fetch_add(submitted_ops, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_wait_completions(&self, wait_completions: usize) {
+        if wait_completions != 0 {
+            self.0
+                .wait_completions
+                .fetch_add(wait_completions, Ordering::Relaxed);
+        }
     }
 }
 

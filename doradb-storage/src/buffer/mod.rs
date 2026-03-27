@@ -39,6 +39,8 @@ use crate::error::{PersistedFileKind, Result};
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Shared terminal-status cell for one page-sized buffer-pool IO operation.
 ///
@@ -49,6 +51,163 @@ pub(crate) type PageIOCompletion = Completion<Result<PageID>>;
 
 /// Validation callback for one persisted readonly-cache page image.
 pub(crate) type ReadonlyPageValidator = fn(&[u8], PersistedFileKind, PageID) -> Result<()>;
+
+/// Snapshot of buffer-pool access and IO lifecycle counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BufferPoolStats {
+    /// Number of resident-page accesses satisfied without a miss load.
+    pub cache_hits: usize,
+    /// Number of logical accesses that missed the resident set.
+    pub cache_misses: usize,
+    /// Number of miss accesses that joined an existing inflight load.
+    pub miss_joins: usize,
+    /// Number of read operations queued by the pool.
+    pub queued_reads: usize,
+    /// Number of read operations accepted into the backend running state.
+    pub running_reads: usize,
+    /// Number of read operations that reached a terminal state.
+    pub completed_reads: usize,
+    /// Number of read operations that completed with an error.
+    pub read_errors: usize,
+    /// Number of write operations queued by the pool.
+    pub queued_writes: usize,
+    /// Number of write operations accepted into the backend running state.
+    pub running_writes: usize,
+    /// Number of write operations that reached a terminal state.
+    pub completed_writes: usize,
+    /// Number of write operations that completed with an error.
+    pub write_errors: usize,
+}
+
+impl BufferPoolStats {
+    /// Returns the saturating delta from one earlier snapshot.
+    #[inline]
+    pub fn delta_since(self, earlier: BufferPoolStats) -> BufferPoolStats {
+        BufferPoolStats {
+            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            cache_misses: self.cache_misses.saturating_sub(earlier.cache_misses),
+            miss_joins: self.miss_joins.saturating_sub(earlier.miss_joins),
+            queued_reads: self.queued_reads.saturating_sub(earlier.queued_reads),
+            running_reads: self.running_reads.saturating_sub(earlier.running_reads),
+            completed_reads: self.completed_reads.saturating_sub(earlier.completed_reads),
+            read_errors: self.read_errors.saturating_sub(earlier.read_errors),
+            queued_writes: self.queued_writes.saturating_sub(earlier.queued_writes),
+            running_writes: self.running_writes.saturating_sub(earlier.running_writes),
+            completed_writes: self
+                .completed_writes
+                .saturating_sub(earlier.completed_writes),
+            write_errors: self.write_errors.saturating_sub(earlier.write_errors),
+        }
+    }
+}
+
+#[derive(Default)]
+struct BufferPoolStatsCounters {
+    cache_hits: AtomicUsize,
+    cache_misses: AtomicUsize,
+    miss_joins: AtomicUsize,
+    queued_reads: AtomicUsize,
+    running_reads: AtomicUsize,
+    completed_reads: AtomicUsize,
+    read_errors: AtomicUsize,
+    queued_writes: AtomicUsize,
+    running_writes: AtomicUsize,
+    completed_writes: AtomicUsize,
+    write_errors: AtomicUsize,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct BufferPoolStatsHandle(Arc<BufferPoolStatsCounters>);
+
+impl BufferPoolStatsHandle {
+    #[inline]
+    pub(crate) fn snapshot(&self) -> BufferPoolStats {
+        BufferPoolStats {
+            cache_hits: self.0.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.0.cache_misses.load(Ordering::Relaxed),
+            miss_joins: self.0.miss_joins.load(Ordering::Relaxed),
+            queued_reads: self.0.queued_reads.load(Ordering::Relaxed),
+            running_reads: self.0.running_reads.load(Ordering::Relaxed),
+            completed_reads: self.0.completed_reads.load(Ordering::Relaxed),
+            read_errors: self.0.read_errors.load(Ordering::Relaxed),
+            queued_writes: self.0.queued_writes.load(Ordering::Relaxed),
+            running_writes: self.0.running_writes.load(Ordering::Relaxed),
+            completed_writes: self.0.completed_writes.load(Ordering::Relaxed),
+            write_errors: self.0.write_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_cache_hit(&self) {
+        self.0.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_cache_miss(&self) {
+        self.0.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_miss_join(&self) {
+        self.0.miss_joins.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_queued_reads(&self, count: usize) {
+        if count != 0 {
+            self.0.queued_reads.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_running_reads(&self, count: usize) {
+        if count != 0 {
+            self.0.running_reads.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_completed_reads(&self, count: usize) {
+        if count != 0 {
+            self.0.completed_reads.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_read_errors(&self, count: usize) {
+        if count != 0 {
+            self.0.read_errors.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_queued_writes(&self, count: usize) {
+        if count != 0 {
+            self.0.queued_writes.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_running_writes(&self, count: usize) {
+        if count != 0 {
+            self.0.running_writes.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_completed_writes(&self, count: usize) {
+        if count != 0 {
+            self.0.completed_writes.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_write_errors(&self, count: usize) {
+        if count != 0 {
+            self.0.write_errors.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Abstraction of buffer pool.
 pub trait BufferPool: Send + Sync {

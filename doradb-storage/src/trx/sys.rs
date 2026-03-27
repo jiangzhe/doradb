@@ -349,10 +349,9 @@ impl TransactionSystem {
             stats.log_bytes += partition.stats.log_bytes.load(Ordering::Relaxed);
             stats.sync_count += partition.stats.sync_count.load(Ordering::Relaxed);
             stats.sync_nanos += partition.stats.sync_nanos.load(Ordering::Relaxed);
-            stats.io_submit_count += partition.stats.io_submit_count.load(Ordering::Relaxed);
-            stats.io_submit_nanos += partition.stats.io_submit_nanos.load(Ordering::Relaxed);
-            stats.io_wait_count += partition.stats.io_wait_count.load(Ordering::Relaxed);
-            stats.io_wait_nanos += partition.stats.io_wait_nanos.load(Ordering::Relaxed);
+            let io_stats = partition.io_backend_stats();
+            stats.io_submit_and_wait_count += io_stats.submit_and_wait_calls;
+            stats.io_submit_and_wait_nanos += io_stats.submit_and_wait_nanos;
             stats.purge_trx_count += partition.stats.purge_trx_count.load(Ordering::Relaxed);
             stats.purge_row_count += partition.stats.purge_row_count.load(Ordering::Relaxed);
             stats.purge_index_count += partition.stats.purge_index_count.load(Ordering::Relaxed);
@@ -454,10 +453,14 @@ pub struct TrxSysStats {
     pub log_bytes: usize,
     pub sync_count: usize,
     pub sync_nanos: usize,
-    pub io_submit_count: usize,
-    pub io_submit_nanos: usize,
-    pub io_wait_count: usize,
-    pub io_wait_nanos: usize,
+    /// Number of backend submit-or-wait calls observed across redo workers.
+    ///
+    /// On `libaio`, one logical IO commonly contributes separate submit and
+    /// wait syscalls, so this count can be roughly doubled compared with
+    /// `io_uring` for serialized workloads.
+    pub io_submit_and_wait_count: usize,
+    /// Total non-overlapping nanoseconds spent in backend submit-or-wait calls.
+    pub io_submit_and_wait_nanos: usize,
     pub purge_trx_count: usize,
     pub purge_row_count: usize,
     pub purge_index_count: usize,

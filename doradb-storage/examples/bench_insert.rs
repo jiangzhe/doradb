@@ -106,19 +106,12 @@ fn main() {
             } else {
                 sync_nanos as f64 / 1000f64 / sync_count as f64
             };
-            let io_submit_count = stats.io_submit_count;
-            let io_submit_nanos = stats.io_submit_nanos;
-            let io_submit_latency = if io_submit_count == 0 {
+            let io_submit_and_wait_count = stats.io_submit_and_wait_count;
+            let io_submit_and_wait_nanos = stats.io_submit_and_wait_nanos;
+            let io_submit_and_wait_latency = if io_submit_and_wait_count == 0 {
                 0f64
             } else {
-                io_submit_nanos as f64 / 1000f64 / io_submit_count as f64
-            };
-            let io_wait_count = stats.io_wait_count;
-            let io_wait_nanos = stats.io_wait_nanos;
-            let io_wait_latency = if io_wait_count == 0 {
-                0f64
-            } else {
-                io_wait_nanos as f64 / 1000f64 / io_wait_count as f64
+                io_submit_and_wait_nanos as f64 / 1000f64 / io_submit_and_wait_count as f64
             };
             let trx_per_group = if commit_count == 0 {
                 0f64
@@ -128,7 +121,7 @@ fn main() {
             let tps = total_trx_count as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
             println!(
                 "threads={},dur={},total_trx={},groups={},sync={},sync_dur={:.2}us,\
-                io_submit={},io_submit_dur={:.2}us,io_wait={},io_wait_dur={:.2}us,\
+                io_submit_and_wait={},io_submit_and_wait_dur={:.2}us,\
                 trx/grp={:.2},trx/s={:.0},log/s={:.2}MB,purge_trx={},purge_row={},purge_index={}",
                 args.threads,
                 dur.as_micros(),
@@ -136,10 +129,8 @@ fn main() {
                 commit_count,
                 sync_count,
                 sync_latency,
-                io_submit_count,
-                io_submit_latency,
-                io_wait_count,
-                io_wait_latency,
+                io_submit_and_wait_count,
+                io_submit_and_wait_latency,
                 trx_per_group,
                 tps,
                 log_bytes as f64 / dur.as_micros() as f64,
