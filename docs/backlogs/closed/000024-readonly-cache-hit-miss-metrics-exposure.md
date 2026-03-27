@@ -19,3 +19,10 @@ Expose readonly cache hit/miss metrics for operational tuning and observability.
 
 Readonly hit/miss metrics are available with validated correctness and documented usage.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000092-benchmark-and-improve-iouring-single-miss-latency.md, which exposed readonly cache hit/miss metrics through shared BufferPoolStats, readonly global_stats(), tests, and benchmark reporting.
+- Closed By: backlog close
+- Reference: docs/tasks/000092-benchmark-and-improve-iouring-single-miss-latency.md
+- Closed At: 2026-03-27
