@@ -45,18 +45,22 @@ impl BackendToken {
 /// Snapshot of backend-owned submit/wait activity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IOBackendStats {
-    /// Number of backend submit-side kernel-entry calls.
-    pub submit_calls: usize,
+    /// Number of backend kernel-entry calls spent submitting work or waiting.
+    ///
+    /// On `libaio`, one logical IO commonly contributes one submit call and
+    /// one wait call, so this count can be roughly doubled compared with
+    /// `io_uring` for serialized workloads.
+    pub submit_and_wait_calls: usize,
     /// Number of operations accepted by the backend submit path.
     pub submitted_ops: usize,
-    /// Total nanoseconds spent in backend submit-side work.
-    pub submit_nanos: usize,
-    /// Number of backend wait-side blocking calls.
-    pub wait_calls: usize,
+    /// Total nanoseconds spent in backend submit-or-wait calls.
+    ///
+    /// This is a non-overlapping total. `libaio` contributes separate submit
+    /// and wait syscall time, while `io_uring` contributes fused
+    /// `submit_and_wait()` time once.
+    pub submit_and_wait_nanos: usize,
     /// Number of completions observed by the backend wait path.
     pub wait_completions: usize,
-    /// Total nanoseconds spent in backend wait-side blocking work.
-    pub wait_nanos: usize,
 }
 
 impl IOBackendStats {
@@ -64,26 +68,26 @@ impl IOBackendStats {
     #[inline]
     pub fn delta_since(self, earlier: IOBackendStats) -> IOBackendStats {
         IOBackendStats {
-            submit_calls: self.submit_calls.saturating_sub(earlier.submit_calls),
+            submit_and_wait_calls: self
+                .submit_and_wait_calls
+                .saturating_sub(earlier.submit_and_wait_calls),
             submitted_ops: self.submitted_ops.saturating_sub(earlier.submitted_ops),
-            submit_nanos: self.submit_nanos.saturating_sub(earlier.submit_nanos),
-            wait_calls: self.wait_calls.saturating_sub(earlier.wait_calls),
+            submit_and_wait_nanos: self
+                .submit_and_wait_nanos
+                .saturating_sub(earlier.submit_and_wait_nanos),
             wait_completions: self
                 .wait_completions
                 .saturating_sub(earlier.wait_completions),
-            wait_nanos: self.wait_nanos.saturating_sub(earlier.wait_nanos),
         }
     }
 }
 
 #[derive(Default)]
 struct IOBackendStatsCounters {
-    submit_calls: AtomicUsize,
+    submit_and_wait_calls: AtomicUsize,
     submitted_ops: AtomicUsize,
-    submit_nanos: AtomicUsize,
-    wait_calls: AtomicUsize,
+    submit_and_wait_nanos: AtomicUsize,
     wait_completions: AtomicUsize,
-    wait_nanos: AtomicUsize,
 }
 
 #[derive(Clone, Default)]
@@ -93,56 +97,42 @@ impl IOBackendStatsHandle {
     #[inline]
     pub(crate) fn snapshot(&self) -> IOBackendStats {
         IOBackendStats {
-            submit_calls: self.0.submit_calls.load(Ordering::Relaxed),
+            submit_and_wait_calls: self.0.submit_and_wait_calls.load(Ordering::Relaxed),
             submitted_ops: self.0.submitted_ops.load(Ordering::Relaxed),
-            submit_nanos: self.0.submit_nanos.load(Ordering::Relaxed),
-            wait_calls: self.0.wait_calls.load(Ordering::Relaxed),
+            submit_and_wait_nanos: self.0.submit_and_wait_nanos.load(Ordering::Relaxed),
             wait_completions: self.0.wait_completions.load(Ordering::Relaxed),
-            wait_nanos: self.0.wait_nanos.load(Ordering::Relaxed),
         }
     }
 
     #[inline]
-    pub(crate) fn record_submit(
-        &self,
-        submit_calls: usize,
-        submitted_ops: usize,
-        submit_nanos: usize,
-    ) {
-        if submit_calls != 0 {
+    pub(crate) fn record_submit_and_wait(&self, submit_and_wait_calls: usize, nanos: usize) {
+        if submit_and_wait_calls != 0 {
             self.0
-                .submit_calls
-                .fetch_add(submit_calls, Ordering::Relaxed);
+                .submit_and_wait_calls
+                .fetch_add(submit_and_wait_calls, Ordering::Relaxed);
         }
+        if nanos != 0 {
+            self.0
+                .submit_and_wait_nanos
+                .fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_submitted_ops(&self, submitted_ops: usize) {
         if submitted_ops != 0 {
             self.0
                 .submitted_ops
                 .fetch_add(submitted_ops, Ordering::Relaxed);
         }
-        if submit_nanos != 0 {
-            self.0
-                .submit_nanos
-                .fetch_add(submit_nanos, Ordering::Relaxed);
-        }
     }
 
     #[inline]
-    pub(crate) fn record_wait(
-        &self,
-        wait_calls: usize,
-        wait_completions: usize,
-        wait_nanos: usize,
-    ) {
-        if wait_calls != 0 {
-            self.0.wait_calls.fetch_add(wait_calls, Ordering::Relaxed);
-        }
+    pub(crate) fn record_wait_completions(&self, wait_completions: usize) {
         if wait_completions != 0 {
             self.0
                 .wait_completions
                 .fetch_add(wait_completions, Ordering::Relaxed);
-        }
-        if wait_nanos != 0 {
-            self.0.wait_nanos.fetch_add(wait_nanos, Ordering::Relaxed);
         }
     }
 }

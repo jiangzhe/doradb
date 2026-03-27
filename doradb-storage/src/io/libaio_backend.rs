@@ -402,14 +402,15 @@ impl IOBackend for LibaioBackend {
         if batch.staged.is_empty() || limit == 0 {
             return 0;
         }
+        let start = Instant::now();
         batch.prefix.clear();
         batch
             .prefix
             .extend(batch.staged.iter().take(limit).copied());
-        let start = Instant::now();
         let submit_count = self.submit_limit(&batch.prefix, limit);
         self.stats
-            .record_submit(1, submit_count, start.elapsed().as_nanos() as usize);
+            .record_submit_and_wait(1, start.elapsed().as_nanos() as usize);
+        self.stats.record_submitted_ops(submit_count);
         if submit_count != 0 {
             batch.staged.drain(0..submit_count);
         }
@@ -429,11 +430,9 @@ impl IOBackend for LibaioBackend {
                 completed.push((BackendToken::from_raw(token), res));
                 AIOKind::Read
             });
-        self.stats.record_wait(
-            wait_calls,
-            completed.len(),
-            start.elapsed().as_nanos() as usize,
-        );
+        self.stats
+            .record_submit_and_wait(wait_calls, start.elapsed().as_nanos() as usize);
+        self.stats.record_wait_completions(completed.len());
         completed
     }
 }
@@ -590,7 +589,7 @@ pub(crate) mod tests {
         }
 
         let delta = backend.stats().delta_since(baseline);
-        assert_eq!(delta.wait_calls, 2);
+        assert_eq!(delta.submit_and_wait_calls, 2);
         assert_eq!(delta.wait_completions, 1);
     }
 

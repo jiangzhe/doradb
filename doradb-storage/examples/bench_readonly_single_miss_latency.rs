@@ -95,13 +95,11 @@ fn format_pool_stats(stats: BufferPoolStats) -> String {
 
 fn format_backend_stats(stats: IOBackendStats) -> String {
     format!(
-        "submit_calls={} submitted_ops={} submit_nanos={} wait_calls={} wait_completions={} wait_nanos={}",
-        stats.submit_calls,
+        "submit_and_wait_calls={} submitted_ops={} submit_and_wait_nanos={} wait_completions={}",
+        stats.submit_and_wait_calls,
         stats.submitted_ops,
-        stats.submit_nanos,
-        stats.wait_calls,
+        stats.submit_and_wait_nanos,
         stats.wait_completions,
-        stats.wait_nanos
     )
 }
 

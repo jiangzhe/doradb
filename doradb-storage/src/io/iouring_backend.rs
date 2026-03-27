@@ -90,19 +90,19 @@ unsafe impl Send for IouringSubmitBatch {}
 
 struct SubmitOutcome {
     submitted: usize,
-    submit_calls: usize,
+    call_count: usize,
 }
 
 struct BlockingWaitOutcome {
     submitted: usize,
-    wait_calls: usize,
+    call_count: usize,
 }
 
 #[inline]
 fn finish_submit(
     batch: &mut IouringSubmitBatch,
     submitted: usize,
-    submit_calls: usize,
+    call_count: usize,
 ) -> SubmitOutcome {
     assert!(
         submitted <= batch.pending_sqes,
@@ -114,7 +114,7 @@ fn finish_submit(
     }
     SubmitOutcome {
         submitted,
-        submit_calls,
+        call_count,
     }
 }
 
@@ -131,15 +131,15 @@ where
 {
     debug_assert!(batch.pending_sqes != 0);
 
-    let mut submit_calls = 0usize;
+    let mut call_count = 0usize;
     let submitted = loop {
-        submit_calls += 1;
+        call_count += 1;
         match submit() {
             Ok(submitted) => break submitted,
             Err(err) if err.raw_os_error() == Some(EINTR) => continue,
             Err(err) if matches!(err.raw_os_error(), Some(EAGAIN | EBUSY)) => {
                 let submitted = loop {
-                    submit_calls += 1;
+                    call_count += 1;
                     match submit_and_wait(1) {
                         Ok(submitted) => break submitted,
                         Err(err) if err.raw_os_error() == Some(EINTR) => continue,
@@ -166,7 +166,7 @@ where
         }
     };
 
-    finish_submit(batch, submitted, submit_calls)
+    finish_submit(batch, submitted, call_count)
 }
 
 fn blocking_submit_and_wait<SubmitAndWait>(
@@ -176,9 +176,9 @@ fn blocking_submit_and_wait<SubmitAndWait>(
 where
     SubmitAndWait: FnMut(usize) -> std::io::Result<usize>,
 {
-    let mut wait_calls = 0usize;
+    let mut call_count = 0usize;
     let submitted = loop {
-        wait_calls += 1;
+        call_count += 1;
         match submit_and_wait(min_nr) {
             Ok(submitted) => break submitted,
             Err(err) if err.raw_os_error() == Some(EINTR) => continue,
@@ -187,7 +187,7 @@ where
     };
     BlockingWaitOutcome {
         submitted,
-        wait_calls,
+        call_count,
     }
 }
 
@@ -197,8 +197,8 @@ fn record_blocking_wait_stats(
     outcome: BlockingWaitOutcome,
     elapsed_nanos: usize,
 ) {
-    stats.record_submit(outcome.wait_calls, outcome.submitted, elapsed_nanos);
-    stats.record_wait(outcome.wait_calls, 0, elapsed_nanos);
+    stats.record_submit_and_wait(outcome.call_count, elapsed_nanos);
+    stats.record_submitted_ops(outcome.submitted);
 }
 
 impl IouringBackend {
@@ -239,7 +239,7 @@ impl IouringBackend {
             };
             completed.push((BackendToken::from_raw(cqe.user_data()), res));
         }
-        self.stats.record_wait(0, completed.len(), 0);
+        self.stats.record_wait_completions(completed.len());
         completed
     }
 }
@@ -285,24 +285,22 @@ impl IOBackend for IouringBackend {
 
     #[inline]
     fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
+        let start = Instant::now();
         self.stage_pending_sqes(batch, limit);
 
         if batch.pending_sqes == 0 {
             return 0;
         }
 
-        let start = Instant::now();
         let outcome = submit_pending_sqes(
             batch,
             limit,
             || self.ring.submit(),
             |min_nr| self.ring.submit_and_wait(min_nr),
         );
-        self.stats.record_submit(
-            outcome.submit_calls,
-            outcome.submitted,
-            start.elapsed().as_nanos() as usize,
-        );
+        self.stats
+            .record_submit_and_wait(outcome.call_count, start.elapsed().as_nanos() as usize);
+        self.stats.record_submitted_ops(outcome.submitted);
         outcome.submitted
     }
 
@@ -360,7 +358,7 @@ mod tests {
             |_| panic!("blocking fallback should not run on successful submit"),
         );
         assert_eq!(outcome.submitted, 2);
-        assert_eq!(outcome.submit_calls, 1);
+        assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 1);
         assert_eq!(batch.staged.len(), 1);
     }
@@ -382,7 +380,7 @@ mod tests {
             },
         );
         assert_eq!(outcome.submitted, 2);
-        assert_eq!(outcome.submit_calls, 2);
+        assert_eq!(outcome.call_count, 2);
         assert_eq!(submit_calls, 1);
         assert_eq!(batch.pending_sqes, 0);
         assert!(batch.staged.is_empty());
@@ -401,7 +399,7 @@ mod tests {
             },
         );
         assert_eq!(outcome.submitted, 1);
-        assert_eq!(outcome.submit_calls, 2);
+        assert_eq!(outcome.call_count, 2);
         assert_eq!(batch.pending_sqes, 2);
         assert_eq!(batch.staged.len(), 2);
     }
@@ -415,7 +413,7 @@ mod tests {
             Ok(2)
         });
         assert_eq!(outcome.submitted, 2);
-        assert_eq!(outcome.wait_calls, 1);
+        assert_eq!(outcome.call_count, 1);
         assert_eq!(calls, 1);
     }
 
@@ -432,29 +430,27 @@ mod tests {
             }
         });
         assert_eq!(outcome.submitted, 3);
-        assert_eq!(outcome.wait_calls, 2);
+        assert_eq!(outcome.call_count, 2);
         assert_eq!(calls, 2);
     }
 
     #[test]
-    fn test_record_blocking_wait_stats_counts_submit_and_wait_fields() {
+    fn test_record_blocking_wait_stats_counts_combined_fields() {
         let stats = IOBackendStatsHandle::default();
         record_blocking_wait_stats(
             &stats,
             BlockingWaitOutcome {
                 submitted: 5,
-                wait_calls: 2,
+                call_count: 2,
             },
             17,
         );
-        stats.record_wait(0, 3, 0);
+        stats.record_wait_completions(3);
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.submit_calls, 2);
+        assert_eq!(snapshot.submit_and_wait_calls, 2);
         assert_eq!(snapshot.submitted_ops, 5);
-        assert_eq!(snapshot.submit_nanos, 17);
-        assert_eq!(snapshot.wait_calls, 2);
+        assert_eq!(snapshot.submit_and_wait_nanos, 17);
         assert_eq!(snapshot.wait_completions, 3);
-        assert_eq!(snapshot.wait_nanos, 17);
     }
 }
