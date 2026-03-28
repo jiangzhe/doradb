@@ -115,9 +115,11 @@ impl<T: 'static> LockStrategy for ExclusiveLockStrategy<T> {
 }
 
 pub(crate) struct PageLatchGuard {
-    // Field order is part of the safety contract. Drop the raw detached guard
-    // before releasing the retained pool keepalive so unlock runs while pool
-    // provenance and quiescent liveness are still held.
+    // SAFETY: field order is part of the contract. `raw` must drop before
+    // `keepalive` so unlock runs while pool provenance and quiescent liveness
+    // are still held. Do not reorder these fields. When destructuring `Self`,
+    // also bind `keepalive` before `raw` so reverse local-drop order preserves
+    // the same guarantee across async suspension or future refactors.
     raw: RawHybridGuard,
     keepalive: PoolGuard,
 }
@@ -140,7 +142,7 @@ impl PageLatchGuard {
 
     #[inline]
     fn downgrade(self) -> Self {
-        let Self { raw, keepalive } = self;
+        let Self { keepalive, raw } = self;
         Self {
             raw: raw.downgrade(),
             keepalive,
@@ -149,7 +151,7 @@ impl PageLatchGuard {
 
     #[inline]
     fn downgrade_exclusive_to_shared(self) -> Self {
-        let Self { raw, keepalive } = self;
+        let Self { keepalive, raw } = self;
         Self {
             raw: raw.downgrade_exclusive_to_shared(),
             keepalive,
@@ -168,7 +170,9 @@ impl PageLatchGuard {
 
     #[inline]
     async fn shared_async(self) -> Self {
-        let Self { raw, keepalive } = self;
+        // Keep `keepalive` bound before `raw` so reverse local-drop order still
+        // drops the raw latch state first if this future is cancelled.
+        let Self { keepalive, raw } = self;
         Self {
             raw: raw.shared_async().await,
             keepalive,
@@ -192,7 +196,9 @@ impl PageLatchGuard {
 
     #[inline]
     async fn exclusive_async(self) -> Self {
-        let Self { raw, keepalive } = self;
+        // Keep `keepalive` bound before `raw` so reverse local-drop order still
+        // drops the raw latch state first if this future is cancelled.
+        let Self { keepalive, raw } = self;
         Self {
             raw: raw.exclusive_async().await,
             keepalive,
