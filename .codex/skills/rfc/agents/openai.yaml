@@ -1,4 +1,4 @@
 interface:
   display_name: "RFC Design"
-  short_description: "Evidence-gated RFC create/resolve with draft and sync checks"
-  default_prompt: "Use $rfc create for deep-research RFC proposals with draft-to-formal gates, and $rfc resolve to sync phase outcomes/backlogs before explicit issue closure via $issue resolve-rfc."
+  short_description: "Evidence-gated RFC create/resolve with proposal quality gates"
+  default_prompt: "Use $rfc create for deep-research RFC proposals that require explicit `First-Principles`, `Long-Term Evolution`, and `Original-Requirement-Fit` alternatives, a best-overall recommendation rather than defaulting to the original request, and draft-to-formal gates. Use $rfc resolve to sync phase outcomes/backlogs, create deferred follow-up backlog docs with source RFC/task context plus defer reason/findings/direction hint when work is postponed intentionally, and close issues only via $issue resolve-rfc."

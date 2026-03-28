@@ -103,6 +103,9 @@ Supported update operations:
 - Replace body (`--body` or `--body-file`)
 - Add comment
 
+For multiline comments, markdown, Rust code, or text containing backticks, prefer `--comment-file` over inline `--comment`.
+Default safe pattern: write the text to a temp file with a quoted heredoc such as `<<'EOF'`, then pass that file path.
+
 ## Close Issue
 
 ```bash
@@ -110,6 +113,8 @@ tools/issue.rs close-issue \
   --issue 123 \
   --comment "Completed in PR #456."
 ```
+
+Use `--comment-file` when the close comment is longer than a short phrase or contains markdown/backticks.
 
 ## Resolve RFC Issue (Precheck + Explicit Close)
 
@@ -131,6 +136,8 @@ tools/issue.rs resolve-rfc \
   --close \
   --comment "RFC implemented and synchronized."
 ```
+
+Use `--comment-file` for longer resolve comments or any text that includes markdown/backticks.
 
 Rules:
 - `resolve-rfc` must validate all sub-task/docs/backlog prechecks before closure.

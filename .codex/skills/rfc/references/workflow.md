@@ -22,11 +22,18 @@ Complete all items:
 
 1. Capture target goal, scope, and directional constraints.
 2. Read relevant docs and inspect impacted code paths.
-3. Produce at least three proposals.
-4. Provide tradeoffs and drawbacks for each proposal.
-5. Recommend one proposal with rationale.
-6. Include source references (docs/code/conversation/backlog as applicable).
-7. Ask user feedback.
+3. Produce at least three explicitly labeled proposals:
+   - `First-Principles Proposal`
+   - `Long-Term Evolution Proposal`
+   - `Original-Requirement-Fit Proposal`
+   Additional proposals are optional when they add real strategic value.
+4. For each proposal, explain scope change (if any), rationale, tradeoffs/drawbacks, and alignment/conflict with the original request.
+5. If the `Long-Term Evolution Proposal` broadens scope beyond the original framing, state that scope change explicitly and, when useful, identify a prerequisite or Phase 0 task candidate.
+6. Recommend the best overall direction for correctness and project evolution; do not default to the original request.
+7. If the recommendation conflicts with the original request, explain the findings that make the original direction weaker.
+8. Treat effort-tier-only proposal sets (for example `easy / medium / hard`) as weak by default; use them only when each option maps to a materially different strategic direction and say what that difference is.
+9. Include source references (docs/code/conversation/backlog as applicable).
+10. Ask user feedback.
 
 ## Test Strategy Constraint
 
@@ -72,16 +79,20 @@ Complete all items:
 1. RFC status is `implemented` or `superseded` at completion.
 2. Every phase has updated `Implementation Summary`.
 3. Linked task docs have non-empty `Implementation Notes`.
-4. Linked task issues are closed.
-5. Related backlogs are resolved (close with explicit per-item confirmation).
-6. Run strict precheck:
+4. When implementation intentionally defers follow-up work, create backlog docs that include:
+   - `Deferred From`: current RFC doc plus relevant task doc/phase when applicable.
+   - `Deferral Context`: defer reason, findings, and direction hint.
+5. Linked task issues are closed.
+6. Related backlogs are resolved (close with explicit per-item confirmation).
+7. Run strict precheck:
 ```bash
 tools/rfc.rs precheck-rfc-resolve --doc docs/rfcs/0006-example.md
 ```
-7. Close RFC issue only via explicit issue command:
+8. Close RFC issue only via explicit issue command:
 ```bash
 tools/issue.rs resolve-rfc --doc docs/rfcs/0006-example.md --issue <id> --close --comment "Completed"
 ```
+Use `--comment-file <path>` instead of inline `--comment` when the close text is multiline or contains markdown/backticks.
 
 ## Legacy Fallback Mode
 

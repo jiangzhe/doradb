@@ -1,4 +1,4 @@
 interface:
   display_name: "Backlog Workflow"
-  short_description: "Create and close backlog docs with duplicate checks"
-  default_prompt: "Use $backlog create to confirm intent, scan open backlog duplicates, allocate id, and create a backlog doc. Use $backlog close to archive an open backlog doc with explicit close reason."
+  short_description: "Create and close backlog docs with duplicate and deferred-context checks"
+  default_prompt: "Use $backlog create to confirm intent, classify standalone vs intentionally deferred work, require source task/RFC linkage plus defer reason/findings/direction hint when backlog items come from active execution, scan open backlog duplicates, allocate id, and create a backlog doc. Use $backlog close to archive an open backlog doc with explicit close reason."
