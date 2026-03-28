@@ -923,13 +923,6 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     }
 }
 
-// SAFETY: the row-block index only stores thread-safe pool handles and routing
-// metadata; all page mutation remains guarded by buffer-pool latches.
-unsafe impl<P: BufferPool> Send for GenericRowBlockIndex<P> {}
-// SAFETY: shared references expose read-only search logic over the same
-// thread-safe handles and immutable metadata.
-unsafe impl<P: BufferPool> Sync for GenericRowBlockIndex<P> {}
-
 /// Physical lookup target returned by row/column block-index search.
 pub enum RowLocation {
     // Lightweight columnar page.

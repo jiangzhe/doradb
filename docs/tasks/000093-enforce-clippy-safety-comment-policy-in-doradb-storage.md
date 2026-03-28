@@ -13,10 +13,13 @@ github_issue: 486
 Enforce a repository policy for safety-contract comments in the active
 production `doradb-storage` crate by adopting crate-level Clippy enforcement
 for `unsafe` blocks and `unsafe impl`, aligning public `unsafe fn`
-documentation with Rust `# Safety` conventions, and cleaning the production
-tree until the standard strict Clippy command passes. Keep unsafe baseline
-inventory scope unchanged; this task enforces comment coverage more broadly
-than the existing baseline report but does not expand that reporting scope.
+documentation with Rust `# Safety` conventions, cleaning the production tree
+until the standard strict Clippy command passes, and auditing manual
+`unsafe impl Send/Sync` sites so redundant impls are removed while the
+necessary non-auto-trait cases remain explicitly documented. Keep unsafe
+baseline inventory scope unchanged; this task enforces comment coverage more
+broadly than the existing baseline report but does not expand that reporting
+scope.
 
 ## Context
 
@@ -68,6 +71,9 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
    command.
 4. Preserve the current unsafe inventory/reporting scope while still refreshing
    `docs/unsafe-usage-baseline.md` when covered modules are touched.
+5. Remove redundant explicit `unsafe impl Send/Sync` blocks when the type
+   already gets the auto traits from its fields, and keep manual impls only
+   where the compiler cannot derive them automatically.
 
 ## Non-Goals
 
@@ -140,7 +146,16 @@ behavior-preserving:
      buffer helpers, file/io paths), then clear remaining production reports
      until the strict Clippy command passes cleanly.
 
-4. Preserve the current inventory/reporting scope
+4. Audit manual `Send`/`Sync` impl necessity
+   - Re-check each explicit `unsafe impl Send/Sync` in `doradb-storage/src`
+     against the current field types and usage.
+   - Remove the impl when the compiler can infer the auto trait from the
+     fields alone.
+   - Keep manual impls only for non-auto cases such as raw pointers,
+     `NonNull`, `UnsafeCell`, unions/manual-drop layouts, or backend/FFI state
+     whose thread-safety relies on invariants outside the visible field types.
+
+5. Preserve the current inventory/reporting scope
    - Do not modify the module list in `tools/unsafe_inventory.rs`.
    - If the sweep touches files inside the existing baseline scope and changes
      `// SAFETY:` counts there, refresh `docs/unsafe-usage-baseline.md` with
@@ -161,9 +176,19 @@ behavior-preserving:
 3. Swept the active production `doradb-storage` code to satisfy the new gate.
    The implementation added or normalized safety comments across buffer, latch,
    file, index, row, io, trx, `value.rs`, `memcmp.rs`, and catalog code.
-4. Preserved the unsafe inventory scope and refreshed the scoped baseline report
+4. Audited every explicit `unsafe impl Send/Sync` in `doradb-storage/src`
+   against the current implementation and removed the redundant ones that the
+   compiler can infer automatically. This pruned explicit impls from wrapper
+   and facade types such as `GenericRowBlockIndex`, `GenericBlockIndex`,
+   `Catalog`, readonly/eviction runtime wrappers, the io_uring backend staging
+   types, and several test helper mutex/rwlock wrappers, while retaining manual
+   impls for real non-auto cases such as raw-pointer/`NonNull`/`UnsafeCell`-
+   backed types and the libaio backend.
+5. Preserved the unsafe inventory scope and refreshed the scoped baseline report
    with `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`.
-5. Validation completed on 2026-03-27 with:
+6. Validation completed on 2026-03-28 with:
+   - `cargo check -p doradb-storage`
+   - `cargo check -p doradb-storage --no-default-features --features libaio`
    - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
    - `cargo nextest run -p doradb-storage`
    - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
@@ -186,6 +211,8 @@ behavior-preserving:
    - `doradb-storage/src/catalog/**/*.rs`
    - current unsafe-heavy files under
      `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
+   - explicit `unsafe impl Send/Sync` sites audited for redundancy vs.
+     compiler-derived auto traits
 
 4. Existing scoped inventory artifacts, only if covered files change counts:
    - `tools/unsafe_inventory.rs` usage remains the same
@@ -203,7 +230,12 @@ behavior-preserving:
 4. Workflow alignment verification:
    - `.githooks/pre-commit` and `.github/workflows/build.yml` use the same
      strict Clippy command documented in `docs/process/lint.md`
-5. Scoped inventory refresh verification, when baseline-covered modules are
+5. Auto-trait cleanup verification:
+   - `cargo check -p doradb-storage`
+   - `cargo check -p doradb-storage --no-default-features --features libaio`
+   - removed explicit `unsafe impl Send/Sync` sites still compile under both
+     backend configurations
+6. Scoped inventory refresh verification, when baseline-covered modules are
    touched:
    - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
    - regenerated output changes only in the existing module set and does not

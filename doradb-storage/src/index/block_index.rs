@@ -282,13 +282,6 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     }
 }
 
-// SAFETY: the index only contains buffer-pool handles and immutable routing
-// metadata; page mutation still goes through buffer-pool guards and latches.
-unsafe impl<P: BufferPool> Send for GenericBlockIndex<P> {}
-// SAFETY: shared references expose only read-only routing logic over the same
-// thread-safe pool handles and metadata.
-unsafe impl<P: BufferPool> Sync for GenericBlockIndex<P> {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

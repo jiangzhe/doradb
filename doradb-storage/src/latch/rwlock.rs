@@ -506,8 +506,6 @@ mod tests {
             unsafe { *self.data.get() }
         }
     }
-    // SAFETY: `Counter` protects its `UnsafeCell` with `RawRwLock`.
-    unsafe impl Send for Counter {}
     // SAFETY: shared references are synchronized by `RawRwLock`.
     unsafe impl Sync for Counter {}
 

@@ -472,7 +472,3 @@ impl RowUndoHead {
         }
     }
 }
-
-// SAFETY: `RowUndoHead` is moved and shared only through thread-safe status
-// handles plus version-chain references governed by MVCC synchronization.
-unsafe impl Send for RowUndoHead {}

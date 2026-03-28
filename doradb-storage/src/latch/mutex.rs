@@ -85,13 +85,6 @@ pub struct RawMutex {
     event: Event,
 }
 
-// SAFETY: `RawMutex` is a thin wrapper over `parking_lot::RawMutex` plus an
-// event listener, both of which are thread-safe to move between threads.
-unsafe impl Send for RawMutex {}
-// SAFETY: shared references coordinate all mutation through the underlying raw
-// mutex and event primitive.
-unsafe impl Sync for RawMutex {}
-
 impl RawMutex {
     /// Create a new async RawMutex.
     #[inline]
@@ -473,8 +466,6 @@ mod tests {
             unsafe { *self.data.get() }
         }
     }
-    // SAFETY: `Counter` protects its `UnsafeCell` with `RawMutex`.
-    unsafe impl Send for Counter {}
     // SAFETY: shared references are synchronized by `RawMutex`.
     unsafe impl Sync for Counter {}
 
@@ -506,9 +497,6 @@ mod tests {
         }
     }
 
-    // SAFETY: `ParkingLotCounter` protects its `UnsafeCell` with
-    // `parking_lot::RawMutex`.
-    unsafe impl Send for ParkingLotCounter {}
     // SAFETY: shared references are synchronized by `parking_lot::RawMutex`.
     unsafe impl Sync for ParkingLotCounter {}
 }

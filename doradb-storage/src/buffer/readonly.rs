@@ -1086,10 +1086,6 @@ impl EvictionRuntime for ReadonlyRuntime {
     }
 }
 
-// SAFETY: the runtime only contains thread-safe handles (`Arc`, atomics,
-// keepalive guards, and worker-safe stats state).
-unsafe impl Send for ReadonlyRuntime {}
-
 /// Per-file readonly wrapper implementing the `BufferPool` contract.
 ///
 /// This wrapper translates file-local `PageID` into global physical cache keys
@@ -1396,13 +1392,6 @@ impl BufferPool for ReadonlyBufferPool {
         Ok(Validation::Invalid)
     }
 }
-
-// SAFETY: the per-file wrapper is a thin cloneable handle over the global pool
-// plus immutable file identity metadata.
-unsafe impl Send for ReadonlyBufferPool {}
-// SAFETY: sharing `&ReadonlyBufferPool` delegates to the thread-safe global
-// readonly pool and immutable wrapper fields.
-unsafe impl Sync for ReadonlyBufferPool {}
 
 #[cfg(test)]
 pub(crate) mod tests {

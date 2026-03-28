@@ -927,10 +927,6 @@ impl EvictionRuntime for EvictableRuntime {
     }
 }
 
-// SAFETY: the eviction runtime only contains thread-safe handles and stable
-// arena/page ownership required by the eviction worker thread.
-unsafe impl Send for EvictableRuntime {}
-
 struct InMemPageSet {
     // Current page number held in memory.
     count: AtomicUsize,

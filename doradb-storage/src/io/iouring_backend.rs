@@ -18,10 +18,6 @@ pub struct IouringBackend {
     stats: IOBackendStatsHandle,
 }
 
-// SAFETY: the backend owns one io_uring instance and is moved as a whole onto
-// the dedicated IO worker thread; it is never used concurrently.
-unsafe impl Send for IouringBackend {}
-
 impl IouringBackend {
     /// Creates a new io_uring backend with the requested maximum concurrent IO depth.
     #[inline]
@@ -82,11 +78,6 @@ pub struct IouringSubmitBatch {
     staged: VecDeque<squeue::Entry>,
     pending_sqes: usize,
 }
-
-// SAFETY: the batch is owned by one worker thread. SQEs only contain copied
-// kernel request descriptors and raw user pointers whose lifetime is owned by
-// the worker inflight table.
-unsafe impl Send for IouringSubmitBatch {}
 
 struct SubmitOutcome {
     submitted: usize,

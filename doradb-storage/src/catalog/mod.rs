@@ -315,13 +315,6 @@ impl Catalog {
     }
 }
 
-// SAFETY: `Catalog` is composed of thread-safe caches/handles (`Arc`,
-// dashmaps, atomics, and buffer-pool handles) without thread-affine state.
-unsafe impl Send for Catalog {}
-// SAFETY: sharing `&Catalog` only exposes thread-safe shared state and
-// immutable metadata accessors.
-unsafe impl Sync for Catalog {}
-
 /// Unified runtime handle for either user table or catalog table.
 pub enum TableHandle {
     User(Arc<Table>),

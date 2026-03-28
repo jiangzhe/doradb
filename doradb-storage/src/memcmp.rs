@@ -967,13 +967,6 @@ impl Drop for Inner {
     }
 }
 
-// SAFETY: `Inner` stores only plain bytes or owned heap data with no
-// thread-affine state.
-unsafe impl Send for Inner {}
-// SAFETY: shared references only expose immutable access to that inline/heap
-// storage.
-unsafe impl Sync for Inner {}
-
 union InlineOrHeap {
     i: [u8; MEM_CMP_KEY_INLINE],
     h: ManuallyDrop<Heap>,
