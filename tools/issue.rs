@@ -834,6 +834,7 @@ fn cmd_update_issue(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
     let mut body: Option<String> = None;
     let mut body_file: Option<String> = None;
     let mut comment: Option<String> = None;
+    let mut comment_file: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -900,8 +901,15 @@ fn cmd_update_issue(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
                 };
                 comment = Some(v);
             }
+            "--comment-file" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --comment-file");
+                    return Err(1);
+                };
+                comment_file = Some(v);
+            }
             "-h" | "--help" => {
-                println!("Usage: ... issue.rs update-issue --issue <n> [--add-label <csv>] [--remove-label <csv>] [--add-assignee <a>] [--remove-assignee <a>] [--body <text>|--body-file <path>] [--comment <text>]");
+                println!("Usage: ... issue.rs update-issue --issue <n> [--add-label <csv>] [--remove-label <csv>] [--add-assignee <a>] [--remove-assignee <a>] [--body <text>|--body-file <path>] [--comment <text>|--comment-file <path>]");
                 return Ok(());
             }
             _ => {
@@ -920,6 +928,13 @@ fn cmd_update_issue(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
         print_json(&json!({"ok": false, "error": "use either --body or --body-file, not both"}));
         return Err(1);
     }
+    let comment = match resolve_optional_text_arg(comment, comment_file, "--comment", "--comment-file") {
+        Ok(v) => v,
+        Err(err) => {
+            print_json(&json!({"ok": false, "error": err}));
+            return Err(1);
+        }
+    };
 
     let mut commands: Vec<Vec<String>> = Vec::new();
     let mut edit_cmd = vec!["gh".to_string(), "issue".to_string(), "edit".to_string(), issue.to_string()];
@@ -1002,6 +1017,7 @@ fn cmd_update_issue(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
 fn cmd_close_issue(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
     let mut issue: Option<i64> = None;
     let mut comment: Option<String> = None;
+    let mut comment_file: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1026,8 +1042,15 @@ fn cmd_close_issue(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
                 };
                 comment = Some(v);
             }
+            "--comment-file" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --comment-file");
+                    return Err(1);
+                };
+                comment_file = Some(v);
+            }
             "-h" | "--help" => {
-                println!("Usage: ... issue.rs close-issue --issue <n> --comment <text>");
+                println!("Usage: ... issue.rs close-issue --issue <n> (--comment <text> | --comment-file <path>)");
                 return Ok(());
             }
             _ => {
@@ -1041,9 +1064,12 @@ fn cmd_close_issue(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
         eprintln!("missing required arg: --issue");
         return Err(1);
     };
-    let Some(comment) = comment else {
-        eprintln!("missing required arg: --comment");
-        return Err(1);
+    let comment = match resolve_required_text_arg(comment, comment_file, "--comment", "--comment-file") {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("{err}");
+            return Err(1);
+        }
     };
 
     let cmd = vec![
@@ -1079,6 +1105,7 @@ fn cmd_resolve_rfc(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
     let mut issue: Option<i64> = None;
     let mut close = false;
     let mut comment: Option<String> = None;
+    let mut comment_file: Option<String> = None;
     let mut allow_legacy = false;
 
     while let Some(arg) = args.next() {
@@ -1114,11 +1141,18 @@ fn cmd_resolve_rfc(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
                 };
                 comment = Some(v);
             }
+            "--comment-file" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --comment-file");
+                    return Err(1);
+                };
+                comment_file = Some(v);
+            }
             "--allow-legacy" => {
                 allow_legacy = true;
             }
             "-h" | "--help" => {
-                println!("Usage: ... issue.rs resolve-rfc --doc <docs/rfcs/<id>-<slug>.md> [--issue <n>] [--allow-legacy] [--close] [--comment <text>]");
+                println!("Usage: ... issue.rs resolve-rfc --doc <docs/rfcs/<id>-<slug>.md> [--issue <n>] [--allow-legacy] [--close] [--comment <text>|--comment-file <path>]");
                 return Ok(());
             }
             _ => {
@@ -1155,6 +1189,17 @@ fn cmd_resolve_rfc(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
         }));
         return Err(1);
     }
+    let comment = match resolve_optional_text_arg(comment, comment_file, "--comment", "--comment-file") {
+        Ok(v) => v,
+        Err(err) => {
+            print_json(&json!({
+                "ok": false,
+                "doc": normalize_path(doc_path),
+                "error": err,
+            }));
+            return Err(1);
+        }
+    };
 
     let mut precheck_cmd = vec![
         "tools/rfc.rs".to_string(),
@@ -1242,6 +1287,45 @@ fn cmd_resolve_rfc(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
         "close_stdout": close_res.stdout.trim(),
     }));
     Ok(())
+}
+
+fn read_text_file(path_text: &str, file_flag: &str) -> Result<String, String> {
+    let path = Path::new(path_text);
+    if !path.exists() {
+        return Err(format!("{file_flag} path not found: {path_text}"));
+    }
+    if !path.is_file() {
+        return Err(format!("{file_flag} is not a file: {}", normalize_path(path)));
+    }
+    fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {} for {file_flag}: {e}", normalize_path(path)))
+}
+
+fn resolve_optional_text_arg(
+    value: Option<String>,
+    file: Option<String>,
+    flag: &str,
+    file_flag: &str,
+) -> Result<Option<String>, String> {
+    if value.is_some() && file.is_some() {
+        return Err(format!("use either {flag} or {file_flag}, not both"));
+    }
+    match (value, file) {
+        (Some(v), None) => Ok(Some(v)),
+        (None, Some(path)) => Ok(Some(read_text_file(&path, file_flag)?)),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    }
+}
+
+fn resolve_required_text_arg(
+    value: Option<String>,
+    file: Option<String>,
+    flag: &str,
+    file_flag: &str,
+) -> Result<String, String> {
+    resolve_optional_text_arg(value, file, flag, file_flag)?
+        .ok_or_else(|| format!("missing required arg: {flag} or {file_flag}"))
 }
 
 fn cmd_link_pr_guidance(mut args: impl Iterator<Item = String>) -> Result<(), i32> {

@@ -23,18 +23,25 @@ Complete all items:
 1. Capture feature/bug statement and success criteria.
 2. Read relevant architecture/process docs in `docs/`.
 3. Inspect impacted code paths and related modules.
-4. Produce at least three proposals.
-5. Provide tradeoffs and drawbacks for each proposal.
-6. Include a `Source References` block with at least:
+4. Produce at least three explicitly labeled proposals:
+   - `First-Principles Proposal`
+   - `Long-Term Evolution Proposal`
+   - `Original-Requirement-Fit Proposal`
+   Additional proposals are optional when they add real strategic value.
+5. For each proposal, explain scope, rationale, tradeoffs/drawbacks, and alignment/conflict with the original request.
+6. If the `Long-Term Evolution Proposal` broadens to RFC scope and becomes the recommended best-overall direction, fail the task gate, recommend RFC escalation, and include one limited prerequisite task suggestion.
+7. Include a `Source References` block with at least:
    - 2 concrete repo references total,
    - 1 docs/backlog/process reference (`[D#]` or `[B#]`),
    - 1 code/tool/skill reference (`[C#]`),
    - source backlog reference (`[B#]`) when task creation starts from backlog input,
    - optional conversation references (`[U#]`) only when user constraints materially affect scope.
-7. Cite at least one relevant reference token in each proposal and in the recommendation.
-8. Avoid low-value citation padding; references must be materially used in analysis or rationale.
-9. Recommend one proposal and explain why.
-10. Ask for user feedback on the recommendation.
+8. Cite at least one relevant reference token in each proposal and in the recommendation.
+9. Avoid low-value citation padding; references must be materially used in analysis or rationale.
+10. Recommend the best overall direction for correctness and project evolution; do not default to the original request.
+11. If the recommendation conflicts with the original request, explain the findings that make the original direction weaker.
+12. Treat effort-tier-only proposal sets (for example `easy / medium / hard`) as weak by default; use them only when each option maps to a materially different strategic direction and say what that difference is.
+13. Ask for user feedback on the recommendation.
 
 ## `task create` Round 2 Checklist
 
@@ -65,6 +72,8 @@ If escalated:
 1. Explain why task scope is not sufficient.
 2. Point to `docs/rfcs/0000-template.md`.
 3. Stop task document generation.
+
+A `Long-Term Evolution Proposal` may surface this gate during comparison even when the original request still has a narrower task-shaped option. If that long-term direction is recommended as best overall, stop task generation and convert the recommendation into RFC escalation plus a limited prerequisite task suggestion.
 
 ## Task Document Structure
 
@@ -128,8 +137,11 @@ Complete all items:
 3. Fill `Implementation Notes` with concrete implementation/test/review results.
 4. Append unresolved future improvements to `Open Questions` if they remain out of scope.
 5. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
-6. Link related backlog todos from task doc resolve updates.
-7. If task doc has `Source Backlogs:` entries in `docs/backlogs/`, close/archive those backlog files during resolve.
+6. When a follow-up backlog item is intentionally deferred from current task/RFC execution, require backlog creation to include:
+   - `Deferred From`: current task doc plus parent RFC when applicable.
+   - `Deferral Context`: defer reason, findings, and direction hint.
+7. Link related backlog todos from task doc resolve updates.
+8. If task doc has `Source Backlogs:` entries in `docs/backlogs/`, close/archive those backlog files during resolve.
    - Resolve backlog by id/path first when needed:
 ```bash
 tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
@@ -138,18 +150,20 @@ tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
 ```bash
 tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
-8. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
+   - If close `detail`/`reference` text is multiline or contains markdown/backticks, use `tools/backlog.rs close-doc --detail-file ... [--reference-file ...]`.
+9. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
 ```bash
 tools/task.rs resolve-task-next-id --task docs/tasks/000042-example.md
 ```
-9. Always check whether resolved task is an RFC sub-task.
-10. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
+10. Always check whether resolved task is an RFC sub-task.
+11. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
    - Use:
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
-11. Do not run `git commit` or `git push` during `task resolve`.
-12. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
+   - Use `--summary-file` when the sync summary is longer than a short phrase or includes markdown/backticks.
+12. Do not run `git commit` or `git push` during `task resolve`.
+13. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
 
 ## `task purge worktree` Checklist
 

@@ -39,7 +39,7 @@ fn alloc_id_usage() -> &'static str {
 }
 
 fn create_doc_usage() -> &'static str {
-    "Usage: tools/backlog.rs create-doc --title <title> --slug <slug> --summary <text> --reference <text> --scope-hint <text> --acceptance-hint <text> [--notes <text>] (--id <6digits> | --auto-id) [--template <path>] [--output-dir <path>] [--next-id-path <path>] [--force]"
+    "Usage: tools/backlog.rs create-doc --title <title> --slug <slug> (--summary <text> | --summary-file <path>) (--reference <text> | --reference-file <path>) (--scope-hint <text> | --scope-hint-file <path>) (--acceptance-hint <text> | --acceptance-hint-file <path>) [--notes <text> | --notes-file <path>] [(--deferred-from <text> | --deferred-from-file <path>) (--defer-reason <text> | --defer-reason-file <path>) (--findings <text> | --findings-file <path>) (--direction-hint <text> | --direction-hint-file <path>)] (--id <6digits> | --auto-id) [--template <path>] [--output-dir <path>] [--next-id-path <path>] [--force]"
 }
 
 fn find_duplicates_usage() -> &'static str {
@@ -47,7 +47,7 @@ fn find_duplicates_usage() -> &'static str {
 }
 
 fn close_doc_usage() -> &'static str {
-    "Usage: tools/backlog.rs close-doc (--path <docs/backlogs/<id>-<slug>.md> | --id <6digits>) --type <type> --detail <text> [--reference <text>] [--date <YYYY-MM-DD>] [--force-reason-update]"
+    "Usage: tools/backlog.rs close-doc (--path <docs/backlogs/<id>-<slug>.md> | --id <6digits>) --type <type> (--detail <text> | --detail-file <path>) [--reference <text> | --reference-file <path>] [--date <YYYY-MM-DD>] [--force-reason-update]"
 }
 
 #[derive(Clone)]
@@ -66,6 +66,14 @@ struct DuplicateCandidate {
     title: String,
     reasons: Vec<String>,
     token_overlap: f64,
+}
+
+#[derive(Clone)]
+struct DeferredContext {
+    deferred_from: String,
+    defer_reason: String,
+    findings: String,
+    direction_hint: String,
 }
 
 fn main() {
@@ -182,10 +190,23 @@ fn run_create_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> 
     let mut title: Option<String> = None;
     let mut slug: Option<String> = None;
     let mut summary: Option<String> = None;
+    let mut summary_file: Option<String> = None;
     let mut reference: Option<String> = None;
+    let mut reference_file: Option<String> = None;
     let mut scope_hint: Option<String> = None;
+    let mut scope_hint_file: Option<String> = None;
     let mut acceptance_hint: Option<String> = None;
+    let mut acceptance_hint_file: Option<String> = None;
     let mut notes: Option<String> = None;
+    let mut notes_file: Option<String> = None;
+    let mut deferred_from: Option<String> = None;
+    let mut deferred_from_file: Option<String> = None;
+    let mut defer_reason: Option<String> = None;
+    let mut defer_reason_file: Option<String> = None;
+    let mut findings: Option<String> = None;
+    let mut findings_file: Option<String> = None;
+    let mut direction_hint: Option<String> = None;
+    let mut direction_hint_file: Option<String> = None;
     let mut backlog_id: Option<String> = None;
     let mut auto_id = false;
     let mut template = PathBuf::from(BACKLOG_TEMPLATE_FILE);
@@ -216,6 +237,15 @@ fn run_create_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> 
                 };
                 summary = Some(v);
             }
+            "--summary-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --summary-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                summary_file = Some(v);
+            }
             "--reference" => {
                 let Some(v) = args.next() else {
                     return Err(format!(
@@ -224,6 +254,15 @@ fn run_create_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> 
                     ));
                 };
                 reference = Some(v);
+            }
+            "--reference-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --reference-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                reference_file = Some(v);
             }
             "--scope-hint" => {
                 let Some(v) = args.next() else {
@@ -234,6 +273,15 @@ fn run_create_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> 
                 };
                 scope_hint = Some(v);
             }
+            "--scope-hint-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --scope-hint-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                scope_hint_file = Some(v);
+            }
             "--acceptance-hint" => {
                 let Some(v) = args.next() else {
                     return Err(format!(
@@ -243,11 +291,101 @@ fn run_create_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> 
                 };
                 acceptance_hint = Some(v);
             }
+            "--acceptance-hint-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --acceptance-hint-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                acceptance_hint_file = Some(v);
+            }
             "--notes" => {
                 let Some(v) = args.next() else {
                     return Err(format!("missing value for --notes\n{}", create_doc_usage()));
                 };
                 notes = Some(v);
+            }
+            "--notes-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --notes-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                notes_file = Some(v);
+            }
+            "--deferred-from" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --deferred-from\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                deferred_from = Some(v);
+            }
+            "--deferred-from-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --deferred-from-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                deferred_from_file = Some(v);
+            }
+            "--defer-reason" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --defer-reason\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                defer_reason = Some(v);
+            }
+            "--defer-reason-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --defer-reason-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                defer_reason_file = Some(v);
+            }
+            "--findings" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --findings\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                findings = Some(v);
+            }
+            "--findings-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --findings-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                findings_file = Some(v);
+            }
+            "--direction-hint" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --direction-hint\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                direction_hint = Some(v);
+            }
+            "--direction-hint-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --direction-hint-file\n{}",
+                        create_doc_usage()
+                    ));
+                };
+                direction_hint_file = Some(v);
             }
             "--id" => {
                 let Some(v) = args.next() else {
@@ -301,18 +439,75 @@ fn run_create_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> 
     let slug =
         slug.ok_or_else(|| format!("missing required arg: --slug\n{}", create_doc_usage()))?;
     let slug = validate_slug(&slug)?;
-    let summary = summary
-        .ok_or_else(|| format!("missing required arg: --summary\n{}", create_doc_usage()))?;
-    let reference = reference
-        .ok_or_else(|| format!("missing required arg: --reference\n{}", create_doc_usage()))?;
-    let scope_hint = scope_hint
-        .ok_or_else(|| format!("missing required arg: --scope-hint\n{}", create_doc_usage()))?;
-    let acceptance_hint = acceptance_hint.ok_or_else(|| {
-        format!(
-            "missing required arg: --acceptance-hint\n{}",
-            create_doc_usage()
-        )
-    })?;
+    let summary = resolve_required_text_arg(
+        summary,
+        summary_file,
+        "--summary",
+        "--summary-file",
+        create_doc_usage(),
+    )?;
+    let reference = resolve_required_text_arg(
+        reference,
+        reference_file,
+        "--reference",
+        "--reference-file",
+        create_doc_usage(),
+    )?;
+    let scope_hint = resolve_required_text_arg(
+        scope_hint,
+        scope_hint_file,
+        "--scope-hint",
+        "--scope-hint-file",
+        create_doc_usage(),
+    )?;
+    let acceptance_hint = resolve_required_text_arg(
+        acceptance_hint,
+        acceptance_hint_file,
+        "--acceptance-hint",
+        "--acceptance-hint-file",
+        create_doc_usage(),
+    )?;
+    let notes = resolve_optional_text_arg(
+        notes,
+        notes_file,
+        "--notes",
+        "--notes-file",
+        create_doc_usage(),
+    )?;
+    let deferred_from = resolve_optional_text_arg(
+        deferred_from,
+        deferred_from_file,
+        "--deferred-from",
+        "--deferred-from-file",
+        create_doc_usage(),
+    )?;
+    let defer_reason = resolve_optional_text_arg(
+        defer_reason,
+        defer_reason_file,
+        "--defer-reason",
+        "--defer-reason-file",
+        create_doc_usage(),
+    )?;
+    let findings = resolve_optional_text_arg(
+        findings,
+        findings_file,
+        "--findings",
+        "--findings-file",
+        create_doc_usage(),
+    )?;
+    let direction_hint = resolve_optional_text_arg(
+        direction_hint,
+        direction_hint_file,
+        "--direction-hint",
+        "--direction-hint-file",
+        create_doc_usage(),
+    )?;
+    let deferred_context = parse_deferred_context(
+        deferred_from,
+        defer_reason,
+        findings,
+        direction_hint,
+    )?;
 
     if auto_id && backlog_id.is_some() {
         return Err("use either --id or --auto-id, not both".to_string());
@@ -339,6 +534,7 @@ fn run_create_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> 
         &scope_hint,
         &acceptance_hint,
         notes.as_deref(),
+        deferred_context.as_ref(),
     )?;
 
     if !output_dir.exists() {
@@ -468,7 +664,9 @@ fn run_close_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut backlog_id: Option<String> = None;
     let mut reason_type: Option<String> = None;
     let mut detail: Option<String> = None;
+    let mut detail_file: Option<String> = None;
     let mut reference: Option<String> = None;
+    let mut reference_file: Option<String> = None;
     let mut date: Option<String> = None;
     let mut force_reason_update = false;
 
@@ -498,6 +696,15 @@ fn run_close_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 };
                 detail = Some(v);
             }
+            "--detail-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --detail-file\n{}",
+                        close_doc_usage()
+                    ));
+                };
+                detail_file = Some(v);
+            }
             "--reference" => {
                 let Some(v) = args.next() else {
                     return Err(format!(
@@ -506,6 +713,15 @@ fn run_close_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                     ));
                 };
                 reference = Some(v);
+            }
+            "--reference-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --reference-file\n{}",
+                        close_doc_usage()
+                    ));
+                };
+                reference_file = Some(v);
             }
             "--date" => {
                 let Some(v) = args.next() else {
@@ -525,11 +741,24 @@ fn run_close_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     }
 
     let open_path = resolve_open_backlog_path(path, backlog_id, close_doc_usage())?;
+    let detail = resolve_required_text_arg(
+        detail,
+        detail_file,
+        "--detail",
+        "--detail-file",
+        close_doc_usage(),
+    )?;
+    let reference = resolve_optional_text_arg(
+        reference,
+        reference_file,
+        "--reference",
+        "--reference-file",
+        close_doc_usage(),
+    )?;
     let reason = CloseReason {
         reason_type: reason_type
             .ok_or_else(|| format!("missing required arg: --type\n{}", close_doc_usage()))?,
-        detail: detail
-            .ok_or_else(|| format!("missing required arg: --detail\n{}", close_doc_usage()))?,
+        detail,
         closed_by: "backlog close".to_string(),
         reference: reference.unwrap_or_else(|| "User decision".to_string()),
         closed_at: date.unwrap_or_else(today_yyyy_mm_dd),
@@ -538,6 +767,51 @@ fn run_close_doc(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let closed_path = archive_backlog_with_reason(&open_path, &reason, force_reason_update)?;
     println!("{}", normalize_path(&closed_path));
     Ok(())
+}
+
+fn read_text_file(path_text: &str, file_flag: &str) -> Result<String, String> {
+    let path = Path::new(path_text);
+    if !path.exists() {
+        return Err(format!("{file_flag} path not found: {path_text}"));
+    }
+    if !path.is_file() {
+        return Err(format!("{file_flag} is not a file: {}", normalize_path(path)));
+    }
+    fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {} for {file_flag}: {e}", normalize_path(path)))
+}
+
+fn resolve_optional_text_arg(
+    value: Option<String>,
+    file: Option<String>,
+    flag: &str,
+    file_flag: &str,
+    usage: &str,
+) -> Result<Option<String>, String> {
+    if value.is_some() && file.is_some() {
+        return Err(format!(
+            "use either {flag} or {file_flag}, not both\n{usage}"
+        ));
+    }
+    match (value, file) {
+        (Some(v), None) => Ok(Some(v)),
+        (None, Some(path)) => Ok(Some(read_text_file(&path, file_flag)?)),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    }
+}
+
+fn resolve_required_text_arg(
+    value: Option<String>,
+    file: Option<String>,
+    flag: &str,
+    file_flag: &str,
+    usage: &str,
+) -> Result<String, String> {
+    resolve_optional_text_arg(value, file, flag, file_flag, usage)?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("missing required arg: {flag} or {file_flag}\n{usage}"))
 }
 
 fn alloc_backlog_id(path: &Path) -> Result<String, String> {
@@ -562,10 +836,23 @@ fn render_backlog_doc(
     scope_hint: &str,
     acceptance_hint: &str,
     notes: Option<&str>,
+    deferred_context: Option<&DeferredContext>,
 ) -> Result<String, String> {
     let mut text = apply_backlog_title(template, title)?;
     text = replace_section_body(&text, "Summary", summary)?;
     text = replace_section_body(&text, "Reference", reference)?;
+    let deferred_from = deferred_context
+        .map(|ctx| ctx.deferred_from.as_str())
+        .unwrap_or("");
+    text = replace_optional_section_body(&text, "Deferred From (Optional)", deferred_from)?;
+    let deferral_context = deferred_context
+        .map(render_deferral_context)
+        .unwrap_or_default();
+    text = replace_optional_section_body(
+        &text,
+        "Deferral Context (Optional)",
+        &deferral_context,
+    )?;
     text = replace_section_body(&text, "Scope Hint", scope_hint)?;
     text = replace_section_body(&text, "Acceptance Hint", acceptance_hint)?;
     text = replace_section_body(&text, "Notes (Optional)", notes.unwrap_or(""))?;
@@ -627,6 +914,16 @@ fn replace_section_body(content: &str, section: &str, body: &str) -> Result<Stri
     Ok(rebuilt)
 }
 
+fn replace_optional_section_body(content: &str, section: &str, body: &str) -> Result<String, String> {
+    if extract_section_text(content, section).is_none() {
+        if body.trim().is_empty() {
+            return Ok(content.to_string());
+        }
+        return Err(format!("missing section header: ## {section}"));
+    }
+    replace_section_body(content, section, body)
+}
+
 fn collect_open_backlog_docs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     if !dir.exists() {
         return Err(format!("directory not found: {}", normalize_path(dir)));
@@ -682,6 +979,83 @@ fn extract_section_text(text: &str, section: &str) -> Option<String> {
         .unwrap_or(lines.len());
     let body = lines[start + 1..end].join("\n");
     Some(body.trim().to_string())
+}
+
+fn parse_deferred_context(
+    deferred_from: Option<String>,
+    defer_reason: Option<String>,
+    findings: Option<String>,
+    direction_hint: Option<String>,
+) -> Result<Option<DeferredContext>, String> {
+    let invalid = || {
+        format!(
+            "deferred-work context requires all of --deferred-from/--deferred-from-file, --defer-reason/--defer-reason-file, --findings/--findings-file, and --direction-hint/--direction-hint-file together\n{}",
+            create_doc_usage()
+        )
+    };
+    let fields_present = [
+        deferred_from.is_some(),
+        defer_reason.is_some(),
+        findings.is_some(),
+        direction_hint.is_some(),
+    ]
+    .into_iter()
+    .any(|v| v);
+    let provided = [
+        deferred_from
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        defer_reason
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        findings
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        direction_hint
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+    ]
+    .into_iter()
+    .filter(|v| *v)
+    .count();
+    if provided == 0 && !fields_present {
+        return Ok(None);
+    }
+    if provided != 4 {
+        return Err(invalid());
+    }
+    Ok(Some(DeferredContext {
+        deferred_from: deferred_from.expect("checked count"),
+        defer_reason: defer_reason.expect("checked count"),
+        findings: findings.expect("checked count"),
+        direction_hint: direction_hint.expect("checked count"),
+    }))
+}
+
+fn render_deferral_context(ctx: &DeferredContext) -> String {
+    [
+        render_named_bullet("Defer Reason", &ctx.defer_reason),
+        render_named_bullet("Findings", &ctx.findings),
+        render_named_bullet("Direction Hint", &ctx.direction_hint),
+    ]
+    .join("\n")
+}
+
+fn render_named_bullet(label: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if !trimmed.contains('\n') {
+        return format!("- {label}: {trimmed}");
+    }
+    let indented = trimmed
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("- {label}:\n{indented}")
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -1141,4 +1515,156 @@ fn json_escape(text: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("backlog-rs-{name}-{nanos}.txt"))
+    }
+
+    fn deferred_context_usage_error() -> String {
+        format!(
+            "deferred-work context requires all of --deferred-from/--deferred-from-file, --defer-reason/--defer-reason-file, --findings/--findings-file, and --direction-hint/--direction-hint-file together\n{}",
+            create_doc_usage()
+        )
+    }
+
+    #[test]
+    fn resolve_required_text_arg_rejects_blank_inline_value() {
+        let err = resolve_required_text_arg(
+            Some("  \n\t  ".to_string()),
+            None,
+            "--summary",
+            "--summary-file",
+            "usage",
+        )
+        .expect_err("blank inline value should be rejected");
+
+        assert_eq!(err, "missing required arg: --summary or --summary-file\nusage");
+    }
+
+    #[test]
+    fn resolve_required_text_arg_rejects_blank_file_value() {
+        let path = temp_file_path("blank");
+        fs::write(&path, "  \n\n").expect("write temp file");
+
+        let err = resolve_required_text_arg(
+            None,
+            Some(normalize_path(&path)),
+            "--detail",
+            "--detail-file",
+            "usage",
+        )
+        .expect_err("blank file value should be rejected");
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(err, "missing required arg: --detail or --detail-file\nusage");
+    }
+
+    #[test]
+    fn resolve_required_text_arg_trims_non_empty_inline_value() {
+        let value = resolve_required_text_arg(
+            Some("  keep this text  \n".to_string()),
+            None,
+            "--summary",
+            "--summary-file",
+            "usage",
+        )
+        .expect("non-empty inline value should succeed");
+
+        assert_eq!(value, "keep this text");
+    }
+
+    #[test]
+    fn resolve_required_text_arg_trims_non_empty_file_value() {
+        let path = temp_file_path("trimmed");
+        fs::write(&path, "  preserved text  \n").expect("write temp file");
+
+        let value = resolve_required_text_arg(
+            None,
+            Some(normalize_path(&path)),
+            "--detail",
+            "--detail-file",
+            "usage",
+        )
+        .expect("non-empty file value should succeed");
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(value, "preserved text");
+    }
+
+    #[test]
+    fn parse_deferred_context_returns_none_when_all_fields_absent() {
+        let value = parse_deferred_context(None, None, None, None)
+            .expect("all absent deferred context should be allowed");
+
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn parse_deferred_context_rejects_blank_field_when_others_are_present() {
+        let err = parse_deferred_context(
+            Some("   \n".to_string()),
+            Some("valid reason".to_string()),
+            Some("valid findings".to_string()),
+            Some("valid direction".to_string()),
+        )
+        .err()
+        .expect("blank deferred field should be rejected");
+
+        assert_eq!(err, deferred_context_usage_error());
+    }
+
+    #[test]
+    fn parse_deferred_context_rejects_partial_non_empty_context() {
+        let err = parse_deferred_context(
+            Some("docs/tasks/000001-demo.md".to_string()),
+            Some("valid reason".to_string()),
+            None,
+            None,
+        )
+        .err()
+        .expect("partial deferred context should be rejected");
+
+        assert_eq!(err, deferred_context_usage_error());
+    }
+
+    #[test]
+    fn parse_deferred_context_preserves_original_non_empty_values() {
+        let value = parse_deferred_context(
+            Some("  docs/tasks/000001-demo.md  ".to_string()),
+            Some("  valid reason  ".to_string()),
+            Some("  valid findings  ".to_string()),
+            Some("  valid direction  ".to_string()),
+        )
+        .expect("non-empty deferred context should succeed")
+        .expect("deferred context should be present");
+
+        assert_eq!(value.deferred_from, "  docs/tasks/000001-demo.md  ");
+        assert_eq!(value.defer_reason, "  valid reason  ");
+        assert_eq!(value.findings, "  valid findings  ");
+        assert_eq!(value.direction_hint, "  valid direction  ");
+    }
+
+    #[test]
+    fn parse_deferred_context_rejects_all_blank_values() {
+        let err = parse_deferred_context(
+            Some("  ".to_string()),
+            Some("\n".to_string()),
+            Some("\t".to_string()),
+            Some("   ".to_string()),
+        )
+        .err()
+        .expect("all blank deferred values should be rejected");
+
+        assert_eq!(err, deferred_context_usage_error());
+    }
 }

@@ -1,6 +1,6 @@
 ---
 name: task
-description: Design a task document for a feature or bug fix through deep research and multi-round design review. Use when planning implementation work in this repository, especially before creating files in docs/tasks/. Enforce background-doc research, codebase impact analysis, at least three design proposals with tradeoffs, two formal review rounds with user feedback, strict RFC escalation for oversized scope, and explicit user approval before writing docs/tasks files following the 6-digit-id and slug naming pattern.
+description: Design a task document for a feature or bug fix through deep research and multi-round design review. Use when planning implementation work in this repository, especially before creating files in docs/tasks/. Enforce background-doc research, codebase impact analysis, explicit first-principles/long-term/original-fit proposal lenses with tradeoffs, two formal review rounds with user feedback, strict RFC escalation for oversized scope, and explicit user approval before writing docs/tasks files following the 6-digit-id and slug naming pattern.
 ---
 
 # Task Design Workflow
@@ -16,7 +16,7 @@ This skill has three prompt workflows:
 ## `task create` Required Flow
 
 1. Perform deep research first.
-2. Present multiple proposals and tradeoffs.
+2. Present multiple proposals and tradeoffs under the proposal quality gate.
 3. Run two formal rounds before writing.
 4. Require explicit approval before writing to a task worktree under `.worktrees/<task-id>/docs/tasks/`.
 
@@ -46,13 +46,19 @@ Escalate to RFC instead of task when any condition is true:
 When escalating, explain why and direct the user to `docs/rfcs/0000-template.md`.
 Do not draft a task file after a failed gate.
 
+A `Long-Term Evolution Proposal` may legitimately surface RFC-scale scope during comparison even when the original request still has a narrower task-shaped variant. If that long-term direction becomes the recommended best-overall path, treat the complexity gate as failed: recommend RFC escalation, explain why task scope is insufficient, and include one limited prerequisite task suggestion that can de-risk or enable the RFC.
+
 ## Step 3: Run Round 1 (Initial Design)
 
 Produce an initial design package with:
 1. Problem framing and success criteria.
 2. Relevant current-state analysis from docs and code.
-3. At least 3 implementation proposals.
-4. Clear tradeoffs/drawbacks for each proposal.
+3. At least 3 implementation proposals with these explicit labeled lenses:
+   - `First-Principles Proposal`: derived from project goals and fundamentals, even when it conflicts with the developer's requested direction.
+   - `Long-Term Evolution Proposal`: optimized for the project's long-term architecture and evolution, even when it broadens scope.
+   - `Original-Requirement-Fit Proposal`: best fit for the developer's requested scope/intention.
+   - Additional proposals are welcome when they add real strategic value.
+4. Clear scope, rationale, tradeoffs/drawbacks, and alignment/conflict with the original request for each proposal.
 5. Recommended direction with rationale.
 
 Round 1 must include a short `Source References` block for the material used in the analysis.
@@ -65,6 +71,12 @@ Minimum evidence requirements:
 
 Every proposal and the recommendation must cite at least one relevant reference token.
 Do not satisfy this gate with low-value citation padding; references must be materially used in current-state analysis, tradeoffs, or recommendation rationale.
+Recommendation defaults to the best overall direction for correctness and project evolution; do not default to the original request just because it was requested.
+If the recommended direction conflicts with the original request, explicitly describe the reasoning and findings that make the original direction weaker.
+If the `Long-Term Evolution Proposal` broadens to RFC scope, state that scope change explicitly and, when recommending it, include one limited prerequisite task suggestion for the RFC.
+Proposal sets that differ only by effort level (for example `easy / medium / hard`) are weak by default. They are acceptable only when each option represents a materially different strategic direction, and that difference is stated explicitly.
+
+The labeled proposal taxonomy is required in proposal rounds only; the final task doc should capture the chosen direction and materially relevant rejected alternatives without needing to preserve the labels verbatim.
 
 Then request user feedback.
 Round 1 is incomplete without explicit user input.
@@ -144,6 +156,9 @@ Use `task resolve` only after implementation and tests are done, and behavior is
 2. Fill `Implementation Notes` with concrete implementation/test/review outcomes.
 3. Append unresolved future improvements to `Open Questions` when needed.
 4. Create/link follow-up backlog todos in `docs/backlogs/` for actionable deferred work (use `$backlog create` when creating new backlog docs manually).
+   - When the backlog captures work intentionally deferred to avoid disrupting current execution, include:
+     - `Deferred From`: the current task doc and parent RFC doc when applicable.
+     - `Deferral Context`: why the work is deferred now, what was learned during implementation, and what future planning should revisit or prefer.
 5. Keep `Implementation Notes` blank during design phase and fill it only in resolve phase.
 6. If the task is sourced from open backlog docs (tracked via `Source Backlogs:` in task doc), close/archive each source backlog during resolve.
    - Resolve id/path deterministically first when only id is available:
@@ -154,6 +169,7 @@ tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
 ```bash
 tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
+   - If backlog close `detail`/`reference` text or RFC sync summary contains markdown, Rust code, or backticks, prefer `tools/backlog.rs ... --detail-file/--reference-file` and `tools/task.rs resolve-task-rfc --summary-file ...`.
 7. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
 ```bash
 tools/task.rs resolve-task-next-id --task docs/tasks/000042-example.md
@@ -210,6 +226,7 @@ Ensure every task document is:
 2. Narrow enough for task-level execution.
 3. Decision-complete for implementation.
 4. Explicit about risks, tests, and non-goals.
+5. Based on proposal rounds that compare meaningfully different strategic directions, not just effort tiers.
 
 ## Reference
 

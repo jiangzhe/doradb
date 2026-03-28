@@ -57,6 +57,8 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 - Use non-interactive commands.
 - Use `--json` for list/read operations.
 - Use `--body-file` when body can be long.
+- Use `--comment-file` for multiline comments, markdown, Rust code, or text containing backticks.
+- Prefer quoted heredocs such as `<<'EOF'` when preparing temp files for file-backed inputs.
 - Always use assignee `@me` when creating issues and PRs.
 - `tools/issue.rs create-issue-from-doc` must sync `github_issue: <issue-id>`
   into the source planning doc immediately after issue creation.
@@ -96,6 +98,8 @@ tools/issue.rs resolve-rfc \
   --close \
   --comment "RFC implemented and synchronized."
 ```
+
+If the close comment is not shell-safe, use `--comment-file <path>` instead of inline `--comment`.
 
 Precheck must verify:
 1. RFC resolve readiness checks pass (`tools/rfc.rs precheck-rfc-resolve`).

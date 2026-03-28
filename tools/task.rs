@@ -57,7 +57,7 @@ fn resolve_task_backlogs_usage() -> &'static str {
 }
 
 fn resolve_task_rfc_usage() -> &'static str {
-    "Usage: tools/task.rs resolve-task-rfc --task <docs/tasks/<id>-<slug>.md> [--date <YYYY-MM-DD>] [--summary <text>] [--rfc <docs/rfcs/<id>-<slug>.md>]"
+    "Usage: tools/task.rs resolve-task-rfc --task <docs/tasks/<id>-<slug>.md> [--date <YYYY-MM-DD>] [--summary <text> | --summary-file <path>] [--rfc <docs/rfcs/<id>-<slug>.md>]"
 }
 
 fn resolve_task_next_id_usage() -> &'static str {
@@ -776,6 +776,7 @@ fn run_resolve_task_rfc(mut args: impl Iterator<Item = String>) -> Result<(), St
     let mut task_path: Option<PathBuf> = None;
     let mut date: Option<String> = None;
     let mut summary: Option<String> = None;
+    let mut summary_file: Option<String> = None;
     let mut rfc_override: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
@@ -807,6 +808,15 @@ fn run_resolve_task_rfc(mut args: impl Iterator<Item = String>) -> Result<(), St
                 };
                 summary = Some(v);
             }
+            "--summary-file" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --summary-file\n{}",
+                        resolve_task_rfc_usage()
+                    ));
+                };
+                summary_file = Some(v);
+            }
             "--rfc" => {
                 let Some(v) = args.next() else {
                     return Err(format!(
@@ -827,10 +837,49 @@ fn run_resolve_task_rfc(mut args: impl Iterator<Item = String>) -> Result<(), St
     let task_path = task_path
         .ok_or_else(|| format!("missing required arg: --task\n{}", resolve_task_rfc_usage()))?;
     validate_task_doc_path(&task_path)?;
+    let summary = resolve_optional_text_arg(
+        summary,
+        summary_file,
+        "--summary",
+        "--summary-file",
+        resolve_task_rfc_usage(),
+    )?;
 
     let sync = sync_task_into_parent_rfc(&task_path, summary, date, rfc_override)?;
     println!("{}", rfc_sync_summary_json(&sync));
     Ok(())
+}
+
+fn read_text_file(path_text: &str, file_flag: &str) -> Result<String, String> {
+    let path = Path::new(path_text);
+    if !path.exists() {
+        return Err(format!("{file_flag} path not found: {path_text}"));
+    }
+    if !path.is_file() {
+        return Err(format!("{file_flag} is not a file: {}", normalize_path(path)));
+    }
+    fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {} for {file_flag}: {e}", normalize_path(path)))
+}
+
+fn resolve_optional_text_arg(
+    value: Option<String>,
+    file: Option<String>,
+    flag: &str,
+    file_flag: &str,
+    usage: &str,
+) -> Result<Option<String>, String> {
+    if value.is_some() && file.is_some() {
+        return Err(format!(
+            "use either {flag} or {file_flag}, not both\n{usage}"
+        ));
+    }
+    match (value, file) {
+        (Some(v), None) => Ok(Some(v)),
+        (None, Some(path)) => Ok(Some(read_text_file(&path, file_flag)?)),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    }
 }
 
 fn run_resolve_task_next_id(mut args: impl Iterator<Item = String>) -> Result<(), String> {
