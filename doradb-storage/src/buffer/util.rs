@@ -30,6 +30,9 @@ pub(super) unsafe fn initialize_frame_and_page_arrays(
 ) -> Result<(*mut BufferFrame, *mut Page)> {
     let frame_total_bytes = frame_total_bytes(capacity);
     let page_total_bytes = page_total_bytes(capacity);
+    // SAFETY: this helper owns the freshly mmapped regions for the duration of
+    // initialization, writes each frame exactly once, and cleans up the frame
+    // mapping if page allocation fails.
     unsafe {
         let frames = mmap_allocate(frame_total_bytes)? as *mut BufferFrame;
         let pages = match mmap_allocate(page_total_bytes) {
@@ -58,6 +61,8 @@ pub(super) unsafe fn deallocate_frame_and_page_arrays(
 ) {
     let frame_total_bytes = frame_total_bytes(capacity);
     let page_total_bytes = page_total_bytes(capacity);
+    // SAFETY: callers pass the same mmap base pointers and byte lengths that
+    // were returned from `initialize_frame_and_page_arrays`.
     unsafe {
         mmap_deallocate(frames as *mut u8, frame_total_bytes);
         mmap_deallocate(pages as *mut u8, page_total_bytes);
@@ -66,6 +71,9 @@ pub(super) unsafe fn deallocate_frame_and_page_arrays(
 
 #[inline]
 pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
+    // SAFETY: the anonymous private mapping does not alias existing Rust
+    // references, and all returned pointers are checked for `MAP_FAILED`
+    // before being handed to callers.
     unsafe {
         let memory_chunk = mmap(
             std::ptr::null_mut(),
@@ -86,6 +94,8 @@ pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
 
 #[inline]
 pub(super) unsafe fn mmap_deallocate(ptr: *mut u8, total_bytes: usize) {
+    // SAFETY: callers pass a live mmap region base and the exact byte length
+    // originally used to create that mapping.
     unsafe {
         munmap(ptr as *mut c_void, total_bytes);
     }
@@ -93,11 +103,15 @@ pub(super) unsafe fn mmap_deallocate(ptr: *mut u8, total_bytes: usize) {
 
 #[inline]
 pub(super) unsafe fn madvise_dontneed(ptr: *mut u8, len: usize) -> bool {
+    // SAFETY: callers provide a live mapping range owned by the buffer arena,
+    // and `madvise` only observes the address range.
     unsafe { madvise(ptr as *mut c_void, len, MADV_DONTNEED) == 0 }
 }
 
 #[allow(dead_code)]
 #[inline]
 pub(super) unsafe fn madvise_remove(ptr: *mut u8, len: usize) -> bool {
+    // SAFETY: callers provide a live mapping range owned by the buffer arena,
+    // and `madvise` only observes the address range.
     unsafe { madvise(ptr as *mut c_void, len, MADV_REMOVE) == 0 }
 }

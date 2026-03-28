@@ -23,7 +23,13 @@ pub struct LibaioBackend {
     stats: IOBackendStatsHandle,
 }
 
+// SAFETY: shared references only pass the opaque kernel context to libaio
+// submit/wait syscalls and access atomics-backed stats; mutable backend state
+// lives in the kernel or behind atomics, with no thread-affine Rust data.
 unsafe impl Sync for LibaioBackend {}
+// SAFETY: `LibaioBackend` stores only the opaque kernel-owned `io_context_t`,
+// a plain `usize`, and atomics-backed stats state, so moving it between
+// threads does not invalidate any Rust-side aliasing or ownership invariants.
 unsafe impl Send for LibaioBackend {}
 
 pub type IocbRawPtr = *mut iocb;

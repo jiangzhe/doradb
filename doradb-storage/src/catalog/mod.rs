@@ -315,9 +315,6 @@ impl Catalog {
     }
 }
 
-unsafe impl Send for Catalog {}
-unsafe impl Sync for Catalog {}
-
 /// Unified runtime handle for either user table or catalog table.
 pub enum TableHandle {
     User(Arc<Table>),

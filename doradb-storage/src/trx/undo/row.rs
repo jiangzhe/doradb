@@ -224,7 +224,11 @@ impl OwnedRowUndo {
 #[repr(transparent)]
 pub struct RowUndoRef(NonNull<RowUndo>);
 
+// SAFETY: version-chain lifetime and row-lock/GC rules guarantee the pointed
+// undo entry remains valid while a `RowUndoRef` is reachable.
 unsafe impl Send for RowUndoRef {}
+// SAFETY: sharing references to `RowUndoRef` only shares access to the same
+// version-chain node governed by those MVCC/GC invariants.
 unsafe impl Sync for RowUndoRef {}
 
 impl RowUndoRef {
@@ -468,5 +472,3 @@ impl RowUndoHead {
         }
     }
 }
-
-unsafe impl Send for RowUndoHead {}

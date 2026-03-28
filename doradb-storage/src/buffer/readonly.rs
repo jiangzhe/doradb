@@ -88,6 +88,8 @@ impl ReadonlyBackingFile {
     #[inline]
     fn read_operation(&self, key: PersistedBlockKey, ptr: *mut u8, len: usize) -> Operation {
         let offset = key.block_id as usize * PAGE_SIZE;
+        // SAFETY: readonly loads borrow frame-owned page memory that remains
+        // live until IO completion, and offsets are page-aligned by construction.
         unsafe { Operation::pread_borrowed(self.raw_fd(), offset, ptr, len) }
     }
 }
@@ -568,7 +570,11 @@ impl Drop for GlobalReadonlyBufferPool {
     }
 }
 
+// SAFETY: the global pool coordinates shared state with atomics, dashmaps, and
+// page latches, while the arena keeps frame/page memory stable.
 unsafe impl Send for GlobalReadonlyBufferPool {}
+// SAFETY: shared references only access thread-safe coordination state and
+// latch-protected frames.
 unsafe impl Sync for GlobalReadonlyBufferPool {}
 
 impl Component for DiskPoolWorkers {
@@ -1080,8 +1086,6 @@ impl EvictionRuntime for ReadonlyRuntime {
     }
 }
 
-unsafe impl Send for ReadonlyRuntime {}
-
 /// Per-file readonly wrapper implementing the `BufferPool` contract.
 ///
 /// This wrapper translates file-local `PageID` into global physical cache keys
@@ -1388,9 +1392,6 @@ impl BufferPool for ReadonlyBufferPool {
         Ok(Validation::Invalid)
     }
 }
-
-unsafe impl Send for ReadonlyBufferPool {}
-unsafe impl Sync for ReadonlyBufferPool {}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2470,6 +2471,8 @@ pub(crate) mod tests {
                 listener!(global.residency.evict_ev => evict_listener);
                 let reserve_waiter = smol::spawn(async move {
                     let global_ptr = global_ptr;
+                    // SAFETY: the spawned task holds `task_arena`, which keeps
+                    // the pool allocation alive until the waiter finishes.
                     let global = unsafe { &*global_ptr.0 };
                     match ReadonlyPageReservation::reserve_page(global, key, task_arena).await {
                         Ok((_frame_id, _page_guard)) => {

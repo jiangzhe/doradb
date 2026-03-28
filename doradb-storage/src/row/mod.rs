@@ -536,6 +536,8 @@ impl RowPage {
     pub(crate) fn update_val<V: Value>(&self, row_idx: usize, col_idx: usize, val: V) {
         let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
         let ptr = (&self.data()[offset]) as *const u8;
+        // SAFETY: `val_offset` computes the column slot for `V`, and callers
+        // only use this helper with column types matching that inline layout.
         unsafe { val.atomic_store(ptr) };
     }
 
@@ -712,6 +714,8 @@ impl RowPage {
     ) {
         let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
         let ptr = (&mut self.data_mut()[offset]) as *mut u8;
+        // SAFETY: the exclusive row-page path owns mutable access to the
+        // destination slot, and the slot layout matches `V`.
         unsafe { val.store(ptr) };
     }
 

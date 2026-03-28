@@ -100,7 +100,8 @@ impl BlockIndexRoot {
     }
 }
 
-unsafe impl Send for BlockIndexRoot {}
+// SAFETY: shared references only observe values through latch-validated reads
+// or exclusive-latch-protected updates.
 unsafe impl Sync for BlockIndexRoot {}
 
 #[cfg(test)]

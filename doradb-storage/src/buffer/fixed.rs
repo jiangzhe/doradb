@@ -239,8 +239,12 @@ impl BufferPool for FixedBufferPool {
     }
 }
 
+// SAFETY: `FixedBufferPool` shares access through atomics, `AllocMap`, and the
+// quiescent arena; it does not hand out thread-affine resources.
 unsafe impl Send for FixedBufferPool {}
 
+// SAFETY: shared references coordinate mutable page access through page latches
+// and allocation state, so `&FixedBufferPool` is safe to share between threads.
 unsafe impl Sync for FixedBufferPool {}
 
 #[cfg(test)]

@@ -425,7 +425,11 @@ impl<T: 'static> FacadePageGuard<T> {
     }
 }
 
+// SAFETY: the guard keeps the frame allocation alive and only exposes shared
+// page access unless it owns the exclusive latch bit internally.
 unsafe impl<T: Sync + 'static> Send for FacadePageGuard<T> {}
+// SAFETY: sharing references to this guard only shares latch-protected frame
+// metadata plus shared access to `T`.
 unsafe impl<T: Sync + 'static> Sync for FacadePageGuard<T> {}
 
 pub struct PageOptimisticGuard<T: 'static> {
@@ -523,7 +527,11 @@ impl<T> PageOptimisticGuard<T> {
     }
 }
 
+// SAFETY: the guard owns a version-validated raw latch handle and a keepalive
+// for the frame allocation, and it only exposes shared page access.
 unsafe impl<T: Sync + 'static> Send for PageOptimisticGuard<T> {}
+// SAFETY: sharing references to the optimistic guard preserves the same
+// read-only page access and validated frame lifetime.
 unsafe impl<T: Sync + 'static> Sync for PageOptimisticGuard<T> {}
 
 pub struct PageSharedGuard<T: 'static> {
@@ -603,7 +611,11 @@ impl<T: 'static> PageSharedGuard<T> {
     }
 }
 
+// SAFETY: the guard owns one shared latch acquisition plus the pool keepalive,
+// so moving it between threads preserves the same shared-access contract.
 unsafe impl<T: Sync + 'static> Send for PageSharedGuard<T> {}
+// SAFETY: sharing references to this guard only shares latch-protected frame
+// metadata and shared access to `T`.
 unsafe impl<T: Sync + 'static> Sync for PageSharedGuard<T> {}
 
 pub struct PageExclusiveGuard<T: 'static> {
@@ -721,7 +733,11 @@ impl<T: 'static> PageExclusiveGuard<T> {
     }
 }
 
+// SAFETY: the guard owns the exclusive latch state and the frame keepalive, so
+// moving it transfers that unique mutable-access capability to another thread.
 unsafe impl<T: Send + 'static> Send for PageExclusiveGuard<T> {}
+// SAFETY: shared references to the guard do not duplicate mutable access;
+// mutable page access still requires `&mut self` while metadata stays latched.
 unsafe impl<T: Sync + 'static> Sync for PageExclusiveGuard<T> {}
 
 #[inline]

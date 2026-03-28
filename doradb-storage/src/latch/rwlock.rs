@@ -131,6 +131,8 @@ struct WriteGuardRollback<'a>(&'a RawRwLock);
 impl Drop for WriteGuardRollback<'_> {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: this rollback helper only exists after `mu` was locked and the
+        // writer bit was set, so clearing the bit and unlocking `mu` is paired.
         unsafe {
             // rollback writer bit.
             self.0.state.fetch_and(!WRITER_BIT, Ordering::SeqCst);
@@ -146,6 +148,8 @@ impl Drop for WriteGuardRollback<'_> {
     }
 }
 
+// SAFETY: `RawRwLock` maintains the `parking_lot` raw-mutex contract and its
+// reader/writer state transitions with atomics plus event ordering.
 unsafe impl RawRwLockApi for RawRwLock {
     #[allow(clippy::declare_interior_mutable_const)]
     const INIT: RawRwLock = RawRwLock::new();
@@ -189,6 +193,8 @@ unsafe impl RawRwLockApi for RawRwLock {
         {
             return true; // no reader, no writer
         }
+        // SAFETY: the failed exclusive try-lock path owns `mu` from the
+        // successful `try_lock()` above and must release it before returning.
         unsafe {
             self.mu.unlock();
         }
@@ -227,6 +233,8 @@ unsafe impl RawRwLockApi for RawRwLock {
     #[inline]
     unsafe fn unlock_exclusive(&self) {
         self.state.fetch_and(!WRITER_BIT, Ordering::SeqCst);
+        // SAFETY: the caller holds the exclusive lock, so this unlock is paired
+        // with a prior `lock_exclusive*` acquisition.
         unsafe {
             // Publish the writer-free state before waking waiters, then unlock
             // `mu` before notifying. This guarantees the waiter-side
@@ -248,9 +256,13 @@ unsafe impl RawRwLockApi for RawRwLock {
     }
 }
 
+// SAFETY: downgrade preserves the raw-rwlock contract by converting one held
+// exclusive lock into one held shared lock under the same synchronization.
 unsafe impl RawRwLockDowngradeApi for RawRwLock {
     #[inline]
     unsafe fn downgrade(&self) {
+        // SAFETY: callers only invoke downgrade while owning the exclusive lock,
+        // so adding one reader and delegating to `unlock_exclusive` is valid.
         unsafe {
             debug_assert!(self.state.load(Ordering::Acquire) & !WRITER_BIT == 0);
             self.state.fetch_add(ONE_READER, Ordering::SeqCst);
@@ -281,6 +293,8 @@ mod tests {
                 let rw = Arc::clone(&rw);
                 smol::spawn(async move {
                     rw.lock_exclusive_async().await;
+                    // SAFETY: this task unlocks only after it has acquired the
+                    // exclusive lock above.
                     unsafe {
                         rw.unlock_exclusive();
                     }
@@ -291,6 +305,8 @@ mod tests {
                 let rw = Arc::clone(&rw);
                 smol::spawn(async move {
                     rw.lock_shared_async().await;
+                    // SAFETY: this task unlocks only after it has acquired the
+                    // shared lock above.
                     unsafe {
                         rw.unlock_shared();
                     }
@@ -298,6 +314,8 @@ mod tests {
                 .detach();
             }
             smol::Timer::after(Duration::from_millis(100)).await;
+            // SAFETY: the test still owns the original exclusive lock acquired
+            // before spawning the waiters.
             unsafe {
                 rw.unlock_exclusive();
             }
@@ -359,6 +377,8 @@ mod tests {
                     let rw = Arc::clone(&rw);
                     async move {
                         rw.lock_exclusive_async().await;
+                        // SAFETY: this waiter unlocks only after its acquire
+                        // completes.
                         unsafe {
                             rw.unlock_exclusive();
                         }
@@ -368,6 +388,8 @@ mod tests {
                     let rw = Arc::clone(&rw);
                     async move {
                         rw.lock_exclusive_async().await;
+                        // SAFETY: this waiter unlocks only after its acquire
+                        // completes.
                         unsafe {
                             rw.unlock_exclusive();
                         }
@@ -377,6 +399,8 @@ mod tests {
                     let rw = Arc::clone(&rw);
                     async move {
                         smol::Timer::after(Duration::from_millis(1)).await;
+                        // SAFETY: the test still owns the initial exclusive
+                        // lock until this release path runs.
                         unsafe {
                             rw.unlock_exclusive();
                         }
@@ -455,6 +479,8 @@ mod tests {
 
         #[inline]
         fn inc(&self) {
+            // SAFETY: this helper holds the exclusive lock while mutating the
+            // counter stored in `UnsafeCell`.
             unsafe {
                 self.mu.lock_exclusive();
                 *self.data.get() += 1;
@@ -464,6 +490,8 @@ mod tests {
 
         #[inline]
         async fn inc_async(&self) {
+            // SAFETY: this helper holds the exclusive lock while mutating the
+            // counter stored in `UnsafeCell`.
             unsafe {
                 self.mu.lock_exclusive_async().await;
                 *self.data.get() += 1;
@@ -473,10 +501,12 @@ mod tests {
 
         #[inline]
         fn val(&self) -> usize {
+            // SAFETY: tests only read the counter after all worker activity is
+            // quiesced, so no concurrent mutation remains.
             unsafe { *self.data.get() }
         }
     }
-    unsafe impl Send for Counter {}
+    // SAFETY: shared references are synchronized by `RawRwLock`.
     unsafe impl Sync for Counter {}
 
     struct ParkingLotCounter {
@@ -494,6 +524,8 @@ mod tests {
 
         #[inline]
         fn inc(&self) {
+            // SAFETY: this helper holds the parking_lot exclusive raw lock while
+            // mutating the counter.
             unsafe {
                 self.mu.lock_exclusive();
                 *self.data.get() += 1;

@@ -549,7 +549,11 @@ impl Drop for HybridGuardRaw {
     }
 }
 
+// SAFETY: the raw guard only carries a stable latch pointer plus the currently
+// owned latch state/version, and drop preserves the required unlock protocol.
 unsafe impl Send for HybridGuardRaw {}
+// SAFETY: sharing references to the raw guard does not duplicate ownership of
+// the latch state; mutation still requires `&mut self`.
 unsafe impl Sync for HybridGuardRaw {}
 
 impl<'a> HybridGuard<'a> {

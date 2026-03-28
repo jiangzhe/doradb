@@ -313,6 +313,8 @@ impl MmapLogReader {
         offset: usize,
     ) -> Result<Self> {
         let file = File::open(log_file_path.as_ref())?;
+        // SAFETY: the file handle stays alive for the duration of mapping
+        // creation, and the returned `Mmap` owns the mapping afterward.
         let m = unsafe { Mmap::map(&file)? };
         Ok(MmapLogReader {
             m,

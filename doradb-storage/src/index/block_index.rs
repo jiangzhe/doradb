@@ -282,9 +282,6 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     }
 }
 
-unsafe impl<P: BufferPool> Send for GenericBlockIndex<P> {}
-unsafe impl<P: BufferPool> Sync for GenericBlockIndex<P> {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

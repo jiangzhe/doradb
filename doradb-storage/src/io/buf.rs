@@ -27,6 +27,8 @@ impl DirectBuf {
     pub fn uninit(len: usize) -> Self {
         debug_assert!(len <= u32::MAX as usize);
         let cap = align_to_sector_size(len);
+        // SAFETY: `cap` is sector-aligned by `align_to_sector_size`, which
+        // satisfies `DirectBuf::new`'s allocation/layout contract.
         unsafe { Self::new(len, cap, false) }
     }
 
@@ -35,11 +37,16 @@ impl DirectBuf {
     pub fn zeroed(len: usize) -> Self {
         debug_assert!(len <= u32::MAX as usize);
         let cap = align_to_sector_size(len);
+        // SAFETY: `cap` is sector-aligned by `align_to_sector_size`, which
+        // satisfies `DirectBuf::new`'s allocation/layout contract.
         unsafe { Self::new(len, cap, true) }
     }
 
     #[inline]
     unsafe fn new(len: usize, cap: usize, zero: bool) -> Self {
+        // SAFETY: callers provide a sector-aligned `cap`; the allocation uses
+        // the same layout later transferred into `Vec::from_raw_parts`, so the
+        // boxed slice owns exactly the bytes allocated here.
         unsafe {
             let layout = Layout::from_size_align_unchecked(cap, STORAGE_SECTOR_SIZE);
             let ptr = if zero {
