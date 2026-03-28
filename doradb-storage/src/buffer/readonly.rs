@@ -539,7 +539,7 @@ impl GlobalReadonlyBufferPool {
             .arena
             .frame(frame_id)
             .latch
-            .optimistic_fallback_core(mode)
+            .optimistic_fallback_raw(mode)
             .await;
         Ok(FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf))
     }

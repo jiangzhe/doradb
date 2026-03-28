@@ -387,7 +387,7 @@ impl BufferPool for EvictableBufferPool {
                     panic!("get an uninitialized page");
                 }
                 FrameKind::Fixed | FrameKind::Hot => {
-                    let g = frame.latch.optimistic_fallback_core(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     self.stats.record_cache_hit();
                     return Ok(FacadePageGuard::new(
                         PageLatchGuard::new(guard.clone(), g),
@@ -403,7 +403,7 @@ impl BufferPool for EvictableBufferPool {
                         // This page is going to be evicted. we have to retry and probably wait.
                         continue;
                     }
-                    let g = frame.latch.optimistic_fallback_core(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     self.stats.record_cache_hit();
                     return Ok(FacadePageGuard::new(
                         PageLatchGuard::new(guard.clone(), g),
@@ -445,7 +445,7 @@ impl BufferPool for EvictableBufferPool {
             match frame.kind() {
                 FrameKind::Uninitialized => return Ok(None),
                 FrameKind::Fixed | FrameKind::Hot => {
-                    let g = frame.latch.optimistic_fallback_core(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     let g = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
@@ -459,7 +459,7 @@ impl BufferPool for EvictableBufferPool {
                 }
                 FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
-                    let g = frame.latch.optimistic_fallback_core(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
                         != FrameKind::Cool
                     {
@@ -516,7 +516,7 @@ impl BufferPool for EvictableBufferPool {
                     panic!("get an uninitialized page");
                 }
                 FrameKind::Fixed | FrameKind::Hot => {
-                    let g = frame.latch.optimistic_fallback_core(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     // apply lock coupling.
                     // the validation make sure parent page does not change until child
                     // page is acquired.
@@ -534,7 +534,7 @@ impl BufferPool for EvictableBufferPool {
                 }
                 FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
-                    let g = frame.latch.optimistic_fallback_core(mode).await;
+                    let g = frame.latch.optimistic_fallback_raw(mode).await;
                     // Try to mark this page as HOT.
                     if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
                         != FrameKind::Cool

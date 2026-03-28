@@ -80,7 +80,7 @@ impl FixedBufferPool {
             .arena
             .frame(page_id)
             .latch
-            .optimistic_fallback_core(mode)
+            .optimistic_fallback_raw(mode)
             .await;
         FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf)
     }
@@ -111,7 +111,7 @@ impl FixedBufferPool {
         guard.assert_matches(self.identity(), "fixed buffer pool");
         let keepalive = guard.clone();
         let bf = self.arena.frame_ptr(page_id);
-        let g = self.arena.frame(page_id).latch.optimistic_spin_core();
+        let g = self.arena.frame(page_id).latch.optimistic_spin_raw();
         FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf)
     }
 }

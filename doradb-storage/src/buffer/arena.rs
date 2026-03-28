@@ -125,7 +125,7 @@ impl ArenaInner {
         page_id: PageID,
     ) -> Option<PageExclusiveGuard<Page>> {
         let bf = self.frame_ptr(page_id);
-        let g = self.frame(page_id).latch.try_exclusive_core();
+        let g = self.frame(page_id).latch.try_exclusive_raw();
         g.map(|g| {
             FacadePageGuard::new(PageLatchGuard::new(keepalive.clone(), g), bf).must_exclusive()
         })
@@ -214,7 +214,7 @@ impl QuiescentArena {
         let bf = self.frame_ptr(page_id);
         let mut guard = {
             let frame = self.frame(page_id);
-            let g = frame.latch.try_exclusive_core().unwrap();
+            let g = frame.latch.try_exclusive_raw().unwrap();
             frame.bump_generation();
             FacadePageGuard::<T>::new(PageLatchGuard::new(keepalive, g), bf.clone())
                 .must_exclusive()
