@@ -19,3 +19,10 @@ Evaluate and implement repository-wide policy requiring `// SAFETY:` contracts a
 
 Repository-wide policy is documented and enforced with a migration strategy for existing code.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000093-enforce-clippy-safety-comment-policy-in-doradb-storage.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-03-28
