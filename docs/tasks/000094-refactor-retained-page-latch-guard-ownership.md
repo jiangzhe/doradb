@@ -13,9 +13,10 @@ github_issue: 488
 Refactor the current buffer-side detached latch guard so its ownership and
 safety contract are explicit and self-contained. Keep the public borrowed
 `HybridGuard<'a>` returned by `HybridLatch` unchanged, remove
-`HybridGuardRaw`, introduce one private shared `HybridGuardCore` for common
-state/transition logic, and add a buffer-only retained `PageLatchGuard` that
-owns the `PoolGuard` keepalive/provenance it depends on.
+the old duplicated `HybridGuardRaw` split, use one crate-private shared
+`RawHybridGuard` for detached state/transition logic, and add a buffer-only
+retained `PageLatchGuard` that owns the `PoolGuard` keepalive/provenance it
+depends on.
 
 ## Context
 
@@ -41,9 +42,9 @@ non-buffer latches such as `BlockIndexRoot`.
 Instead, this task keeps the public borrowed latch API intact and makes the
 buffer-specific retained latch guard explicit:
 
-1. one private `HybridGuardCore` holds detached latch state;
+1. one crate-private `RawHybridGuard` holds detached latch state;
 2. public `HybridGuard<'a>` remains the safe borrowed wrapper;
-3. buffer-only `PageLatchGuard` owns `HybridGuardCore` plus `PoolGuard`.
+3. buffer-only `PageLatchGuard` owns `RawHybridGuard` plus `PoolGuard`.
 
 Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 Issue Labels:
@@ -53,13 +54,14 @@ Issue Labels:
 
 ## Goals
 
-1. Remove `HybridGuardRaw` as an externally meaningful internal type.
+1. Remove the old duplicated `HybridGuardRaw` implementation shape in favor of
+   one shared detached raw guard implementation.
 2. Keep public `HybridGuard<'a>` and `HybridLatch` borrowed API semantics
    unchanged.
-3. Introduce one private shared `HybridGuardCore` that owns the detached latch
-   pointer/state/version used by both borrowed and retained guards.
+3. Introduce one crate-private shared `RawHybridGuard` that owns the detached
+   latch pointer/state/version used by both borrowed and retained guards.
 4. Introduce one buffer-only retained `PageLatchGuard` that owns
-   `HybridGuardCore` plus `PoolGuard`.
+   `RawHybridGuard` plus `PoolGuard`.
 5. Update `FacadePageGuard`, `PageOptimisticGuard`, `PageSharedGuard`, and
    `PageExclusiveGuard` to store `PageLatchGuard` instead of separate
    `HybridGuardRaw` plus `PoolGuard`.
@@ -98,12 +100,15 @@ the current lifetime/provenance proof explicit.
 2. Required invariants and checks:
    - public `HybridGuard<'a>` must continue to prove latch lifetime through the
      borrow, not through detached raw state;
-   - `HybridGuardCore` constructors must remain crate-private and must not
+   - `RawHybridGuard` constructors must remain crate-private and must not
      expose a safe detached guard constructor to arbitrary callers;
    - `PageLatchGuard` construction must require a validated `PoolGuard` from
      the target pool before retaining detached latch state;
    - `PageLatchGuard` field order must keep latch-core drop before keepalive
      release so unlock runs before the final pool keepalive is dropped;
+   - async `PageLatchGuard` transitions must bind `keepalive` before `raw` so
+     cancellation still drops the detached latch state before the retained
+     keepalive;
    - `PoolGuard` provenance checks introduced by task `000072` must remain in
      effect on all retained-guard entry points;
    - all new or modified raw-pointer helpers keep adjacent `// SAFETY:`
@@ -123,17 +128,17 @@ Reference:
 ## Plan
 
 1. Refactor `doradb-storage/src/latch/hybrid.rs` around one shared detached
-   core:
-   - introduce crate-private `HybridGuardCore { lock, state, version }`;
+   guard implementation:
+   - introduce crate-private `RawHybridGuard { lock, state, version }`;
    - move common validate, downgrade, upgrade, rollback, refresh, and unlock
      behavior onto the shared implementation;
    - keep public `HybridGuard<'a>` as a borrowed wrapper over that core using
      a lifetime marker rather than a stored borrowed latch reference;
-   - replace the current `*_raw` latch acquisition helpers with crate-private
-     helpers that return detached core state instead of `HybridGuardRaw`.
+   - use crate-private `*_raw` latch acquisition helpers that return detached
+     raw guard state.
 2. Introduce buffer-only retained latch ownership in
    `doradb-storage/src/buffer/guard.rs`:
-   - add crate-private `PageLatchGuard { core, keepalive }`;
+   - add crate-private `PageLatchGuard { raw, keepalive }`;
    - make `PageLatchGuard` own `PoolGuard` so retained latch lifetime and pool
      provenance live in one value;
    - keep retained-guard methods aligned with the page-guard use cases only:
@@ -162,7 +167,7 @@ Reference:
    - do not move buffer-specific keepalive concepts into the generic public
      latch API.
 6. Refresh comments and contracts:
-   - explain in `latch/hybrid.rs` that `HybridGuardCore` is detached state and
+   - explain in `latch/hybrid.rs` that `RawHybridGuard` is detached state and
      is not itself a public lifetime proof;
    - explain in `buffer/guard.rs` that `PageLatchGuard` is the retained
      buffer-only proof combining latch state with pool keepalive;
@@ -171,10 +176,28 @@ Reference:
 
 ## Implementation Notes
 
-Implemented on this branch by replacing `HybridGuardRaw` with crate-private
-`HybridGuardCore`, introducing buffer-only `PageLatchGuard`, and updating the
-buffer/page guard construction sites plus retained guard storage to use the new
-ownership model.
+Implemented on this branch via issue `#488` / PR `#489`.
+
+1. `doradb-storage/src/latch/hybrid.rs` now uses crate-private
+   `RawHybridGuard` as the shared detached latch implementation, while public
+   `HybridGuard<'a>` remains the borrowed wrapper returned by `HybridLatch`.
+2. `doradb-storage/src/buffer/guard.rs` now introduces
+   `PageLatchGuard { raw, keepalive }`, and the page guard variants retain that
+   combined proof instead of storing detached latch state and `PoolGuard`
+   separately.
+3. Buffer construction sites in arena/fixed/evict/readonly paths now create
+   `PageLatchGuard` from the crate-private `*_raw` latch acquisition helpers
+   after validating pool provenance.
+4. Follow-up review cleanup renamed the retained guard fields to `raw`,
+   renamed `HybridGuardCore` to `RawHybridGuard`, and preserved the
+   `PageLatchGuard` raw-before-keepalive drop contract across async suspension
+   by binding `keepalive` before `raw` in async transitions.
+5. Validation completed:
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+6. Deferred follow-up backlog created:
+   - `docs/backlogs/000073-validate-generation-during-optimistic-guard-lock-upgrades.md`
 
 ## Impacts
 
@@ -188,7 +211,7 @@ ownership model.
 8. Key types:
    - `HybridLatch`
    - `HybridGuard<'a>`
-   - `HybridGuardCore`
+   - `RawHybridGuard`
    - `PageLatchGuard`
    - `FacadePageGuard`
    - `PageOptimisticGuard`
@@ -220,4 +243,8 @@ ownership model.
 
 ## Open Questions
 
-None currently.
+1. Optimistic guard transitions that acquire shared/exclusive locks still do
+   not consistently validate frame generation at every conversion point, and
+   addressing that may require API changes plus call-site consolidation.
+   Follow-up backlog:
+   `docs/backlogs/000073-validate-generation-during-optimistic-guard-lock-upgrades.md`
