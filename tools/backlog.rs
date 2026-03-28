@@ -809,6 +809,8 @@ fn resolve_required_text_arg(
     usage: &str,
 ) -> Result<String, String> {
     resolve_optional_text_arg(value, file, flag, file_flag, usage)?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("missing required arg: {flag} or {file_flag}\n{usage}"))
 }
 
@@ -985,23 +987,46 @@ fn parse_deferred_context(
     findings: Option<String>,
     direction_hint: Option<String>,
 ) -> Result<Option<DeferredContext>, String> {
-    let provided = [
+    let invalid = || {
+        format!(
+            "deferred-work context requires all of --deferred-from/--deferred-from-file, --defer-reason/--defer-reason-file, --findings/--findings-file, and --direction-hint/--direction-hint-file together\n{}",
+            create_doc_usage()
+        )
+    };
+    let fields_present = [
         deferred_from.is_some(),
         defer_reason.is_some(),
         findings.is_some(),
         direction_hint.is_some(),
     ]
     .into_iter()
+    .any(|v| v);
+    let provided = [
+        deferred_from
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        defer_reason
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        findings
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        direction_hint
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+    ]
+    .into_iter()
     .filter(|v| *v)
     .count();
-    if provided == 0 {
+    if provided == 0 && !fields_present {
         return Ok(None);
     }
     if provided != 4 {
-        return Err(format!(
-            "deferred-work context requires all of --deferred-from/--deferred-from-file, --defer-reason/--defer-reason-file, --findings/--findings-file, and --direction-hint/--direction-hint-file together\n{}",
-            create_doc_usage()
-        ));
+        return Err(invalid());
     }
     Ok(Some(DeferredContext {
         deferred_from: deferred_from.expect("checked count"),
@@ -1490,4 +1515,156 @@ fn json_escape(text: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("backlog-rs-{name}-{nanos}.txt"))
+    }
+
+    fn deferred_context_usage_error() -> String {
+        format!(
+            "deferred-work context requires all of --deferred-from/--deferred-from-file, --defer-reason/--defer-reason-file, --findings/--findings-file, and --direction-hint/--direction-hint-file together\n{}",
+            create_doc_usage()
+        )
+    }
+
+    #[test]
+    fn resolve_required_text_arg_rejects_blank_inline_value() {
+        let err = resolve_required_text_arg(
+            Some("  \n\t  ".to_string()),
+            None,
+            "--summary",
+            "--summary-file",
+            "usage",
+        )
+        .expect_err("blank inline value should be rejected");
+
+        assert_eq!(err, "missing required arg: --summary or --summary-file\nusage");
+    }
+
+    #[test]
+    fn resolve_required_text_arg_rejects_blank_file_value() {
+        let path = temp_file_path("blank");
+        fs::write(&path, "  \n\n").expect("write temp file");
+
+        let err = resolve_required_text_arg(
+            None,
+            Some(normalize_path(&path)),
+            "--detail",
+            "--detail-file",
+            "usage",
+        )
+        .expect_err("blank file value should be rejected");
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(err, "missing required arg: --detail or --detail-file\nusage");
+    }
+
+    #[test]
+    fn resolve_required_text_arg_trims_non_empty_inline_value() {
+        let value = resolve_required_text_arg(
+            Some("  keep this text  \n".to_string()),
+            None,
+            "--summary",
+            "--summary-file",
+            "usage",
+        )
+        .expect("non-empty inline value should succeed");
+
+        assert_eq!(value, "keep this text");
+    }
+
+    #[test]
+    fn resolve_required_text_arg_trims_non_empty_file_value() {
+        let path = temp_file_path("trimmed");
+        fs::write(&path, "  preserved text  \n").expect("write temp file");
+
+        let value = resolve_required_text_arg(
+            None,
+            Some(normalize_path(&path)),
+            "--detail",
+            "--detail-file",
+            "usage",
+        )
+        .expect("non-empty file value should succeed");
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(value, "preserved text");
+    }
+
+    #[test]
+    fn parse_deferred_context_returns_none_when_all_fields_absent() {
+        let value = parse_deferred_context(None, None, None, None)
+            .expect("all absent deferred context should be allowed");
+
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn parse_deferred_context_rejects_blank_field_when_others_are_present() {
+        let err = parse_deferred_context(
+            Some("   \n".to_string()),
+            Some("valid reason".to_string()),
+            Some("valid findings".to_string()),
+            Some("valid direction".to_string()),
+        )
+        .err()
+        .expect("blank deferred field should be rejected");
+
+        assert_eq!(err, deferred_context_usage_error());
+    }
+
+    #[test]
+    fn parse_deferred_context_rejects_partial_non_empty_context() {
+        let err = parse_deferred_context(
+            Some("docs/tasks/000001-demo.md".to_string()),
+            Some("valid reason".to_string()),
+            None,
+            None,
+        )
+        .err()
+        .expect("partial deferred context should be rejected");
+
+        assert_eq!(err, deferred_context_usage_error());
+    }
+
+    #[test]
+    fn parse_deferred_context_preserves_original_non_empty_values() {
+        let value = parse_deferred_context(
+            Some("  docs/tasks/000001-demo.md  ".to_string()),
+            Some("  valid reason  ".to_string()),
+            Some("  valid findings  ".to_string()),
+            Some("  valid direction  ".to_string()),
+        )
+        .expect("non-empty deferred context should succeed")
+        .expect("deferred context should be present");
+
+        assert_eq!(value.deferred_from, "  docs/tasks/000001-demo.md  ");
+        assert_eq!(value.defer_reason, "  valid reason  ");
+        assert_eq!(value.findings, "  valid findings  ");
+        assert_eq!(value.direction_hint, "  valid direction  ");
+    }
+
+    #[test]
+    fn parse_deferred_context_rejects_all_blank_values() {
+        let err = parse_deferred_context(
+            Some("  ".to_string()),
+            Some("\n".to_string()),
+            Some("\t".to_string()),
+            Some("   ".to_string()),
+        )
+        .err()
+        .expect("all blank deferred values should be rejected");
+
+        assert_eq!(err, deferred_context_usage_error());
+    }
 }

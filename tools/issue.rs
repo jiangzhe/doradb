@@ -1177,17 +1177,6 @@ fn cmd_resolve_rfc(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
         print_json(&validated_value);
         return Err(1);
     }
-    let comment = match resolve_optional_text_arg(comment, comment_file, "--comment", "--comment-file") {
-        Ok(v) => v,
-        Err(err) => {
-            print_json(&json!({
-                "ok": false,
-                "doc": normalize_path(doc_path),
-                "error": err,
-            }));
-            return Err(1);
-        }
-    };
     let doc_type = validated_value
         .get("doc_type")
         .and_then(|v| v.as_str())
@@ -1200,6 +1189,17 @@ fn cmd_resolve_rfc(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
         }));
         return Err(1);
     }
+    let comment = match resolve_optional_text_arg(comment, comment_file, "--comment", "--comment-file") {
+        Ok(v) => v,
+        Err(err) => {
+            print_json(&json!({
+                "ok": false,
+                "doc": normalize_path(doc_path),
+                "error": err,
+            }));
+            return Err(1);
+        }
+    };
 
     let mut precheck_cmd = vec![
         "tools/rfc.rs".to_string(),
