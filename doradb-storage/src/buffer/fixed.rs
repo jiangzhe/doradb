@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::arena::QuiescentArena;
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
 use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
 use crate::buffer::{
     BufferPool, BufferPoolStats, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole,
@@ -82,7 +82,7 @@ impl FixedBufferPool {
             .latch
             .optimistic_fallback_raw(mode)
             .await;
-        FacadePageGuard::new(keepalive, bf, g)
+        FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf)
     }
 
     /// Since all pages are kept in memory, we can use spin mode to eliminate
@@ -112,7 +112,7 @@ impl FixedBufferPool {
         let keepalive = guard.clone();
         let bf = self.arena.frame_ptr(page_id);
         let g = self.arena.frame(page_id).latch.optimistic_spin_raw();
-        FacadePageGuard::new(keepalive, bf, g)
+        FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf)
     }
 }
 

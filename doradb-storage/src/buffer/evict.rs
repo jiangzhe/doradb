@@ -5,7 +5,7 @@ use crate::buffer::evictor::{
     PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard};
 use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
@@ -389,7 +389,10 @@ impl BufferPool for EvictableBufferPool {
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     self.stats.record_cache_hit();
-                    return Ok(FacadePageGuard::new(guard.clone(), bf, g));
+                    return Ok(FacadePageGuard::new(
+                        PageLatchGuard::new(guard.clone(), g),
+                        bf,
+                    ));
                 }
                 FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
@@ -402,7 +405,10 @@ impl BufferPool for EvictableBufferPool {
                     }
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     self.stats.record_cache_hit();
-                    return Ok(FacadePageGuard::new(guard.clone(), bf, g));
+                    return Ok(FacadePageGuard::new(
+                        PageLatchGuard::new(guard.clone(), g),
+                        bf,
+                    ));
                 }
                 FrameKind::Evicting => {
                     // The page is marked evicting in order to be evicted to disk in near future.
@@ -440,7 +446,7 @@ impl BufferPool for EvictableBufferPool {
                 FrameKind::Uninitialized => return Ok(None),
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
-                    let g = FacadePageGuard::new(guard.clone(), bf, g);
+                    let g = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
                         if g.is_exclusive() {
@@ -459,7 +465,7 @@ impl BufferPool for EvictableBufferPool {
                     {
                         continue;
                     }
-                    let g = FacadePageGuard::new(guard.clone(), bf, g);
+                    let g = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
                     let bf = g.bf();
                     if bf.kind() == FrameKind::Uninitialized || bf.generation() != id.generation {
                         if g.is_exclusive() {
@@ -516,9 +522,12 @@ impl BufferPool for EvictableBufferPool {
                     // page is acquired.
                     if p_guard.validate_bool() {
                         self.stats.record_cache_hit();
-                        return Ok(Valid(FacadePageGuard::new(guard.clone(), bf, g)));
+                        return Ok(Valid(FacadePageGuard::new(
+                            PageLatchGuard::new(guard.clone(), g),
+                            bf,
+                        )));
                     }
-                    if g.state == GuardState::Exclusive {
+                    if g.state() == GuardState::Exclusive {
                         g.rollback_exclusive_bit();
                     }
                     return Ok(Validation::Invalid);
@@ -536,9 +545,12 @@ impl BufferPool for EvictableBufferPool {
                     // apply lock coupling.
                     // the validation make sure parent page does not change until child
                     // page is acquired.
-                    let validated = p_guard
-                        .validate()
-                        .and_then(|_| Valid(FacadePageGuard::new(guard.clone(), bf, g)));
+                    let validated = p_guard.validate().and_then(|_| {
+                        Valid(FacadePageGuard::new(
+                            PageLatchGuard::new(guard.clone(), g),
+                            bf,
+                        ))
+                    });
                     if matches!(validated, Validation::Valid(_)) {
                         self.stats.record_cache_hit();
                     }

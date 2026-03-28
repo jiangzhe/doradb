@@ -1,5 +1,5 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
 use crate::buffer::page::{BufferPage, Page, PageID};
 use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
 use crate::buffer::{PoolGuard, PoolIdentity};
@@ -126,7 +126,9 @@ impl ArenaInner {
     ) -> Option<PageExclusiveGuard<Page>> {
         let bf = self.frame_ptr(page_id);
         let g = self.frame(page_id).latch.try_exclusive_raw();
-        g.map(|g| FacadePageGuard::new(keepalive.clone(), bf, g).must_exclusive())
+        g.map(|g| {
+            FacadePageGuard::new(PageLatchGuard::new(keepalive.clone(), g), bf).must_exclusive()
+        })
     }
 }
 
@@ -214,7 +216,8 @@ impl QuiescentArena {
             let frame = self.frame(page_id);
             let g = frame.latch.try_exclusive_raw().unwrap();
             frame.bump_generation();
-            FacadePageGuard::<T>::new(keepalive, bf.clone(), g).must_exclusive()
+            FacadePageGuard::<T>::new(PageLatchGuard::new(keepalive, g), bf.clone())
+                .must_exclusive()
         };
         {
             let frame = guard.bf_mut();
