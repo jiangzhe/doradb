@@ -243,6 +243,12 @@ impl<T: 'static> FacadePageGuard<T> {
     }
 
     #[inline]
+    fn refresh_version_and_generation(&mut self) {
+        self.raw.refresh_version();
+        self.captured_generation = self.bf().generation();
+    }
+
+    #[inline]
     pub fn try_exclusive_either(mut self) -> Either<PageExclusiveGuard<T>, PageOptimisticGuard<T>> {
         match self.try_exclusive() {
             Valid(()) => Either::Left(PageExclusiveGuard {
@@ -265,7 +271,7 @@ impl<T: 'static> FacadePageGuard<T> {
         match self.raw.try_exclusive() {
             Valid(()) => Valid(()),
             Invalid => {
-                self.raw.refresh_version();
+                self.refresh_version_and_generation();
                 Invalid
             }
         }
@@ -346,7 +352,7 @@ impl<T: 'static> FacadePageGuard<T> {
         match self.raw.try_shared() {
             Valid(()) => Valid(()),
             Invalid => {
-                self.raw.refresh_version();
+                self.refresh_version_and_generation();
                 Invalid
             }
         }
