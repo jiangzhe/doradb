@@ -5,7 +5,7 @@ use crate::error::{
     Validation,
     Validation::{Invalid, Valid},
 };
-use crate::latch::{GuardState, HybridGuardRaw, LatchFallbackMode};
+use crate::latch::{GuardState, HybridGuardCore, LatchFallbackMode};
 use crate::ptr::UnsafePtr;
 use either::Either;
 use std::future::Future;
@@ -114,9 +114,99 @@ impl<T: 'static> LockStrategy for ExclusiveLockStrategy<T> {
     }
 }
 
-pub struct FacadePageGuard<T: 'static> {
-    guard: HybridGuardRaw,
+pub(crate) struct PageLatchGuard {
+    // Field order is part of the safety contract. Drop the detached latch core
+    // before releasing the retained pool keepalive so unlock runs while pool
+    // provenance and quiescent liveness are still held.
+    core: HybridGuardCore,
     keepalive: PoolGuard,
+}
+
+impl PageLatchGuard {
+    #[inline]
+    pub(crate) fn new(keepalive: PoolGuard, core: HybridGuardCore) -> Self {
+        Self { core, keepalive }
+    }
+
+    #[inline]
+    fn state(&self) -> GuardState {
+        self.core.state()
+    }
+
+    #[inline]
+    fn validate(&self) -> bool {
+        self.core.validate()
+    }
+
+    #[inline]
+    fn downgrade(self) -> Self {
+        let Self { core, keepalive } = self;
+        Self {
+            core: core.downgrade(),
+            keepalive,
+        }
+    }
+
+    #[inline]
+    fn downgrade_exclusive_to_shared(self) -> Self {
+        let Self { core, keepalive } = self;
+        Self {
+            core: core.downgrade_exclusive_to_shared(),
+            keepalive,
+        }
+    }
+
+    #[inline]
+    fn try_shared(&mut self) -> Validation<()> {
+        self.core.try_shared()
+    }
+
+    #[inline]
+    async fn verify_shared_async<const PRE_VERIFY: bool>(&mut self) -> Validation<()> {
+        self.core.verify_shared_async::<PRE_VERIFY>().await
+    }
+
+    #[inline]
+    async fn shared_async(self) -> Self {
+        let Self { core, keepalive } = self;
+        Self {
+            core: core.shared_async().await,
+            keepalive,
+        }
+    }
+
+    #[inline]
+    fn try_exclusive(&mut self) -> Validation<()> {
+        self.core.try_exclusive()
+    }
+
+    #[inline]
+    async fn verify_exclusive_async<const PRE_VERIFY: bool>(&mut self) -> Validation<()> {
+        self.core.verify_exclusive_async::<PRE_VERIFY>().await
+    }
+
+    #[inline]
+    fn rollback_exclusive_bit(self) {
+        self.core.rollback_exclusive_bit();
+    }
+
+    #[inline]
+    async fn exclusive_async(self) -> Self {
+        let Self { core, keepalive } = self;
+        Self {
+            core: core.exclusive_async().await,
+            keepalive,
+        }
+    }
+
+    #[inline]
+    fn refresh_version(&mut self) {
+        self.core.refresh_version();
+    }
+}
+
+pub struct FacadePageGuard<T: 'static> {
+    latch: PageLatchGuard,
     bf: UnsafePtr<BufferFrame>,
     captured_generation: u64,
     _marker: PhantomData<T>,
@@ -124,16 +214,11 @@ pub struct FacadePageGuard<T: 'static> {
 
 impl<T: 'static> FacadePageGuard<T> {
     #[inline]
-    pub(crate) fn new(
-        keepalive: PoolGuard,
-        bf: UnsafePtr<BufferFrame>,
-        guard: HybridGuardRaw,
-    ) -> Self {
+    pub(crate) fn new(latch: PageLatchGuard, bf: UnsafePtr<BufferFrame>) -> Self {
         let captured_generation = frame_ref(&bf).generation();
         FacadePageGuard {
-            keepalive,
+            latch,
             bf,
-            guard,
             captured_generation,
             _marker: PhantomData,
         }
@@ -161,16 +246,14 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn try_exclusive_either(mut self) -> Either<PageExclusiveGuard<T>, PageOptimisticGuard<T>> {
         match self.try_exclusive() {
             Valid(()) => Either::Left(PageExclusiveGuard {
-                keepalive: self.keepalive,
+                latch: self.latch,
                 bf: self.bf,
-                guard: self.guard,
                 captured_generation: self.captured_generation,
                 _marker: PhantomData,
             }),
             Invalid => Either::Right(PageOptimisticGuard {
-                keepalive: self.keepalive,
+                latch: self.latch,
                 bf: self.bf,
-                guard: self.guard,
                 captured_generation: self.captured_generation,
                 _marker: PhantomData,
             }),
@@ -179,10 +262,10 @@ impl<T: 'static> FacadePageGuard<T> {
 
     #[inline]
     pub fn try_exclusive(&mut self) -> Validation<()> {
-        match self.guard.try_exclusive() {
+        match self.latch.try_exclusive() {
             Valid(()) => Valid(()),
             Invalid => {
-                self.guard.refresh_version();
+                self.latch.refresh_version();
                 Invalid
             }
         }
@@ -192,7 +275,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub async fn verify_exclusive_async<const PRE_VERIFY: bool>(
         mut self,
     ) -> Validation<PageExclusiveGuard<T>> {
-        let res = self.guard.verify_exclusive_async::<PRE_VERIFY>().await;
+        let res = self.latch.verify_exclusive_async::<PRE_VERIFY>().await;
         verify!(res);
         Valid(self.must_exclusive())
     }
@@ -201,9 +284,8 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn must_exclusive(self) -> PageExclusiveGuard<T> {
         debug_assert!(self.is_exclusive());
         PageExclusiveGuard {
-            keepalive: self.keepalive,
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
@@ -211,20 +293,19 @@ impl<T: 'static> FacadePageGuard<T> {
 
     #[inline]
     pub async fn lock_exclusive_async(self) -> Option<PageExclusiveGuard<T>> {
-        match self.guard.state {
+        match self.latch.state() {
             GuardState::Optimistic => {
-                let keepalive = self.keepalive;
+                let latch = self.latch;
                 let bf = self.bf;
                 let captured_generation = self.captured_generation;
-                let guard = self.guard.exclusive_async().await;
+                let latch = latch.exclusive_async().await;
                 if frame_ref(&bf).generation() != captured_generation {
-                    guard.rollback_exclusive_bit();
+                    latch.rollback_exclusive_bit();
                     return None;
                 }
                 Some(PageExclusiveGuard {
-                    keepalive,
+                    latch,
                     bf,
-                    guard,
                     captured_generation,
                     _marker: PhantomData,
                 })
@@ -233,9 +314,8 @@ impl<T: 'static> FacadePageGuard<T> {
             GuardState::Exclusive => {
                 debug_assert!(self.bf().generation() == self.captured_generation);
                 Some(PageExclusiveGuard {
-                    keepalive: self.keepalive,
+                    latch: self.latch,
                     bf: self.bf,
-                    guard: self.guard,
                     captured_generation: self.captured_generation,
                     _marker: PhantomData,
                 })
@@ -247,16 +327,14 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn try_shared_either(mut self) -> Either<PageSharedGuard<T>, PageOptimisticGuard<T>> {
         match self.try_shared() {
             Valid(()) => Either::Left(PageSharedGuard {
-                keepalive: self.keepalive,
+                latch: self.latch,
                 bf: self.bf,
-                guard: self.guard,
                 captured_generation: self.captured_generation,
                 _marker: PhantomData,
             }),
             Invalid => Either::Right(PageOptimisticGuard {
-                keepalive: self.keepalive,
+                latch: self.latch,
                 bf: self.bf,
-                guard: self.guard,
                 captured_generation: self.captured_generation,
                 _marker: PhantomData,
             }),
@@ -265,10 +343,10 @@ impl<T: 'static> FacadePageGuard<T> {
 
     #[inline]
     pub fn try_shared(&mut self) -> Validation<()> {
-        match self.guard.try_shared() {
+        match self.latch.try_shared() {
             Valid(()) => Valid(()),
             Invalid => {
-                self.guard.refresh_version();
+                self.latch.refresh_version();
                 Invalid
             }
         }
@@ -278,7 +356,7 @@ impl<T: 'static> FacadePageGuard<T> {
     pub async fn verify_shared_async<const PRE_VERIFY: bool>(
         mut self,
     ) -> Validation<PageSharedGuard<T>> {
-        let res = self.guard.verify_shared_async::<PRE_VERIFY>().await;
+        let res = self.latch.verify_shared_async::<PRE_VERIFY>().await;
         verify!(res);
         Valid(self.must_shared())
     }
@@ -287,9 +365,8 @@ impl<T: 'static> FacadePageGuard<T> {
     pub fn must_shared(self) -> PageSharedGuard<T> {
         debug_assert!(self.is_shared());
         PageSharedGuard {
-            keepalive: self.keepalive,
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
@@ -297,19 +374,18 @@ impl<T: 'static> FacadePageGuard<T> {
 
     #[inline]
     pub async fn lock_shared_async(self) -> Option<PageSharedGuard<T>> {
-        match self.guard.state {
+        match self.latch.state() {
             GuardState::Optimistic => {
-                let keepalive = self.keepalive;
+                let latch = self.latch;
                 let bf = self.bf;
                 let captured_generation = self.captured_generation;
-                let guard = self.guard.shared_async().await;
+                let latch = latch.shared_async().await;
                 if frame_ref(&bf).generation() != captured_generation {
                     return None;
                 }
                 Some(PageSharedGuard {
-                    keepalive,
+                    latch,
                     bf,
-                    guard,
                     captured_generation,
                     _marker: PhantomData,
                 })
@@ -317,9 +393,8 @@ impl<T: 'static> FacadePageGuard<T> {
             GuardState::Shared => {
                 debug_assert!(self.bf().generation() == self.captured_generation);
                 Some(PageSharedGuard {
-                    keepalive: self.keepalive,
+                    latch: self.latch,
                     bf: self.bf,
-                    guard: self.guard,
                     captured_generation: self.captured_generation,
                     _marker: PhantomData,
                 })
@@ -330,16 +405,15 @@ impl<T: 'static> FacadePageGuard<T> {
 
     #[inline]
     pub fn try_into_shared(self) -> Option<PageSharedGuard<T>> {
-        if self.guard.state != GuardState::Shared {
+        if self.latch.state() != GuardState::Shared {
             return None;
         }
         if self.bf().generation() != self.captured_generation {
             return None;
         }
         Some(PageSharedGuard {
-            keepalive: self.keepalive,
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         })
@@ -347,16 +421,15 @@ impl<T: 'static> FacadePageGuard<T> {
 
     #[inline]
     pub fn try_into_exclusive(self) -> Option<PageExclusiveGuard<T>> {
-        if self.guard.state != GuardState::Exclusive {
+        if self.latch.state() != GuardState::Exclusive {
             return None;
         }
         if self.bf().generation() != self.captured_generation {
             return None;
         }
         Some(PageExclusiveGuard {
-            keepalive: self.keepalive,
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         })
@@ -365,9 +438,8 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
-            keepalive: self.keepalive,
+            latch: self.latch.downgrade(),
             bf: self.bf,
-            guard: self.guard.downgrade(),
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
@@ -375,22 +447,22 @@ impl<T: 'static> FacadePageGuard<T> {
 
     #[inline]
     pub fn is_optimistic(&self) -> bool {
-        self.guard.state == GuardState::Optimistic
+        self.latch.state() == GuardState::Optimistic
     }
 
     #[inline]
     pub fn is_exclusive(&self) -> bool {
-        self.guard.state == GuardState::Exclusive
+        self.latch.state() == GuardState::Exclusive
     }
 
     #[inline]
     pub fn is_shared(&self) -> bool {
-        self.guard.state == GuardState::Shared
+        self.latch.state() == GuardState::Shared
     }
 
     #[inline]
     pub fn validate(&self) -> Validation<()> {
-        if self.guard.validate() {
+        if self.latch.validate() {
             Valid(())
         } else {
             Invalid
@@ -399,7 +471,7 @@ impl<T: 'static> FacadePageGuard<T> {
 
     #[inline]
     pub fn validate_bool(&self) -> bool {
-        self.guard.validate()
+        self.latch.validate()
     }
 
     #[inline]
@@ -408,7 +480,7 @@ impl<T: 'static> FacadePageGuard<T> {
         F: for<'a> FnOnce(&'a T) -> R,
     {
         let out = f(page_ref(self.bf()));
-        if self.guard.validate() {
+        if self.latch.validate() {
             Valid(out)
         } else {
             Invalid
@@ -418,10 +490,10 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub fn rollback_exclusive_version_change(self) {
         assert!(
-            self.guard.state == GuardState::Exclusive,
+            self.latch.state() == GuardState::Exclusive,
             "rollback_exclusive_version_change requires exclusive guard"
         );
-        self.guard.rollback_exclusive_bit();
+        self.latch.rollback_exclusive_bit();
     }
 }
 
@@ -433,8 +505,7 @@ unsafe impl<T: Sync + 'static> Send for FacadePageGuard<T> {}
 unsafe impl<T: Sync + 'static> Sync for FacadePageGuard<T> {}
 
 pub struct PageOptimisticGuard<T: 'static> {
-    guard: HybridGuardRaw,
-    keepalive: PoolGuard,
+    latch: PageLatchGuard,
     bf: UnsafePtr<BufferFrame>,
     captured_generation: u64,
     _marker: PhantomData<T>,
@@ -456,10 +527,9 @@ impl<T> PageOptimisticGuard<T> {
 
     #[inline]
     pub fn try_shared(mut self) -> Validation<PageSharedGuard<T>> {
-        self.guard.try_shared().map(|_| PageSharedGuard {
-            keepalive: self.keepalive,
+        self.latch.try_shared().map(|_| PageSharedGuard {
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         })
@@ -467,14 +537,13 @@ impl<T> PageOptimisticGuard<T> {
 
     #[inline]
     pub async fn shared_async(self) -> PageSharedGuard<T> {
-        let keepalive = self.keepalive;
+        let latch = self.latch;
         let bf = self.bf;
         let captured_generation = self.captured_generation;
-        let guard = self.guard.shared_async().await;
+        let latch = latch.shared_async().await;
         PageSharedGuard {
-            keepalive,
+            latch,
             bf,
-            guard,
             captured_generation,
             _marker: PhantomData,
         }
@@ -482,10 +551,9 @@ impl<T> PageOptimisticGuard<T> {
 
     #[inline]
     pub fn try_exclusive(mut self) -> Validation<PageExclusiveGuard<T>> {
-        self.guard.try_exclusive().map(|_| PageExclusiveGuard {
-            keepalive: self.keepalive,
+        self.latch.try_exclusive().map(|_| PageExclusiveGuard {
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         })
@@ -493,14 +561,13 @@ impl<T> PageOptimisticGuard<T> {
 
     #[inline]
     pub async fn exclusive_async(self) -> PageExclusiveGuard<T> {
-        let keepalive = self.keepalive;
+        let latch = self.latch;
         let bf = self.bf;
         let captured_generation = self.captured_generation;
-        let guard = self.guard.exclusive_async().await;
+        let latch = latch.exclusive_async().await;
         PageExclusiveGuard {
-            keepalive,
+            latch,
             bf,
-            guard,
             captured_generation,
             _marker: PhantomData,
         }
@@ -508,8 +575,8 @@ impl<T> PageOptimisticGuard<T> {
 
     #[inline]
     pub fn validate(&self) -> Validation<()> {
-        if !self.guard.validate() {
-            debug_assert!(self.guard.state == GuardState::Optimistic);
+        if !self.latch.validate() {
+            debug_assert!(self.latch.state() == GuardState::Optimistic);
             return Invalid;
         }
         Valid(())
@@ -518,25 +585,23 @@ impl<T> PageOptimisticGuard<T> {
     #[inline]
     pub fn facade(self) -> FacadePageGuard<T> {
         FacadePageGuard {
-            keepalive: self.keepalive,
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
     }
 }
 
-// SAFETY: the guard owns a version-validated raw latch handle and a keepalive
-// for the frame allocation, and it only exposes shared page access.
+// SAFETY: the guard owns a version-validated retained latch guard plus the
+// frame keepalive, and it only exposes shared page access.
 unsafe impl<T: Sync + 'static> Send for PageOptimisticGuard<T> {}
 // SAFETY: sharing references to the optimistic guard preserves the same
 // read-only page access and validated frame lifetime.
 unsafe impl<T: Sync + 'static> Sync for PageOptimisticGuard<T> {}
 
 pub struct PageSharedGuard<T: 'static> {
-    guard: HybridGuardRaw,
-    keepalive: PoolGuard,
+    latch: PageLatchGuard,
     bf: UnsafePtr<BufferFrame>,
     captured_generation: u64,
     _marker: PhantomData<T>,
@@ -553,9 +618,8 @@ impl<T: 'static> PageSharedGuard<T> {
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
-            keepalive: self.keepalive,
+            latch: self.latch.downgrade(),
             bf: self.bf,
-            guard: self.guard.downgrade(),
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
@@ -594,9 +658,8 @@ impl<T: 'static> PageSharedGuard<T> {
             bf.set_dirty(true);
         }
         FacadePageGuard {
-            keepalive: self.keepalive,
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
@@ -619,8 +682,7 @@ unsafe impl<T: Sync + 'static> Send for PageSharedGuard<T> {}
 unsafe impl<T: Sync + 'static> Sync for PageSharedGuard<T> {}
 
 pub struct PageExclusiveGuard<T: 'static> {
-    guard: HybridGuardRaw,
-    keepalive: PoolGuard,
+    latch: PageLatchGuard,
     bf: UnsafePtr<BufferFrame>,
     captured_generation: u64,
     _marker: PhantomData<T>,
@@ -636,19 +698,18 @@ impl<T: 'static> PageGuard<T> for PageExclusiveGuard<T> {
 impl<T: 'static> PageExclusiveGuard<T> {
     #[inline]
     fn frame_mut(&mut self) -> &mut BufferFrame {
-        debug_assert!(self.guard.state == GuardState::Exclusive);
+        debug_assert!(self.latch.state() == GuardState::Exclusive);
         // SAFETY: `PageExclusiveGuard` is only constructed from an exclusive
-        // raw latch guard, `&mut self` guarantees one mutable borrow at a time,
-        // and the retained quiescent guard keeps the arena allocation alive.
+        // retained latch guard, `&mut self` guarantees one mutable borrow at a
+        // time, and the retained quiescent guard keeps the arena allocation alive.
         unsafe { frame_mut(self.bf.clone()) }
     }
 
     #[inline]
     pub fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
-            keepalive: self.keepalive,
+            latch: self.latch.downgrade(),
             bf: self.bf,
-            guard: self.guard.downgrade(),
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
@@ -657,9 +718,8 @@ impl<T: 'static> PageExclusiveGuard<T> {
     #[inline]
     pub fn downgrade_shared(self) -> PageSharedGuard<T> {
         PageSharedGuard {
-            keepalive: self.keepalive,
+            latch: self.latch.downgrade_exclusive_to_shared(),
             bf: self.bf,
-            guard: self.guard.downgrade_exclusive_to_shared(),
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
@@ -711,9 +771,8 @@ impl<T: 'static> PageExclusiveGuard<T> {
             bf.set_dirty(true);
         }
         FacadePageGuard {
-            keepalive: self.keepalive,
+            latch: self.latch,
             bf: self.bf,
-            guard: self.guard,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }

@@ -5,7 +5,9 @@ use crate::buffer::evictor::{
     FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageSharedGuard};
+use crate::buffer::guard::{
+    FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard, PageSharedGuard,
+};
 use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
@@ -537,9 +539,9 @@ impl GlobalReadonlyBufferPool {
             .arena
             .frame(frame_id)
             .latch
-            .optimistic_fallback_raw(mode)
+            .optimistic_fallback_core(mode)
             .await;
-        Ok(FacadePageGuard::new(keepalive, bf, g))
+        Ok(FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf))
     }
 
     #[inline]
