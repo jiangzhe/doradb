@@ -487,7 +487,8 @@ pub mod tests {
     use crate::engine::Engine;
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::index::ColumnBlockIndex;
+    use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
+    use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_PREFIX_SIZE, ColumnBlockIndex};
     use crate::table::TablePersistence;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
@@ -642,6 +643,42 @@ pub mod tests {
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&byte).unwrap();
         file.flush().unwrap();
+    }
+
+    fn rewrite_page_with_checksum(
+        path: impl AsRef<std::path::Path>,
+        page_id: u64,
+        rewrite: impl FnOnce(&mut [u8]),
+    ) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
+        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut page).unwrap();
+        rewrite(&mut page);
+        write_page_checksum(&mut page);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&page).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn corrupt_leaf_delete_codec(
+        path: impl AsRef<std::path::Path>,
+        page_id: u64,
+        prefix_idx: usize,
+    ) {
+        const DELETE_CODEC_OFFSET_IN_PREFIX: usize = 38;
+        let byte_offset = PAGE_INTEGRITY_HEADER_SIZE
+            + COLUMN_BLOCK_HEADER_SIZE
+            + prefix_idx * COLUMN_BLOCK_LEAF_PREFIX_SIZE
+            + DELETE_CODEC_OFFSET_IN_PREFIX;
+        rewrite_page_with_checksum(path, page_id, |page| {
+            page[byte_offset] = 0xFF;
+        });
     }
 
     #[test]
@@ -855,9 +892,10 @@ pub mod tests {
                 .into_iter()
                 .next()
                 .expect("catalog checkpoint should publish at least one LWC page");
+            let block_id = entry.block_id();
             drop(engine);
 
-            corrupt_page_checksum(main_dir.join("catalog.mtb"), entry.payload.block_id);
+            corrupt_page_checksum(main_dir.join("catalog.mtb"), block_id);
 
             let err = match EngineConfig::default()
                 .storage_root(main_dir)
@@ -879,7 +917,81 @@ pub mod tests {
                     page_kind: PersistedPageKind::LwcPage,
                     page_id,
                     cause: PersistedPageCorruptionCause::ChecksumMismatch,
-                } if page_id == entry.payload.block_id
+                } if page_id == block_id
+            ));
+        });
+    }
+
+    #[test]
+    fn test_catalog_bootstrap_fails_on_invalid_v2_delete_metadata() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+
+            let engine = EngineConfig::default()
+                .storage_root(main_dir.clone())
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let root = snap
+                .meta
+                .table_roots
+                .iter()
+                .copied()
+                .find(|root| root.root_page_id.is_some())
+                .expect("catalog checkpoint should publish at least one root");
+            let root_page_id = root.root_page_id.unwrap().get();
+            let index = ColumnBlockIndex::new(
+                root_page_id,
+                root.pivot_row_id,
+                &engine.catalog().storage.disk_pool,
+            );
+            let entry = index
+                .collect_leaf_entries()
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("catalog checkpoint should publish at least one leaf entry");
+            drop(engine);
+
+            corrupt_leaf_delete_codec(main_dir.join("catalog.mtb"), entry.leaf_page_id, 0);
+
+            let err = match EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected catalog bootstrap invalid-metadata failure"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::CatalogMultiTableFile,
+                    page_kind: PersistedPageKind::ColumnBlockIndex,
+                    page_id,
+                    cause: PersistedPageCorruptionCause::InvalidPayload,
+                } if page_id == entry.leaf_page_id
             ));
         });
     }

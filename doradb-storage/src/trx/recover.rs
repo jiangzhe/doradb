@@ -627,7 +627,8 @@ mod tests {
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::build_test_fs_in;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::index::ColumnBlockIndex;
+    use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
+    use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol, UpdateMvcc};
     use crate::table::{TableAccess, TablePersistence};
@@ -652,6 +653,40 @@ mod tests {
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&byte).unwrap();
         file.flush().unwrap();
+    }
+
+    fn rewrite_page_with_checksum(
+        path: impl AsRef<std::path::Path>,
+        page_id: u64,
+        rewrite: impl FnOnce(&mut [u8]),
+    ) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
+        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut page).unwrap();
+        rewrite(&mut page);
+        write_page_checksum(&mut page);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&page).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn corrupt_blob_header_kind(
+        path: impl AsRef<std::path::Path>,
+        page_id: u64,
+        start_offset: u16,
+    ) {
+        let byte_offset = PAGE_INTEGRITY_HEADER_SIZE
+            + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE
+            + start_offset as usize;
+        rewrite_page_with_checksum(path, page_id, |page| {
+            page[byte_offset] = 0xFF;
+        });
     }
 
     #[test]
@@ -1480,6 +1515,7 @@ mod tests {
                 .into_iter()
                 .next()
                 .expect("checkpointed table should publish a persisted LWC page");
+            let block_id = entry.block_id();
 
             drop(checkpoint_session);
             drop(table);
@@ -1487,7 +1523,7 @@ mod tests {
             drop(engine);
 
             let fs = build_test_fs_in(temp_dir.path());
-            corrupt_page_checksum(fs.table_file_path(table_id), entry.payload.block_id);
+            corrupt_page_checksum(fs.table_file_path(table_id), block_id);
 
             let err = match EngineConfig::default()
                 .storage_root(main_dir)
@@ -1515,7 +1551,172 @@ mod tests {
                     page_kind: PersistedPageKind::LwcPage,
                     page_id,
                     cause: PersistedPageCorruptionCause::ChecksumMismatch,
-                } if page_id == entry.payload.block_id
+                } if page_id == block_id
+            ));
+        })
+    }
+
+    #[test]
+    fn test_log_recover_fails_on_invalid_delete_blob_framing() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("recover9")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.try_new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![ColumnSpec::new(
+                        "id",
+                        ValKind::U32,
+                        ColumnAttributes::empty(),
+                    )]),
+                    vec![IndexSpec::new(
+                        "idx_t9_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            for i in 0..80u32 {
+                let mut stmt = trx.start_stmt();
+                let insert = stmt.insert_row(&table, vec![Val::from(i)]).await;
+                assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+                trx = stmt.succeed();
+            }
+            trx.commit().await.unwrap();
+
+            table.freeze(&session, usize::MAX).await;
+            let mut checkpoint_session = engine.try_new_session().unwrap();
+            table
+                .checkpoint_for_new_data(&mut checkpoint_session)
+                .await
+                .unwrap();
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            for i in 0..64u32 {
+                let key = SelectKey::new(0, vec![Val::from(i)]);
+                let mut stmt = trx.start_stmt();
+                let delete = stmt.delete_row(&table, &key).await;
+                assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+                trx = stmt.succeed();
+            }
+            trx.commit().await.unwrap();
+
+            let marker = table.deletion_buffer().get(0).unwrap();
+            let marker_ts = match marker {
+                crate::table::DeleteMarker::Committed(ts) => ts,
+                crate::table::DeleteMarker::Ref(status) => status.ts(),
+            };
+            let trx_sys = session.engine().trx_sys.clone();
+            let mut ready = false;
+            for _ in 0..50 {
+                if trx_sys.calc_min_active_sts_for_gc() > marker_ts {
+                    ready = true;
+                    break;
+                }
+                smol::Timer::after(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                ready,
+                "deletion marker ts {} not yet below checkpoint cutoff",
+                marker_ts
+            );
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt.insert_row(&table, vec![Val::from(1000u32)]).await;
+            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            table.freeze(&session, usize::MAX).await;
+            table
+                .data_checkpoint(&mut checkpoint_session)
+                .await
+                .unwrap();
+
+            let active_root = table.file().active_root();
+            let index = ColumnBlockIndex::new(
+                active_root.column_block_index_root,
+                active_root.pivot_row_id,
+                table.disk_pool(),
+            );
+            let entry = index
+                .find_entry(0)
+                .await
+                .unwrap()
+                .expect("checkpointed table should keep the deleted row's block entry");
+            let blob_ref = entry
+                .deletion_blob_ref()
+                .unwrap()
+                .expect("delete checkpoint should offload large delete sets");
+
+            drop(trx_sys);
+            drop(checkpoint_session);
+            drop(table);
+            drop(session);
+            drop(engine);
+
+            let fs = build_test_fs_in(temp_dir.path());
+            corrupt_blob_header_kind(
+                fs.table_file_path(table_id),
+                blob_ref.start_page_id,
+                blob_ref.start_offset,
+            );
+
+            let err = match EngineConfig::default()
+                .storage_root(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("recover9")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+            {
+                Ok(_) => panic!("expected recovery invalid-delete-blob failure"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::TableFile,
+                    page_kind: PersistedPageKind::ColumnDeletionBlob,
+                    page_id,
+                    cause: PersistedPageCorruptionCause::InvalidPayload,
+                } if page_id == blob_ref.start_page_id
             ));
         })
     }

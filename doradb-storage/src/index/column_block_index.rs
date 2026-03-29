@@ -239,6 +239,12 @@ pub struct ColumnLeafEntry {
 }
 
 impl ColumnLeafEntry {
+    /// Returns the persisted LWC block page id.
+    #[inline]
+    pub fn block_id(&self) -> PageID {
+        self.payload.block_id
+    }
+
     /// Returns the exclusive coverage upper bound of this persisted entry.
     #[inline]
     pub fn end_row_id(&self) -> RowID {
@@ -256,6 +262,35 @@ impl ColumnLeafEntry {
     pub fn del_count(&self) -> u16 {
         self.del_count
     }
+
+    /// Returns the persisted row-id coverage span.
+    #[inline]
+    pub fn row_id_span(&self) -> u32 {
+        self.row_id_span
+    }
+
+    /// Returns the delta from `start_row_id` to the first present persisted row.
+    #[inline]
+    pub fn first_present_delta(&self) -> u32 {
+        self.first_present_delta
+    }
+
+    /// Returns the referenced delete blob when this entry uses external delete storage.
+    pub fn deletion_blob_ref(&self) -> Result<Option<BlobRef>> {
+        match self.delete_section_kind {
+            COLUMN_DELETE_CODEC_NONE | COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => Ok(None),
+            COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
+                if self.delete_section_aux != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS {
+                    return Err(Error::InvalidFormat);
+                }
+                match self.payload.try_offloaded_ref()? {
+                    Some(blob_ref) => Ok(Some(blob_ref)),
+                    None => Err(Error::InvalidFormat),
+                }
+            }
+            _ => Err(Error::InvalidFormat),
+        }
+    }
 }
 
 /// One bitmap update patch keyed by leaf `start_row_id`.
@@ -263,6 +298,13 @@ impl ColumnLeafEntry {
 pub struct OffloadedBitmapPatch<'a> {
     pub start_row_id: RowID,
     pub bitmap_bytes: &'a [u8],
+}
+
+/// One authoritative delete-delta rewrite keyed by leaf `start_row_id`.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnDeleteDeltaPatch<'a> {
+    pub start_row_id: RowID,
+    pub delete_deltas: &'a [u32],
 }
 
 /// One full payload replacement patch keyed by leaf `start_row_id`.
@@ -383,11 +425,15 @@ impl LogicalLeafEntry {
 
 #[derive(Clone, Debug)]
 enum ResolvedLeafPatch {
-    ReplaceEntry {
+    Entry {
         start_row_id: RowID,
         entry: LogicalLeafEntry,
     },
-    ReplacePayload {
+    DeleteSet {
+        start_row_id: RowID,
+        delete_set: LogicalDeleteSet,
+    },
+    Payload {
         start_row_id: RowID,
         block_id: PageID,
         delete_set: LogicalDeleteSet,
@@ -398,14 +444,15 @@ impl ResolvedLeafPatch {
     #[inline]
     fn start_row_id(&self) -> RowID {
         match self {
-            ResolvedLeafPatch::ReplaceEntry { start_row_id, .. } => *start_row_id,
-            ResolvedLeafPatch::ReplacePayload { start_row_id, .. } => *start_row_id,
+            ResolvedLeafPatch::Entry { start_row_id, .. } => *start_row_id,
+            ResolvedLeafPatch::DeleteSet { start_row_id, .. } => *start_row_id,
+            ResolvedLeafPatch::Payload { start_row_id, .. } => *start_row_id,
         }
     }
 
     fn apply(&self, entry: &mut LogicalLeafEntry) -> Result<()> {
         match self {
-            ResolvedLeafPatch::ReplaceEntry {
+            ResolvedLeafPatch::Entry {
                 start_row_id,
                 entry: replacement,
             } => {
@@ -414,7 +461,10 @@ impl ResolvedLeafPatch {
                 }
                 *entry = replacement.clone();
             }
-            ResolvedLeafPatch::ReplacePayload {
+            ResolvedLeafPatch::DeleteSet { delete_set, .. } => {
+                entry.delete_set = delete_set.clone();
+            }
+            ResolvedLeafPatch::Payload {
                 block_id,
                 delete_set,
                 ..
@@ -894,7 +944,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         entry: &ColumnLeafEntry,
     ) -> Result<Option<Vec<u8>>> {
-        let blob_ref = match entry.payload.try_offloaded_ref() {
+        let blob_ref = match entry.deletion_blob_ref() {
             Ok(Some(blob_ref)) => blob_ref,
             Ok(None) => return Ok(None),
             Err(Error::InvalidFormat) => {
@@ -1089,14 +1139,52 @@ impl<'a> ColumnBlockIndex<'a> {
             for patch in patches {
                 let deltas = decode_raw_u32_list(patch.bitmap_bytes)?;
                 let blob_ref = writer.append(patch.bitmap_bytes).await?;
-                resolved.push(ResolvedLeafPatch::ReplacePayload {
+                resolved.push(ResolvedLeafPatch::DeleteSet {
                     start_row_id: patch.start_row_id,
-                    block_id: 0,
                     delete_set: LogicalDeleteSet::External {
                         del_count: storage_count_u16(deltas.len())?,
                         blob_ref,
                         deltas: Some(deltas),
                     },
+                });
+            }
+            writer.finish().await?;
+            resolved
+        };
+
+        let root_height = self.read_node(self.root_page_id).await?.header.height;
+        let res = self
+            .rewrite_subtree_with_patches(mutable_file, self.root_page_id, &resolved, create_ts)
+            .await?;
+        if !res.touched {
+            return Err(Error::InvalidState);
+        }
+        self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
+            .await
+    }
+
+    /// Replaces sorted delete-delta sets keyed by `start_row_id`.
+    pub async fn batch_replace_delete_deltas<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        patches: &[ColumnDeleteDeltaPatch<'_>],
+        create_ts: u64,
+    ) -> Result<PageID> {
+        if patches.is_empty() {
+            return Ok(self.root_page_id);
+        }
+        if self.root_page_id == 0 || !delete_delta_patches_sorted_unique(patches) {
+            return Err(Error::InvalidArgument);
+        }
+
+        let resolved = {
+            let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
+            let mut resolved = Vec::with_capacity(patches.len());
+            for patch in patches {
+                let delete_set = build_rewrite_delete_set(&mut writer, patch.delete_deltas).await?;
+                resolved.push(ResolvedLeafPatch::DeleteSet {
+                    start_row_id: patch.start_row_id,
+                    delete_set,
                 });
             }
             writer.finish().await?;
@@ -1133,7 +1221,7 @@ impl<'a> ColumnBlockIndex<'a> {
         let mut resolved = Vec::with_capacity(patches.len());
         for patch in patches {
             let delete_set = payload_to_delete_set(&patch.payload, self.disk_pool).await?;
-            resolved.push(ResolvedLeafPatch::ReplacePayload {
+            resolved.push(ResolvedLeafPatch::Payload {
                 start_row_id: patch.start_row_id,
                 block_id: patch.payload.block_id,
                 delete_set,
@@ -1169,7 +1257,7 @@ impl<'a> ColumnBlockIndex<'a> {
         let mut resolved = Vec::with_capacity(patches.len());
         for patch in patches {
             let logical = LogicalLeafEntry::from_input(&patch.entry)?;
-            resolved.push(ResolvedLeafPatch::ReplaceEntry {
+            resolved.push(ResolvedLeafPatch::Entry {
                 start_row_id: patch.start_row_id,
                 entry: logical,
             });
@@ -1264,11 +1352,6 @@ impl<'a> ColumnBlockIndex<'a> {
                 .map_err(|_| Error::InvalidArgument)?;
             let mut replacement = entries[idx].clone();
             patch.apply(&mut replacement)?;
-            if let ResolvedLeafPatch::ReplacePayload { block_id, .. } = patch
-                && *block_id == 0
-            {
-                replacement.block_id = entries[idx].block_id;
-            }
             entries[idx] = replacement;
         }
         let new_entries = self
@@ -2191,6 +2274,40 @@ fn decode_raw_u32_list(bytes: &[u8]) -> Result<Vec<u32>> {
     )
 }
 
+fn encode_u32_delta_bytes(deltas: &[u32]) -> Result<Vec<u8>> {
+    storage_count_u16(deltas.len())?;
+    if !delete_deltas_sorted_unique(deltas) {
+        return Err(Error::InvalidArgument);
+    }
+    let mut out = Vec::with_capacity(mem::size_of_val(deltas));
+    for delta in deltas {
+        out.extend_from_slice(&delta.to_le_bytes());
+    }
+    Ok(out)
+}
+
+async fn build_rewrite_delete_set<M: MutableCowFile>(
+    writer: &mut ColumnDeletionBlobWriter<'_, M>,
+    delete_deltas: &[u32],
+) -> Result<LogicalDeleteSet> {
+    if delete_deltas.is_empty() {
+        return Ok(LogicalDeleteSet::None);
+    }
+    if !delete_deltas_sorted_unique(delete_deltas) {
+        return Err(Error::InvalidArgument);
+    }
+    if inline_delete_deltas_fit(delete_deltas)? {
+        return Ok(LogicalDeleteSet::Inline(delete_deltas.to_vec()));
+    }
+    let bytes = encode_u32_delta_bytes(delete_deltas)?;
+    let blob_ref = writer.append(&bytes).await?;
+    Ok(LogicalDeleteSet::External {
+        del_count: storage_count_u16(delete_deltas.len())?,
+        blob_ref,
+        deltas: Some(delete_deltas.to_vec()),
+    })
+}
+
 fn inline_delete_deltas_fit(deltas: &[u32]) -> Result<bool> {
     let mut payload = ColumnPagePayload {
         block_id: 0,
@@ -2217,9 +2334,20 @@ fn entry_inputs_sorted(entries: &[ColumnBlockEntryInput]) -> bool {
         .all(|pair| pair[0].start_row_id() < pair[1].start_row_id())
 }
 
+fn delete_deltas_sorted_unique(deltas: &[u32]) -> bool {
+    deltas.windows(2).all(|pair| pair[0] < pair[1])
+}
+
 fn patches_sorted_unique(patches: &[OffloadedBitmapPatch<'_>]) -> bool {
     patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id)
         && patches.iter().all(|patch| !patch.bitmap_bytes.is_empty())
+}
+
+fn delete_delta_patches_sorted_unique(patches: &[ColumnDeleteDeltaPatch<'_>]) -> bool {
+    patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id)
+        && patches
+            .iter()
+            .all(|patch| delete_deltas_sorted_unique(patch.delete_deltas))
 }
 
 fn patches_sorted_unique_by_start_row_id<P, F>(patches: &[P], mut key: F) -> bool
@@ -2254,7 +2382,9 @@ mod tests {
     };
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
-    use crate::index::{encode_deletion_deltas_to_bytes, load_payload_deletion_deltas};
+    use crate::index::{
+        encode_deletion_deltas_to_bytes, load_entry_deletion_deltas, load_payload_deletion_deltas,
+    };
     use crate::value::ValKind;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -2402,12 +2532,60 @@ mod tests {
             let index = ColumnBlockIndex::new(root_v2, 10, &disk_pool);
             let entries = index.collect_leaf_entries().await.unwrap();
             assert_eq!(entries.len(), 2);
-            assert_eq!(entries[1].payload.block_id, 2002);
+            assert_eq!(entries[1].block_id(), 2002);
             assert_eq!(entries[1].end_row_id(), 10);
             assert_eq!(entries[1].row_count(), 4);
             assert_eq!(entries[1].del_count(), 0);
             assert!(index.find_entry(7).await.unwrap().is_none());
             assert_eq!(index.find(8).await.unwrap().unwrap().block_id, 2002);
+        });
+    }
+
+    #[test]
+    fn test_batch_replace_delete_deltas_roundtrip_inline() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata();
+            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let mut mutable = MutableTableFile::fork(&table);
+            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+                .batch_insert(&mut mutable, &[dense_entry(0, 8, 1001)], 8, 2)
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+            let mut mutable = MutableTableFile::fork(&table);
+            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
+                .batch_replace_delete_deltas(
+                    &mut mutable,
+                    &[ColumnDeleteDeltaPatch {
+                        start_row_id: 0,
+                        delete_deltas: &[1, 3, 6],
+                    }],
+                    3,
+                )
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
+
+            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool);
+            let entry = index.find_entry(0).await.unwrap().unwrap();
+            assert_eq!(entry.block_id(), 1001);
+            assert_eq!(entry.row_count(), 8);
+            assert_eq!(entry.del_count(), 3);
+            assert!(
+                index
+                    .read_offloaded_bitmap_bytes(&entry)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let loaded = load_entry_deletion_deltas(&index, &entry).await.unwrap();
+            assert_eq!(loaded, BTreeSet::from([1u32, 3, 6]));
         });
     }
 
@@ -2446,7 +2624,7 @@ mod tests {
 
             let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool);
             let entry = index.find_entry(0).await.unwrap().unwrap();
-            assert!(entry.payload.offloaded_ref().is_some());
+            assert!(entry.deletion_blob_ref().unwrap().is_some());
             assert_eq!(entry.row_count(), 8);
             assert_eq!(entry.del_count(), 3);
             let loaded = load_payload_deletion_deltas(&index, entry).await.unwrap();

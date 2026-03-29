@@ -2,8 +2,7 @@ use crate::buffer::page::PageID;
 use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::table_file::MutableTableFile;
 use crate::index::{
-    ColumnBlockIndex, ColumnLeafEntry, OffloadedBitmapPatch, encode_deletion_deltas_to_bytes,
-    load_payload_deletion_deltas,
+    ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry, load_entry_deletion_deltas,
 };
 use crate::session::Session;
 use crate::table::Table;
@@ -224,31 +223,31 @@ impl Table {
             return Ok(false);
         }
 
-        // Step 4: load persisted deltas, merge pending deltas, and build patch bytes.
-        let mut patch_storage: Vec<(u64, Vec<u8>)> = Vec::new();
+        // Step 4: load authoritative persisted deltas and merge pending row-id deltas.
+        let mut patch_storage: Vec<(u64, Vec<u32>)> = Vec::new();
         for (start_row_id, (seed, pending)) in grouped {
-            let mut base = load_payload_deletion_deltas(&column_index, seed.entry).await?;
+            let mut base = load_entry_deletion_deltas(&column_index, &seed.entry).await?;
             let old_len = base.len();
             base.extend(pending);
             if base.len() == old_len {
                 continue;
             }
-            patch_storage.push((start_row_id, encode_deletion_deltas_to_bytes(&base)));
+            patch_storage.push((start_row_id, base.into_iter().collect()));
         }
         if patch_storage.is_empty() {
             return Ok(false);
         }
 
-        // Step 5: apply offloaded bitmap patches and advance index root in mutable file.
-        let patches: Vec<OffloadedBitmapPatch<'_>> = patch_storage
+        // Step 5: apply typed delete rewrites and advance the index root in the mutable file.
+        let patches: Vec<ColumnDeleteDeltaPatch<'_>> = patch_storage
             .iter()
-            .map(|(start_row_id, bytes)| OffloadedBitmapPatch {
+            .map(|(start_row_id, delete_deltas)| ColumnDeleteDeltaPatch {
                 start_row_id: *start_row_id,
-                bitmap_bytes: bytes,
+                delete_deltas,
             })
             .collect();
         let new_root = column_index
-            .batch_update_offloaded_bitmaps(mutable_file, &patches, checkpoint_ts)
+            .batch_replace_delete_deltas(mutable_file, &patches, checkpoint_ts)
             .await?;
         mutable_file.set_column_block_index_root(new_root);
         Ok(true)

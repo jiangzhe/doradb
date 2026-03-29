@@ -11,8 +11,8 @@ use crate::file::multi_table_file::{
     MutableMultiTableFile,
 };
 use crate::index::{
-    ColumnBlockEntryPatch, ColumnBlockEntryShape, ColumnBlockIndex, ColumnLeafEntry,
-    OffloadedBitmapPatch, encode_deletion_deltas_to_bytes, load_payload_deletion_deltas,
+    ColumnBlockEntryPatch, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch,
+    ColumnLeafEntry, load_entry_deletion_deltas,
 };
 use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, PersistedLwcPage};
@@ -257,7 +257,7 @@ impl CatalogStorage {
             && let Some(last_entry) = entries.last().copied()
         {
             let existing_tail_rows = self
-                .decode_lwc_page_rows(last_entry.payload.block_id, metadata)
+                .decode_lwc_page_rows(last_entry.block_id(), metadata)
                 .await?;
             if !existing_tail_rows.is_empty()
                 && let Some((merged_tail_buf, merged_row_ids, consumed)) = self
@@ -268,13 +268,12 @@ impl CatalogStorage {
                 mutable
                     .write_page(new_tail_page_id, merged_tail_buf)
                     .await?;
-                mutable.record_gc_page(last_entry.payload.block_id);
+                mutable.record_gc_page(last_entry.block_id());
                 let merged_end_row_id = live_inserts
                     .get(consumed.saturating_sub(1))
                     .map(|row| row.row_id.saturating_add(1))
                     .unwrap_or(current_end_row_id);
-                let existing_deletes =
-                    load_payload_deletion_deltas(&base_index, last_entry).await?;
+                let existing_deletes = load_entry_deletion_deltas(&base_index, &last_entry).await?;
                 let replacement = ColumnBlockEntryShape::new(
                     last_entry.start_row_id,
                     merged_end_row_id,
@@ -328,35 +327,35 @@ impl CatalogStorage {
             }
         }
 
-        // Step 7: Materialize deletion bitmap patches keyed by leaf start-row-id.
-        let mut patch_storage: Vec<(RowID, Vec<u8>)> = Vec::new();
+        // Step 7: Materialize typed delete rewrites keyed by leaf start-row-id.
+        let mut patch_storage: Vec<(RowID, Vec<u32>)> = Vec::new();
         for (start_row_id, pending) in &delete_deltas {
             let idx = entries
                 .binary_search_by_key(start_row_id, |entry| entry.start_row_id)
                 .map_err(|_| Error::InvalidState)?;
             let entry = entries[idx];
-            let mut base = load_payload_deletion_deltas(&base_index, entry).await?;
+            let mut base = load_entry_deletion_deltas(&base_index, &entry).await?;
             let old_len = base.len();
-            base.extend(pending);
+            base.extend(pending.iter().copied());
             if base.len() == old_len {
                 continue;
             }
-            patch_storage.push((*start_row_id, encode_deletion_deltas_to_bytes(&base)));
+            patch_storage.push((*start_row_id, base.into_iter().collect()));
         }
 
-        // Step 8: Apply deletion patches with CoW payload updates on the current root.
+        // Step 8: Apply typed delete rewrites on the current root.
         if !patch_storage.is_empty() {
-            let patches: Vec<OffloadedBitmapPatch<'_>> = patch_storage
+            let patches: Vec<ColumnDeleteDeltaPatch<'_>> = patch_storage
                 .iter()
-                .map(|(start_row_id, bytes)| OffloadedBitmapPatch {
+                .map(|(start_row_id, delete_deltas)| ColumnDeleteDeltaPatch {
                     start_row_id: *start_row_id,
-                    bitmap_bytes: bytes,
+                    delete_deltas,
                 })
                 .collect();
             let column_index =
                 ColumnBlockIndex::new(current_root_page_id, current_end_row_id, &self.disk_pool);
             current_root_page_id = column_index
-                .batch_update_offloaded_bitmaps(mutable, &patches, checkpoint_cts)
+                .batch_replace_delete_deltas(mutable, &patches, checkpoint_cts)
                 .await?;
             entries_changed = true;
         }
@@ -396,9 +395,9 @@ impl CatalogStorage {
         let column_index = ColumnBlockIndex::new(root_page_id, root.pivot_row_id, &self.disk_pool);
         let mut rows = Vec::new();
         for entry in entries {
-            let deleted = load_payload_deletion_deltas(&column_index, entry).await?;
+            let deleted = load_entry_deletion_deltas(&column_index, &entry).await?;
             let page_rows = self
-                .decode_lwc_page_rows(entry.payload.block_id, metadata)
+                .decode_lwc_page_rows(entry.block_id(), metadata)
                 .await?;
             for row in page_rows {
                 let delta = row
@@ -425,9 +424,9 @@ impl CatalogStorage {
     ) -> Result<Vec<ExistingVisibleRow>> {
         let mut rows = Vec::new();
         for entry in entries {
-            let deleted = load_payload_deletion_deltas(column_index, *entry).await?;
+            let deleted = load_entry_deletion_deltas(column_index, entry).await?;
             let page_rows = self
-                .decode_lwc_page_rows(entry.payload.block_id, metadata)
+                .decode_lwc_page_rows(entry.block_id(), metadata)
                 .await?;
             for row in page_rows {
                 let delta = row
@@ -625,6 +624,7 @@ mod tests {
     use crate::catalog::tests::{table1, table2};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::file::multi_table_file::CATALOG_MTB_PERSISTED_FILE_ID;
+    use crate::index::{ColumnBlockIndex, load_entry_deletion_deltas};
     use tempfile::TempDir;
 
     #[test]
@@ -740,9 +740,22 @@ mod tests {
 
             let last1 = entries1.last().copied().unwrap();
             let last2 = entries2.last().copied().unwrap();
+            let index1 = ColumnBlockIndex::new(
+                tables_root1.root_page_id.unwrap().get(),
+                tables_root1.pivot_row_id,
+                &engine.catalog().storage.disk_pool,
+            );
+            let index2 = ColumnBlockIndex::new(
+                tables_root2.root_page_id.unwrap().get(),
+                tables_root2.pivot_row_id,
+                &engine.catalog().storage.disk_pool,
+            );
             assert_eq!(last2.start_row_id, last1.start_row_id);
-            assert_ne!(last2.payload.block_id, last1.payload.block_id);
-            assert_eq!(last2.payload.deletion_field, last1.payload.deletion_field);
+            assert_ne!(last2.block_id(), last1.block_id());
+            assert_eq!(
+                load_entry_deletion_deltas(&index2, &last2).await.unwrap(),
+                load_entry_deletion_deltas(&index1, &last1).await.unwrap()
+            );
         });
     }
 }

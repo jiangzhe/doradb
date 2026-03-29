@@ -26,13 +26,21 @@ pub fn decode_deletion_deltas_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
     Ok(res)
 }
 
-/// Loads persisted deletion deltas from either inline payload bytes or an offloaded blob.
+/// Loads authoritative persisted deletion deltas for one v2 leaf entry.
+pub async fn load_entry_deletion_deltas(
+    column_index: &ColumnBlockIndex<'_>,
+    entry: &ColumnLeafEntry,
+) -> Result<BTreeSet<u32>> {
+    let deltas = column_index.load_delete_deltas(entry).await?;
+    Ok(deltas.into_iter().collect())
+}
+
+/// Compatibility alias for phase-1 callers that still reference payload terminology.
 pub async fn load_payload_deletion_deltas(
     column_index: &ColumnBlockIndex<'_>,
     entry: ColumnLeafEntry,
 ) -> Result<BTreeSet<u32>> {
-    let deltas = column_index.load_delete_deltas(&entry).await?;
-    Ok(deltas.into_iter().collect())
+    load_entry_deletion_deltas(column_index, &entry).await
 }
 
 #[cfg(test)]
