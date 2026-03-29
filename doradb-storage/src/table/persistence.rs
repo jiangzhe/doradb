@@ -90,9 +90,9 @@ impl Table {
             }
 
             if let Some(last) = lwc_pages.last_mut()
-                && last.end_row_id < new_pivot_row_id
+                && last.shape.end_row_id() < new_pivot_row_id
             {
-                last.end_row_id = new_pivot_row_id;
+                last.shape.set_end_row_id(new_pivot_row_id)?;
             }
 
             let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
