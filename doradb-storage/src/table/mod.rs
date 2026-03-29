@@ -599,7 +599,7 @@ impl Table {
         #[cfg(test)]
         {
             if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
-                return Err(crate::error::Error::InvalidState);
+                return Err(Error::InvalidState);
             }
         }
         let mut lwc_pages = Vec::new();
@@ -635,7 +635,7 @@ impl Table {
                     current_end = page_info.end_row_id;
                     let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                     if !builder.append_view(page, view)? {
-                        return Err(crate::error::Error::InvalidState);
+                        return Err(Error::InvalidState);
                     }
                 } else {
                     current_end = page_info.end_row_id;

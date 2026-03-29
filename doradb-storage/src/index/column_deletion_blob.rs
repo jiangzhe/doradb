@@ -132,6 +132,18 @@ impl ColumnAuxBlobHeader {
     }
 }
 
+#[inline]
+fn validate_delete_delta_header(header: &ColumnAuxBlobHeader) -> Result<()> {
+    if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
+        || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
+        || header.codec_version() != RAW_U32_CODEC_VERSION
+        || header.flags != 0
+    {
+        return Err(Error::InvalidFormat);
+    }
+    Ok(())
+}
+
 fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
     let next_page_id = u64::from_le_bytes(
         page[COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET..COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET + 8]
@@ -379,7 +391,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         &self,
         blob_ref: BlobRef,
     ) -> Result<(ColumnAuxBlobHeader, Vec<u8>)> {
-        let bytes = self.read_raw(blob_ref).await?;
+        let mut bytes = self.read_raw(blob_ref).await?;
         if bytes.len() < COLUMN_AUX_BLOB_HEADER_SIZE {
             return Err(Error::InvalidFormat);
         }
@@ -387,12 +399,14 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         if bytes.len() != COLUMN_AUX_BLOB_HEADER_SIZE + header.payload_len() {
             return Err(Error::InvalidFormat);
         }
-        Ok((header, bytes[COLUMN_AUX_BLOB_HEADER_SIZE..].to_vec()))
+        let payload = bytes.split_off(COLUMN_AUX_BLOB_HEADER_SIZE);
+        Ok((header, payload))
     }
 
     /// Reads the payload bytes of one delete-delta blob after validating its framing header.
     pub async fn read(&self, blob_ref: BlobRef) -> Result<Vec<u8>> {
-        let (_, payload) = self.read_framed_blob(blob_ref).await?;
+        let (header, payload) = self.read_framed_blob(blob_ref).await?;
+        validate_delete_delta_header(&header)?;
         Ok(payload)
     }
 
@@ -465,6 +479,76 @@ mod tests {
         let bytes = [1u8, 2, 3, 4, 0, 0, 0, 0];
         assert!(matches!(
             ColumnAuxBlobHeader::decode(&bytes),
+            Err(Error::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn test_validate_delete_delta_header_accepts_expected_framing() {
+        let header = ColumnAuxBlobHeader::deletion_deltas(27).unwrap();
+        assert!(validate_delete_delta_header(&header).is_ok());
+    }
+
+    #[test]
+    fn test_validate_delete_delta_header_rejects_wrong_blob_kind() {
+        let header = ColumnAuxBlobHeader::new(
+            2,
+            COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
+            RAW_U32_CODEC_VERSION,
+            0,
+            27,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_delete_delta_header(&header),
+            Err(Error::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn test_validate_delete_delta_header_rejects_wrong_codec_kind() {
+        let header = ColumnAuxBlobHeader::new(
+            COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
+            2,
+            RAW_U32_CODEC_VERSION,
+            0,
+            27,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_delete_delta_header(&header),
+            Err(Error::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn test_validate_delete_delta_header_rejects_wrong_codec_version() {
+        let header = ColumnAuxBlobHeader::new(
+            COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
+            COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
+            RAW_U32_CODEC_VERSION + 1,
+            0,
+            27,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_delete_delta_header(&header),
+            Err(Error::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn test_validate_delete_delta_header_rejects_non_zero_flags() {
+        let header = ColumnAuxBlobHeader::new(
+            COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
+            COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
+            RAW_U32_CODEC_VERSION,
+            1,
+            27,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_delete_delta_header(&header),
             Err(Error::InvalidFormat)
         ));
     }

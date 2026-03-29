@@ -48,8 +48,8 @@ struct ColumnBlockLeafPrefix {
     block_page_id: [u8; 8],
     row_id_span: [u8; 4],
     first_present_delta: [u8; 4],
-    row_count: [u8; 4],
-    del_count: [u8; 4],
+    row_count: [u8; 2],
+    del_count: [u8; 2],
     row_section_offset: [u8; 2],
     row_section_len: [u8; 2],
     delete_section_offset: [u8; 2],
@@ -59,7 +59,7 @@ struct ColumnBlockLeafPrefix {
     delete_domain: u8,
     prefix_version: u8,
     flags: u8,
-    reserved: [u8; 3],
+    reserved: [u8; 7],
 }
 
 pub const COLUMN_BLOCK_LEAF_PREFIX_SIZE: usize = mem::size_of::<ColumnBlockLeafPrefix>();
@@ -219,8 +219,8 @@ pub struct ColumnLeafEntry {
     pub start_row_id: RowID,
     pub payload: ColumnPagePayload,
     end_row_id: RowID,
-    row_count: u32,
-    del_count: u32,
+    row_count: u16,
+    del_count: u16,
     row_id_span: u32,
     first_present_delta: u32,
     row_section_offset: u16,
@@ -247,13 +247,13 @@ impl ColumnLeafEntry {
 
     /// Returns the decoded persisted row count.
     #[inline]
-    pub fn row_count(&self) -> u32 {
+    pub fn row_count(&self) -> u16 {
         self.row_count
     }
 
     /// Returns the decoded persisted delete count.
     #[inline]
-    pub fn del_count(&self) -> u32 {
+    pub fn del_count(&self) -> u16 {
         self.del_count
     }
 }
@@ -335,7 +335,7 @@ enum LogicalDeleteSet {
     None,
     Inline(Vec<u32>),
     External {
-        del_count: u32,
+        del_count: u16,
         blob_ref: BlobRef,
         deltas: Option<Vec<u32>>,
     },
@@ -343,11 +343,11 @@ enum LogicalDeleteSet {
 
 impl LogicalDeleteSet {
     #[inline]
-    fn del_count(&self) -> u32 {
+    fn del_count(&self) -> Result<u16> {
         match self {
-            LogicalDeleteSet::None => 0,
-            LogicalDeleteSet::Inline(deltas) => deltas.len() as u32,
-            LogicalDeleteSet::External { del_count, .. } => *del_count,
+            LogicalDeleteSet::None => Ok(0),
+            LogicalDeleteSet::Inline(deltas) => storage_count_u16(deltas.len()),
+            LogicalDeleteSet::External { del_count, .. } => Ok(*del_count),
         }
     }
 }
@@ -433,8 +433,8 @@ struct EncodedLeafEntry {
     block_page_id: PageID,
     row_id_span: u32,
     first_present_delta: u32,
-    row_count: u32,
-    del_count: u32,
+    row_count: u16,
+    del_count: u16,
     row_section_kind: u8,
     delete_section_kind: u8,
     delete_domain: u8,
@@ -454,7 +454,7 @@ impl EncodedLeafEntry {
             row_id_span,
             first_present_delta,
             row_count,
-            del_count: entry.delete_set.del_count(),
+            del_count: entry.delete_set.del_count()?,
             row_section_kind,
             delete_section_kind,
             delete_domain,
@@ -733,13 +733,13 @@ impl ColumnBlockLeafPrefix {
     }
 
     #[inline]
-    fn row_count(&self) -> u32 {
-        u32::from_le_bytes(self.row_count)
+    fn row_count(&self) -> u16 {
+        u16::from_le_bytes(self.row_count)
     }
 
     #[inline]
-    fn del_count(&self) -> u32 {
-        u32::from_le_bytes(self.del_count)
+    fn del_count(&self) -> u16 {
+        u16::from_le_bytes(self.del_count)
     }
 
     #[inline]
@@ -807,7 +807,7 @@ impl ColumnBlockLeafPrefix {
             delete_domain: entry.delete_domain,
             prefix_version: COLUMN_LEAF_PREFIX_VERSION,
             flags: 0,
-            reserved: [0; 3],
+            reserved: [0; 7],
         }
     }
 }
@@ -1093,7 +1093,7 @@ impl<'a> ColumnBlockIndex<'a> {
                     start_row_id: patch.start_row_id,
                     block_page_id: 0,
                     delete_set: LogicalDeleteSet::External {
-                        del_count: deltas.len() as u32,
+                        del_count: storage_count_u16(deltas.len())?,
                         blob_ref,
                         deltas: Some(deltas),
                     },
@@ -1626,7 +1626,7 @@ fn validate_leaf_prefixes(
             || prefix.row_codec() == COLUMN_ROW_CODEC_NONE
             || prefix.row_id_span() == 0
             || prefix.row_count() == 0
-            || prefix.row_count() > prefix.row_id_span()
+            || u32::from(prefix.row_count()) > prefix.row_id_span()
             || prefix.del_count() > prefix.row_count()
             || prefix.delete_domain() != COLUMN_DELETE_DOMAIN_ROW_ID_DELTA
         {
@@ -1662,7 +1662,7 @@ fn validate_leaf_prefixes(
                     || row_header.version != COLUMN_ROW_SECTION_VERSION
                     || row_range.1 - row_range.0 != 4
                     || prefix.first_present_delta() != 0
-                    || prefix.row_count() != prefix.row_id_span()
+                    || u32::from(prefix.row_count()) != prefix.row_id_span()
                 {
                     return Err(invalid_node_payload(file_kind, page_id));
                 }
@@ -1926,7 +1926,7 @@ fn compatibility_payload_for_view(view: &LeafEntryView<'_>) -> Result<ColumnPage
     }
 }
 
-fn encode_row_section(row_set: &LogicalRowSet) -> Result<(u8, Vec<u8>, u32, u32, u32)> {
+fn encode_row_section(row_set: &LogicalRowSet) -> Result<(u8, Vec<u8>, u32, u32, u16)> {
     match row_set {
         LogicalRowSet::Dense { row_id_span } => {
             let header = SectionHeader {
@@ -1940,7 +1940,7 @@ fn encode_row_section(row_set: &LogicalRowSet) -> Result<(u8, Vec<u8>, u32, u32,
                 header.encode().to_vec(),
                 *row_id_span,
                 0,
-                *row_id_span,
+                u16::try_from(*row_id_span).map_err(|_| Error::InvalidArgument)?,
             ))
         }
         LogicalRowSet::DeltaList {
@@ -1966,7 +1966,7 @@ fn encode_row_section(row_set: &LogicalRowSet) -> Result<(u8, Vec<u8>, u32, u32,
                 bytes,
                 *row_id_span,
                 *first_present_delta,
-                deltas.len() as u32,
+                storage_count_u16(deltas.len())?,
             ))
         }
     }
@@ -2092,7 +2092,7 @@ fn encode_blob_ref(blob_ref: &BlobRef, out: &mut Vec<u8>) {
 
 fn decode_u32_row_deltas(
     bytes: &[u8],
-    expected_count: u32,
+    expected_count: u16,
     row_id_span: u32,
     first_present_delta: u32,
     file_kind: PersistedFileKind,
@@ -2109,7 +2109,7 @@ fn decode_u32_row_deltas(
 
 fn decode_u32_delta_list(
     bytes: &[u8],
-    expected_count: u32,
+    expected_count: u16,
     row_set: &LogicalRowSet,
     file_kind: PersistedFileKind,
     page_id: PageID,
@@ -2121,7 +2121,7 @@ fn decode_u32_delta_list(
     Ok(deltas)
 }
 
-fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u32) -> Result<Vec<u32>> {
+fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> Result<Vec<u32>> {
     if bytes.len() != expected_count as usize * mem::size_of::<u32>() {
         return Err(Error::InvalidFormat);
     }
@@ -2149,8 +2149,12 @@ fn contains_u32_delta(
     if !bytes.len().is_multiple_of(mem::size_of::<u32>()) {
         return Err(invalid_node_payload(file_kind, page_id));
     }
-    let deltas = decode_u32_bytes_strict(bytes, (bytes.len() / mem::size_of::<u32>()) as u32)
-        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    let deltas = decode_u32_bytes_strict(
+        bytes,
+        storage_count_u16(bytes.len() / mem::size_of::<u32>())
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?,
+    )
+    .map_err(|_| invalid_node_payload(file_kind, page_id))?;
     Ok(deltas.binary_search(&target).is_ok())
 }
 
@@ -2163,7 +2167,7 @@ async fn payload_to_delete_set(
         let payload_bytes = reader.read(blob_ref).await?;
         let deltas = decode_raw_u32_list(&payload_bytes)?;
         return Ok(LogicalDeleteSet::External {
-            del_count: deltas.len() as u32,
+            del_count: storage_count_u16(deltas.len())?,
             blob_ref,
             deltas: Some(deltas),
         });
@@ -2181,7 +2185,10 @@ fn decode_raw_u32_list(bytes: &[u8]) -> Result<Vec<u32>> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(mem::size_of::<u32>()) {
         return Err(Error::InvalidFormat);
     }
-    decode_u32_bytes_strict(bytes, (bytes.len() / mem::size_of::<u32>()) as u32)
+    decode_u32_bytes_strict(
+        bytes,
+        storage_count_u16(bytes.len() / mem::size_of::<u32>())?,
+    )
 }
 
 fn inline_delete_deltas_fit(deltas: &[u32]) -> Result<bool> {
@@ -2197,6 +2204,11 @@ fn inline_delete_deltas_fit(deltas: &[u32]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+#[inline]
+fn storage_count_u16(len: usize) -> Result<u16> {
+    u16::try_from(len).map_err(|_| Error::InvalidArgument)
 }
 
 fn entry_inputs_sorted(entries: &[ColumnBlockEntryInput]) -> bool {
@@ -2242,7 +2254,7 @@ mod tests {
     };
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
-    use crate::index::load_payload_deletion_deltas;
+    use crate::index::{encode_deletion_deltas_to_bytes, load_payload_deletion_deltas};
     use crate::value::ValKind;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -2278,6 +2290,46 @@ mod tests {
         ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
             .unwrap()
             .with_block_page_id(block_page_id)
+    }
+
+    #[test]
+    fn test_leaf_prefix_count_roundtrip_uses_u16() {
+        let encoded = EncodedLeafEntry {
+            start_row_id: 10,
+            block_page_id: 1001,
+            row_id_span: 32,
+            first_present_delta: 3,
+            row_count: 7,
+            del_count: 2,
+            row_section_kind: COLUMN_ROW_CODEC_DELTA_LIST,
+            delete_section_kind: COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
+            delete_domain: COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
+            row_section: vec![0u8; 4 + 7 * mem::size_of::<u32>()],
+            delete_section: vec![0u8; 4 + 2 * mem::size_of::<u32>()],
+        };
+        let prefix = ColumnBlockLeafPrefix::from_encoded(&encoded, 128, 32, 160, 12);
+        assert_eq!(prefix.row_count(), 7);
+        assert_eq!(prefix.del_count(), 2);
+        assert_eq!(mem::size_of::<ColumnBlockLeafPrefix>(), 48);
+    }
+
+    #[test]
+    fn test_encode_row_section_rejects_row_count_above_u16() {
+        assert!(matches!(
+            encode_row_section(&LogicalRowSet::Dense {
+                row_id_span: u16::MAX as u32 + 1,
+            }),
+            Err(Error::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn test_logical_delete_set_rejects_delete_count_above_u16() {
+        let delete_set = LogicalDeleteSet::Inline((0..=u16::MAX as u32).collect());
+        assert!(matches!(
+            delete_set.del_count(),
+            Err(Error::InvalidArgument)
+        ));
     }
 
     #[test]
@@ -2352,6 +2404,8 @@ mod tests {
             assert_eq!(entries.len(), 2);
             assert_eq!(entries[1].payload.block_id, 2002);
             assert_eq!(entries[1].end_row_id(), 10);
+            assert_eq!(entries[1].row_count(), 4);
+            assert_eq!(entries[1].del_count(), 0);
             assert!(index.find_entry(7).await.unwrap().is_none());
             assert_eq!(index.find(8).await.unwrap().unwrap().block_id, 2002);
         });
@@ -2375,7 +2429,7 @@ mod tests {
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
             let deltas = BTreeSet::from([1u32, 3, 6]);
-            let bytes = crate::index::encode_deletion_deltas_to_bytes(&deltas);
+            let bytes = encode_deletion_deltas_to_bytes(&deltas);
             let mut mutable = MutableTableFile::fork(&table);
             let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
                 .batch_update_offloaded_bitmaps(
@@ -2393,6 +2447,8 @@ mod tests {
             let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool);
             let entry = index.find_entry(0).await.unwrap().unwrap();
             assert!(entry.payload.offloaded_ref().is_some());
+            assert_eq!(entry.row_count(), 8);
+            assert_eq!(entry.del_count(), 3);
             let loaded = load_payload_deletion_deltas(&index, entry).await.unwrap();
             assert_eq!(loaded, deltas);
         });

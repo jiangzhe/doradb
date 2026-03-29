@@ -20,7 +20,7 @@ use crate::file::super_page::{
     SUPER_PAGE_FOOTER_OFFSET, SUPER_PAGE_SIZE, SUPER_PAGE_VERSION, SuperPage, SuperPageBody,
     SuperPageFooter, SuperPageHeader, SuperPageSerView, parse_super_page,
 };
-use crate::index::ColumnBlockEntryShape;
+use crate::index::{ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
@@ -470,11 +470,8 @@ impl MutableTableFile {
         try_join_all(writes).await?;
 
         let root = self.root();
-        let column_index = crate::index::ColumnBlockIndex::new(
-            root.column_block_index_root,
-            root.pivot_row_id,
-            disk_pool,
-        );
+        let column_index =
+            ColumnBlockIndex::new(root.column_block_index_root, root.pivot_row_id, disk_pool);
         let new_root = column_index
             .batch_insert(self, &new_entries, max_row_id, ts)
             .await?;
@@ -831,23 +828,13 @@ mod tests {
 
             let lwc_pages = vec![
                 LwcPagePersist {
-                    shape: crate::index::ColumnBlockEntryShape::new(
-                        0,
-                        10,
-                        (0..10).collect(),
-                        Vec::new(),
-                    )
-                    .unwrap(),
+                    shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
+                        .unwrap(),
                     buf: page_buf(b"lwc-page-1"),
                 },
                 LwcPagePersist {
-                    shape: crate::index::ColumnBlockEntryShape::new(
-                        10,
-                        20,
-                        (10..20).collect(),
-                        Vec::new(),
-                    )
-                    .unwrap(),
+                    shape: ColumnBlockEntryShape::new(10, 20, (10..20).collect(), Vec::new())
+                        .unwrap(),
                     buf: page_buf(b"lwc-page-2"),
                 },
             ];
@@ -867,7 +854,7 @@ mod tests {
             assert_ne!(active_root.column_block_index_root, 0);
             let disk_pool = table_readonly_pool(&global, 43, &table_file);
 
-            let column_index = crate::index::ColumnBlockIndex::new(
+            let column_index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,
                 &disk_pool,
@@ -899,23 +886,13 @@ mod tests {
 
             let lwc_pages = vec![
                 LwcPagePersist {
-                    shape: crate::index::ColumnBlockEntryShape::new(
-                        0,
-                        10,
-                        (0..10).collect(),
-                        Vec::new(),
-                    )
-                    .unwrap(),
+                    shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
+                        .unwrap(),
                     buf: page_buf(b"lwc-overlap-1"),
                 },
                 LwcPagePersist {
-                    shape: crate::index::ColumnBlockEntryShape::new(
-                        5,
-                        15,
-                        (5..15).collect(),
-                        Vec::new(),
-                    )
-                    .unwrap(),
+                    shape: ColumnBlockEntryShape::new(5, 15, (5..15).collect(), Vec::new())
+                        .unwrap(),
                     buf: page_buf(b"lwc-overlap-2"),
                 },
             ];
