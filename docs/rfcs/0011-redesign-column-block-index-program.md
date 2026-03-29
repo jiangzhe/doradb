@@ -270,10 +270,10 @@ The intended unsafe scope is limited:
   - Goals: Make the new `locate_block` contract authoritative for infrastructure paths and prove checkpoint/recovery correctness with the redesigned leaves.
   - Ordered Success Gates: deletion checkpoint, then catalog checkpoint, then recovery replay/bootstrap, then corruption-path validation.
   - Non-goals: Making the block index the preferred runtime `RowID -> ordinal` path.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000096-checkpoint-and-recovery-alignment.md`
+  - Task Issue: `#495`
+  - Phase Status: done
+  - Implementation Summary: 1. Made the v2 column-block-index entry/decode surface authoritative for [Task Resolve Sync: docs/tasks/000096-checkpoint-and-recovery-alignment.md @ 2026-03-29]
 
 - **Phase 3: Runtime Lookup Alignment**
   - Scope: Introduce `resolve_row`, align runtime point-read behavior with redesigned block-index row-id metadata where beneficial, and benchmark whether later negative-lookup hints are justified.

@@ -2,7 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::buffer::page::PageID;
 use crate::error::{Error, Result};
 use crate::index::{
-    ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_payload_deletion_deltas,
+    ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_entry_deletion_deltas,
 };
 use crate::lwc::PersistedLwcPage;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
@@ -269,8 +269,8 @@ impl TableRecover for Table {
             self.disk_pool(),
         );
         for entry in index.collect_leaf_entries().await? {
-            let deleted = load_payload_deletion_deltas(&index, entry).await?;
-            let page = PersistedLwcPage::load(self.disk_pool(), entry.payload.block_id).await?;
+            let deleted = load_entry_deletion_deltas(&index, &entry).await?;
+            let page = PersistedLwcPage::load(self.disk_pool(), entry.block_id()).await?;
             let row_ids = page.decode_row_ids()?;
 
             for (row_idx, row_id) in row_ids.into_iter().enumerate() {
