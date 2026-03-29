@@ -323,9 +323,13 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
 
     #[inline]
     fn ensure_current_page(&mut self) -> Result<()> {
-        if self.current_page.is_none() {
-            let page_id = self.mutable_file.allocate_page_id()?;
-            self.current_page = Some(PendingBlobPage::new(page_id));
+        match self.current_page.as_ref() {
+            Some(current) if current.free_space() == 0 => self.roll_to_next_page()?,
+            Some(_) => {}
+            None => {
+                let page_id = self.mutable_file.allocate_page_id()?;
+                self.current_page = Some(PendingBlobPage::new(page_id));
+            }
         }
         Ok(())
     }
@@ -533,6 +537,50 @@ mod tests {
             let reader = ColumnDeletionBlobReader::new(&disk_pool);
             let payload = reader.read(blob_ref).await.unwrap();
             assert_eq!(payload, blob);
+        });
+    }
+
+    #[test]
+    fn test_blob_writer_starts_next_blob_on_fresh_page_after_exact_fill() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = Arc::new(TableMetadata::new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U64,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            ));
+            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 1, &table);
+
+            let mut mutable = MutableTableFile::fork(&table);
+            let first_blob =
+                vec![3u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE - COLUMN_AUX_BLOB_HEADER_SIZE];
+            let second_blob = vec![5u8; 17];
+            let (first_ref, second_ref) = {
+                let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
+                let first_ref = writer.append(&first_blob).await.unwrap();
+                let second_ref = writer.append(&second_blob).await.unwrap();
+                writer.finish().await.unwrap();
+                (first_ref, second_ref)
+            };
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+            assert_ne!(first_ref.start_page_id, 0);
+            assert_eq!(first_ref.start_offset, 0);
+            assert_ne!(second_ref.start_page_id, first_ref.start_page_id);
+            assert_eq!(second_ref.start_offset, 0);
+
+            let reader = ColumnDeletionBlobReader::new(&disk_pool);
+            let first_payload = reader.read(first_ref).await.unwrap();
+            let second_payload = reader.read(second_ref).await.unwrap();
+            assert_eq!(first_payload, first_blob);
+            assert_eq!(second_payload, second_blob);
         });
     }
 }

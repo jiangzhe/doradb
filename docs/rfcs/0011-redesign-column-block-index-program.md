@@ -4,6 +4,7 @@ title: Redesign Column Block Index Program
 status: proposal
 tags: [storage-engine, index, checkpoint, recovery, file-format]
 created: 2026-03-28
+github_issue: 494
 ---
 
 # RFC-0011: Redesign Column Block Index Program
