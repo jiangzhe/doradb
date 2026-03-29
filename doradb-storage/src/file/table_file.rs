@@ -20,6 +20,7 @@ use crate::file::super_page::{
     SUPER_PAGE_FOOTER_OFFSET, SUPER_PAGE_SIZE, SUPER_PAGE_VERSION, SuperPage, SuperPageBody,
     SuperPageFooter, SuperPageHeader, SuperPageSerView, parse_super_page,
 };
+use crate::index::{ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
@@ -290,10 +291,8 @@ pub struct MutableTableFile {
 
 /// One LWC page payload that should be persisted into table file pages.
 pub struct LwcPagePersist {
-    /// Inclusive start row id covered by this page.
-    pub start_row_id: RowID,
-    /// Exclusive end row id covered by this page.
-    pub end_row_id: RowID,
+    /// Phase-1 logical index-entry shape for this page before page-id assignment.
+    pub shape: ColumnBlockEntryShape,
     /// Serialized LWC page bytes.
     pub buf: DirectBuf,
 }
@@ -453,30 +452,26 @@ impl MutableTableFile {
         let mut last_end = self.root().pivot_row_id;
 
         for page in lwc_pages {
-            if page.start_row_id >= page.end_row_id {
-                return Err(Error::InvalidArgument);
-            }
+            let start_row_id = page.shape.start_row_id();
+            let end_row_id = page.shape.end_row_id();
             let page_id = self
                 .new_root_mut()
                 .try_allocate_page_id()
                 .ok_or(Error::InvalidState)?;
-            max_row_id = max_row_id.max(page.end_row_id);
-            if page.start_row_id < last_end {
+            max_row_id = max_row_id.max(end_row_id);
+            if start_row_id < last_end {
                 return Err(Error::InvalidArgument);
             }
-            last_end = page.end_row_id;
-            new_entries.push((page.start_row_id, page_id));
+            last_end = end_row_id;
+            new_entries.push(page.shape.with_block_id(page_id));
             writes.push(table_file.write_page(page_id, page.buf));
         }
 
         try_join_all(writes).await?;
 
         let root = self.root();
-        let column_index = crate::index::ColumnBlockIndex::new(
-            root.column_block_index_root,
-            root.pivot_row_id,
-            disk_pool,
-        );
+        let column_index =
+            ColumnBlockIndex::new(root.column_block_index_root, root.pivot_row_id, disk_pool);
         let new_root = column_index
             .batch_insert(self, &new_entries, max_row_id, ts)
             .await?;
@@ -833,13 +828,13 @@ mod tests {
 
             let lwc_pages = vec![
                 LwcPagePersist {
-                    start_row_id: 0,
-                    end_row_id: 10,
+                    shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
+                        .unwrap(),
                     buf: page_buf(b"lwc-page-1"),
                 },
                 LwcPagePersist {
-                    start_row_id: 10,
-                    end_row_id: 20,
+                    shape: ColumnBlockEntryShape::new(10, 20, (10..20).collect(), Vec::new())
+                        .unwrap(),
                     buf: page_buf(b"lwc-page-2"),
                 },
             ];
@@ -859,7 +854,7 @@ mod tests {
             assert_ne!(active_root.column_block_index_root, 0);
             let disk_pool = table_readonly_pool(&global, 43, &table_file);
 
-            let column_index = crate::index::ColumnBlockIndex::new(
+            let column_index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,
                 &disk_pool,
@@ -891,13 +886,13 @@ mod tests {
 
             let lwc_pages = vec![
                 LwcPagePersist {
-                    start_row_id: 0,
-                    end_row_id: 10,
+                    shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
+                        .unwrap(),
                     buf: page_buf(b"lwc-overlap-1"),
                 },
                 LwcPagePersist {
-                    start_row_id: 5,
-                    end_row_id: 15,
+                    shape: ColumnBlockEntryShape::new(5, 15, (5..15).collect(), Vec::new())
+                        .unwrap(),
                     buf: page_buf(b"lwc-overlap-2"),
                 },
             ];

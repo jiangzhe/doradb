@@ -11,8 +11,8 @@ use crate::file::multi_table_file::{
     MutableMultiTableFile,
 };
 use crate::index::{
-    ColumnBlockIndex, ColumnLeafEntry, ColumnPagePayloadPatch, OffloadedBitmapPatch,
-    encode_deletion_deltas_to_bytes, load_payload_deletion_deltas,
+    ColumnBlockEntryPatch, ColumnBlockEntryShape, ColumnBlockIndex, ColumnLeafEntry,
+    OffloadedBitmapPatch, encode_deletion_deltas_to_bytes, load_payload_deletion_deltas,
 };
 use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, PersistedLwcPage};
@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
 struct PendingLwcPage {
-    start_row_id: RowID,
+    shape: ColumnBlockEntryShape,
     buf: DirectBuf,
 }
 
@@ -260,7 +260,7 @@ impl CatalogStorage {
                 .decode_lwc_page_rows(last_entry.payload.block_id, metadata)
                 .await?;
             if !existing_tail_rows.is_empty()
-                && let Some((merged_tail_buf, consumed)) = self
+                && let Some((merged_tail_buf, merged_row_ids, consumed)) = self
                     .build_merged_tail_lwc_page(metadata, &existing_tail_rows, &live_inserts)
                     .await?
             {
@@ -269,11 +269,22 @@ impl CatalogStorage {
                     .write_page(new_tail_page_id, merged_tail_buf)
                     .await?;
                 mutable.record_gc_page(last_entry.payload.block_id);
-                let mut updated_payload = last_entry.payload;
-                updated_payload.block_id = new_tail_page_id;
-                let patches = [ColumnPagePayloadPatch {
+                let merged_end_row_id = live_inserts
+                    .get(consumed.saturating_sub(1))
+                    .map(|row| row.row_id.saturating_add(1))
+                    .unwrap_or(current_end_row_id);
+                let existing_deletes =
+                    load_payload_deletion_deltas(&base_index, last_entry).await?;
+                let replacement = ColumnBlockEntryShape::new(
+                    last_entry.start_row_id,
+                    merged_end_row_id,
+                    merged_row_ids,
+                    existing_deletes.into_iter().collect(),
+                )?
+                .with_block_id(new_tail_page_id);
+                let patches = [ColumnBlockEntryPatch {
                     start_row_id: last_entry.start_row_id,
-                    payload: updated_payload,
+                    entry: replacement,
                 }];
                 let column_index = ColumnBlockIndex::new(
                     current_root_page_id,
@@ -281,7 +292,7 @@ impl CatalogStorage {
                     &self.disk_pool,
                 );
                 current_root_page_id = column_index
-                    .batch_replace_payloads(mutable, &patches, checkpoint_cts)
+                    .batch_replace_entries(mutable, &patches, checkpoint_cts)
                     .await?;
                 entries_changed = true;
                 live_inserts.drain(0..consumed);
@@ -300,7 +311,7 @@ impl CatalogStorage {
             for page in new_pages {
                 let page_id = mutable.allocate_page_id()?;
                 mutable.write_page(page_id, page.buf).await?;
-                new_entries.push((page.start_row_id, page_id));
+                new_entries.push(page.shape.with_block_id(page_id));
             }
             if !new_entries.is_empty() {
                 let new_end_row_id = next_row_id.max(root.pivot_row_id);
@@ -487,8 +498,14 @@ impl CatalogStorage {
                 if builder_end <= start_row_id {
                     return Err(Error::InvalidState);
                 }
+                let shape = ColumnBlockEntryShape::new(
+                    start_row_id,
+                    builder_end,
+                    builder.row_ids().to_vec(),
+                    Vec::new(),
+                )?;
                 let buf = builder.build()?;
-                lwc_pages.push(PendingLwcPage { start_row_id, buf });
+                lwc_pages.push(PendingLwcPage { shape, buf });
 
                 builder = LwcBuilder::new(metadata);
                 builder_start = Some(row.row_id);
@@ -506,8 +523,14 @@ impl CatalogStorage {
             if builder_end <= start_row_id {
                 return Err(Error::InvalidState);
             }
+            let shape = ColumnBlockEntryShape::new(
+                start_row_id,
+                builder_end,
+                builder.row_ids().to_vec(),
+                Vec::new(),
+            )?;
             let buf = builder.build()?;
-            lwc_pages.push(PendingLwcPage { start_row_id, buf });
+            lwc_pages.push(PendingLwcPage { shape, buf });
         }
         Ok(lwc_pages)
     }
@@ -517,7 +540,7 @@ impl CatalogStorage {
         metadata: &TableMetadata,
         existing_tail_rows: &[RowRecord],
         inserts: &[RowRecord],
-    ) -> Result<Option<(DirectBuf, usize)>> {
+    ) -> Result<Option<(DirectBuf, Vec<RowID>, usize)>> {
         if existing_tail_rows.is_empty() || inserts.is_empty() {
             return Ok(None);
         }
@@ -556,8 +579,9 @@ impl CatalogStorage {
         if consumed == 0 {
             return Ok(None);
         }
+        let row_ids = builder.row_ids().to_vec();
         let buf = builder.build()?;
-        Ok(Some((buf, consumed)))
+        Ok(Some((buf, row_ids, consumed)))
     }
 }
 

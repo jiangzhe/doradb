@@ -765,6 +765,11 @@ impl<'a> LwcBuilder<'a> {
         self.buffer.len()
     }
 
+    #[inline]
+    pub(crate) fn row_ids(&self) -> &[RowID] {
+        &self.row_ids
+    }
+
     pub fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
         let view = page.vector_view(self.metadata);
         self.append_view(page, view)

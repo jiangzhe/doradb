@@ -11,10 +11,10 @@ pub(crate) const PAGE_INTEGRITY_TRAILER_SIZE: usize = mem::size_of::<PageIntegri
 pub(crate) const LWC_PAGE_SPEC: PageIntegritySpec = PageIntegritySpec::new(*b"LWCPAGE\0", 1);
 /// Page-integrity markers for persisted column block-index nodes.
 pub(crate) const COLUMN_BLOCK_INDEX_PAGE_SPEC: PageIntegritySpec =
-    PageIntegritySpec::new(*b"CBINDEX\0", 1);
-/// Page-integrity markers for persisted deletion-blob pages.
+    PageIntegritySpec::new(*b"CBINDEX\0", 2);
+/// Page-integrity markers for persisted column auxiliary-blob pages.
 pub(crate) const COLUMN_DELETION_BLOB_PAGE_SPEC: PageIntegritySpec =
-    PageIntegritySpec::new(*b"CDBLOB\0\0", 1);
+    PageIntegritySpec::new(*b"CDBLOB\0\0", 2);
 
 /// Expected page-envelope markers for one persisted CoW page kind.
 ///

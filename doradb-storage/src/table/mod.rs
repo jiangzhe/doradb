@@ -22,8 +22,8 @@ use crate::error::{Error, Result};
 use crate::file::table_file::{LwcPagePersist, TableFile};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    BlockIndex, GenericSecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex,
-    RowLocation, UniqueIndex,
+    BlockIndex, ColumnBlockEntryShape, GenericSecondaryIndex, IndexCompareExchange, IndexInsert,
+    NonUniqueIndex, RowLocation, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
 use crate::lwc::LwcBuilder;
@@ -599,7 +599,7 @@ impl Table {
         #[cfg(test)]
         {
             if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
-                return Err(crate::error::Error::InvalidState);
+                return Err(Error::InvalidState);
             }
         }
         let mut lwc_pages = Vec::new();
@@ -622,30 +622,34 @@ impl Table {
                     current_end = page_info.end_row_id;
                 }
                 if !builder.append_view(page, view)? {
+                    let shape = ColumnBlockEntryShape::new(
+                        current_start,
+                        current_end,
+                        builder.row_ids().to_vec(),
+                        Vec::new(),
+                    )?;
                     let buf = builder.build()?;
-                    lwc_pages.push(LwcPagePersist {
-                        start_row_id: current_start,
-                        end_row_id: current_end,
-                        buf,
-                    });
+                    lwc_pages.push(LwcPagePersist { shape, buf });
                     builder = LwcBuilder::new(metadata);
                     current_start = page_info.start_row_id;
                     current_end = page_info.end_row_id;
                     let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                     if !builder.append_view(page, view)? {
-                        return Err(crate::error::Error::InvalidState);
+                        return Err(Error::InvalidState);
                     }
                 } else {
                     current_end = page_info.end_row_id;
                 }
             }
             if !builder.is_empty() {
+                let shape = ColumnBlockEntryShape::new(
+                    current_start,
+                    current_end,
+                    builder.row_ids().to_vec(),
+                    Vec::new(),
+                )?;
                 let buf = builder.build()?;
-                lwc_pages.push(LwcPagePersist {
-                    start_row_id: current_start,
-                    end_row_id: current_end,
-                    buf,
-                });
+                lwc_pages.push(LwcPagePersist { shape, buf });
             }
         }
         Ok(lwc_pages)

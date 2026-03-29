@@ -4,6 +4,7 @@ title: Redesign Column Block Index Program
 status: proposal
 tags: [storage-engine, index, checkpoint, recovery, file-format]
 created: 2026-03-28
+github_issue: 494
 ---
 
 # RFC-0011: Redesign Column Block Index Program
@@ -259,10 +260,10 @@ The intended unsafe scope is limited:
   - Scope: Introduce the redesigned leaf page format, fixed-prefix addressing model, section headers, and page-builder CoW rebuild flow while keeping branch pages fixed-width.
   - Goals: Land the new leaf contract, exact common section header, phase-1 generic auxiliary-blob header, phase-1 `locate_block` metadata surface, row-id-domain delete sections, structural plus semantic validation, and root publication under one tree-format version.
   - Non-goals: Runtime ordinal fast path, ordinal delete persistence, optional delete synopsis fields, or mandatory row-id spill support.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000095-leaf-format-and-rebuilder-foundation.md`
+  - Task Issue: `#492`
+  - Phase Status: done
+  - Implementation Summary: 1. Implemented the RFC-0011 phase-1 leaf-format foundation in [Task Resolve Sync: docs/tasks/000095-leaf-format-and-rebuilder-foundation.md @ 2026-03-29]
 
 - **Phase 2: Checkpoint and Recovery Alignment**
   - Scope: Align deletion checkpoint, catalog checkpoint, recovery, and related persisted-state consumers with the redesigned leaf contract while preserving row-id-domain external semantics.

@@ -9,11 +9,14 @@ use crate::file::page_integrity::{
     COLUMN_BLOCK_INDEX_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
     write_page_checksum, write_page_header,
 };
-use crate::index::column_deletion_blob::{ColumnDeletionBlobReader, ColumnDeletionBlobWriter};
-use crate::index::column_payload::{BlobRef, ColumnPagePayload};
+use crate::index::column_deletion_blob::{
+    COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST, COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
+    ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
+};
+use crate::index::column_payload::{BlobRef, ColumnPagePayload, DeletionListError};
 use crate::io::DirectBuf;
 use crate::row::RowID;
-use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
+use bytemuck::{Pod, Zeroable, bytes_of, cast_slice, cast_slice_mut, try_cast_slice};
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
@@ -24,29 +27,49 @@ pub const COLUMN_BLOCK_HEADER_SIZE: usize = mem::size_of::<ColumnBlockNodeHeader
 pub const COLUMN_BLOCK_DATA_SIZE: usize = COLUMN_BLOCK_NODE_PAYLOAD_SIZE - COLUMN_BLOCK_HEADER_SIZE;
 pub const COLUMN_PAGE_PAYLOAD_SIZE: usize = mem::size_of::<ColumnPagePayload>();
 pub const COLUMN_BRANCH_ENTRY_SIZE: usize = mem::size_of::<ColumnBlockBranchEntry>();
-pub const COLUMN_BLOCK_MAX_ENTRIES: usize =
-    COLUMN_BLOCK_DATA_SIZE / (mem::size_of::<RowID>() + COLUMN_PAGE_PAYLOAD_SIZE);
+
+const COLUMN_LEAF_PREFIX_VERSION: u8 = 1;
+const COLUMN_ROW_SECTION_VERSION: u8 = 1;
+const COLUMN_DELETE_SECTION_VERSION: u8 = 1;
+const COLUMN_DELETE_DOMAIN_ROW_ID_DELTA: u8 = 1;
+const COLUMN_ROW_CODEC_NONE: u8 = 0;
+const COLUMN_ROW_CODEC_DENSE: u8 = 1;
+const COLUMN_ROW_CODEC_DELTA_LIST: u8 = 2;
+const COLUMN_DELETE_CODEC_NONE: u8 = 0;
+const COLUMN_DELETE_CODEC_INLINE_DELTA_LIST: u8 = 1;
+const COLUMN_DELETE_CODEC_EXTERNAL_BLOB: u8 = 2;
+const COLUMN_BLOB_REF_SIZE: usize =
+    mem::size_of::<PageID>() + mem::size_of::<u16>() + mem::size_of::<u32>();
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+struct ColumnBlockLeafPrefix {
+    start_row_id: [u8; 8],
+    block_id: [u8; 8],
+    row_id_span: [u8; 4],
+    first_present_delta: [u8; 4],
+    row_count: [u8; 2],
+    del_count: [u8; 2],
+    row_section_offset: [u8; 2],
+    row_section_len: [u8; 2],
+    delete_section_offset: [u8; 2],
+    delete_section_len: [u8; 2],
+    row_codec: u8,
+    delete_codec: u8,
+    delete_domain: u8,
+    prefix_version: u8,
+    flags: u8,
+    reserved: [u8; 7],
+}
+
+pub const COLUMN_BLOCK_LEAF_PREFIX_SIZE: usize = mem::size_of::<ColumnBlockLeafPrefix>();
+pub const COLUMN_BLOCK_MAX_ENTRIES: usize = COLUMN_BLOCK_DATA_SIZE / COLUMN_BLOCK_LEAF_PREFIX_SIZE;
 pub const COLUMN_BLOCK_MAX_BRANCH_ENTRIES: usize =
     COLUMN_BLOCK_DATA_SIZE / COLUMN_BRANCH_ENTRY_SIZE;
 
-const _: () = assert!(
-    COLUMN_BLOCK_HEADER_SIZE
-        + COLUMN_BLOCK_MAX_ENTRIES * (mem::size_of::<RowID>() + COLUMN_PAGE_PAYLOAD_SIZE)
-        <= COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
-    "ColumnBlockNode should fit into the persisted column-block payload"
-);
-
-const _: () = assert!(
-    mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
-    "ColumnBlockNode size must match the persisted column-block payload size"
-);
+const _: () = assert!(mem::size_of::<ColumnBlockLeafPrefix>() == 48);
 const _: () = assert!(mem::size_of::<ColumnBlockBranchEntry>() == 16);
-const _: () = assert!(COLUMN_BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<RowID>()));
-const _: () =
-    assert!(COLUMN_BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<ColumnPagePayload>()));
-const _: () =
-    assert!(COLUMN_BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<ColumnBlockBranchEntry>()));
-const _: () = assert!(mem::size_of::<RowID>().is_multiple_of(mem::align_of::<ColumnPagePayload>()));
+const _: () = assert!(mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_NODE_PAYLOAD_SIZE);
 
 #[repr(C)]
 /// Header stored at the beginning of each on-disk column block-index node.
@@ -59,7 +82,7 @@ pub struct ColumnBlockNodeHeader {
 }
 
 #[repr(C)]
-/// Branch entry mapping a start row id to child node page id.
+/// Branch entry mapping a child lower bound to a child page id.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
 pub struct ColumnBlockBranchEntry {
     pub start_row_id: RowID,
@@ -67,7 +90,7 @@ pub struct ColumnBlockBranchEntry {
 }
 
 #[repr(C)]
-/// One column block-index node, either leaf (`height == 0`) or branch.
+/// Fixed-size node payload protected by the shared page-integrity envelope.
 #[derive(Clone)]
 pub struct ColumnBlockNode {
     pub header: ColumnBlockNodeHeader,
@@ -77,7 +100,8 @@ pub struct ColumnBlockNode {
 impl ColumnBlockNode {
     #[inline]
     fn new_boxed(height: u32, start_row_id: RowID, create_ts: u64) -> Box<Self> {
-        // SAFETY: zeroed bytes are valid for `ColumnBlockNode` (all integer/byte fields).
+        // SAFETY: `ColumnBlockNode` contains only integer and byte-array fields,
+        // so the all-zero bit pattern is valid for the whole value.
         let mut node = unsafe { Box::<ColumnBlockNode>::new_zeroed().assume_init() };
         node.header = ColumnBlockNodeHeader {
             height,
@@ -88,112 +112,398 @@ impl ColumnBlockNode {
         node
     }
 
-    /// Returns mutable leaf start-row-id array.
     #[inline]
-    pub fn leaf_start_row_ids_mut(&mut self) -> &mut [RowID] {
-        debug_assert!(self.is_leaf());
-        self.leaf_row_ids_mut_with_count(self.header.count as usize)
+    fn data_ref(&self) -> &[u8] {
+        &self.data
     }
 
-    /// Returns mutable leaf payload array.
     #[inline]
-    pub fn leaf_payloads_mut(&mut self) -> &mut [ColumnPagePayload] {
-        debug_assert!(self.is_leaf());
-        let count = self.header.count as usize;
-        self.leaf_payloads_mut_with_count(count)
+    fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
     }
 
-    /// Returns mutable views of leaf row ids and payloads in one call.
     #[inline]
-    pub fn leaf_arrays_mut(&mut self) -> (&mut [RowID], &mut [ColumnPagePayload]) {
-        debug_assert!(self.is_leaf());
-        let count = self.header.count as usize;
-        debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-        let row_bytes = count * mem::size_of::<RowID>();
-        let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
-        let (row_region, remain) = self.data.split_at_mut(row_bytes);
-        let (payload_region, _) = remain.split_at_mut(payload_bytes);
-        (cast_slice_mut(row_region), cast_slice_mut(payload_region))
+    fn branch_entries_mut(&mut self) -> &mut [ColumnBlockBranchEntry] {
+        branch_entries_from_bytes_mut(&mut self.data, self.header.count as usize)
     }
+}
 
-    /// Returns mutable branch entries.
-    #[inline]
-    pub fn branch_entries_mut(&mut self) -> &mut [ColumnBlockBranchEntry] {
-        debug_assert!(self.is_branch());
-        self.branch_entries_mut_with_count(self.header.count as usize)
-    }
+/// Row-shape metadata carried alongside one freshly built LWC page before the
+/// page id is assigned in the table file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnBlockEntryShape {
+    start_row_id: RowID,
+    end_row_id: RowID,
+    row_ids: Vec<RowID>,
+    delete_deltas: Vec<u32>,
+}
 
-    /// Appends one branch entry.
-    #[inline]
-    pub fn branch_add_entry(&mut self, start_row_id: RowID, page_id: PageID) {
-        debug_assert!(self.is_branch());
-        debug_assert!((self.header.count as usize) < COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-        let idx = self.header.count as usize;
-        self.header.count += 1;
-        self.branch_entries_mut()[idx] = ColumnBlockBranchEntry {
+impl ColumnBlockEntryShape {
+    /// Builds one validated phase-1 logical entry shape.
+    pub(crate) fn new(
+        start_row_id: RowID,
+        end_row_id: RowID,
+        row_ids: Vec<RowID>,
+        mut delete_deltas: Vec<u32>,
+    ) -> Result<Self> {
+        if start_row_id >= end_row_id || row_ids.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        validate_row_ids(&row_ids, start_row_id, end_row_id)?;
+        delete_deltas.sort_unstable();
+        delete_deltas.dedup();
+        Ok(ColumnBlockEntryShape {
             start_row_id,
-            page_id,
+            end_row_id,
+            row_ids,
+            delete_deltas,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn start_row_id(&self) -> RowID {
+        self.start_row_id
+    }
+
+    #[inline]
+    pub(crate) fn end_row_id(&self) -> RowID {
+        self.end_row_id
+    }
+
+    pub(crate) fn set_end_row_id(&mut self, end_row_id: RowID) -> Result<()> {
+        validate_row_ids(&self.row_ids, self.start_row_id, end_row_id)?;
+        self.end_row_id = end_row_id;
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn with_block_id(self, block_id: PageID) -> ColumnBlockEntryInput {
+        ColumnBlockEntryInput {
+            start_row_id: self.start_row_id,
+            end_row_id: self.end_row_id,
+            block_id,
+            row_ids: self.row_ids,
+            delete_deltas: self.delete_deltas,
+        }
+    }
+}
+
+/// Fully materialized phase-1 logical entry used by v2 builders and rewrite flows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnBlockEntryInput {
+    start_row_id: RowID,
+    end_row_id: RowID,
+    block_id: PageID,
+    row_ids: Vec<RowID>,
+    delete_deltas: Vec<u32>,
+}
+
+impl ColumnBlockEntryInput {
+    #[inline]
+    pub(crate) fn start_row_id(&self) -> RowID {
+        self.start_row_id
+    }
+}
+
+/// One full logical-entry replacement keyed by leaf `start_row_id`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnBlockEntryPatch {
+    pub start_row_id: RowID,
+    pub entry: ColumnBlockEntryInput,
+}
+
+/// One resolved leaf entry from the persisted column block-index tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnLeafEntry {
+    pub leaf_page_id: PageID,
+    pub start_row_id: RowID,
+    pub payload: ColumnPagePayload,
+    end_row_id: RowID,
+    row_count: u16,
+    del_count: u16,
+    row_id_span: u32,
+    first_present_delta: u32,
+    row_section_offset: u16,
+    row_section_len: u16,
+    delete_section_offset: u16,
+    delete_section_len: u16,
+    row_section_kind: u8,
+    row_section_version: u8,
+    row_section_flags: u8,
+    row_section_aux: u8,
+    delete_section_kind: u8,
+    delete_section_version: u8,
+    delete_section_flags: u8,
+    delete_section_aux: u8,
+    delete_domain: u8,
+}
+
+impl ColumnLeafEntry {
+    /// Returns the exclusive coverage upper bound of this persisted entry.
+    #[inline]
+    pub fn end_row_id(&self) -> RowID {
+        self.end_row_id
+    }
+
+    /// Returns the decoded persisted row count.
+    #[inline]
+    pub fn row_count(&self) -> u16 {
+        self.row_count
+    }
+
+    /// Returns the decoded persisted delete count.
+    #[inline]
+    pub fn del_count(&self) -> u16 {
+        self.del_count
+    }
+}
+
+/// One bitmap update patch keyed by leaf `start_row_id`.
+#[derive(Clone, Copy, Debug)]
+pub struct OffloadedBitmapPatch<'a> {
+    pub start_row_id: RowID,
+    pub bitmap_bytes: &'a [u8],
+}
+
+/// One full payload replacement patch keyed by leaf `start_row_id`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnPagePayloadPatch {
+    pub start_row_id: RowID,
+    pub payload: ColumnPagePayload,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LogicalRowSet {
+    Dense {
+        row_id_span: u32,
+    },
+    DeltaList {
+        row_id_span: u32,
+        first_present_delta: u32,
+        deltas: Vec<u32>,
+    },
+}
+
+impl LogicalRowSet {
+    fn from_row_ids(start_row_id: RowID, end_row_id: RowID, row_ids: &[RowID]) -> Result<Self> {
+        validate_row_ids(row_ids, start_row_id, end_row_id)?;
+        let span_u64 = end_row_id
+            .checked_sub(start_row_id)
+            .ok_or(Error::InvalidArgument)?;
+        if span_u64 == 0 || span_u64 > u32::MAX as u64 {
+            return Err(Error::InvalidArgument);
+        }
+        let row_id_span = span_u64 as u32;
+        let dense = row_ids.len() == row_id_span as usize
+            && row_ids
+                .iter()
+                .enumerate()
+                .all(|(idx, row_id)| *row_id == start_row_id + idx as RowID);
+        if dense {
+            return Ok(LogicalRowSet::Dense { row_id_span });
+        }
+        let deltas = row_ids
+            .iter()
+            .map(|row_id| {
+                let delta = row_id
+                    .checked_sub(start_row_id)
+                    .ok_or(Error::InvalidArgument)?;
+                if delta > u32::MAX as u64 {
+                    return Err(Error::InvalidArgument);
+                }
+                Ok(delta as u32)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let first_present_delta = *deltas.first().ok_or(Error::InvalidArgument)?;
+        Ok(LogicalRowSet::DeltaList {
+            row_id_span,
+            first_present_delta,
+            deltas,
+        })
+    }
+
+    fn contains_delta(&self, delta: u32) -> bool {
+        match self {
+            LogicalRowSet::Dense { row_id_span } => delta < *row_id_span,
+            LogicalRowSet::DeltaList { deltas, .. } => deltas.binary_search(&delta).is_ok(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LogicalDeleteSet {
+    None,
+    Inline(Vec<u32>),
+    External {
+        del_count: u16,
+        blob_ref: BlobRef,
+        deltas: Option<Vec<u32>>,
+    },
+}
+
+impl LogicalDeleteSet {
+    #[inline]
+    fn del_count(&self) -> Result<u16> {
+        match self {
+            LogicalDeleteSet::None => Ok(0),
+            LogicalDeleteSet::Inline(deltas) => storage_count_u16(deltas.len()),
+            LogicalDeleteSet::External { del_count, .. } => Ok(*del_count),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LogicalLeafEntry {
+    start_row_id: RowID,
+    block_id: PageID,
+    row_set: LogicalRowSet,
+    delete_set: LogicalDeleteSet,
+}
+
+impl LogicalLeafEntry {
+    fn from_input(input: &ColumnBlockEntryInput) -> Result<Self> {
+        if input.block_id == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let row_set =
+            LogicalRowSet::from_row_ids(input.start_row_id, input.end_row_id, &input.row_ids)?;
+        let delete_set = if input.delete_deltas.is_empty() {
+            LogicalDeleteSet::None
+        } else {
+            LogicalDeleteSet::Inline(input.delete_deltas.clone())
         };
+        Ok(LogicalLeafEntry {
+            start_row_id: input.start_row_id,
+            block_id: input.block_id,
+            row_set,
+            delete_set,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedLeafPatch {
+    ReplaceEntry {
+        start_row_id: RowID,
+        entry: LogicalLeafEntry,
+    },
+    ReplacePayload {
+        start_row_id: RowID,
+        block_id: PageID,
+        delete_set: LogicalDeleteSet,
+    },
+}
+
+impl ResolvedLeafPatch {
+    #[inline]
+    fn start_row_id(&self) -> RowID {
+        match self {
+            ResolvedLeafPatch::ReplaceEntry { start_row_id, .. } => *start_row_id,
+            ResolvedLeafPatch::ReplacePayload { start_row_id, .. } => *start_row_id,
+        }
+    }
+
+    fn apply(&self, entry: &mut LogicalLeafEntry) -> Result<()> {
+        match self {
+            ResolvedLeafPatch::ReplaceEntry {
+                start_row_id,
+                entry: replacement,
+            } => {
+                if replacement.start_row_id != *start_row_id {
+                    return Err(Error::InvalidArgument);
+                }
+                *entry = replacement.clone();
+            }
+            ResolvedLeafPatch::ReplacePayload {
+                block_id,
+                delete_set,
+                ..
+            } => {
+                entry.block_id = *block_id;
+                entry.delete_set = delete_set.clone();
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct EncodedLeafEntry {
+    start_row_id: RowID,
+    block_id: PageID,
+    row_id_span: u32,
+    first_present_delta: u32,
+    row_count: u16,
+    del_count: u16,
+    row_section_kind: u8,
+    delete_section_kind: u8,
+    delete_domain: u8,
+    row_section: Vec<u8>,
+    delete_section: Vec<u8>,
+}
+
+impl EncodedLeafEntry {
+    fn from_logical(entry: &LogicalLeafEntry) -> Result<Self> {
+        let (row_section_kind, row_section, row_id_span, first_present_delta, row_count) =
+            encode_row_section(&entry.row_set)?;
+        let (delete_section_kind, delete_domain, delete_section) =
+            encode_delete_section(&entry.delete_set)?;
+        Ok(EncodedLeafEntry {
+            start_row_id: entry.start_row_id,
+            block_id: entry.block_id,
+            row_id_span,
+            first_present_delta,
+            row_count,
+            del_count: entry.delete_set.del_count()?,
+            row_section_kind,
+            delete_section_kind,
+            delete_domain,
+            row_section,
+            delete_section,
+        })
     }
 
     #[inline]
-    fn leaf_row_ids_mut_with_count(&mut self, count: usize) -> &mut [RowID] {
-        leaf_row_ids_from_bytes_mut(&mut self.data, count)
+    fn encoded_len(&self) -> usize {
+        COLUMN_BLOCK_LEAF_PREFIX_SIZE + self.row_section.len() + self.delete_section.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SectionHeader {
+    kind: u8,
+    version: u8,
+    flags: u8,
+    aux: u8,
+}
+
+impl SectionHeader {
+    #[inline]
+    fn encode(self) -> [u8; 4] {
+        [self.kind, self.version, self.flags, self.aux]
     }
 
     #[inline]
-    fn leaf_payloads_mut_with_count(&mut self, count: usize) -> &mut [ColumnPagePayload] {
-        leaf_payloads_from_bytes_mut(&mut self.data, count)
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 4 {
+            return Err(Error::InvalidFormat);
+        }
+        Ok(SectionHeader {
+            kind: bytes[0],
+            version: bytes[1],
+            flags: bytes[2],
+            aux: bytes[3],
+        })
     }
-
-    #[inline]
-    fn branch_entries_mut_with_count(&mut self, count: usize) -> &mut [ColumnBlockBranchEntry] {
-        branch_entries_from_bytes_mut(&mut self.data, count)
-    }
 }
 
-#[inline]
-fn leaf_row_ids_from_bytes(data: &[u8], count: usize) -> &[RowID] {
-    debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-    let row_bytes = count * mem::size_of::<RowID>();
-    cast_slice(&data[..row_bytes])
-}
-
-#[inline]
-fn leaf_row_ids_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [RowID] {
-    debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-    let row_bytes = count * mem::size_of::<RowID>();
-    cast_slice_mut(&mut data[..row_bytes])
-}
-
-#[inline]
-fn leaf_payloads_from_bytes(data: &[u8], count: usize) -> &[ColumnPagePayload] {
-    debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-    let row_bytes = count * mem::size_of::<RowID>();
-    let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
-    cast_slice(&data[row_bytes..row_bytes + payload_bytes])
-}
-
-#[inline]
-fn leaf_payloads_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnPagePayload] {
-    debug_assert!(count <= COLUMN_BLOCK_MAX_ENTRIES);
-    let row_bytes = count * mem::size_of::<RowID>();
-    let payload_bytes = count * mem::size_of::<ColumnPagePayload>();
-    cast_slice_mut(&mut data[row_bytes..row_bytes + payload_bytes])
-}
-
-#[inline]
-fn branch_entries_from_bytes(data: &[u8], count: usize) -> &[ColumnBlockBranchEntry] {
-    debug_assert!(count <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
-    cast_slice(&data[..bytes_len])
-}
-
-#[inline]
-fn branch_entries_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnBlockBranchEntry] {
-    debug_assert!(count <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
-    cast_slice_mut(&mut data[..bytes_len])
+#[derive(Clone, Debug)]
+struct LeafEntryView<'a> {
+    prefix: ColumnBlockLeafPrefix,
+    row_section: &'a [u8],
+    delete_section: Option<&'a [u8]>,
+    row_header: SectionHeader,
+    delete_header: Option<SectionHeader>,
 }
 
 trait ColumnBlockNodeRead {
@@ -204,27 +514,8 @@ trait ColumnBlockNodeRead {
     fn is_leaf(&self) -> bool {
         self.header_ref().height == 0
     }
-
-    #[inline]
-    fn is_branch(&self) -> bool {
-        !self.is_leaf()
-    }
-
-    #[inline]
-    fn leaf_start_row_ids(&self) -> &[RowID] {
-        debug_assert!(self.is_leaf());
-        leaf_row_ids_from_bytes(self.data_ref(), self.header_ref().count as usize)
-    }
-
-    #[inline]
-    fn leaf_payloads(&self) -> &[ColumnPagePayload] {
-        debug_assert!(self.is_leaf());
-        leaf_payloads_from_bytes(self.data_ref(), self.header_ref().count as usize)
-    }
-
     #[inline]
     fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
-        debug_assert!(self.is_branch());
         branch_entries_from_bytes(self.data_ref(), self.header_ref().count as usize)
     }
 }
@@ -247,66 +538,9 @@ pub struct ColumnBlockIndex<'a> {
     end_row_id: RowID,
 }
 
-/// One resolved leaf entry from the persisted column block-index tree.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ColumnLeafEntry {
-    pub leaf_page_id: PageID,
-    pub start_row_id: RowID,
-    pub payload: ColumnPagePayload,
-}
-
-/// One bitmap update patch keyed by leaf `start_row_id`.
-#[derive(Clone, Copy, Debug)]
-pub struct OffloadedBitmapPatch<'a> {
-    pub start_row_id: RowID,
-    pub bitmap_bytes: &'a [u8],
-}
-
-/// One full payload replacement patch keyed by leaf `start_row_id`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ColumnPagePayloadPatch {
-    pub start_row_id: RowID,
-    pub payload: ColumnPagePayload,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OffloadedBitmapRefPatch {
-    start_row_id: RowID,
-    blob_ref: BlobRef,
-}
-
-trait LeafPayloadPatch: Copy {
-    fn start_row_id(&self) -> RowID;
-    fn apply_payload(&self, payload: &mut ColumnPagePayload);
-}
-
-impl LeafPayloadPatch for OffloadedBitmapRefPatch {
-    #[inline]
-    fn start_row_id(&self) -> RowID {
-        self.start_row_id
-    }
-
-    #[inline]
-    fn apply_payload(&self, payload: &mut ColumnPagePayload) {
-        payload.clear_inline_and_set_offloaded(self.blob_ref);
-    }
-}
-
-impl LeafPayloadPatch for ColumnPagePayloadPatch {
-    #[inline]
-    fn start_row_id(&self) -> RowID {
-        self.start_row_id
-    }
-
-    #[inline]
-    fn apply_payload(&self, payload: &mut ColumnPagePayload) {
-        *payload = self.payload;
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct NodeUpdateResult {
-    new_page_id: PageID,
+#[derive(Clone, Debug)]
+struct NodeRewriteResult {
+    entries: Vec<ColumnBlockBranchEntry>,
     touched: bool,
 }
 
@@ -362,22 +596,15 @@ fn validated_node_payload(page: &[u8]) -> &[u8] {
 }
 
 #[inline]
-fn parse_validated_node_header(
-    page: &[u8],
-    file_kind: PersistedFileKind,
-    page_id: PageID,
-) -> Result<ColumnBlockNodeHeader> {
-    let payload = validated_node_payload(page);
-    let header =
-        bytemuck::try_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
-            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-    let count = header.count as usize;
-    if (header.height == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
-        || (header.height > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
-    {
-        return Err(invalid_node_payload(file_kind, page_id));
-    }
-    Ok(*header)
+fn branch_entries_from_bytes(data: &[u8], count: usize) -> &[ColumnBlockBranchEntry] {
+    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
+    cast_slice(&data[..bytes_len])
+}
+
+#[inline]
+fn branch_entries_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnBlockBranchEntry] {
+    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
+    cast_slice_mut(&mut data[..bytes_len])
 }
 
 struct ValidatedColumnBlockNode {
@@ -392,8 +619,82 @@ impl ValidatedColumnBlockNode {
         file_kind: PersistedFileKind,
         page_id: PageID,
     ) -> Result<Self> {
-        let header = parse_validated_node_header(guard.page(), file_kind, page_id)?;
+        let (_, header) = validate_node_payload(guard.page(), file_kind, page_id)?;
         Ok(ValidatedColumnBlockNode { guard, header })
+    }
+
+    fn leaf_prefixes(
+        &self,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<&[ColumnBlockLeafPrefix]> {
+        let count = self.header.count as usize;
+        let prefix_bytes = count * COLUMN_BLOCK_LEAF_PREFIX_SIZE;
+        let data = self.data_ref();
+        let prefixes = try_cast_slice(&data[..prefix_bytes])
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        validate_leaf_prefixes(prefixes, self.header.start_row_id, data, file_kind, page_id)?;
+        Ok(prefixes)
+    }
+
+    fn leaf_entry_view(
+        &self,
+        idx: usize,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<LeafEntryView<'_>> {
+        let prefixes = self.leaf_prefixes(file_kind, page_id)?;
+        let prefix = *prefixes
+            .get(idx)
+            .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+        let data = self.data_ref();
+        let prefix_end = prefixes.len() * COLUMN_BLOCK_LEAF_PREFIX_SIZE;
+        let row_section = section_slice(
+            data,
+            prefix_end,
+            prefix.row_section_offset(),
+            prefix.row_section_len(),
+            file_kind,
+            page_id,
+        )?;
+        let row_header = SectionHeader::decode(row_section)
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        if row_header.kind != prefix.row_codec() || row_header.version != COLUMN_ROW_SECTION_VERSION
+        {
+            return Err(invalid_node_payload(file_kind, page_id));
+        }
+        let delete_section = if prefix.delete_section_len() == 0 {
+            None
+        } else {
+            Some(section_slice(
+                data,
+                prefix_end,
+                prefix.delete_section_offset(),
+                prefix.delete_section_len(),
+                file_kind,
+                page_id,
+            )?)
+        };
+        let delete_header = match delete_section {
+            Some(bytes) => {
+                let header = SectionHeader::decode(bytes)
+                    .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+                if header.kind != prefix.delete_codec()
+                    || header.version != COLUMN_DELETE_SECTION_VERSION
+                {
+                    return Err(invalid_node_payload(file_kind, page_id));
+                }
+                Some(header)
+            }
+            None => None,
+        };
+        Ok(LeafEntryView {
+            prefix,
+            row_section,
+            delete_section,
+            row_header,
+            delete_header,
+        })
     }
 }
 
@@ -407,6 +708,107 @@ impl ColumnBlockNodeRead for ValidatedColumnBlockNode {
     fn data_ref(&self) -> &[u8] {
         let payload = validated_node_payload(self.guard.page());
         &payload[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
+    }
+}
+
+impl ColumnBlockLeafPrefix {
+    #[inline]
+    fn start_row_id(&self) -> RowID {
+        u64::from_le_bytes(self.start_row_id)
+    }
+
+    #[inline]
+    fn block_id(&self) -> PageID {
+        u64::from_le_bytes(self.block_id)
+    }
+
+    #[inline]
+    fn row_id_span(&self) -> u32 {
+        u32::from_le_bytes(self.row_id_span)
+    }
+
+    #[inline]
+    fn first_present_delta(&self) -> u32 {
+        u32::from_le_bytes(self.first_present_delta)
+    }
+
+    #[inline]
+    fn row_count(&self) -> u16 {
+        u16::from_le_bytes(self.row_count)
+    }
+
+    #[inline]
+    fn del_count(&self) -> u16 {
+        u16::from_le_bytes(self.del_count)
+    }
+
+    #[inline]
+    fn row_section_offset(&self) -> u16 {
+        u16::from_le_bytes(self.row_section_offset)
+    }
+
+    #[inline]
+    fn row_section_len(&self) -> u16 {
+        u16::from_le_bytes(self.row_section_len)
+    }
+
+    #[inline]
+    fn delete_section_offset(&self) -> u16 {
+        u16::from_le_bytes(self.delete_section_offset)
+    }
+
+    #[inline]
+    fn delete_section_len(&self) -> u16 {
+        u16::from_le_bytes(self.delete_section_len)
+    }
+
+    #[inline]
+    fn row_codec(&self) -> u8 {
+        self.row_codec
+    }
+
+    #[inline]
+    fn delete_codec(&self) -> u8 {
+        self.delete_codec
+    }
+
+    #[inline]
+    fn delete_domain(&self) -> u8 {
+        self.delete_domain
+    }
+
+    #[inline]
+    fn end_row_id(&self) -> Result<RowID> {
+        self.start_row_id()
+            .checked_add(self.row_id_span() as RowID)
+            .ok_or(Error::InvalidFormat)
+    }
+
+    fn from_encoded(
+        entry: &EncodedLeafEntry,
+        row_section_offset: u16,
+        row_section_len: u16,
+        delete_section_offset: u16,
+        delete_section_len: u16,
+    ) -> Self {
+        ColumnBlockLeafPrefix {
+            start_row_id: entry.start_row_id.to_le_bytes(),
+            block_id: entry.block_id.to_le_bytes(),
+            row_id_span: entry.row_id_span.to_le_bytes(),
+            first_present_delta: entry.first_present_delta.to_le_bytes(),
+            row_count: entry.row_count.to_le_bytes(),
+            del_count: entry.del_count.to_le_bytes(),
+            row_section_offset: row_section_offset.to_le_bytes(),
+            row_section_len: row_section_len.to_le_bytes(),
+            delete_section_offset: delete_section_offset.to_le_bytes(),
+            delete_section_len: delete_section_len.to_le_bytes(),
+            row_codec: entry.row_section_kind,
+            delete_codec: entry.delete_section_kind,
+            delete_domain: entry.delete_domain,
+            prefix_version: COLUMN_LEAF_PREFIX_VERSION,
+            flags: 0,
+            reserved: [0; 7],
+        }
     }
 }
 
@@ -447,17 +849,13 @@ impl<'a> ColumnBlockIndex<'a> {
         ValidatedColumnBlockNode::try_from_guard(g, self.file_kind(), page_id)
     }
 
-    /// Finds the column page payload containing `row_id`.
-    ///
-    /// Returns `Ok(None)` when `row_id` is not persisted in this column range.
+    /// Finds the compatibility payload containing `row_id`.
     pub async fn find(&self, row_id: RowID) -> Result<Option<ColumnPagePayload>> {
-        Ok(self.find_entry(row_id).await?.map(|entry| entry.payload))
+        Ok(self.locate_block(row_id).await?.map(|entry| entry.payload))
     }
 
-    /// Finds the leaf entry containing `row_id`.
-    ///
-    /// Returns `Ok(None)` when `row_id` is not persisted in this column range.
-    pub async fn find_entry(&self, row_id: RowID) -> Result<Option<ColumnLeafEntry>> {
+    /// Finds the persisted leaf entry whose coverage contains `row_id`.
+    pub async fn locate_block(&self, row_id: RowID) -> Result<Option<ColumnLeafEntry>> {
         if self.root_page_id == 0 || row_id >= self.end_row_id {
             return Ok(None);
         }
@@ -465,16 +863,16 @@ impl<'a> ColumnBlockIndex<'a> {
         loop {
             let node = self.read_node(page_id).await?;
             if node.is_leaf() {
-                let start_row_ids = node.leaf_start_row_ids();
-                let idx = match search_start_row_id(start_row_ids, row_id) {
+                let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
+                let idx = match search_start_row_id(prefixes, row_id) {
                     Some(idx) => idx,
                     None => return Ok(None),
                 };
-                return Ok(Some(ColumnLeafEntry {
-                    leaf_page_id: page_id,
-                    start_row_id: start_row_ids[idx],
-                    payload: node.leaf_payloads()[idx],
-                }));
+                let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
+                if !entry_contains_row_id(&view, row_id, self.file_kind(), page_id)? {
+                    return Ok(None);
+                }
+                return Ok(Some(build_leaf_entry(page_id, &view, self.file_kind())?));
             }
             let entries = node.branch_entries();
             let idx = match search_branch_entry(entries, row_id) {
@@ -485,9 +883,13 @@ impl<'a> ColumnBlockIndex<'a> {
         }
     }
 
-    /// Reads offloaded bitmap bytes referenced by payload.
-    ///
-    /// Returns `Ok(None)` when payload is inline-only.
+    /// Compatibility alias for the old entry lookup surface.
+    #[inline]
+    pub async fn find_entry(&self, row_id: RowID) -> Result<Option<ColumnLeafEntry>> {
+        self.locate_block(row_id).await
+    }
+
+    /// Reads delete payload bytes from an external blob reference.
     pub async fn read_offloaded_bitmap_bytes(
         &self,
         entry: &ColumnLeafEntry,
@@ -501,8 +903,134 @@ impl<'a> ColumnBlockIndex<'a> {
             Err(err) => return Err(err),
         };
         let reader = ColumnDeletionBlobReader::new(self.disk_pool);
-        let bytes = reader.read(blob_ref).await?;
-        Ok(Some(bytes))
+        let (header, payload) =
+            reader
+                .read_framed_blob(blob_ref)
+                .await
+                .map_err(|err| match err {
+                    Error::InvalidFormat => Error::persisted_page_corrupted(
+                        self.file_kind(),
+                        PersistedPageKind::ColumnDeletionBlob,
+                        blob_ref.start_page_id,
+                        PersistedPageCorruptionCause::InvalidPayload,
+                    ),
+                    other => other,
+                })?;
+        if entry.delete_section_kind != COLUMN_DELETE_CODEC_EXTERNAL_BLOB
+            || entry.delete_section_aux != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
+            || header.blob_kind() != entry.delete_section_aux
+            || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
+            || header.codec_version() != entry.delete_section_version
+        {
+            return Err(Error::persisted_page_corrupted(
+                self.file_kind(),
+                PersistedPageKind::ColumnDeletionBlob,
+                blob_ref.start_page_id,
+                PersistedPageCorruptionCause::InvalidPayload,
+            ));
+        }
+        Ok(Some(payload))
+    }
+
+    /// Loads validated delete deltas for one persisted entry.
+    pub(crate) async fn load_delete_deltas(&self, entry: &ColumnLeafEntry) -> Result<Vec<u32>> {
+        let node = self.read_node(entry.leaf_page_id).await?;
+        let prefixes = node.leaf_prefixes(self.file_kind(), entry.leaf_page_id)?;
+        let idx = prefixes
+            .binary_search_by_key(&entry.start_row_id, |prefix| prefix.start_row_id())
+            .map_err(|_| invalid_node_payload(self.file_kind(), entry.leaf_page_id))?;
+        let view = node.leaf_entry_view(idx, self.file_kind(), entry.leaf_page_id)?;
+        let row_set = decode_logical_row_set(&view, self.file_kind(), entry.leaf_page_id)?;
+        let delete_set = self
+            .decode_logical_delete_set(&view, &row_set, entry.leaf_page_id)
+            .await?;
+        Ok(match delete_set {
+            LogicalDeleteSet::None => Vec::new(),
+            LogicalDeleteSet::Inline(deltas) => deltas,
+            LogicalDeleteSet::External { deltas, .. } => deltas.ok_or(Error::InvalidState)?,
+        })
+    }
+
+    async fn decode_logical_delete_set(
+        &self,
+        view: &LeafEntryView<'_>,
+        row_set: &LogicalRowSet,
+        page_id: PageID,
+    ) -> Result<LogicalDeleteSet> {
+        match view.prefix.delete_codec() {
+            COLUMN_DELETE_CODEC_NONE => Ok(LogicalDeleteSet::None),
+            COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
+                let bytes = view
+                    .delete_section
+                    .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?;
+                let deltas = decode_u32_delta_list(
+                    &bytes[4..],
+                    view.prefix.del_count(),
+                    row_set,
+                    self.file_kind(),
+                    page_id,
+                )?;
+                Ok(LogicalDeleteSet::Inline(deltas))
+            }
+            COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
+                let bytes = view
+                    .delete_section
+                    .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?;
+                let blob_ref = decode_blob_ref(&bytes[4..])
+                    .map_err(|_| invalid_node_payload(self.file_kind(), page_id))?;
+                let reader = ColumnDeletionBlobReader::new(self.disk_pool);
+                let (header, payload) =
+                    reader
+                        .read_framed_blob(blob_ref)
+                        .await
+                        .map_err(|err| match err {
+                            Error::InvalidFormat => Error::persisted_page_corrupted(
+                                self.file_kind(),
+                                PersistedPageKind::ColumnDeletionBlob,
+                                blob_ref.start_page_id,
+                                PersistedPageCorruptionCause::InvalidPayload,
+                            ),
+                            other => other,
+                        })?;
+                if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
+                    || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
+                    || header.codec_version()
+                        != view
+                            .delete_header
+                            .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?
+                            .version
+                {
+                    return Err(Error::persisted_page_corrupted(
+                        self.file_kind(),
+                        PersistedPageKind::ColumnDeletionBlob,
+                        blob_ref.start_page_id,
+                        PersistedPageCorruptionCause::InvalidPayload,
+                    ));
+                }
+                let deltas = decode_u32_delta_list(
+                    &payload,
+                    view.prefix.del_count(),
+                    row_set,
+                    self.file_kind(),
+                    page_id,
+                )
+                .map_err(|err| match err {
+                    Error::InvalidFormat => Error::persisted_page_corrupted(
+                        self.file_kind(),
+                        PersistedPageKind::ColumnDeletionBlob,
+                        blob_ref.start_page_id,
+                        PersistedPageCorruptionCause::InvalidPayload,
+                    ),
+                    other => other,
+                })?;
+                Ok(LogicalDeleteSet::External {
+                    del_count: view.prefix.del_count(),
+                    blob_ref,
+                    deltas: Some(deltas),
+                })
+            }
+            _ => Err(invalid_node_payload(self.file_kind(), page_id)),
+        }
     }
 
     /// Collects all leaf entries in ascending `start_row_id` order.
@@ -512,23 +1040,26 @@ impl<'a> ColumnBlockIndex<'a> {
         }
         let mut stack = vec![self.root_page_id];
         let mut entries = Vec::new();
+        let mut last_end = None;
         while let Some(page_id) = stack.pop() {
             let node = self.read_node(page_id).await?;
             if node.is_leaf() {
-                entries.extend(
-                    node.leaf_start_row_ids()
-                        .iter()
-                        .copied()
-                        .zip(node.leaf_payloads().iter().copied())
-                        .map(|(start_row_id, payload)| ColumnLeafEntry {
-                            leaf_page_id: page_id,
-                            start_row_id,
-                            payload,
-                        }),
-                );
+                let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
+                for idx in 0..prefixes.len() {
+                    let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
+                    let entry = build_leaf_entry(page_id, &view, self.file_kind())?;
+                    if let Some(prev_end) = last_end
+                        && entry.start_row_id < prev_end
+                    {
+                        return Err(invalid_node_payload(self.file_kind(), page_id));
+                    }
+                    last_end = Some(entry.end_row_id());
+                    entries.push(entry);
+                }
                 continue;
             }
-            for entry in node.branch_entries().iter().rev() {
+            let branch_entries = node.branch_entries();
+            for entry in branch_entries.iter().rev() {
                 if entry.page_id == 0 {
                     return Err(invalid_node_payload(self.file_kind(), page_id));
                 }
@@ -539,15 +1070,6 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     /// Applies sorted start-row-id bitmap patches with copy-on-write updates.
-    ///
-    /// Constraints:
-    /// - `patches` must be sorted and unique by `start_row_id`.
-    /// - every `start_row_id` must already exist in the current index snapshot.
-    ///
-    /// Behavior:
-    /// - this API is sticky offload: updated payloads always store offloaded refs.
-    /// - it mutates the provided `MutableCowFile` as part of CoW writes.
-    /// - callers should discard the mutable file after `Err` and fork a new one for retries.
     pub async fn batch_update_offloaded_bitmaps<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
@@ -557,42 +1079,42 @@ impl<'a> ColumnBlockIndex<'a> {
         if patches.is_empty() {
             return Ok(self.root_page_id);
         }
-        if self.root_page_id == 0 {
-            return Err(Error::InvalidState);
-        }
-        if !patches_sorted_unique(patches) {
+        if self.root_page_id == 0 || !patches_sorted_unique(patches) {
             return Err(Error::InvalidArgument);
         }
 
-        let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
-        let mut resolved = Vec::with_capacity(patches.len());
-        for patch in patches {
-            let blob_ref = writer.append(patch.bitmap_bytes).await?;
-            resolved.push(OffloadedBitmapRefPatch {
-                start_row_id: patch.start_row_id,
-                blob_ref,
-            });
-        }
-        writer.finish().await?;
+        let resolved = {
+            let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
+            let mut resolved = Vec::with_capacity(patches.len());
+            for patch in patches {
+                let deltas = decode_raw_u32_list(patch.bitmap_bytes)?;
+                let blob_ref = writer.append(patch.bitmap_bytes).await?;
+                resolved.push(ResolvedLeafPatch::ReplacePayload {
+                    start_row_id: patch.start_row_id,
+                    block_id: 0,
+                    delete_set: LogicalDeleteSet::External {
+                        del_count: storage_count_u16(deltas.len())?,
+                        blob_ref,
+                        deltas: Some(deltas),
+                    },
+                });
+            }
+            writer.finish().await?;
+            resolved
+        };
 
+        let root_height = self.read_node(self.root_page_id).await?.header.height;
         let res = self
-            .update_subtree_with_patches(mutable_file, self.root_page_id, &resolved, create_ts)
+            .rewrite_subtree_with_patches(mutable_file, self.root_page_id, &resolved, create_ts)
             .await?;
         if !res.touched {
             return Err(Error::InvalidState);
         }
-        Ok(res.new_page_id)
+        self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
+            .await
     }
 
     /// Replaces sorted leaf payloads keyed by `start_row_id` with copy-on-write updates.
-    ///
-    /// Constraints:
-    /// - `patches` must be sorted and unique by `start_row_id`.
-    /// - every `start_row_id` must already exist in the current index snapshot.
-    ///
-    /// Behavior:
-    /// - it mutates the provided `MutableCowFile` as part of CoW writes.
-    /// - callers should discard the mutable file after `Err` and fork a new one for retries.
     pub async fn batch_replace_payloads<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
@@ -602,202 +1124,401 @@ impl<'a> ColumnBlockIndex<'a> {
         if patches.is_empty() {
             return Ok(self.root_page_id);
         }
-        if self.root_page_id == 0 {
-            return Err(Error::InvalidState);
-        }
-        if !patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id) {
+        if self.root_page_id == 0
+            || !patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id)
+        {
             return Err(Error::InvalidArgument);
         }
 
+        let mut resolved = Vec::with_capacity(patches.len());
+        for patch in patches {
+            let delete_set = payload_to_delete_set(&patch.payload, self.disk_pool).await?;
+            resolved.push(ResolvedLeafPatch::ReplacePayload {
+                start_row_id: patch.start_row_id,
+                block_id: patch.payload.block_id,
+                delete_set,
+            });
+        }
+        let root_height = self.read_node(self.root_page_id).await?.header.height;
         let res = self
-            .update_subtree_with_patches(mutable_file, self.root_page_id, patches, create_ts)
+            .rewrite_subtree_with_patches(mutable_file, self.root_page_id, &resolved, create_ts)
             .await?;
         if !res.touched {
             return Err(Error::InvalidState);
         }
-        Ok(res.new_page_id)
+        self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
+            .await
     }
 
-    /// Appends sorted `(start_row_id, block_id)` entries and returns new root page id.
-    ///
-    /// The update follows copy-on-write semantics on the right-most path.
+    /// Replaces sorted logical entries keyed by existing `start_row_id`.
+    pub async fn batch_replace_entries<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        patches: &[ColumnBlockEntryPatch],
+        create_ts: u64,
+    ) -> Result<PageID> {
+        if patches.is_empty() {
+            return Ok(self.root_page_id);
+        }
+        if self.root_page_id == 0
+            || !patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id)
+        {
+            return Err(Error::InvalidArgument);
+        }
+
+        let mut resolved = Vec::with_capacity(patches.len());
+        for patch in patches {
+            let logical = LogicalLeafEntry::from_input(&patch.entry)?;
+            resolved.push(ResolvedLeafPatch::ReplaceEntry {
+                start_row_id: patch.start_row_id,
+                entry: logical,
+            });
+        }
+        let root_height = self.read_node(self.root_page_id).await?.header.height;
+        let res = self
+            .rewrite_subtree_with_patches(mutable_file, self.root_page_id, &resolved, create_ts)
+            .await?;
+        if !res.touched {
+            return Err(Error::InvalidState);
+        }
+        self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
+            .await
+    }
+
+    /// Appends sorted logical entries and returns the new root page id.
     pub async fn batch_insert<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
-        entries: &[(RowID, u64)],
+        entries: &[ColumnBlockEntryInput],
         new_end_row_id: RowID,
         create_ts: u64,
     ) -> Result<PageID> {
-        debug_assert!(entries_sorted(entries));
-        debug_assert!(
-            entries
-                .first()
-                .is_none_or(|entry| entry.0 >= self.end_row_id)
-        );
-        debug_assert!(entries.last().is_none_or(|entry| entry.0 < new_end_row_id));
-        debug_assert!(new_end_row_id >= self.end_row_id);
         if entries.is_empty() {
             return Ok(self.root_page_id);
         }
+        if !entry_inputs_sorted(entries)
+            || entries
+                .first()
+                .is_none_or(|entry| entry.start_row_id() < self.end_row_id)
+            || new_end_row_id < self.end_row_id
+        {
+            return Err(Error::InvalidArgument);
+        }
 
+        let logical_entries = entries
+            .iter()
+            .map(LogicalLeafEntry::from_input)
+            .collect::<Result<Vec<_>>>()?;
         if self.root_page_id == 0 {
             return self
-                .build_tree_from_entries(mutable_file, entries, create_ts)
+                .build_tree_from_logical_entries(mutable_file, &logical_entries, create_ts)
                 .await;
         }
+
         let root_height = self.read_node(self.root_page_id).await?.header.height;
-        let append_result = self
-            .append_rightmost_path(mutable_file, entries, create_ts)
+        let new_root_entries = self
+            .append_rightmost_path(mutable_file, &logical_entries, create_ts)
             .await?;
-        if append_result.extra_entries.is_empty() {
-            return Ok(append_result.new_page_id);
-        }
-        let mut root_entries = Vec::with_capacity(1 + append_result.extra_entries.len());
-        root_entries.push(ColumnBlockBranchEntry {
-            start_row_id: append_result.start_row_id,
-            page_id: append_result.new_page_id,
-        });
-        root_entries.extend_from_slice(&append_result.extra_entries);
-        let new_root_page_id = self
-            .build_branch_levels(mutable_file, root_entries, root_height + 1, create_ts)
-            .await?;
-        Ok(new_root_page_id)
+        self.finalize_root_rewrite(mutable_file, root_height, new_root_entries, create_ts)
+            .await
     }
 
-    fn update_subtree_with_patches<'b, M: MutableCowFile + 'b, P: LeafPayloadPatch + 'b>(
+    fn rewrite_subtree_with_patches<'b, M: MutableCowFile + 'b>(
         &'b self,
         mutable_file: &'b mut M,
         page_id: PageID,
-        patches: &'b [P],
+        patches: &'b [ResolvedLeafPatch],
         create_ts: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<NodeUpdateResult>> + 'b>> {
+    ) -> Pin<Box<dyn Future<Output = Result<NodeRewriteResult>> + 'b>> {
         Box::pin(async move {
             if patches.is_empty() {
-                return Ok(NodeUpdateResult {
-                    new_page_id: page_id,
+                return Ok(NodeRewriteResult {
+                    entries: Vec::new(),
                     touched: false,
                 });
             }
             let node = self.read_node(page_id).await?;
             if node.is_leaf() {
                 return self
-                    .update_leaf_with_patches(mutable_file, page_id, &node, patches, create_ts)
+                    .rewrite_leaf_with_patches(mutable_file, page_id, &node, patches, create_ts)
                     .await;
             }
-            self.update_branch_with_patches(mutable_file, page_id, &node, patches, create_ts)
+            self.rewrite_branch_with_patches(mutable_file, page_id, &node, patches, create_ts)
                 .await
         })
     }
 
-    async fn update_leaf_with_patches<M: MutableCowFile, P: LeafPayloadPatch>(
+    async fn rewrite_leaf_with_patches<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
         page_id: PageID,
         node: &ValidatedColumnBlockNode,
-        patches: &[P],
+        patches: &[ResolvedLeafPatch],
         create_ts: u64,
-    ) -> Result<NodeUpdateResult> {
-        let row_ids = node.leaf_start_row_ids();
-        let mut update_slots = Vec::with_capacity(patches.len());
+    ) -> Result<NodeRewriteResult> {
+        let mut entries = self.decode_logical_leaf_entries(node, page_id)?;
+        let start_row_ids: Vec<RowID> = entries.iter().map(|entry| entry.start_row_id).collect();
         for patch in patches {
-            match row_ids.binary_search(&patch.start_row_id()) {
-                Ok(slot_idx) => update_slots.push((slot_idx, *patch)),
-                Err(_) => return Err(Error::InvalidArgument),
+            let idx = start_row_ids
+                .binary_search(&patch.start_row_id())
+                .map_err(|_| Error::InvalidArgument)?;
+            let mut replacement = entries[idx].clone();
+            patch.apply(&mut replacement)?;
+            if let ResolvedLeafPatch::ReplacePayload { block_id, .. } = patch
+                && *block_id == 0
+            {
+                replacement.block_id = entries[idx].block_id;
             }
+            entries[idx] = replacement;
         }
-
-        let (new_page_id, mut new_node) =
-            self.allocate_node(mutable_file, 0, node.header.start_row_id, create_ts)?;
-        new_node.header.count = node.header.count;
-        {
-            let (new_row_ids, new_payloads) = new_node.leaf_arrays_mut();
-            new_row_ids.copy_from_slice(row_ids);
-            new_payloads.copy_from_slice(node.leaf_payloads());
-            for (slot_idx, patch) in update_slots {
-                patch.apply_payload(&mut new_payloads[slot_idx]);
-            }
-        }
-        self.write_node(mutable_file, new_page_id, &new_node)
+        let new_entries = self
+            .write_leaf_pages_from_logical_entries(mutable_file, &entries, create_ts)
             .await?;
         self.record_obsolete_node(mutable_file, page_id)?;
-        Ok(NodeUpdateResult {
-            new_page_id,
+        Ok(NodeRewriteResult {
+            entries: new_entries,
             touched: true,
         })
     }
 
-    async fn update_branch_with_patches<M: MutableCowFile, P: LeafPayloadPatch>(
+    async fn rewrite_branch_with_patches<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
         page_id: PageID,
         node: &ValidatedColumnBlockNode,
-        patches: &[P],
+        patches: &[ResolvedLeafPatch],
         create_ts: u64,
-    ) -> Result<NodeUpdateResult> {
+    ) -> Result<NodeRewriteResult> {
         let old_entries = node.branch_entries();
-        if old_entries.is_empty() {
-            return Err(Error::InvalidState);
-        }
-
+        let mut combined = Vec::with_capacity(old_entries.len() + patches.len());
         let mut patch_idx = 0usize;
-        let mut child_updates = Vec::new();
-        // Future improvement: disjoint child ranges can be processed in parallel.
-        // We keep this loop sequential today because subtree updates mutate one shared
-        // `MutableCowFile` (page-id allocation + obsolete-page recording), so safe
-        // parallel writes require an additional staging or allocator-partition design.
+        let mut touched = false;
         for (child_idx, entry) in old_entries.iter().enumerate() {
-            let next_start_row_id = old_entries
+            let next_start = old_entries
                 .get(child_idx + 1)
                 .map(|next| next.start_row_id)
                 .unwrap_or(RowID::MAX);
-            let range_start = patch_idx;
-            while patch_idx < patches.len() && patches[patch_idx].start_row_id() < next_start_row_id
-            {
+            let start_idx = patch_idx;
+            while patch_idx < patches.len() && patches[patch_idx].start_row_id() < next_start {
                 patch_idx += 1;
             }
-            if patch_idx == range_start {
+            if start_idx == patch_idx {
+                combined.push(*entry);
                 continue;
             }
-            let child_res = self
-                .update_subtree_with_patches(
+            let child = self
+                .rewrite_subtree_with_patches(
                     mutable_file,
                     entry.page_id,
-                    &patches[range_start..patch_idx],
+                    &patches[start_idx..patch_idx],
                     create_ts,
                 )
                 .await?;
-            if child_res.touched {
-                child_updates.push((child_idx, child_res.new_page_id));
+            if !child.touched {
+                return Err(Error::InvalidState);
             }
+            touched = true;
+            combined.extend(child.entries);
         }
         if patch_idx != patches.len() {
             return Err(Error::InvalidArgument);
         }
-        if child_updates.is_empty() {
-            return Ok(NodeUpdateResult {
-                new_page_id: page_id,
+        if !touched {
+            return Ok(NodeRewriteResult {
+                entries: Vec::new(),
                 touched: false,
             });
         }
-
-        let (new_page_id, mut new_node) = self.allocate_node(
-            mutable_file,
-            node.header.height,
-            node.header.start_row_id,
-            create_ts,
-        )?;
-        new_node.header.count = node.header.count;
-        new_node.branch_entries_mut().copy_from_slice(old_entries);
-        for (child_idx, child_page_id) in child_updates {
-            new_node.branch_entries_mut()[child_idx].page_id = child_page_id;
-        }
-        self.write_node(mutable_file, new_page_id, &new_node)
+        let new_entries = self
+            .write_branch_pages(mutable_file, &combined, node.header.height, create_ts)
             .await?;
         self.record_obsolete_node(mutable_file, page_id)?;
-        Ok(NodeUpdateResult {
-            new_page_id,
+        Ok(NodeRewriteResult {
+            entries: new_entries,
             touched: true,
         })
+    }
+
+    async fn build_tree_from_logical_entries<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        entries: &[LogicalLeafEntry],
+        create_ts: u64,
+    ) -> Result<PageID> {
+        let leaf_entries = self
+            .write_leaf_pages_from_logical_entries(mutable_file, entries, create_ts)
+            .await?;
+        self.finalize_root_rewrite(mutable_file, 0, leaf_entries, create_ts)
+            .await
+    }
+
+    async fn append_rightmost_path<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        entries: &[LogicalLeafEntry],
+        create_ts: u64,
+    ) -> Result<Vec<ColumnBlockBranchEntry>> {
+        let mut path = Vec::new();
+        let mut page_id = self.root_page_id;
+        loop {
+            let node = self.read_node(page_id).await?;
+            path.push((page_id, node.header.height));
+            if node.is_leaf() {
+                break;
+            }
+            page_id = node
+                .branch_entries()
+                .last()
+                .map(|entry| entry.page_id)
+                .ok_or(Error::InvalidState)?;
+        }
+
+        let (leaf_page_id, _) = path.pop().ok_or(Error::InvalidState)?;
+        let leaf_node = self.read_node(leaf_page_id).await?;
+        let mut combined = self.decode_logical_leaf_entries(&leaf_node, leaf_page_id)?;
+        combined.extend_from_slice(entries);
+        let mut child_entries = self
+            .write_leaf_pages_from_logical_entries(mutable_file, &combined, create_ts)
+            .await?;
+        self.record_obsolete_node(mutable_file, leaf_page_id)?;
+
+        for (branch_page_id, height) in path.into_iter().rev() {
+            let branch_node = self.read_node(branch_page_id).await?;
+            let old_entries = branch_node.branch_entries();
+            let last_idx = old_entries
+                .len()
+                .checked_sub(1)
+                .ok_or(Error::InvalidState)?;
+            let mut combined_entries =
+                Vec::with_capacity(old_entries.len() - 1 + child_entries.len());
+            combined_entries.extend_from_slice(&old_entries[..last_idx]);
+            combined_entries.extend(child_entries);
+            child_entries = self
+                .write_branch_pages(mutable_file, &combined_entries, height, create_ts)
+                .await?;
+            self.record_obsolete_node(mutable_file, branch_page_id)?;
+        }
+        Ok(child_entries)
+    }
+
+    async fn finalize_root_rewrite<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        old_root_height: u32,
+        entries: Vec<ColumnBlockBranchEntry>,
+        create_ts: u64,
+    ) -> Result<PageID> {
+        if entries.is_empty() {
+            return Err(Error::InvalidState);
+        }
+        if entries.len() == 1 {
+            return Ok(entries[0].page_id);
+        }
+        self.build_branch_levels(mutable_file, entries, old_root_height + 1, create_ts)
+            .await
+    }
+
+    fn decode_logical_leaf_entries(
+        &self,
+        node: &ValidatedColumnBlockNode,
+        page_id: PageID,
+    ) -> Result<Vec<LogicalLeafEntry>> {
+        let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
+        let mut entries = Vec::with_capacity(prefixes.len());
+        for idx in 0..prefixes.len() {
+            let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
+            let row_set = decode_logical_row_set(&view, self.file_kind(), page_id)?;
+            let delete_set =
+                decode_logical_delete_set_without_blob(&view, &row_set, self.file_kind(), page_id)?;
+            entries.push(LogicalLeafEntry {
+                start_row_id: view.prefix.start_row_id(),
+                block_id: view.prefix.block_id(),
+                row_set,
+                delete_set,
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn write_leaf_pages_from_logical_entries<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        entries: &[LogicalLeafEntry],
+        create_ts: u64,
+    ) -> Result<Vec<ColumnBlockBranchEntry>> {
+        let encoded = entries
+            .iter()
+            .map(EncodedLeafEntry::from_logical)
+            .collect::<Result<Vec<_>>>()?;
+        let mut leaf_entries = Vec::new();
+        let mut start = 0usize;
+        while start < encoded.len() {
+            let mut used = 0usize;
+            let mut end = start;
+            while end < encoded.len() {
+                let next = encoded[end].encoded_len();
+                if end > start && used + next > COLUMN_BLOCK_DATA_SIZE {
+                    break;
+                }
+                if next > COLUMN_BLOCK_DATA_SIZE {
+                    return Err(Error::InvalidArgument);
+                }
+                used += next;
+                end += 1;
+            }
+            let chunk = &encoded[start..end];
+            let (page_id, mut node) =
+                self.allocate_node(mutable_file, 0, chunk[0].start_row_id, create_ts)?;
+            node.header.count = chunk.len() as u32;
+            encode_leaf_chunk(node.data_mut(), chunk)?;
+            self.write_node(mutable_file, page_id, &node).await?;
+            leaf_entries.push(ColumnBlockBranchEntry {
+                start_row_id: chunk[0].start_row_id,
+                page_id,
+            });
+            start = end;
+        }
+        Ok(leaf_entries)
+    }
+
+    async fn write_branch_pages<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        entries: &[ColumnBlockBranchEntry],
+        height: u32,
+        create_ts: u64,
+    ) -> Result<Vec<ColumnBlockBranchEntry>> {
+        let mut res = Vec::new();
+        for chunk in entries.chunks(COLUMN_BLOCK_MAX_BRANCH_ENTRIES) {
+            let (page_id, mut node) =
+                self.allocate_node(mutable_file, height, chunk[0].start_row_id, create_ts)?;
+            node.header.count = chunk.len() as u32;
+            node.branch_entries_mut().copy_from_slice(chunk);
+            self.write_node(mutable_file, page_id, &node).await?;
+            res.push(ColumnBlockBranchEntry {
+                start_row_id: chunk[0].start_row_id,
+                page_id,
+            });
+        }
+        Ok(res)
+    }
+
+    async fn build_branch_levels<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        mut entries: Vec<ColumnBlockBranchEntry>,
+        mut height: u32,
+        create_ts: u64,
+    ) -> Result<PageID> {
+        loop {
+            if entries.len() == 1 {
+                return Ok(entries[0].page_id);
+            }
+            entries = self
+                .write_branch_pages(mutable_file, &entries, height, create_ts)
+                .await?;
+            height += 1;
+        }
     }
 
     /// Allocate a new node page for copy-on-write updates.
@@ -838,276 +1559,662 @@ impl<'a> ColumnBlockIndex<'a> {
         let payload_start = write_page_header(buf.data_mut(), COLUMN_BLOCK_INDEX_PAGE_SPEC);
         let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
         let dst = &mut buf.data_mut()[payload_start..payload_end];
-        let header_bytes = cast_slice(std::slice::from_ref(&node.header));
-        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
+        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(bytes_of(&node.header));
         dst[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
-            .copy_from_slice(&node.data);
+            .copy_from_slice(node.data_ref());
         write_page_checksum(buf.data_mut());
         mutable_file.write_page(page_id, buf).await
     }
+}
 
-    async fn build_tree_from_entries<M: MutableCowFile>(
-        &self,
-        mutable_file: &mut M,
-        entries: &[(RowID, u64)],
-        create_ts: u64,
-    ) -> Result<PageID> {
-        let leaf_entries = self
-            .build_leaf_nodes(mutable_file, entries, create_ts)
-            .await?;
-        if leaf_entries.len() == 1 {
-            return Ok(leaf_entries[0].page_id);
-        }
-        self.build_branch_levels(mutable_file, leaf_entries, 1, create_ts)
-            .await
+fn validate_row_ids(row_ids: &[RowID], start_row_id: RowID, end_row_id: RowID) -> Result<()> {
+    if row_ids.is_empty() || start_row_id >= end_row_id {
+        return Err(Error::InvalidArgument);
     }
-
-    async fn build_leaf_nodes<M: MutableCowFile>(
-        &self,
-        mutable_file: &mut M,
-        entries: &[(RowID, u64)],
-        create_ts: u64,
-    ) -> Result<Vec<ColumnBlockBranchEntry>> {
-        let mut leaf_entries = Vec::new();
-        for chunk in entries.chunks(COLUMN_BLOCK_MAX_ENTRIES) {
-            let (page_id, mut node) = self.allocate_node(mutable_file, 0, chunk[0].0, create_ts)?;
-            node.header.count = chunk.len() as u32;
-            {
-                let (row_ids, payloads) = node.leaf_arrays_mut();
-                for (idx, entry) in chunk.iter().enumerate() {
-                    row_ids[idx] = entry.0;
-                    payloads[idx] = ColumnPagePayload {
-                        block_id: entry.1,
-                        deletion_field: [0u8; 120],
-                    };
-                }
-            }
-            self.write_node(mutable_file, page_id, &node).await?;
-            leaf_entries.push(ColumnBlockBranchEntry {
-                start_row_id: chunk[0].0,
-                page_id,
-            });
+    let mut prev = None;
+    for row_id in row_ids {
+        if *row_id < start_row_id || *row_id >= end_row_id {
+            return Err(Error::InvalidArgument);
         }
-        Ok(leaf_entries)
-    }
-
-    async fn build_branch_levels<M: MutableCowFile>(
-        &self,
-        mutable_file: &mut M,
-        mut entries: Vec<ColumnBlockBranchEntry>,
-        mut height: u32,
-        create_ts: u64,
-    ) -> Result<PageID> {
-        loop {
-            if entries.len() <= COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
-                let (page_id, mut node) =
-                    self.allocate_node(mutable_file, height, entries[0].start_row_id, create_ts)?;
-                node.header.count = entries.len() as u32;
-                node.branch_entries_mut().copy_from_slice(&entries);
-                self.write_node(mutable_file, page_id, &node).await?;
-                return Ok(page_id);
-            }
-            let mut next_entries = Vec::new();
-            for chunk in entries.chunks(COLUMN_BLOCK_MAX_BRANCH_ENTRIES) {
-                let (page_id, mut node) =
-                    self.allocate_node(mutable_file, height, chunk[0].start_row_id, create_ts)?;
-                node.header.count = chunk.len() as u32;
-                node.branch_entries_mut().copy_from_slice(chunk);
-                self.write_node(mutable_file, page_id, &node).await?;
-                next_entries.push(ColumnBlockBranchEntry {
-                    start_row_id: chunk[0].start_row_id,
-                    page_id,
-                });
-            }
-            entries = next_entries;
-            height += 1;
-        }
-    }
-
-    async fn append_rightmost_path<M: MutableCowFile>(
-        &self,
-        mutable_file: &mut M,
-        entries: &[(RowID, u64)],
-        create_ts: u64,
-    ) -> Result<NodeAppendResult> {
-        let mut path = Vec::new();
-        let mut page_id = self.root_page_id;
-        loop {
-            let node = self.read_node(page_id).await?;
-            path.push(page_id);
-            if node.is_leaf() {
-                break;
-            } else {
-                let next_page_id = node
-                    .branch_entries()
-                    .last()
-                    .map(|entry| entry.page_id)
-                    .ok_or(Error::InvalidState)?;
-                page_id = next_page_id;
-            }
-        }
-
-        let leaf_page_id = path.pop().ok_or(Error::InvalidState)?;
-        let mut child_result = self
-            .append_to_leaf(mutable_file, leaf_page_id, entries, create_ts)
-            .await?;
-
-        for page_id in path.into_iter().rev() {
-            child_result = self
-                .append_to_branch_with_child(mutable_file, page_id, child_result, create_ts)
-                .await?;
-        }
-
-        Ok(child_result)
-    }
-
-    async fn append_to_leaf<M: MutableCowFile>(
-        &self,
-        mutable_file: &mut M,
-        page_id: PageID,
-        entries: &[(RowID, u64)],
-        create_ts: u64,
-    ) -> Result<NodeAppendResult> {
-        let capacity = COLUMN_BLOCK_MAX_ENTRIES;
-        let node = self.read_node(page_id).await?;
-        if !node.is_leaf() {
-            return Err(Error::InvalidState);
-        }
-
-        let old_count = node.header.count as usize;
-        let take = entries.len().min(capacity.saturating_sub(old_count));
-        let new_count = old_count + take;
-        let start_row_id = if old_count == 0 {
-            entries
-                .first()
-                .map(|entry| entry.0)
-                .unwrap_or(node.header.start_row_id)
-        } else {
-            node.header.start_row_id
-        };
-        let (new_page_id, mut new_node) =
-            self.allocate_node(mutable_file, 0, start_row_id, create_ts)?;
-        new_node.header.count = new_count as u32;
+        if let Some(prev_row_id) = prev
+            && *row_id <= prev_row_id
         {
-            let (row_ids, payloads) = new_node.leaf_arrays_mut();
-            if old_count > 0 {
-                row_ids[..old_count].copy_from_slice(node.leaf_start_row_ids());
-                payloads[..old_count].copy_from_slice(node.leaf_payloads());
-            }
-            for (idx, entry) in entries.iter().take(take).enumerate() {
-                row_ids[old_count + idx] = entry.0;
-                payloads[old_count + idx] = ColumnPagePayload {
-                    block_id: entry.1,
-                    deletion_field: [0u8; 120],
-                };
-            }
+            return Err(Error::InvalidArgument);
         }
-        let mut remaining = &entries[take..];
-        self.write_node(mutable_file, new_page_id, &new_node)
-            .await?;
-        self.record_obsolete_node(mutable_file, page_id)?;
+        prev = Some(*row_id);
+    }
+    Ok(())
+}
 
-        let mut extra_entries = Vec::new();
-        while !remaining.is_empty() {
-            let chunk_len = remaining.len().min(capacity);
-            let chunk = &remaining[..chunk_len];
-            let (page_id, mut leaf_node) =
-                self.allocate_node(mutable_file, 0, chunk[0].0, create_ts)?;
-            leaf_node.header.count = chunk_len as u32;
-            {
-                let (row_ids, payloads) = leaf_node.leaf_arrays_mut();
-                for (idx, entry) in chunk.iter().enumerate() {
-                    row_ids[idx] = entry.0;
-                    payloads[idx] = ColumnPagePayload {
-                        block_id: entry.1,
-                        deletion_field: [0u8; 120],
-                    };
+fn section_slice(
+    data: &[u8],
+    prefix_end: usize,
+    offset: u16,
+    len: u16,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<&[u8]> {
+    let offset = offset as usize;
+    let len = len as usize;
+    if offset == 0 || len == 0 {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+    if offset < prefix_end || end > data.len() {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    Ok(&data[offset..end])
+}
+
+fn validate_leaf_prefixes(
+    prefixes: &[ColumnBlockLeafPrefix],
+    header_start_row_id: RowID,
+    data: &[u8],
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<()> {
+    if prefixes.is_empty() {
+        return Ok(());
+    }
+    let prefix_end = prefixes.len() * COLUMN_BLOCK_LEAF_PREFIX_SIZE;
+    let mut ranges = Vec::with_capacity(prefixes.len() * 2);
+    let mut last_end = None;
+    for (idx, prefix) in prefixes.iter().enumerate() {
+        if prefix.prefix_version != COLUMN_LEAF_PREFIX_VERSION
+            || prefix.row_codec() == COLUMN_ROW_CODEC_NONE
+            || prefix.row_id_span() == 0
+            || prefix.row_count() == 0
+            || u32::from(prefix.row_count()) > prefix.row_id_span()
+            || prefix.del_count() > prefix.row_count()
+            || prefix.delete_domain() != COLUMN_DELETE_DOMAIN_ROW_ID_DELTA
+        {
+            return Err(invalid_node_payload(file_kind, page_id));
+        }
+        let start = prefix.start_row_id();
+        let end = prefix
+            .end_row_id()
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        if idx == 0 && start != header_start_row_id {
+            return Err(invalid_node_payload(file_kind, page_id));
+        }
+        if let Some(prev_end) = last_end
+            && start < prev_end
+        {
+            return Err(invalid_node_payload(file_kind, page_id));
+        }
+        last_end = Some(end);
+
+        let row_range = validate_present_section_range(
+            prefix_end,
+            prefix.row_section_offset(),
+            prefix.row_section_len(),
+            data.len(),
+            file_kind,
+            page_id,
+        )?;
+        let row_header = SectionHeader::decode(&data[row_range.0..row_range.0 + 4])
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        match prefix.row_codec() {
+            COLUMN_ROW_CODEC_DENSE => {
+                if row_header.kind != COLUMN_ROW_CODEC_DENSE
+                    || row_header.version != COLUMN_ROW_SECTION_VERSION
+                    || row_range.1 - row_range.0 != 4
+                    || prefix.first_present_delta() != 0
+                    || u32::from(prefix.row_count()) != prefix.row_id_span()
+                {
+                    return Err(invalid_node_payload(file_kind, page_id));
                 }
             }
-            self.write_node(mutable_file, page_id, &leaf_node).await?;
-            extra_entries.push(ColumnBlockBranchEntry {
-                start_row_id: chunk[0].0,
-                page_id,
-            });
-            remaining = &remaining[chunk_len..];
+            COLUMN_ROW_CODEC_DELTA_LIST => {
+                let expected_len = 4 + prefix.row_count() as usize * mem::size_of::<u32>();
+                if row_header.kind != COLUMN_ROW_CODEC_DELTA_LIST
+                    || row_header.version != COLUMN_ROW_SECTION_VERSION
+                    || row_range.1 - row_range.0 != expected_len
+                {
+                    return Err(invalid_node_payload(file_kind, page_id));
+                }
+            }
+            _ => return Err(invalid_node_payload(file_kind, page_id)),
         }
+        ranges.push(row_range);
 
-        Ok(NodeAppendResult {
-            new_page_id,
-            start_row_id,
-            extra_entries,
-        })
+        match prefix.delete_codec() {
+            COLUMN_DELETE_CODEC_NONE => {
+                if prefix.del_count() != 0
+                    || prefix.delete_section_offset() != 0
+                    || prefix.delete_section_len() != 0
+                {
+                    return Err(invalid_node_payload(file_kind, page_id));
+                }
+            }
+            COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
+                let delete_range = validate_present_section_range(
+                    prefix_end,
+                    prefix.delete_section_offset(),
+                    prefix.delete_section_len(),
+                    data.len(),
+                    file_kind,
+                    page_id,
+                )?;
+                let delete_header =
+                    SectionHeader::decode(&data[delete_range.0..delete_range.0 + 4])
+                        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+                let expected_len = 4 + prefix.del_count() as usize * mem::size_of::<u32>();
+                if delete_header.kind != COLUMN_DELETE_CODEC_INLINE_DELTA_LIST
+                    || delete_header.version != COLUMN_DELETE_SECTION_VERSION
+                    || delete_range.1 - delete_range.0 != expected_len
+                {
+                    return Err(invalid_node_payload(file_kind, page_id));
+                }
+                ranges.push(delete_range);
+            }
+            COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
+                let delete_range = validate_present_section_range(
+                    prefix_end,
+                    prefix.delete_section_offset(),
+                    prefix.delete_section_len(),
+                    data.len(),
+                    file_kind,
+                    page_id,
+                )?;
+                let delete_header =
+                    SectionHeader::decode(&data[delete_range.0..delete_range.0 + 4])
+                        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+                if delete_header.kind != COLUMN_DELETE_CODEC_EXTERNAL_BLOB
+                    || delete_header.version != COLUMN_DELETE_SECTION_VERSION
+                    || delete_header.aux != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
+                    || delete_range.1 - delete_range.0 != 4 + COLUMN_BLOB_REF_SIZE
+                {
+                    return Err(invalid_node_payload(file_kind, page_id));
+                }
+                ranges.push(delete_range);
+            }
+            _ => return Err(invalid_node_payload(file_kind, page_id)),
+        }
     }
-
-    async fn append_to_branch_with_child<M: MutableCowFile>(
-        &self,
-        mutable_file: &mut M,
-        page_id: PageID,
-        child_result: NodeAppendResult,
-        create_ts: u64,
-    ) -> Result<NodeAppendResult> {
-        let node = self.read_node(page_id).await?;
-        if !node.is_branch() {
-            return Err(Error::InvalidState);
+    ranges.sort_unstable_by_key(|range| range.0);
+    for pair in ranges.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(invalid_node_payload(file_kind, page_id));
         }
-        let old_entries = node.branch_entries();
-        if old_entries.is_empty() {
-            return Err(Error::InvalidState);
+    }
+    Ok(())
+}
+
+fn validate_present_section_range(
+    prefix_end: usize,
+    offset: u16,
+    len: u16,
+    data_len: usize,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<(usize, usize)> {
+    let offset = offset as usize;
+    let len = len as usize;
+    if offset == 0 || len == 0 {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+    if offset < prefix_end || end > data_len {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    Ok((offset, end))
+}
+
+fn entry_contains_row_id(
+    view: &LeafEntryView<'_>,
+    row_id: RowID,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<bool> {
+    let start_row_id = view.prefix.start_row_id();
+    let delta_u64 = match row_id.checked_sub(start_row_id) {
+        Some(delta) => delta,
+        None => return Ok(false),
+    };
+    if delta_u64 >= view.prefix.row_id_span() as u64 {
+        return Ok(false);
+    }
+    let delta = delta_u64 as u32;
+    if delta < view.prefix.first_present_delta() {
+        return Ok(false);
+    }
+    match view.row_header.kind {
+        COLUMN_ROW_CODEC_DENSE => Ok(true),
+        COLUMN_ROW_CODEC_DELTA_LIST => {
+            contains_u32_delta(&view.row_section[4..], delta, file_kind, page_id)
         }
-        let last_idx = old_entries.len() - 1;
-        let mut new_entries =
-            Vec::with_capacity(old_entries.len() + child_result.extra_entries.len());
-        new_entries.extend_from_slice(old_entries);
-        new_entries[last_idx].page_id = child_result.new_page_id;
-        new_entries.extend_from_slice(&child_result.extra_entries);
-        let height = node.header.height;
-        let start_row_id = node.header.start_row_id;
-
-        let mut remaining = new_entries.as_slice();
-        let first_len = remaining.len().min(COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-        let (new_page_id, mut new_node) =
-            self.allocate_node(mutable_file, height, start_row_id, create_ts)?;
-        new_node.header.count = first_len as u32;
-        new_node
-            .branch_entries_mut()
-            .copy_from_slice(&remaining[..first_len]);
-        self.write_node(mutable_file, new_page_id, &new_node)
-            .await?;
-        self.record_obsolete_node(mutable_file, page_id)?;
-
-        remaining = &remaining[first_len..];
-        let mut extra_entries = Vec::new();
-        while !remaining.is_empty() {
-            let chunk_len = remaining.len().min(COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-            let chunk = &remaining[..chunk_len];
-            let (page_id, mut branch_node) =
-                self.allocate_node(mutable_file, height, chunk[0].start_row_id, create_ts)?;
-            branch_node.header.count = chunk_len as u32;
-            branch_node.branch_entries_mut().copy_from_slice(chunk);
-            self.write_node(mutable_file, page_id, &branch_node).await?;
-            extra_entries.push(ColumnBlockBranchEntry {
-                start_row_id: chunk[0].start_row_id,
-                page_id,
-            });
-            remaining = &remaining[chunk_len..];
-        }
-
-        Ok(NodeAppendResult {
-            new_page_id,
-            start_row_id,
-            extra_entries,
-        })
+        _ => Err(invalid_node_payload(file_kind, page_id)),
     }
 }
 
-struct NodeAppendResult {
-    new_page_id: PageID,
-    start_row_id: RowID,
-    extra_entries: Vec<ColumnBlockBranchEntry>,
+fn decode_logical_row_set(
+    view: &LeafEntryView<'_>,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<LogicalRowSet> {
+    match view.row_header.kind {
+        COLUMN_ROW_CODEC_DENSE => Ok(LogicalRowSet::Dense {
+            row_id_span: view.prefix.row_id_span(),
+        }),
+        COLUMN_ROW_CODEC_DELTA_LIST => {
+            let deltas = decode_u32_row_deltas(
+                &view.row_section[4..],
+                view.prefix.row_count(),
+                view.prefix.row_id_span(),
+                view.prefix.first_present_delta(),
+                file_kind,
+                page_id,
+            )?;
+            Ok(LogicalRowSet::DeltaList {
+                row_id_span: view.prefix.row_id_span(),
+                first_present_delta: view.prefix.first_present_delta(),
+                deltas,
+            })
+        }
+        _ => Err(invalid_node_payload(file_kind, page_id)),
+    }
 }
 
-fn entries_sorted(entries: &[(RowID, u64)]) -> bool {
-    entries.windows(2).all(|pair| pair[0].0 <= pair[1].0)
+fn decode_logical_delete_set_without_blob(
+    view: &LeafEntryView<'_>,
+    row_set: &LogicalRowSet,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<LogicalDeleteSet> {
+    match view.prefix.delete_codec() {
+        COLUMN_DELETE_CODEC_NONE => Ok(LogicalDeleteSet::None),
+        COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
+            let bytes = view
+                .delete_section
+                .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+            let deltas = decode_u32_delta_list(
+                &bytes[4..],
+                view.prefix.del_count(),
+                row_set,
+                file_kind,
+                page_id,
+            )?;
+            Ok(LogicalDeleteSet::Inline(deltas))
+        }
+        COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
+            let bytes = view
+                .delete_section
+                .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+            let blob_ref = decode_blob_ref(&bytes[4..])
+                .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+            Ok(LogicalDeleteSet::External {
+                del_count: view.prefix.del_count(),
+                blob_ref,
+                deltas: None,
+            })
+        }
+        _ => Err(invalid_node_payload(file_kind, page_id)),
+    }
+}
+
+fn build_leaf_entry(
+    leaf_page_id: PageID,
+    view: &LeafEntryView<'_>,
+    file_kind: PersistedFileKind,
+) -> Result<ColumnLeafEntry> {
+    let payload = compatibility_payload_for_view(view)
+        .map_err(|_| invalid_node_payload(file_kind, leaf_page_id))?;
+    Ok(ColumnLeafEntry {
+        leaf_page_id,
+        start_row_id: view.prefix.start_row_id(),
+        payload,
+        end_row_id: view
+            .prefix
+            .end_row_id()
+            .map_err(|_| invalid_node_payload(file_kind, leaf_page_id))?,
+        row_count: view.prefix.row_count(),
+        del_count: view.prefix.del_count(),
+        row_id_span: view.prefix.row_id_span(),
+        first_present_delta: view.prefix.first_present_delta(),
+        row_section_offset: view.prefix.row_section_offset(),
+        row_section_len: view.prefix.row_section_len(),
+        delete_section_offset: view.prefix.delete_section_offset(),
+        delete_section_len: view.prefix.delete_section_len(),
+        row_section_kind: view.row_header.kind,
+        row_section_version: view.row_header.version,
+        row_section_flags: view.row_header.flags,
+        row_section_aux: view.row_header.aux,
+        delete_section_kind: view
+            .delete_header
+            .map(|header| header.kind)
+            .unwrap_or(COLUMN_DELETE_CODEC_NONE),
+        delete_section_version: view.delete_header.map(|header| header.version).unwrap_or(0),
+        delete_section_flags: view.delete_header.map(|header| header.flags).unwrap_or(0),
+        delete_section_aux: view.delete_header.map(|header| header.aux).unwrap_or(0),
+        delete_domain: view.prefix.delete_domain(),
+    })
+}
+
+fn compatibility_payload_for_view(view: &LeafEntryView<'_>) -> Result<ColumnPagePayload> {
+    let mut payload = ColumnPagePayload {
+        block_id: view.prefix.block_id(),
+        deletion_field: [0u8; 120],
+    };
+    match view.prefix.delete_codec() {
+        COLUMN_DELETE_CODEC_NONE => Ok(payload),
+        COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
+            let deltas = decode_u32_bytes_strict(
+                &view.delete_section.ok_or(Error::InvalidFormat)?[4..],
+                view.prefix.del_count(),
+            )?;
+            let mut list = payload.deletion_list();
+            for delta in deltas {
+                match list.add(delta) {
+                    Ok(true) | Ok(false) => {}
+                    Err(DeletionListError::Full) => return Err(Error::InvalidFormat),
+                }
+            }
+            Ok(payload)
+        }
+        COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
+            let bytes = &view.delete_section.ok_or(Error::InvalidFormat)?[4..];
+            let blob_ref = decode_blob_ref(bytes)?;
+            payload.clear_inline_and_set_offloaded(blob_ref);
+            Ok(payload)
+        }
+        _ => Err(Error::InvalidFormat),
+    }
+}
+
+fn encode_row_section(row_set: &LogicalRowSet) -> Result<(u8, Vec<u8>, u32, u32, u16)> {
+    match row_set {
+        LogicalRowSet::Dense { row_id_span } => {
+            let header = SectionHeader {
+                kind: COLUMN_ROW_CODEC_DENSE,
+                version: COLUMN_ROW_SECTION_VERSION,
+                flags: 0,
+                aux: 0,
+            };
+            Ok((
+                COLUMN_ROW_CODEC_DENSE,
+                header.encode().to_vec(),
+                *row_id_span,
+                0,
+                u16::try_from(*row_id_span).map_err(|_| Error::InvalidArgument)?,
+            ))
+        }
+        LogicalRowSet::DeltaList {
+            row_id_span,
+            first_present_delta,
+            deltas,
+        } => {
+            let mut bytes = Vec::with_capacity(4 + deltas.len() * mem::size_of::<u32>());
+            bytes.extend_from_slice(
+                &SectionHeader {
+                    kind: COLUMN_ROW_CODEC_DELTA_LIST,
+                    version: COLUMN_ROW_SECTION_VERSION,
+                    flags: 0,
+                    aux: 0,
+                }
+                .encode(),
+            );
+            for delta in deltas {
+                bytes.extend_from_slice(&delta.to_le_bytes());
+            }
+            Ok((
+                COLUMN_ROW_CODEC_DELTA_LIST,
+                bytes,
+                *row_id_span,
+                *first_present_delta,
+                storage_count_u16(deltas.len())?,
+            ))
+        }
+    }
+}
+
+fn encode_delete_section(delete_set: &LogicalDeleteSet) -> Result<(u8, u8, Vec<u8>)> {
+    match delete_set {
+        LogicalDeleteSet::None => Ok((
+            COLUMN_DELETE_CODEC_NONE,
+            COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
+            Vec::new(),
+        )),
+        LogicalDeleteSet::Inline(deltas) => {
+            if !inline_delete_deltas_fit(deltas)? {
+                return Err(Error::InvalidArgument);
+            }
+            let mut bytes = Vec::with_capacity(4 + deltas.len() * mem::size_of::<u32>());
+            bytes.extend_from_slice(
+                &SectionHeader {
+                    kind: COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
+                    version: COLUMN_DELETE_SECTION_VERSION,
+                    flags: 0,
+                    aux: 0,
+                }
+                .encode(),
+            );
+            for delta in deltas {
+                bytes.extend_from_slice(&delta.to_le_bytes());
+            }
+            Ok((
+                COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
+                COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
+                bytes,
+            ))
+        }
+        LogicalDeleteSet::External { blob_ref, .. } => {
+            let mut bytes = Vec::with_capacity(4 + COLUMN_BLOB_REF_SIZE);
+            bytes.extend_from_slice(
+                &SectionHeader {
+                    kind: COLUMN_DELETE_CODEC_EXTERNAL_BLOB,
+                    version: COLUMN_DELETE_SECTION_VERSION,
+                    flags: 0,
+                    aux: COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
+                }
+                .encode(),
+            );
+            encode_blob_ref(blob_ref, &mut bytes);
+            Ok((
+                COLUMN_DELETE_CODEC_EXTERNAL_BLOB,
+                COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
+                bytes,
+            ))
+        }
+    }
+}
+
+fn encode_leaf_chunk(buf: &mut [u8], entries: &[EncodedLeafEntry]) -> Result<()> {
+    buf.fill(0);
+    let prefix_bytes_len = entries.len() * COLUMN_BLOCK_LEAF_PREFIX_SIZE;
+    let mut prefix_cursor = 0usize;
+    let mut arena_end = buf.len();
+    for entry in entries {
+        let row_range = reserve_tail(&mut arena_end, entry.row_section.len(), buf.len())?;
+        buf[row_range.0..row_range.1].copy_from_slice(&entry.row_section);
+        let delete_range = if entry.delete_section.is_empty() {
+            None
+        } else {
+            let range = reserve_tail(&mut arena_end, entry.delete_section.len(), buf.len())?;
+            buf[range.0..range.1].copy_from_slice(&entry.delete_section);
+            Some(range)
+        };
+        if arena_end < prefix_bytes_len {
+            return Err(Error::InvalidArgument);
+        }
+        let prefix = ColumnBlockLeafPrefix::from_encoded(
+            entry,
+            row_range.0 as u16,
+            entry.row_section.len() as u16,
+            delete_range.map(|range| range.0 as u16).unwrap_or(0),
+            delete_range
+                .map(|range| (range.1 - range.0) as u16)
+                .unwrap_or(0),
+        );
+        let end = prefix_cursor + COLUMN_BLOCK_LEAF_PREFIX_SIZE;
+        buf[prefix_cursor..end].copy_from_slice(bytes_of(&prefix));
+        prefix_cursor = end;
+    }
+    Ok(())
+}
+
+fn reserve_tail(arena_end: &mut usize, len: usize, total_len: usize) -> Result<(usize, usize)> {
+    if len == 0 || *arena_end > total_len || len > *arena_end {
+        return Err(Error::InvalidArgument);
+    }
+    let start = *arena_end - len;
+    let end = *arena_end;
+    *arena_end = start;
+    Ok((start, end))
+}
+
+fn decode_blob_ref(bytes: &[u8]) -> Result<BlobRef> {
+    if bytes.len() != COLUMN_BLOB_REF_SIZE {
+        return Err(Error::InvalidFormat);
+    }
+    let start_page_id = u64::from_le_bytes(bytes[0..8].try_into()?);
+    let start_offset = u16::from_le_bytes(bytes[8..10].try_into()?);
+    let byte_len = u32::from_le_bytes(bytes[10..14].try_into()?);
+    if start_page_id == 0 || byte_len == 0 {
+        return Err(Error::InvalidFormat);
+    }
+    Ok(BlobRef {
+        start_page_id,
+        start_offset,
+        byte_len,
+    })
+}
+
+fn encode_blob_ref(blob_ref: &BlobRef, out: &mut Vec<u8>) {
+    out.extend_from_slice(&blob_ref.start_page_id.to_le_bytes());
+    out.extend_from_slice(&blob_ref.start_offset.to_le_bytes());
+    out.extend_from_slice(&blob_ref.byte_len.to_le_bytes());
+}
+
+fn decode_u32_row_deltas(
+    bytes: &[u8],
+    expected_count: u16,
+    row_id_span: u32,
+    first_present_delta: u32,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<Vec<u32>> {
+    let deltas = decode_u32_bytes_strict(bytes, expected_count)?;
+    if deltas.first().copied() != Some(first_present_delta)
+        || deltas.iter().any(|delta| *delta >= row_id_span)
+    {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    Ok(deltas)
+}
+
+fn decode_u32_delta_list(
+    bytes: &[u8],
+    expected_count: u16,
+    row_set: &LogicalRowSet,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<Vec<u32>> {
+    let deltas = decode_u32_bytes_strict(bytes, expected_count)?;
+    if deltas.iter().any(|delta| !row_set.contains_delta(*delta)) {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    Ok(deltas)
+}
+
+fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> Result<Vec<u32>> {
+    if bytes.len() != expected_count as usize * mem::size_of::<u32>() {
+        return Err(Error::InvalidFormat);
+    }
+    let mut res = Vec::with_capacity(expected_count as usize);
+    let mut prev = None;
+    for chunk in bytes.chunks_exact(mem::size_of::<u32>()) {
+        let value = u32::from_le_bytes(chunk.try_into()?);
+        if let Some(prev_value) = prev
+            && value <= prev_value
+        {
+            return Err(Error::InvalidFormat);
+        }
+        prev = Some(value);
+        res.push(value);
+    }
+    Ok(res)
+}
+
+fn contains_u32_delta(
+    bytes: &[u8],
+    target: u32,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<bool> {
+    if !bytes.len().is_multiple_of(mem::size_of::<u32>()) {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    let deltas = decode_u32_bytes_strict(
+        bytes,
+        storage_count_u16(bytes.len() / mem::size_of::<u32>())
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?,
+    )
+    .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    Ok(deltas.binary_search(&target).is_ok())
+}
+
+async fn payload_to_delete_set(
+    payload: &ColumnPagePayload,
+    disk_pool: &ReadonlyBufferPool,
+) -> Result<LogicalDeleteSet> {
+    if let Some(blob_ref) = payload.offloaded_ref() {
+        let reader = ColumnDeletionBlobReader::new(disk_pool);
+        let payload_bytes = reader.read(blob_ref).await?;
+        let deltas = decode_raw_u32_list(&payload_bytes)?;
+        return Ok(LogicalDeleteSet::External {
+            del_count: storage_count_u16(deltas.len())?,
+            blob_ref,
+            deltas: Some(deltas),
+        });
+    }
+    let mut payload = *payload;
+    let deltas: Vec<u32> = payload.deletion_list().iter().collect();
+    if deltas.is_empty() {
+        Ok(LogicalDeleteSet::None)
+    } else {
+        Ok(LogicalDeleteSet::Inline(deltas))
+    }
+}
+
+fn decode_raw_u32_list(bytes: &[u8]) -> Result<Vec<u32>> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(mem::size_of::<u32>()) {
+        return Err(Error::InvalidFormat);
+    }
+    decode_u32_bytes_strict(
+        bytes,
+        storage_count_u16(bytes.len() / mem::size_of::<u32>())?,
+    )
+}
+
+fn inline_delete_deltas_fit(deltas: &[u32]) -> Result<bool> {
+    let mut payload = ColumnPagePayload {
+        block_id: 0,
+        deletion_field: [0u8; 120],
+    };
+    let mut list = payload.deletion_list();
+    for delta in deltas {
+        match list.add(*delta) {
+            Ok(true) | Ok(false) => {}
+            Err(DeletionListError::Full) => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+#[inline]
+fn storage_count_u16(len: usize) -> Result<u16> {
+    u16::try_from(len).map_err(|_| Error::InvalidArgument)
+}
+
+fn entry_inputs_sorted(entries: &[ColumnBlockEntryInput]) -> bool {
+    entries
+        .windows(2)
+        .all(|pair| pair[0].start_row_id() < pair[1].start_row_id())
 }
 
 fn patches_sorted_unique(patches: &[OffloadedBitmapPatch<'_>]) -> bool {
@@ -1122,8 +2229,8 @@ where
     patches.windows(2).all(|pair| key(&pair[0]) < key(&pair[1]))
 }
 
-fn search_start_row_id(start_row_ids: &[RowID], row_id: RowID) -> Option<usize> {
-    match start_row_ids.binary_search(&row_id) {
+fn search_start_row_id(prefixes: &[ColumnBlockLeafPrefix], row_id: RowID) -> Option<usize> {
+    match prefixes.binary_search_by_key(&row_id, |prefix| prefix.start_row_id()) {
         Ok(idx) => Some(idx),
         Err(0) => None,
         Err(idx) => Some(idx - 1),
@@ -1141,170 +2248,24 @@ fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{PersistedBlockKey, global_readonly_pool_scope, table_readonly_pool};
+    use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
-    use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
-    use crate::index::load_payload_deletion_deltas;
+    use crate::index::{encode_deletion_deltas_to_bytes, load_payload_deletion_deltas};
     use crate::value::ValKind;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    fn copy_persisted_node(
-        page: &[u8],
-        file_kind: PersistedFileKind,
-        page_id: PageID,
-    ) -> Result<Box<ColumnBlockNode>> {
-        let (payload, header) = validate_node_payload(page, file_kind, page_id)?;
-        let mut node =
-            ColumnBlockNode::new_boxed(header.height, header.start_row_id, header.create_ts);
-        node.header = header;
-        node.data.copy_from_slice(
-            &payload[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE],
-        );
-        Ok(node)
-    }
-
-    #[inline]
-    async fn read_node_from_file(
-        disk_pool: &ReadonlyBufferPool,
-        page_id: PageID,
-    ) -> Result<Box<ColumnBlockNode>> {
-        let page = disk_pool
-            .get_validated_page_shared(page_id, validate_persisted_column_block_index_page)
-            .await?;
-        copy_persisted_node(page.page(), PersistedFileKind::TableFile, page_id)
-    }
-
-    fn build_persisted_node() -> DirectBuf {
-        let mut node = ColumnBlockNode::new_boxed(0, 0, 1);
-        node.header.count = 1;
-        node.leaf_start_row_ids_mut()[0] = 0;
-        node.leaf_payloads_mut()[0] = ColumnPagePayload {
-            block_id: 7,
-            deletion_field: [0u8; 120],
-        };
-
-        let mut buf = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
-        let payload_start = write_page_header(buf.data_mut(), COLUMN_BLOCK_INDEX_PAGE_SPEC);
-        let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
-        let dst = &mut buf.data_mut()[payload_start..payload_end];
-        let header_bytes = cast_slice(std::slice::from_ref(&node.header));
-        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
-        dst[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
-            .copy_from_slice(&node.data);
-        write_page_checksum(buf.data_mut());
-        buf
-    }
-
-    #[test]
-    fn test_column_block_node_size() {
-        assert_eq!(
-            mem::size_of::<ColumnBlockNode>(),
-            COLUMN_BLOCK_NODE_PAYLOAD_SIZE
-        );
-    }
-
-    #[test]
-    fn test_parse_persisted_node_rejects_version_corruption() {
-        let mut buf = build_persisted_node();
-        let version_start = COLUMN_BLOCK_INDEX_PAGE_SPEC.magic_word.len();
-        let version_end = version_start + mem::size_of::<u64>();
-        buf.data_mut()[version_start..version_end].copy_from_slice(&9u64.to_le_bytes());
-
-        let err =
-            match validate_node_payload(buf.data(), PersistedFileKind::CatalogMultiTableFile, 13) {
-                Ok(_) => panic!("expected column-block-index version corruption"),
-                Err(err) => err,
-            };
-        assert!(matches!(
-            err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::CatalogMultiTableFile,
-                page_kind: PersistedPageKind::ColumnBlockIndex,
-                page_id: 13,
-                cause: PersistedPageCorruptionCause::InvalidVersion,
-            }
-        ));
-    }
-
-    #[test]
-    fn test_validate_node_payload_rejects_invalid_leaf_count() {
-        let mut buf = build_persisted_node();
-        let payload_start = crate::file::page_integrity::PAGE_INTEGRITY_HEADER_SIZE;
-        let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
-        let mut node = copy_persisted_node(buf.data(), PersistedFileKind::TableFile, 17).unwrap();
-        node.header.count = (COLUMN_BLOCK_MAX_ENTRIES + 1) as u32;
-        let dst = &mut buf.data_mut()[payload_start..payload_end];
-        let header_bytes = cast_slice(std::slice::from_ref(&node.header));
-        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
-        write_page_checksum(buf.data_mut());
-
-        let err = match validate_node_payload(buf.data(), PersistedFileKind::TableFile, 17) {
-            Ok(_) => panic!("expected invalid leaf count corruption"),
-            Err(err) => err,
-        };
-        assert!(matches!(
-            err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::ColumnBlockIndex,
-                page_id: 17,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
-            }
-        ));
-    }
-
-    #[test]
-    fn test_leaf_layout_offsets() {
-        let mut node = ColumnBlockNode::new_boxed(0, 0, 0);
-        node.header.count = 2;
-
-        let start_ptr = node.leaf_start_row_ids().as_ptr() as usize;
-        let payload_ptr = node.leaf_payloads().as_ptr() as usize;
-        assert_eq!(payload_ptr - start_ptr, 2 * mem::size_of::<RowID>());
-
-        let start_mut = node.leaf_start_row_ids_mut();
-        start_mut[0] = 10;
-        start_mut[1] = 20;
-        let payloads = node.leaf_payloads_mut();
-        payloads[0].block_id = 1;
-        payloads[1].block_id = 2;
-
-        assert_eq!(node.leaf_start_row_ids(), &[10, 20]);
-        assert_eq!(node.leaf_payloads()[0].block_id, 1);
-        assert_eq!(node.leaf_payloads()[1].block_id, 2);
-    }
-
-    #[test]
-    fn test_branch_add_entry() {
-        let mut node = ColumnBlockNode::new_boxed(1, 0, 0);
-        node.branch_add_entry(5, 7);
-        assert_eq!(node.header.count, 1);
-        assert_eq!(
-            node.branch_entries()[0],
-            ColumnBlockBranchEntry {
-                start_row_id: 5,
-                page_id: 7
-            }
-        );
-    }
-
-    fn build_deletion_payload() -> ColumnPagePayload {
-        ColumnPagePayload {
-            block_id: 0,
-            deletion_field: [0u8; 120],
-        }
-    }
-
-    fn build_test_metadata() -> Arc<TableMetadata> {
+    fn metadata() -> Arc<TableMetadata> {
         Arc::new(TableMetadata::new(
-            vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
-            ],
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U64,
+                ColumnAttributes::empty(),
+            )],
             vec![IndexSpec::new(
                 "idx1",
                 vec![IndexKey::new(0)],
@@ -1313,970 +2274,225 @@ mod tests {
         ))
     }
 
-    fn build_entries(start: RowID, count: usize, base_block: u64) -> Vec<(RowID, u64)> {
-        (0..count)
-            .map(|idx| (start + idx as RowID, base_block + idx as u64))
-            .collect()
+    fn dense_entry(start: RowID, end: RowID, block_id: PageID) -> ColumnBlockEntryInput {
+        let row_ids: Vec<RowID> = (start..end).collect();
+        ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
+            .unwrap()
+            .with_block_id(block_id)
     }
 
-    fn run_with_large_stack<F>(f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(f)
-            .expect("spawn test thread")
-            .join()
-            .expect("join test thread");
+    fn sparse_entry(
+        start: RowID,
+        end: RowID,
+        row_ids: Vec<RowID>,
+        block_id: PageID,
+    ) -> ColumnBlockEntryInput {
+        ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
+            .unwrap()
+            .with_block_id(block_id)
     }
 
     #[test]
-    fn test_batch_insert_into_empty_tree_and_find() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let metadata = build_test_metadata();
-                let table_file = fs.create_table_file(200, metadata, false).unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 200, &table_file);
+    fn test_leaf_prefix_count_roundtrip_uses_u16() {
+        let encoded = EncodedLeafEntry {
+            start_row_id: 10,
+            block_id: 1001,
+            row_id_span: 32,
+            first_present_delta: 3,
+            row_count: 7,
+            del_count: 2,
+            row_section_kind: COLUMN_ROW_CODEC_DELTA_LIST,
+            delete_section_kind: COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
+            delete_domain: COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
+            row_section: vec![0u8; 4 + 7 * mem::size_of::<u32>()],
+            delete_section: vec![0u8; 4 + 2 * mem::size_of::<u32>()],
+        };
+        let prefix = ColumnBlockLeafPrefix::from_encoded(&encoded, 128, 32, 160, 12);
+        assert_eq!(prefix.row_count(), 7);
+        assert_eq!(prefix.del_count(), 2);
+        assert_eq!(mem::size_of::<ColumnBlockLeafPrefix>(), 48);
+    }
 
-                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let entries = vec![(10, 100), (20, 200), (30, 300)];
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let new_root = index
-                    .batch_insert(&mut mutable, &entries, 40, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
+    #[test]
+    fn test_encode_row_section_rejects_row_count_above_u16() {
+        assert!(matches!(
+            encode_row_section(&LogicalRowSet::Dense {
+                row_id_span: u16::MAX as u32 + 1,
+            }),
+            Err(Error::InvalidArgument)
+        ));
+    }
 
-                let index = ColumnBlockIndex::new(new_root, 40, &disk_pool);
-                assert_eq!(index.find(9).await.unwrap(), None);
-                assert_eq!(index.find(10).await.unwrap().unwrap().block_id, 100);
-                assert_eq!(index.find(19).await.unwrap().unwrap().block_id, 100);
-                assert_eq!(index.find(20).await.unwrap().unwrap().block_id, 200);
-                assert_eq!(index.find(39).await.unwrap().unwrap().block_id, 300);
-                assert_eq!(index.find(40).await.unwrap(), None);
+    #[test]
+    fn test_logical_delete_set_rejects_delete_count_above_u16() {
+        let delete_set = LogicalDeleteSet::Inline((0..=u16::MAX as u32).collect());
+        assert!(matches!(
+            delete_set.del_count(),
+            Err(Error::InvalidArgument)
+        ));
+    }
 
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
+    #[test]
+    fn test_batch_insert_and_locate_sparse_membership() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata();
+            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let mut mutable = MutableTableFile::fork(&table);
+            let index = ColumnBlockIndex::new(0, 0, &disk_pool);
+            let entries = vec![
+                sparse_entry(10, 20, vec![12, 15, 18], 1001),
+                dense_entry(20, 24, 1002),
+            ];
+            let root_page_id = index
+                .batch_insert(&mut mutable, &entries, 24, 2)
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+            let index = ColumnBlockIndex::new(root_page_id, 24, &disk_pool);
+            assert!(index.find_entry(10).await.unwrap().is_none());
+            assert_eq!(index.find(12).await.unwrap().unwrap().block_id, 1001);
+            assert!(index.find_entry(19).await.unwrap().is_none());
+            assert_eq!(index.find(22).await.unwrap().unwrap().block_id, 1002);
         });
     }
 
     #[test]
-    fn test_index_accessors_and_find() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let metadata = build_test_metadata();
-                let table_file = fs.create_table_file(203, metadata, false).unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 203, &table_file);
+    fn test_collect_leaf_entries_and_replace_entry() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata();
+            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let mut mutable = MutableTableFile::fork(&table);
+            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+                .batch_insert(
+                    &mut mutable,
+                    &[dense_entry(0, 4, 1001), dense_entry(4, 8, 1002)],
+                    8,
+                    2,
+                )
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-                let entries = vec![(5, 500), (15, 600)];
-                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_page = index
-                    .batch_insert(&mut mutable, &entries, 20, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
+            let mut mutable = MutableTableFile::fork(&table);
+            let replacement = sparse_entry(4, 10, vec![4, 5, 8, 9], 2002);
+            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
+                .batch_replace_entries(
+                    &mut mutable,
+                    &[ColumnBlockEntryPatch {
+                        start_row_id: 4,
+                        entry: replacement,
+                    }],
+                    3,
+                )
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
 
-                let index = ColumnBlockIndex::new(root_page, 20, &disk_pool);
-                assert_eq!(index.root_page_id(), root_page);
-                assert_eq!(index.end_row_id(), 20);
-                assert_eq!(index.find(6).await.unwrap().unwrap().block_id, 500);
-                assert_eq!(index.find(19).await.unwrap().unwrap().block_id, 600);
-                assert_eq!(index.find(4).await.unwrap(), None);
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
+            let index = ColumnBlockIndex::new(root_v2, 10, &disk_pool);
+            let entries = index.collect_leaf_entries().await.unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[1].payload.block_id, 2002);
+            assert_eq!(entries[1].end_row_id(), 10);
+            assert_eq!(entries[1].row_count(), 4);
+            assert_eq!(entries[1].del_count(), 0);
+            assert!(index.find_entry(7).await.unwrap().is_none());
+            assert_eq!(index.find(8).await.unwrap().unwrap().block_id, 2002);
         });
     }
 
     #[test]
-    fn test_batch_insert_appends_within_leaf() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let metadata = build_test_metadata();
-                let table_file = fs.create_table_file(201, metadata, false).unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 201, &table_file);
+    fn test_batch_update_offloaded_bitmaps_roundtrip() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata();
+            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let mut mutable = MutableTableFile::fork(&table);
+            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+                .batch_insert(&mut mutable, &[dense_entry(0, 8, 1001)], 8, 2)
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-                let entries = build_entries(0, 8, 1000);
-                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_page = index
-                    .batch_insert(&mut mutable, &entries, 8, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let more_entries = build_entries(8, 4, 2000);
-                let index = ColumnBlockIndex::new(root_page, 8, &disk_pool);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let new_root = index
-                    .batch_insert(&mut mutable, &more_entries, 12, 3)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let index = ColumnBlockIndex::new(new_root, 12, &disk_pool);
-                assert_eq!(index.find(0).await.unwrap().unwrap().block_id, 1000);
-                assert_eq!(index.find(7).await.unwrap().unwrap().block_id, 1007);
-                assert_eq!(index.find(8).await.unwrap().unwrap().block_id, 2000);
-                assert_eq!(index.find(11).await.unwrap().unwrap().block_id, 2003);
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_build_branch_levels_multiple_layers() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let metadata = build_test_metadata();
-                let table_file = fs.create_table_file(204, metadata, false).unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-
-                let entry_count = COLUMN_BLOCK_MAX_BRANCH_ENTRIES + 1;
-                let entries = (0..entry_count)
-                    .map(|idx| ColumnBlockBranchEntry {
-                        start_row_id: idx as RowID,
-                        page_id: (1000 + idx) as PageID,
-                    })
-                    .collect::<Vec<_>>();
-
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 204, &table_file);
-                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_page = index
-                    .build_branch_levels(&mut mutable, entries, 1, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let root_node = read_node_from_file(&disk_pool, root_page).await.unwrap();
-                assert_eq!(root_node.header.height, 2);
-                assert_eq!(root_node.header.count, 2);
-                let root_entries = root_node.branch_entries();
-                assert_eq!(root_entries[0].start_row_id, 0);
-                assert_eq!(
-                    root_entries[1].start_row_id,
-                    COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID
-                );
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_batch_insert_creates_new_leaf_nodes() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let metadata = build_test_metadata();
-                let table_file = fs.create_table_file(202, metadata, false).unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 202, &table_file);
-
-                let initial_count = COLUMN_BLOCK_MAX_ENTRIES - 1;
-                let entries = build_entries(0, initial_count, 1);
-                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_page = index
-                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let append_entries = build_entries(initial_count as RowID, 2, 9000);
-                let index = ColumnBlockIndex::new(root_page, initial_count as RowID, &disk_pool);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let new_root = index
-                    .batch_insert(&mut mutable, &append_entries, initial_count as RowID + 2, 3)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let index = ColumnBlockIndex::new(new_root, initial_count as RowID + 2, &disk_pool);
-                assert_eq!(index.find(0).await.unwrap().unwrap().block_id, 1);
-                assert_eq!(
-                    index
-                        .find(initial_count as RowID)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .block_id,
-                    9000
-                );
-                assert_eq!(
-                    index
-                        .find(initial_count as RowID + 1)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .block_id,
-                    9001
-                );
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_append_to_branch_with_child_splits() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let metadata = build_test_metadata();
-                let table_file = fs.create_table_file(205, metadata, false).unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let (table_file, obsolete_page_id) = {
-                    let disk_pool = table_readonly_pool(&global, 205, &table_file);
-                    let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                    let mut setup_mutable = MutableTableFile::fork(&table_file);
-                    let obsolete_page_id = setup_mutable.allocate_page_id().unwrap();
-                    let mut node = ColumnBlockNode::new_boxed(1, 0, 0);
-                    let mut entries = Vec::with_capacity(COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-                    for idx in 0..COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
-                        entries.push(ColumnBlockBranchEntry {
-                            start_row_id: idx as RowID,
-                            page_id: (2000 + idx) as PageID,
-                        });
-                    }
-                    node.header.count = entries.len() as u32;
-                    node.branch_entries_mut().copy_from_slice(&entries);
-                    index
-                        .write_node(&setup_mutable, obsolete_page_id, &node)
-                        .await
-                        .unwrap();
-                    let (table_file, old_root) = setup_mutable.commit(2, false).await.unwrap();
-                    drop(old_root);
-                    (table_file, obsolete_page_id)
-                };
-
-                let (table_file, child_page_id, result) = {
-                    let disk_pool = table_readonly_pool(&global, 205, &table_file);
-                    let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                    let mut mutable = MutableTableFile::fork(&table_file);
-                    let child_page_id = mutable.allocate_page_id().unwrap();
-                    let extra_entries = vec![
-                        ColumnBlockBranchEntry {
-                            start_row_id: COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID,
-                            page_id: mutable.allocate_page_id().unwrap(),
-                        },
-                        ColumnBlockBranchEntry {
-                            start_row_id: COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID + 1,
-                            page_id: mutable.allocate_page_id().unwrap(),
-                        },
-                    ];
-
-                    let result = index
-                        .append_to_branch_with_child(
-                            &mut mutable,
-                            obsolete_page_id,
-                            NodeAppendResult {
-                                new_page_id: child_page_id,
-                                start_row_id: 0,
-                                extra_entries,
-                            },
-                            2,
-                        )
-                        .await
-                        .unwrap();
-                    let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                    drop(old_root);
-                    (table_file, child_page_id, result)
-                };
-
-                let disk_pool = table_readonly_pool(&global, 205, &table_file);
-                let new_root = read_node_from_file(&disk_pool, result.new_page_id)
-                    .await
-                    .unwrap();
-                let new_entries = new_root.branch_entries();
-                assert_eq!(new_entries.len(), COLUMN_BLOCK_MAX_BRANCH_ENTRIES);
-                assert_eq!(
-                    new_entries[COLUMN_BLOCK_MAX_BRANCH_ENTRIES - 1].page_id,
-                    child_page_id
-                );
-                assert_eq!(result.extra_entries.len(), 1);
-                assert_eq!(
-                    result.extra_entries[0].start_row_id,
-                    COLUMN_BLOCK_MAX_BRANCH_ENTRIES as RowID
-                );
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_batch_update_offloaded_bitmaps_cow_snapshot() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let table_file = fs
-                    .create_table_file(207, build_test_metadata(), false)
-                    .unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 207, &table_file);
-
-                let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
-                let entries = build_entries(0, initial_count, 7000);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let index_v1 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool);
-                let patch_bytes = vec![3u8; 1024];
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v2 = index_v1
-                    .batch_update_offloaded_bitmaps(
-                        &mut mutable,
-                        &[OffloadedBitmapPatch {
-                            start_row_id: 0,
-                            bitmap_bytes: &patch_bytes,
-                        }],
-                        3,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let old_root_node = read_node_from_file(&disk_pool, root_v1).await.unwrap();
-                let new_root_node = read_node_from_file(&disk_pool, root_v2).await.unwrap();
-                assert!(old_root_node.is_branch());
-                assert!(new_root_node.is_branch());
-                assert_eq!(
-                    old_root_node.branch_entries().len(),
-                    new_root_node.branch_entries().len()
-                );
-                assert_ne!(
-                    old_root_node.branch_entries()[0].page_id,
-                    new_root_node.branch_entries()[0].page_id
-                );
-                assert_eq!(
-                    old_root_node.branch_entries()[1].page_id,
-                    new_root_node.branch_entries()[1].page_id
-                );
-
-                let old_payload =
-                    ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool)
-                        .find(0)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                assert_eq!(old_payload.offloaded_ref(), None);
-
-                let index_v2 = ColumnBlockIndex::new(root_v2, initial_count as RowID, &disk_pool);
-                let new_entry = index_v2.find_entry(0).await.unwrap().unwrap();
-                assert!(new_entry.payload.offloaded_ref().is_some());
-                assert_eq!(
-                    index_v2
-                        .read_offloaded_bitmap_bytes(&new_entry)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    patch_bytes
-                );
-                let untouched = index_v2
-                    .find(COLUMN_BLOCK_MAX_ENTRIES as RowID)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(untouched.offloaded_ref(), None);
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_batch_update_offloaded_bitmaps_multi_leaf() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let table_file = fs
-                    .create_table_file(208, build_test_metadata(), false)
-                    .unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 208, &table_file);
-
-                let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
-                let entries = build_entries(0, initial_count, 8000);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let left_bytes = vec![1u8; 321];
-                let right_bytes = vec![2u8; 777];
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v2 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool)
-                    .batch_update_offloaded_bitmaps(
-                        &mut mutable,
-                        &[
-                            OffloadedBitmapPatch {
-                                start_row_id: 0,
-                                bitmap_bytes: &left_bytes,
-                            },
-                            OffloadedBitmapPatch {
-                                start_row_id: COLUMN_BLOCK_MAX_ENTRIES as RowID,
-                                bitmap_bytes: &right_bytes,
-                            },
-                        ],
-                        3,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let index_v2 = ColumnBlockIndex::new(root_v2, initial_count as RowID, &disk_pool);
-                let left_entry = index_v2.find_entry(0).await.unwrap().unwrap();
-                let right_entry = index_v2
-                    .find_entry(COLUMN_BLOCK_MAX_ENTRIES as RowID)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    index_v2
-                        .read_offloaded_bitmap_bytes(&left_entry)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    left_bytes
-                );
-                assert_eq!(
-                    index_v2
-                        .read_offloaded_bitmap_bytes(&right_entry)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    right_bytes
-                );
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_batch_update_offloaded_bitmaps_sticky() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let table_file = fs
-                    .create_table_file(209, build_test_metadata(), false)
-                    .unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 209, &table_file);
-
-                let entries = build_entries(0, 4, 9000);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                    .batch_insert(&mut mutable, &entries, 4, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let first = vec![11u8; 100];
-                let second = vec![22u8; 333];
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v2 = ColumnBlockIndex::new(root_v1, 4, &disk_pool)
-                    .batch_update_offloaded_bitmaps(
-                        &mut mutable,
-                        &[OffloadedBitmapPatch {
-                            start_row_id: 0,
-                            bitmap_bytes: &first,
-                        }],
-                        3,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v3 = ColumnBlockIndex::new(root_v2, 4, &disk_pool)
-                    .batch_update_offloaded_bitmaps(
-                        &mut mutable,
-                        &[OffloadedBitmapPatch {
-                            start_row_id: 0,
-                            bitmap_bytes: &second,
-                        }],
-                        4,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(4, false).await.unwrap();
-                drop(old_root);
-
-                let index_v2 = ColumnBlockIndex::new(root_v2, 4, &disk_pool);
-                let entry_v2 = index_v2.find_entry(0).await.unwrap().unwrap();
-                assert!(entry_v2.payload.offloaded_ref().is_some());
-                assert_eq!(
-                    index_v2
-                        .read_offloaded_bitmap_bytes(&entry_v2)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    first
-                );
-
-                let index_v3 = ColumnBlockIndex::new(root_v3, 4, &disk_pool);
-                let entry_v3 = index_v3.find_entry(0).await.unwrap().unwrap();
-                assert!(entry_v3.payload.offloaded_ref().is_some());
-                assert_eq!(
-                    index_v3
-                        .read_offloaded_bitmap_bytes(&entry_v3)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    second
-                );
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_batch_replace_payloads_cow_snapshot() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let table_file = fs
-                    .create_table_file(211, build_test_metadata(), false)
-                    .unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 211, &table_file);
-
-                let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
-                let entries = build_entries(0, initial_count, 11_000);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let index_v1 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool);
-                let mut replacement = index_v1.find(0).await.unwrap().unwrap();
-                replacement.block_id = 99_001;
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v2 = index_v1
-                    .batch_replace_payloads(
-                        &mut mutable,
-                        &[ColumnPagePayloadPatch {
-                            start_row_id: 0,
-                            payload: replacement,
-                        }],
-                        3,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let old_payload = index_v1.find(0).await.unwrap().unwrap();
-                assert_eq!(old_payload.block_id, 11_000);
-                let index_v2 = ColumnBlockIndex::new(root_v2, initial_count as RowID, &disk_pool);
-                let new_payload = index_v2.find(0).await.unwrap().unwrap();
-                assert_eq!(new_payload.block_id, 99_001);
-                assert_eq!(
-                    new_payload.deletion_field, old_payload.deletion_field,
-                    "replace path should preserve payload bytes except explicit updates"
-                );
-                let untouched = index_v2
-                    .find(COLUMN_BLOCK_MAX_ENTRIES as RowID)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(untouched.block_id, 11_000 + COLUMN_BLOCK_MAX_ENTRIES as u64);
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_batch_replace_payloads_multi_leaf() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let table_file = fs
-                    .create_table_file(212, build_test_metadata(), false)
-                    .unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 212, &table_file);
-
-                let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
-                let entries = build_entries(0, initial_count, 12_000);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let index_v1 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool);
-                let mut left = index_v1.find(0).await.unwrap().unwrap();
-                left.block_id = 88_001;
-                let mut right = index_v1
-                    .find(COLUMN_BLOCK_MAX_ENTRIES as RowID)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                right.block_id = 88_002;
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v2 = index_v1
-                    .batch_replace_payloads(
-                        &mut mutable,
-                        &[
-                            ColumnPagePayloadPatch {
-                                start_row_id: 0,
-                                payload: left,
-                            },
-                            ColumnPagePayloadPatch {
-                                start_row_id: COLUMN_BLOCK_MAX_ENTRIES as RowID,
-                                payload: right,
-                            },
-                        ],
-                        3,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let index_v2 = ColumnBlockIndex::new(root_v2, initial_count as RowID, &disk_pool);
-                assert_eq!(index_v2.find(0).await.unwrap().unwrap().block_id, 88_001);
-                assert_eq!(
-                    index_v2
-                        .find(COLUMN_BLOCK_MAX_ENTRIES as RowID)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .block_id,
-                    88_002
-                );
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_batch_replace_payloads_rejects_invalid_patches() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let table_file = fs
-                    .create_table_file(213, build_test_metadata(), false)
-                    .unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 213, &table_file);
-
-                let entries = build_entries(0, COLUMN_BLOCK_MAX_ENTRIES + 8, 13_000);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                    .batch_insert(&mut mutable, &entries, entries.len() as RowID, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let index_v1 = ColumnBlockIndex::new(root_v1, entries.len() as RowID, &disk_pool);
-                let base = index_v1.find(0).await.unwrap().unwrap();
-
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let unsorted = [
-                    ColumnPagePayloadPatch {
-                        start_row_id: COLUMN_BLOCK_MAX_ENTRIES as RowID,
-                        payload: base,
-                    },
-                    ColumnPagePayloadPatch {
+            let deltas = BTreeSet::from([1u32, 3, 6]);
+            let bytes = encode_deletion_deltas_to_bytes(&deltas);
+            let mut mutable = MutableTableFile::fork(&table);
+            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
+                .batch_update_offloaded_bitmaps(
+                    &mut mutable,
+                    &[OffloadedBitmapPatch {
                         start_row_id: 0,
-                        payload: base,
-                    },
-                ];
-                let err = index_v1
-                    .batch_replace_payloads(&mut mutable, &unsorted, 3)
-                    .await
-                    .unwrap_err();
-                assert!(matches!(err, Error::InvalidArgument));
-                drop(mutable);
+                        bitmap_bytes: &bytes,
+                    }],
+                    3,
+                )
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
 
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let missing = [ColumnPagePayloadPatch {
-                    start_row_id: entries.len() as RowID + 100,
-                    payload: base,
-                }];
-                let err = index_v1
-                    .batch_replace_payloads(&mut mutable, &missing, 3)
-                    .await
-                    .unwrap_err();
-                assert!(matches!(err, Error::InvalidArgument));
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
+            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool);
+            let entry = index.find_entry(0).await.unwrap().unwrap();
+            assert!(entry.payload.offloaded_ref().is_some());
+            assert_eq!(entry.row_count(), 8);
+            assert_eq!(entry.del_count(), 3);
+            let loaded = load_payload_deletion_deltas(&index, entry).await.unwrap();
+            assert_eq!(loaded, deltas);
         });
     }
 
     #[test]
-    fn test_read_offloaded_bitmap_invalid_ref() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let table_file = fs
-                    .create_table_file(210, build_test_metadata(), false)
-                    .unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 210, &table_file);
+    fn test_batch_insert_splits_leaf_pages() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata();
+            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let mut mutable = MutableTableFile::fork(&table);
+            let mut entries = Vec::new();
+            for idx in 0..(COLUMN_BLOCK_MAX_ENTRIES + 32) as u64 {
+                entries.push(dense_entry(idx * 2, idx * 2 + 2, 10_000 + idx));
+            }
+            let root = ColumnBlockIndex::new(0, 0, &disk_pool)
+                .batch_insert(
+                    &mut mutable,
+                    &entries,
+                    entries.last().unwrap().end_row_id,
+                    2,
+                )
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-                let mut payload = build_deletion_payload();
-                payload.set_offloaded_ref(BlobRef {
-                    start_page_id: 0,
-                    start_offset: 0,
-                    byte_len: 1,
-                });
-                let index = ColumnBlockIndex::new(0, 0, &disk_pool);
-                let entry = ColumnLeafEntry {
-                    leaf_page_id: 77,
-                    start_row_id: 0,
-                    payload,
-                };
-                let res = index.read_offloaded_bitmap_bytes(&entry).await;
-                assert!(matches!(
-                    res,
-                    Err(Error::PersistedPageCorrupted {
-                        file_kind: PersistedFileKind::TableFile,
-                        page_kind: PersistedPageKind::ColumnBlockIndex,
-                        page_id: 77,
-                        cause: PersistedPageCorruptionCause::InvalidPayload,
-                    })
-                ));
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_load_payload_deletion_deltas_maps_invalid_blob_contents_to_corruption() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let table_file = fs
-                    .create_table_file(214, build_test_metadata(), false)
-                    .unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 214, &table_file);
-
-                let entries = build_entries(0, 1, 9100);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                    .batch_insert(&mut mutable, &entries, 1, 2)
+            let index = ColumnBlockIndex::new(root, entries.last().unwrap().end_row_id, &disk_pool);
+            let collected = index.collect_leaf_entries().await.unwrap();
+            assert_eq!(collected.len(), entries.len());
+            assert_eq!(index.find(0).await.unwrap().unwrap().block_id, 10_000);
+            assert_eq!(
+                index
+                    .find((COLUMN_BLOCK_MAX_ENTRIES as u64) * 2)
                     .await
-                    .unwrap();
-                let bad_blob = [1u8, 2, 3];
-                let root_v2 = ColumnBlockIndex::new(root_v1, 1, &disk_pool)
-                    .batch_update_offloaded_bitmaps(
-                        &mut mutable,
-                        &[OffloadedBitmapPatch {
-                            start_row_id: 0,
-                            bitmap_bytes: &bad_blob,
-                        }],
-                        3,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let index = ColumnBlockIndex::new(root_v2, 1, &disk_pool);
-                let entry = index.find_entry(0).await.unwrap().unwrap();
-                let blob_ref = entry.payload.try_offloaded_ref().unwrap().unwrap();
-                let err = load_payload_deletion_deltas(&index, entry)
-                    .await
-                    .unwrap_err();
-                assert!(matches!(
-                    err,
-                    Error::PersistedPageCorrupted {
-                        file_kind: PersistedFileKind::TableFile,
-                        page_kind: PersistedPageKind::ColumnDeletionBlob,
-                        page_id,
-                        cause: PersistedPageCorruptionCause::InvalidPayload,
-                    } if page_id == blob_ref.start_page_id
-                ));
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
-        });
-    }
-
-    #[test]
-    fn test_cache_reuse_for_unchanged_leaf_across_root_swap() {
-        run_with_large_stack(|| {
-            smol::block_on(async {
-                let (_temp_dir, fs) = build_test_fs();
-                let metadata = build_test_metadata();
-                let table_file = fs.create_table_file(206, metadata, false).unwrap();
-                let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-                drop(old_root);
-                let global = global_readonly_pool_scope(64 * 1024 * 1024);
-                let disk_pool = table_readonly_pool(&global, 206, &table_file);
-
-                // Build at least two leaves so right-most append can preserve left leaf pages.
-                let initial_count = COLUMN_BLOCK_MAX_ENTRIES + 8;
-                let entries = build_entries(0, initial_count, 5000);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                    .batch_insert(&mut mutable, &entries, initial_count as RowID, 2)
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-                drop(old_root);
-
-                let root_node = read_node_from_file(&disk_pool, root_v1).await.unwrap();
-                assert!(root_node.is_branch());
-                let left_leaf_page_id = root_node.branch_entries()[0].page_id;
-
-                let index_v1 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool);
-                assert_eq!(index_v1.find(0).await.unwrap().unwrap().block_id, 5000);
-
-                let left_leaf_key = PersistedBlockKey::new(206, left_leaf_page_id);
-                let frame_before = global
-                    .try_get_frame_id(&left_leaf_key)
-                    .expect("left leaf should be cached after first lookup");
-
-                let append = build_entries(initial_count as RowID, 16, 9000);
-                let mut mutable = MutableTableFile::fork(&table_file);
-                let root_v2 = ColumnBlockIndex::new(root_v1, initial_count as RowID, &disk_pool)
-                    .batch_insert(
-                        &mut mutable,
-                        &append,
-                        initial_count as RowID + append.len() as RowID,
-                        3,
-                    )
-                    .await
-                    .unwrap();
-                let (table_file, old_root) = mutable.commit(3, false).await.unwrap();
-                drop(old_root);
-
-                let index_v2 = ColumnBlockIndex::new(
-                    root_v2,
-                    initial_count as RowID + append.len() as RowID,
-                    &disk_pool,
-                );
-                assert_eq!(index_v2.find(0).await.unwrap().unwrap().block_id, 5000);
-
-                let frame_after = global
-                    .try_get_frame_id(&left_leaf_key)
-                    .expect("left leaf cache entry should remain valid");
-                assert_eq!(frame_before, frame_after);
-
-                drop(disk_pool);
-                drop(global);
-                drop(table_file);
-                drop(fs);
-            })
+                    .unwrap()
+                    .unwrap()
+                    .block_id,
+                10_000 + COLUMN_BLOCK_MAX_ENTRIES as u64
+            );
         });
     }
 }
