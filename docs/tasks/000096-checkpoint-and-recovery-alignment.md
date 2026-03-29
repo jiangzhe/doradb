@@ -303,10 +303,7 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-1. If the typed delete-rewrite API makes `OffloadedBitmapPatch` and
-   `batch_update_offloaded_bitmaps` unused for all infrastructure callers, the
-   implementation should decide whether local removal is clean enough to do in
-   this task or whether a narrow cleanup follow-up is preferable.
-2. Runtime point-read callers in `doradb-storage/src/index/block_index.rs`
+1. Runtime point-read callers in `doradb-storage/src/index/block_index.rs`
    still rely on compatibility payload lookup. That compatibility surface is
-   intentionally left for RFC-0011 phase 3 rather than expanded here.
+   intentionally left for RFC-0011 phase 3 rather than expanded here, so no
+   separate backlog item was created during this task resolve.
