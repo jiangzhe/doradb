@@ -1,7 +1,7 @@
 ---
 id: 000095
 title: Leaf Format and Rebuilder Foundation
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-29
 github_issue: 492
 ---
@@ -212,6 +212,60 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented the RFC-0011 phase-1 leaf-format foundation in
+   `doradb-storage/src/index/column_block_index.rs`:
+   - replaced the fixed-width leaf payload layout with the v2 logical-entry
+     leaf format;
+   - added fixed prefixes plus reverse-grown row/delete sections;
+   - introduced logical leaf decode/build/rebuild flows and leaf splitting by
+     encoded size;
+   - landed the phase-1 `locate_block(row_id)` metadata surface and
+     compatibility readers for current row-id-space consumers.
+2. Updated write-side persistence callers so v2 entries are built from row
+   shape metadata instead of `(start_row_id, block_id)` alone:
+   - LWC build output now carries the row-shape information needed by the v2
+     builder;
+   - table-file persistence, catalog checkpoint append, and tail-block
+     replacement flows now pass full logical entry inputs into the column
+     block index.
+3. Landed the phase-1 auxiliary-blob and page-version foundation:
+   - column-block-index and column-deletion-blob persisted page specs now use
+     the new v2 format boundary;
+   - delete-delta spills use the shared 8-byte auxiliary-blob framing header;
+   - compatibility delete-delta loading validates section/blob metadata on top
+     of the new leaf and blob contracts.
+4. Incorporated post-implementation review fixes while resolving this task:
+   - `ColumnDeletionBlobWriter` now advances off an exactly full page before
+     capturing a new blob start reference;
+   - `read_framed_blob` reuses the owned `Vec<u8>` from `read_raw()` instead
+     of cloning the payload tail;
+   - `ColumnDeletionBlobReader::read` now validates delete-delta framing
+     header fields before returning payload bytes;
+   - persisted leaf `row_count` and `del_count` now use `u16` consistently for
+     actual stored counts;
+   - `block_page_id` has been renamed to `block_id` across the column block
+     index path.
+5. Verification executed for the implemented state:
+   - `cargo fmt --all`
+   - `cargo test -p doradb-storage column_block_index::tests::`
+     - result: `7/7` targeted column-block-index tests passed
+   - `cargo nextest run -p doradb-storage`
+     - result: `447/447` passed
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+     - result: `446/446` passed
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+6. Resolve-time tracking updates:
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000095-leaf-format-and-rebuilder-foundation.md`
+     - result: `docs/tasks/next-id` already at `000096`; no change was needed
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000095-leaf-format-and-rebuilder-foundation.md`
+     - result: updated RFC-0011 phase 1 with this task doc, issue `#492`,
+       phase status `done`, and the phase implementation summary
+   - implementation tracked in GitHub issue `#492`
+   - pull request opened as `#493`
+   - no new follow-up backlog doc was created during this resolve pass; the
+     existing blob-page sweep/reclamation backlogs remain the tracked follow-up
+     for deferred reachability work
+
 ## Impacts
 
 - `doradb-storage/src/index/column_block_index.rs`
@@ -219,27 +273,23 @@ Reference:
 - `doradb-storage/src/index/column_checkpoint.rs`
   - delete-section encode/decode helpers move off fixed `ColumnPagePayload`
     assumptions.
-- `doradb-storage/src/index/column_deletion_blob.rs` or successor module
-  - generalized auxiliary-blob page/header support.
-- `doradb-storage/src/index/column_payload.rs`
-  - likely reduced to a compatibility layer or removed from the phase-1 write
-    path.
+- `doradb-storage/src/index/column_deletion_blob.rs`
+  - phase-1 auxiliary-blob framing, page writer/reader support, and follow-up
+    reader/writer correctness fixes.
 - `doradb-storage/src/file/page_integrity.rs`
   - v2 page spec constants for column-block-index and auxiliary-blob pages.
+- `doradb-storage/src/lwc/mod.rs`
+  - row-shape metadata propagation from built LWC pages.
 - `doradb-storage/src/table/mod.rs`
   - row-shape metadata propagation from LWC build results into v2 index entry
     construction.
 - `doradb-storage/src/file/table_file.rs`
-  - `LwcPagePersist` or adjacent write-path structs likely gain v2
-    entry-shape metadata.
-- `doradb-storage/src/table/persistence.rs`
-  - delete patch application shifts from fixed payload patching to v2 entry
-    rewrite.
+  - write-path persistence now publishes v2 entry-shape metadata and updated
+    builder naming.
 - `doradb-storage/src/catalog/storage/checkpoint.rs`
   - append and tail rewrite paths must use v2 entry build/rewrite inputs.
-- `doradb-storage/src/table/recover.rs`
-  - expected to keep current semantics but may need compatibility type
-    adjustments if old leaf entry structs change.
+- `docs/unsafe-usage-baseline.md`
+  - unsafe inventory refreshed for the implemented low-level page-layout work.
 
 ## Test Cases
 
@@ -267,12 +317,20 @@ Reference:
    - catalog checkpoint append and tail rewrite;
    - recovery-time leaf iteration and delete-delta loading;
    - unchanged runtime point-read path.
+9. Append a blob immediately after an exact page fill and verify the new
+   `BlobRef` starts on a fresh page at offset `0`.
+10. Reject delete-blob reader framing mismatches for wrong kind, codec,
+    version, or non-zero flags.
 
 ## Open Questions
 
 1. Codec threshold values should remain provisional in this task and can be
    tuned after phase-1 implementation data exists.
-2. If row-id external spill turns out to be required for builder correctness
-   rather than just future optimization, it should be added inside this task
-   using the phase-1 auxiliary-blob header rather than reopening the on-disk
-   contract later.
+2. Row-id external spill was not required by the implemented phase-1 builder.
+   If later builder correctness or measured compression wins require it, it
+   should reuse the phase-1 auxiliary-blob header rather than reopening the
+   on-disk contract.
+3. Blob-page reachability sweep and reclamation remain deferred to the
+   existing backlogs:
+   - `docs/backlogs/000029-column-deletion-blob-reachability-sweep-strategy.md`
+   - `docs/backlogs/000030-column-deletion-blob-reclamation-trigger-and-sla.md`
