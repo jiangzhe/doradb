@@ -6,3 +6,7 @@ Cargo.lock
 tarpaulin-report.html
 .env
 gha-creds-*.json
+
+# draft designs
+/docs/drafts
+
