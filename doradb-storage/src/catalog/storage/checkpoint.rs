@@ -281,7 +281,7 @@ impl CatalogStorage {
                     merged_row_ids,
                     existing_deletes.into_iter().collect(),
                 )?
-                .with_block_page_id(new_tail_page_id);
+                .with_block_id(new_tail_page_id);
                 let patches = [ColumnBlockEntryPatch {
                     start_row_id: last_entry.start_row_id,
                     entry: replacement,
@@ -311,7 +311,7 @@ impl CatalogStorage {
             for page in new_pages {
                 let page_id = mutable.allocate_page_id()?;
                 mutable.write_page(page_id, page.buf).await?;
-                new_entries.push(page.shape.with_block_page_id(page_id));
+                new_entries.push(page.shape.with_block_id(page_id));
             }
             if !new_entries.is_empty() {
                 let new_end_row_id = next_row_id.max(root.pivot_row_id);

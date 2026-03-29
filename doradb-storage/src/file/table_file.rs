@@ -463,7 +463,7 @@ impl MutableTableFile {
                 return Err(Error::InvalidArgument);
             }
             last_end = end_row_id;
-            new_entries.push(page.shape.with_block_page_id(page_id));
+            new_entries.push(page.shape.with_block_id(page_id));
             writes.push(table_file.write_page(page_id, page.buf));
         }
 

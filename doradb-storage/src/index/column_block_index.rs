@@ -45,7 +45,7 @@ const COLUMN_BLOB_REF_SIZE: usize =
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
 struct ColumnBlockLeafPrefix {
     start_row_id: [u8; 8],
-    block_page_id: [u8; 8],
+    block_id: [u8; 8],
     row_id_span: [u8; 4],
     first_present_delta: [u8; 4],
     row_count: [u8; 2],
@@ -177,11 +177,11 @@ impl ColumnBlockEntryShape {
     }
 
     #[inline]
-    pub(crate) fn with_block_page_id(self, block_page_id: PageID) -> ColumnBlockEntryInput {
+    pub(crate) fn with_block_id(self, block_id: PageID) -> ColumnBlockEntryInput {
         ColumnBlockEntryInput {
             start_row_id: self.start_row_id,
             end_row_id: self.end_row_id,
-            block_page_id,
+            block_id,
             row_ids: self.row_ids,
             delete_deltas: self.delete_deltas,
         }
@@ -193,7 +193,7 @@ impl ColumnBlockEntryShape {
 pub struct ColumnBlockEntryInput {
     start_row_id: RowID,
     end_row_id: RowID,
-    block_page_id: PageID,
+    block_id: PageID,
     row_ids: Vec<RowID>,
     delete_deltas: Vec<u32>,
 }
@@ -355,14 +355,14 @@ impl LogicalDeleteSet {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LogicalLeafEntry {
     start_row_id: RowID,
-    block_page_id: PageID,
+    block_id: PageID,
     row_set: LogicalRowSet,
     delete_set: LogicalDeleteSet,
 }
 
 impl LogicalLeafEntry {
     fn from_input(input: &ColumnBlockEntryInput) -> Result<Self> {
-        if input.block_page_id == 0 {
+        if input.block_id == 0 {
             return Err(Error::InvalidArgument);
         }
         let row_set =
@@ -374,7 +374,7 @@ impl LogicalLeafEntry {
         };
         Ok(LogicalLeafEntry {
             start_row_id: input.start_row_id,
-            block_page_id: input.block_page_id,
+            block_id: input.block_id,
             row_set,
             delete_set,
         })
@@ -389,7 +389,7 @@ enum ResolvedLeafPatch {
     },
     ReplacePayload {
         start_row_id: RowID,
-        block_page_id: PageID,
+        block_id: PageID,
         delete_set: LogicalDeleteSet,
     },
 }
@@ -415,11 +415,11 @@ impl ResolvedLeafPatch {
                 *entry = replacement.clone();
             }
             ResolvedLeafPatch::ReplacePayload {
-                block_page_id,
+                block_id,
                 delete_set,
                 ..
             } => {
-                entry.block_page_id = *block_page_id;
+                entry.block_id = *block_id;
                 entry.delete_set = delete_set.clone();
             }
         }
@@ -430,7 +430,7 @@ impl ResolvedLeafPatch {
 #[derive(Clone)]
 struct EncodedLeafEntry {
     start_row_id: RowID,
-    block_page_id: PageID,
+    block_id: PageID,
     row_id_span: u32,
     first_present_delta: u32,
     row_count: u16,
@@ -450,7 +450,7 @@ impl EncodedLeafEntry {
             encode_delete_section(&entry.delete_set)?;
         Ok(EncodedLeafEntry {
             start_row_id: entry.start_row_id,
-            block_page_id: entry.block_page_id,
+            block_id: entry.block_id,
             row_id_span,
             first_present_delta,
             row_count,
@@ -718,8 +718,8 @@ impl ColumnBlockLeafPrefix {
     }
 
     #[inline]
-    fn block_page_id(&self) -> PageID {
-        u64::from_le_bytes(self.block_page_id)
+    fn block_id(&self) -> PageID {
+        u64::from_le_bytes(self.block_id)
     }
 
     #[inline]
@@ -793,7 +793,7 @@ impl ColumnBlockLeafPrefix {
     ) -> Self {
         ColumnBlockLeafPrefix {
             start_row_id: entry.start_row_id.to_le_bytes(),
-            block_page_id: entry.block_page_id.to_le_bytes(),
+            block_id: entry.block_id.to_le_bytes(),
             row_id_span: entry.row_id_span.to_le_bytes(),
             first_present_delta: entry.first_present_delta.to_le_bytes(),
             row_count: entry.row_count.to_le_bytes(),
@@ -1091,7 +1091,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 let blob_ref = writer.append(patch.bitmap_bytes).await?;
                 resolved.push(ResolvedLeafPatch::ReplacePayload {
                     start_row_id: patch.start_row_id,
-                    block_page_id: 0,
+                    block_id: 0,
                     delete_set: LogicalDeleteSet::External {
                         del_count: storage_count_u16(deltas.len())?,
                         blob_ref,
@@ -1135,7 +1135,7 @@ impl<'a> ColumnBlockIndex<'a> {
             let delete_set = payload_to_delete_set(&patch.payload, self.disk_pool).await?;
             resolved.push(ResolvedLeafPatch::ReplacePayload {
                 start_row_id: patch.start_row_id,
-                block_page_id: patch.payload.block_id,
+                block_id: patch.payload.block_id,
                 delete_set,
             });
         }
@@ -1264,10 +1264,10 @@ impl<'a> ColumnBlockIndex<'a> {
                 .map_err(|_| Error::InvalidArgument)?;
             let mut replacement = entries[idx].clone();
             patch.apply(&mut replacement)?;
-            if let ResolvedLeafPatch::ReplacePayload { block_page_id, .. } = patch
-                && *block_page_id == 0
+            if let ResolvedLeafPatch::ReplacePayload { block_id, .. } = patch
+                && *block_id == 0
             {
-                replacement.block_page_id = entries[idx].block_page_id;
+                replacement.block_id = entries[idx].block_id;
             }
             entries[idx] = replacement;
         }
@@ -1432,7 +1432,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 decode_logical_delete_set_without_blob(&view, &row_set, self.file_kind(), page_id)?;
             entries.push(LogicalLeafEntry {
                 start_row_id: view.prefix.start_row_id(),
-                block_page_id: view.prefix.block_page_id(),
+                block_id: view.prefix.block_id(),
                 row_set,
                 delete_set,
             });
@@ -1897,7 +1897,7 @@ fn build_leaf_entry(
 
 fn compatibility_payload_for_view(view: &LeafEntryView<'_>) -> Result<ColumnPagePayload> {
     let mut payload = ColumnPagePayload {
-        block_id: view.prefix.block_page_id(),
+        block_id: view.prefix.block_id(),
         deletion_field: [0u8; 120],
     };
     match view.prefix.delete_codec() {
@@ -2274,29 +2274,29 @@ mod tests {
         ))
     }
 
-    fn dense_entry(start: RowID, end: RowID, block_page_id: PageID) -> ColumnBlockEntryInput {
+    fn dense_entry(start: RowID, end: RowID, block_id: PageID) -> ColumnBlockEntryInput {
         let row_ids: Vec<RowID> = (start..end).collect();
         ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
             .unwrap()
-            .with_block_page_id(block_page_id)
+            .with_block_id(block_id)
     }
 
     fn sparse_entry(
         start: RowID,
         end: RowID,
         row_ids: Vec<RowID>,
-        block_page_id: PageID,
+        block_id: PageID,
     ) -> ColumnBlockEntryInput {
         ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
             .unwrap()
-            .with_block_page_id(block_page_id)
+            .with_block_id(block_id)
     }
 
     #[test]
     fn test_leaf_prefix_count_roundtrip_uses_u16() {
         let encoded = EncodedLeafEntry {
             start_row_id: 10,
-            block_page_id: 1001,
+            block_id: 1001,
             row_id_span: 32,
             first_present_delta: 3,
             row_count: 7,
