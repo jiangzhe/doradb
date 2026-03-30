@@ -1,7 +1,7 @@
 ---
 id: 0011
 title: Redesign Column Block Index Program
-status: proposal
+status: implemented
 tags: [storage-engine, index, checkpoint, recovery, file-format]
 created: 2026-03-28
 github_issue: 494
@@ -292,9 +292,6 @@ The intended unsafe scope is limited:
   - Task Issue: `#499`
   - Phase Status: done
   - Implementation Summary: Implemented ordinal-domain persisted deletes, domain-preserving delete rewrites, authoritative catalog tail-merge ordinal persistence, and payload-era compatibility cleanup. [Task Resolve Sync: docs/tasks/000098-later-domain-evolution-and-auxiliary-payload-expansion.md @ 2026-03-30]
-  - Related Backlogs:
-    - `docs/backlogs/000029-column-deletion-blob-reachability-sweep-strategy.md`
-    - `docs/backlogs/000030-column-deletion-blob-reclamation-trigger-and-sla.md`
 
 ## Consequences
 
@@ -315,14 +312,17 @@ The intended unsafe scope is limited:
 
 ## Open Questions
 
-1. Exact phase-2 task decomposition remains open as a planning question, but any split must preserve the ordered success gates defined in this RFC.
-2. Exact codec-threshold values remain benchmark-derived and are intentionally not frozen by this RFC.
+1. Exact codec-threshold values remain benchmark-derived and are intentionally not frozen by this RFC.
+2. Whether later negative-lookup or delete-hint fields justify their per-entry cost remains open pending the broader measurement tracked in `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`.
 
 ## Future Work
 
 - Any branch-page redesign beyond the current fixed-width mapping model.
 - Any broader attempt to remove LWC ownership of persisted row-id data for non-runtime consumers.
+- Any broader cleanup of deferred `RowLocation::LwcPage(..)` runtime callers, including the remaining purge/index-delete path tracked in `docs/backlogs/000049-purge-crashes-on-checkpointed-rows-in-index-delete-lwc-path.md`.
 - Compatibility or migration tooling for pre-redesign persisted trees if that ever becomes necessary.
+- Additional delete-surface refinement beyond the phase-4 compatibility cleanup, tracked in `docs/backlogs/000075-refine-column-block-index-inline-delete-field-and-delete-surface-cleanup.md`.
+- Broader runtime lookup benchmark coverage before any later hint-field decision, tracked in `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`.
 - Auxiliary blob reclamation policy and SLA beyond the backlog items already tracked in [B1] and [B2].
 
 ## References
