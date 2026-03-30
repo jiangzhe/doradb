@@ -293,6 +293,34 @@ impl ColumnLeafEntry {
     }
 }
 
+/// Runtime row resolution result for one persisted columnar row lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedColumnRow {
+    leaf_page_id: PageID,
+    block_id: PageID,
+    row_idx: usize,
+}
+
+impl ResolvedColumnRow {
+    /// Returns the leaf page that produced this resolution result.
+    #[inline]
+    pub fn leaf_page_id(&self) -> PageID {
+        self.leaf_page_id
+    }
+
+    /// Returns the persisted LWC block page id that stores the row values.
+    #[inline]
+    pub fn block_id(&self) -> PageID {
+        self.block_id
+    }
+
+    /// Returns the resolved ordinal inside the persisted LWC page.
+    #[inline]
+    pub fn row_idx(&self) -> usize {
+        self.row_idx
+    }
+}
+
 /// One bitmap update patch keyed by leaf `start_row_id`.
 #[derive(Clone, Copy, Debug)]
 pub struct OffloadedBitmapPatch<'a> {
@@ -937,6 +965,57 @@ impl<'a> ColumnBlockIndex<'a> {
     #[inline]
     pub async fn find_entry(&self, row_id: RowID) -> Result<Option<ColumnLeafEntry>> {
         self.locate_block(row_id).await
+    }
+
+    /// Resolves one row id against an already-located persisted leaf entry.
+    pub async fn resolve_row(
+        &self,
+        row_id: RowID,
+        entry: &ColumnLeafEntry,
+    ) -> Result<Option<ResolvedColumnRow>> {
+        let node = self.read_node(entry.leaf_page_id).await?;
+        let prefixes = node.leaf_prefixes(self.file_kind(), entry.leaf_page_id)?;
+        let idx = prefixes
+            .binary_search_by_key(&entry.start_row_id, |prefix| prefix.start_row_id())
+            .map_err(|_| invalid_node_payload(self.file_kind(), entry.leaf_page_id))?;
+        let view = node.leaf_entry_view(idx, self.file_kind(), entry.leaf_page_id)?;
+        let Some(row_idx) =
+            resolve_row_idx_in_view(&view, row_id, self.file_kind(), entry.leaf_page_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(build_resolved_row(entry.leaf_page_id, &view, row_idx)))
+    }
+
+    /// Locates and resolves one persisted row id in a single tree descent.
+    pub async fn locate_and_resolve_row(&self, row_id: RowID) -> Result<Option<ResolvedColumnRow>> {
+        if self.root_page_id == 0 || row_id >= self.end_row_id {
+            return Ok(None);
+        }
+        let mut page_id = self.root_page_id;
+        loop {
+            let node = self.read_node(page_id).await?;
+            if node.is_leaf() {
+                let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
+                let idx = match search_start_row_id(prefixes, row_id) {
+                    Some(idx) => idx,
+                    None => return Ok(None),
+                };
+                let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
+                let Some(row_idx) =
+                    resolve_row_idx_in_view(&view, row_id, self.file_kind(), page_id)?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(build_resolved_row(page_id, &view, row_idx)));
+            }
+            let entries = node.branch_entries();
+            let idx = match search_branch_entry(entries, row_id) {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+            page_id = entries[idx].page_id;
+        }
     }
 
     /// Reads delete payload bytes from an external blob reference.
@@ -1854,25 +1933,49 @@ fn entry_contains_row_id(
     file_kind: PersistedFileKind,
     page_id: PageID,
 ) -> Result<bool> {
+    Ok(resolve_row_idx_in_view(view, row_id, file_kind, page_id)?.is_some())
+}
+
+fn resolve_row_idx_in_view(
+    view: &LeafEntryView<'_>,
+    row_id: RowID,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<Option<usize>> {
     let start_row_id = view.prefix.start_row_id();
     let delta_u64 = match row_id.checked_sub(start_row_id) {
         Some(delta) => delta,
-        None => return Ok(false),
+        None => return Ok(None),
     };
     if delta_u64 >= view.prefix.row_id_span() as u64 {
-        return Ok(false);
+        return Ok(None);
     }
     let delta = delta_u64 as u32;
     if delta < view.prefix.first_present_delta() {
-        return Ok(false);
+        return Ok(None);
     }
     match view.row_header.kind {
-        COLUMN_ROW_CODEC_DENSE => Ok(true),
-        COLUMN_ROW_CODEC_DELTA_LIST => {
-            contains_u32_delta(&view.row_section[4..], delta, file_kind, page_id)
-        }
+        COLUMN_ROW_CODEC_DENSE => Ok(Some(delta as usize)),
+        COLUMN_ROW_CODEC_DELTA_LIST => resolve_delta_list_row_idx(view, delta, file_kind, page_id),
         _ => Err(invalid_node_payload(file_kind, page_id)),
     }
+}
+
+fn resolve_delta_list_row_idx(
+    view: &LeafEntryView<'_>,
+    delta: u32,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<Option<usize>> {
+    let deltas = decode_u32_row_deltas(
+        &view.row_section[4..],
+        view.prefix.row_count(),
+        view.prefix.row_id_span(),
+        view.prefix.first_present_delta(),
+        file_kind,
+        page_id,
+    )?;
+    Ok(deltas.binary_search(&delta).ok())
 }
 
 fn decode_logical_row_set(
@@ -1976,6 +2079,18 @@ fn build_leaf_entry(
         delete_section_aux: view.delete_header.map(|header| header.aux).unwrap_or(0),
         delete_domain: view.prefix.delete_domain(),
     })
+}
+
+fn build_resolved_row(
+    leaf_page_id: PageID,
+    view: &LeafEntryView<'_>,
+    row_idx: usize,
+) -> ResolvedColumnRow {
+    ResolvedColumnRow {
+        leaf_page_id,
+        block_id: view.prefix.block_id(),
+        row_idx,
+    }
 }
 
 fn compatibility_payload_for_view(view: &LeafEntryView<'_>) -> Result<ColumnPagePayload> {
@@ -2221,24 +2336,6 @@ fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> Result<Vec<u32>
         res.push(value);
     }
     Ok(res)
-}
-
-fn contains_u32_delta(
-    bytes: &[u8],
-    target: u32,
-    file_kind: PersistedFileKind,
-    page_id: PageID,
-) -> Result<bool> {
-    if !bytes.len().is_multiple_of(mem::size_of::<u32>()) {
-        return Err(invalid_node_payload(file_kind, page_id));
-    }
-    let deltas = decode_u32_bytes_strict(
-        bytes,
-        storage_count_u16(bytes.len() / mem::size_of::<u32>())
-            .map_err(|_| invalid_node_payload(file_kind, page_id))?,
-    )
-    .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-    Ok(deltas.binary_search(&target).is_ok())
 }
 
 async fn payload_to_delete_set(
@@ -2489,6 +2586,53 @@ mod tests {
             assert_eq!(index.find(12).await.unwrap().unwrap().block_id, 1001);
             assert!(index.find_entry(19).await.unwrap().is_none());
             assert_eq!(index.find(22).await.unwrap().unwrap().block_id, 1002);
+        });
+    }
+
+    #[test]
+    fn test_resolve_row_dense_and_sparse() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata();
+            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let mut mutable = MutableTableFile::fork(&table);
+            let entries = vec![
+                dense_entry(0, 4, 1001),
+                sparse_entry(10, 20, vec![12, 15, 18], 1002),
+            ];
+            let root_page_id = ColumnBlockIndex::new(0, 0, &disk_pool)
+                .batch_insert(&mut mutable, &entries, 20, 2)
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+            let index = ColumnBlockIndex::new(root_page_id, 20, &disk_pool);
+            let dense_entry = index.find_entry(2).await.unwrap().unwrap();
+            let dense_resolved = index.resolve_row(2, &dense_entry).await.unwrap().unwrap();
+            assert_eq!(dense_resolved.block_id(), 1001);
+            assert_eq!(dense_resolved.row_idx(), 2);
+            assert_eq!(dense_resolved.leaf_page_id(), dense_entry.leaf_page_id);
+
+            let sparse_entry = index.find_entry(15).await.unwrap().unwrap();
+            let sparse_resolved = index.resolve_row(15, &sparse_entry).await.unwrap().unwrap();
+            assert_eq!(sparse_resolved.block_id(), 1002);
+            assert_eq!(sparse_resolved.row_idx(), 1);
+            assert_eq!(sparse_resolved.leaf_page_id(), sparse_entry.leaf_page_id);
+            assert!(
+                index
+                    .resolve_row(14, &sparse_entry)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let one_descent = index.locate_and_resolve_row(18).await.unwrap().unwrap();
+            assert_eq!(one_descent.block_id(), 1002);
+            assert_eq!(one_descent.row_idx(), 2);
         });
     }
 

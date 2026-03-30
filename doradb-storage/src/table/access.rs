@@ -2,9 +2,13 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::{INVALID_PAGE_ID, PageID};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards};
 use crate::catalog::{CatalogTable, TableMetadata};
-use crate::error::{Error, Result};
+use crate::error::{
+    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
-use crate::index::{IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex};
+use crate::index::{
+    IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, RuntimeRowLocation, UniqueIndex,
+};
 use crate::lwc::PersistedLwcPage;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey,
@@ -189,15 +193,15 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<SelectMvcc> {
         loop {
             let location = match self
-                .try_find_row(stmt.pool_guards(), row_id, self.storage)
+                .try_find_runtime_row(stmt.pool_guards(), row_id, self.storage)
                 .await
             {
                 Ok(location) => location,
                 Err(err) => return Err(err),
             };
             match location {
-                RowLocation::NotFound => return Ok(SelectMvcc::NotFound),
-                RowLocation::LwcPage(page_id) => {
+                RuntimeRowLocation::NotFound => return Ok(SelectMvcc::NotFound),
+                RuntimeRowLocation::Persisted(resolved) => {
                     let Some(deletion_buffer) = self.deletion_buffer() else {
                         return Ok(SelectMvcc::NotFound);
                     };
@@ -220,13 +224,17 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             }
                         }
                     }
-                    return match self.read_lwc_row(page_id, row_id, user_read_set).await {
-                        Ok(Some(vals)) => Ok(SelectMvcc::Found(vals)),
-                        Ok(None) => Ok(SelectMvcc::NotFound),
-                        Err(err) => Err(err),
-                    };
+                    let vals = self
+                        .read_lwc_row(
+                            resolved.block_id(),
+                            row_id,
+                            resolved.row_idx(),
+                            user_read_set,
+                        )
+                        .await?;
+                    return Ok(SelectMvcc::Found(vals));
                 }
-                RowLocation::RowPage(page_id) => {
+                RuntimeRowLocation::RowPage(page_id) => {
                     let page_guard =
                         match self.get_row_page_shared(stmt.pool_guards(), page_id).await {
                             Ok(Some(page_guard)) => page_guard,
@@ -258,17 +266,23 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         &self,
         page_id: PageID,
         row_id: RowID,
+        row_idx: usize,
         read_set: &[usize],
-    ) -> Result<Option<Vec<Val>>> {
+    ) -> Result<Vec<Val>> {
         let Some(storage) = self.storage else {
             return Err(Error::InvalidState);
         };
         let page = PersistedLwcPage::load(storage.disk_pool(), page_id).await?;
-        let Some(row_idx) = page.find_row_idx(row_id)? else {
-            return Ok(None);
-        };
+        let actual_row_id = page.row_id_at(row_idx)?;
+        if actual_row_id != Some(row_id) {
+            return Err(Error::persisted_page_corrupted(
+                PersistedFileKind::TableFile,
+                PersistedPageKind::LwcPage,
+                page_id,
+                PersistedPageCorruptionCause::InvalidPayload,
+            ));
+        }
         page.decode_row_values(self.metadata(), row_idx, read_set)
-            .map(Some)
     }
 
     #[inline]

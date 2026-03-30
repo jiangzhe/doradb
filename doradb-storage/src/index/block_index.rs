@@ -4,7 +4,7 @@ use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableMetadata;
 use crate::error::{Error, Result};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
-use crate::index::column_block_index::ColumnBlockIndex;
+use crate::index::column_block_index::{ColumnBlockIndex, ResolvedColumnRow};
 use crate::index::row_block_index::{
     GenericRowBlockIndex, GenericRowBlockIndexMemCursor, RowLocation,
 };
@@ -28,6 +28,12 @@ pub struct GenericBlockIndex<P: 'static> {
 
 /// Compatibility alias for runtime block index backed by `FixedBufferPool`.
 pub type BlockIndex = GenericBlockIndex<FixedBufferPool>;
+
+pub(crate) enum RuntimeRowLocation {
+    Persisted(ResolvedColumnRow),
+    RowPage(PageID),
+    NotFound,
+}
 
 impl<P: BufferPool> GenericBlockIndex<P> {
     /// Creates a block-index facade for one table.
@@ -263,6 +269,36 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     }
 
     #[inline]
+    pub(crate) async fn try_find_runtime_row(
+        &self,
+        meta_pool_guard: &PoolGuard,
+        row_id: RowID,
+        storage: Option<&ColumnStorage>,
+    ) -> Result<RuntimeRowLocation> {
+        debug_assert!(!row_id.is_deleted());
+        match self.root.guide(row_id) {
+            BlockIndexRoute::Column {
+                pivot_row_id,
+                root_page_id,
+            } => {
+                self.find_runtime_row_in_column(storage, row_id, pivot_row_id, root_page_id)
+                    .await
+            }
+            BlockIndexRoute::Row => match self.row.find_row(meta_pool_guard, row_id).await {
+                RowLocation::RowPage(page_id) => Ok(RuntimeRowLocation::RowPage(page_id)),
+                RowLocation::NotFound => match self.root.try_column(row_id) {
+                    Some((pivot_row_id, root_page_id)) => {
+                        self.find_runtime_row_in_column(storage, row_id, pivot_row_id, root_page_id)
+                            .await
+                    }
+                    None => Ok(RuntimeRowLocation::NotFound),
+                },
+                RowLocation::LwcPage(..) => Err(Error::InvalidState),
+            },
+        }
+    }
+
+    #[inline]
     async fn find_row_in_column(
         &self,
         storage: Option<&ColumnStorage>,
@@ -277,6 +313,25 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         match index.find(row_id).await {
             Ok(Some(payload)) => Ok(RowLocation::LwcPage(payload.block_id as PageID)),
             Ok(None) => Ok(RowLocation::NotFound),
+            Err(err) => Err(err),
+        }
+    }
+
+    #[inline]
+    async fn find_runtime_row_in_column(
+        &self,
+        storage: Option<&ColumnStorage>,
+        row_id: RowID,
+        pivot_row_id: RowID,
+        root_page_id: PageID,
+    ) -> Result<RuntimeRowLocation> {
+        let Some(storage) = storage else {
+            return Err(Error::ColumnStorageMissing);
+        };
+        let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, storage.disk_pool());
+        match index.locate_and_resolve_row(row_id).await {
+            Ok(Some(resolved)) => Ok(RuntimeRowLocation::Persisted(resolved)),
+            Ok(None) => Ok(RuntimeRowLocation::NotFound),
             Err(err) => Err(err),
         }
     }

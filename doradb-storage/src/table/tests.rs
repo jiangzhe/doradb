@@ -17,6 +17,7 @@ use crate::index::{
 };
 use crate::io::{AIOKind, StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook};
 use crate::latch::LatchFallbackMode;
+use crate::lwc::{LWC_PAGE_PAYLOAD_SIZE, LwcCode, LwcPage};
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
@@ -400,6 +401,105 @@ fn test_lwc_select_surfaces_persisted_corruption() {
                 cause: PersistedPageCorruptionCause::ChecksumMismatch,
             }) => assert_eq!(page_id, block_id),
             other => panic!("expected persisted LWC corruption, got {other:?}"),
+        }
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let active_root = sys.table.file().active_root();
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            sys.table.disk_pool(),
+        );
+        let entry = index.find_entry(row_id).await.unwrap().unwrap();
+
+        let fs = build_test_fs_in(sys._temp_dir.path());
+        corrupt_leaf_row_codec(
+            fs.table_file_path(sys.table.table_id()),
+            entry.leaf_page_id,
+            0,
+        );
+        let _ = sys
+            .table
+            .disk_pool()
+            .invalidate_block_id(entry.leaf_page_id);
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let stmt = trx.start_stmt();
+        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        match res {
+            Err(Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::ColumnBlockIndex,
+                page_id,
+                cause: PersistedPageCorruptionCause::InvalidPayload,
+            }) => assert_eq!(page_id, entry.leaf_page_id),
+            other => panic!("expected persisted column-block-index corruption, got {other:?}"),
+        }
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_select_surfaces_resolved_row_id_mismatch_corruption() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let active_root = sys.table.file().active_root();
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            sys.table.disk_pool(),
+        );
+        let entry = index.find_entry(row_id).await.unwrap().unwrap();
+
+        let fs = build_test_fs_in(sys._temp_dir.path());
+        corrupt_lwc_row_id_order(fs.table_file_path(sys.table.table_id()), entry.block_id());
+        let _ = sys.table.disk_pool().invalidate_block_id(entry.block_id());
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let stmt = trx.start_stmt();
+        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        match res {
+            Err(Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::LwcPage,
+                page_id,
+                cause: PersistedPageCorruptionCause::InvalidPayload,
+            }) => assert_eq!(page_id, entry.block_id()),
+            other => panic!("expected persisted LWC invalid-payload corruption, got {other:?}"),
         }
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
@@ -2578,6 +2678,34 @@ fn corrupt_leaf_delete_codec(path: impl AsRef<std::path::Path>, page_id: u64, pr
         + DELETE_CODEC_OFFSET_IN_PREFIX;
     rewrite_page_with_checksum(path, page_id, |page| {
         page[byte_offset] = 0xFF;
+    });
+}
+
+fn corrupt_leaf_row_codec(path: impl AsRef<std::path::Path>, page_id: u64, prefix_idx: usize) {
+    const ROW_CODEC_OFFSET_IN_PREFIX: usize = 36;
+    let byte_offset = PAGE_INTEGRITY_HEADER_SIZE
+        + COLUMN_BLOCK_HEADER_SIZE
+        + prefix_idx * COLUMN_BLOCK_LEAF_PREFIX_SIZE
+        + ROW_CODEC_OFFSET_IN_PREFIX;
+    rewrite_page_with_checksum(path, page_id, |page| {
+        page[byte_offset] = 0;
+    });
+}
+
+fn corrupt_lwc_row_id_order(path: impl AsRef<std::path::Path>, page_id: u64) {
+    rewrite_page_with_checksum(path, page_id, |page| {
+        let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+        let page = LwcPage::try_from_bytes_mut(&mut page[payload_start..payload_end]).unwrap();
+        let row_id_offset = page.header.col_count() as usize * std::mem::size_of::<u16>();
+        assert_eq!(page.header.row_count(), 4);
+        assert_eq!(page.body[row_id_offset], LwcCode::ForBitpacking as u8);
+        assert_eq!(page.body[row_id_offset + 1], 2);
+        let packed_idx = row_id_offset + 1 + 1 + std::mem::size_of::<u64>() * 2;
+        let packed = page.body[packed_idx];
+        let delta0 = packed & 0b11;
+        let delta1 = (packed >> 2) & 0b11;
+        page.body[packed_idx] = (packed & !0b1111) | delta1 | (delta0 << 2);
     });
 }
 

@@ -151,6 +151,12 @@ impl LwcPage {
             .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))
     }
 
+    /// Returns the row id at one ordinal position.
+    #[inline]
+    pub fn row_id_at(&self, row_idx: usize) -> Result<Option<RowID>> {
+        Ok(self.row_id_set()?.value(row_idx))
+    }
+
     #[inline]
     fn row_id_set(&self) -> Result<RowIDSet<'_>> {
         let start_idx = self.header.col_count() as usize * mem::size_of::<u16>();
@@ -371,9 +377,17 @@ impl PersistedLwcPage {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn find_row_idx(&self, row_id: RowID) -> Result<Option<usize>> {
         self.page()
             .find_persisted_row_idx(row_id, self.file_kind, self.page_id)
+    }
+
+    #[inline]
+    pub fn row_id_at(&self, row_idx: usize) -> Result<Option<RowID>> {
+        self.page()
+            .row_id_at(row_idx)
+            .map_err(|err| map_persisted_lwc_error(self.file_kind, self.page_id, err))
     }
 
     #[inline]
@@ -632,6 +646,20 @@ impl<'a> RowIDSet<'a> {
             RowIDSet::B16(f) => f.sorted_position(row_id),
             RowIDSet::B32(f) => f.sorted_position(row_id),
             RowIDSet::Flat(f) => f.sorted_position(row_id),
+        }
+    }
+
+    /// Returns the row id at the given ordinal position.
+    #[inline]
+    pub fn value(&self, idx: usize) -> Option<RowID> {
+        match self {
+            RowIDSet::B1(f) => f.value(idx),
+            RowIDSet::B2(f) => f.value(idx),
+            RowIDSet::B4(f) => f.value(idx),
+            RowIDSet::B8(f) => f.value(idx),
+            RowIDSet::B16(f) => f.value(idx),
+            RowIDSet::B32(f) => f.value(idx),
+            RowIDSet::Flat(f) => f.value(idx),
         }
     }
 
