@@ -12,7 +12,7 @@ use crate::file::multi_table_file::{
 };
 use crate::index::{
     ColumnBlockEntryPatch, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch,
-    ColumnLeafEntry, load_entry_deletion_deltas,
+    ColumnDeleteDomain, ColumnLeafEntry, load_entry_deletion_deltas,
 };
 use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, PersistedLwcPage};
@@ -280,6 +280,7 @@ impl CatalogStorage {
                     merged_row_ids,
                     existing_deletes.into_iter().collect(),
                 )?
+                .with_delete_domain(ColumnDeleteDomain::Ordinal)
                 .with_block_id(new_tail_page_id);
                 let patches = [ColumnBlockEntryPatch {
                     start_row_id: last_entry.start_row_id,
@@ -624,7 +625,7 @@ mod tests {
     use crate::catalog::tests::{table1, table2};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::file::multi_table_file::CATALOG_MTB_PERSISTED_FILE_ID;
-    use crate::index::{ColumnBlockIndex, load_entry_deletion_deltas};
+    use crate::index::{ColumnBlockIndex, ColumnDeleteDomain, load_entry_deletion_deltas};
     use tempfile::TempDir;
 
     #[test]
@@ -752,6 +753,7 @@ mod tests {
             );
             assert_eq!(last2.start_row_id, last1.start_row_id);
             assert_ne!(last2.block_id(), last1.block_id());
+            assert_eq!(last2.delete_domain(), ColumnDeleteDomain::Ordinal);
             assert_eq!(
                 load_entry_deletion_deltas(&index2, &last2).await.unwrap(),
                 load_entry_deletion_deltas(&index1, &last1).await.unwrap()

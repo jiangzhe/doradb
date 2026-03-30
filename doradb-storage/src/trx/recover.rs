@@ -1668,13 +1668,12 @@ mod tests {
                 table.disk_pool(),
             );
             let entry = index
-                .find_entry(0)
+                .locate_block(0)
                 .await
                 .unwrap()
                 .expect("checkpointed table should keep the deleted row's block entry");
             let blob_ref = entry
                 .deletion_blob_ref()
-                .unwrap()
                 .expect("delete checkpoint should offload large delete sets");
 
             drop(trx_sys);

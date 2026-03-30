@@ -210,20 +210,20 @@ impl BenchmarkCase {
 
 #[derive(Clone, Copy)]
 enum BenchPath {
-    Compat,
+    Locate,
     Resolved,
 }
 
 fn bench_case(case: &BenchmarkCase, threads: usize, iterations_per_thread: usize) {
-    let compat = bench_parallel(case, threads, iterations_per_thread, BenchPath::Compat);
+    let locate = bench_parallel(case, threads, iterations_per_thread, BenchPath::Locate);
     let resolved = bench_parallel(case, threads, iterations_per_thread, BenchPath::Resolved);
     print_result(
         case.label,
-        "compat",
+        "locate",
         case.row_ids.len(),
         threads,
         iterations_per_thread,
-        compat,
+        locate,
     );
     print_result(
         case.label,
@@ -255,9 +255,9 @@ fn bench_parallel(
                     for step in 0..iterations_per_thread {
                         let row_id = row_ids[(worker_idx + step * threads) % row_ids.len()];
                         match path {
-                            BenchPath::Compat => {
-                                let payload = index.find(row_id).await.unwrap().unwrap();
-                                black_box(payload.block_id);
+                            BenchPath::Locate => {
+                                let entry = index.locate_block(row_id).await.unwrap().unwrap();
+                                black_box(entry.block_id());
                             }
                             BenchPath::Resolved => {
                                 let resolved =
