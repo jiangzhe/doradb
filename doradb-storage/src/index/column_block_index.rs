@@ -267,18 +267,6 @@ pub struct ColumnLeafEntry {
     del_count: u16,
     row_id_span: u32,
     first_present_delta: u32,
-    row_section_offset: u16,
-    row_section_len: u16,
-    delete_section_offset: u16,
-    delete_section_len: u16,
-    row_section_kind: u8,
-    row_section_version: u8,
-    row_section_flags: u8,
-    row_section_aux: u8,
-    delete_section_kind: u8,
-    delete_section_version: u8,
-    delete_section_flags: u8,
-    delete_section_aux: u8,
     delete_domain: ColumnDeleteDomain,
     delete_blob_ref: Option<BlobRef>,
 }
@@ -1049,45 +1037,6 @@ impl<'a> ColumnBlockIndex<'a> {
         }
     }
 
-    /// Reads delete payload bytes from an external blob reference.
-    pub async fn read_delete_payload_bytes(
-        &self,
-        entry: &ColumnLeafEntry,
-    ) -> Result<Option<Vec<u8>>> {
-        let blob_ref = match entry.deletion_blob_ref() {
-            Some(blob_ref) => blob_ref,
-            None => return Ok(None),
-        };
-        let reader = ColumnDeletionBlobReader::new(self.disk_pool);
-        let (header, payload) =
-            reader
-                .read_framed_blob(blob_ref)
-                .await
-                .map_err(|err| match err {
-                    Error::InvalidFormat => Error::persisted_page_corrupted(
-                        self.file_kind(),
-                        PersistedPageKind::ColumnDeletionBlob,
-                        blob_ref.start_page_id,
-                        PersistedPageCorruptionCause::InvalidPayload,
-                    ),
-                    other => other,
-                })?;
-        if entry.delete_section_kind != COLUMN_DELETE_CODEC_EXTERNAL_BLOB
-            || entry.delete_section_aux != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
-            || header.blob_kind() != entry.delete_section_aux
-            || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
-            || header.codec_version() != entry.delete_section_version
-        {
-            return Err(Error::persisted_page_corrupted(
-                self.file_kind(),
-                PersistedPageKind::ColumnDeletionBlob,
-                blob_ref.start_page_id,
-                PersistedPageCorruptionCause::InvalidPayload,
-            ));
-        }
-        Ok(Some(payload))
-    }
-
     /// Loads validated delete deltas for one persisted entry.
     pub(crate) async fn load_delete_deltas(&self, entry: &ColumnLeafEntry) -> Result<Vec<u32>> {
         let node = self.read_node(entry.leaf_page_id).await?;
@@ -1115,75 +1064,22 @@ impl<'a> ColumnBlockIndex<'a> {
         row_set: &LogicalRowSet,
         page_id: PageID,
     ) -> Result<LogicalDeleteSet> {
-        let delete_domain = decode_delete_domain_or_invalid_node(
-            view.prefix.delete_domain(),
-            self.file_kind(),
-            page_id,
-        )?;
-        match view.prefix.delete_codec() {
-            COLUMN_DELETE_CODEC_NONE => Ok(LogicalDeleteSet::None {
-                domain: delete_domain,
-            }),
-            COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
-                let bytes = view
-                    .delete_section
-                    .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?;
-                let row_id_deltas = decode_delete_rows(
-                    &bytes[4..],
-                    view.prefix.del_count(),
-                    delete_domain,
-                    row_set,
-                    self.file_kind(),
-                    page_id,
-                )?;
-                Ok(LogicalDeleteSet::Inline {
-                    domain: delete_domain,
-                    row_id_deltas,
-                })
-            }
-            COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
-                let bytes = view
-                    .delete_section
-                    .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?;
-                let blob_ref = decode_blob_ref(&bytes[4..])
-                    .map_err(|_| invalid_node_payload(self.file_kind(), page_id))?;
-                let reader = ColumnDeletionBlobReader::new(self.disk_pool);
-                let (header, payload) =
-                    reader
-                        .read_framed_blob(blob_ref)
-                        .await
-                        .map_err(|err| match err {
-                            Error::InvalidFormat => Error::persisted_page_corrupted(
-                                self.file_kind(),
-                                PersistedPageKind::ColumnDeletionBlob,
-                                blob_ref.start_page_id,
-                                PersistedPageCorruptionCause::InvalidPayload,
-                            ),
-                            other => other,
-                        })?;
-                if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
-                    || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
-                    || header.codec_version()
-                        != view
-                            .delete_header
-                            .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?
-                            .version
-                {
-                    return Err(Error::persisted_page_corrupted(
-                        self.file_kind(),
-                        PersistedPageKind::ColumnDeletionBlob,
-                        blob_ref.start_page_id,
-                        PersistedPageCorruptionCause::InvalidPayload,
-                    ));
-                }
-                let row_id_deltas = decode_delete_rows(
-                    &payload,
-                    view.prefix.del_count(),
-                    delete_domain,
-                    row_set,
-                    self.file_kind(),
-                    page_id,
-                )
+        let delete_set = decode_logical_delete_set_base(view, row_set, self.file_kind(), page_id)?;
+        let LogicalDeleteSet::External {
+            domain,
+            del_count,
+            blob_ref,
+            ..
+        } = delete_set
+        else {
+            return Ok(delete_set);
+        };
+
+        let reader = ColumnDeletionBlobReader::new(self.disk_pool);
+        let (header, payload) =
+            reader
+                .read_framed_blob(blob_ref)
+                .await
                 .map_err(|err| match err {
                     Error::InvalidFormat => Error::persisted_page_corrupted(
                         self.file_kind(),
@@ -1193,15 +1089,44 @@ impl<'a> ColumnBlockIndex<'a> {
                     ),
                     other => other,
                 })?;
-                Ok(LogicalDeleteSet::External {
-                    domain: delete_domain,
-                    del_count: view.prefix.del_count(),
-                    blob_ref,
-                    row_id_deltas: Some(row_id_deltas),
-                })
-            }
-            _ => Err(invalid_node_payload(self.file_kind(), page_id)),
+        if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
+            || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
+            || header.codec_version()
+                != view
+                    .delete_header
+                    .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?
+                    .version
+        {
+            return Err(Error::persisted_page_corrupted(
+                self.file_kind(),
+                PersistedPageKind::ColumnDeletionBlob,
+                blob_ref.start_page_id,
+                PersistedPageCorruptionCause::InvalidPayload,
+            ));
         }
+        let row_id_deltas = decode_delete_rows(
+            &payload,
+            del_count,
+            domain,
+            row_set,
+            self.file_kind(),
+            page_id,
+        )
+        .map_err(|err| match err {
+            Error::InvalidFormat => Error::persisted_page_corrupted(
+                self.file_kind(),
+                PersistedPageKind::ColumnDeletionBlob,
+                blob_ref.start_page_id,
+                PersistedPageCorruptionCause::InvalidPayload,
+            ),
+            other => other,
+        })?;
+        Ok(LogicalDeleteSet::External {
+            domain,
+            del_count,
+            blob_ref,
+            row_id_deltas: Some(row_id_deltas),
+        })
     }
 
     async fn load_rewrite_context(
@@ -1601,7 +1526,7 @@ impl<'a> ColumnBlockIndex<'a> {
             let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
             let row_set = decode_logical_row_set(&view, self.file_kind(), page_id)?;
             let delete_set =
-                decode_logical_delete_set_without_blob(&view, &row_set, self.file_kind(), page_id)?;
+                decode_logical_delete_set_base(&view, &row_set, self.file_kind(), page_id)?;
             entries.push(LogicalLeafEntry::new(
                 view.prefix.start_row_id(),
                 view.prefix.block_id(),
@@ -2024,7 +1949,7 @@ fn decode_logical_row_set(
     }
 }
 
-fn decode_logical_delete_set_without_blob(
+fn decode_logical_delete_set_base(
     view: &LeafEntryView<'_>,
     row_set: &LogicalRowSet,
     file_kind: PersistedFileKind,
@@ -2054,11 +1979,7 @@ fn decode_logical_delete_set_without_blob(
             })
         }
         COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
-            let bytes = view
-                .delete_section
-                .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
-            let blob_ref = decode_blob_ref(&bytes[4..])
-                .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+            let blob_ref = decode_external_delete_blob_ref(view, file_kind, page_id)?;
             Ok(LogicalDeleteSet::External {
                 domain: delete_domain,
                 del_count: view.prefix.del_count(),
@@ -2076,14 +1997,11 @@ fn build_leaf_entry(
     file_kind: PersistedFileKind,
 ) -> Result<ColumnLeafEntry> {
     let delete_blob_ref = if view.prefix.delete_codec() == COLUMN_DELETE_CODEC_EXTERNAL_BLOB {
-        Some(
-            decode_blob_ref(
-                &view
-                    .delete_section
-                    .ok_or_else(|| invalid_node_payload(file_kind, leaf_page_id))?[4..],
-            )
-            .map_err(|_| invalid_node_payload(file_kind, leaf_page_id))?,
-        )
+        Some(decode_external_delete_blob_ref(
+            view,
+            file_kind,
+            leaf_page_id,
+        )?)
     } else {
         None
     };
@@ -2099,21 +2017,6 @@ fn build_leaf_entry(
         del_count: view.prefix.del_count(),
         row_id_span: view.prefix.row_id_span(),
         first_present_delta: view.prefix.first_present_delta(),
-        row_section_offset: view.prefix.row_section_offset(),
-        row_section_len: view.prefix.row_section_len(),
-        delete_section_offset: view.prefix.delete_section_offset(),
-        delete_section_len: view.prefix.delete_section_len(),
-        row_section_kind: view.row_header.kind,
-        row_section_version: view.row_header.version,
-        row_section_flags: view.row_header.flags,
-        row_section_aux: view.row_header.aux,
-        delete_section_kind: view
-            .delete_header
-            .map(|header| header.kind)
-            .unwrap_or(COLUMN_DELETE_CODEC_NONE),
-        delete_section_version: view.delete_header.map(|header| header.version).unwrap_or(0),
-        delete_section_flags: view.delete_header.map(|header| header.flags).unwrap_or(0),
-        delete_section_aux: view.delete_header.map(|header| header.aux).unwrap_or(0),
         delete_domain: decode_delete_domain_or_invalid_node(
             view.prefix.delete_domain(),
             file_kind,
@@ -2121,6 +2024,17 @@ fn build_leaf_entry(
         )?,
         delete_blob_ref,
     })
+}
+
+fn decode_external_delete_blob_ref(
+    view: &LeafEntryView<'_>,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<BlobRef> {
+    let bytes = view
+        .delete_section
+        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+    decode_blob_ref(&bytes[4..]).map_err(|_| invalid_node_payload(file_kind, page_id))
 }
 
 fn build_resolved_row(
@@ -2788,13 +2702,7 @@ mod tests {
             assert_eq!(entry.block_id(), 1001);
             assert_eq!(entry.row_count(), 8);
             assert_eq!(entry.del_count(), 3);
-            assert!(
-                index
-                    .read_delete_payload_bytes(&entry)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(entry.deletion_blob_ref().is_none());
             let loaded = load_entry_deletion_deltas(&index, &entry).await.unwrap();
             assert_eq!(loaded, BTreeSet::from([1u32, 3, 6]));
         });
