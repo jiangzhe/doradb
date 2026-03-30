@@ -1,7 +1,7 @@
 ---
 id: 000098
 title: Later-Domain Evolution and Auxiliary Payload Expansion
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-30
 github_issue: 499
 ---
@@ -212,6 +212,49 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented the phase-4 persisted delete-domain evolution in
+   `doradb-storage/src/index/column_block_index.rs` and
+   `doradb-storage/src/index/column_deletion_blob.rs`:
+   - leaf validation, encode, and decode now support both persisted delete
+     domains, `RowIdDelta` and `Ordinal`;
+   - authoritative full-entry rewrites can persist ordinal-domain delete
+     payloads;
+   - delete-only rewrites remain row-id-based at the caller boundary but now
+     preserve each target entry's existing persisted delete domain when
+     rebuilding the leaf entry.
+2. Made catalog tail merge in
+   `doradb-storage/src/catalog/storage/checkpoint.rs` the first justified
+   authoritative ordinal-domain rewrite consumer:
+   - catalog tail merge now opts into ordinal-domain delete persistence on its
+     full-entry rewrite path because it already owns the merged block row
+     ordering;
+   - user-table deletion checkpoint in `doradb-storage/src/table/persistence.rs`
+     stays row-id-based externally while relying on the domain-preserving
+     rewrite behavior above.
+3. Removed the payload-era compatibility layer and migrated remaining callers:
+   - removed `ColumnBlockIndex::find`, `ColumnBlockIndex::find_entry`,
+     `load_payload_deletion_deltas`, `ColumnPagePayloadPatch`, and
+     `batch_replace_payloads`;
+   - deleted `doradb-storage/src/index/column_payload.rs`;
+   - moved remaining callers and tests onto `locate_block`, direct
+     `entry.block_id()`, and authoritative typed delete decoding.
+4. Performed follow-up cleanup after implementation and review:
+   - removed the unused `batch_update_offloaded_bitmaps` compatibility path
+     because the current repo has no production caller for it;
+   - trimmed `ColumnLeafEntry` to the surviving live metadata surface;
+   - removed the `read_delete_payload_bytes` wrapper and consolidated shared
+     delete-set decoding for inline and external delete payloads.
+5. Refreshed supporting measurement and low-level safety tracking:
+   - updated `doradb-storage/examples/bench_column_runtime_lookup.rs` to
+     compare `locate_block` with `locate_and_resolve_row`;
+   - refreshed `docs/unsafe-usage-baseline.md` after the low-level leaf/decode
+     changes.
+6. Verification executed for the implemented state:
+   - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+
 ## Impacts
 
 - `doradb-storage/src/index/column_block_index.rs`
@@ -277,3 +320,6 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 3. Broader cleanup of `RowLocation::LwcPage(..)` and its unfinished runtime
    callers should be planned separately if phase-4 persisted-domain cleanup
    proves stable.
+4. Finalizing the inline delete-field footprint and removing the remaining
+   stale delete-surface sizing/constants is deferred to
+   `docs/backlogs/000075-refine-column-block-index-inline-delete-field-and-delete-surface-cleanup.md`.
