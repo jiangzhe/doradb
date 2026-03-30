@@ -3,6 +3,7 @@ id: 000097
 title: Runtime Lookup Alignment
 status: implemented  # proposal | implemented | superseded
 created: 2026-03-29
+github_issue: 497
 ---
 
 # Task: Runtime Lookup Alignment
