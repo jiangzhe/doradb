@@ -288,10 +288,10 @@ The intended unsafe scope is limited:
   - Scope: Permit ordinal-domain delete payloads on authoritative block rewrite paths if later work still justifies them, and add optional runtime lookup hints only when real builders and benchmarks justify them.
   - Goals: Land only the later-phase work that remains justified after phase-1 through phase-3 measurements.
   - Non-goals: Forcing ordinal delete persistence, row-id spill usage, or optional lookup hints without evidence.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000098-later-domain-evolution-and-auxiliary-payload-expansion.md`
+  - Task Issue: `#499`
+  - Phase Status: done
+  - Implementation Summary: Implemented ordinal-domain persisted deletes, domain-preserving delete rewrites, authoritative catalog tail-merge ordinal persistence, and payload-era compatibility cleanup. [Task Resolve Sync: docs/tasks/000098-later-domain-evolution-and-auxiliary-payload-expansion.md @ 2026-03-30]
   - Related Backlogs:
     - `docs/backlogs/000029-column-deletion-blob-reachability-sweep-strategy.md`
     - `docs/backlogs/000030-column-deletion-blob-reclamation-trigger-and-sla.md`

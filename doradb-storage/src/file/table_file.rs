@@ -859,12 +859,12 @@ mod tests {
                 active_root.pivot_row_id,
                 &disk_pool,
             );
-            let payload1 = column_index.find(0).await.unwrap().unwrap();
-            let payload2 = column_index.find(15).await.unwrap().unwrap();
-            let page1 = read_page_for_test(&table_file, payload1.block_id)
+            let entry1 = column_index.locate_block(0).await.unwrap().unwrap();
+            let entry2 = column_index.locate_block(15).await.unwrap().unwrap();
+            let page1 = read_page_for_test(&table_file, entry1.block_id())
                 .await
                 .unwrap();
-            let page2 = read_page_for_test(&table_file, payload2.block_id)
+            let page2 = read_page_for_test(&table_file, entry2.block_id())
                 .await
                 .unwrap();
             assert_eq!(&page1.as_bytes()[..10], b"lwc-page-1");

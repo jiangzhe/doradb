@@ -310,8 +310,8 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             return Err(Error::ColumnStorageMissing);
         };
         let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, storage.disk_pool());
-        match index.find(row_id).await {
-            Ok(Some(payload)) => Ok(RowLocation::LwcPage(payload.block_id as PageID)),
+        match index.locate_block(row_id).await {
+            Ok(Some(entry)) => Ok(RowLocation::LwcPage(entry.block_id())),
             Ok(None) => Ok(RowLocation::NotFound),
             Err(err) => Err(err),
         }

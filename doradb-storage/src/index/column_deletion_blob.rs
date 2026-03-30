@@ -9,7 +9,6 @@ use crate::file::page_integrity::{
     COLUMN_DELETION_BLOB_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
     write_page_checksum, write_page_header,
 };
-use crate::index::column_payload::BlobRef;
 use crate::io::DirectBuf;
 use futures::future::try_join_all;
 use std::mem;
@@ -31,6 +30,15 @@ pub const COLUMN_AUX_BLOB_HEADER_SIZE: usize = 8;
 pub const COLUMN_AUX_BLOB_KIND_DELETE_DELTAS: u8 = 1;
 /// Codec kind for little-endian `u32` delete-delta payload bytes.
 pub const COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST: u8 = 1;
+
+/// Reference to one offloaded delete-payload byte range in linked immutable
+/// blob pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobRef {
+    pub start_page_id: PageID,
+    pub start_offset: u16,
+    pub byte_len: u32,
+}
 
 struct BlobPageHeader {
     next_page_id: PageID,
@@ -68,7 +76,7 @@ impl ColumnAuxBlobHeader {
     }
 
     #[inline]
-    pub(crate) fn deletion_deltas(payload_len: usize) -> Result<Self> {
+    pub(crate) fn delete_payload(payload_len: usize) -> Result<Self> {
         Self::new(
             COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
             COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
@@ -133,7 +141,7 @@ impl ColumnAuxBlobHeader {
 }
 
 #[inline]
-fn validate_delete_delta_header(header: &ColumnAuxBlobHeader) -> Result<()> {
+fn validate_delete_payload_header(header: &ColumnAuxBlobHeader) -> Result<()> {
     if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
         || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
         || header.codec_version() != RAW_U32_CODEC_VERSION
@@ -257,7 +265,7 @@ struct SealedBlobPage {
     next_page_id: PageID,
 }
 
-/// Append-only writer for immutable shared delete-payload blobs.
+/// Append-only writer for immutable shared delete payload blobs.
 pub struct ColumnDeletionBlobWriter<'a, M: MutableCowFile> {
     mutable_file: &'a mut M,
     current_page: Option<PendingBlobPage>,
@@ -274,9 +282,10 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         }
     }
 
-    /// Appends one delete-delta blob and returns the persisted blob reference.
-    pub async fn append(&mut self, bytes: &[u8]) -> Result<BlobRef> {
-        let header = ColumnAuxBlobHeader::deletion_deltas(bytes.len())?;
+    /// Appends one framed delete payload and returns the persisted blob
+    /// reference.
+    pub async fn append_delete_payload(&mut self, bytes: &[u8]) -> Result<BlobRef> {
+        let header = ColumnAuxBlobHeader::delete_payload(bytes.len())?;
         self.append_framed_blob(header, bytes).await
     }
 
@@ -403,10 +412,11 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         Ok((header, payload))
     }
 
-    /// Reads the payload bytes of one delete-delta blob after validating its framing header.
-    pub async fn read(&self, blob_ref: BlobRef) -> Result<Vec<u8>> {
+    /// Reads the payload bytes of one delete payload after validating its
+    /// framing header.
+    pub async fn read_delete_payload(&self, blob_ref: BlobRef) -> Result<Vec<u8>> {
         let (header, payload) = self.read_framed_blob(blob_ref).await?;
-        validate_delete_delta_header(&header)?;
+        validate_delete_payload_header(&header)?;
         Ok(payload)
     }
 
@@ -468,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_blob_header_roundtrip() {
-        let header = ColumnAuxBlobHeader::deletion_deltas(27).unwrap();
+        let header = ColumnAuxBlobHeader::delete_payload(27).unwrap();
         let bytes = header.encode();
         let decoded = ColumnAuxBlobHeader::decode(&bytes).unwrap();
         assert_eq!(decoded, header);
@@ -484,13 +494,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_delete_delta_header_accepts_expected_framing() {
-        let header = ColumnAuxBlobHeader::deletion_deltas(27).unwrap();
-        assert!(validate_delete_delta_header(&header).is_ok());
+    fn test_validate_delete_payload_header_accepts_expected_framing() {
+        let header = ColumnAuxBlobHeader::delete_payload(27).unwrap();
+        assert!(validate_delete_payload_header(&header).is_ok());
     }
 
     #[test]
-    fn test_validate_delete_delta_header_rejects_wrong_blob_kind() {
+    fn test_validate_delete_payload_header_rejects_wrong_blob_kind() {
         let header = ColumnAuxBlobHeader::new(
             2,
             COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
@@ -500,13 +510,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_delete_delta_header(&header),
+            validate_delete_payload_header(&header),
             Err(Error::InvalidFormat)
         ));
     }
 
     #[test]
-    fn test_validate_delete_delta_header_rejects_wrong_codec_kind() {
+    fn test_validate_delete_payload_header_rejects_wrong_codec_kind() {
         let header = ColumnAuxBlobHeader::new(
             COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
             2,
@@ -516,13 +526,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_delete_delta_header(&header),
+            validate_delete_payload_header(&header),
             Err(Error::InvalidFormat)
         ));
     }
 
     #[test]
-    fn test_validate_delete_delta_header_rejects_wrong_codec_version() {
+    fn test_validate_delete_payload_header_rejects_wrong_codec_version() {
         let header = ColumnAuxBlobHeader::new(
             COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
             COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
@@ -532,13 +542,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_delete_delta_header(&header),
+            validate_delete_payload_header(&header),
             Err(Error::InvalidFormat)
         ));
     }
 
     #[test]
-    fn test_validate_delete_delta_header_rejects_non_zero_flags() {
+    fn test_validate_delete_payload_header_rejects_non_zero_flags() {
         let header = ColumnAuxBlobHeader::new(
             COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
             COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
@@ -548,7 +558,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_delete_delta_header(&header),
+            validate_delete_payload_header(&header),
             Err(Error::InvalidFormat)
         ));
     }
@@ -575,7 +585,7 @@ mod tests {
             let blob = vec![9u8; 513];
             let blob_ref = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
-                let blob_ref = writer.append(&blob).await.unwrap();
+                let blob_ref = writer.append_delete_payload(&blob).await.unwrap();
                 writer.finish().await.unwrap();
                 blob_ref
             };
@@ -612,14 +622,14 @@ mod tests {
             let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
             let blob_ref = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
-                let blob_ref = writer.append(&blob).await.unwrap();
+                let blob_ref = writer.append_delete_payload(&blob).await.unwrap();
                 writer.finish().await.unwrap();
                 blob_ref
             };
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
             let reader = ColumnDeletionBlobReader::new(&disk_pool);
-            let payload = reader.read(blob_ref).await.unwrap();
+            let payload = reader.read_delete_payload(blob_ref).await.unwrap();
             assert_eq!(payload, blob);
         });
     }
@@ -648,8 +658,8 @@ mod tests {
             let second_blob = vec![5u8; 17];
             let (first_ref, second_ref) = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
-                let first_ref = writer.append(&first_blob).await.unwrap();
-                let second_ref = writer.append(&second_blob).await.unwrap();
+                let first_ref = writer.append_delete_payload(&first_blob).await.unwrap();
+                let second_ref = writer.append_delete_payload(&second_blob).await.unwrap();
                 writer.finish().await.unwrap();
                 (first_ref, second_ref)
             };
@@ -661,8 +671,8 @@ mod tests {
             assert_eq!(second_ref.start_offset, 0);
 
             let reader = ColumnDeletionBlobReader::new(&disk_pool);
-            let first_payload = reader.read(first_ref).await.unwrap();
-            let second_payload = reader.read(second_ref).await.unwrap();
+            let first_payload = reader.read_delete_payload(first_ref).await.unwrap();
+            let second_payload = reader.read_delete_payload(second_ref).await.unwrap();
             assert_eq!(first_payload, first_blob);
             assert_eq!(second_payload, second_blob);
         });

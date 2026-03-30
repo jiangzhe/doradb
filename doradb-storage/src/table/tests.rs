@@ -384,7 +384,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
             active_root.pivot_row_id,
             sys.table.disk_pool(),
         );
-        let entry = index.find_entry(row_id).await.unwrap().unwrap();
+        let entry = index.locate_block(row_id).await.unwrap().unwrap();
         let block_id = entry.block_id();
 
         let fs = build_test_fs_in(sys._temp_dir.path());
@@ -430,7 +430,7 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
             active_root.pivot_row_id,
             sys.table.disk_pool(),
         );
-        let entry = index.find_entry(row_id).await.unwrap().unwrap();
+        let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
         let fs = build_test_fs_in(sys._temp_dir.path());
         corrupt_leaf_row_codec(
@@ -483,7 +483,7 @@ fn test_lwc_select_surfaces_resolved_row_id_mismatch_corruption() {
             active_root.pivot_row_id,
             sys.table.disk_pool(),
         );
-        let entry = index.find_entry(row_id).await.unwrap().unwrap();
+        let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
         let fs = build_test_fs_in(sys._temp_dir.path());
         corrupt_lwc_row_id_order(fs.table_file_path(sys.table.table_id()), entry.block_id());
@@ -718,7 +718,7 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
             sys.table.disk_pool(),
         );
         let entry_before = index_before
-            .find_entry(row_id)
+            .locate_block(row_id)
             .await
             .unwrap()
             .expect("persisted entry should exist before delete checkpoint");
@@ -735,7 +735,7 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
             sys.table.disk_pool(),
         );
         let entry = index
-            .find_entry(row_id)
+            .locate_block(row_id)
             .await
             .unwrap()
             .expect("persisted entry should exist");
@@ -797,7 +797,7 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
             sys.table.disk_pool(),
         );
         let entry = index
-            .find_entry(row_id)
+            .locate_block(row_id)
             .await
             .unwrap()
             .expect("persisted entry should exist");
@@ -866,7 +866,7 @@ fn test_checkpoint_for_deletion_fails_on_invalid_v2_delete_metadata() {
             sys.table.disk_pool(),
         );
         let entry = index
-            .find_entry(row_id1)
+            .locate_block(row_id1)
             .await
             .unwrap()
             .expect("persisted entry should exist");

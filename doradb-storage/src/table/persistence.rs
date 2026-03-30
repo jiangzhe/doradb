@@ -204,7 +204,7 @@ impl Table {
 
         let mut grouped: BTreeMap<u64, (BlockPatchSeed, BTreeSet<u32>)> = BTreeMap::new();
         for row_id in selected_row_ids {
-            let Some(entry) = column_index.find_entry(row_id).await? else {
+            let Some(entry) = column_index.locate_block(row_id).await? else {
                 continue;
             };
             let delta_u64 = row_id

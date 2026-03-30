@@ -35,14 +35,6 @@ pub async fn load_entry_deletion_deltas(
     Ok(deltas.into_iter().collect())
 }
 
-/// Compatibility alias for phase-1 callers that still reference payload terminology.
-pub async fn load_payload_deletion_deltas(
-    column_index: &ColumnBlockIndex<'_>,
-    entry: ColumnLeafEntry,
-) -> Result<BTreeSet<u32>> {
-    load_entry_deletion_deltas(column_index, &entry).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
