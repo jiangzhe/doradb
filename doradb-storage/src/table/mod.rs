@@ -411,6 +411,19 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
             .try_find_row(meta_pool_guard, row_id, storage)
             .await
     }
+
+    #[inline]
+    pub(crate) async fn try_find_runtime_row(
+        &self,
+        guards: &PoolGuards,
+        row_id: RowID,
+        storage: Option<&ColumnStorage>,
+    ) -> Result<crate::index::RuntimeRowLocation> {
+        let meta_pool_guard = guards.meta_guard();
+        self.blk_idx
+            .try_find_runtime_row(meta_pool_guard, row_id, storage)
+            .await
+    }
 }
 
 impl ColumnStorage {
