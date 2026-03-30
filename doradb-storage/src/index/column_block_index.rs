@@ -362,13 +362,6 @@ impl ResolvedColumnRow {
     }
 }
 
-/// One bitmap update patch keyed by leaf `start_row_id`.
-#[derive(Clone, Copy, Debug)]
-pub struct OffloadedBitmapPatch<'a> {
-    pub start_row_id: RowID,
-    pub bitmap_bytes: &'a [u8],
-}
-
 /// One authoritative delete-delta rewrite keyed by leaf `start_row_id`.
 #[derive(Clone, Copy, Debug)]
 pub struct ColumnDeleteDeltaPatch<'a> {
@@ -1275,51 +1268,6 @@ impl<'a> ColumnBlockIndex<'a> {
             }
         }
         Ok(entries)
-    }
-
-    /// Applies sorted start-row-id bitmap patches with copy-on-write updates.
-    pub async fn batch_update_offloaded_bitmaps<M: MutableCowFile>(
-        &self,
-        mutable_file: &mut M,
-        patches: &[OffloadedBitmapPatch<'_>],
-        create_ts: u64,
-    ) -> Result<PageID> {
-        if patches.is_empty() {
-            return Ok(self.root_page_id);
-        }
-        if self.root_page_id == 0 || !patches_sorted_unique(patches) {
-            return Err(Error::InvalidArgument);
-        }
-
-        let resolved = {
-            let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
-            let mut resolved = Vec::with_capacity(patches.len());
-            for patch in patches {
-                let deltas = decode_raw_u32_list(patch.bitmap_bytes)?;
-                let blob_ref = writer.append_delete_payload(patch.bitmap_bytes).await?;
-                resolved.push(ResolvedLeafPatch::DeleteSet {
-                    start_row_id: patch.start_row_id,
-                    delete_set: LogicalDeleteSet::External {
-                        domain: ColumnDeleteDomain::RowIdDelta,
-                        del_count: storage_count_u16(deltas.len())?,
-                        blob_ref,
-                        row_id_deltas: Some(deltas),
-                    },
-                });
-            }
-            writer.finish().await?;
-            resolved
-        };
-
-        let root_height = self.read_node(self.root_page_id).await?.header.height;
-        let res = self
-            .rewrite_subtree_with_patches(mutable_file, self.root_page_id, &resolved, create_ts)
-            .await?;
-        if !res.touched {
-            return Err(Error::InvalidState);
-        }
-        self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
-            .await
     }
 
     /// Replaces sorted delete-delta sets keyed by `start_row_id`.
@@ -2432,16 +2380,6 @@ fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> Result<Vec<u32>
     Ok(res)
 }
 
-fn decode_raw_u32_list(bytes: &[u8]) -> Result<Vec<u32>> {
-    if bytes.is_empty() || !bytes.len().is_multiple_of(mem::size_of::<u32>()) {
-        return Err(Error::InvalidFormat);
-    }
-    decode_u32_bytes_strict(
-        bytes,
-        storage_count_u16(bytes.len() / mem::size_of::<u32>())?,
-    )
-}
-
 fn encode_u32_values_bytes(values: &[u32]) -> Result<Vec<u8>> {
     storage_count_u16(values.len())?;
     if !delete_deltas_sorted_unique(values) {
@@ -2559,11 +2497,6 @@ fn delete_deltas_sorted_unique(deltas: &[u32]) -> bool {
     deltas.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn patches_sorted_unique(patches: &[OffloadedBitmapPatch<'_>]) -> bool {
-    patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id)
-        && patches.iter().all(|patch| !patch.bitmap_bytes.is_empty())
-}
-
 fn delete_delta_patches_sorted_unique(patches: &[ColumnDeleteDeltaPatch<'_>]) -> bool {
     patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id)
         && patches
@@ -2603,7 +2536,7 @@ mod tests {
     };
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
-    use crate::index::{encode_deletion_deltas_to_bytes, load_entry_deletion_deltas};
+    use crate::index::load_entry_deletion_deltas;
     use crate::value::ValKind;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -2864,49 +2797,6 @@ mod tests {
             );
             let loaded = load_entry_deletion_deltas(&index, &entry).await.unwrap();
             assert_eq!(loaded, BTreeSet::from([1u32, 3, 6]));
-        });
-    }
-
-    #[test]
-    fn test_batch_update_offloaded_bitmaps_roundtrip() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
-            let mut mutable = MutableTableFile::fork(&table);
-            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
-                .batch_insert(&mut mutable, &[dense_entry(0, 8, 1001)], 8, 2)
-                .await
-                .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
-
-            let deltas = BTreeSet::from([1u32, 3, 6]);
-            let bytes = encode_deletion_deltas_to_bytes(&deltas);
-            let mut mutable = MutableTableFile::fork(&table);
-            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
-                .batch_update_offloaded_bitmaps(
-                    &mut mutable,
-                    &[OffloadedBitmapPatch {
-                        start_row_id: 0,
-                        bitmap_bytes: &bytes,
-                    }],
-                    3,
-                )
-                .await
-                .unwrap();
-            let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
-
-            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool);
-            let entry = index.locate_block(0).await.unwrap().unwrap();
-            assert!(entry.deletion_blob_ref().is_some());
-            assert_eq!(entry.row_count(), 8);
-            assert_eq!(entry.del_count(), 3);
-            let loaded = load_entry_deletion_deltas(&index, &entry).await.unwrap();
-            assert_eq!(loaded, deltas);
         });
     }
 
