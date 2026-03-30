@@ -279,10 +279,10 @@ The intended unsafe scope is limited:
   - Scope: Introduce `resolve_row`, align runtime point-read behavior with redesigned block-index row-id metadata where beneficial, and benchmark whether later negative-lookup hints are justified.
   - Goals: Allow the block index to become the preferred runtime lookup path when that produces measured benefit without invalidating existing LWC consumers; first ship `resolve_row` without delete hints.
   - Non-goals: Ordinal delete-domain conversion on delete-only rewrites.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000097-runtime-lookup-alignment.md`
+  - Task Issue: `#497`
+  - Phase Status: done
+  - Implementation Summary: Implemented phase-3 runtime row resolution and persisted point-read alignment with focused hot-cache lookup benchmarking. [Task Resolve Sync: docs/tasks/000097-runtime-lookup-alignment.md @ 2026-03-30]
 
 - **Phase 4: Later-Domain Evolution and Auxiliary Payload Expansion**
   - Scope: Permit ordinal-domain delete payloads on authoritative block rewrite paths if later work still justifies them, and add optional runtime lookup hints only when real builders and benchmarks justify them.

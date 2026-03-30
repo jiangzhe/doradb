@@ -183,8 +183,8 @@ Reference:
 1. Implemented the phase-3 runtime resolution surface in
    `doradb-storage/src/index/column_block_index.rs`:
    - added `ResolvedColumnRow` plus public `resolve_row(row_id, entry)`;
-   - added the crate-private one-descent `resolve_row_once(row_id)` helper
-     used by runtime point reads;
+   - added public one-descent `locate_and_resolve_row(row_id)` used by
+     runtime point reads;
    - resolved dense entries by ordinal arithmetic and sparse delta-list
      entries by validated row-delta position.
 2. Aligned the runtime routing path in
@@ -210,13 +210,15 @@ Reference:
      behavior;
    - `table/tests.rs` now covers malformed row metadata during point read and
      index/LWC ordinal mismatch corruption;
-   - `doradb-storage/examples/bench_column_runtime_lookup.rs` benchmarks the
-     compatibility `find` path against the phase-3 resolved-row path for dense
-     and sparse persisted blocks.
+   - `doradb-storage/examples/bench_column_runtime_lookup.rs` now benchmarks
+     the hot-cache compatibility `find` path against the phase-3
+     `locate_and_resolve_row` path for dense and sparse persisted blocks,
+     uses threaded workers, and exits cleanly after teardown.
 6. Verification run for the implemented state:
    - `cargo test -p doradb-storage resolve_row_dense_and_sparse`
    - `cargo test -p doradb-storage lwc_select_surfaces_`
    - `cargo check -p doradb-storage --example bench_column_runtime_lookup`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
    - `cargo nextest run -p doradb-storage`
    - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
 
@@ -224,7 +226,7 @@ Reference:
 
 - `doradb-storage/src/index/column_block_index.rs`
   - runtime `resolve_row` API, dense/sparse ordinal resolution, and the
-    private one-descent runtime helper.
+    one-descent runtime helper used by persisted point reads.
 - `doradb-storage/src/index/block_index.rs`
   - private runtime-read routing for persisted point reads without changing the
     shared `RowLocation` surface.
@@ -240,7 +242,7 @@ Reference:
   - point-read regressions and corruption-path coverage for the new runtime
     lookup path.
 - `doradb-storage/examples/bench_column_runtime_lookup.rs`
-  - focused benchmark for dense and sparse persisted runtime lookup.
+  - focused hot-cache benchmark for dense and sparse persisted runtime lookup.
 
 ## Test Cases
 
@@ -257,8 +259,8 @@ Reference:
    the resolved ordinal does not map back to the requested `RowID`.
 7. Existing non-point-read runtime callers that still branch on
    `RowLocation::LwcPage(..)` remain behaviorally unchanged by this task.
-8. Focused benchmark runs compare the old compatibility path versus the new
-   resolved runtime path on representative dense and sparse blocks.
+8. Focused hot-cache benchmark runs compare the old compatibility path versus
+   the new resolved runtime path on representative dense and sparse blocks.
 9. Routine validation for the implemented change uses:
 
 ```bash
@@ -268,8 +270,10 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-1. Whether the private resolved persisted-row helper should later expand to
+1. Whether the resolved persisted-row lookup path should later expand to
    cold-row update/delete and uncommitted-read callers remains a separate
    follow-up after this phase-3 point-read slice lands.
-2. Whether any later negative-lookup or delete-hint fields are justified
-   remains benchmark-dependent and belongs to RFC-0011 phase 4, not this task.
+2. Benchmark-scope expansion is deferred to
+   `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`; any
+   later negative-lookup or delete-hint fields remain benchmark-dependent and
+   belong to RFC-0011 phase 4, not this task.
