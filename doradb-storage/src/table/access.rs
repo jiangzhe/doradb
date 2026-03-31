@@ -195,7 +195,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 .await?;
             match location {
                 RowLocation::NotFound => return Ok(SelectMvcc::NotFound),
-                RowLocation::LwcPage { page_id, row_idx } => {
+                RowLocation::LwcPage {
+                    page_id,
+                    row_idx,
+                    row_shape_fingerprint,
+                } => {
                     let Some(deletion_buffer) = self.deletion_buffer() else {
                         return Ok(SelectMvcc::NotFound);
                     };
@@ -219,7 +223,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         }
                     }
                     let vals = self
-                        .read_lwc_row(page_id, row_id, row_idx, user_read_set)
+                        .read_lwc_row(
+                            page_id,
+                            row_id,
+                            row_idx,
+                            row_shape_fingerprint,
+                            user_read_set,
+                        )
                         .await?;
                     return Ok(SelectMvcc::Found(vals));
                 }
@@ -256,6 +266,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         page_id: PageID,
         row_id: RowID,
         row_idx: usize,
+        _row_shape_fingerprint: u128,
         read_set: &[usize],
     ) -> Result<Vec<Val>> {
         let Some(storage) = self.storage else {

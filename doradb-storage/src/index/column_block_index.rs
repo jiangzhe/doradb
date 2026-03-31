@@ -26,7 +26,7 @@ pub const COLUMN_BLOCK_HEADER_SIZE: usize = mem::size_of::<ColumnBlockNodeHeader
 pub const COLUMN_BLOCK_DATA_SIZE: usize = COLUMN_BLOCK_NODE_PAYLOAD_SIZE - COLUMN_BLOCK_HEADER_SIZE;
 pub const COLUMN_BRANCH_ENTRY_SIZE: usize = mem::size_of::<ColumnBlockBranchEntry>();
 
-const COLUMN_LEAF_PREFIX_VERSION: u8 = 1;
+const COLUMN_LEAF_PREFIX_VERSION: u8 = 2;
 const COLUMN_ROW_SECTION_VERSION: u8 = 1;
 const COLUMN_DELETE_SECTION_VERSION: u8 = 1;
 const COLUMN_DELETE_DOMAIN_ROW_ID_DELTA: u8 = 1;
@@ -46,6 +46,9 @@ const LEGACY_INLINE_DELETE_U16_CAPACITY: usize =
     (LEGACY_INLINE_DELETE_FIELD_SIZE - LEGACY_INLINE_DELETE_U16_OFFSET) / 2;
 const LEGACY_INLINE_DELETE_U32_CAPACITY: usize =
     (LEGACY_INLINE_DELETE_FIELD_SIZE - LEGACY_INLINE_DELETE_U32_OFFSET) / 4;
+const ROW_SHAPE_FINGERPRINT_VERSION: u8 = 1;
+const ROW_SHAPE_KIND_DENSE: u8 = 1;
+const ROW_SHAPE_KIND_PRESENT_DELTA_LIST: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
@@ -66,6 +69,7 @@ struct ColumnBlockLeafPrefix {
     prefix_version: u8,
     flags: u8,
     reserved: [u8; 7],
+    row_shape_fingerprint: [u8; 16],
 }
 
 pub const COLUMN_BLOCK_LEAF_PREFIX_SIZE: usize = mem::size_of::<ColumnBlockLeafPrefix>();
@@ -73,7 +77,7 @@ pub const COLUMN_BLOCK_MAX_ENTRIES: usize = COLUMN_BLOCK_DATA_SIZE / COLUMN_BLOC
 pub const COLUMN_BLOCK_MAX_BRANCH_ENTRIES: usize =
     COLUMN_BLOCK_DATA_SIZE / COLUMN_BRANCH_ENTRY_SIZE;
 
-const _: () = assert!(mem::size_of::<ColumnBlockLeafPrefix>() == 48);
+const _: () = assert!(mem::size_of::<ColumnBlockLeafPrefix>() == 64);
 const _: () = assert!(mem::size_of::<ColumnBlockBranchEntry>() == 16);
 const _: () = assert!(mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_NODE_PAYLOAD_SIZE);
 
@@ -171,6 +175,7 @@ pub struct ColumnBlockEntryShape {
     row_ids: Vec<RowID>,
     delete_deltas: Vec<u32>,
     delete_domain: ColumnDeleteDomain,
+    row_shape_fingerprint: u128,
 }
 
 impl ColumnBlockEntryShape {
@@ -187,12 +192,15 @@ impl ColumnBlockEntryShape {
         validate_row_ids(&row_ids, start_row_id, end_row_id)?;
         delete_deltas.sort_unstable();
         delete_deltas.dedup();
+        let row_shape_fingerprint =
+            row_shape_fingerprint_for_row_ids(start_row_id, end_row_id, &row_ids)?;
         Ok(ColumnBlockEntryShape {
             start_row_id,
             end_row_id,
             row_ids,
             delete_deltas,
             delete_domain: ColumnDeleteDomain::RowIdDelta,
+            row_shape_fingerprint,
         })
     }
 
@@ -209,6 +217,8 @@ impl ColumnBlockEntryShape {
     pub(crate) fn set_end_row_id(&mut self, end_row_id: RowID) -> Result<()> {
         validate_row_ids(&self.row_ids, self.start_row_id, end_row_id)?;
         self.end_row_id = end_row_id;
+        self.row_shape_fingerprint =
+            row_shape_fingerprint_for_row_ids(self.start_row_id, self.end_row_id, &self.row_ids)?;
         Ok(())
     }
 
@@ -227,6 +237,7 @@ impl ColumnBlockEntryShape {
             row_ids: self.row_ids,
             delete_deltas: self.delete_deltas,
             delete_domain: self.delete_domain,
+            row_shape_fingerprint: self.row_shape_fingerprint,
         }
     }
 }
@@ -240,6 +251,7 @@ pub struct ColumnBlockEntryInput {
     row_ids: Vec<RowID>,
     delete_deltas: Vec<u32>,
     delete_domain: ColumnDeleteDomain,
+    row_shape_fingerprint: u128,
 }
 
 impl ColumnBlockEntryInput {
@@ -269,6 +281,7 @@ pub struct ColumnLeafEntry {
     first_present_delta: u32,
     delete_domain: ColumnDeleteDomain,
     delete_blob_ref: Option<BlobRef>,
+    row_shape_fingerprint: u128,
 }
 
 impl ColumnLeafEntry {
@@ -320,6 +333,13 @@ impl ColumnLeafEntry {
     pub fn deletion_blob_ref(&self) -> Option<BlobRef> {
         self.delete_blob_ref
     }
+
+    /// Returns the canonical row-shape fingerprint bound to this persisted
+    /// block-index leaf entry.
+    #[inline]
+    pub fn row_shape_fingerprint(&self) -> u128 {
+        self.row_shape_fingerprint
+    }
 }
 
 /// Runtime row resolution result for one persisted columnar row lookup.
@@ -328,6 +348,7 @@ pub struct ResolvedColumnRow {
     leaf_page_id: PageID,
     block_id: PageID,
     row_idx: usize,
+    row_shape_fingerprint: u128,
 }
 
 impl ResolvedColumnRow {
@@ -347,6 +368,13 @@ impl ResolvedColumnRow {
     #[inline]
     pub fn row_idx(&self) -> usize {
         self.row_idx
+    }
+
+    /// Returns the expected canonical row-shape fingerprint for the resolved
+    /// persisted LWC page.
+    #[inline]
+    pub fn row_shape_fingerprint(&self) -> u128 {
+        self.row_shape_fingerprint
     }
 }
 
@@ -441,6 +469,41 @@ impl LogicalRowSet {
     }
 }
 
+fn row_shape_fingerprint_for_row_ids(
+    start_row_id: RowID,
+    end_row_id: RowID,
+    row_ids: &[RowID],
+) -> Result<u128> {
+    let row_set = LogicalRowSet::from_row_ids(start_row_id, end_row_id, row_ids)?;
+    logical_row_shape_fingerprint(start_row_id, &row_set)
+}
+
+fn logical_row_shape_fingerprint(start_row_id: RowID, row_set: &LogicalRowSet) -> Result<u128> {
+    let row_count = u32::try_from(row_set.row_count()).map_err(|_| Error::InvalidArgument)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[ROW_SHAPE_FINGERPRINT_VERSION]);
+    let sparse_deltas = match row_set {
+        LogicalRowSet::Dense { .. } => {
+            hasher.update(&[ROW_SHAPE_KIND_DENSE]);
+            None
+        }
+        LogicalRowSet::DeltaList { deltas, .. } => {
+            hasher.update(&[ROW_SHAPE_KIND_PRESENT_DELTA_LIST]);
+            Some(deltas.as_slice())
+        }
+    };
+    hasher.update(&start_row_id.to_le_bytes());
+    hasher.update(&row_count.to_le_bytes());
+    if let Some(deltas) = sparse_deltas {
+        for delta in deltas {
+            hasher.update(&delta.to_le_bytes());
+        }
+    }
+    let mut truncated = [0u8; mem::size_of::<u128>()];
+    truncated.copy_from_slice(&hasher.finalize().as_bytes()[..mem::size_of::<u128>()]);
+    Ok(u128::from_le_bytes(truncated))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LogicalDeleteSet {
     None {
@@ -477,6 +540,7 @@ struct LogicalLeafEntry {
     block_id: PageID,
     row_set: LogicalRowSet,
     delete_set: LogicalDeleteSet,
+    row_shape_fingerprint: u128,
 }
 
 impl LogicalLeafEntry {
@@ -485,12 +549,14 @@ impl LogicalLeafEntry {
         block_id: PageID,
         row_set: LogicalRowSet,
         delete_set: LogicalDeleteSet,
+        row_shape_fingerprint: u128,
     ) -> Self {
         LogicalLeafEntry {
             start_row_id,
             block_id,
             row_set,
             delete_set,
+            row_shape_fingerprint,
         }
     }
 }
@@ -546,6 +612,7 @@ struct EncodedLeafEntry {
     row_section_kind: u8,
     delete_section_kind: u8,
     delete_domain: u8,
+    row_shape_fingerprint: u128,
     row_section: Vec<u8>,
     delete_section: Vec<u8>,
 }
@@ -566,6 +633,7 @@ impl EncodedLeafEntry {
             row_section_kind,
             delete_section_kind,
             delete_domain: delete_domain.encode(),
+            row_shape_fingerprint: entry.row_shape_fingerprint,
             row_section,
             delete_section,
         })
@@ -886,6 +954,11 @@ impl ColumnBlockLeafPrefix {
     }
 
     #[inline]
+    fn row_shape_fingerprint(&self) -> u128 {
+        u128::from_le_bytes(self.row_shape_fingerprint)
+    }
+
+    #[inline]
     fn end_row_id(&self) -> Result<RowID> {
         self.start_row_id()
             .checked_add(self.row_id_span() as RowID)
@@ -916,6 +989,7 @@ impl ColumnBlockLeafPrefix {
             prefix_version: COLUMN_LEAF_PREFIX_VERSION,
             flags: 0,
             reserved: [0; 7],
+            row_shape_fingerprint: entry.row_shape_fingerprint.to_le_bytes(),
         }
     }
 }
@@ -957,6 +1031,19 @@ impl<'a> ColumnBlockIndex<'a> {
         ValidatedColumnBlockNode::try_from_guard(g, self.file_kind(), page_id)
     }
 
+    #[inline]
+    fn read_entry_view<'n>(
+        &self,
+        node: &'n ValidatedColumnBlockNode,
+        entry: &ColumnLeafEntry,
+    ) -> Result<LeafEntryView<'n>> {
+        let prefixes = node.leaf_prefixes(self.file_kind(), entry.leaf_page_id)?;
+        let idx = prefixes
+            .binary_search_by_key(&entry.start_row_id, |prefix| prefix.start_row_id())
+            .map_err(|_| invalid_node_payload(self.file_kind(), entry.leaf_page_id))?;
+        node.leaf_entry_view(idx, self.file_kind(), entry.leaf_page_id)
+    }
+
     /// Finds the persisted leaf entry whose coverage contains `row_id`.
     pub async fn locate_block(&self, row_id: RowID) -> Result<Option<ColumnLeafEntry>> {
         if self.root_page_id == 0 || row_id >= self.end_row_id {
@@ -993,11 +1080,7 @@ impl<'a> ColumnBlockIndex<'a> {
         entry: &ColumnLeafEntry,
     ) -> Result<Option<ResolvedColumnRow>> {
         let node = self.read_node(entry.leaf_page_id).await?;
-        let prefixes = node.leaf_prefixes(self.file_kind(), entry.leaf_page_id)?;
-        let idx = prefixes
-            .binary_search_by_key(&entry.start_row_id, |prefix| prefix.start_row_id())
-            .map_err(|_| invalid_node_payload(self.file_kind(), entry.leaf_page_id))?;
-        let view = node.leaf_entry_view(idx, self.file_kind(), entry.leaf_page_id)?;
+        let view = self.read_entry_view(&node, entry)?;
         let Some(row_idx) =
             resolve_row_idx_in_view(&view, row_id, self.file_kind(), entry.leaf_page_id)?
         else {
@@ -1040,11 +1123,7 @@ impl<'a> ColumnBlockIndex<'a> {
     /// Loads validated delete deltas for one persisted entry.
     pub(crate) async fn load_delete_deltas(&self, entry: &ColumnLeafEntry) -> Result<Vec<u32>> {
         let node = self.read_node(entry.leaf_page_id).await?;
-        let prefixes = node.leaf_prefixes(self.file_kind(), entry.leaf_page_id)?;
-        let idx = prefixes
-            .binary_search_by_key(&entry.start_row_id, |prefix| prefix.start_row_id())
-            .map_err(|_| invalid_node_payload(self.file_kind(), entry.leaf_page_id))?;
-        let view = node.leaf_entry_view(idx, self.file_kind(), entry.leaf_page_id)?;
+        let view = self.read_entry_view(&node, entry)?;
         let row_set = decode_logical_row_set(&view, self.file_kind(), entry.leaf_page_id)?;
         let delete_set = self
             .decode_logical_delete_set(&view, &row_set, entry.leaf_page_id)
@@ -1056,6 +1135,20 @@ impl<'a> ColumnBlockIndex<'a> {
                 row_id_deltas.ok_or(Error::InvalidState)?
             }
         })
+    }
+
+    /// Loads the authoritative persisted row-id set for one validated leaf
+    /// entry.
+    pub async fn load_entry_row_ids(&self, entry: &ColumnLeafEntry) -> Result<Vec<RowID>> {
+        let node = self.read_node(entry.leaf_page_id).await?;
+        let view = self.read_entry_view(&node, entry)?;
+        let row_set = decode_logical_row_set(&view, self.file_kind(), entry.leaf_page_id)?;
+        decode_row_ids_from_row_set(
+            view.prefix.start_row_id(),
+            &row_set,
+            self.file_kind(),
+            entry.leaf_page_id,
+        )
     }
 
     async fn decode_logical_delete_set(
@@ -1532,6 +1625,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 view.prefix.block_id(),
                 row_set,
                 delete_set,
+                view.prefix.row_shape_fingerprint(),
             ));
         }
         Ok(entries)
@@ -1949,6 +2043,36 @@ fn decode_logical_row_set(
     }
 }
 
+fn decode_row_ids_from_row_set(
+    start_row_id: RowID,
+    row_set: &LogicalRowSet,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<Vec<RowID>> {
+    let mut row_ids = Vec::with_capacity(row_set.row_count());
+    match row_set {
+        LogicalRowSet::Dense { row_id_span } => {
+            for delta in 0..*row_id_span {
+                row_ids.push(
+                    start_row_id
+                        .checked_add(delta as RowID)
+                        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?,
+                );
+            }
+        }
+        LogicalRowSet::DeltaList { deltas, .. } => {
+            for delta in deltas {
+                row_ids.push(
+                    start_row_id
+                        .checked_add(*delta as RowID)
+                        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?,
+                );
+            }
+        }
+    }
+    Ok(row_ids)
+}
+
 fn decode_logical_delete_set_base(
     view: &LeafEntryView<'_>,
     row_set: &LogicalRowSet,
@@ -2023,6 +2147,7 @@ fn build_leaf_entry(
             leaf_page_id,
         )?,
         delete_blob_ref,
+        row_shape_fingerprint: view.prefix.row_shape_fingerprint(),
     })
 }
 
@@ -2046,6 +2171,7 @@ fn build_resolved_row(
         leaf_page_id,
         block_id: view.prefix.block_id(),
         row_idx,
+        row_shape_fingerprint: view.prefix.row_shape_fingerprint(),
     }
 }
 
@@ -2383,6 +2509,7 @@ async fn build_logical_entry_from_input<M: MutableCowFile>(
         input.block_id,
         row_set,
         delete_set,
+        input.row_shape_fingerprint,
     ))
 }
 
@@ -2500,13 +2627,34 @@ mod tests {
             row_section_kind: COLUMN_ROW_CODEC_DELTA_LIST,
             delete_section_kind: COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
             delete_domain: COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
+            row_shape_fingerprint: 42,
             row_section: vec![0u8; 4 + 7 * mem::size_of::<u32>()],
             delete_section: vec![0u8; 4 + 2 * mem::size_of::<u32>()],
         };
         let prefix = ColumnBlockLeafPrefix::from_encoded(&encoded, 128, 32, 160, 12);
         assert_eq!(prefix.row_count(), 7);
         assert_eq!(prefix.del_count(), 2);
-        assert_eq!(mem::size_of::<ColumnBlockLeafPrefix>(), 48);
+        assert_eq!(prefix.row_shape_fingerprint(), 42);
+        assert_eq!(mem::size_of::<ColumnBlockLeafPrefix>(), 64);
+    }
+
+    #[test]
+    fn test_row_shape_fingerprint_is_deterministic_and_canonical() {
+        let dense_row_ids: Vec<RowID> = (10..20).collect();
+        let sparse_row_ids = vec![12, 15, 18];
+
+        let dense = row_shape_fingerprint_for_row_ids(10, 20, &dense_row_ids).unwrap();
+        assert_eq!(
+            dense,
+            row_shape_fingerprint_for_row_ids(10, 20, &dense_row_ids).unwrap()
+        );
+
+        let sparse = row_shape_fingerprint_for_row_ids(10, 20, &sparse_row_ids).unwrap();
+        assert_ne!(dense, sparse);
+        assert_eq!(
+            sparse,
+            row_shape_fingerprint_for_row_ids(10, 99, &sparse_row_ids).unwrap()
+        );
     }
 
     #[test]
@@ -2568,6 +2716,54 @@ mod tests {
     }
 
     #[test]
+    fn test_load_entry_row_ids_roundtrip_dense_and_sparse() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata();
+            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let mut mutable = MutableTableFile::fork(&table);
+            let root_page_id = ColumnBlockIndex::new(0, 0, &disk_pool)
+                .batch_insert(
+                    &mut mutable,
+                    &[
+                        dense_entry(0, 4, 1001),
+                        sparse_entry(10, 20, vec![12, 15, 18], 1002),
+                    ],
+                    20,
+                    2,
+                )
+                .await
+                .unwrap();
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+            let index = ColumnBlockIndex::new(root_page_id, 20, &disk_pool);
+            let dense = index.locate_block(2).await.unwrap().unwrap();
+            let sparse = index.locate_block(15).await.unwrap().unwrap();
+
+            assert_eq!(
+                index.load_entry_row_ids(&dense).await.unwrap(),
+                vec![0, 1, 2, 3]
+            );
+            assert_eq!(
+                dense.row_shape_fingerprint(),
+                row_shape_fingerprint_for_row_ids(0, 4, &[0, 1, 2, 3]).unwrap()
+            );
+            assert_eq!(
+                index.load_entry_row_ids(&sparse).await.unwrap(),
+                vec![12, 15, 18]
+            );
+            assert_eq!(
+                sparse.row_shape_fingerprint(),
+                row_shape_fingerprint_for_row_ids(10, 20, &[12, 15, 18]).unwrap()
+            );
+        });
+    }
+
+    #[test]
     fn test_resolve_row_dense_and_sparse() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
@@ -2594,12 +2790,20 @@ mod tests {
             assert_eq!(dense_resolved.block_id(), 1001);
             assert_eq!(dense_resolved.row_idx(), 2);
             assert_eq!(dense_resolved.leaf_page_id(), dense_entry.leaf_page_id);
+            assert_eq!(
+                dense_resolved.row_shape_fingerprint(),
+                dense_entry.row_shape_fingerprint()
+            );
 
             let sparse_entry = index.locate_block(15).await.unwrap().unwrap();
             let sparse_resolved = index.resolve_row(15, &sparse_entry).await.unwrap().unwrap();
             assert_eq!(sparse_resolved.block_id(), 1002);
             assert_eq!(sparse_resolved.row_idx(), 1);
             assert_eq!(sparse_resolved.leaf_page_id(), sparse_entry.leaf_page_id);
+            assert_eq!(
+                sparse_resolved.row_shape_fingerprint(),
+                sparse_entry.row_shape_fingerprint()
+            );
             assert!(
                 index
                     .resolve_row(14, &sparse_entry)
@@ -2611,6 +2815,10 @@ mod tests {
             let one_descent = index.locate_and_resolve_row(18).await.unwrap().unwrap();
             assert_eq!(one_descent.block_id(), 1002);
             assert_eq!(one_descent.row_idx(), 2);
+            assert_eq!(
+                one_descent.row_shape_fingerprint(),
+                sparse_entry.row_shape_fingerprint()
+            );
         });
     }
 

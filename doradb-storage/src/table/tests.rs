@@ -395,9 +395,14 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             .unwrap();
 
         match sys.table.find_row(session.pool_guards(), row_id).await {
-            RowLocation::LwcPage { page_id, row_idx } => {
+            RowLocation::LwcPage {
+                page_id,
+                row_idx,
+                row_shape_fingerprint,
+            } => {
                 assert_eq!(page_id, resolved.block_id());
                 assert_eq!(row_idx, resolved.row_idx());
+                assert_eq!(row_shape_fingerprint, resolved.row_shape_fingerprint());
             }
             RowLocation::RowPage(..) => panic!("row should be in lwc"),
             RowLocation::NotFound => panic!("row should exist"),

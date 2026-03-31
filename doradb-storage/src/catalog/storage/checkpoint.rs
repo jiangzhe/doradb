@@ -5,7 +5,7 @@ use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{Error, Result};
+use crate::error::{Error, PersistedPageCorruptionCause, PersistedPageKind, Result};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
     MutableMultiTableFile,
@@ -257,7 +257,7 @@ impl CatalogStorage {
             && let Some(last_entry) = entries.last().copied()
         {
             let existing_tail_rows = self
-                .decode_lwc_page_rows(last_entry.block_id(), metadata)
+                .decode_lwc_page_rows(metadata, &base_index, &last_entry)
                 .await?;
             if !existing_tail_rows.is_empty()
                 && let Some((merged_tail_buf, merged_row_ids, consumed)) = self
@@ -398,7 +398,7 @@ impl CatalogStorage {
         for entry in entries {
             let deleted = load_entry_deletion_deltas(&column_index, &entry).await?;
             let page_rows = self
-                .decode_lwc_page_rows(entry.block_id(), metadata)
+                .decode_lwc_page_rows(metadata, &column_index, &entry)
                 .await?;
             for row in page_rows {
                 let delta = row
@@ -427,7 +427,7 @@ impl CatalogStorage {
         for entry in entries {
             let deleted = load_entry_deletion_deltas(column_index, entry).await?;
             let page_rows = self
-                .decode_lwc_page_rows(entry.block_id(), metadata)
+                .decode_lwc_page_rows(metadata, column_index, entry)
                 .await?;
             for row in page_rows {
                 let delta = row
@@ -453,12 +453,21 @@ impl CatalogStorage {
 
     async fn decode_lwc_page_rows(
         &self,
-        page_id: u64,
         metadata: &TableMetadata,
+        column_index: &ColumnBlockIndex<'_>,
+        entry: &CatalogIndexEntry,
     ) -> Result<Vec<RowRecord>> {
-        let lwc_page = PersistedLwcPage::load(&self.disk_pool, page_id).await?;
+        let lwc_page = PersistedLwcPage::load(&self.disk_pool, entry.block_id()).await?;
         let row_count = lwc_page.row_count();
-        let row_ids = lwc_page.decode_row_ids()?;
+        let row_ids = column_index.load_entry_row_ids(entry).await?;
+        if row_count != row_ids.len() {
+            return Err(Error::persisted_page_corrupted(
+                self.disk_pool.persisted_file_kind(),
+                PersistedPageKind::LwcPage,
+                entry.block_id(),
+                PersistedPageCorruptionCause::InvalidPayload,
+            ));
+        }
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
             let vals = lwc_page.decode_full_row_values(metadata, row_idx)?;
