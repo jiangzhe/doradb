@@ -3,6 +3,7 @@ id: 000102
 title: Separate readonly pool interface and simplify ownership
 status: proposal  # proposal | implemented | superseded
 created: 2026-03-31
+github_issue: 511
 ---
 
 # Task: Separate readonly pool interface and simplify ownership
