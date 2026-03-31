@@ -925,10 +925,16 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
 
 /// Physical lookup target returned by row/column block-index search.
 pub enum RowLocation {
-    // Lightweight columnar page.
-    LwcPage(PageID),
-    // Row page.
+    /// Persisted lightweight columnar page plus the resolved row ordinal.
+    LwcPage {
+        /// Persisted LWC page id.
+        page_id: PageID,
+        /// Resolved row ordinal within the persisted LWC page.
+        row_idx: usize,
+    },
+    /// Row page.
     RowPage(PageID),
+    /// Row id was not found in either route.
     NotFound,
 }
 
