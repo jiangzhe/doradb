@@ -1,7 +1,7 @@
 ---
 id: 0012
 title: Remove Row ID From LWC Page
-status: proposal
+status: implemented
 tags: [storage-engine, lwc, file-format, checkpoint, recovery]
 created: 2026-03-31
 github_issue: 504
@@ -232,9 +232,10 @@ entirely ([D1], [D4], [D5], [D8], [C1], [C3], [C4], [C5], [C6], [U1], [U4]).
 
 ### 5. LWC page format v2
 
-1. The LWC page-integrity envelope version is bumped for the new page format so
-   readers can reject old payloads cleanly rather than attempting to interpret
-   them as values-only pages ([C9], [D5]).
+1. The implemented cutover keeps `LWC_PAGE_SPEC.version` unchanged. Legacy
+   row-id LWC payload compatibility remains out of scope, so the project relies
+   on a new-format-only publish boundary rather than an envelope-version
+   discriminator or fallback reader path ([C9], [D5], [U5]).
 2. The v2 LWC page header is a fixed 32-byte structure. It replaces
    `first_row_id`, `last_row_id`, and `first_col_offset` with values-page-local
    metadata only:
@@ -326,8 +327,9 @@ therefore requires explicit unsafe-boundary discipline ([D9], [D10], [C1],
      existing validated page helpers;
    - new header fields use explicit little-endian encode/decode helpers rather
      than relying on implicit layout assumptions;
-   - v2 LWC payload parsing must reject any attempt to interpret an old row-id
-     section as column bytes;
+   - the implemented new-format reader must validate the values-only offset and
+     payload structure without adding compatibility-discriminator handling for
+     legacy row-id LWC payloads;
    - fingerprint mismatch must be surfaced as persisted corruption, not treated
      as a soft miss.
 3. If implementation changes unsafe code or low-level page-casting logic, run:
@@ -406,9 +408,9 @@ Reference:
 
 ## Open Questions
 
-1. No blocking design questions remain for the draft direction. Phase planning
-   should focus on work packaging, not on re-opening the ownership model or the
-   chosen consistency mechanism.
+1. No open implementation questions remain for this RFC. Any future work on
+   legacy row-id compatibility or mixed-format support should be treated as
+   separate planning rather than reopening this implemented cutover.
 
 ## Future Work
 
@@ -418,6 +420,9 @@ Reference:
 2. If future evidence shows that whole-block fingerprint binding is not
    sufficient, a separate follow-up can evaluate stronger per-ordinal
    verification metadata. That is intentionally not part of this RFC.
+3. Column-block-index leaf search-prefix compaction remains separate
+   layout/performance planning rather than part of this correctness-focused
+   ownership cutover.
 
 ## References
 
