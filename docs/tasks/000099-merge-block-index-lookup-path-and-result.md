@@ -135,6 +135,45 @@ Reference:
 
 ## Implementation Notes
 
+Implemented on this branch via issue `#502`.
+
+1. Unified the block-index facade result shape in
+   `doradb-storage/src/index/row_block_index.rs` and
+   `doradb-storage/src/index/block_index.rs`:
+   - `RowLocation::LwcPage` now carries `{ page_id, row_idx }`;
+   - removed `RuntimeRowLocation`;
+   - `GenericBlockIndex::try_find_row()` is now the only facade lookup path
+     for both direct column routing and row-route fallback.
+2. Switched persisted unique point reads in
+   `doradb-storage/src/table/access.rs` onto the unified result:
+   - `index_lookup_unique_row_mvcc()` now calls `try_find_row()`;
+   - persisted reads reuse the resolved `row_idx` when calling
+     `read_lwc_row(page_id, row_id, row_idx, ..)`;
+   - deletion-buffer-first MVCC checks and persisted LWC row-id consistency
+     validation remain unchanged.
+3. Removed the table-level runtime-only pass-through and kept deferred callers
+   shape-only in place:
+   - deleted `try_find_runtime_row()` from
+     `doradb-storage/src/table/mod.rs`;
+   - updated the remaining `RowLocation::LwcPage(..)` matches in
+     `table/access.rs`, `table/mod.rs`, `trx/undo/index.rs`, and
+     `trx/purge.rs` to the new struct variant without broadening those
+     existing deferred branches.
+4. Added and updated coverage in `doradb-storage/src/table/tests.rs`:
+   - new `test_find_row_returns_resolved_lwc_page_location` asserts that
+     `find_row()` returns the same `page_id` and `row_idx` as
+     `ColumnBlockIndex::locate_and_resolve_row()`;
+   - existing persisted-read corruption and row-in-LWC assertions now match
+     the enriched `RowLocation` shape.
+5. Resolve-time sync and verification completed:
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000099-merge-block-index-lookup-path-and-result.md`
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000099-merge-block-index-lookup-path-and-result.md`
+   - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+6. Resolve sync confirmed that this task has no parent RFC reference and no
+   source backlog docs to close.
+
 ## Impacts
 
 - `doradb-storage/src/index/row_block_index.rs`
@@ -148,9 +187,14 @@ Reference:
   - unified point-read lookup path for persisted and row-store rows.
 - `doradb-storage/src/trx/undo/index.rs`
   - variant-shape-only updates for deferred `LwcPage(..)` branches.
+- `doradb-storage/src/trx/purge.rs`
+  - variant-shape-only updates for deferred `LwcPage(..)` branches in purge
+    coverage.
 - `doradb-storage/src/table/tests.rs`
   - assertions updated to the enriched `RowLocation` shape and new facade-level
     persisted-row lookup coverage.
+- `docs/unsafe-usage-baseline.md`
+  - resolve-time unsafe inventory refresh after the index/table changes.
 
 ## Test Cases
 
@@ -158,9 +202,10 @@ Reference:
    `Error::ColumnStorageMissing` for both:
    - direct column-route lookup without storage;
    - row-route miss that falls back to the column route without storage.
-2. Add a focused block-index test that a persisted row lookup returns
+2. Add a focused table-level test that a persisted row lookup returns
    `RowLocation::LwcPage { page_id, row_idx }`, proving the unified result
-   shape and the resolved column path.
+   shape and the resolved column path against
+   `ColumnBlockIndex::locate_and_resolve_row()`.
 3. Persisted unique point reads still return found/not-found correctly after
    switching from `try_find_runtime_row()` to `try_find_row()`.
 4. Existing point-read corruption tests still surface:
