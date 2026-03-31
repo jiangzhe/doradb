@@ -1,7 +1,7 @@
 ---
 id: 000101
 title: Values-Only LWC Page Format
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-31
 github_issue: 508
 ---
@@ -171,6 +171,41 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented the phase-2 values-only cutover in `doradb-storage` so
+   `LwcPage` now stores `row_shape_fingerprint` in the persisted header, the
+   body contains only column offsets plus column payloads, and production
+   persisted row-id helpers were removed from `LwcPage` and
+   `PersistedLwcPage`.
+2. Updated `LwcBuilder` and the table/checkpoint LWC build paths to write the
+   new values-only layout from the authoritative
+   `ColumnBlockEntryShape::row_shape_fingerprint()`, while continuing to use
+   the collected row-id set only for block-index entry-shape construction.
+3. Switched runtime persisted reads in `doradb-storage/src/table/access.rs`
+   from `row_id_at(row_idx)` validation to fingerprint comparison against the
+   resolved `RowLocation::LwcPage` metadata, keeping fingerprint mismatch as
+   persisted `InvalidPayload` corruption.
+4. Kept recovery bootstrap and catalog checkpoint strictly ordinal-only on the
+   LWC side: row IDs continue to come from
+   `ColumnBlockIndex::load_entry_row_ids()`, while page decode uses only row
+   ordinals and values.
+5. Updated unit and corruption coverage for the new contract, including:
+   - values-only page/header parsing in `doradb-storage/src/lwc/page.rs`;
+   - builder output coverage in `doradb-storage/src/lwc/mod.rs`;
+   - readonly-cache invalid-offset rejection in
+     `doradb-storage/src/buffer/readonly.rs`;
+   - persisted point-read fingerprint-mismatch corruption in
+     `doradb-storage/src/table/tests.rs`.
+6. Validation completed successfully:
+   - `cargo fmt --all`
+   - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+7. Review handoff is tracked in GitHub issue `#508` and PR `#509`.
+8. Resolve-time sync completed:
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000101-values-only-lwc-page-format.md`
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000101-values-only-lwc-page-format.md`
+
 ## Impacts
 
 - `doradb-storage/src/lwc/page.rs`
@@ -201,6 +236,7 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-1. No blocking design questions remain. `task resolve` must sync RFC-0012 so
-   the recorded phase-2 design matches the approved no-version-bump
-   values-only execution plan.
+1. No open questions remain for this implemented task. If the project later
+   needs backward-compatibility, mixed-format support, or upgrade behavior for
+   legacy row-id LWC pages, treat that as separate RFC-level planning rather
+   than a follow-up on this completed phase-2 cutover.
