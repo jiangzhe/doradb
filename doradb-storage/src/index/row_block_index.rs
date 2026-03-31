@@ -931,6 +931,8 @@ pub enum RowLocation {
         page_id: PageID,
         /// Resolved row ordinal within the persisted LWC page.
         row_idx: usize,
+        /// Canonical authoritative row-shape fingerprint bound to the page.
+        row_shape_fingerprint: u128,
     },
     /// Row page.
     RowPage(PageID),

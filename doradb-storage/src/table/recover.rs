@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::PageID;
-use crate::error::{Error, Result};
+use crate::error::{Error, PersistedPageCorruptionCause, PersistedPageKind, Result};
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_entry_deletion_deltas,
 };
@@ -271,7 +271,15 @@ impl TableRecover for Table {
         for entry in index.collect_leaf_entries().await? {
             let deleted = load_entry_deletion_deltas(&index, &entry).await?;
             let page = PersistedLwcPage::load(self.disk_pool(), entry.block_id()).await?;
-            let row_ids = page.decode_row_ids()?;
+            let row_ids = index.load_entry_row_ids(&entry).await?;
+            if page.row_count() != row_ids.len() {
+                return Err(Error::persisted_page_corrupted(
+                    self.disk_pool().persisted_file_kind(),
+                    PersistedPageKind::LwcPage,
+                    entry.block_id(),
+                    PersistedPageCorruptionCause::InvalidPayload,
+                ));
+            }
 
             for (row_idx, row_id) in row_ids.into_iter().enumerate() {
                 let delta = row_id

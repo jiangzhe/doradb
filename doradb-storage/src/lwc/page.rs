@@ -391,6 +391,7 @@ impl PersistedLwcPage {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn decode_row_ids(&self) -> Result<Vec<RowID>> {
         self.page()
             .decode_persisted_row_ids(self.file_kind, self.page_id)

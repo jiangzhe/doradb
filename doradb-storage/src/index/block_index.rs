@@ -278,6 +278,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             Ok(Some(resolved)) => Ok(RowLocation::LwcPage {
                 page_id: resolved.block_id(),
                 row_idx: resolved.row_idx(),
+                row_shape_fingerprint: resolved.row_shape_fingerprint(),
             }),
             Ok(None) => Ok(RowLocation::NotFound),
             Err(err) => Err(err),
