@@ -261,7 +261,12 @@ impl CatalogStorage {
                 .await?;
             if !existing_tail_rows.is_empty()
                 && let Some((merged_tail_buf, merged_row_ids, consumed)) = self
-                    .build_merged_tail_lwc_page(metadata, &existing_tail_rows, &live_inserts)
+                    .build_merged_tail_lwc_page(
+                        metadata,
+                        last_entry.start_row_id,
+                        &existing_tail_rows,
+                        &live_inserts,
+                    )
                     .await?
             {
                 let new_tail_page_id = mutable.allocate_page_id()?;
@@ -513,7 +518,7 @@ impl CatalogStorage {
                     builder.row_ids().to_vec(),
                     Vec::new(),
                 )?;
-                let buf = builder.build()?;
+                let buf = builder.build(shape.row_shape_fingerprint())?;
                 lwc_pages.push(PendingLwcPage { shape, buf });
 
                 builder = LwcBuilder::new(metadata);
@@ -538,7 +543,7 @@ impl CatalogStorage {
                 builder.row_ids().to_vec(),
                 Vec::new(),
             )?;
-            let buf = builder.build()?;
+            let buf = builder.build(shape.row_shape_fingerprint())?;
             lwc_pages.push(PendingLwcPage { shape, buf });
         }
         Ok(lwc_pages)
@@ -547,6 +552,7 @@ impl CatalogStorage {
     async fn build_merged_tail_lwc_page(
         &self,
         metadata: &TableMetadata,
+        start_row_id: RowID,
         existing_tail_rows: &[RowRecord],
         inserts: &[RowRecord],
     ) -> Result<Option<(DirectBuf, Vec<RowID>, usize)>> {
@@ -589,7 +595,15 @@ impl CatalogStorage {
             return Ok(None);
         }
         let row_ids = builder.row_ids().to_vec();
-        let buf = builder.build()?;
+        let end_row_id = row_ids
+            .last()
+            .copied()
+            .ok_or(Error::InvalidState)?
+            .saturating_add(1);
+        let fingerprint =
+            ColumnBlockEntryShape::new(start_row_id, end_row_id, row_ids.clone(), Vec::new())?
+                .row_shape_fingerprint();
+        let buf = builder.build(fingerprint)?;
         Ok(Some((buf, row_ids, consumed)))
     }
 }

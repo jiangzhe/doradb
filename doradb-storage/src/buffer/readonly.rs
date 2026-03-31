@@ -1407,7 +1407,7 @@ pub(crate) mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::page_integrity::{
         COLUMN_BLOCK_INDEX_PAGE_SPEC, COLUMN_DELETION_BLOB_PAGE_SPEC, LWC_PAGE_SPEC,
-        max_payload_len, write_page_checksum, write_page_header,
+        PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, write_page_checksum, write_page_header,
     };
     use crate::file::table_file::TableFile;
     use crate::index::{
@@ -1734,7 +1734,7 @@ pub(crate) mod tests {
         let payload_start = write_page_header(&mut buf, LWC_PAGE_SPEC);
         let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
         let page = LwcPage::try_from_bytes_mut(&mut buf[payload_start..payload_end]).unwrap();
-        page.header = LwcPageHeader::new(1, 1, 0, 0, 0);
+        page.header = LwcPageHeader::new(1, 0, 0, 0);
         write_page_checksum(&mut buf);
         buf
     }
@@ -2670,6 +2670,57 @@ pub(crate) mod tests {
                     page_kind: PersistedPageKind::LwcPage,
                     page_id: 9,
                     cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                }
+            ));
+            assert_eq!(global.try_get_frame_id(&key), None);
+            assert_eq!(global.allocated(), 0);
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_validated_lwc_miss_rejects_invalid_offsets_without_mapping() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs.create_table_file(116, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let mut page = build_valid_persisted_lwc_page();
+            {
+                let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+                let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+                let page_view =
+                    LwcPage::try_from_bytes_mut(&mut page[payload_start..payload_end]).unwrap();
+                let invalid_end = (page_view.body.len() as u16).saturating_add(1);
+                page_view.header = LwcPageHeader::new(1, 1, 1, 0);
+                page_view.body[..2].copy_from_slice(&invalid_end.to_le_bytes());
+            }
+            write_page_checksum(&mut page);
+            write_page_bytes(&table_file, 10, &page).await;
+
+            let global = owned_global_pool(frame_page_bytes(4));
+            let pool = owned_readonly_pool(
+                116,
+                PersistedFileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
+            let key = PersistedBlockKey::new(116, 10);
+
+            let err = match pool
+                .get_validated_page_shared(10, validate_persisted_lwc_page)
+                .await
+            {
+                Ok(_) => panic!("expected persisted LWC invalid-payload corruption"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                Error::PersistedPageCorrupted {
+                    file_kind: PersistedFileKind::TableFile,
+                    page_kind: PersistedPageKind::LwcPage,
+                    page_id: 10,
+                    cause: PersistedPageCorruptionCause::InvalidPayload,
                 }
             ));
             assert_eq!(global.try_get_frame_id(&key), None);
