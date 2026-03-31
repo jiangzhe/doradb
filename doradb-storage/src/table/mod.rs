@@ -394,8 +394,9 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         storage: Option<&ColumnStorage>,
     ) -> RowLocation {
         let meta_pool_guard = guards.meta_guard();
+        let disk_pool_guard = storage.map(|_| guards.disk_guard());
         self.blk_idx
-            .find_row(meta_pool_guard, row_id, storage)
+            .find_row(meta_pool_guard, disk_pool_guard, row_id, storage)
             .await
     }
 
@@ -407,8 +408,9 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         storage: Option<&ColumnStorage>,
     ) -> Result<RowLocation> {
         let meta_pool_guard = guards.meta_guard();
+        let disk_pool_guard = storage.map(|_| guards.disk_guard());
         self.blk_idx
-            .try_find_row(meta_pool_guard, row_id, storage)
+            .try_find_row(meta_pool_guard, disk_pool_guard, row_id, storage)
             .await
     }
 }

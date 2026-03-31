@@ -9,15 +9,14 @@ use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard, PageSharedGuard,
 };
 use crate::buffer::load::{PageReservation, PageReservationGuard};
-use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID, VersionedPageID};
+use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{
-    BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity,
-    PoolRole, ReadonlyPageValidator,
+    BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
+    ReadonlyPageValidator,
 };
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::Validation::Valid;
-use crate::error::{Error, PersistedFileKind, Result, Validation};
+use crate::error::{Error, PersistedFileKind, Result};
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
 use crate::io::{AIOKind, IOSubmission, Operation};
@@ -118,9 +117,9 @@ impl From<Arc<MultiTableFile>> for ReadonlyBackingFile {
 /// Reverse lookup is stored inline in `BufferFrame` as persisted-block metadata.
 pub struct GlobalReadonlyBufferPool {
     size: usize,
-    mappings: Arc<DashMap<PersistedBlockKey, PageID>>,
-    inflight_loads: Arc<DashMap<PersistedBlockKey, Arc<PageIOCompletion>>>,
-    residency: Arc<ReadonlyResidency>,
+    mappings: DashMap<PersistedBlockKey, PageID>,
+    inflight_loads: DashMap<PersistedBlockKey, Arc<PageIOCompletion>>,
+    residency: ReadonlyResidency,
     eviction_arbiter: EvictionArbiter,
     shutdown_flag: Arc<AtomicBool>,
     role: PoolRole,
@@ -165,9 +164,9 @@ impl GlobalReadonlyBufferPool {
         let arena = QuiescentArena::new(size)?;
         let pool = GlobalReadonlyBufferPool {
             size,
-            mappings: Arc::new(DashMap::new()),
-            inflight_loads: Arc::new(DashMap::new()),
-            residency: Arc::new(ReadonlyResidency::new(size, eviction_arbiter)),
+            mappings: DashMap::new(),
+            inflight_loads: DashMap::new(),
+            residency: ReadonlyResidency::new(size, eviction_arbiter),
             eviction_arbiter,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             role,
@@ -450,9 +449,7 @@ impl GlobalReadonlyBufferPool {
         let pool = pool.into_sync();
         let runtime = ReadonlyRuntime {
             arena: pool.arena.arena_guard(pool.pool_guard()),
-            mappings: Arc::clone(&pool.mappings),
-            residency: Arc::clone(&pool.residency),
-            _pool: Some(pool.clone()),
+            pool: pool.clone(),
         };
         let policy = PressureDeltaClockPolicy::new(pool.eviction_arbiter, 1);
         let evictor = Evictor::new(runtime, policy, Arc::clone(&pool.shutdown_flag));
@@ -997,9 +994,7 @@ impl ReadonlyResidency {
 
 struct ReadonlyRuntime {
     arena: ArenaGuard,
-    mappings: Arc<DashMap<PersistedBlockKey, PageID>>,
-    residency: Arc<ReadonlyResidency>,
-    _pool: Option<SyncQuiescentGuard<GlobalReadonlyBufferPool>>,
+    pool: SyncQuiescentGuard<GlobalReadonlyBufferPool>,
 }
 
 impl ReadonlyRuntime {
@@ -1013,7 +1008,7 @@ impl ReadonlyRuntime {
 
         if let Some((file_id, block_id)) = frame.persisted_block_key() {
             let key = PersistedBlockKey::new(file_id, block_id);
-            if let Some((_, mapped_frame_id)) = self.mappings.remove(&key) {
+            if let Some((_, mapped_frame_id)) = self.pool.mappings.remove(&key) {
                 debug_assert_eq!(mapped_frame_id, frame_id);
             }
         }
@@ -1029,19 +1024,19 @@ impl ReadonlyRuntime {
             let _ = madvise_dontneed(page_guard.page_mut() as *mut Page as *mut u8, PAGE_SIZE);
         }
         drop(page_guard);
-        let _ = self.residency.move_resident_to_free(frame_id);
+        let _ = self.pool.residency.move_resident_to_free(frame_id);
     }
 }
 
 impl EvictionRuntime for ReadonlyRuntime {
     #[inline]
     fn resident_count(&self) -> usize {
-        self.residency.resident_len()
+        self.pool.residency.resident_len()
     }
 
     #[inline]
     fn capacity(&self) -> usize {
-        self.residency.capacity()
+        self.pool.residency.capacity()
     }
 
     #[inline]
@@ -1051,12 +1046,12 @@ impl EvictionRuntime for ReadonlyRuntime {
 
     #[inline]
     fn allocation_failure_rate(&self) -> f64 {
-        self.residency.alloc_failure_rate()
+        self.pool.residency.alloc_failure_rate()
     }
 
     #[inline]
     fn work_listener(&self) -> EventListener {
-        self.residency.evict_ev.listen()
+        self.pool.residency.evict_ev.listen()
     }
 
     #[inline]
@@ -1071,7 +1066,7 @@ impl EvictionRuntime for ReadonlyRuntime {
         limit: usize,
         out: &mut Vec<PageID>,
     ) -> Option<ClockHand> {
-        self.residency.collect_batch_ids(hand, limit, out)
+        self.pool.residency.collect_batch_ids(hand, limit, out)
     }
 
     #[inline]
@@ -1088,10 +1083,38 @@ impl EvictionRuntime for ReadonlyRuntime {
     }
 }
 
-/// Per-file readonly wrapper implementing the `BufferPool` contract.
+/// Immutable persisted-block view returned by [`ReadonlyBufferPool`].
+///
+/// The guard retains the readonly-cache residency/lifetime of one loaded block
+/// without exposing pool guards or latch types to callers.
+pub struct ReadonlyBlockGuard {
+    block_id: PageID,
+    guard: PageSharedGuard<Page>,
+}
+
+impl ReadonlyBlockGuard {
+    #[inline]
+    fn new(block_id: PageID, guard: PageSharedGuard<Page>) -> Self {
+        Self { block_id, guard }
+    }
+
+    /// Returns the persisted bytes of the loaded block.
+    #[inline]
+    pub fn page(&self) -> &Page {
+        self.guard.page()
+    }
+
+    /// Returns the physical block id in the backing file.
+    #[inline]
+    pub fn block_id(&self) -> PageID {
+        self.block_id
+    }
+}
+
+/// Per-file readonly wrapper for immutable persisted-block reads.
 ///
 /// This wrapper translates file-local `PageID` into global physical cache keys
-/// and delegates to `GlobalReadonlyBufferPool`.
+/// and delegates to [`GlobalReadonlyBufferPool`].
 #[derive(Clone)]
 pub struct ReadonlyBufferPool {
     file_id: PersistedFileID,
@@ -1152,6 +1175,11 @@ impl ReadonlyBufferPool {
     #[inline]
     pub fn global_stats(&self) -> BufferPoolStats {
         self.global.stats()
+    }
+
+    #[inline]
+    pub fn pool_guard(&self) -> PoolGuard {
+        self.global.pool_guard()
     }
 
     #[inline]
@@ -1246,159 +1274,87 @@ impl ReadonlyBufferPool {
     }
 
     #[inline]
-    async fn get_page_facade<T: BufferPage>(
+    async fn read_shared_block(
         &self,
         guard: &PoolGuard,
         page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> Result<FacadePageGuard<T>> {
+        validation: Option<ReadonlyPageValidator>,
+    ) -> Result<ReadonlyBlockGuard> {
         let key = self.block_key(page_id);
         let global = &self.global;
         global.validate_guard(guard);
         loop {
-            let (frame_id, resident_hit) = self.get_or_load_frame_id(key).await?;
-            let page_guard = global.get_page_internal(guard, frame_id, mode).await?;
-            if global.validate_guarded_frame_key(&page_guard, key) {
-                if resident_hit {
-                    global.stats.record_cache_hit();
-                }
-                return Ok(page_guard);
-            }
-            global.invalidate_stale_mapping_if_same_frame(key, frame_id);
-        }
-    }
-
-    /// Invalidates one block for this file from the global readonly cache.
-    #[inline]
-    pub fn invalidate_block_id(&self, block_id: PageID) -> Option<PageID> {
-        self.global.invalidate_file_block(self.file_id, block_id)
-    }
-
-    /// Invalidates one block for this file with strict GC ordering preconditions.
-    #[inline]
-    pub fn invalidate_block_id_strict(&self, block_id: PageID) -> Option<PageID> {
-        self.global
-            .invalidate_file_block_strict(self.file_id, block_id)
-    }
-
-    /// Returns a shared guard for one persisted page after validating its page-kind contract.
-    ///
-    /// On cache miss, validation runs before the new frame becomes resident.
-    /// On cached hits, validation is re-run against the resident bytes and a
-    /// failed validation invalidates the mapping before returning the error.
-    #[inline]
-    pub(crate) async fn get_validated_page_shared(
-        &self,
-        page_id: PageID,
-        validator: ReadonlyPageValidator,
-    ) -> Result<PageSharedGuard<Page>> {
-        let key = self.block_key(page_id);
-        let global = &self.global;
-        loop {
-            let (frame_id, resident_hit) =
-                self.get_or_load_frame_id_validated(key, validator).await?;
-            let guard = global.pool_guard();
+            let (frame_id, resident_hit) = match validation {
+                Some(validator) => self.get_or_load_frame_id_validated(key, validator).await?,
+                None => self.get_or_load_frame_id(key).await?,
+            };
             let guard = global
-                .get_page_internal::<Page>(&guard, frame_id, LatchFallbackMode::Shared)
+                .get_page_internal::<Page>(guard, frame_id, LatchFallbackMode::Shared)
                 .await?;
             if !global.validate_guarded_frame_key(&guard, key) {
                 global.invalidate_stale_mapping_if_same_frame(key, frame_id);
                 continue;
             }
             if let Some(shared) = guard.lock_shared_async().await {
-                if let Err(err) = validator(shared.page(), self.file_kind, page_id) {
-                    drop(shared);
+                let block = ReadonlyBlockGuard::new(page_id, shared);
+                if let Some(validator) = validation
+                    && let Err(err) = validator(block.page(), self.file_kind, page_id)
+                {
+                    drop(block);
                     let _ = self.invalidate_block_id(page_id);
                     return Err(err);
                 }
                 if resident_hit {
                     global.stats.record_cache_hit();
                 }
-                return Ok(shared);
+                return Ok(block);
             }
         }
     }
-}
-
-impl BufferPool for ReadonlyBufferPool {
-    #[inline]
-    fn capacity(&self) -> usize {
-        self.global.capacity()
-    }
 
     #[inline]
-    fn allocated(&self) -> usize {
-        self.global.allocated()
-    }
-
-    #[inline]
-    fn pool_guard(&self) -> PoolGuard {
-        self.global.pool_guard()
-    }
-
-    #[inline]
-    async fn allocate_page<T: BufferPage>(&self, _guard: &PoolGuard) -> PageExclusiveGuard<T> {
-        panic!("readonly buffer pool does not support page allocation")
-    }
-
-    #[inline]
-    async fn allocate_page_at<T: BufferPage>(
-        &self,
-        _guard: &PoolGuard,
-        _page_id: PageID,
-    ) -> Result<PageExclusiveGuard<T>> {
-        panic!("readonly buffer pool does not support page allocation")
-    }
-
-    #[inline]
-    async fn get_page<T: BufferPage>(
+    /// Reads one persisted block without page-kind validation.
+    pub async fn read_block(
         &self,
         guard: &PoolGuard,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> Result<FacadePageGuard<T>> {
-        self.get_page_facade(guard, page_id, mode).await
+        block_id: PageID,
+    ) -> Result<ReadonlyBlockGuard> {
+        self.read_shared_block(guard, block_id, None).await
     }
 
     #[inline]
-    async fn get_page_versioned<T: BufferPage>(
+    /// Reads and validates one persisted block before returning immutable bytes.
+    ///
+    /// On cache miss, validation runs before the new frame becomes resident.
+    /// On cache hit, validation is re-run against the resident bytes and a
+    /// failed validation invalidates the mapping before returning the error.
+    pub async fn read_validated_block(
         &self,
         guard: &PoolGuard,
-        _id: VersionedPageID,
-        _mode: LatchFallbackMode,
-    ) -> Result<Option<FacadePageGuard<T>>> {
-        self.global.validate_guard(guard);
-        Ok(None)
+        block_id: PageID,
+        validator: ReadonlyPageValidator,
+    ) -> Result<ReadonlyBlockGuard> {
+        self.read_shared_block(guard, block_id, Some(validator))
+            .await
     }
 
     #[inline]
-    fn deallocate_page<T: BufferPage>(&self, _g: PageExclusiveGuard<T>) {
-        panic!("readonly buffer pool does not support page deallocation")
+    /// Invalidates one block for this file from the global readonly cache.
+    pub fn invalidate_block_id(&self, block_id: PageID) -> Option<PageID> {
+        self.global.invalidate_file_block(self.file_id, block_id)
     }
 
     #[inline]
-    async fn get_child_page<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        p_guard: &FacadePageGuard<T>,
-        page_id: PageID,
-        mode: LatchFallbackMode,
-    ) -> Result<Validation<FacadePageGuard<T>>> {
-        let g = self.get_page(guard, page_id, mode).await?;
-        if p_guard.validate_bool() {
-            return Ok(Valid(g));
-        }
-        if g.is_exclusive() {
-            g.rollback_exclusive_version_change();
-        }
-        Ok(Validation::Invalid)
+    /// Invalidates one block for this file with strict GC ordering preconditions.
+    pub fn invalidate_block_id_strict(&self, block_id: PageID) -> Option<PageID> {
+        self.global
+            .invalidate_file_block_strict(self.file_id, block_id)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::guard::{FacadePageGuard, PageGuard};
     use crate::buffer::page::Page;
     use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
@@ -1420,7 +1376,6 @@ pub(crate) mod tests {
         set_storage_backend_test_hook,
     };
     use crate::lwc::{LWC_PAGE_PAYLOAD_SIZE, LwcPage, LwcPageHeader, validate_persisted_lwc_page};
-    use crate::ptr::UnsafePtr;
     use crate::quiescent::QuiescentBox;
     use crate::thread::join_worker;
     use crate::value::ValKind;
@@ -1645,12 +1600,9 @@ pub(crate) mod tests {
 
             let cold_start = pool.global_stats();
             let cold_guard = pool
-                .get_page::<Page>(&pool_guard, 0, crate::latch::LatchFallbackMode::Shared)
+                .read_block(&pool_guard, 0)
                 .await
-                .expect("readonly cold read failed in test")
-                .lock_shared_async()
-                .await
-                .unwrap();
+                .expect("readonly cold read failed in test");
             assert_eq!(&cold_guard.page()[..14], b"readonly-stats");
             drop(cold_guard);
 
@@ -1665,12 +1617,9 @@ pub(crate) mod tests {
 
             let warm_start = pool.global_stats();
             let warm_guard = pool
-                .get_page::<Page>(&pool_guard, 0, crate::latch::LatchFallbackMode::Shared)
+                .read_block(&pool_guard, 0)
                 .await
-                .expect("readonly warm read failed in test")
-                .lock_shared_async()
-                .await
-                .unwrap();
+                .expect("readonly warm read failed in test");
             assert_eq!(&warm_guard.page()[..14], b"readonly-stats");
             drop(warm_guard);
 
@@ -1700,19 +1649,16 @@ pub(crate) mod tests {
             let scope = global_readonly_pool_scope(frame_page_bytes(4));
             let pool_a = table_readonly_pool(&scope, 121, &table_file_a);
             let pool_b = table_readonly_pool(&scope, 122, &table_file_b);
-            let pool_guard_a = pool_a.pool_guard();
+            let pool_a_guard = pool_a.pool_guard();
 
             let start_a = pool_a.global_stats();
             let start_b = pool_b.global_stats();
             assert_eq!(start_a, start_b);
 
             let guard_a = pool_a
-                .get_page::<Page>(&pool_guard_a, 0, crate::latch::LatchFallbackMode::Shared)
+                .read_block(&pool_a_guard, 0)
                 .await
-                .expect("readonly shared global read failed in test")
-                .lock_shared_async()
-                .await
-                .unwrap();
+                .expect("readonly shared global read failed in test");
             assert_eq!(&guard_a.page()[..17], b"readonly-shared-a");
             drop(guard_a);
 
@@ -2118,13 +2064,12 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = pool.pool_guard();
             let reload_start = pool.global_stats();
-            let page: FacadePageGuard<Page> = pool
-                .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
+            let page = pool
+                .read_block(&pool_guard, 9)
                 .await
                 .expect("buffer-pool read failed in test");
-            let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..6], b"reload");
             drop(page);
 
@@ -2174,10 +2119,11 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
+            let pool_guard = pool.pool_guard();
 
             let reload_start = pool.global_stats();
             let page = pool
-                .get_validated_page_shared(12, validate_persisted_lwc_page)
+                .read_validated_block(&pool_guard, 12, validate_persisted_lwc_page)
                 .await
                 .expect("validated readonly reload failed in test");
             drop(page);
@@ -2193,7 +2139,7 @@ pub(crate) mod tests {
 
             let warm_start = pool.global_stats();
             let page = pool
-                .get_validated_page_shared(12, validate_persisted_lwc_page)
+                .read_validated_block(&pool_guard, 12, validate_persisted_lwc_page)
                 .await
                 .expect("validated readonly warm hit failed in test");
             drop(page);
@@ -2225,20 +2171,18 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
-            let page: FacadePageGuard<Page> = pool
-                .get_page::<Page>(&pool_guard, 3, LatchFallbackMode::Shared)
+            let pool_guard = pool.pool_guard();
+            let page = pool
+                .read_block(&pool_guard, 3)
                 .await
                 .expect("buffer-pool read failed in test");
-            let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..5], b"hello");
             drop(page);
 
-            let page: FacadePageGuard<Page> = pool
-                .get_page::<Page>(&pool_guard, 3, LatchFallbackMode::Shared)
+            let page = pool
+                .read_block(&pool_guard, 3)
                 .await
                 .expect("buffer-pool read failed in test");
-            let page = page.lock_shared_async().await.unwrap();
             assert_eq!(&page.page()[..5], b"hello");
             assert_eq!(global.allocated(), 1);
             drop(page);
@@ -2263,18 +2207,18 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = pool.pool_guard();
 
             let mut tasks = vec![];
             for _ in 0..16 {
                 let pool = (*pool).clone();
                 let pool_guard = pool_guard.clone();
                 tasks.push(smol::spawn(async move {
-                    let g: FacadePageGuard<Page> = pool
-                        .get_page::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
+                    let g = pool
+                        .read_block(&pool_guard, 5)
                         .await
                         .expect("buffer-pool read failed in test");
-                    g.lock_shared_async().await.unwrap().page()[0]
+                    g.page()[0]
                 }));
             }
             for task in tasks {
@@ -2304,29 +2248,23 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = pool.pool_guard();
             let key = PersistedBlockKey::new(112, 5);
 
             let pool_for_loader = (*pool).clone();
+            let loader_guard = pool_guard.clone();
             let loader = smol::spawn(async move {
-                let _ = pool_for_loader
-                    .get_page_facade::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
-                    .await
-                    .unwrap();
+                let _ = pool_for_loader.read_block(&loader_guard, 5).await.unwrap();
             });
             read_hook.wait_started(1).await;
             assert!(global.inflight_loads.contains_key(&key));
 
             drop(loader);
 
-            let pool_guard = (*pool).pool_guard();
             let pool_for_waiter = (*pool).clone();
+            let waiter_guard = pool_guard.clone();
             let waiter = smol::spawn(async move {
-                let g = pool_for_waiter
-                    .get_page_facade::<Page>(&pool_guard, 5, LatchFallbackMode::Shared)
-                    .await
-                    .unwrap();
-                let g = g.lock_shared_async().await.unwrap();
+                let g = pool_for_waiter.read_block(&waiter_guard, 5).await.unwrap();
                 g.page()[..5].to_vec()
             });
             smol::future::yield_now().await;
@@ -2361,15 +2299,13 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = pool.pool_guard();
             let key = PersistedBlockKey::new(113, 9);
 
             let pool_for_loader = (*pool).clone();
+            let loader_guard = pool_guard.clone();
             let loader = smol::spawn(async move {
-                let _ = pool_for_loader
-                    .get_page_facade::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
-                    .await
-                    .unwrap();
+                let _ = pool_for_loader.read_block(&loader_guard, 9).await.unwrap();
             });
             read_hook.wait_started(1).await;
             assert!(global.inflight_loads.contains_key(&key));
@@ -2377,7 +2313,6 @@ pub(crate) mod tests {
             drop(loader);
             read_hook.release();
 
-            let pool_guard = (*pool).pool_guard();
             wait_for(|| {
                 !global.inflight_loads.contains_key(&key) && global.try_get_frame_id(&key).is_some()
             })
@@ -2385,11 +2320,7 @@ pub(crate) mod tests {
 
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 1);
-            let g = pool
-                .get_page_facade::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
-                .await
-                .unwrap();
-            let g = g.lock_shared_async().await.unwrap();
+            let g = pool.read_block(&pool_guard, 9).await.unwrap();
             assert_eq!(&g.page()[..4], b"solo");
             drop(table_file);
             drop(fs);
@@ -2415,20 +2346,18 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
-            let inflight_loads = Arc::clone(&global.inflight_loads);
-            let mappings = Arc::clone(&global.mappings);
+            let pool_guard = pool.pool_guard();
+            let observe = global.guard();
 
             let pool_for_loader = (*pool).clone();
+            let loader_guard = pool_guard.clone();
             let loader = smol::spawn(async move {
-                let _ = pool_for_loader
-                    .get_page_facade::<Page>(&pool_guard, 12, LatchFallbackMode::Shared)
-                    .await
-                    .unwrap();
+                let _ = pool_for_loader.read_block(&loader_guard, 12).await.unwrap();
             });
             read_hook.wait_started(1).await;
-            assert!(inflight_loads.contains_key(&key));
+            assert!(observe.inflight_loads.contains_key(&key));
             drop(loader);
+            drop(pool_guard);
 
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
@@ -2442,10 +2371,14 @@ pub(crate) mod tests {
             assert!(!dropped.load(Ordering::SeqCst));
 
             read_hook.release();
-            wait_for(|| !inflight_loads.contains_key(&key) && mappings.contains_key(&key)).await;
+            wait_for(|| {
+                !observe.inflight_loads.contains_key(&key) && observe.mappings.contains_key(&key)
+            })
+            .await;
+            assert!(observe.mappings.contains_key(&key));
+            drop(observe);
             teardown.join().unwrap();
             assert_eq!(read_hook.call_count(), 1);
-            assert!(mappings.contains_key(&key));
             assert!(dropped.load(Ordering::SeqCst));
             drop(table_file);
             drop(fs);
@@ -2457,7 +2390,6 @@ pub(crate) mod tests {
         smol::block_on(async {
             let key = PersistedBlockKey::new(117, 13);
             let global = owned_global_pool(frame_page_bytes(1));
-            let inflight_loads = Arc::clone(&global.inflight_loads);
 
             {
                 let mut free = global.residency.free.lock();
@@ -2466,41 +2398,45 @@ pub(crate) mod tests {
 
             let inflight = Arc::new(PageIOCompletion::new());
             global.inflight_loads.insert(key, Arc::clone(&inflight));
-            let task_arena = global.arena.arena_guard(global.pool_guard());
-            let global_ptr =
-                UnsafePtr(std::ptr::from_ref::<GlobalReadonlyBufferPool>(&global) as *mut _);
+            let global_guard = global.guard();
+            let task_arena = global_guard.arena.arena_guard(global_guard.pool_guard());
+            let inflight_for_waiter = Arc::clone(&inflight);
             let reserve_waiter = {
                 listener!(global.residency.evict_ev => evict_listener);
                 let reserve_waiter = smol::spawn(async move {
-                    let global_ptr = global_ptr;
-                    // SAFETY: the spawned task holds `task_arena`, which keeps
-                    // the pool allocation alive until the waiter finishes.
-                    let global = unsafe { &*global_ptr.0 };
-                    match ReadonlyPageReservation::reserve_page(global, key, task_arena).await {
+                    let global = global_guard;
+                    match ReadonlyPageReservation::reserve_page(&global, key, task_arena).await {
                         Ok((_frame_id, _page_guard)) => {
                             panic!("reserve waiter unexpectedly acquired a frame");
                         }
-                        Err(err) => global.complete_inflight_load(key, &inflight, Err(err)),
+                        Err(err) => {
+                            global.complete_inflight_load(key, &inflight_for_waiter, Err(err))
+                        }
                     }
                 });
                 evict_listener.await;
                 reserve_waiter
             };
-            assert!(inflight_loads.contains_key(&key));
+            assert!(global.inflight_loads.contains_key(&key));
             assert!(global.residency.alloc_failure_rate() > 0.0);
 
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
+            let shutdown = global.guard();
             let teardown = thread::spawn(move || {
+                shutdown.signal_shutdown();
+                drop(shutdown);
                 drop(global);
                 dropped_flag.store(true, Ordering::SeqCst);
             });
 
-            wait_for(|| dropped.load(Ordering::SeqCst)).await;
             reserve_waiter.await;
             teardown.join().unwrap();
-
-            assert!(!inflight_loads.contains_key(&key));
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(matches!(
+                inflight.wait_result().await,
+                Err(Error::InvalidState)
+            ));
         });
     }
 
@@ -2525,23 +2461,15 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = pool.pool_guard();
             let key = PersistedBlockKey::new(114, 7);
 
-            let pool_guard_1 = pool_guard.clone();
             let pool_1 = (*pool).clone();
-            let waiter1 = smol::spawn(async move {
-                pool_1
-                    .get_page_facade::<Page>(&pool_guard_1, 7, LatchFallbackMode::Shared)
-                    .await
-            });
-            let pool_guard_2 = pool_guard.clone();
+            let waiter1_guard = pool_guard.clone();
+            let waiter1 = smol::spawn(async move { pool_1.read_block(&waiter1_guard, 7).await });
             let pool_2 = (*pool).clone();
-            let waiter2 = smol::spawn(async move {
-                pool_2
-                    .get_page_facade::<Page>(&pool_guard_2, 7, LatchFallbackMode::Shared)
-                    .await
-            });
+            let waiter2_guard = pool_guard.clone();
+            let waiter2 = smol::spawn(async move { pool_2.read_block(&waiter2_guard, 7).await });
 
             read_hook.wait_started(1).await;
             smol::Timer::after(Duration::from_millis(10)).await;
@@ -2579,19 +2507,21 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let _pool_guard = (*pool).pool_guard();
+            let pool_guard = pool.pool_guard();
             let key = PersistedBlockKey::new(115, 8);
 
             let pool_1 = (*pool).clone();
+            let waiter1_guard = pool_guard.clone();
             let waiter1 = smol::spawn(async move {
                 pool_1
-                    .get_validated_page_shared(8, validate_persisted_lwc_page)
+                    .read_validated_block(&waiter1_guard, 8, validate_persisted_lwc_page)
                     .await
             });
             let pool_2 = (*pool).clone();
+            let waiter2_guard = pool_guard.clone();
             let waiter2 = smol::spawn(async move {
                 pool_2
-                    .get_validated_page_shared(8, validate_persisted_lwc_page)
+                    .read_validated_block(&waiter2_guard, 8, validate_persisted_lwc_page)
                     .await
             });
 
@@ -2654,10 +2584,11 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
+            let pool_guard = pool.pool_guard();
             let key = PersistedBlockKey::new(107, 9);
 
             let err = match pool
-                .get_validated_page_shared(9, validate_persisted_lwc_page)
+                .read_validated_block(&pool_guard, 9, validate_persisted_lwc_page)
                 .await
             {
                 Ok(_) => panic!("expected persisted LWC corruption"),
@@ -2705,10 +2636,11 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
+            let pool_guard = pool.pool_guard();
             let key = PersistedBlockKey::new(116, 10);
 
             let err = match pool
-                .get_validated_page_shared(10, validate_persisted_lwc_page)
+                .read_validated_block(&pool_guard, 10, validate_persisted_lwc_page)
                 .await
             {
                 Ok(_) => panic!("expected persisted LWC invalid-payload corruption"),
@@ -2748,10 +2680,11 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
+            let pool_guard = pool.pool_guard();
             let key = PersistedBlockKey::new(108, 10);
 
             let err = match pool
-                .get_validated_page_shared(10, validate_persisted_column_block_index_page)
+                .read_validated_block(&pool_guard, 10, validate_persisted_column_block_index_page)
                 .await
             {
                 Ok(_) => panic!("expected persisted column-block corruption"),
@@ -2791,10 +2724,11 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
+            let pool_guard = pool.pool_guard();
             let key = PersistedBlockKey::new(109, 11);
 
             let err = match pool
-                .get_validated_page_shared(11, validate_persisted_blob_page)
+                .read_validated_block(&pool_guard, 11, validate_persisted_blob_page)
                 .await
             {
                 Ok(_) => panic!("expected persisted deletion-blob corruption"),
@@ -2829,7 +2763,7 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = pool.pool_guard();
             let capacity = global.capacity();
             let base_page_id = 7u64;
 
@@ -2843,11 +2777,10 @@ pub(crate) mod tests {
             for i in 0..=capacity {
                 let page_id = base_page_id + i as u64;
                 let expected = format!("page-{i}");
-                let g: FacadePageGuard<Page> = pool
-                    .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                let g = pool
+                    .read_block(&pool_guard, page_id)
                     .await
                     .expect("buffer-pool read failed in test");
-                let g = g.lock_shared_async().await.unwrap();
                 assert_eq!(&g.page()[..expected.len()], expected.as_bytes());
                 drop(g);
             }
@@ -2862,11 +2795,10 @@ pub(crate) mod tests {
             assert!(mapped_count < loaded_count);
 
             // Reload the first page after cache pressure; this should still return correct data.
-            let g: FacadePageGuard<Page> = pool
-                .get_page::<Page>(&pool_guard, base_page_id, LatchFallbackMode::Shared)
+            let g = pool
+                .read_block(&pool_guard, base_page_id)
                 .await
                 .expect("buffer-pool read failed in test");
-            let g = g.lock_shared_async().await.unwrap();
             assert_eq!(&g.page()[..6], b"page-0");
             drop(g);
             drop(pool_guard);
@@ -2894,13 +2826,12 @@ pub(crate) mod tests {
                 Arc::clone(&table_file),
                 &global,
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = pool.pool_guard();
 
-            let g: FacadePageGuard<Page> = pool
-                .get_page::<Page>(&pool_guard, 9, LatchFallbackMode::Shared)
+            let g = pool
+                .read_block(&pool_guard, 9)
                 .await
                 .expect("buffer-pool read failed in test");
-            let g = g.lock_shared_async().await.unwrap();
             assert_eq!(&g.page()[..10], b"drop-order");
             drop(g);
             drop(table_file);
@@ -2908,18 +2839,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "readonly buffer pool does not support page allocation")]
-    fn test_readonly_pool_allocate_page_panics() {
+    fn test_readonly_pool_read_block_returns_immutable_guard_type() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(104, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
+            write_payload(&table_file, 4, b"guard").await;
 
             let global = owned_global_pool(64 * 1024 * 1024);
             let pool = owned_readonly_pool(104, PersistedFileKind::TableFile, table_file, &global);
-            let pool_guard = (*pool).pool_guard();
-            let _ = pool.allocate_page::<Page>(&pool_guard).await;
+            let pool_guard = pool.pool_guard();
+            let guard: ReadonlyBlockGuard = pool.read_block(&pool_guard, 4).await.unwrap();
+            assert_eq!(guard.block_id(), 4);
+            assert_eq!(&guard.page()[..5], b"guard");
         });
     }
 

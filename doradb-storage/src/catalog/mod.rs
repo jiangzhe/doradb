@@ -95,6 +95,7 @@ impl Catalog {
     pub async fn new(storage: CatalogStorage) -> Result<Self> {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, storage.meta_pool.pool_guard())
+            .push(PoolRole::Disk, storage.disk_pool.pool_guard())
             .build();
         let snapshot = storage.checkpoint_snapshot()?;
         storage
@@ -880,19 +881,23 @@ pub mod tests {
                 .find(|root| root.root_page_id.is_some())
                 .expect("catalog checkpoint should publish at least one root");
             let root_page_id = root.root_page_id.unwrap().get();
-            let index = ColumnBlockIndex::new(
-                root_page_id,
-                root.pivot_row_id,
-                &engine.catalog().storage.disk_pool,
-            );
-            let entry = index
-                .collect_leaf_entries()
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-                .expect("catalog checkpoint should publish at least one LWC page");
-            let block_id = entry.block_id();
+            let block_id = {
+                let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
+                let index = ColumnBlockIndex::new(
+                    root_page_id,
+                    root.pivot_row_id,
+                    &engine.catalog().storage.disk_pool,
+                    &disk_pool_guard,
+                );
+                let entry = index
+                    .collect_leaf_entries()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .expect("catalog checkpoint should publish at least one LWC page");
+                entry.block_id()
+            };
             drop(engine);
 
             corrupt_page_checksum(main_dir.join("catalog.mtb"), block_id);
@@ -955,18 +960,22 @@ pub mod tests {
                 .find(|root| root.root_page_id.is_some())
                 .expect("catalog checkpoint should publish at least one root");
             let root_page_id = root.root_page_id.unwrap().get();
-            let index = ColumnBlockIndex::new(
-                root_page_id,
-                root.pivot_row_id,
-                &engine.catalog().storage.disk_pool,
-            );
-            let entry = index
-                .collect_leaf_entries()
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-                .expect("catalog checkpoint should publish at least one leaf entry");
+            let entry = {
+                let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
+                let index = ColumnBlockIndex::new(
+                    root_page_id,
+                    root.pivot_row_id,
+                    &engine.catalog().storage.disk_pool,
+                    &disk_pool_guard,
+                );
+                index
+                    .collect_leaf_entries()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .expect("catalog checkpoint should publish at least one leaf entry")
+            };
             drop(engine);
 
             corrupt_leaf_delete_codec(main_dir.join("catalog.mtb"), entry.leaf_page_id, 0);

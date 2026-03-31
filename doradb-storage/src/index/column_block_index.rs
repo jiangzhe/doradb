@@ -1,6 +1,5 @@
-use crate::buffer::ReadonlyBufferPool;
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::buffer::page::{Page, PageID};
+use crate::buffer::page::PageID;
+use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
@@ -715,6 +714,7 @@ impl ColumnBlockNodeRead for ColumnBlockNode {
 
 pub struct ColumnBlockIndex<'a> {
     disk_pool: &'a ReadonlyBufferPool,
+    disk_pool_guard: &'a PoolGuard,
     root_page_id: PageID,
     end_row_id: RowID,
 }
@@ -789,14 +789,14 @@ fn branch_entries_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnB
 }
 
 struct ValidatedColumnBlockNode {
-    guard: PageSharedGuard<Page>,
+    guard: ReadonlyBlockGuard,
     header: ColumnBlockNodeHeader,
 }
 
 impl ValidatedColumnBlockNode {
     #[inline]
     fn try_from_guard(
-        guard: PageSharedGuard<Page>,
+        guard: ReadonlyBlockGuard,
         file_kind: PersistedFileKind,
         page_id: PageID,
     ) -> Result<Self> {
@@ -1002,9 +1002,15 @@ impl ColumnBlockLeafPrefix {
 impl<'a> ColumnBlockIndex<'a> {
     /// Creates a column block-index view for one root page snapshot.
     #[inline]
-    pub fn new(root_page_id: PageID, end_row_id: RowID, disk_pool: &'a ReadonlyBufferPool) -> Self {
+    pub fn new(
+        root_page_id: PageID,
+        end_row_id: RowID,
+        disk_pool: &'a ReadonlyBufferPool,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> Self {
         ColumnBlockIndex {
             disk_pool,
+            disk_pool_guard,
             root_page_id,
             end_row_id,
         }
@@ -1031,7 +1037,11 @@ impl<'a> ColumnBlockIndex<'a> {
     async fn read_node(&self, page_id: PageID) -> Result<ValidatedColumnBlockNode> {
         let g = self
             .disk_pool
-            .get_validated_page_shared(page_id, validate_persisted_column_block_index_page)
+            .read_validated_block(
+                self.disk_pool_guard,
+                page_id,
+                validate_persisted_column_block_index_page,
+            )
             .await?;
         ValidatedColumnBlockNode::try_from_guard(g, self.file_kind(), page_id)
     }
@@ -1173,7 +1183,7 @@ impl<'a> ColumnBlockIndex<'a> {
             return Ok(delete_set);
         };
 
-        let reader = ColumnDeletionBlobReader::new(self.disk_pool);
+        let reader = ColumnDeletionBlobReader::new(self.disk_pool, self.disk_pool_guard);
         let (header, payload) =
             reader
                 .read_framed_blob(blob_ref)
@@ -2694,8 +2704,9 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
-            let index = ColumnBlockIndex::new(0, 0, &disk_pool);
+            let index = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard);
             let entries = vec![
                 sparse_entry(10, 20, vec![12, 15, 18], 1001),
                 dense_entry(20, 24, 1002),
@@ -2706,7 +2717,7 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let index = ColumnBlockIndex::new(root_page_id, 24, &disk_pool);
+            let index = ColumnBlockIndex::new(root_page_id, 24, &disk_pool, &disk_pool_guard);
             assert!(index.locate_block(10).await.unwrap().is_none());
             assert_eq!(
                 index.locate_block(12).await.unwrap().unwrap().block_id(),
@@ -2730,8 +2741,9 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
-            let root_page_id = ColumnBlockIndex::new(0, 0, &disk_pool)
+            let root_page_id = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(
                     &mut mutable,
                     &[
@@ -2745,7 +2757,7 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let index = ColumnBlockIndex::new(root_page_id, 20, &disk_pool);
+            let index = ColumnBlockIndex::new(root_page_id, 20, &disk_pool, &disk_pool_guard);
             let dense = index.locate_block(2).await.unwrap().unwrap();
             let sparse = index.locate_block(15).await.unwrap().unwrap();
 
@@ -2778,18 +2790,19 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
             let entries = vec![
                 dense_entry(0, 4, 1001),
                 sparse_entry(10, 20, vec![12, 15, 18], 1002),
             ];
-            let root_page_id = ColumnBlockIndex::new(0, 0, &disk_pool)
+            let root_page_id = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(&mut mutable, &entries, 20, 2)
                 .await
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let index = ColumnBlockIndex::new(root_page_id, 20, &disk_pool);
+            let index = ColumnBlockIndex::new(root_page_id, 20, &disk_pool, &disk_pool_guard);
             let dense_entry = index.locate_block(2).await.unwrap().unwrap();
             let dense_resolved = index.resolve_row(2, &dense_entry).await.unwrap().unwrap();
             assert_eq!(dense_resolved.block_id(), 1001);
@@ -2837,8 +2850,9 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
-            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(
                     &mut mutable,
                     &[dense_entry(0, 4, 1001), dense_entry(4, 8, 1002)],
@@ -2851,7 +2865,7 @@ mod tests {
 
             let mut mutable = MutableTableFile::fork(&table);
             let replacement = sparse_entry(4, 10, vec![4, 5, 8, 9], 2002);
-            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
+            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_entries(
                     &mut mutable,
                     &[ColumnBlockEntryPatch {
@@ -2864,7 +2878,7 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
 
-            let index = ColumnBlockIndex::new(root_v2, 10, &disk_pool);
+            let index = ColumnBlockIndex::new(root_v2, 10, &disk_pool, &disk_pool_guard);
             let entries = index.collect_leaf_entries().await.unwrap();
             assert_eq!(entries.len(), 2);
             assert_eq!(entries[1].block_id(), 2002);
@@ -2889,15 +2903,16 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
-            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(&mut mutable, &[dense_entry(0, 8, 1001)], 8, 2)
                 .await
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
             let mut mutable = MutableTableFile::fork(&table);
-            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
+            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_delete_deltas(
                     &mut mutable,
                     &[ColumnDeleteDeltaPatch {
@@ -2910,7 +2925,7 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
 
-            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool);
+            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool, &disk_pool_guard);
             let entry = index.locate_block(0).await.unwrap().unwrap();
             assert_eq!(entry.block_id(), 1001);
             assert_eq!(entry.row_count(), 8);
@@ -2931,8 +2946,9 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
-            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(&mut mutable, &[dense_entry(0, 8, 1001)], 8, 2)
                 .await
                 .unwrap();
@@ -2943,7 +2959,7 @@ mod tests {
                 .with_delete_domain(ColumnDeleteDomain::Ordinal)
                 .with_block_id(1001);
             let mut mutable = MutableTableFile::fork(&table);
-            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
+            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_entries(
                     &mut mutable,
                     &[ColumnBlockEntryPatch {
@@ -2956,7 +2972,7 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
 
-            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool);
+            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool, &disk_pool_guard);
             let entry = index.locate_block(0).await.unwrap().unwrap();
             assert_eq!(entry.delete_domain(), ColumnDeleteDomain::Ordinal);
             assert_eq!(
@@ -2976,20 +2992,21 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
 
             let seed = ColumnBlockEntryShape::new(0, 8, (0..8).collect(), vec![1, 3])
                 .unwrap()
                 .with_delete_domain(ColumnDeleteDomain::Ordinal)
                 .with_block_id(1001);
             let mut mutable = MutableTableFile::fork(&table);
-            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool)
+            let root_v1 = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(&mut mutable, &[seed], 8, 2)
                 .await
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
             let mut mutable = MutableTableFile::fork(&table);
-            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool)
+            let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_delete_deltas(
                     &mut mutable,
                     &[ColumnDeleteDeltaPatch {
@@ -3002,7 +3019,7 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
 
-            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool);
+            let index = ColumnBlockIndex::new(root_v2, 8, &disk_pool, &disk_pool_guard);
             let entry = index.locate_block(0).await.unwrap().unwrap();
             assert_eq!(entry.delete_domain(), ColumnDeleteDomain::Ordinal);
             assert_eq!(
@@ -3022,12 +3039,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
             let mut entries = Vec::new();
             for idx in 0..(COLUMN_BLOCK_MAX_ENTRIES + 32) as u64 {
                 entries.push(dense_entry(idx * 2, idx * 2 + 2, 10_000 + idx));
             }
-            let root = ColumnBlockIndex::new(0, 0, &disk_pool)
+            let root = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(
                     &mut mutable,
                     &entries,
@@ -3038,7 +3056,12 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let index = ColumnBlockIndex::new(root, entries.last().unwrap().end_row_id, &disk_pool);
+            let index = ColumnBlockIndex::new(
+                root,
+                entries.last().unwrap().end_row_id,
+                &disk_pool,
+                &disk_pool_guard,
+            );
             let collected = index.collect_leaf_entries().await.unwrap();
             assert_eq!(collected.len(), entries.len());
             assert_eq!(

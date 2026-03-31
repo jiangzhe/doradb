@@ -386,6 +386,7 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
         );
         let resolved = column_index
             .locate_and_resolve_row(row_id)
@@ -432,6 +433,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
         let block_id = entry.block_id();
@@ -478,6 +480,7 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
@@ -531,6 +534,7 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
@@ -768,6 +772,7 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
         );
         let entry_before = index_before
             .locate_block(row_id)
@@ -785,6 +790,7 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
         );
         let entry = index
             .locate_block(row_id)
@@ -847,6 +853,7 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
         );
         let entry = index
             .locate_block(row_id)
@@ -916,6 +923,7 @@ fn test_checkpoint_for_deletion_fails_on_invalid_v2_delete_metadata() {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
         );
         let entry = index
             .locate_block(row_id1)

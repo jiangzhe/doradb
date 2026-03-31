@@ -1,6 +1,5 @@
-use crate::buffer::ReadonlyBufferPool;
-use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PageID;
+use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
@@ -387,12 +386,16 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
 /// Reader for immutable auxiliary blobs referenced by `BlobRef`.
 pub struct ColumnDeletionBlobReader<'a> {
     disk_pool: &'a ReadonlyBufferPool,
+    disk_pool_guard: &'a PoolGuard,
 }
 
 impl<'a> ColumnDeletionBlobReader<'a> {
     #[inline]
-    pub fn new(disk_pool: &'a ReadonlyBufferPool) -> Self {
-        ColumnDeletionBlobReader { disk_pool }
+    pub fn new(disk_pool: &'a ReadonlyBufferPool, disk_pool_guard: &'a PoolGuard) -> Self {
+        ColumnDeletionBlobReader {
+            disk_pool,
+            disk_pool_guard,
+        }
     }
 
     /// Reads and validates one framed blob, returning its header and payload bytes.
@@ -433,7 +436,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         while remaining > 0 {
             let guard = self
                 .disk_pool
-                .get_validated_page_shared(page_id, validate_persisted_blob_page)
+                .read_validated_block(self.disk_pool_guard, page_id, validate_persisted_blob_page)
                 .await?;
             let payload = validated_blob_page_payload(guard.page());
             let header = decode_blob_page_header(payload).map_err(|err| match err {
@@ -580,6 +583,7 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
 
             let mut mutable = MutableTableFile::fork(&table);
             let blob = vec![9u8; 513];
@@ -591,7 +595,7 @@ mod tests {
             };
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let reader = ColumnDeletionBlobReader::new(&disk_pool);
+            let reader = ColumnDeletionBlobReader::new(&disk_pool, &disk_pool_guard);
             let (header, payload) = reader.read_framed_blob(blob_ref).await.unwrap();
             assert_eq!(header.blob_kind(), COLUMN_AUX_BLOB_KIND_DELETE_DELTAS);
             assert_eq!(header.codec_kind(), COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST);
@@ -617,6 +621,7 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
 
             let mut mutable = MutableTableFile::fork(&table);
             let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
@@ -628,7 +633,7 @@ mod tests {
             };
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let reader = ColumnDeletionBlobReader::new(&disk_pool);
+            let reader = ColumnDeletionBlobReader::new(&disk_pool, &disk_pool_guard);
             let payload = reader.read_delete_payload(blob_ref).await.unwrap();
             assert_eq!(payload, blob);
         });
@@ -651,6 +656,7 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool_guard = disk_pool.pool_guard();
 
             let mut mutable = MutableTableFile::fork(&table);
             let first_blob =
@@ -670,7 +676,7 @@ mod tests {
             assert_ne!(second_ref.start_page_id, first_ref.start_page_id);
             assert_eq!(second_ref.start_offset, 0);
 
-            let reader = ColumnDeletionBlobReader::new(&disk_pool);
+            let reader = ColumnDeletionBlobReader::new(&disk_pool, &disk_pool_guard);
             let first_payload = reader.read_delete_payload(first_ref).await.unwrap();
             let second_payload = reader.read_delete_payload(second_ref).await.unwrap();
             assert_eq!(first_payload, first_blob);

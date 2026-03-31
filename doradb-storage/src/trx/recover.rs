@@ -1503,19 +1503,23 @@ mod tests {
                 .unwrap();
 
             let active_root = table.file().active_root();
-            let index = ColumnBlockIndex::new(
-                active_root.column_block_index_root,
-                active_root.pivot_row_id,
-                table.disk_pool(),
-            );
-            let entry = index
-                .collect_leaf_entries()
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-                .expect("checkpointed table should publish a persisted LWC page");
-            let block_id = entry.block_id();
+            let block_id = {
+                let disk_pool_guard = table.disk_pool().pool_guard();
+                let index = ColumnBlockIndex::new(
+                    active_root.column_block_index_root,
+                    active_root.pivot_row_id,
+                    table.disk_pool(),
+                    &disk_pool_guard,
+                );
+                let entry = index
+                    .collect_leaf_entries()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .expect("checkpointed table should publish a persisted LWC page");
+                entry.block_id()
+            };
 
             drop(checkpoint_session);
             drop(table);
@@ -1662,19 +1666,23 @@ mod tests {
                 .unwrap();
 
             let active_root = table.file().active_root();
-            let index = ColumnBlockIndex::new(
-                active_root.column_block_index_root,
-                active_root.pivot_row_id,
-                table.disk_pool(),
-            );
-            let entry = index
-                .locate_block(0)
-                .await
-                .unwrap()
-                .expect("checkpointed table should keep the deleted row's block entry");
-            let blob_ref = entry
-                .deletion_blob_ref()
-                .expect("delete checkpoint should offload large delete sets");
+            let blob_ref = {
+                let disk_pool_guard = table.disk_pool().pool_guard();
+                let index = ColumnBlockIndex::new(
+                    active_root.column_block_index_root,
+                    active_root.pivot_row_id,
+                    table.disk_pool(),
+                    &disk_pool_guard,
+                );
+                let entry = index
+                    .locate_block(0)
+                    .await
+                    .unwrap()
+                    .expect("checkpointed table should keep the deleted row's block entry");
+                entry
+                    .deletion_blob_ref()
+                    .expect("delete checkpoint should offload large delete sets")
+            };
 
             drop(trx_sys);
             drop(checkpoint_session);

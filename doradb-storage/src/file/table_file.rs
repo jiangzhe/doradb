@@ -446,6 +446,7 @@ impl MutableTableFile {
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<()> {
         let table_file = Arc::clone(self.file_ref());
+        let disk_pool_guard = disk_pool.pool_guard();
         let mut max_row_id = self.root().pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_pages.len());
         let mut new_entries = Vec::with_capacity(lwc_pages.len());
@@ -470,8 +471,12 @@ impl MutableTableFile {
         try_join_all(writes).await?;
 
         let root = self.root();
-        let column_index =
-            ColumnBlockIndex::new(root.column_block_index_root, root.pivot_row_id, disk_pool);
+        let column_index = ColumnBlockIndex::new(
+            root.column_block_index_root,
+            root.pivot_row_id,
+            disk_pool,
+            &disk_pool_guard,
+        );
         let new_root = column_index
             .batch_insert(self, &new_entries, max_row_id, ts)
             .await?;
@@ -560,7 +565,6 @@ pub type OldRoot = OldCowRoot<TableMeta>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::guard::PageGuard;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
@@ -582,8 +586,9 @@ mod tests {
     async fn read_page_for_test(table_file: &Arc<TableFile>, page_id: PageID) -> Result<DirectBuf> {
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
         let disk_pool = table_readonly_pool(&global, 0, table_file);
+        let disk_pool_guard = disk_pool.pool_guard();
         let page = disk_pool
-            .get_validated_page_shared(page_id, accept_any_page)
+            .read_validated_block(&disk_pool_guard, page_id, accept_any_page)
             .await?;
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(page.page());
@@ -657,9 +662,10 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 145, &table_file);
+            let disk_pool_guard = disk_pool.pool_guard();
             let out_of_range_page_id = 1_000_000;
             let res = disk_pool
-                .get_validated_page_shared(out_of_range_page_id, accept_any_page)
+                .read_validated_block(&disk_pool_guard, out_of_range_page_id, accept_any_page)
                 .await;
             assert!(res.is_err());
 
@@ -853,11 +859,13 @@ mod tests {
             assert_eq!(active_root.heap_redo_start_ts, 7);
             assert_ne!(active_root.column_block_index_root, 0);
             let disk_pool = table_readonly_pool(&global, 43, &table_file);
+            let disk_pool_guard = disk_pool.pool_guard();
 
             let column_index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,
                 &disk_pool,
+                &disk_pool_guard,
             );
             let entry1 = column_index.locate_block(0).await.unwrap().unwrap();
             let entry2 = column_index.locate_block(15).await.unwrap().unwrap();

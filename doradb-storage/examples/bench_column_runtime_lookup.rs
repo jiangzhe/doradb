@@ -1,5 +1,5 @@
 use clap::Parser;
-use doradb_storage::buffer::{GlobalReadonlyBufferPool, PoolRole, ReadonlyBufferPool};
+use doradb_storage::buffer::{GlobalReadonlyBufferPool, PoolGuard, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
 };
@@ -39,6 +39,7 @@ struct BenchmarkCase {
     _engine: Engine,
     _table: Arc<Table>,
     disk_pool: ReadonlyBufferPool,
+    disk_pool_guard: PoolGuard,
     _global_pool: QuiescentBox<GlobalReadonlyBufferPool>,
     root_page_id: u64,
     end_row_id: RowID,
@@ -135,7 +136,8 @@ async fn build_case(
     let active_root = table.file().active_root();
     let root_page_id = active_root.column_block_index_root;
     let end_row_id = active_root.pivot_row_id;
-    let index = ColumnBlockIndex::new(root_page_id, end_row_id, &disk_pool);
+    let disk_pool_guard = disk_pool.pool_guard();
+    let index = ColumnBlockIndex::new(root_page_id, end_row_id, &disk_pool, &disk_pool_guard);
 
     let mut row_ids = Vec::new();
     for row_id in 0..rows as RowID {
@@ -155,6 +157,7 @@ async fn build_case(
         _table: table,
         _global_pool: global_pool,
         disk_pool,
+        disk_pool_guard,
         root_page_id,
         end_row_id,
         row_ids,
@@ -195,12 +198,14 @@ impl BenchmarkCase {
             _engine,
             _table,
             disk_pool,
+            disk_pool_guard,
             _global_pool,
             root_page_id: _,
             end_row_id: _,
             row_ids: _,
         } = self;
         drop(disk_pool);
+        drop(disk_pool_guard);
         drop(_global_pool);
         drop(_table);
         drop(_engine);
@@ -246,12 +251,18 @@ fn bench_parallel(
     thread::scope(|scope| {
         for worker_idx in 0..threads {
             let disk_pool = case.disk_pool.clone();
+            let disk_pool_guard = case.disk_pool_guard.clone();
             let row_ids = &case.row_ids;
             let root_page_id = case.root_page_id;
             let end_row_id = case.end_row_id;
             scope.spawn(move || {
                 smol::block_on(async move {
-                    let index = ColumnBlockIndex::new(root_page_id, end_row_id, &disk_pool);
+                    let index = ColumnBlockIndex::new(
+                        root_page_id,
+                        end_row_id,
+                        &disk_pool,
+                        &disk_pool_guard,
+                    );
                     for step in 0..iterations_per_thread {
                         let row_id = row_ids[(worker_idx + step * threads) % row_ids.len()];
                         match path {
