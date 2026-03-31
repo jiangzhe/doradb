@@ -375,10 +375,10 @@ Reference:
     - defining backward compatibility or mixed-format support;
     - per-ordinal verification vectors;
     - broader analytical column-page redesign.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000101-values-only-lwc-page-format.md`
+  - Task Issue: `#508`
+  - Phase Status: done
+  - Implementation Summary: Phase 2 implemented: LwcPage now persists values-only payloads bound by row_shape_fingerprint, runtime persisted reads validate fingerprint instead of row_id_at, and recovery plus catalog checkpoint continue to source row ids from ColumnBlockIndex while decoding values by ordinal. [Task Resolve Sync: docs/tasks/000101-values-only-lwc-page-format.md @ 2026-03-31]
 
 ## Consequences
 

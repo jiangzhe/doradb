@@ -793,7 +793,7 @@ impl<'a> LwcBuilder<'a> {
         Ok(true)
     }
 
-    pub fn build(&self) -> Result<DirectBuf> {
+    pub fn build(&self, row_shape_fingerprint: u128) -> Result<DirectBuf> {
         if self.buffer.is_empty() {
             return Err(Error::InvalidState);
         }
@@ -801,11 +801,9 @@ impl<'a> LwcBuilder<'a> {
         if row_count > u16::MAX as usize {
             return Err(Error::InvalidArgument);
         }
-        let row_id_ser = LwcPrimitiveSer::new_u64(&self.row_ids);
-        let row_id_len = row_id_ser.ser_len();
         let mut column_payloads = Vec::with_capacity(self.metadata.col_count());
         let mut col_offsets = Vec::with_capacity(self.metadata.col_count());
-        let mut offset = mem::size_of::<u16>() * self.metadata.col_count() + row_id_len;
+        let mut offset = mem::size_of::<u16>() * self.metadata.col_count();
 
         for col_idx in 0..self.metadata.col_count() {
             let column = self
@@ -876,20 +874,18 @@ impl<'a> LwcBuilder<'a> {
             };
             data.extend_from_slice(&payload);
             offset += data.len();
+            if offset > u16::MAX as usize {
+                return Err(Error::InvalidArgument);
+            }
             col_offsets.push(offset as u16);
             column_payloads.push(data);
         }
 
-        let first_row_id = *self.row_ids.first().unwrap_or(&0);
-        let last_row_id = *self.row_ids.last().unwrap_or(&0);
-        let first_col_offset =
-            (mem::size_of::<u16>() * self.metadata.col_count() + row_id_len) as u16;
         let header = LwcPageHeader::new(
-            first_row_id,
-            last_row_id,
+            row_shape_fingerprint,
             row_count as u16,
             self.metadata.col_count() as u16,
-            first_col_offset,
+            0,
         );
 
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
@@ -901,7 +897,6 @@ impl<'a> LwcBuilder<'a> {
         for offset in col_offsets {
             body_idx = offset.ser(&mut page.body[..], body_idx);
         }
-        body_idx = row_id_ser.ser(&mut page.body[..], body_idx);
         for payload in column_payloads {
             let end = body_idx + payload.len();
             page.body[body_idx..end].copy_from_slice(&payload);
@@ -1012,7 +1007,6 @@ impl<'a> LwcBuilder<'a> {
         let row_count = self.buffer.len();
         let mut total = LWC_PAGE_HEADER_SIZE;
         total += mem::size_of::<u16>() * self.metadata.col_count();
-        total += estimate_row_ids_size(&self.row_ids);
         total += estimate_columns_size(self.metadata, &self.buffer, &self.stats, row_count)?;
         Ok(total)
     }
@@ -1041,20 +1035,6 @@ fn bitmap_to_bytes(bitmap: &[u64], len: usize) -> Vec<u8> {
         }
     }
     bytes
-}
-
-fn estimate_row_ids_size(row_ids: &[RowID]) -> usize {
-    if row_ids.is_empty() {
-        return mem::size_of::<u8>();
-    }
-    match ForBitpackingSer::new(row_ids) {
-        Some(fbp) => {
-            let packed = mem::size_of::<u8>() + fbp.ser_len();
-            let flat = mem::size_of::<u8>() + mem::size_of::<u64>() + mem::size_of_val(row_ids);
-            if packed < flat { packed } else { flat }
-        }
-        None => mem::size_of::<u8>() + mem::size_of::<u64>() + mem::size_of_val(row_ids),
-    }
 }
 
 fn estimate_columns_size(
@@ -1608,10 +1588,17 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
     use crate::error::PersistedFileKind;
+    use crate::index::ColumnBlockEntryShape;
     use crate::io::AIOBuf;
     use crate::row::{Delete, InsertRow, RowPage};
     use crate::value::{MemVar, Val};
     use ordered_float::OrderedFloat;
+
+    fn row_shape_fingerprint_for(row_ids: &[u64], start_row_id: u64, end_row_id: u64) -> u128 {
+        ColumnBlockEntryShape::new(start_row_id, end_row_id, row_ids.to_vec(), Vec::new())
+            .unwrap()
+            .row_shape_fingerprint()
+    }
 
     #[test]
     fn test_lwc_primitive_serde() {
@@ -1949,19 +1936,16 @@ mod tests {
         assert!(builder.row_count() == 0);
         let appended = builder.append_row_page(&page).unwrap();
         assert!(appended);
-        let buf = builder.build().unwrap();
+        let expected_fingerprint = row_shape_fingerprint_for(builder.row_ids(), 100, 110);
+        let buf = builder.build(expected_fingerprint).unwrap();
 
         let lwc_page =
             LwcPage::try_from_persisted_bytes(buf.as_bytes(), PersistedFileKind::TableFile, 1)
                 .unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, expected_rows.len());
         assert_eq!(
-            lwc_page.header.first_row_id(),
-            expected_rows.first().unwrap().0
-        );
-        assert_eq!(
-            lwc_page.header.last_row_id(),
-            expected_rows.last().unwrap().0
+            lwc_page.header.row_shape_fingerprint(),
+            expected_fingerprint
         );
 
         let column0 = lwc_page.column(&metadata, 0).unwrap();
@@ -2121,7 +2105,9 @@ mod tests {
 
         let mut builder = LwcBuilder::new(&metadata);
         assert!(builder.append_row_page(&page).unwrap());
-        let buf = builder.build().unwrap();
+        let buf = builder
+            .build(row_shape_fingerprint_for(builder.row_ids(), 10, 13))
+            .unwrap();
 
         let lwc_page =
             LwcPage::try_from_persisted_bytes(buf.as_bytes(), PersistedFileKind::TableFile, 1)

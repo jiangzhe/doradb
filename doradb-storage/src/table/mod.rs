@@ -628,7 +628,7 @@ impl Table {
                         builder.row_ids().to_vec(),
                         Vec::new(),
                     )?;
-                    let buf = builder.build()?;
+                    let buf = builder.build(shape.row_shape_fingerprint())?;
                     lwc_pages.push(LwcPagePersist { shape, buf });
                     builder = LwcBuilder::new(metadata);
                     current_start = page_info.start_row_id;
@@ -648,7 +648,7 @@ impl Table {
                     builder.row_ids().to_vec(),
                     Vec::new(),
                 )?;
-                let buf = builder.build()?;
+                let buf = builder.build(shape.row_shape_fingerprint())?;
                 lwc_pages.push(LwcPagePersist { shape, buf });
             }
         }

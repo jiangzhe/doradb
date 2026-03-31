@@ -214,6 +214,11 @@ impl ColumnBlockEntryShape {
         self.end_row_id
     }
 
+    #[inline]
+    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
+        self.row_shape_fingerprint
+    }
+
     pub(crate) fn set_end_row_id(&mut self, end_row_id: RowID) -> Result<()> {
         validate_row_ids(&self.row_ids, self.start_row_id, end_row_id)?;
         self.end_row_id = end_row_id;
