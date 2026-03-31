@@ -365,6 +365,51 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
 }
 
 #[test]
+fn test_find_row_returns_resolved_lwc_page_location() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let (row_id, _) = index
+            .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let active_root = sys.table.file().active_root();
+        let column_index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            sys.table.disk_pool(),
+        );
+        let resolved = column_index
+            .locate_and_resolve_row(row_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        match sys.table.find_row(session.pool_guards(), row_id).await {
+            RowLocation::LwcPage { page_id, row_idx } => {
+                assert_eq!(page_id, resolved.block_id());
+                assert_eq!(row_idx, resolved.row_idx());
+            }
+            RowLocation::RowPage(..) => panic!("row should be in lwc"),
+            RowLocation::NotFound => panic!("row should exist"),
+        }
+        trx.commit().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_lwc_select_surfaces_persisted_corruption() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -926,7 +971,7 @@ fn test_row_page_transition_retries_update_delete() {
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
-            RowLocation::LwcPage(..) => unreachable!("lwc page"),
+            RowLocation::LwcPage { .. } => unreachable!("lwc page"),
         };
         let page_guard = sys
             .engine
@@ -1661,7 +1706,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
-            RowLocation::LwcPage(..) => unreachable!("row page expected"),
+            RowLocation::LwcPage { .. } => unreachable!("row page expected"),
         };
 
         let page_guard = sys
@@ -1926,7 +1971,7 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
 
         let next_page_id = match sys.table.find_row(session.pool_guards(), next_row_id).await {
             RowLocation::RowPage(page_id) => page_id,
-            RowLocation::LwcPage(..) | RowLocation::NotFound => {
+            RowLocation::LwcPage { .. } | RowLocation::NotFound => {
                 panic!("row should still be in the in-memory row store")
             }
         };
@@ -2080,7 +2125,7 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
                     break;
                 }
                 RowLocation::RowPage(..) => (),
-                RowLocation::LwcPage(..) | RowLocation::NotFound => {
+                RowLocation::LwcPage { .. } | RowLocation::NotFound => {
                     panic!("newly inserted row should stay in a row page")
                 }
             }
@@ -2627,7 +2672,7 @@ async fn assert_row_in_lwc(
         panic!("row should exist");
     };
     match table.find_row(guards, row_id).await {
-        RowLocation::LwcPage(..) => row_id,
+        RowLocation::LwcPage { .. } => row_id,
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),
     }
