@@ -358,10 +358,10 @@ Reference:
     - removing row ids from the LWC page payload;
     - changing the LWC page-integrity version;
     - removing `row_id_at()` runtime validation yet.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000100-authoritative-row-shape-api-cutover.md`
+  - Task Issue: `#506`
+  - Phase Status: done
+  - Implementation Summary: Phase 1 implemented: ColumnBlockIndex now owns persisted row-shape fingerprints and authoritative row-id enumeration, and recovery plus catalog checkpoint consume block-index row sets while runtime still uses row_id_at validation until phase 2. [Task Resolve Sync: docs/tasks/000100-authoritative-row-shape-api-cutover.md @ 2026-03-31]
 
 - **Phase 2: Values-Only LWC Page Format**
   - Scope: Introduce LWC page v2 with no row-id section and switch runtime

@@ -1,7 +1,7 @@
 ---
 id: 000100
 title: Authoritative Row-Shape API Cutover
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-31
 github_issue: 506
 ---
@@ -176,6 +176,30 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented the phase-1 ownership cutover in `doradb-storage` so
+   `ColumnBlockIndex` is now the authoritative persisted source for row-shape
+   metadata and infrastructure row-id enumeration.
+2. Added canonical `row_shape_fingerprint` computation over the logical row
+   set, persisted it in column-block-index leaf entries via leaf
+   `prefix_version` 2, and exposed it through `ColumnLeafEntry`,
+   `ResolvedColumnRow`, and `RowLocation::LwcPage`.
+3. Added public `ColumnBlockIndex::load_entry_row_ids(&ColumnLeafEntry)` and
+   migrated recovery bootstrap plus catalog checkpoint/tail-merge off
+   `PersistedLwcPage::decode_row_ids()` and onto block-index-owned row sets,
+   while continuing to decode persisted values from the LWC page by ordinal.
+4. Kept the phase boundary intact: the LWC page bytes, page-integrity version,
+   and runtime `row_id_at(row_idx)` validation remain unchanged in this task.
+5. Added focused tests for canonical fingerprint determinism, dense/sparse
+   `load_entry_row_ids()` round-trips, and fingerprint propagation through
+   resolved persisted lookup surfaces.
+6. Validation completed successfully:
+   - `cargo fmt --all`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+   - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+7. Review handoff is tracked in GitHub issue `#506` and PR `#507`.
+
 ## Impacts
 
 - `doradb-storage/src/index/column_block_index.rs`
@@ -227,5 +251,7 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 1. Phase 2 remains responsible for removing row ids from `LwcPage`,
    introducing the values-only LWC page format, and replacing runtime
    `row_id_at()` validation with fingerprint binding.
-2. Resolve-time sync for this task must update RFC-0012 phase metadata once the
-   implementation is complete.
+2. `ColumnBlockLeafPrefix` compaction remains deferred to
+   `docs/backlogs/000076-compact-column-block-leaf-search-prefix.md`; any
+   follow-up should keep the search prefix focused on binary-search-critical
+   fields and move cold metadata into the entry payload where possible.
