@@ -4,6 +4,7 @@ title: Remove Row ID From LWC Page
 status: proposal
 tags: [storage-engine, lwc, file-format, checkpoint, recovery]
 created: 2026-03-31
+github_issue: 504
 ---
 
 # RFC-0012: Remove Row ID From LWC Page
