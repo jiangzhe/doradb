@@ -1379,7 +1379,7 @@ pub(crate) mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::error::{PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::build_test_fs;
-    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::page_integrity::{
         COLUMN_BLOCK_INDEX_PAGE_SPEC, COLUMN_DELETION_BLOB_PAGE_SPEC, LWC_PAGE_SPEC,
         PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, write_page_checksum, write_page_header,
@@ -1619,7 +1619,7 @@ pub(crate) mod tests {
 
             let cold_start = pool.global_stats();
             let cold_guard = pool
-                .read_block(&pool_guard, 0)
+                .read_block(&pool_guard, SUPER_BLOCK_ID)
                 .await
                 .expect("readonly cold read failed in test");
             assert_eq!(&cold_guard.page()[..14], b"readonly-stats");
@@ -1636,7 +1636,7 @@ pub(crate) mod tests {
 
             let warm_start = pool.global_stats();
             let warm_guard = pool
-                .read_block(&pool_guard, 0)
+                .read_block(&pool_guard, SUPER_BLOCK_ID)
                 .await
                 .expect("readonly warm read failed in test");
             assert_eq!(&warm_guard.page()[..14], b"readonly-stats");

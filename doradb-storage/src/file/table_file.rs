@@ -8,7 +8,7 @@ use crate::error::{
 use crate::file::TableFsRequest;
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
-    OldCowRoot, ParsedMeta, validate_active_meta_page_id,
+    OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_page_id,
 };
 use crate::file::meta_page::{
     MetaPage, MetaPageSerView, TABLE_META_MAGIC_WORD, TABLE_META_VERSION,
@@ -70,21 +70,19 @@ impl ActiveRoot {
     /// Page number is set to zero (the first super-page slot of this file).
     #[inline]
     pub fn new(trx_id: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
-        const DEFAULT_ROOT_PAGE_NO: PageID = 0;
-
         let alloc_map = AllocMap::new(max_pages);
-        let super_page_allocated = alloc_map.allocate_at(DEFAULT_ROOT_PAGE_NO as usize);
-        assert!(super_page_allocated);
+        let super_block_allocated = alloc_map.allocate_at(SUPER_BLOCK_ID as usize);
+        assert!(super_block_allocated);
 
         ActiveRoot::from_parts(
-            DEFAULT_ROOT_PAGE_NO,
-            trx_id,
             0,
+            trx_id,
+            SUPER_BLOCK_ID,
             alloc_map,
             vec![],
             TableMeta {
                 metadata,
-                column_block_index_root: 0,
+                column_block_index_root: SUPER_BLOCK_ID,
                 pivot_row_id: 0,
                 heap_redo_start_ts: trx_id,
             },
@@ -364,8 +362,8 @@ impl MutableTableFile {
 
     /// Updates mutable root column-index pointer.
     #[inline]
-    pub fn set_column_block_index_root(&mut self, root_page_id: PageID) {
-        self.new_root_mut().column_block_index_root = root_page_id;
+    pub fn set_column_block_index_root(&mut self, root_block_id: PageID) {
+        self.new_root_mut().column_block_index_root = root_block_id;
     }
 
     /// Updates mutable root checkpoint metadata.
@@ -857,7 +855,7 @@ mod tests {
             assert_eq!(active_root.trx_id, 2);
             assert_eq!(active_root.pivot_row_id, 20);
             assert_eq!(active_root.heap_redo_start_ts, 7);
-            assert_ne!(active_root.column_block_index_root, 0);
+            assert_ne!(active_root.column_block_index_root, SUPER_BLOCK_ID);
             let disk_pool = table_readonly_pool(&global, 43, &table_file);
             let disk_pool_guard = disk_pool.pool_guard();
 
@@ -914,7 +912,7 @@ mod tests {
             assert!(matches!(result, Err(Error::InvalidArgument)));
             let active_root = table_file.active_root();
             assert_eq!(active_root.pivot_row_id, 0);
-            assert_eq!(active_root.column_block_index_root, 0);
+            assert_eq!(active_root.column_block_index_root, SUPER_BLOCK_ID);
 
             drop(table_file);
             drop(fs);

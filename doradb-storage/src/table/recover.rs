@@ -1,6 +1,7 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::PageID;
 use crate::error::{Error, PersistedPageCorruptionCause, PersistedPageKind, Result};
+use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_entry_deletion_deltas,
 };
@@ -260,7 +261,7 @@ impl TableRecover for Table {
             return Ok(());
         }
         let active_root = self.file().active_root();
-        if active_root.column_block_index_root == 0 || active_root.pivot_row_id == 0 {
+        if active_root.column_block_index_root == SUPER_BLOCK_ID || active_root.pivot_row_id == 0 {
             return Ok(());
         }
 

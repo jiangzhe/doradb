@@ -3,6 +3,7 @@ use crate::buffer::page::PageID;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
 use crate::catalog::{ObjID, USER_OBJ_ID_START};
 use crate::error::Result;
+use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaPage,
 };
@@ -135,7 +136,7 @@ impl Deser for AllocMapGcList {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, alloc_map) = AllocMap::deser(input, start_idx)?;
-        if alloc_map.len() == 0 || !alloc_map.is_allocated(0) {
+        if alloc_map.len() == 0 || !alloc_map.is_allocated(SUPER_BLOCK_ID as usize) {
             return Err(crate::error::Error::InvalidFormat);
         }
 
@@ -301,7 +302,10 @@ impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
         idx = out.ser_u32(idx, 0); // reserved
         for root in self.table_roots {
             idx = out.ser_u64(idx, root.table_id);
-            idx = out.ser_u64(idx, root.root_page_id.map_or(0, NonZeroU64::get));
+            idx = out.ser_u64(
+                idx,
+                root.root_page_id.map_or(SUPER_BLOCK_ID, NonZeroU64::get),
+            );
             idx = out.ser_u64(idx, root.pivot_row_id);
         }
         self.space.ser(out, idx)
