@@ -16,6 +16,12 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Shared page size of CoW table files and multi-table files.
 pub const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
+/// Reserved persisted block id that stores the colocated ping-pong super-page
+/// pair for every CoW file.
+///
+/// Because block `0` is occupied by that super block, no other persisted
+/// meta/data/blob/index block may legally use this id.
+pub const SUPER_BLOCK_ID: PageID = 0;
 
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub trait MutableCowFile {
@@ -314,7 +320,7 @@ impl<M> CowFile<M> {
 
     /// Load and validate the active root from on-disk super/meta pages.
     ///
-    /// This reads the ping-pong super-page pair from page 0, picks the newest
+    /// This reads the ping-pong super-page pair from block 0, picks the newest
     /// valid slot, validates the referenced meta page through the configured
     /// codec, and rejects invalid root invariants before returning an
     /// in-memory [`ActiveRoot`].
@@ -330,9 +336,9 @@ impl<M> CowFile<M> {
         &self,
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<ActiveRoot<M>> {
-        let _ = disk_pool.invalidate_block_id(0);
+        let _ = disk_pool.invalidate_block_id(SUPER_BLOCK_ID);
         let pool_guard = disk_pool.pool_guard();
-        let super_page_guard = disk_pool.read_block(&pool_guard, 0).await?;
+        let super_page_guard = disk_pool.read_block(&pool_guard, SUPER_BLOCK_ID).await?;
         let super_page =
             Self::pick_super_page(super_page_guard.page(), self.codec.parse_super_page)?;
         drop(super_page_guard);
@@ -366,7 +372,7 @@ impl<M> CowFile<M> {
     #[inline]
     pub async fn publish_root(&self, mut new_root: ActiveRoot<M>) -> Result<Option<OldCowRoot<M>>> {
         let old_meta_page_id = new_root.meta_page_id;
-        if old_meta_page_id != 0 {
+        if old_meta_page_id != SUPER_BLOCK_ID {
             new_root.push_gc_meta_page(old_meta_page_id);
         }
 
@@ -399,7 +405,7 @@ impl<M> CowFile<M> {
         let _ = remove_file_by_fd(self.file.as_raw_fd());
     }
 
-    /// Pick latest valid super page from page-0 image.
+    /// Pick latest valid super page from the reserved super-block image.
     #[inline]
     fn pick_super_page(
         buf: &[u8],
@@ -468,7 +474,7 @@ pub(crate) fn validate_active_meta_page_id(
             PersistedPageCorruptionCause::InvalidRootInvariant,
         )
     })?;
-    if meta_page_idx == 0
+    if meta_page_idx == SUPER_BLOCK_ID as usize
         || meta_page_idx >= alloc_map.len()
         || !alloc_map.is_allocated(meta_page_idx)
     {

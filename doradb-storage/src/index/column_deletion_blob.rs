@@ -3,7 +3,7 @@ use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
-use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::page_integrity::{
     COLUMN_DELETION_BLOB_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
     write_page_checksum, write_page_header,
@@ -319,7 +319,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         {
             self.sealed_pages.push(SealedBlobPage {
                 page,
-                next_page_id: 0,
+                next_page_id: SUPER_BLOCK_ID,
             });
         }
         let sealed_pages = std::mem::take(&mut self.sealed_pages);
@@ -424,7 +424,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
     }
 
     async fn read_raw(&self, blob_ref: BlobRef) -> Result<Vec<u8>> {
-        if blob_ref.start_page_id == 0 || blob_ref.byte_len == 0 {
+        if blob_ref.start_page_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
             return Err(Error::InvalidFormat);
         }
         let file_kind = self.disk_pool.persisted_file_kind();
@@ -459,7 +459,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
             if remaining == 0 {
                 break;
             }
-            if header.next_page_id == 0 {
+            if header.next_page_id == SUPER_BLOCK_ID {
                 return Err(invalid_blob_payload(file_kind, page_id));
             }
             page_id = header.next_page_id;
@@ -671,7 +671,7 @@ mod tests {
             };
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            assert_ne!(first_ref.start_page_id, 0);
+            assert_ne!(first_ref.start_page_id, SUPER_BLOCK_ID);
             assert_eq!(first_ref.start_offset, 0);
             assert_ne!(second_ref.start_page_id, first_ref.start_page_id);
             assert_eq!(second_ref.start_offset, 0);

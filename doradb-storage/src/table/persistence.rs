@@ -1,5 +1,6 @@
 use crate::buffer::page::PageID;
 use crate::error::{Error, Result, StoragePoisonSource};
+use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::MutableTableFile;
 use crate::index::{
     ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry, load_entry_deletion_deltas,
@@ -175,7 +176,8 @@ impl Table {
         let disk_pool_guard = disk_pool.pool_guard();
         // Step 1: ensure there is a persisted column index to patch.
         let mutable_root = mutable_file.root();
-        if mutable_root.column_block_index_root == 0 || mutable_root.pivot_row_id == 0 {
+        if mutable_root.column_block_index_root == SUPER_BLOCK_ID || mutable_root.pivot_row_id == 0
+        {
             return Ok(false);
         }
 

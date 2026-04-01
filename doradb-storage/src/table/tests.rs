@@ -9,7 +9,7 @@ use crate::error::{
     StoragePoisonSource,
 };
 use crate::file::build_test_fs_in;
-use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
 use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, RowLocation,
@@ -516,6 +516,60 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
 }
 
 #[test]
+fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.data_checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let active_root = sys.table.file().active_root();
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
+        );
+        let entry = index.locate_block(row_id).await.unwrap().unwrap();
+
+        let fs = build_test_fs_in(sys._temp_dir.path());
+        corrupt_leaf_block_id(
+            fs.table_file_path(sys.table.table_id()),
+            entry.leaf_page_id,
+            0,
+        );
+        let _ = sys
+            .table
+            .disk_pool()
+            .invalidate_block_id(entry.leaf_page_id);
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let stmt = trx.start_stmt();
+        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        match res {
+            Err(Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::ColumnBlockIndex,
+                page_id,
+                cause: PersistedPageCorruptionCause::InvalidPayload,
+            }) => assert_eq!(page_id, entry.leaf_page_id),
+            other => panic!("expected persisted column-block-index corruption, got {other:?}"),
+        }
+        trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -933,6 +987,93 @@ fn test_checkpoint_for_deletion_fails_on_invalid_v2_delete_metadata() {
 
         let fs = build_test_fs_in(sys._temp_dir.path());
         corrupt_leaf_delete_codec(
+            fs.table_file_path(sys.table.table_id()),
+            entry.leaf_page_id,
+            0,
+        );
+        let _ = sys
+            .table
+            .disk_pool()
+            .invalidate_block_id(entry.leaf_page_id);
+
+        let err = sys
+            .table
+            .checkpoint_for_deletion(&mut session)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PersistedPageCorrupted {
+                file_kind: PersistedFileKind::TableFile,
+                page_kind: PersistedPageKind::ColumnBlockIndex,
+                page_id,
+                cause: PersistedPageCorruptionCause::InvalidPayload,
+            } if page_id == entry.leaf_page_id
+        ));
+
+        drop(trx_sys);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_for_deletion_fails_on_short_v2_delete_section_header() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table
+            .checkpoint_for_new_data(&mut session)
+            .await
+            .unwrap();
+
+        let key1 = single_key(6i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let row_id1 = assert_row_in_lwc(&sys.table, session.pool_guards(), &key1, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        sys.new_trx_delete(&mut session, &key1).await;
+        let marker1 = sys.table.deletion_buffer().get(row_id1).unwrap();
+        let marker1_ts = match marker1 {
+            DeleteMarker::Committed(ts) => ts,
+            DeleteMarker::Ref(status) => status.ts(),
+        };
+        let trx_sys = session.engine().trx_sys.clone();
+        let mut ready = false;
+        for _ in 0..50 {
+            if trx_sys.calc_min_active_sts_for_gc() > marker1_ts {
+                ready = true;
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(20)).await;
+        }
+        assert!(
+            ready,
+            "deletion marker ts {} not yet below checkpoint cutoff",
+            marker1_ts
+        );
+        sys.table
+            .checkpoint_for_deletion(&mut session)
+            .await
+            .unwrap();
+
+        let active_root = sys.table.file().active_root();
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
+        );
+        let entry = index
+            .locate_block(row_id1)
+            .await
+            .unwrap()
+            .expect("persisted entry should exist");
+
+        let fs = build_test_fs_in(sys._temp_dir.path());
+        corrupt_leaf_short_delete_section_header(
             fs.table_file_path(sys.table.table_id()),
             entry.leaf_page_id,
             0,
@@ -1796,7 +1937,7 @@ fn test_data_checkpoint_basic_flow() {
 
         let new_root = sys.table.file().active_root();
         assert!(new_root.pivot_row_id > old_root.pivot_row_id);
-        assert!(new_root.column_block_index_root > 0);
+        assert_ne!(new_root.column_block_index_root, SUPER_BLOCK_ID);
 
         drop(session);
         sys.clean_all();
@@ -2741,6 +2882,39 @@ fn corrupt_leaf_row_codec(path: impl AsRef<std::path::Path>, page_id: u64, prefi
     rewrite_page_with_checksum(path, page_id, |page| {
         let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 32;
         page[byte_offset] = 0;
+    });
+}
+
+fn corrupt_leaf_block_id(path: impl AsRef<std::path::Path>, page_id: u64, prefix_idx: usize) {
+    rewrite_page_with_checksum(path, page_id, |page| {
+        let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
+        page[byte_offset..byte_offset + 8].copy_from_slice(&SUPER_BLOCK_ID.to_le_bytes());
+    });
+}
+
+fn corrupt_leaf_short_delete_section_header(
+    path: impl AsRef<std::path::Path>,
+    page_id: u64,
+    prefix_idx: usize,
+) {
+    const LEAF_ENTRY_ENTRY_LEN_OFFSET: usize = 28;
+    const LEAF_ENTRY_ROW_SECTION_LEN_OFFSET: usize = 30;
+    const LEAF_ENTRY_HEADER_SIZE: usize = 32;
+    const TRUNCATED_DELETE_SECTION_LEN: usize = 4;
+
+    rewrite_page_with_checksum(path, page_id, |page| {
+        let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
+        let row_section_len = u16::from_le_bytes(
+            page[byte_offset + LEAF_ENTRY_ROW_SECTION_LEN_OFFSET
+                ..byte_offset + LEAF_ENTRY_ROW_SECTION_LEN_OFFSET + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let truncated_entry_len =
+            (LEAF_ENTRY_HEADER_SIZE + row_section_len + TRUNCATED_DELETE_SECTION_LEN) as u16;
+        page[byte_offset + LEAF_ENTRY_ENTRY_LEN_OFFSET
+            ..byte_offset + LEAF_ENTRY_ENTRY_LEN_OFFSET + 2]
+            .copy_from_slice(&truncated_entry_len.to_le_bytes());
     });
 }
 

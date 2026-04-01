@@ -6,6 +6,7 @@ use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{Error, PersistedPageCorruptionCause, PersistedPageKind, Result};
+use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
     MutableMultiTableFile,
@@ -170,15 +171,15 @@ impl CatalogStorage {
         if root.root_page_id.is_none() && root.pivot_row_id != 0 {
             return Err(Error::InvalidState);
         }
-        let root_page_id = root.root_page_id.map_or(0, NonZeroU64::get);
-        let entries = if root_page_id == 0 {
+        let root_block_id = root.root_page_id.map_or(SUPER_BLOCK_ID, NonZeroU64::get);
+        let entries = if root_block_id == SUPER_BLOCK_ID {
             Vec::new()
         } else {
-            self.collect_index_entries(&disk_pool_guard, root_page_id)
+            self.collect_index_entries(&disk_pool_guard, root_block_id)
                 .await?
         };
         let base_index = ColumnBlockIndex::new(
-            root_page_id,
+            root_block_id,
             root.pivot_row_id,
             &self.disk_pool,
             &disk_pool_guard,
@@ -251,7 +252,7 @@ impl CatalogStorage {
         }
 
         // Step 4: Build the live-insert batch after canceling same-batch insert+delete rows.
-        let mut current_root_page_id = root_page_id;
+        let mut current_root_block_id = root_block_id;
         let mut current_end_row_id = root.pivot_row_id;
         let mut entries_changed = false;
         let mut live_inserts = Vec::new();
@@ -304,12 +305,12 @@ impl CatalogStorage {
                     entry: replacement,
                 }];
                 let column_index = ColumnBlockIndex::new(
-                    current_root_page_id,
+                    current_root_block_id,
                     current_end_row_id,
                     &self.disk_pool,
                     &disk_pool_guard,
                 );
-                current_root_page_id = column_index
+                current_root_block_id = column_index
                     .batch_replace_entries(mutable, &patches, checkpoint_cts)
                     .await?;
                 entries_changed = true;
@@ -334,12 +335,12 @@ impl CatalogStorage {
             if !new_entries.is_empty() {
                 let new_end_row_id = next_row_id.max(root.pivot_row_id);
                 let column_index = ColumnBlockIndex::new(
-                    current_root_page_id,
+                    current_root_block_id,
                     current_end_row_id,
                     &self.disk_pool,
                     &disk_pool_guard,
                 );
-                current_root_page_id = column_index
+                current_root_block_id = column_index
                     .batch_insert(mutable, &new_entries, new_end_row_id, checkpoint_cts)
                     .await?;
                 current_end_row_id = new_end_row_id;
@@ -373,12 +374,12 @@ impl CatalogStorage {
                 })
                 .collect();
             let column_index = ColumnBlockIndex::new(
-                current_root_page_id,
+                current_root_block_id,
                 current_end_row_id,
                 &self.disk_pool,
                 &disk_pool_guard,
             );
-            current_root_page_id = column_index
+            current_root_block_id = column_index
                 .batch_replace_delete_deltas(mutable, &patches, checkpoint_cts)
                 .await?;
             entries_changed = true;
@@ -386,7 +387,7 @@ impl CatalogStorage {
 
         // Step 9: Publish final per-table root descriptor for this checkpoint batch.
         let root_page_id = if entries_changed {
-            Some(NonZeroU64::new(current_root_page_id).ok_or(Error::InvalidState)?)
+            Some(NonZeroU64::new(current_root_block_id).ok_or(Error::InvalidState)?)
         } else {
             root.root_page_id
         };
@@ -400,11 +401,14 @@ impl CatalogStorage {
     async fn collect_index_entries(
         &self,
         disk_pool_guard: &PoolGuard,
-        root_page_id: PageID,
+        root_block_id: PageID,
     ) -> Result<Vec<CatalogIndexEntry>> {
-        assert_ne!(root_page_id, 0, "root_page_id must be non-zero");
+        assert_ne!(
+            root_block_id, SUPER_BLOCK_ID,
+            "root_block_id must not reference the reserved super block",
+        );
         let index =
-            ColumnBlockIndex::new(root_page_id, RowID::MAX, &self.disk_pool, disk_pool_guard);
+            ColumnBlockIndex::new(root_block_id, RowID::MAX, &self.disk_pool, disk_pool_guard);
         index.collect_leaf_entries().await
     }
 
@@ -420,12 +424,15 @@ impl CatalogStorage {
             }
             return Ok(Vec::new());
         }
-        let root_page_id = root.root_page_id.map(NonZeroU64::get).unwrap_or(0);
+        let root_block_id = root
+            .root_page_id
+            .map(NonZeroU64::get)
+            .unwrap_or(SUPER_BLOCK_ID);
         let entries = self
-            .collect_index_entries(disk_pool_guard, root_page_id)
+            .collect_index_entries(disk_pool_guard, root_block_id)
             .await?;
         let column_index = ColumnBlockIndex::new(
-            root_page_id,
+            root_block_id,
             root.pivot_row_id,
             &self.disk_pool,
             disk_pool_guard,
