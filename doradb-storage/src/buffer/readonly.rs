@@ -1301,6 +1301,14 @@ impl ReadonlyBufferPool {
                     && let Err(err) = validator(block.page(), self.file_kind, page_id)
                 {
                     drop(block);
+                    // This resident-hit cleanup is only expected when a page
+                    // became resident without miss-time validation. In current
+                    // runtime usage that raw-read path is limited to CowFile
+                    // super/meta-page loading, which does not overlap with the
+                    // validated page kinds that reach this branch. Drop the
+                    // shared guard before invalidation so the retry loop does
+                    // not contend with our own latch; revisit this synchronous
+                    // path if raw readonly usage expands in the future.
                     let _ = self.invalidate_block_id(page_id);
                     return Err(err);
                 }
@@ -1314,6 +1322,17 @@ impl ReadonlyBufferPool {
 
     #[inline]
     /// Reads one persisted block without page-kind validation.
+    ///
+    /// Current runtime use is limited to COW root recovery, where
+    /// `CowFile::load_active_root_from_pool()` immediately parses the
+    /// super/meta pages and enforces root-specific invariants before use.
+    ///
+    /// Add future callers with caution. This API does not provide the
+    /// pre-publication validation contract of [`Self::read_validated_block`],
+    /// so pages that require page-kind validation should use the validated
+    /// entrypoint instead. If a new raw-read caller could overlap with a
+    /// validated read for the same page, revisit the inflight-load semantics
+    /// before expanding this API's usage.
     pub async fn read_block(
         &self,
         guard: &PoolGuard,

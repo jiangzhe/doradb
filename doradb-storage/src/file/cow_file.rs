@@ -318,6 +318,13 @@ impl<M> CowFile<M> {
     /// valid slot, validates the referenced meta page through the configured
     /// codec, and rejects invalid root invariants before returning an
     /// in-memory [`ActiveRoot`].
+    ///
+    /// This is the intended runtime use of `ReadonlyBufferPool::read_block()`.
+    /// The raw block reads here are acceptable because super/meta-page
+    /// validation happens immediately through `pick_super_page`,
+    /// `parse_meta_page`, and `validate_root`. New callers should prefer
+    /// `read_validated_block()` unless they have an equivalent caller-owned
+    /// validation path and have reviewed the raw-read inflight semantics.
     #[inline]
     pub async fn load_active_root_from_pool(
         &self,
