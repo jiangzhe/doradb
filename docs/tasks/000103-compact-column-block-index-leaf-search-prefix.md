@@ -214,6 +214,42 @@ Reference:
 
 ## Implementation Notes
 
+- Implemented the redesigned leaf layout in
+  `doradb-storage/src/index/column_block_index.rs`: leaf pages now use a
+  32-byte leaf header with leaf-level `search_type`, compact typed prefix
+  planes (`Plain`, `DeltaU32`, `DeltaU16`), stdlib-backed binary search over
+  decoded start-row keys, and contiguous tail entry payloads with a fixed
+  32-byte entry header plus row and delete sections. Branch-page layout
+  remains unchanged.
+- Validation and decode now derive row and delete metadata from section
+  headers/payloads instead of the previous fixed 64-byte search prefix.
+  Corruption helpers in `doradb-storage/src/catalog/mod.rs` and
+  `doradb-storage/src/table/tests.rs` were updated to the new layout, and
+  direct search-type coverage was added for all three prefix encodings.
+- Review follow-up hardening landed with the main task work:
+  - reject persisted leaf entries whose `block_id` resolves to the reserved
+    super block;
+  - define persisted block `0` as `SUPER_BLOCK_ID` and rename
+    `ColumnBlockIndex::root_page_id` to `root_block_id`;
+  - add public-facing documentation comments for the core exported structs and
+    methods in the module;
+  - reject malformed short delete-section headers in both shared decode and
+    `leaf_entry_view` paths so corrupted leaves return `InvalidPayload`
+    instead of panicking.
+- Validation completed with:
+
+```bash
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+cargo nextest run -p doradb-storage --no-default-features --features libaio
+cargo fmt -p doradb-storage
+cargo check -p doradb-storage --lib
+```
+
+- GitHub tracking synced during implementation:
+  - issue `#513`
+  - PR `#514`
+
 ## Impacts
 
 - `doradb-storage/src/index/column_block_index.rs`
