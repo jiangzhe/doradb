@@ -411,6 +411,7 @@ pub enum ValArrayRef<'a> {
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
+    use crate::buffer::PageID;
     use crate::buffer::page::VersionedPageID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::row::tests::create_row_page;
@@ -776,7 +777,7 @@ mod tests {
         let undo = OwnedRowUndo::new(
             0,
             Some(VersionedPageID {
-                page_id: 0,
+                page_id: PageID::from(0),
                 generation: 0,
             }),
             page.row_id(0),
@@ -847,7 +848,7 @@ mod tests {
         let undo = OwnedRowUndo::new(
             0,
             Some(VersionedPageID {
-                page_id: 0,
+                page_id: PageID::from(0),
                 generation: 0,
             }),
             page.row_id(0),

@@ -1066,7 +1066,7 @@ impl Table {
     ) -> Result<Option<TrxID>> {
         Ok(match self.find_row(guards, row_id).await {
             RowLocation::NotFound => None,
-            RowLocation::LwcPage { .. } => todo!("lwc page"),
+            RowLocation::LwcBlock { .. } => todo!("lwc page"),
             RowLocation::RowPage(page_id) => {
                 let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
                 debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));

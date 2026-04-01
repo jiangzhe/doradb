@@ -1,4 +1,4 @@
-use crate::buffer::page::PageID;
+use crate::buffer::PageID;
 use crate::catalog::TableID;
 use crate::row::{INVALID_ROW_ID, RowID};
 use crate::trx::TrxID;

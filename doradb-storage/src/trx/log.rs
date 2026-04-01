@@ -1080,6 +1080,7 @@ pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::PageID;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::EngineRef;
@@ -1317,7 +1318,7 @@ mod tests {
         std::thread::spawn(move || {
             smol::block_on(async move {
                 let mut sys_trx = engine.trx_sys.begin_sys_trx();
-                sys_trx.create_row_page(marker as _, marker as _, 0, 1);
+                sys_trx.create_row_page(marker as _, PageID::from(marker), 0, 1);
                 let prepared = sys_trx.prepare();
                 engine.trx_sys.log_partitions[0]
                     .commit(prepared, &engine.trx_sys.ts, true)
@@ -1664,7 +1665,7 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = build_redo_test_engine("redo_no_wait", LogSync::None).await;
             let mut sys_trx = engine.trx_sys.begin_sys_trx();
-            sys_trx.create_row_page(1, 1, 0, 1);
+            sys_trx.create_row_page(1, PageID::from(1), 0, 1);
             let cts = engine.trx_sys.commit_sys(sys_trx).unwrap();
             assert!(cts >= MIN_SNAPSHOT_TS);
         });

@@ -27,8 +27,8 @@ pub mod sys_trx;
 pub mod undo;
 pub mod ver_map;
 
+use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
-use crate::buffer::page::PageID;
 use crate::engine::EngineRef;
 use crate::error::Result;
 use crate::session::SessionState;
@@ -308,7 +308,7 @@ impl ActiveTrx {
         self.redo.insert_dml(
             0,
             RowRedo {
-                page_id: 0,
+                page_id: PageID::new(0),
                 row_id: 0,
                 kind: RowRedoKind::Insert(vec![
                     Val::U64(123),

@@ -1588,6 +1588,7 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
     use crate::error::PersistedFileKind;
+    use crate::file::BlockID;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::AIOBuf;
     use crate::row::{Delete, InsertRow, RowPage};
@@ -1939,9 +1940,12 @@ mod tests {
         let expected_fingerprint = row_shape_fingerprint_for(builder.row_ids(), 100, 110);
         let buf = builder.build(expected_fingerprint).unwrap();
 
-        let lwc_page =
-            LwcPage::try_from_persisted_bytes(buf.as_bytes(), PersistedFileKind::TableFile, 1)
-                .unwrap();
+        let lwc_page = LwcPage::try_from_persisted_bytes(
+            buf.as_bytes(),
+            PersistedFileKind::TableFile,
+            BlockID::from(1),
+        )
+        .unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, expected_rows.len());
         assert_eq!(
             lwc_page.header.row_shape_fingerprint(),
@@ -2109,9 +2113,12 @@ mod tests {
             .build(row_shape_fingerprint_for(builder.row_ids(), 10, 13))
             .unwrap();
 
-        let lwc_page =
-            LwcPage::try_from_persisted_bytes(buf.as_bytes(), PersistedFileKind::TableFile, 1)
-                .unwrap();
+        let lwc_page = LwcPage::try_from_persisted_bytes(
+            buf.as_bytes(),
+            PersistedFileKind::TableFile,
+            BlockID::from(1),
+        )
+        .unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, rows.len());
 
         for (col_idx, expected_kind) in [

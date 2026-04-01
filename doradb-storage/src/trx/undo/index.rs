@@ -141,7 +141,7 @@ impl IndexUndoLogs {
                     // index entry if it is deleted and does not have any old version (already GCed).
                     match table.find_row(guards, old_row_id, storage).await {
                         RowLocation::NotFound => unreachable!(),
-                        RowLocation::LwcPage { .. } => todo!("lwc page"),
+                        RowLocation::LwcBlock { .. } => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let Some(page_guard) =
                                 table.get_row_page_shared(guards, page_id).await?

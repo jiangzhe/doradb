@@ -1,8 +1,9 @@
+use crate::buffer::PageID;
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
-use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableMetadata;
 use crate::error::{Error, Result};
+use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
 use crate::index::row_block_index::{
@@ -39,17 +40,17 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         pool: QuiescentGuard<P>,
         meta_pool_guard: &PoolGuard,
         pivot_row_id: RowID,
-        column_root_page_id: PageID,
+        column_root_block_id: BlockID,
     ) -> Self {
         let row = GenericRowBlockIndex::new(pool, meta_pool_guard, pivot_row_id).await;
-        let root = BlockIndexRoot::new(pivot_row_id, column_root_page_id);
+        let root = BlockIndexRoot::new(pivot_row_id, column_root_block_id);
         GenericBlockIndex { root, row }
     }
 
     /// Creates block index for catalog-table runtime without table-file backing.
     #[inline]
     pub async fn new_catalog(pool: QuiescentGuard<P>, meta_pool_guard: &PoolGuard) -> Self {
-        Self::new(pool, meta_pool_guard, 0, 0).await
+        Self::new(pool, meta_pool_guard, 0, SUPER_BLOCK_ID).await
     }
 
     /// Returns the in-memory row index height.
@@ -62,15 +63,15 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     ///
     /// Called after checkpoint/persist updates the column block index.
     #[inline]
-    pub async fn update_column_root(&self, pivot_row_id: RowID, column_root_page_id: PageID) {
+    pub async fn update_column_root(&self, pivot_row_id: RowID, column_root_block_id: BlockID) {
         self.root
-            .update_column_root(pivot_row_id, column_root_page_id)
+            .update_column_root(pivot_row_id, column_root_block_id)
             .await;
     }
 
     /// Returns current row/column route boundary metadata.
     #[inline]
-    pub fn root_snapshot(&self) -> (RowID, PageID) {
+    pub fn root_snapshot(&self) -> (RowID, BlockID) {
         self.root.snapshot()
     }
 
@@ -82,8 +83,8 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
     /// Returns current column-root page id.
     #[inline]
-    pub fn column_root_page_id(&self) -> PageID {
-        self.root.column_root_page_id()
+    pub fn column_root_block_id(&self) -> BlockID {
+        self.root.column_root_block_id()
     }
 
     /// Returns a shared row page suitable for insert operations.
@@ -243,14 +244,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         match self.root.guide(row_id) {
             BlockIndexRoute::Column {
                 pivot_row_id,
-                root_page_id,
+                root_block_id,
             } => {
                 self.find_row_in_column(
                     storage,
                     disk_pool_guard,
                     row_id,
                     pivot_row_id,
-                    root_page_id,
+                    root_block_id,
                 )
                 .await
             }
@@ -260,13 +261,13 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                     return Ok(found);
                 }
                 match self.root.try_column(row_id) {
-                    Some((pivot_row_id, root_page_id)) => {
+                    Some((pivot_row_id, root_block_id)) => {
                         self.find_row_in_column(
                             storage,
                             disk_pool_guard,
                             row_id,
                             pivot_row_id,
-                            root_page_id,
+                            root_block_id,
                         )
                         .await
                     }
@@ -283,7 +284,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         disk_pool_guard: Option<&PoolGuard>,
         row_id: RowID,
         pivot_row_id: RowID,
-        root_page_id: PageID,
+        root_block_id: BlockID,
     ) -> Result<RowLocation> {
         let Some(storage) = storage else {
             return Err(Error::ColumnStorageMissing);
@@ -292,14 +293,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             return Err(Error::InvalidState);
         };
         let index = ColumnBlockIndex::new(
-            root_page_id,
+            root_block_id,
             pivot_row_id,
             storage.disk_pool(),
             disk_pool_guard,
         );
         match index.locate_and_resolve_row(row_id).await {
-            Ok(Some(resolved)) => Ok(RowLocation::LwcPage {
-                page_id: resolved.block_id(),
+            Ok(Some(resolved)) => Ok(RowLocation::LwcBlock {
+                block_id: resolved.block_id(),
                 row_idx: resolved.row_idx(),
                 row_shape_fingerprint: resolved.row_shape_fingerprint(),
             }),
@@ -343,7 +344,7 @@ mod tests {
         ) -> Self {
             StallingBufferPool {
                 inner,
-                stall_page_id: AtomicU64::new(INVALID_PAGE_ID),
+                stall_page_id: AtomicU64::new(u64::from(INVALID_PAGE_ID)),
                 entered,
                 release,
             }
@@ -351,7 +352,8 @@ mod tests {
 
         #[inline]
         fn set_stall_page_id(&self, page_id: PageID) {
-            self.stall_page_id.store(page_id, Ordering::Release);
+            self.stall_page_id
+                .store(u64::from(page_id), Ordering::Release);
         }
     }
 
@@ -440,7 +442,12 @@ mod tests {
                 .unwrap(),
         );
         let meta_guard = (*pool).pool_guard();
-        let blk_idx = smol::block_on(BlockIndex::new(pool.guard(), &meta_guard, 10, 77));
+        let blk_idx = smol::block_on(BlockIndex::new(
+            pool.guard(),
+            &meta_guard,
+            10,
+            BlockID::from(77),
+        ));
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
         // Without column storage this must surface as an error, not as "not found".
@@ -465,7 +472,12 @@ mod tests {
             Arc::clone(&release),
         ));
         let meta_guard = (*pool).pool_guard();
-        let blk_idx = smol::block_on(GenericBlockIndex::new(pool.guard(), &meta_guard, 10, 77));
+        let blk_idx = smol::block_on(GenericBlockIndex::new(
+            pool.guard(),
+            &meta_guard,
+            10,
+            BlockID::from(77),
+        ));
         pool.set_stall_page_id(blk_idx.row.root_page_id());
 
         std::thread::scope(|s| {
@@ -480,7 +492,7 @@ mod tests {
             // row_id so the subsequent `try_column()` fallback becomes eligible.
             // This avoids relying on timing-sensitive races to exercise the fallback.
             entered.wait();
-            smol::block_on(blk_idx.update_column_root(11, 88));
+            smol::block_on(blk_idx.update_column_root(11, BlockID::from(88)));
             release.wait();
 
             let res = handle.join().unwrap();

@@ -94,7 +94,7 @@ impl FixedBufferPool {
         page_id: PageID,
     ) -> FacadePageGuard<T> {
         debug_assert!(
-            self.alloc_map.is_allocated(page_id as usize),
+            self.alloc_map.is_allocated(usize::from(page_id)),
             "page not allocated"
         );
         let guard = self.get_page_spin_internal(guard, page_id);
@@ -136,7 +136,7 @@ impl BufferPool for FixedBufferPool {
     #[inline]
     async fn allocate_page<T: BufferPage>(&self, guard: &PoolGuard) -> PageExclusiveGuard<T> {
         match self.alloc_map.try_allocate() {
-            Some(page_id) => self.arena.init_page(guard, page_id as PageID),
+            Some(page_id) => self.arena.init_page(guard, PageID::from(page_id)),
             None => {
                 panic!("buffer pool full");
             }
@@ -149,8 +149,8 @@ impl BufferPool for FixedBufferPool {
         guard: &PoolGuard,
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
-        if self.alloc_map.allocate_at(page_id as usize) {
-            Ok(self.arena.init_page(guard, page_id as PageID))
+        if self.alloc_map.allocate_at(usize::from(page_id)) {
+            Ok(self.arena.init_page(guard, page_id))
         } else {
             Err(Error::BufferPageAlreadyAllocated)
         }
@@ -166,7 +166,7 @@ impl BufferPool for FixedBufferPool {
         mode: LatchFallbackMode,
     ) -> Result<FacadePageGuard<T>> {
         debug_assert!(
-            self.alloc_map.is_allocated(page_id as usize),
+            self.alloc_map.is_allocated(usize::from(page_id)),
             "page not allocated"
         );
         let guard = self.get_page_internal(guard, page_id, mode).await;
@@ -181,7 +181,7 @@ impl BufferPool for FixedBufferPool {
         id: VersionedPageID,
         mode: LatchFallbackMode,
     ) -> Result<Option<FacadePageGuard<T>>> {
-        if !self.alloc_map.is_allocated(id.page_id as usize) {
+        if !self.alloc_map.is_allocated(usize::from(id.page_id)) {
             return Ok(None);
         }
         let g = self.get_page_internal(guard, id.page_id, mode).await;
@@ -204,7 +204,7 @@ impl BufferPool for FixedBufferPool {
         g.bf_mut().ctx = None;
         T::deinit_frame(g.bf_mut());
         g.bf_mut().bump_generation();
-        let res = self.alloc_map.deallocate(page_id as usize);
+        let res = self.alloc_map.deallocate(usize::from(page_id));
         debug_assert!(res);
     }
 
@@ -221,7 +221,7 @@ impl BufferPool for FixedBufferPool {
         mode: LatchFallbackMode,
     ) -> Result<Validation<FacadePageGuard<T>>> {
         debug_assert!(
-            self.alloc_map.is_allocated(page_id as usize),
+            self.alloc_map.is_allocated(usize::from(page_id)),
             "page not allocated"
         );
         let g = self.get_page_internal::<T>(guard, page_id, mode).await;
@@ -279,7 +279,7 @@ mod tests {
             }
             {
                 let g = pool
-                    .get_page::<BlockNode>(&pool_guard, 0, LatchFallbackMode::Spin)
+                    .get_page::<BlockNode>(&pool_guard, PageID::from(0), LatchFallbackMode::Spin)
                     .await
                     .expect("buffer-pool read failed in test")
                     .downgrade();

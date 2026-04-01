@@ -82,9 +82,9 @@ impl ArenaInner {
 
     #[inline]
     pub(crate) fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
-        debug_assert!((page_id as usize) < self.capacity);
+        debug_assert!(usize::from(page_id) < self.capacity);
         // SAFETY: frame memory is one contiguous mmap region indexed by page id.
-        unsafe { UnsafePtr(self.frames.add(page_id as usize)) }
+        unsafe { UnsafePtr(self.frames.add(usize::from(page_id))) }
     }
 
     #[inline]
@@ -97,9 +97,9 @@ impl ArenaInner {
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn page_ptr(&self, page_id: PageID) -> UnsafePtr<Page> {
-        debug_assert!((page_id as usize) < self.capacity);
+        debug_assert!(usize::from(page_id) < self.capacity);
         // SAFETY: page memory is one contiguous mmap region indexed by page id.
-        unsafe { UnsafePtr(self.pages.add(page_id as usize)) }
+        unsafe { UnsafePtr(self.pages.add(usize::from(page_id))) }
     }
 
     #[inline]

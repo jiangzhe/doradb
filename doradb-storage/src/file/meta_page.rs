@@ -1,9 +1,8 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::page::PageID;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
 use crate::catalog::{ObjID, USER_OBJ_ID_START};
 use crate::error::Result;
-use crate::file::cow_file::SUPER_BLOCK_ID;
+use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaPage,
 };
@@ -11,6 +10,7 @@ use crate::lwc::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
+use bytemuck::cast_slice;
 use std::mem;
 use std::num::NonZeroU64;
 
@@ -32,11 +32,11 @@ pub struct MetaPage {
     /// Table schema metadata.
     pub schema: TableMetadata,
     /// Root page id of column block index.
-    pub column_block_index_root: PageID,
+    pub column_block_index_root: BlockID,
     /// Page allocation bitmap.
     pub alloc_map: AllocMap,
     /// Obsolete page ids pending reclamation.
-    pub gc_page_list: Vec<PageID>,
+    pub gc_block_list: Vec<BlockID>,
 }
 
 impl Deser for MetaPage {
@@ -53,9 +53,9 @@ impl Deser for MetaPage {
                 pivot_row_id,
                 heap_redo_start_ts,
                 schema: TableMetadata::from(meta),
-                column_block_index_root,
+                column_block_index_root: BlockID::from(column_block_index_root),
                 alloc_map: space.alloc_map,
-                gc_page_list: space.gc_page_list,
+                gc_block_list: space.gc_block_list,
             },
         ))
     }
@@ -73,7 +73,7 @@ pub struct MetaPageSerView<'a> {
     /// Compact schema serialization view.
     pub schema: TableBriefMetadataSerView<'a>,
     /// Root page id of column block index.
-    pub column_block_index_root: PageID,
+    pub column_block_index_root: BlockID,
     /// Shared allocation-map + GC-list serialization view.
     pub space: AllocMapGcListSerView<'a>,
 }
@@ -84,9 +84,9 @@ impl<'a> MetaPageSerView<'a> {
     #[inline]
     pub fn new(
         schema: TableBriefMetadataSerView<'a>,
-        column_block_index_root: PageID,
+        column_block_index_root: BlockID,
         alloc_map: &'a AllocMap,
-        gc_page_list: &'a [PageID],
+        gc_block_list: &'a [BlockID],
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
     ) -> Self {
@@ -95,7 +95,7 @@ impl<'a> MetaPageSerView<'a> {
             heap_redo_start_ts,
             schema,
             column_block_index_root,
-            space: AllocMapGcListSerView::new(alloc_map, gc_page_list),
+            space: AllocMapGcListSerView::new(alloc_map, gc_block_list),
         }
     }
 }
@@ -107,7 +107,7 @@ impl<'a> Ser<'a> for MetaPageSerView<'a> {
             + mem::size_of::<TrxID>()
             + self.space.ser_len()
             + self.schema.ser_len()
-            + mem::size_of::<PageID>()
+            + mem::size_of::<BlockID>()
     }
 
     #[inline]
@@ -116,7 +116,7 @@ impl<'a> Ser<'a> for MetaPageSerView<'a> {
         let idx = out.ser_u64(idx, self.heap_redo_start_ts);
         let idx = self.space.ser(out, idx);
         let idx = self.schema.ser(out, idx);
-        out.ser_u64(idx, self.column_block_index_root)
+        out.ser_u64(idx, self.column_block_index_root.into())
     }
 }
 
@@ -129,20 +129,20 @@ pub struct AllocMapGcList {
     /// Page allocation bitmap.
     pub alloc_map: AllocMap,
     /// Obsolete page ids pending reclamation.
-    pub gc_page_list: Vec<PageID>,
+    pub gc_block_list: Vec<BlockID>,
 }
 
 impl Deser for AllocMapGcList {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, alloc_map) = AllocMap::deser(input, start_idx)?;
-        if alloc_map.len() == 0 || !alloc_map.is_allocated(SUPER_BLOCK_ID as usize) {
+        if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
             return Err(crate::error::Error::InvalidFormat);
         }
 
-        let (idx, gc_page_list) = LwcPrimitiveDeser::<PageID>::deser(input, idx)?;
-        for page_id in &gc_page_list.0 {
-            if *page_id as usize >= alloc_map.len() {
+        let (idx, gc_block_list) = LwcPrimitiveDeser::<BlockID>::deser(input, idx)?;
+        for page_id in &gc_block_list.0 {
+            if usize::from(*page_id) >= alloc_map.len() {
                 return Err(crate::error::Error::InvalidFormat);
             }
         }
@@ -151,7 +151,7 @@ impl Deser for AllocMapGcList {
             idx,
             AllocMapGcList {
                 alloc_map,
-                gc_page_list: gc_page_list.0,
+                gc_block_list: gc_block_list.0,
             },
         ))
     }
@@ -162,16 +162,16 @@ pub struct AllocMapGcListSerView<'a> {
     /// Page allocation bitmap.
     pub alloc_map: &'a AllocMap,
     /// LWC serialization view of obsolete page ids pending reclamation.
-    pub gc_page_list: LwcPrimitiveSer<'a>,
+    pub gc_block_list: LwcPrimitiveSer<'a>,
 }
 
 impl<'a> AllocMapGcListSerView<'a> {
     /// Constructs a serialization view of allocation bitmap and GC list.
     #[inline]
-    pub fn new(alloc_map: &'a AllocMap, gc_page_list: &'a [PageID]) -> Self {
+    pub fn new(alloc_map: &'a AllocMap, gc_block_list: &'a [BlockID]) -> Self {
         AllocMapGcListSerView {
             alloc_map,
-            gc_page_list: LwcPrimitiveSer::new_u64(gc_page_list),
+            gc_block_list: LwcPrimitiveSer::new_u64(cast_slice(gc_block_list)),
         }
     }
 }
@@ -179,13 +179,13 @@ impl<'a> AllocMapGcListSerView<'a> {
 impl<'a> Ser<'a> for AllocMapGcListSerView<'a> {
     #[inline]
     fn ser_len(&self) -> usize {
-        self.alloc_map.ser_len() + self.gc_page_list.ser_len()
+        self.alloc_map.ser_len() + self.gc_block_list.ser_len()
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = self.alloc_map.ser(out, start_idx);
-        self.gc_page_list.ser(out, idx)
+        self.gc_block_list.ser(out, idx)
     }
 }
 
@@ -206,7 +206,7 @@ pub struct MultiTableMetaPageData {
     /// Page allocation bitmap.
     pub alloc_map: AllocMap,
     /// Obsolete page ids pending reclamation.
-    pub gc_page_list: Vec<PageID>,
+    pub gc_block_list: Vec<BlockID>,
 }
 
 impl Deser for MultiTableMetaPageData {
@@ -247,7 +247,7 @@ impl Deser for MultiTableMetaPageData {
                 next_user_obj_id,
                 table_roots,
                 alloc_map: space.alloc_map,
-                gc_page_list: space.gc_page_list,
+                gc_block_list: space.gc_block_list,
             },
         ))
     }
@@ -273,12 +273,12 @@ impl<'a> MultiTableMetaPageSerView<'a> {
     pub fn new(
         meta: &'a MultiTableMetaPage,
         alloc_map: &'a AllocMap,
-        gc_page_list: &'a [PageID],
+        gc_block_list: &'a [BlockID],
     ) -> Self {
         MultiTableMetaPageSerView {
             next_user_obj_id: meta.next_user_obj_id,
             table_roots: &meta.table_roots,
-            space: AllocMapGcListSerView::new(alloc_map, gc_page_list),
+            space: AllocMapGcListSerView::new(alloc_map, gc_block_list),
         }
     }
 }
@@ -304,7 +304,8 @@ impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
             idx = out.ser_u64(idx, root.table_id);
             idx = out.ser_u64(
                 idx,
-                root.root_page_id.map_or(SUPER_BLOCK_ID, NonZeroU64::get),
+                root.root_page_id
+                    .map_or(SUPER_BLOCK_ID.into(), NonZeroU64::get),
             );
             idx = out.ser_u64(idx, root.pivot_row_id);
         }
@@ -347,7 +348,7 @@ mod tests {
             active_root.column_block_index_root
         );
         assert_eq!(meta_page.alloc_map, active_root.alloc_map);
-        assert_eq!(meta_page.gc_page_list, active_root.gc_page_list);
+        assert_eq!(meta_page.gc_block_list, active_root.gc_block_list);
         assert_eq!(meta_page.pivot_row_id, active_root.pivot_row_id);
         assert_eq!(meta_page.heap_redo_start_ts, active_root.heap_redo_start_ts);
     }

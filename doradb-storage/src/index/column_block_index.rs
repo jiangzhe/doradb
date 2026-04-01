@@ -1,9 +1,8 @@
-use crate::buffer::page::PageID;
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
-use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::page_integrity::{
     COLUMN_BLOCK_INDEX_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
     write_page_checksum, write_page_header,
@@ -57,7 +56,7 @@ const COLUMN_DELETE_CODEC_NONE: u8 = 0;
 const COLUMN_DELETE_CODEC_INLINE_DELTA_LIST: u8 = 1;
 const COLUMN_DELETE_CODEC_EXTERNAL_BLOB: u8 = 2;
 const COLUMN_BLOB_REF_SIZE: usize =
-    mem::size_of::<PageID>() + mem::size_of::<u16>() + mem::size_of::<u32>();
+    mem::size_of::<BlockID>() + mem::size_of::<u16>() + mem::size_of::<u32>();
 const LEGACY_INLINE_DELETE_FIELD_SIZE: usize = 120;
 const LEGACY_INLINE_DELETE_U16_OFFSET: usize = 4;
 const LEGACY_INLINE_DELETE_U32_OFFSET: usize = 4;
@@ -182,8 +181,8 @@ impl ColumnBlockLeafHeaderExt {
 
 impl ColumnBlockLeafEntryHeader {
     #[inline]
-    fn block_id(&self) -> PageID {
-        u64::from_le_bytes(self.block_id)
+    fn block_id(&self) -> BlockID {
+        BlockID::from(u64::from_le_bytes(self.block_id))
     }
 
     #[inline]
@@ -282,7 +281,7 @@ pub struct ColumnBlockBranchEntry {
     /// Inclusive lower row-id bound routed to the child subtree.
     pub start_row_id: RowID,
     /// Page id of the child node.
-    pub page_id: PageID,
+    pub page_id: BlockID,
 }
 
 #[repr(C)]
@@ -404,11 +403,11 @@ impl ColumnBlockEntryShape {
     }
 
     #[inline]
-    pub(crate) fn with_block_id(self, block_id: PageID) -> ColumnBlockEntryInput {
+    pub(crate) fn with_block_id(self, block_id: impl Into<BlockID>) -> ColumnBlockEntryInput {
         ColumnBlockEntryInput {
             start_row_id: self.start_row_id,
             end_row_id: self.end_row_id,
-            block_id,
+            block_id: block_id.into(),
             row_ids: self.row_ids,
             delete_deltas: self.delete_deltas,
             delete_domain: self.delete_domain,
@@ -423,7 +422,7 @@ impl ColumnBlockEntryShape {
 pub struct ColumnBlockEntryInput {
     start_row_id: RowID,
     end_row_id: RowID,
-    block_id: PageID,
+    block_id: BlockID,
     row_ids: Vec<RowID>,
     delete_deltas: Vec<u32>,
     delete_domain: ColumnDeleteDomain,
@@ -450,10 +449,10 @@ pub struct ColumnBlockEntryPatch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColumnLeafEntry {
     /// Page id of the leaf node that owns this entry.
-    pub leaf_page_id: PageID,
+    pub leaf_page_id: BlockID,
     /// Inclusive lower row-id bound of the entry.
     pub start_row_id: RowID,
-    block_id: PageID,
+    block_id: BlockID,
     end_row_id: RowID,
     row_count: u16,
     del_count: u16,
@@ -467,7 +466,7 @@ pub struct ColumnLeafEntry {
 impl ColumnLeafEntry {
     /// Returns the persisted LWC block page id.
     #[inline]
-    pub fn block_id(&self) -> PageID {
+    pub fn block_id(&self) -> BlockID {
         self.block_id
     }
 
@@ -525,8 +524,8 @@ impl ColumnLeafEntry {
 /// Runtime row resolution result for one persisted columnar row lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolvedColumnRow {
-    leaf_page_id: PageID,
-    block_id: PageID,
+    leaf_page_id: BlockID,
+    block_id: BlockID,
     row_idx: usize,
     row_shape_fingerprint: u128,
 }
@@ -534,13 +533,13 @@ pub struct ResolvedColumnRow {
 impl ResolvedColumnRow {
     /// Returns the leaf page that produced this resolution result.
     #[inline]
-    pub fn leaf_page_id(&self) -> PageID {
+    pub fn leaf_page_id(&self) -> BlockID {
         self.leaf_page_id
     }
 
     /// Returns the persisted LWC block page id that stores the row values.
     #[inline]
-    pub fn block_id(&self) -> PageID {
+    pub fn block_id(&self) -> BlockID {
         self.block_id
     }
 
@@ -737,7 +736,7 @@ impl LogicalDeleteSet {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LogicalLeafEntry {
     start_row_id: RowID,
-    block_id: PageID,
+    block_id: BlockID,
     row_set: LogicalRowSet,
     delete_set: LogicalDeleteSet,
     row_shape_fingerprint: u128,
@@ -746,7 +745,7 @@ struct LogicalLeafEntry {
 impl LogicalLeafEntry {
     fn new(
         start_row_id: RowID,
-        block_id: PageID,
+        block_id: BlockID,
         row_set: LogicalRowSet,
         delete_set: LogicalDeleteSet,
         row_shape_fingerprint: u128,
@@ -804,7 +803,7 @@ impl ResolvedLeafPatch {
 #[derive(Clone)]
 struct EncodedLeafEntry {
     start_row_id: RowID,
-    block_id: PageID,
+    block_id: BlockID,
     row_id_span: u32,
     row_shape_fingerprint: u128,
     row_section: Vec<u8>,
@@ -1131,7 +1130,7 @@ impl ColumnBlockNodeRead for ColumnBlockNode {
 pub struct ColumnBlockIndex<'a> {
     disk_pool: &'a ReadonlyBufferPool,
     disk_pool_guard: &'a PoolGuard,
-    root_block_id: PageID,
+    root_block_id: BlockID,
     end_row_id: RowID,
 }
 
@@ -1142,7 +1141,7 @@ struct NodeRewriteResult {
 }
 
 #[inline]
-fn invalid_node_payload(file_kind: PersistedFileKind, page_id: PageID) -> Error {
+fn invalid_node_payload(file_kind: PersistedFileKind, page_id: BlockID) -> Error {
     Error::persisted_page_corrupted(
         file_kind,
         PersistedPageKind::ColumnBlockIndex,
@@ -1155,7 +1154,7 @@ fn invalid_node_payload(file_kind: PersistedFileKind, page_id: PageID) -> Error 
 fn validate_node_payload(
     page: &[u8],
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<(&[u8], ColumnBlockNodeHeader)> {
     let payload = validate_page(page, COLUMN_BLOCK_INDEX_PAGE_SPEC).map_err(|cause| {
         Error::persisted_page_corrupted(
@@ -1181,7 +1180,7 @@ fn validate_node_payload(
 pub(crate) fn validate_persisted_column_block_index_page(
     page: &[u8],
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<()> {
     validate_node_payload(page, file_kind, page_id).map(|_| ())
 }
@@ -1214,7 +1213,7 @@ impl ValidatedColumnBlockNode {
     fn try_from_guard(
         guard: ReadonlyBlockGuard,
         file_kind: PersistedFileKind,
-        page_id: PageID,
+        page_id: BlockID,
     ) -> Result<Self> {
         let (_, header) = validate_node_payload(guard.page(), file_kind, page_id)?;
         Ok(ValidatedColumnBlockNode { guard, header })
@@ -1223,7 +1222,7 @@ impl ValidatedColumnBlockNode {
     fn leaf_header_ext(
         &self,
         file_kind: PersistedFileKind,
-        page_id: PageID,
+        page_id: BlockID,
     ) -> Result<&ColumnBlockLeafHeaderExt> {
         bytemuck::try_from_bytes::<ColumnBlockLeafHeaderExt>(
             &self.data_ref()[..COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE],
@@ -1234,7 +1233,7 @@ impl ValidatedColumnBlockNode {
     fn leaf_prefix_plane(
         &self,
         file_kind: PersistedFileKind,
-        page_id: PageID,
+        page_id: BlockID,
     ) -> Result<LeafPrefixPlane<'_>> {
         let search_type = self
             .leaf_header_ext(file_kind, page_id)?
@@ -1274,7 +1273,7 @@ impl ValidatedColumnBlockNode {
         &self,
         idx: usize,
         file_kind: PersistedFileKind,
-        page_id: PageID,
+        page_id: BlockID,
     ) -> Result<LeafEntryView<'_>> {
         let prefixes = self.leaf_prefix_plane(file_kind, page_id)?;
         let prefix = prefixes
@@ -1345,7 +1344,7 @@ impl<'a> ColumnBlockIndex<'a> {
     /// Creates a column block-index view for one root block snapshot.
     #[inline]
     pub fn new(
-        root_block_id: PageID,
+        root_block_id: BlockID,
         end_row_id: RowID,
         disk_pool: &'a ReadonlyBufferPool,
         disk_pool_guard: &'a PoolGuard,
@@ -1360,7 +1359,7 @@ impl<'a> ColumnBlockIndex<'a> {
 
     /// Returns current column block-index root block id.
     #[inline]
-    pub fn root_block_id(&self) -> PageID {
+    pub fn root_block_id(&self) -> BlockID {
         self.root_block_id
     }
 
@@ -1376,7 +1375,7 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     #[inline]
-    async fn read_node(&self, page_id: PageID) -> Result<ValidatedColumnBlockNode> {
+    async fn read_node(&self, page_id: BlockID) -> Result<ValidatedColumnBlockNode> {
         let g = self
             .disk_pool
             .read_validated_block(
@@ -1512,7 +1511,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         view: &LeafEntryView<'_>,
         row_set: &LogicalRowSet,
-        page_id: PageID,
+        page_id: BlockID,
     ) -> Result<LogicalDeleteSet> {
         let delete_set = decode_logical_delete_set_base(view, row_set, self.file_kind(), page_id)?;
         let LogicalDeleteSet::External {
@@ -1651,7 +1650,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         patches: &[ColumnDeleteDeltaPatch<'_>],
         create_ts: u64,
-    ) -> Result<PageID> {
+    ) -> Result<BlockID> {
         if patches.is_empty() {
             return Ok(self.root_block_id);
         }
@@ -1698,7 +1697,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         patches: &[ColumnBlockEntryPatch],
         create_ts: u64,
-    ) -> Result<PageID> {
+    ) -> Result<BlockID> {
         if patches.is_empty() {
             return Ok(self.root_block_id);
         }
@@ -1739,7 +1738,7 @@ impl<'a> ColumnBlockIndex<'a> {
         entries: &[ColumnBlockEntryInput],
         new_end_row_id: RowID,
         create_ts: u64,
-    ) -> Result<PageID> {
+    ) -> Result<BlockID> {
         if entries.is_empty() {
             return Ok(self.root_block_id);
         }
@@ -1778,7 +1777,7 @@ impl<'a> ColumnBlockIndex<'a> {
     fn rewrite_subtree_with_patches<'b, M: MutableCowFile + 'b>(
         &'b self,
         mutable_file: &'b mut M,
-        page_id: PageID,
+        page_id: BlockID,
         patches: &'b [ResolvedLeafPatch],
         create_ts: u64,
     ) -> Pin<Box<dyn Future<Output = Result<NodeRewriteResult>> + 'b>> {
@@ -1803,7 +1802,7 @@ impl<'a> ColumnBlockIndex<'a> {
     async fn rewrite_leaf_with_patches<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
-        page_id: PageID,
+        page_id: BlockID,
         node: &ValidatedColumnBlockNode,
         patches: &[ResolvedLeafPatch],
         create_ts: u64,
@@ -1831,7 +1830,7 @@ impl<'a> ColumnBlockIndex<'a> {
     async fn rewrite_branch_with_patches<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
-        page_id: PageID,
+        page_id: BlockID,
         node: &ValidatedColumnBlockNode,
         patches: &[ResolvedLeafPatch],
         create_ts: u64,
@@ -1891,7 +1890,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         entries: &[LogicalLeafEntry],
         create_ts: u64,
-    ) -> Result<PageID> {
+    ) -> Result<BlockID> {
         let leaf_entries = self
             .write_leaf_pages_from_logical_entries(mutable_file, entries, create_ts)
             .await?;
@@ -1954,7 +1953,7 @@ impl<'a> ColumnBlockIndex<'a> {
         old_root_height: u32,
         entries: Vec<ColumnBlockBranchEntry>,
         create_ts: u64,
-    ) -> Result<PageID> {
+    ) -> Result<BlockID> {
         if entries.is_empty() {
             return Err(Error::InvalidState);
         }
@@ -1968,7 +1967,7 @@ impl<'a> ColumnBlockIndex<'a> {
     fn decode_logical_leaf_entries(
         &self,
         node: &ValidatedColumnBlockNode,
-        page_id: PageID,
+        page_id: BlockID,
     ) -> Result<Vec<LogicalLeafEntry>> {
         let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
         let mut entries = Vec::with_capacity(prefixes.count());
@@ -2062,7 +2061,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mut entries: Vec<ColumnBlockBranchEntry>,
         mut height: u32,
         create_ts: u64,
-    ) -> Result<PageID> {
+    ) -> Result<BlockID> {
         loop {
             if entries.len() == 1 {
                 return Ok(entries[0].page_id);
@@ -2082,8 +2081,8 @@ impl<'a> ColumnBlockIndex<'a> {
         height: u32,
         start_row_id: RowID,
         create_ts: u64,
-    ) -> Result<(PageID, Box<ColumnBlockNode>)> {
-        let page_id = table_file.allocate_page_id()?;
+    ) -> Result<(BlockID, Box<ColumnBlockNode>)> {
+        let page_id = table_file.allocate_block_id()?;
         let node = ColumnBlockNode::new_boxed(height, start_row_id, create_ts);
         Ok((page_id, node))
     }
@@ -2093,19 +2092,19 @@ impl<'a> ColumnBlockIndex<'a> {
     pub fn record_obsolete_node<M: MutableCowFile>(
         &self,
         table_file: &mut M,
-        page_id: PageID,
+        page_id: BlockID,
     ) -> Result<()> {
         if page_id == SUPER_BLOCK_ID {
             return Err(Error::InvalidState);
         }
-        table_file.record_gc_page(page_id);
+        table_file.record_gc_block(page_id);
         Ok(())
     }
 
     async fn write_node<M: MutableCowFile>(
         &self,
         mutable_file: &M,
-        page_id: PageID,
+        page_id: BlockID,
         node: &ColumnBlockNode,
     ) -> Result<()> {
         let mut buf = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
@@ -2116,7 +2115,7 @@ impl<'a> ColumnBlockIndex<'a> {
         dst[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
             .copy_from_slice(node.data_ref());
         write_page_checksum(buf.data_mut());
-        mutable_file.write_page(page_id, buf).await
+        mutable_file.write_block(page_id, buf).await
     }
 }
 
@@ -2158,7 +2157,7 @@ fn leaf_entry_slice(
     prefix_end: usize,
     entry_offset: u16,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<&[u8]> {
     let offset = entry_offset as usize;
     let header_end = offset
@@ -2186,7 +2185,7 @@ fn validate_leaf_prefixes(
     prefixes: &LeafPrefixPlane<'_>,
     data: &[u8],
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<()> {
     if prefixes.count() == 0 {
         return Ok(());
@@ -2270,7 +2269,7 @@ fn entry_contains_row_id(
     view: &LeafEntryView<'_>,
     row_id: RowID,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<bool> {
     Ok(resolve_row_idx_in_view(view, row_id, file_kind, page_id)?.is_some())
 }
@@ -2279,7 +2278,7 @@ fn resolve_row_idx_in_view(
     view: &LeafEntryView<'_>,
     row_id: RowID,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<Option<usize>> {
     let delta_u64 = match row_id.checked_sub(view.start_row_id) {
         Some(delta) => delta,
@@ -2313,7 +2312,7 @@ fn resolve_delta_list_row_idx(
     row_meta: DecodedRowSectionMetadata,
     delta: u32,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<Option<usize>> {
     let deltas = decode_u32_row_deltas(
         &view.row_section[mem::size_of::<SectionHeader>()..],
@@ -2329,7 +2328,7 @@ fn resolve_delta_list_row_idx(
 fn decode_logical_row_set(
     view: &LeafEntryView<'_>,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<LogicalRowSet> {
     let row_meta = decode_row_section_metadata(
         view.row_section,
@@ -2365,7 +2364,7 @@ fn decode_row_ids_from_row_set(
     start_row_id: RowID,
     row_set: &LogicalRowSet,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<Vec<RowID>> {
     let mut row_ids = Vec::with_capacity(row_set.row_count());
     match row_set {
@@ -2395,7 +2394,7 @@ fn decode_logical_delete_set_base(
     view: &LeafEntryView<'_>,
     row_set: &LogicalRowSet,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<LogicalDeleteSet> {
     let delete_meta =
         decode_delete_section_metadata(view.delete_section, view.row_header, file_kind, page_id)?;
@@ -2431,7 +2430,7 @@ fn decode_logical_delete_set_base(
 }
 
 fn build_leaf_entry(
-    leaf_page_id: PageID,
+    leaf_page_id: BlockID,
     view: &LeafEntryView<'_>,
     file_kind: PersistedFileKind,
 ) -> Result<ColumnLeafEntry> {
@@ -2467,7 +2466,7 @@ fn build_leaf_entry(
 }
 
 fn build_resolved_row(
-    leaf_page_id: PageID,
+    leaf_page_id: BlockID,
     view: &LeafEntryView<'_>,
     row_idx: usize,
 ) -> ResolvedColumnRow {
@@ -2482,7 +2481,7 @@ fn build_resolved_row(
 fn decode_default_delete_domain_from_row_header(
     row_header: SectionHeader,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<ColumnDeleteDomain> {
     if row_header.flags != 0 {
         return Err(invalid_node_payload(file_kind, page_id));
@@ -2495,7 +2494,7 @@ fn decode_row_section_metadata(
     row_header: SectionHeader,
     row_id_span: u32,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<DecodedRowSectionMetadata> {
     let _delete_domain =
         decode_default_delete_domain_from_row_header(row_header, file_kind, page_id)?;
@@ -2546,7 +2545,7 @@ fn decode_delete_section_metadata(
     delete_section: Option<&[u8]>,
     row_header: SectionHeader,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<DecodedDeleteSectionMetadata> {
     let default_domain =
         decode_default_delete_domain_from_row_header(row_header, file_kind, page_id)?;
@@ -2616,7 +2615,7 @@ fn decode_delete_section_metadata(
 fn decode_delete_domain_or_invalid_node(
     raw: u8,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<ColumnDeleteDomain> {
     ColumnDeleteDomain::decode(raw).map_err(|_| invalid_node_payload(file_kind, page_id))
 }
@@ -2832,7 +2831,7 @@ fn decode_blob_ref(bytes: &[u8]) -> Result<BlobRef> {
     if bytes.len() != COLUMN_BLOB_REF_SIZE {
         return Err(Error::InvalidFormat);
     }
-    let start_page_id = u64::from_le_bytes(bytes[0..8].try_into()?);
+    let start_page_id = BlockID::from(u64::from_le_bytes(bytes[0..8].try_into()?));
     let start_offset = u16::from_le_bytes(bytes[8..10].try_into()?);
     let byte_len = u32::from_le_bytes(bytes[10..14].try_into()?);
     if start_page_id == SUPER_BLOCK_ID || byte_len == 0 {
@@ -2857,7 +2856,7 @@ fn decode_u32_row_deltas(
     row_id_span: u32,
     first_present_delta: u32,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<Vec<u32>> {
     let deltas = decode_u32_bytes_strict(bytes, expected_count)?;
     if deltas.first().copied() != Some(first_present_delta)
@@ -2874,7 +2873,7 @@ fn decode_delete_rows(
     delete_domain: ColumnDeleteDomain,
     row_set: &LogicalRowSet,
     file_kind: PersistedFileKind,
-    page_id: PageID,
+    page_id: BlockID,
 ) -> Result<Vec<u32>> {
     let delete_values = decode_u32_bytes_strict(bytes, expected_count)?;
     match delete_domain {
@@ -3113,7 +3112,11 @@ mod tests {
         ))
     }
 
-    fn dense_entry(start: RowID, end: RowID, block_id: PageID) -> ColumnBlockEntryInput {
+    fn dense_entry(
+        start: RowID,
+        end: RowID,
+        block_id: impl Into<BlockID>,
+    ) -> ColumnBlockEntryInput {
         let row_ids: Vec<RowID> = (start..end).collect();
         ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
             .unwrap()
@@ -3124,7 +3127,7 @@ mod tests {
         start: RowID,
         end: RowID,
         row_ids: Vec<RowID>,
-        block_id: PageID,
+        block_id: impl Into<BlockID>,
     ) -> ColumnBlockEntryInput {
         ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
             .unwrap()
@@ -3135,7 +3138,7 @@ mod tests {
     fn test_leaf_entry_header_roundtrip_uses_u16_lengths() {
         let encoded = EncodedLeafEntry {
             start_row_id: 10,
-            block_id: 1001,
+            block_id: BlockID::from(1001),
             row_id_span: 32,
             row_shape_fingerprint: 42,
             row_section: vec![0u8; 4 + 7 * mem::size_of::<u32>()],
@@ -3189,7 +3192,7 @@ mod tests {
             Some(&[0u8; COLUMN_DELETE_SECTION_HEADER_SIZE - 1]),
             row_header,
             PersistedFileKind::TableFile,
-            42,
+            BlockID::from(42),
         )
         .unwrap_err();
         assert!(matches!(
@@ -3197,9 +3200,9 @@ mod tests {
             Error::PersistedPageCorrupted {
                 file_kind: PersistedFileKind::TableFile,
                 page_kind: PersistedPageKind::ColumnBlockIndex,
-                page_id: 42,
+                page_id,
                 cause: PersistedPageCorruptionCause::InvalidPayload,
-            }
+            } if page_id == BlockID::from(42)
         ));
     }
 
@@ -3270,7 +3273,7 @@ mod tests {
         end_row_id: RowID,
         probe_row_id: RowID,
         expected_search_type: ColumnBlockLeafSearchType,
-        expected_block_id: PageID,
+        expected_block_id: impl Into<BlockID>,
     ) {
         let (_temp_dir, fs) = build_test_fs();
         let metadata = metadata();
@@ -3289,7 +3292,7 @@ mod tests {
 
         let index = ColumnBlockIndex::new(root_block_id, end_row_id, &disk_pool, &disk_pool_guard);
         let entry = index.locate_block(probe_row_id).await.unwrap().unwrap();
-        assert_eq!(entry.block_id(), expected_block_id);
+        assert_eq!(entry.block_id(), expected_block_id.into());
         let node = index.read_node(entry.leaf_page_id).await.unwrap();
         let header = node
             .leaf_header_ext(index.file_kind(), entry.leaf_page_id)
@@ -3694,7 +3697,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .block_id(),
-                10_000 + COLUMN_BLOCK_MAX_ENTRIES as u64
+                BlockID::from(10_000 + COLUMN_BLOCK_MAX_ENTRIES as u64)
             );
         });
     }

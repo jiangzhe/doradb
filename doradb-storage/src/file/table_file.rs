@@ -1,14 +1,13 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
-use crate::buffer::page::PageID;
 use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
 use crate::file::TableFsRequest;
 use crate::file::cow_file::{
-    ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
-    OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_page_id,
+    ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
+    MutableCowFile, OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
 use crate::file::meta_page::{
     MetaPage, MetaPageSerView, TABLE_META_MAGIC_WORD, TABLE_META_VERSION,
@@ -41,7 +40,7 @@ pub const TABLE_FILE_SUPER_PAGE_SIZE: usize = SUPER_PAGE_SIZE;
 /// Super page header size.
 pub const TABLE_FILE_SUPER_PAGE_HEADER_SIZE: usize = mem::size_of::<[u8; 8]>()
     + mem::size_of::<u64>()
-    + mem::size_of::<PageID>()
+    + mem::size_of::<BlockID>()
     + mem::size_of::<TrxID>();
 
 /// Table-specific metadata payload embedded in shared active root.
@@ -53,7 +52,7 @@ pub struct TableMeta {
     /// Metadata of this table.
     pub metadata: Arc<TableMetadata>,
     /// Root page id of column block index.
-    pub column_block_index_root: PageID,
+    pub column_block_index_root: BlockID,
     /// Upper bound of row id in this file.
     pub pivot_row_id: RowID,
     /// Redo log start point for in-memory heap.
@@ -71,7 +70,7 @@ impl ActiveRoot {
     #[inline]
     pub fn new(trx_id: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
         let alloc_map = AllocMap::new(max_pages);
-        let super_block_allocated = alloc_map.allocate_at(SUPER_BLOCK_ID as usize);
+        let super_block_allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
         assert!(super_block_allocated);
 
         ActiveRoot::from_parts(
@@ -96,11 +95,11 @@ impl ActiveRoot {
             header: SuperPageHeader {
                 magic_word: TABLE_FILE_MAGIC_WORD,
                 version: SUPER_PAGE_VERSION,
-                page_no: self.page_no,
+                slot_no: self.slot_no,
                 checkpoint_cts: self.trx_id,
             },
             body: SuperPageBody {
-                meta_page_id: self.meta_page_id,
+                meta_block_id: self.meta_block_id,
             },
         }
     }
@@ -112,7 +111,7 @@ impl ActiveRoot {
             self.metadata.ser_view(),
             self.column_block_index_root,
             &self.alloc_map,
-            &self.gc_page_list,
+            &self.gc_block_list,
             self.pivot_row_id,
             self.heap_redo_start_ts,
         )
@@ -125,7 +124,7 @@ fn parse_table_super_page(buf: &[u8]) -> Result<SuperPage> {
 }
 
 #[inline]
-fn parse_table_meta_page(page_id: PageID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
+fn parse_table_meta_page(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
     let payload = validate_page(buf, TABLE_META_PAGE_SPEC).map_err(|cause| {
         Error::persisted_page_corrupted(
             PersistedFileKind::TableFile,
@@ -151,15 +150,15 @@ fn parse_table_meta_page(page_id: PageID, buf: &[u8]) -> Result<ParsedMeta<Table
             heap_redo_start_ts: meta_page.heap_redo_start_ts,
         },
         alloc_map: meta_page.alloc_map,
-        gc_page_list: meta_page.gc_page_list,
+        gc_block_list: meta_page.gc_block_list,
     })
 }
 
 #[inline]
-fn validate_table_root(meta_page_id: PageID, parsed_meta: &ParsedMeta<TableMeta>) -> Result<()> {
-    validate_active_meta_page_id(
+fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMeta>) -> Result<()> {
+    validate_active_meta_block_id(
         &parsed_meta.alloc_map,
-        meta_page_id,
+        meta_block_id,
         PersistedFileKind::TableFile,
         PersistedPageKind::TableMeta,
     )
@@ -209,9 +208,9 @@ fn build_table_super_page(root: &ActiveRoot) -> Result<DirectBuf> {
 fn table_codec() -> CowCodec<TableMeta> {
     CowCodec {
         parse_super_page: parse_table_super_page,
-        parse_meta_page: parse_table_meta_page,
+        parse_meta_block: parse_table_meta_page,
         validate_root: validate_table_root,
-        build_meta_page: build_table_meta_page,
+        build_meta_block: build_table_meta_page,
         build_super_page: build_table_super_page,
     }
 }
@@ -362,7 +361,7 @@ impl MutableTableFile {
 
     /// Updates mutable root column-index pointer.
     #[inline]
-    pub fn set_column_block_index_root(&mut self, root_block_id: PageID) {
+    pub fn set_column_block_index_root(&mut self, root_block_id: BlockID) {
         self.new_root_mut().column_block_index_root = root_block_id;
     }
 
@@ -384,22 +383,22 @@ impl MutableTableFile {
 
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
-    pub fn allocate_page_id(&mut self) -> Result<PageID> {
+    pub fn allocate_block_id(&mut self) -> Result<BlockID> {
         self.new_root_mut()
-            .try_allocate_page_id()
+            .try_allocate_block_id()
             .ok_or(Error::InvalidState)
     }
 
     /// Record an obsolete page id to be reclaimed on commit.
     #[inline]
-    pub fn record_gc_page(&mut self, page_id: PageID) {
-        self.new_root_mut().gc_page_list.push(page_id);
+    pub fn record_gc_block(&mut self, block_id: BlockID) {
+        self.new_root_mut().gc_block_list.push(block_id);
     }
 
     /// Write one page into the underlying table file.
     #[inline]
-    pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
-        self.file_ref().write_page(page_id, buf).await
+    pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        self.file_ref().write_block(block_id, buf).await
     }
 
     /// Commit the modification of table file.
@@ -455,7 +454,7 @@ impl MutableTableFile {
             let end_row_id = page.shape.end_row_id();
             let page_id = self
                 .new_root_mut()
-                .try_allocate_page_id()
+                .try_allocate_block_id()
                 .ok_or(Error::InvalidState)?;
             max_row_id = max_row_id.max(end_row_id);
             if start_row_id < last_end {
@@ -463,7 +462,7 @@ impl MutableTableFile {
             }
             last_end = end_row_id;
             new_entries.push(page.shape.with_block_id(page_id));
-            writes.push(table_file.write_page(page_id, page.buf));
+            writes.push(table_file.write_block(page_id, page.buf));
         }
 
         try_join_all(writes).await?;
@@ -536,22 +535,22 @@ impl Drop for MutableTableFile {
 
 impl MutableCowFile for MutableTableFile {
     #[inline]
-    fn allocate_page_id(&mut self) -> Result<PageID> {
-        MutableTableFile::allocate_page_id(self)
+    fn allocate_block_id(&mut self) -> Result<BlockID> {
+        MutableTableFile::allocate_block_id(self)
     }
 
     #[inline]
-    fn record_gc_page(&mut self, page_id: PageID) {
-        MutableTableFile::record_gc_page(self, page_id)
+    fn record_gc_block(&mut self, block_id: BlockID) {
+        MutableTableFile::record_gc_block(self, block_id)
     }
 
     #[inline]
-    fn write_page(
+    fn write_block(
         &self,
-        page_id: PageID,
+        block_id: BlockID,
         buf: DirectBuf,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        MutableTableFile::write_page(self, page_id, buf)
+        MutableTableFile::write_block(self, block_id, buf)
     }
 }
 
@@ -576,12 +575,15 @@ mod tests {
     fn accept_any_page(
         _page: &[u8],
         _file_kind: PersistedFileKind,
-        _page_id: PageID,
+        _page_id: BlockID,
     ) -> Result<()> {
         Ok(())
     }
 
-    async fn read_page_for_test(table_file: &Arc<TableFile>, page_id: PageID) -> Result<DirectBuf> {
+    async fn read_page_for_test(
+        table_file: &Arc<TableFile>,
+        page_id: BlockID,
+    ) -> Result<DirectBuf> {
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
         let disk_pool = table_readonly_pool(&global, 0, table_file);
         let disk_pool_guard = disk_pool.pool_guard();
@@ -611,17 +613,17 @@ mod tests {
             let table_file = fs.create_table_file(41, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
-            assert_eq!(table_file.active_root().page_no, 0);
+            assert_eq!(table_file.active_root().slot_no, 0);
             assert_eq!(table_file.active_root().trx_id, 1);
 
             // write
             let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
             buf.reset();
             buf.extend_from_slice(b"hello, world");
-            let res = table_file.write_page(3, buf).await;
+            let res = table_file.write_block(BlockID::from(3), buf).await;
             assert!(res.is_ok());
 
-            let res = read_page_for_test(&table_file, 3).await;
+            let res = read_page_for_test(&table_file, BlockID::from(3)).await;
             assert!(res.is_ok());
             let buf = res.unwrap();
             assert_eq!(&buf.as_bytes()[..12], b"hello, world");
@@ -639,7 +641,7 @@ mod tests {
                 .load_active_root_from_pool(&disk_pool)
                 .await
                 .unwrap();
-            assert_eq!(active_root.page_no, 1);
+            assert_eq!(active_root.slot_no, 1);
             assert_eq!(active_root.trx_id, 2);
             drop(table_file2);
             drop(table_file3);
@@ -661,7 +663,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 145, &table_file);
             let disk_pool_guard = disk_pool.pool_guard();
-            let out_of_range_page_id = 1_000_000;
+            let out_of_range_page_id = BlockID::from(1_000_000);
             let res = disk_pool
                 .read_validated_block(&disk_pool_guard, out_of_range_page_id, accept_any_page)
                 .await;
@@ -690,14 +692,14 @@ mod tests {
             let table_file = fs.create_table_file(42, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
-            assert_eq!(table_file.active_root().page_no, 0);
+            assert_eq!(table_file.active_root().slot_no, 0);
             assert_eq!(table_file.active_root().trx_id, 1);
 
             // We first drop file system, then send the IO request,
             // it should fail.
             drop(fs);
 
-            let res = read_page_for_test(&table_file, 1).await;
+            let res = read_page_for_test(&table_file, BlockID::from(1)).await;
             assert!(res.is_err());
 
             drop(table_file);
@@ -737,7 +739,7 @@ mod tests {
 
     fn assert_table_meta_corruption(
         err: Error,
-        page_id: PageID,
+        page_id: BlockID,
         cause: PersistedPageCorruptionCause,
     ) {
         assert!(matches!(
@@ -762,11 +764,11 @@ mod tests {
                 .unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            let active_meta_page_id = table_file.active_root().meta_page_id;
+            let active_meta_page_id = table_file.active_root().meta_block_id;
             drop(table_file);
             drop(fs);
 
-            let checksum_offset = active_meta_page_id * COW_FILE_PAGE_SIZE as u64
+            let checksum_offset = u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64
                 + (COW_FILE_PAGE_SIZE - PAGE_INTEGRITY_TRAILER_SIZE) as u64;
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
@@ -795,11 +797,11 @@ mod tests {
                 .unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            let active_meta_page_id = table_file.active_root().meta_page_id;
+            let active_meta_page_id = table_file.active_root().meta_block_id;
             drop(table_file);
             drop(fs);
 
-            let version_offset = active_meta_page_id * COW_FILE_PAGE_SIZE as u64
+            let version_offset = u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64
                 + TABLE_META_MAGIC_WORD.len() as u64;
             overwrite_file_bytes(
                 &path,

@@ -1,8 +1,8 @@
+use crate::buffer::PageID;
 use crate::buffer::guard::{
     ExclusiveLockStrategy, FacadePageGuard, LockStrategy, OptimisticLockStrategy,
     PageExclusiveGuard, PageGuard, PageSharedGuard, SharedLockStrategy,
 };
-use crate::buffer::page::PageID;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
@@ -166,7 +166,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         continue;
                     }
                     let c_page_id = if pos.idx == -1 {
-                        p_node.lower_fence_value().to_u64()
+                        p_node.lower_fence_value().into()
                     } else {
                         p_node.value_as_page_id(pos.idx as usize)
                     };
@@ -478,7 +478,7 @@ impl<P: BufferPool> GenericBTree<P> {
             if root.height() == 0 || root.count() > 0 {
                 return Ok(());
             }
-            let c_page_id = root.lower_fence_value().to_u64();
+            let c_page_id = root.lower_fence_value().into();
             let mut c_guard = self
                 .pool
                 .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
@@ -1156,7 +1156,7 @@ impl<P: BufferPool> GenericBTree<P> {
         // Deallocate child associated with lower fence key.
         // Only left-most node has lower fence child.
         if !p_node.lower_fence_value().is_deleted() {
-            let c_page_id = p_node.lower_fence_value().to_u64();
+            let c_page_id = p_node.lower_fence_value().into();
             let c_guard = self
                 .pool
                 .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Exclusive)
@@ -1831,7 +1831,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
         if let Some(parent) = self.coupling.parent.as_mut() {
             let p_node = parent.g.page();
             let c_page_id = if parent.idx == -1 {
-                p_node.lower_fence_value().to_u64()
+                p_node.lower_fence_value().into()
             } else {
                 p_node.value_as_page_id(parent.idx as usize)
             };

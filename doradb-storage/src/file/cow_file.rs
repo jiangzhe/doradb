@@ -1,6 +1,6 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::page::{PAGE_SIZE, PageID};
-use crate::buffer::{PersistedBlockKey, PersistedFileID, ReadSubmission, ReadonlyBufferPool};
+use crate::buffer::page::PAGE_SIZE;
+use crate::buffer::{BlockKey, PersistedFileID, ReadSubmission, ReadonlyBufferPool};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
@@ -14,6 +14,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
+pub use crate::file::BlockID;
+
 /// Shared page size of CoW table files and multi-table files.
 pub const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
 /// Reserved persisted block id that stores the colocated ping-pong super-page
@@ -21,35 +23,37 @@ pub const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
 ///
 /// Because block `0` is occupied by that super block, no other persisted
 /// meta/data/blob/index block may legally use this id.
-pub const SUPER_BLOCK_ID: PageID = 0;
+pub const SUPER_BLOCK_ID: BlockID = BlockID::new(0);
+/// Sentinel persisted block id used only for cleared in-memory metadata.
+pub const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub trait MutableCowFile {
-    fn allocate_page_id(&mut self) -> Result<PageID>;
-    fn record_gc_page(&mut self, page_id: PageID);
-    fn write_page(
+    fn allocate_block_id(&mut self) -> Result<BlockID>;
+    fn record_gc_block(&mut self, block_id: BlockID);
+    fn write_block(
         &self,
-        page_id: PageID,
+        block_id: BlockID,
         buf: DirectBuf,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 /// Shared in-memory active root for copy-on-write files.
 ///
-/// `ActiveRoot<M>` stores generic CoW bookkeeping (`page_no`, `meta_page_id`,
+/// `ActiveRoot<M>` stores generic CoW bookkeeping (`slot_no`, `meta_block_id`,
 /// allocation map, GC list) plus a file-specific payload `M`.
 #[derive(Clone)]
 pub struct ActiveRoot<M> {
     /// Active ping-pong super-page slot (0/1).
-    pub page_no: PageID,
+    pub slot_no: u64,
     /// Transaction/checkpoint id persisted in current super page.
     pub trx_id: TrxID,
     /// Active meta-page id referenced by the super page.
-    pub meta_page_id: PageID,
+    pub meta_block_id: BlockID,
     /// Allocation map used for page-id assignment.
     pub alloc_map: AllocMap,
     /// Obsolete meta pages pending reclamation.
-    pub gc_page_list: Vec<PageID>,
+    pub gc_block_list: Vec<BlockID>,
     /// File-specific in-memory metadata payload.
     pub meta: M,
 }
@@ -58,19 +62,19 @@ impl<M> ActiveRoot<M> {
     /// Build one active root from already-parsed super/meta payload parts.
     #[inline]
     pub fn from_parts(
-        page_no: PageID,
+        slot_no: u64,
         trx_id: TrxID,
-        meta_page_id: PageID,
+        meta_block_id: BlockID,
         alloc_map: AllocMap,
-        gc_page_list: Vec<PageID>,
+        gc_block_list: Vec<BlockID>,
         meta: M,
     ) -> Self {
         ActiveRoot {
-            page_no,
+            slot_no,
             trx_id,
-            meta_page_id,
+            meta_block_id,
             alloc_map,
-            gc_page_list,
+            gc_block_list,
             meta,
         }
     }
@@ -82,7 +86,7 @@ impl<M> ActiveRoot<M> {
         M: Clone,
     {
         let mut new = self.clone();
-        new.page_no = 1 - self.page_no;
+        new.slot_no = 1 - self.slot_no;
         new
     }
 
@@ -91,18 +95,16 @@ impl<M> ActiveRoot<M> {
     /// This is used during publish so the next root keeps a reclaim list
     /// for historical meta pages.
     #[inline]
-    pub fn push_gc_meta_page(&mut self, page_id: PageID) {
-        self.gc_page_list.push(page_id);
+    pub fn push_gc_meta_block(&mut self, block_id: BlockID) {
+        self.gc_block_list.push(block_id);
     }
 
     /// Allocate one new page id for copy-on-write publish.
     ///
     /// Returns `None` when the allocation bitmap cannot provide a new page.
     #[inline]
-    pub fn try_allocate_page_id(&mut self) -> Option<PageID> {
-        self.alloc_map
-            .try_allocate()
-            .map(|page_id| page_id as PageID)
+    pub fn try_allocate_block_id(&mut self) -> Option<BlockID> {
+        self.alloc_map.try_allocate().map(BlockID::from)
     }
 }
 
@@ -124,7 +126,7 @@ impl<M> DerefMut for ActiveRoot<M> {
 
 /// Decoded meta-page payload used to assemble an active root.
 ///
-/// `parse_meta_page` returns this value so `CowFile` can reconstruct one
+/// `parse_meta_block` returns this value so `CowFile` can reconstruct one
 /// full [`ActiveRoot`] without trait-based root logic.
 pub struct ParsedMeta<M> {
     /// File-specific metadata payload.
@@ -132,7 +134,7 @@ pub struct ParsedMeta<M> {
     /// Decoded allocation bitmap for the file.
     pub alloc_map: AllocMap,
     /// Decoded obsolete page list.
-    pub gc_page_list: Vec<PageID>,
+    pub gc_block_list: Vec<BlockID>,
 }
 
 /// Serialization and parsing callbacks for one concrete CoW file type.
@@ -144,11 +146,11 @@ pub struct CowCodec<M> {
     /// Parse one super-page image.
     pub parse_super_page: fn(&[u8]) -> Result<SuperPage>,
     /// Parse one meta-page image.
-    pub parse_meta_page: fn(PageID, &[u8]) -> Result<ParsedMeta<M>>,
+    pub parse_meta_block: fn(BlockID, &[u8]) -> Result<ParsedMeta<M>>,
     /// Validate root invariants after parsing one meta page.
-    pub validate_root: fn(PageID, &ParsedMeta<M>) -> Result<()>,
+    pub validate_root: fn(BlockID, &ParsedMeta<M>) -> Result<()>,
     /// Build one meta-page image from active root.
-    pub build_meta_page: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
+    pub build_meta_block: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
     /// Build one super-page image from active root.
     pub build_super_page: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
 }
@@ -265,17 +267,17 @@ impl<M> CowFile<M> {
         );
     }
 
-    /// Write one page using async direct IO.
+    /// Write one block using async direct IO.
     #[inline]
-    pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
+    pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
         debug_assert!(buf.capacity() == COW_FILE_PAGE_SIZE);
-        let offset = page_id as usize * COW_FILE_PAGE_SIZE;
+        let offset = usize::from(block_id) * COW_FILE_PAGE_SIZE;
         self.write_at_offset(offset, buf).await
     }
 
     #[inline]
-    fn block_key(&self, offset: usize) -> PersistedBlockKey {
-        PersistedBlockKey::new(self.file_id, (offset / COW_FILE_PAGE_SIZE) as PageID)
+    fn block_key(&self, offset: usize) -> BlockKey {
+        BlockKey::new(self.file_id, BlockID::from(offset / COW_FILE_PAGE_SIZE))
     }
 
     /// Write one buffer at given byte offset.
@@ -328,7 +330,7 @@ impl<M> CowFile<M> {
     /// This is the intended runtime use of `ReadonlyBufferPool::read_block()`.
     /// The raw block reads here are acceptable because super/meta-page
     /// validation happens immediately through `pick_super_page`,
-    /// `parse_meta_page`, and `validate_root`. New callers should prefer
+    /// `parse_meta_block`, and `validate_root`. New callers should prefer
     /// `read_validated_block()` unless they have an equivalent caller-owned
     /// validation path and have reviewed the raw-read inflight semantics.
     #[inline]
@@ -343,21 +345,21 @@ impl<M> CowFile<M> {
             Self::pick_super_page(super_page_guard.page(), self.codec.parse_super_page)?;
         drop(super_page_guard);
 
-        let _ = disk_pool.invalidate_block_id(super_page.body.meta_page_id);
+        let _ = disk_pool.invalidate_block_id(super_page.body.meta_block_id);
         let meta_page_guard = disk_pool
-            .read_block(&pool_guard, super_page.body.meta_page_id)
+            .read_block(&pool_guard, super_page.body.meta_block_id)
             .await?;
         let parsed_meta =
-            (self.codec.parse_meta_page)(super_page.body.meta_page_id, meta_page_guard.page())?;
-        (self.codec.validate_root)(super_page.body.meta_page_id, &parsed_meta)?;
+            (self.codec.parse_meta_block)(super_page.body.meta_block_id, meta_page_guard.page())?;
+        (self.codec.validate_root)(super_page.body.meta_block_id, &parsed_meta)?;
         drop(meta_page_guard);
 
         Ok(ActiveRoot::from_parts(
-            super_page.header.page_no,
+            super_page.header.slot_no,
             super_page.header.checkpoint_cts,
-            super_page.body.meta_page_id,
+            super_page.body.meta_block_id,
             parsed_meta.alloc_map,
-            parsed_meta.gc_page_list,
+            parsed_meta.gc_block_list,
             parsed_meta.meta,
         ))
     }
@@ -371,22 +373,22 @@ impl<M> CowFile<M> {
     /// 4. fsync and atomically swap active root pointer.
     #[inline]
     pub async fn publish_root(&self, mut new_root: ActiveRoot<M>) -> Result<Option<OldCowRoot<M>>> {
-        let old_meta_page_id = new_root.meta_page_id;
-        if old_meta_page_id != SUPER_BLOCK_ID {
-            new_root.push_gc_meta_page(old_meta_page_id);
+        let old_meta_block_id = new_root.meta_block_id;
+        if old_meta_block_id != SUPER_BLOCK_ID {
+            new_root.push_gc_meta_block(old_meta_block_id);
         }
 
-        let new_meta_page_id = match new_root.try_allocate_page_id() {
-            Some(page_id) => page_id,
+        let new_meta_block_id = match new_root.try_allocate_block_id() {
+            Some(block_id) => block_id,
             None => return Err(Error::InvalidState),
         };
-        new_root.meta_page_id = new_meta_page_id;
+        new_root.meta_block_id = new_meta_block_id;
 
-        let meta_buf = (self.codec.build_meta_page)(&new_root)?;
-        self.write_page(new_meta_page_id, meta_buf).await?;
+        let meta_buf = (self.codec.build_meta_block)(&new_root)?;
+        self.write_block(new_meta_block_id, meta_buf).await?;
 
         let super_buf = (self.codec.build_super_page)(&new_root)?;
-        let offset = new_root.page_no as usize * super_buf.capacity();
+        let offset = new_root.slot_no as usize * super_buf.capacity();
         self.write_at_offset(offset, super_buf).await?;
 
         self.fsync()?;
@@ -460,28 +462,21 @@ impl<M> CowFile<M> {
 }
 
 #[inline]
-pub(crate) fn validate_active_meta_page_id(
+pub(crate) fn validate_active_meta_block_id(
     alloc_map: &AllocMap,
-    meta_page_id: PageID,
+    meta_block_id: BlockID,
     file_kind: PersistedFileKind,
     page_kind: PersistedPageKind,
 ) -> Result<()> {
-    let meta_page_idx = usize::try_from(meta_page_id).map_err(|_| {
-        Error::persisted_page_corrupted(
-            file_kind,
-            page_kind,
-            meta_page_id,
-            PersistedPageCorruptionCause::InvalidRootInvariant,
-        )
-    })?;
-    if meta_page_idx == SUPER_BLOCK_ID as usize
-        || meta_page_idx >= alloc_map.len()
-        || !alloc_map.is_allocated(meta_page_idx)
+    let meta_block_idx = usize::from(meta_block_id);
+    if meta_block_idx == usize::from(SUPER_BLOCK_ID)
+        || meta_block_idx >= alloc_map.len()
+        || !alloc_map.is_allocated(meta_block_idx)
     {
         return Err(Error::persisted_page_corrupted(
             file_kind,
             page_kind,
-            meta_page_id,
+            meta_block_id,
             PersistedPageCorruptionCause::InvalidRootInvariant,
         ));
     }

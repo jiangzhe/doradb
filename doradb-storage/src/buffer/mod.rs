@@ -22,27 +22,251 @@ pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
 pub(crate) use readonly::DiskPoolWorkers;
 pub(crate) use readonly::ReadSubmission;
-pub use readonly::{
-    GlobalReadonlyBufferPool, PersistedBlockKey, ReadonlyBlockGuard, ReadonlyBufferPool,
-};
+pub use readonly::{BlockKey, GlobalReadonlyBufferPool, ReadonlyBlockGuard, ReadonlyBufferPool};
 
 /// Physical file identity used by persisted-block mappings and cache invalidation.
 pub type PersistedFileID = u64;
 
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, PageID, VersionedPageID};
+use crate::buffer::page::{BufferPage, VersionedPageID};
 use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
     MetaPoolConfig, ShelfScope,
 };
+use crate::compression::BitPackable;
 use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
 use crate::error::{PersistedFileKind, Result};
+use crate::file::BlockID;
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
+use crate::serde::{Deser, Ser, Serde};
+use bytemuck::{Pod, Zeroable};
+use std::fmt;
 use std::future::Future;
+use std::mem;
+use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Runtime buffer-managed page identity.
+///
+/// This id is reserved for mutable or cached pages owned by the buffer layer.
+/// Persisted fixed-size file units use `crate::file::BlockID` instead.
+#[repr(transparent)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, Pod)]
+pub struct PageID(u64);
+
+impl PageID {
+    #[inline]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    #[inline]
+    pub const fn to_le_bytes(self) -> [u8; mem::size_of::<u64>()] {
+        self.0.to_le_bytes()
+    }
+
+    #[inline]
+    pub const fn from_le_bytes(bytes: [u8; mem::size_of::<u64>()]) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
+}
+
+impl From<u64> for PageID {
+    #[inline]
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<u32> for PageID {
+    #[inline]
+    fn from(value: u32) -> Self {
+        Self(value as u64)
+    }
+}
+
+impl From<i32> for PageID {
+    #[inline]
+    fn from(value: i32) -> Self {
+        debug_assert!(value >= 0);
+        Self(value as u64)
+    }
+}
+
+impl From<usize> for PageID {
+    #[inline]
+    fn from(value: usize) -> Self {
+        Self(value as u64)
+    }
+}
+
+impl From<PageID> for u64 {
+    #[inline]
+    fn from(value: PageID) -> Self {
+        value.0
+    }
+}
+
+impl From<PageID> for usize {
+    #[inline]
+    fn from(value: PageID) -> Self {
+        value.as_usize()
+    }
+}
+
+impl Add<u64> for PageID {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: u64) -> Self::Output {
+        Self(self.0 + rhs)
+    }
+}
+
+impl AddAssign<u64> for PageID {
+    #[inline]
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 += rhs;
+    }
+}
+
+impl Sub<u64> for PageID {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: u64) -> Self::Output {
+        Self(self.0 - rhs)
+    }
+}
+
+impl SubAssign<u64> for PageID {
+    #[inline]
+    fn sub_assign(&mut self, rhs: u64) {
+        self.0 -= rhs;
+    }
+}
+
+impl Sub<PageID> for u64 {
+    type Output = PageID;
+
+    #[inline]
+    fn sub(self, rhs: PageID) -> Self::Output {
+        PageID(self - rhs.0)
+    }
+}
+
+impl PartialEq<u64> for PageID {
+    #[inline]
+    fn eq(&self, other: &u64) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<i32> for PageID {
+    #[inline]
+    fn eq(&self, other: &i32) -> bool {
+        *other >= 0 && self.0 == *other as u64
+    }
+}
+
+impl PartialEq<PageID> for u64 {
+    #[inline]
+    fn eq(&self, other: &PageID) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialEq<PageID> for i32 {
+    #[inline]
+    fn eq(&self, other: &PageID) -> bool {
+        *self >= 0 && *self as u64 == other.0
+    }
+}
+
+impl fmt::Display for PageID {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Ser<'_> for PageID {
+    #[inline]
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u64>()
+    }
+
+    #[inline]
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        out.ser_u64(start_idx, self.0)
+    }
+}
+
+impl Deser for PageID {
+    #[inline]
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::error::Result<(usize, Self)> {
+        input
+            .deser_u64(start_idx)
+            .map(|(idx, raw)| (idx, Self(raw)))
+    }
+}
+
+impl BitPackable for PageID {
+    const ZERO: Self = Self(0);
+
+    #[inline]
+    fn sub_to_u64(self, min: Self) -> u64 {
+        self.0.wrapping_sub(min.0)
+    }
+
+    #[inline]
+    fn sub_to_u32(self, min: Self) -> u32 {
+        self.0.wrapping_sub(min.0) as u32
+    }
+
+    #[inline]
+    fn add_from_u32(self, delta: u32) -> Self {
+        Self(self.0.wrapping_add(delta as u64))
+    }
+
+    #[inline]
+    fn sub_to_u16(self, min: Self) -> u16 {
+        self.0.wrapping_sub(min.0) as u16
+    }
+
+    #[inline]
+    fn add_from_u16(self, delta: u16) -> Self {
+        Self(self.0.wrapping_add(delta as u64))
+    }
+
+    #[inline]
+    fn sub_to_u8(self, min: Self) -> u8 {
+        self.0.wrapping_sub(min.0) as u8
+    }
+
+    #[inline]
+    fn add_from_u8(self, delta: u8) -> Self {
+        Self(self.0.wrapping_add(delta as u64))
+    }
+}
+
+pub const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
 
 /// Shared terminal-status cell for one page-sized buffer-pool IO operation.
 ///
@@ -52,7 +276,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) type PageIOCompletion = Completion<Result<PageID>>;
 
 /// Validation callback for one persisted readonly-cache page image.
-pub(crate) type ReadonlyPageValidator = fn(&[u8], PersistedFileKind, PageID) -> Result<()>;
+pub(crate) type ReadonlyBlockValidator = fn(&[u8], PersistedFileKind, BlockID) -> Result<()>;
 
 /// Snapshot of buffer-pool access and IO lifecycle counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

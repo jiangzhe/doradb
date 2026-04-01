@@ -1,5 +1,4 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::page::PageID;
 use crate::buffer::{PersistedFileID, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{
@@ -7,8 +6,8 @@ use crate::error::{
 };
 use crate::file::TableFsRequest;
 use crate::file::cow_file::{
-    ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, MutableCowFile,
-    OldCowRoot, ParsedMeta, validate_active_meta_page_id,
+    ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
+    MutableCowFile, OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
 use crate::file::meta_page::{
     MULTI_TABLE_META_MAGIC_WORD, MultiTableMetaPageData, MultiTableMetaPageSerView,
@@ -56,7 +55,7 @@ pub struct CatalogTableRootDesc {
 
 /// File-specific payload persisted in `catalog.mtb` meta pages.
 ///
-/// Generic CoW bookkeeping fields (`alloc_map`, `gc_page_list`, `meta_page_id`)
+/// Generic CoW bookkeeping fields (`alloc_map`, `gc_block_list`, `meta_block_id`)
 /// are stored on the shared active root, not in this payload struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultiTableMetaPage {
@@ -90,13 +89,13 @@ impl MultiTableActiveRoot {
     pub fn new() -> Self {
         let max_pages = MULTI_TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
         let alloc_map = AllocMap::new(max_pages);
-        let allocated = alloc_map.allocate_at(0);
+        let allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
         debug_assert!(allocated);
 
         MultiTableActiveRoot::from_parts(
             0,
             MIN_SNAPSHOT_TS,
-            0,
+            SUPER_BLOCK_ID,
             alloc_map,
             vec![],
             MultiTableMetaPage::new(USER_OBJ_ID_START),
@@ -105,7 +104,7 @@ impl MultiTableActiveRoot {
 
     #[inline]
     pub fn meta_page_ser_view(&self) -> MultiTableMetaPageSerView<'_> {
-        MultiTableMetaPageSerView::new(&self.meta, &self.alloc_map, &self.gc_page_list)
+        MultiTableMetaPageSerView::new(&self.meta, &self.alloc_map, &self.gc_block_list)
     }
 }
 
@@ -136,15 +135,15 @@ fn parse_multi_table_super_page(buf: &[u8]) -> Result<crate::file::super_page::S
 #[inline]
 fn build_multi_table_super_page(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
     Ok(build_super_page(
-        root.page_no,
+        root.slot_no,
         root.trx_id,
-        root.meta_page_id,
+        root.meta_block_id,
     ))
 }
 
 #[inline]
 fn parse_multi_table_meta_page(
-    page_id: PageID,
+    page_id: BlockID,
     buf: &[u8],
 ) -> Result<ParsedMeta<MultiTableMetaPage>> {
     let payload = validate_page(buf, MULTI_TABLE_META_PAGE_SPEC).map_err(|cause| {
@@ -171,18 +170,18 @@ fn parse_multi_table_meta_page(
             table_roots: meta_page.table_roots,
         },
         alloc_map: meta_page.alloc_map,
-        gc_page_list: meta_page.gc_page_list,
+        gc_block_list: meta_page.gc_block_list,
     })
 }
 
 #[inline]
 fn validate_multi_table_root(
-    meta_page_id: PageID,
+    meta_block_id: BlockID,
     parsed_meta: &ParsedMeta<MultiTableMetaPage>,
 ) -> Result<()> {
-    validate_active_meta_page_id(
+    validate_active_meta_block_id(
         &parsed_meta.alloc_map,
-        meta_page_id,
+        meta_block_id,
         PersistedFileKind::CatalogMultiTableFile,
         PersistedPageKind::MultiTableMeta,
     )
@@ -192,7 +191,8 @@ fn validate_multi_table_root(
 fn build_multi_table_meta_page(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
     let meta_page = root.meta_page_ser_view();
     let meta_len = meta_page.ser_len();
-    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) || root.gc_page_list.len() > u32::MAX as usize
+    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE)
+        || root.gc_block_list.len() > u32::MAX as usize
     {
         return Err(Error::InvalidState);
     }
@@ -211,9 +211,9 @@ fn build_multi_table_meta_page(root: &MultiTableActiveRoot) -> Result<DirectBuf>
 fn multi_table_codec() -> CowCodec<MultiTableMetaPage> {
     CowCodec {
         parse_super_page: parse_multi_table_super_page,
-        parse_meta_page: parse_multi_table_meta_page,
+        parse_meta_block: parse_multi_table_meta_page,
         validate_root: validate_multi_table_root,
-        build_meta_page: build_multi_table_meta_page,
+        build_meta_block: build_multi_table_meta_page,
         build_super_page: build_multi_table_super_page,
     }
 }
@@ -389,22 +389,22 @@ impl MutableMultiTableFile {
 
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
-    pub fn allocate_page_id(&mut self) -> Result<PageID> {
+    pub fn allocate_block_id(&mut self) -> Result<BlockID> {
         self.new_root_mut()
-            .try_allocate_page_id()
+            .try_allocate_block_id()
             .ok_or(Error::InvalidState)
     }
 
     /// Record an obsolete page id to be reclaimed after commit.
     #[inline]
-    pub fn record_gc_page(&mut self, page_id: PageID) {
-        self.new_root_mut().gc_page_list.push(page_id);
+    pub fn record_gc_block(&mut self, block_id: BlockID) {
+        self.new_root_mut().gc_block_list.push(block_id);
     }
 
     /// Write one page into the underlying multi-table file.
     #[inline]
-    pub async fn write_page(&self, page_id: PageID, buf: DirectBuf) -> Result<()> {
-        self.file_ref().write_page(page_id, buf).await
+    pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        self.file_ref().write_block(block_id, buf).await
     }
 
     /// Apply checkpoint metadata to mutable root.
@@ -461,22 +461,22 @@ impl Drop for MutableMultiTableFile {
 
 impl MutableCowFile for MutableMultiTableFile {
     #[inline]
-    fn allocate_page_id(&mut self) -> Result<PageID> {
-        MutableMultiTableFile::allocate_page_id(self)
+    fn allocate_block_id(&mut self) -> Result<BlockID> {
+        MutableMultiTableFile::allocate_block_id(self)
     }
 
     #[inline]
-    fn record_gc_page(&mut self, page_id: PageID) {
-        MutableMultiTableFile::record_gc_page(self, page_id)
+    fn record_gc_block(&mut self, block_id: BlockID) {
+        MutableMultiTableFile::record_gc_block(self, block_id)
     }
 
     #[inline]
-    fn write_page(
+    fn write_block(
         &self,
-        page_id: PageID,
+        block_id: BlockID,
         buf: DirectBuf,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        MutableMultiTableFile::write_page(self, page_id, buf)
+        MutableMultiTableFile::write_block(self, block_id, buf)
     }
 }
 
@@ -484,16 +484,16 @@ impl MutableCowFile for MutableMultiTableFile {
 pub type OldMultiTableRoot = OldCowRoot<MultiTableMetaPage>;
 
 #[inline]
-fn build_super_page(page_no: PageID, checkpoint_cts: TrxID, meta_page_id: PageID) -> DirectBuf {
+fn build_super_page(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID) -> DirectBuf {
     let mut buf = DirectBuf::zeroed(SUPER_PAGE_SIZE);
     let ser_view = SuperPageSerView {
         header: SuperPageHeader {
             magic_word: MULTI_TABLE_FILE_MAGIC_WORD,
             version: SUPER_PAGE_VERSION,
-            page_no,
+            slot_no,
             checkpoint_cts,
         },
-        body: SuperPageBody { meta_page_id },
+        body: SuperPageBody { meta_block_id },
     };
     let ser_len = ser_view.ser_len();
     debug_assert!(ser_len <= SUPER_PAGE_FOOTER_OFFSET);
@@ -535,7 +535,7 @@ mod tests {
 
     fn assert_multi_table_meta_corruption(
         err: Error,
-        page_id: PageID,
+        page_id: BlockID,
         cause: PersistedPageCorruptionCause,
     ) {
         assert!(matches!(
@@ -563,8 +563,8 @@ mod tests {
             let s0 = mtb.load_snapshot().unwrap();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(s0.meta.next_user_obj_id, USER_OBJ_ID_START);
-            let meta_page_id_0 = mtb.active_root().meta_page_id;
-            assert!(meta_page_id_0 > 0);
+            let meta_page_id_0 = mtb.active_root().meta_block_id;
+            assert!(meta_page_id_0 > BlockID::from(0));
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
@@ -575,7 +575,7 @@ mod tests {
             mtb.publish_checkpoint(7, USER_OBJ_ID_START + 16, roots)
                 .await
                 .unwrap();
-            let meta_page_id_1 = mtb.active_root().meta_page_id;
+            let meta_page_id_1 = mtb.active_root().meta_block_id;
             assert_ne!(meta_page_id_0, meta_page_id_1);
             drop(mtb);
 
@@ -609,20 +609,20 @@ mod tests {
                 root.table_id = idx as u64;
             }
 
-            let meta_page_id_0 = mtb.active_root().meta_page_id;
+            let meta_page_id_0 = mtb.active_root().meta_block_id;
             mtb.publish_checkpoint(3, USER_OBJ_ID_START + 1, roots)
                 .await
                 .unwrap();
-            let meta_page_id_1 = mtb.active_root().meta_page_id;
+            let meta_page_id_1 = mtb.active_root().meta_block_id;
             mtb.publish_checkpoint(4, USER_OBJ_ID_START + 2, roots)
                 .await
                 .unwrap();
-            let meta_page_id_2 = mtb.active_root().meta_page_id;
+            let meta_page_id_2 = mtb.active_root().meta_block_id;
 
             assert_ne!(meta_page_id_0, meta_page_id_1);
             assert_ne!(meta_page_id_1, meta_page_id_2);
-            assert!(mtb.active_root().gc_page_list.contains(&meta_page_id_0));
-            assert!(mtb.active_root().gc_page_list.contains(&meta_page_id_1));
+            assert!(mtb.active_root().gc_block_list.contains(&meta_page_id_0));
+            assert!(mtb.active_root().gc_block_list.contains(&meta_page_id_1));
         });
     }
 
@@ -671,7 +671,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let active_meta_page_id = mtb.active_root().meta_page_id;
+            let active_meta_page_id = mtb.active_root().meta_block_id;
             drop(mtb);
             drop(fs);
 
@@ -681,7 +681,7 @@ mod tests {
                 .open(&path)
                 .unwrap();
             // overwrite meta-page version to simulate format mismatch.
-            let meta_offset = active_meta_page_id * COW_FILE_PAGE_SIZE as u64;
+            let meta_offset = u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64;
             file.seek(SeekFrom::Start(
                 meta_offset + crate::file::meta_page::MULTI_TABLE_META_MAGIC_WORD.len() as u64,
             ))
@@ -713,11 +713,11 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let active_meta_page_id = mtb.active_root().meta_page_id;
+            let active_meta_page_id = mtb.active_root().meta_block_id;
             drop(mtb);
             drop(fs);
 
-            let checksum_offset = active_meta_page_id * COW_FILE_PAGE_SIZE as u64
+            let checksum_offset = u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64
                 + (COW_FILE_PAGE_SIZE - PAGE_INTEGRITY_TRAILER_SIZE) as u64;
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
@@ -762,7 +762,7 @@ mod tests {
             mtb.publish_checkpoint(4, USER_OBJ_ID_START + 2, roots_v2)
                 .await
                 .unwrap();
-            let active_super_slot = mtb.active_root().page_no;
+            let active_super_slot = mtb.active_root().slot_no;
             drop(mtb);
             drop(fs);
 
@@ -811,12 +811,12 @@ mod tests {
             mtb.publish_checkpoint(6, USER_OBJ_ID_START + 11, roots_v2)
                 .await
                 .unwrap();
-            let active_meta_page_id = mtb.active_root().meta_page_id;
+            let active_meta_page_id = mtb.active_root().meta_block_id;
             drop(mtb);
             drop(fs);
 
             let file_bytes = std::fs::read(&path).unwrap();
-            let meta_offset = active_meta_page_id as usize * COW_FILE_PAGE_SIZE;
+            let meta_offset = usize::from(active_meta_page_id) * COW_FILE_PAGE_SIZE;
             let meta_end = meta_offset + COW_FILE_PAGE_SIZE;
             let parsed_meta = parse_multi_table_meta_page(
                 active_meta_page_id,
@@ -826,20 +826,20 @@ mod tests {
             assert!(
                 parsed_meta
                     .alloc_map
-                    .deallocate(active_meta_page_id as usize)
+                    .deallocate(usize::from(active_meta_page_id))
             );
             let invalid_root = MultiTableActiveRoot::from_parts(
                 0,
                 0,
                 active_meta_page_id,
                 parsed_meta.alloc_map,
-                parsed_meta.gc_page_list,
+                parsed_meta.gc_block_list,
                 parsed_meta.meta,
             );
             let invalid_meta_buf = build_multi_table_meta_page(&invalid_root).unwrap();
             overwrite_file_bytes(
                 &path,
-                active_meta_page_id * COW_FILE_PAGE_SIZE as u64,
+                u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64,
                 invalid_meta_buf.as_bytes(),
             );
 

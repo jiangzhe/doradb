@@ -1,4 +1,4 @@
-use crate::buffer::page::PageID;
+use crate::buffer::PageID;
 use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::MutableTableFile;

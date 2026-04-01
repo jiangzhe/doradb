@@ -487,6 +487,7 @@ pub mod tests {
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::file::BlockID;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
@@ -899,11 +900,11 @@ pub mod tests {
                 .copied()
                 .find(|root| root.root_page_id.is_some())
                 .expect("catalog checkpoint should publish at least one root");
-            let root_page_id = root.root_page_id.unwrap().get();
+            let root_block_id = BlockID::from(root.root_page_id.unwrap().get());
             let block_id = {
                 let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
                 let index = ColumnBlockIndex::new(
-                    root_page_id,
+                    root_block_id,
                     root.pivot_row_id,
                     &engine.catalog().storage.disk_pool,
                     &disk_pool_guard,
@@ -919,7 +920,7 @@ pub mod tests {
             };
             drop(engine);
 
-            corrupt_page_checksum(main_dir.join("catalog.mtb"), block_id);
+            corrupt_page_checksum(main_dir.join("catalog.mtb"), u64::from(block_id));
 
             let err = match EngineConfig::default()
                 .storage_root(main_dir)
@@ -978,11 +979,11 @@ pub mod tests {
                 .copied()
                 .find(|root| root.root_page_id.is_some())
                 .expect("catalog checkpoint should publish at least one root");
-            let root_page_id = root.root_page_id.unwrap().get();
+            let root_block_id = BlockID::from(root.root_page_id.unwrap().get());
             let entry = {
                 let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
                 let index = ColumnBlockIndex::new(
-                    root_page_id,
+                    root_block_id,
                     root.pivot_row_id,
                     &engine.catalog().storage.disk_pool,
                     &disk_pool_guard,
@@ -997,7 +998,11 @@ pub mod tests {
             };
             drop(engine);
 
-            corrupt_leaf_delete_codec(main_dir.join("catalog.mtb"), entry.leaf_page_id, 0);
+            corrupt_leaf_delete_codec(
+                main_dir.join("catalog.mtb"),
+                u64::from(entry.leaf_page_id),
+                0,
+            );
 
             let err = match EngineConfig::default()
                 .storage_root(main_dir)

@@ -8,6 +8,7 @@ use doradb_storage::conf::{
 };
 use doradb_storage::engine::Engine;
 use doradb_storage::error::PersistedFileKind;
+use doradb_storage::file::BlockID;
 use doradb_storage::index::ColumnBlockIndex;
 use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::row::RowID;
@@ -41,7 +42,7 @@ struct BenchmarkCase {
     disk_pool: ReadonlyBufferPool,
     disk_pool_guard: PoolGuard,
     _global_pool: QuiescentBox<GlobalReadonlyBufferPool>,
-    root_page_id: u64,
+    root_page_id: BlockID,
     end_row_id: RowID,
     row_ids: Vec<RowID>,
 }

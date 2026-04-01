@@ -1,13 +1,14 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::buffer::page::{INVALID_PAGE_ID, PageID};
-use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards};
+use crate::buffer::page::INVALID_PAGE_ID;
+use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PageID, PoolGuards};
 use crate::catalog::{CatalogTable, TableMetadata};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
+use crate::file::BlockID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex};
-use crate::lwc::PersistedLwcPage;
+use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey,
     SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
@@ -195,8 +196,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 .await?;
             match location {
                 RowLocation::NotFound => return Ok(SelectMvcc::NotFound),
-                RowLocation::LwcPage {
-                    page_id,
+                RowLocation::LwcBlock {
+                    block_id,
                     row_idx,
                     row_shape_fingerprint,
                 } => {
@@ -225,7 +226,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     let vals = self
                         .read_lwc_row(
                             stmt.pool_guards(),
-                            page_id,
+                            block_id,
                             row_idx,
                             row_shape_fingerprint,
                             user_read_set,
@@ -264,7 +265,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     async fn read_lwc_row(
         &self,
         guards: &PoolGuards,
-        page_id: PageID,
+        block_id: BlockID,
         row_idx: usize,
         row_shape_fingerprint: u128,
         read_set: &[usize],
@@ -272,17 +273,17 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let Some(storage) = self.storage else {
             return Err(Error::InvalidState);
         };
-        let page =
-            PersistedLwcPage::load(storage.disk_pool(), guards.disk_guard(), page_id).await?;
-        if page.row_shape_fingerprint() != row_shape_fingerprint {
+        let block =
+            PersistedLwcBlock::load(storage.disk_pool(), guards.disk_guard(), block_id).await?;
+        if block.row_shape_fingerprint() != row_shape_fingerprint {
             return Err(Error::persisted_page_corrupted(
                 PersistedFileKind::TableFile,
                 PersistedPageKind::LwcPage,
-                page_id,
+                block_id,
                 PersistedPageCorruptionCause::InvalidPayload,
             ));
         }
-        page.decode_row_values(self.metadata(), row_idx, read_set)
+        block.decode_row_values(self.metadata(), row_idx, read_set)
     }
 
     #[inline]
@@ -420,7 +421,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             None => unreachable!(),
             Some((row_id, _)) => match self.find_row(guards, row_id, self.storage).await {
                 RowLocation::NotFound => unreachable!(),
-                RowLocation::LwcPage { .. } => todo!("lwc page"),
+                RowLocation::LwcBlock { .. } => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self
                         .get_row_page_exclusive(guards, page_id)
@@ -1039,7 +1040,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 )
                                 .await;
                         }
-                        RowLocation::LwcPage { .. } => todo!("lwc page"),
+                        RowLocation::LwcBlock { .. } => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let Some(page_guard) = self
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
@@ -1102,7 +1103,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 )
                                 .await;
                         }
-                        RowLocation::LwcPage { .. } => todo!("lwc page"),
+                        RowLocation::LwcBlock { .. } => todo!("lwc page"),
                         RowLocation::RowPage(page_id) => {
                             let Some(page_guard) = self
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
@@ -1276,7 +1277,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 .await
             {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
-                Ok(RowLocation::LwcPage { .. }) => todo!("lwc page"),
+                Ok(RowLocation::LwcBlock { .. }) => todo!("lwc page"),
                 Ok(RowLocation::RowPage(page_id)) => {
                     let Some(old_guard) = self
                         .try_get_validated_row_page_shared_result(
@@ -2064,7 +2065,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
             None => return Ok(None),
             Some((row_id, _)) => match self.find_row(guards, row_id, self.storage).await {
                 RowLocation::NotFound => return Ok(None),
-                RowLocation::LwcPage { .. } => todo!("lwc page"),
+                RowLocation::LwcBlock { .. } => todo!("lwc page"),
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
                     (page_guard, row_id)
@@ -2187,7 +2188,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     .await
                 {
                     Ok(RowLocation::NotFound) => return Ok(UpdateMvcc::NotFound),
-                    Ok(RowLocation::LwcPage { .. }) => todo!("lwc page"),
+                    Ok(RowLocation::LwcBlock { .. }) => todo!("lwc page"),
                     Ok(RowLocation::RowPage(page_id)) => {
                         let Some(page_guard) = self
                             .try_get_validated_row_page_shared_result(
@@ -2304,7 +2305,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     .await
                 {
                     Ok(RowLocation::NotFound) => return Ok(DeleteMvcc::NotFound),
-                    Ok(RowLocation::LwcPage { .. }) => {
+                    Ok(RowLocation::LwcBlock { .. }) => {
                         let deletion_buffer = self
                             .deletion_buffer()
                             .expect("catalog table should never have lwc page rows");

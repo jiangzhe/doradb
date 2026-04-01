@@ -12,8 +12,8 @@
 //! We separate all transactions into two kinds:
 //! 1. DDL involved transactions
 //! 2. DML-only transactions
+use crate::buffer::PageID;
 use crate::buffer::guard::PageGuard;
-use crate::buffer::page::PageID;
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
     PoolRole,
@@ -639,7 +639,8 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
-    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
+    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {
+        let page_id = page_id.into();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -657,9 +658,10 @@ mod tests {
 
     fn rewrite_page_with_checksum(
         path: impl AsRef<std::path::Path>,
-        page_id: u64,
+        page_id: impl Into<u64>,
         rewrite: impl FnOnce(&mut [u8]),
     ) {
+        let page_id = page_id.into();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -678,7 +680,7 @@ mod tests {
 
     fn corrupt_blob_header_kind(
         path: impl AsRef<std::path::Path>,
-        page_id: u64,
+        page_id: impl Into<u64>,
         start_offset: u16,
     ) {
         let byte_offset = PAGE_INTEGRITY_HEADER_SIZE

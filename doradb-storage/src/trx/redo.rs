@@ -1,4 +1,4 @@
-use crate::buffer::page::PageID;
+use crate::buffer::PageID;
 use crate::catalog::{IndexID, TableID};
 use crate::error::{Error, Result};
 use crate::row::RowID;
@@ -129,7 +129,7 @@ impl Ser<'_> for RowRedo {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = out.ser_u64(idx, self.page_id);
+        idx = out.ser_u64(idx, self.page_id.into());
         idx = out.ser_u64(idx, self.row_id);
         self.kind.ser(out, idx)
     }
@@ -144,7 +144,7 @@ impl Deser for RowRedo {
         Ok((
             idx,
             RowRedo {
-                page_id,
+                page_id: PageID::from(page_id),
                 row_id,
                 kind,
             },
@@ -261,7 +261,7 @@ impl Ser<'_> for DDLRedo {
                 end_row_id,
             } => {
                 idx = out.ser_u64(idx, *table_id);
-                idx = out.ser_u64(idx, *page_id);
+                idx = out.ser_u64(idx, (*page_id).into());
                 idx = out.ser_u64(idx, *start_row_id);
                 idx = out.ser_u64(idx, *end_row_id);
             }
@@ -310,7 +310,7 @@ impl Deser for DDLRedo {
                     idx,
                     DDLRedo::CreateRowPage {
                         table_id,
-                        page_id,
+                        page_id: PageID::from(page_id),
                         start_row_id,
                         end_row_id,
                     },
@@ -589,7 +589,7 @@ mod tests {
 
         // Test case 1: Simple insert
         let insert_entry = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 100,
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
@@ -600,7 +600,7 @@ mod tests {
 
         // Test case 2: Update after insert
         let update_entry = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 100,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
@@ -617,7 +617,7 @@ mod tests {
 
         // Test case 3: Delete after update
         let delete_entry = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 100,
             kind: RowRedoKind::Delete,
         };
@@ -627,14 +627,14 @@ mod tests {
 
         // Test case 4: Multiple updates
         let insert_entry = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 200,
             kind: RowRedoKind::Insert(vec![Val::U64(1), Val::U64(2)]),
         };
         redo_logs.insert_dml(1, insert_entry);
 
         let update1 = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
@@ -644,7 +644,7 @@ mod tests {
         redo_logs.insert_dml(1, update1);
 
         let update2 = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 1,
@@ -663,7 +663,7 @@ mod tests {
 
         // Test case 5: Multiple tables
         let another_insert = RowRedo {
-            page_id: 2,
+            page_id: PageID::from(2),
             row_id: 300,
             kind: RowRedoKind::Insert(vec![Val::U64(50)]),
         };
@@ -681,14 +681,14 @@ mod tests {
 
         // 测试用例1：合并不同表的日志
         let insert1 = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 100,
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
         redo_logs1.insert_dml(1, insert1);
 
         let insert2 = RowRedo {
-            page_id: 2,
+            page_id: PageID::from(2),
             row_id: 200,
             kind: RowRedoKind::Insert(vec![Val::U64(43)]),
         };
@@ -702,7 +702,7 @@ mod tests {
         // 测试用例2：合并相同表中的不同行
         let mut redo_logs2 = RedoLogs::default();
         let insert3 = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 101,
             kind: RowRedoKind::Insert(vec![Val::U64(44)]),
         };
@@ -721,7 +721,7 @@ mod tests {
         // 测试用例3：合并相同表相同行的操作
         let mut redo_logs2 = RedoLogs::default();
         let update1 = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 100,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
@@ -745,7 +745,7 @@ mod tests {
         // 测试用例5：删除操作的合并
         let mut redo_logs2 = RedoLogs::default();
         let delete1 = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 101,
             kind: RowRedoKind::Delete,
         };
@@ -763,7 +763,7 @@ mod tests {
 
         // 测试用例1：插入操作
         let insert_entry = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 100,
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
@@ -771,7 +771,7 @@ mod tests {
 
         // 测试用例2：更新操作
         let update_entry = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
@@ -782,7 +782,7 @@ mod tests {
 
         // 测试用例3：删除操作
         let delete_entry = RowRedo {
-            page_id: 1,
+            page_id: PageID::from(1),
             row_id: 300,
             kind: RowRedoKind::Delete,
         };

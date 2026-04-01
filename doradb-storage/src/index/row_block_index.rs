@@ -1,13 +1,14 @@
 use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
 };
-use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
-use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
+use crate::buffer::page::{BufferPage, PAGE_SIZE};
+use crate::buffer::{BufferPool, FixedBufferPool, PageID, PoolGuard};
 use crate::catalog::TableMetadata;
 use crate::error::{
     Error, Result, Validation,
     Validation::{Invalid, Valid},
 };
+use crate::file::BlockID;
 use crate::index::util::{Maskable, ParentPosition, RowPageCreateRedoCtx};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
@@ -926,12 +927,12 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
 /// Physical lookup target returned by row/column block-index search.
 pub enum RowLocation {
     /// Persisted lightweight columnar page plus the resolved row ordinal.
-    LwcPage {
-        /// Persisted LWC page id.
-        page_id: PageID,
-        /// Resolved row ordinal within the persisted LWC page.
+    LwcBlock {
+        /// Persisted LWC block id.
+        block_id: BlockID,
+        /// Resolved row ordinal within the persisted LWC block.
         row_idx: usize,
-        /// Canonical authoritative row-shape fingerprint bound to the page.
+        /// Canonical authoritative row-shape fingerprint bound to the block.
         row_shape_fingerprint: u128,
     },
     /// Row page.
@@ -1126,7 +1127,7 @@ mod tests {
         fn new(inner: QuiescentGuard<FixedBufferPool>, fail_page_id: PageID) -> Self {
             Self {
                 inner,
-                fail_page_id: AtomicU64::new(fail_page_id),
+                fail_page_id: AtomicU64::new(u64::from(fail_page_id)),
             }
         }
     }
@@ -1402,7 +1403,7 @@ mod tests {
             for row_page_id in 0..row_pages {
                 loop {
                     if let Valid(_) = blk_idx
-                        .insert_row_page(&pool_guard, 1, row_page_id as PageID)
+                        .insert_row_page(&pool_guard, 1, PageID::from(row_page_id))
                         .await
                     {
                         break;
@@ -1462,7 +1463,7 @@ mod tests {
             for i in 0..row_pages {
                 loop {
                     if let Valid(_) = blk_idx
-                        .insert_row_page(&pool_guard, rows_per_page as u64, i as PageID)
+                        .insert_row_page(&pool_guard, rows_per_page as u64, PageID::from(i))
                         .await
                     {
                         break;
@@ -1472,7 +1473,7 @@ mod tests {
             for i in 0..row_pages {
                 let row_id = (i * rows_per_page + rows_per_page / 2) as RowID;
                 match blk_idx.find_row(&pool_guard, row_id).await {
-                    RowLocation::RowPage(page_id) => assert_eq!(page_id, i as PageID),
+                    RowLocation::RowPage(page_id) => assert_eq!(page_id, PageID::from(i)),
                     _ => panic!("invalid search result for i={i}"),
                 }
             }
@@ -1495,7 +1496,10 @@ mod tests {
 
             for row_page_id in 0..10000 {
                 loop {
-                    if let Valid(_) = blk_idx.insert_row_page(&pool_guard, 100, row_page_id).await {
+                    if let Valid(_) = blk_idx
+                        .insert_row_page(&pool_guard, 100, PageID::from(row_page_id))
+                        .await
+                    {
                         break;
                     }
                 }
@@ -1518,7 +1522,7 @@ mod tests {
 
             // Assign right-most leaf node.
             let mut r_g = pool.allocate_page::<BlockNode>(&pool_guard).await;
-            r_g.page_mut().init(0, 50000, 10000, 10001);
+            r_g.page_mut().init(0, 50000, 10000, PageID::from(10001));
             r_g.page_mut().header.count = NBR_PAGE_ENTRIES_IN_LEAF as u32;
             let r_page_id = r_g.page_id();
             drop(r_g);
@@ -1527,7 +1531,10 @@ mod tests {
             drop(root);
 
             loop {
-                if let Valid(_) = blk_idx.insert_row_page(&pool_guard, 100, 20000).await {
+                if let Valid(_) = blk_idx
+                    .insert_row_page(&pool_guard, 100, PageID::from(20000))
+                    .await
+                {
                     break;
                 }
             }

@@ -70,7 +70,7 @@ impl FailingPageReadHook {
     fn for_page(fd: RawFd, page_id: PageID, errno: i32) -> Self {
         Self {
             fd,
-            offset: page_id as usize * PAGE_SIZE,
+            offset: usize::from(page_id) * PAGE_SIZE,
             errno,
             calls: AtomicUsize::new(0),
         }
@@ -395,12 +395,12 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             .unwrap();
 
         match sys.table.find_row(session.pool_guards(), row_id).await {
-            RowLocation::LwcPage {
-                page_id,
+            RowLocation::LwcBlock {
+                block_id,
                 row_idx,
                 row_shape_fingerprint,
             } => {
-                assert_eq!(page_id, resolved.block_id());
+                assert_eq!(block_id, resolved.block_id());
                 assert_eq!(row_idx, resolved.row_idx());
                 assert_eq!(row_shape_fingerprint, resolved.row_shape_fingerprint());
             }
@@ -1127,7 +1127,7 @@ fn test_row_page_transition_retries_update_delete() {
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
-            RowLocation::LwcPage { .. } => unreachable!("lwc page"),
+            RowLocation::LwcBlock { .. } => unreachable!("lwc page"),
         };
         let page_guard = sys
             .engine
@@ -1862,7 +1862,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
-            RowLocation::LwcPage { .. } => unreachable!("row page expected"),
+            RowLocation::LwcBlock { .. } => unreachable!("row page expected"),
         };
 
         let page_guard = sys
@@ -2127,7 +2127,7 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
 
         let next_page_id = match sys.table.find_row(session.pool_guards(), next_row_id).await {
             RowLocation::RowPage(page_id) => page_id,
-            RowLocation::LwcPage { .. } | RowLocation::NotFound => {
+            RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
                 panic!("row should still be in the in-memory row store")
             }
         };
@@ -2281,7 +2281,7 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
                     break;
                 }
                 RowLocation::RowPage(..) => (),
-                RowLocation::LwcPage { .. } | RowLocation::NotFound => {
+                RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
                     panic!("newly inserted row should stay in a row page")
                 }
             }
@@ -2828,13 +2828,14 @@ async fn assert_row_in_lwc(
         panic!("row should exist");
     };
     match table.find_row(guards, row_id).await {
-        RowLocation::LwcPage { .. } => row_id,
+        RowLocation::LwcBlock { .. } => row_id,
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),
     }
 }
 
-fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
+fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {
+    let page_id = page_id.into();
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -2852,9 +2853,10 @@ fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
 
 fn rewrite_page_with_checksum(
     path: impl AsRef<std::path::Path>,
-    page_id: u64,
+    page_id: impl Into<u64>,
     rewrite: impl FnOnce(&mut [u8]),
 ) {
+    let page_id = page_id.into();
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -2871,21 +2873,33 @@ fn rewrite_page_with_checksum(
     file.flush().unwrap();
 }
 
-fn corrupt_leaf_delete_codec(path: impl AsRef<std::path::Path>, page_id: u64, prefix_idx: usize) {
+fn corrupt_leaf_delete_codec(
+    path: impl AsRef<std::path::Path>,
+    page_id: impl Into<u64>,
+    prefix_idx: usize,
+) {
     rewrite_page_with_checksum(path, page_id, |page| {
         let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 35;
         page[byte_offset] = 0xFF;
     });
 }
 
-fn corrupt_leaf_row_codec(path: impl AsRef<std::path::Path>, page_id: u64, prefix_idx: usize) {
+fn corrupt_leaf_row_codec(
+    path: impl AsRef<std::path::Path>,
+    page_id: impl Into<u64>,
+    prefix_idx: usize,
+) {
     rewrite_page_with_checksum(path, page_id, |page| {
         let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 32;
         page[byte_offset] = 0;
     });
 }
 
-fn corrupt_leaf_block_id(path: impl AsRef<std::path::Path>, page_id: u64, prefix_idx: usize) {
+fn corrupt_leaf_block_id(
+    path: impl AsRef<std::path::Path>,
+    page_id: impl Into<u64>,
+    prefix_idx: usize,
+) {
     rewrite_page_with_checksum(path, page_id, |page| {
         let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
         page[byte_offset..byte_offset + 8].copy_from_slice(&SUPER_BLOCK_ID.to_le_bytes());
@@ -2894,7 +2908,7 @@ fn corrupt_leaf_block_id(path: impl AsRef<std::path::Path>, page_id: u64, prefix
 
 fn corrupt_leaf_short_delete_section_header(
     path: impl AsRef<std::path::Path>,
-    page_id: u64,
+    page_id: impl Into<u64>,
     prefix_idx: usize,
 ) {
     const LEAF_ENTRY_ENTRY_LEN_OFFSET: usize = 28;
@@ -2940,7 +2954,7 @@ fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
     payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
 }
 
-fn corrupt_lwc_row_shape_fingerprint(path: impl AsRef<std::path::Path>, page_id: u64) {
+fn corrupt_lwc_row_shape_fingerprint(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {
     rewrite_page_with_checksum(path, page_id, |page| {
         let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
         page[payload_start] ^= 0xFF;

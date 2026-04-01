@@ -369,6 +369,7 @@ impl MmapLogReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::PageID;
     use crate::io::AIOBuf;
     use crate::trx::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
@@ -386,7 +387,7 @@ mod tests {
             RedoLogs {
                 ddl: Some(Box::new(DDLRedo::CreateRowPage {
                     table_id: 6,
-                    page_id: 5,
+                    page_id: PageID::from(5),
                     start_row_id: 0,
                     end_row_id: 574,
                 })),
@@ -400,7 +401,7 @@ mod tests {
         rows.insert(
             100,
             RowRedo {
-                page_id: 5,
+                page_id: PageID::from(5),
                 row_id: 100,
                 kind: RowRedoKind::Delete,
             },

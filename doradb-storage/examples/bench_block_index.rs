@@ -175,7 +175,7 @@ async fn worker(
         match res {
             RowLocation::RowPage(page_id) => {
                 count += 1;
-                sum_page_id += page_id;
+                sum_page_id += u64::from(page_id);
             }
             _ => panic!("invalid search result"),
         }

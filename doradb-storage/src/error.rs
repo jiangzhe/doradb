@@ -1,4 +1,4 @@
-use crate::buffer::page::PageID;
+use crate::file::BlockID;
 use crate::io::AIOError;
 use crate::row::RowID;
 use std::array::TryFromSliceError;
@@ -178,7 +178,7 @@ pub enum Error {
     PersistedPageCorrupted {
         file_kind: PersistedFileKind,
         page_kind: PersistedPageKind,
-        page_id: PageID,
+        page_id: BlockID,
         cause: PersistedPageCorruptionCause,
     },
     #[error(
@@ -229,7 +229,7 @@ impl Error {
     pub fn persisted_page_corrupted(
         file_kind: PersistedFileKind,
         page_kind: PersistedPageKind,
-        page_id: PageID,
+        page_id: BlockID,
         cause: PersistedPageCorruptionCause,
     ) -> Self {
         Error::PersistedPageCorrupted {
