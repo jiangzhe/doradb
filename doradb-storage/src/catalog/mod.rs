@@ -489,7 +489,7 @@ pub mod tests {
     use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
-    use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_PREFIX_SIZE, ColumnBlockIndex};
+    use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::table::TablePersistence;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
@@ -672,14 +672,33 @@ pub mod tests {
         page_id: u64,
         prefix_idx: usize,
     ) {
-        const DELETE_CODEC_OFFSET_IN_PREFIX: usize = 38;
-        let byte_offset = PAGE_INTEGRITY_HEADER_SIZE
-            + COLUMN_BLOCK_HEADER_SIZE
-            + prefix_idx * COLUMN_BLOCK_LEAF_PREFIX_SIZE
-            + DELETE_CODEC_OFFSET_IN_PREFIX;
         rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 35;
             page[byte_offset] = 0xFF;
         });
+    }
+
+    fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
+        const SEARCH_TYPE_PLAIN: u8 = 1;
+        const SEARCH_TYPE_DELTA_U32: u8 = 2;
+        const SEARCH_TYPE_DELTA_U16: u8 = 3;
+
+        let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+        let search_type = page[payload_start + COLUMN_BLOCK_HEADER_SIZE];
+        let (prefix_size, entry_offset_offset) = match search_type {
+            SEARCH_TYPE_PLAIN => (10usize, 8usize),
+            SEARCH_TYPE_DELTA_U32 => (6usize, 4usize),
+            SEARCH_TYPE_DELTA_U16 => (4usize, 2usize),
+            _ => panic!("invalid leaf search type {search_type}"),
+        };
+        let prefix_offset =
+            payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + prefix_idx * prefix_size;
+        let entry_offset = u16::from_le_bytes(
+            page[prefix_offset + entry_offset_offset..prefix_offset + entry_offset_offset + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
     }
 
     #[test]

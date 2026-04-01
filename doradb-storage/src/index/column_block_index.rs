@@ -24,13 +24,27 @@ pub const COLUMN_BLOCK_NODE_PAYLOAD_SIZE: usize = max_payload_len(COLUMN_BLOCK_P
 pub const COLUMN_BLOCK_HEADER_SIZE: usize = mem::size_of::<ColumnBlockNodeHeader>();
 pub const COLUMN_BLOCK_DATA_SIZE: usize = COLUMN_BLOCK_NODE_PAYLOAD_SIZE - COLUMN_BLOCK_HEADER_SIZE;
 pub const COLUMN_BRANCH_ENTRY_SIZE: usize = mem::size_of::<ColumnBlockBranchEntry>();
+pub const COLUMN_BLOCK_LEAF_HEADER_SIZE: usize =
+    COLUMN_BLOCK_HEADER_SIZE + mem::size_of::<ColumnBlockLeafHeaderExt>();
 
-const COLUMN_LEAF_PREFIX_VERSION: u8 = 2;
+const COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE: usize = mem::size_of::<ColumnBlockLeafHeaderExt>();
+const COLUMN_BLOCK_LEAF_DATA_SIZE: usize =
+    COLUMN_BLOCK_DATA_SIZE - COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE;
+const COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE: usize = mem::size_of::<u16>() + mem::size_of::<u16>();
+const COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u16>();
+const COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE: usize = mem::size_of::<u64>() + mem::size_of::<u16>();
+const COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE: usize = mem::size_of::<ColumnBlockLeafEntryHeader>();
+const COLUMN_DELETE_SECTION_HEADER_SIZE: usize = mem::size_of::<DeleteSectionHeader>();
+const COLUMN_BLOCK_MIN_LEAF_ENTRY_SIZE: usize = COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE
+    + COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE
+    + mem::size_of::<SectionHeader>();
+const COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN: u8 = 1;
+const COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32: u8 = 2;
+const COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16: u8 = 3;
 const COLUMN_ROW_SECTION_VERSION: u8 = 1;
 const COLUMN_DELETE_SECTION_VERSION: u8 = 1;
 const COLUMN_DELETE_DOMAIN_ROW_ID_DELTA: u8 = 1;
 const COLUMN_DELETE_DOMAIN_ORDINAL: u8 = 2;
-const COLUMN_ROW_CODEC_NONE: u8 = 0;
 const COLUMN_ROW_CODEC_DENSE: u8 = 1;
 const COLUMN_ROW_CODEC_DELTA_LIST: u8 = 2;
 const COLUMN_DELETE_CODEC_NONE: u8 = 0;
@@ -51,32 +65,66 @@ const ROW_SHAPE_KIND_PRESENT_DELTA_LIST: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
-struct ColumnBlockLeafPrefix {
-    start_row_id: [u8; 8],
-    block_id: [u8; 8],
-    row_id_span: [u8; 4],
-    first_present_delta: [u8; 4],
-    row_count: [u8; 2],
-    del_count: [u8; 2],
-    row_section_offset: [u8; 2],
-    row_section_len: [u8; 2],
-    delete_section_offset: [u8; 2],
-    delete_section_len: [u8; 2],
-    row_codec: u8,
-    delete_codec: u8,
-    delete_domain: u8,
-    prefix_version: u8,
-    flags: u8,
+struct ColumnBlockLeafHeaderExt {
+    search_type: u8,
     reserved: [u8; 7],
-    row_shape_fingerprint: [u8; 16],
 }
 
-pub const COLUMN_BLOCK_LEAF_PREFIX_SIZE: usize = mem::size_of::<ColumnBlockLeafPrefix>();
-pub const COLUMN_BLOCK_MAX_ENTRIES: usize = COLUMN_BLOCK_DATA_SIZE / COLUMN_BLOCK_LEAF_PREFIX_SIZE;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+struct ColumnBlockLeafEntryHeader {
+    block_id: [u8; 8],
+    row_shape_fingerprint: [u8; 16],
+    row_id_span: [u8; 4],
+    entry_len: [u8; 2],
+    row_section_len: [u8; 2],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColumnBlockLeafSearchType {
+    Plain,
+    DeltaU32,
+    DeltaU16,
+}
+
+impl ColumnBlockLeafSearchType {
+    #[inline]
+    fn encode(self) -> u8 {
+        match self {
+            ColumnBlockLeafSearchType::Plain => COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN,
+            ColumnBlockLeafSearchType::DeltaU32 => COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32,
+            ColumnBlockLeafSearchType::DeltaU16 => COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16,
+        }
+    }
+
+    #[inline]
+    fn decode(raw: u8) -> Result<Self> {
+        match raw {
+            COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN => Ok(ColumnBlockLeafSearchType::Plain),
+            COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32 => Ok(ColumnBlockLeafSearchType::DeltaU32),
+            COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16 => Ok(ColumnBlockLeafSearchType::DeltaU16),
+            _ => Err(Error::InvalidFormat),
+        }
+    }
+
+    #[inline]
+    fn prefix_size(self) -> usize {
+        match self {
+            ColumnBlockLeafSearchType::Plain => COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE,
+            ColumnBlockLeafSearchType::DeltaU32 => COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE,
+            ColumnBlockLeafSearchType::DeltaU16 => COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE,
+        }
+    }
+}
+
+pub const COLUMN_BLOCK_LEAF_PREFIX_SIZE: usize = COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE;
+pub const COLUMN_BLOCK_MAX_ENTRIES: usize =
+    COLUMN_BLOCK_LEAF_DATA_SIZE / COLUMN_BLOCK_MIN_LEAF_ENTRY_SIZE;
 pub const COLUMN_BLOCK_MAX_BRANCH_ENTRIES: usize =
     COLUMN_BLOCK_DATA_SIZE / COLUMN_BRANCH_ENTRY_SIZE;
 
-const _: () = assert!(mem::size_of::<ColumnBlockLeafPrefix>() == 64);
+const _: () = assert!(mem::size_of::<ColumnBlockLeafHeaderExt>() == 8);
+const _: () = assert!(mem::size_of::<ColumnBlockLeafEntryHeader>() == 32);
 const _: () = assert!(mem::size_of::<ColumnBlockBranchEntry>() == 16);
 const _: () = assert!(mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_NODE_PAYLOAD_SIZE);
 
@@ -105,6 +153,102 @@ impl ColumnDeleteDomain {
             COLUMN_DELETE_DOMAIN_ORDINAL => Ok(ColumnDeleteDomain::Ordinal),
             _ => Err(Error::InvalidFormat),
         }
+    }
+}
+
+impl ColumnBlockLeafHeaderExt {
+    #[inline]
+    fn new(search_type: ColumnBlockLeafSearchType) -> Self {
+        ColumnBlockLeafHeaderExt {
+            search_type: search_type.encode(),
+            reserved: [0; 7],
+        }
+    }
+
+    #[inline]
+    fn search_type(&self) -> Result<ColumnBlockLeafSearchType> {
+        ColumnBlockLeafSearchType::decode(self.search_type)
+    }
+}
+
+impl ColumnBlockLeafEntryHeader {
+    #[inline]
+    fn block_id(&self) -> PageID {
+        u64::from_le_bytes(self.block_id)
+    }
+
+    #[inline]
+    fn row_shape_fingerprint(&self) -> u128 {
+        u128::from_le_bytes(self.row_shape_fingerprint)
+    }
+
+    #[inline]
+    fn row_id_span(&self) -> u32 {
+        u32::from_le_bytes(self.row_id_span)
+    }
+
+    #[inline]
+    fn entry_len(&self) -> u16 {
+        u16::from_le_bytes(self.entry_len)
+    }
+
+    #[inline]
+    fn row_section_len(&self) -> u16 {
+        u16::from_le_bytes(self.row_section_len)
+    }
+
+    #[inline]
+    fn end_row_id(&self, start_row_id: RowID) -> Result<RowID> {
+        start_row_id
+            .checked_add(self.row_id_span() as RowID)
+            .ok_or(Error::InvalidFormat)
+    }
+
+    fn from_encoded(entry: &EncodedLeafEntry) -> Result<Self> {
+        let entry_len = storage_len_u16(entry.payload_len())?;
+        let row_section_len = storage_len_u16(entry.row_section.len())?;
+        Ok(ColumnBlockLeafEntryHeader {
+            block_id: entry.block_id.to_le_bytes(),
+            row_shape_fingerprint: entry.row_shape_fingerprint.to_le_bytes(),
+            row_id_span: entry.row_id_span.to_le_bytes(),
+            entry_len: entry_len.to_le_bytes(),
+            row_section_len: row_section_len.to_le_bytes(),
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+struct DeleteSectionHeader {
+    kind: u8,
+    version: u8,
+    domain: u8,
+    aux: u8,
+    del_count: [u8; 2],
+    reserved: [u8; 2],
+}
+
+impl DeleteSectionHeader {
+    #[inline]
+    fn new(kind: u8, domain: ColumnDeleteDomain, del_count: u16, aux: u8) -> Self {
+        DeleteSectionHeader {
+            kind,
+            version: COLUMN_DELETE_SECTION_VERSION,
+            domain: domain.encode(),
+            aux,
+            del_count: del_count.to_le_bytes(),
+            reserved: [0; 2],
+        }
+    }
+
+    #[inline]
+    fn del_count(&self) -> u16 {
+        u16::from_le_bytes(self.del_count)
+    }
+
+    #[inline]
+    fn domain(&self) -> Result<ColumnDeleteDomain> {
+        ColumnDeleteDomain::decode(self.domain)
     }
 }
 
@@ -146,6 +290,10 @@ impl ColumnBlockNode {
             start_row_id,
             create_ts,
         };
+        if height == 0 {
+            let header = ColumnBlockLeafHeaderExt::new(ColumnBlockLeafSearchType::Plain);
+            node.data[..COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE].copy_from_slice(bytes_of(&header));
+        }
         node
     }
 
@@ -159,7 +307,6 @@ impl ColumnBlockNode {
         &mut self.data
     }
 
-    #[inline]
     fn branch_entries_mut(&mut self) -> &mut [ColumnBlockBranchEntry] {
         branch_entries_from_bytes_mut(&mut self.data, self.header.count as usize)
     }
@@ -447,6 +594,15 @@ impl LogicalRowSet {
     }
 
     #[inline]
+    fn row_id_span(&self) -> u32 {
+        match self {
+            LogicalRowSet::Dense { row_id_span } | LogicalRowSet::DeltaList { row_id_span, .. } => {
+                *row_id_span
+            }
+        }
+    }
+
+    #[inline]
     fn row_count(&self) -> usize {
         match self {
             LogicalRowSet::Dense { row_id_span } => *row_id_span as usize,
@@ -526,6 +682,15 @@ enum LogicalDeleteSet {
 }
 
 impl LogicalDeleteSet {
+    #[inline]
+    fn domain(&self) -> ColumnDeleteDomain {
+        match self {
+            LogicalDeleteSet::None { domain }
+            | LogicalDeleteSet::Inline { domain, .. }
+            | LogicalDeleteSet::External { domain, .. } => *domain,
+        }
+    }
+
     #[inline]
     fn del_count(&self) -> Result<u16> {
         match self {
@@ -610,12 +775,6 @@ struct EncodedLeafEntry {
     start_row_id: RowID,
     block_id: PageID,
     row_id_span: u32,
-    first_present_delta: u32,
-    row_count: u16,
-    del_count: u16,
-    row_section_kind: u8,
-    delete_section_kind: u8,
-    delete_domain: u8,
     row_shape_fingerprint: u128,
     row_section: Vec<u8>,
     delete_section: Vec<u8>,
@@ -623,20 +782,12 @@ struct EncodedLeafEntry {
 
 impl EncodedLeafEntry {
     fn from_logical(entry: &LogicalLeafEntry) -> Result<Self> {
-        let (row_section_kind, row_section, row_id_span, first_present_delta, row_count) =
-            encode_row_section(&entry.row_set)?;
-        let (delete_section_kind, delete_domain, delete_section) =
-            encode_delete_section(&entry.row_set, &entry.delete_set)?;
+        let row_section = encode_row_section(&entry.row_set, entry.delete_set.domain())?;
+        let delete_section = encode_delete_section(&entry.row_set, &entry.delete_set)?;
         Ok(EncodedLeafEntry {
             start_row_id: entry.start_row_id,
             block_id: entry.block_id,
-            row_id_span,
-            first_present_delta,
-            row_count,
-            del_count: entry.delete_set.del_count()?,
-            row_section_kind,
-            delete_section_kind,
-            delete_domain: delete_domain.encode(),
+            row_id_span: entry.row_set.row_id_span(),
             row_shape_fingerprint: entry.row_shape_fingerprint,
             row_section,
             delete_section,
@@ -644,8 +795,8 @@ impl EncodedLeafEntry {
     }
 
     #[inline]
-    fn encoded_len(&self) -> usize {
-        COLUMN_BLOCK_LEAF_PREFIX_SIZE + self.row_section.len() + self.delete_section.len()
+    fn payload_len(&self) -> usize {
+        COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + self.row_section.len() + self.delete_section.len()
     }
 }
 
@@ -679,11 +830,238 @@ impl SectionHeader {
 
 #[derive(Clone, Debug)]
 struct LeafEntryView<'a> {
-    prefix: ColumnBlockLeafPrefix,
+    start_row_id: RowID,
+    entry_header: ColumnBlockLeafEntryHeader,
     row_section: &'a [u8],
     delete_section: Option<&'a [u8]>,
     row_header: SectionHeader,
-    delete_header: Option<SectionHeader>,
+    delete_header: Option<DeleteSectionHeader>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecodedLeafPrefix {
+    start_row_id: RowID,
+    entry_offset: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+struct ColumnBlockLeafPrefixPlain {
+    start_row_id: [u8; 8],
+    entry_offset: [u8; 2],
+}
+
+impl ColumnBlockLeafPrefixPlain {
+    #[inline]
+    fn start_row_id(&self) -> RowID {
+        u64::from_le_bytes(self.start_row_id)
+    }
+
+    #[inline]
+    fn entry_offset(&self) -> u16 {
+        u16::from_le_bytes(self.entry_offset)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+struct ColumnBlockLeafPrefixDeltaU32 {
+    start_row_delta: [u8; 4],
+    entry_offset: [u8; 2],
+}
+
+impl ColumnBlockLeafPrefixDeltaU32 {
+    #[inline]
+    fn start_row_delta(&self) -> u32 {
+        u32::from_le_bytes(self.start_row_delta)
+    }
+
+    #[inline]
+    fn entry_offset(&self) -> u16 {
+        u16::from_le_bytes(self.entry_offset)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+struct ColumnBlockLeafPrefixDeltaU16 {
+    start_row_delta: [u8; 2],
+    entry_offset: [u8; 2],
+}
+
+impl ColumnBlockLeafPrefixDeltaU16 {
+    #[inline]
+    fn start_row_delta(&self) -> u16 {
+        u16::from_le_bytes(self.start_row_delta)
+    }
+
+    #[inline]
+    fn entry_offset(&self) -> u16 {
+        u16::from_le_bytes(self.entry_offset)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LeafPrefixPlane<'a> {
+    Plain {
+        header_start_row_id: RowID,
+        prefixes: &'a [ColumnBlockLeafPrefixPlain],
+    },
+    DeltaU32 {
+        header_start_row_id: RowID,
+        prefixes: &'a [ColumnBlockLeafPrefixDeltaU32],
+    },
+    DeltaU16 {
+        header_start_row_id: RowID,
+        prefixes: &'a [ColumnBlockLeafPrefixDeltaU16],
+    },
+}
+
+impl<'a> LeafPrefixPlane<'a> {
+    #[inline]
+    fn search_type(&self) -> ColumnBlockLeafSearchType {
+        match self {
+            LeafPrefixPlane::Plain { .. } => ColumnBlockLeafSearchType::Plain,
+            LeafPrefixPlane::DeltaU32 { .. } => ColumnBlockLeafSearchType::DeltaU32,
+            LeafPrefixPlane::DeltaU16 { .. } => ColumnBlockLeafSearchType::DeltaU16,
+        }
+    }
+
+    #[inline]
+    fn header_start_row_id(&self) -> RowID {
+        match self {
+            LeafPrefixPlane::Plain {
+                header_start_row_id,
+                ..
+            }
+            | LeafPrefixPlane::DeltaU32 {
+                header_start_row_id,
+                ..
+            }
+            | LeafPrefixPlane::DeltaU16 {
+                header_start_row_id,
+                ..
+            } => *header_start_row_id,
+        }
+    }
+
+    #[inline]
+    fn count(&self) -> usize {
+        match self {
+            LeafPrefixPlane::Plain { prefixes, .. } => prefixes.len(),
+            LeafPrefixPlane::DeltaU32 { prefixes, .. } => prefixes.len(),
+            LeafPrefixPlane::DeltaU16 { prefixes, .. } => prefixes.len(),
+        }
+    }
+
+    #[inline]
+    fn prefix_bytes_len(&self) -> usize {
+        self.count() * self.search_type().prefix_size()
+    }
+
+    fn prefix(&self, idx: usize) -> Result<DecodedLeafPrefix> {
+        match self {
+            LeafPrefixPlane::Plain { prefixes, .. } => prefixes
+                .get(idx)
+                .map(|prefix| DecodedLeafPrefix {
+                    start_row_id: prefix.start_row_id(),
+                    entry_offset: prefix.entry_offset(),
+                })
+                .ok_or(Error::InvalidFormat),
+            LeafPrefixPlane::DeltaU32 {
+                header_start_row_id,
+                prefixes,
+            } => prefixes
+                .get(idx)
+                .and_then(|prefix| {
+                    header_start_row_id
+                        .checked_add(prefix.start_row_delta() as RowID)
+                        .map(|start_row_id| DecodedLeafPrefix {
+                            start_row_id,
+                            entry_offset: prefix.entry_offset(),
+                        })
+                })
+                .ok_or(Error::InvalidFormat),
+            LeafPrefixPlane::DeltaU16 {
+                header_start_row_id,
+                prefixes,
+            } => prefixes
+                .get(idx)
+                .and_then(|prefix| {
+                    header_start_row_id
+                        .checked_add(prefix.start_row_delta() as RowID)
+                        .map(|start_row_id| DecodedLeafPrefix {
+                            start_row_id,
+                            entry_offset: prefix.entry_offset(),
+                        })
+                })
+                .ok_or(Error::InvalidFormat),
+        }
+    }
+
+    fn search(&self, row_id: RowID) -> Result<Option<usize>> {
+        match self {
+            LeafPrefixPlane::Plain { prefixes, .. } => Ok(search_prefix_slice(
+                prefixes.binary_search_by_key(&row_id, |prefix| prefix.start_row_id()),
+            )),
+            LeafPrefixPlane::DeltaU32 {
+                header_start_row_id,
+                prefixes,
+            } => {
+                let Some(delta) = row_id.checked_sub(*header_start_row_id) else {
+                    return Ok(None);
+                };
+                let key = u32::try_from(delta).unwrap_or(u32::MAX);
+                Ok(search_prefix_slice(
+                    prefixes.binary_search_by_key(&key, |prefix| prefix.start_row_delta()),
+                ))
+            }
+            LeafPrefixPlane::DeltaU16 {
+                header_start_row_id,
+                prefixes,
+            } => {
+                let Some(delta) = row_id.checked_sub(*header_start_row_id) else {
+                    return Ok(None);
+                };
+                let key = u16::try_from(delta).unwrap_or(u16::MAX);
+                Ok(search_prefix_slice(
+                    prefixes.binary_search_by_key(&key, |prefix| prefix.start_row_delta()),
+                ))
+            }
+        }
+    }
+
+    fn search_exact(&self, start_row_id: RowID) -> Result<usize> {
+        match self {
+            LeafPrefixPlane::Plain { prefixes, .. } => prefixes
+                .binary_search_by_key(&start_row_id, |prefix| prefix.start_row_id())
+                .map_err(|_| Error::InvalidFormat),
+            LeafPrefixPlane::DeltaU32 {
+                header_start_row_id,
+                prefixes,
+            } => {
+                let delta = start_row_id
+                    .checked_sub(*header_start_row_id)
+                    .ok_or(Error::InvalidFormat)?;
+                let delta = u32::try_from(delta).map_err(|_| Error::InvalidFormat)?;
+                prefixes
+                    .binary_search_by_key(&delta, |prefix| prefix.start_row_delta())
+                    .map_err(|_| Error::InvalidFormat)
+            }
+            LeafPrefixPlane::DeltaU16 {
+                header_start_row_id,
+                prefixes,
+            } => {
+                let delta = start_row_id
+                    .checked_sub(*header_start_row_id)
+                    .ok_or(Error::InvalidFormat)?;
+                let delta = u16::try_from(delta).map_err(|_| Error::InvalidFormat)?;
+                prefixes
+                    .binary_search_by_key(&delta, |prefix| prefix.start_row_delta())
+                    .map_err(|_| Error::InvalidFormat)
+            }
+        }
+    }
 }
 
 trait ColumnBlockNodeRead {
@@ -697,6 +1075,11 @@ trait ColumnBlockNodeRead {
     #[inline]
     fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
         branch_entries_from_bytes(self.data_ref(), self.header_ref().count as usize)
+    }
+
+    #[inline]
+    fn leaf_data_ref(&self) -> &[u8] {
+        &self.data_ref()[COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE..]
     }
 }
 
@@ -804,18 +1187,54 @@ impl ValidatedColumnBlockNode {
         Ok(ValidatedColumnBlockNode { guard, header })
     }
 
-    fn leaf_prefixes(
+    fn leaf_header_ext(
         &self,
         file_kind: PersistedFileKind,
         page_id: PageID,
-    ) -> Result<&[ColumnBlockLeafPrefix]> {
-        let count = self.header.count as usize;
-        let prefix_bytes = count * COLUMN_BLOCK_LEAF_PREFIX_SIZE;
-        let data = self.data_ref();
-        let prefixes = try_cast_slice(&data[..prefix_bytes])
+    ) -> Result<&ColumnBlockLeafHeaderExt> {
+        bytemuck::try_from_bytes::<ColumnBlockLeafHeaderExt>(
+            &self.data_ref()[..COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE],
+        )
+        .map_err(|_| invalid_node_payload(file_kind, page_id))
+    }
+
+    fn leaf_prefix_plane(
+        &self,
+        file_kind: PersistedFileKind,
+        page_id: PageID,
+    ) -> Result<LeafPrefixPlane<'_>> {
+        let search_type = self
+            .leaf_header_ext(file_kind, page_id)?
+            .search_type()
             .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-        validate_leaf_prefixes(prefixes, self.header.start_row_id, data, file_kind, page_id)?;
-        Ok(prefixes)
+        let count = self.header.count as usize;
+        let data = self.leaf_data_ref();
+        let prefix_bytes_len = count
+            .checked_mul(search_type.prefix_size())
+            .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+        if prefix_bytes_len > data.len() {
+            return Err(invalid_node_payload(file_kind, page_id));
+        }
+        let prefix_bytes = &data[..prefix_bytes_len];
+        let plane = match search_type {
+            ColumnBlockLeafSearchType::Plain => LeafPrefixPlane::Plain {
+                header_start_row_id: self.header.start_row_id,
+                prefixes: try_cast_slice(prefix_bytes)
+                    .map_err(|_| invalid_node_payload(file_kind, page_id))?,
+            },
+            ColumnBlockLeafSearchType::DeltaU32 => LeafPrefixPlane::DeltaU32 {
+                header_start_row_id: self.header.start_row_id,
+                prefixes: try_cast_slice(prefix_bytes)
+                    .map_err(|_| invalid_node_payload(file_kind, page_id))?,
+            },
+            ColumnBlockLeafSearchType::DeltaU16 => LeafPrefixPlane::DeltaU16 {
+                header_start_row_id: self.header.start_row_id,
+                prefixes: try_cast_slice(prefix_bytes)
+                    .map_err(|_| invalid_node_payload(file_kind, page_id))?,
+            },
+        };
+        validate_leaf_prefixes(&plane, data, file_kind, page_id)?;
+        Ok(plane)
     }
 
     fn leaf_entry_view(
@@ -824,45 +1243,38 @@ impl ValidatedColumnBlockNode {
         file_kind: PersistedFileKind,
         page_id: PageID,
     ) -> Result<LeafEntryView<'_>> {
-        let prefixes = self.leaf_prefixes(file_kind, page_id)?;
-        let prefix = *prefixes
-            .get(idx)
-            .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
-        let data = self.data_ref();
-        let prefix_end = prefixes.len() * COLUMN_BLOCK_LEAF_PREFIX_SIZE;
-        let row_section = section_slice(
-            data,
-            prefix_end,
-            prefix.row_section_offset(),
-            prefix.row_section_len(),
-            file_kind,
-            page_id,
-        )?;
+        let prefixes = self.leaf_prefix_plane(file_kind, page_id)?;
+        let prefix = prefixes
+            .prefix(idx)
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        let data = self.leaf_data_ref();
+        let prefix_end = prefixes.prefix_bytes_len();
+        let entry_bytes =
+            leaf_entry_slice(data, prefix_end, prefix.entry_offset, file_kind, page_id)?;
+        let entry_header = *bytemuck::try_from_bytes::<ColumnBlockLeafEntryHeader>(
+            &entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE],
+        )
+        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        let row_section_end =
+            COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + entry_header.row_section_len() as usize;
+        let row_section = &entry_bytes[COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE..row_section_end];
         let row_header = SectionHeader::decode(row_section)
             .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-        if row_header.kind != prefix.row_codec() || row_header.version != COLUMN_ROW_SECTION_VERSION
-        {
+        if row_header.version != COLUMN_ROW_SECTION_VERSION {
             return Err(invalid_node_payload(file_kind, page_id));
         }
-        let delete_section = if prefix.delete_section_len() == 0 {
+        let delete_section = if row_section_end == entry_bytes.len() {
             None
         } else {
-            Some(section_slice(
-                data,
-                prefix_end,
-                prefix.delete_section_offset(),
-                prefix.delete_section_len(),
-                file_kind,
-                page_id,
-            )?)
+            Some(&entry_bytes[row_section_end..])
         };
         let delete_header = match delete_section {
             Some(bytes) => {
-                let header = SectionHeader::decode(bytes)
-                    .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-                if header.kind != prefix.delete_codec()
-                    || header.version != COLUMN_DELETE_SECTION_VERSION
-                {
+                let header = *bytemuck::try_from_bytes::<DeleteSectionHeader>(
+                    &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
+                )
+                .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+                if header.version != COLUMN_DELETE_SECTION_VERSION {
                     return Err(invalid_node_payload(file_kind, page_id));
                 }
                 Some(header)
@@ -870,7 +1282,8 @@ impl ValidatedColumnBlockNode {
             None => None,
         };
         Ok(LeafEntryView {
-            prefix,
+            start_row_id: prefix.start_row_id,
+            entry_header,
             row_section,
             delete_section,
             row_header,
@@ -889,113 +1302,6 @@ impl ColumnBlockNodeRead for ValidatedColumnBlockNode {
     fn data_ref(&self) -> &[u8] {
         let payload = validated_node_payload(self.guard.page());
         &payload[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
-    }
-}
-
-impl ColumnBlockLeafPrefix {
-    #[inline]
-    fn start_row_id(&self) -> RowID {
-        u64::from_le_bytes(self.start_row_id)
-    }
-
-    #[inline]
-    fn block_id(&self) -> PageID {
-        u64::from_le_bytes(self.block_id)
-    }
-
-    #[inline]
-    fn row_id_span(&self) -> u32 {
-        u32::from_le_bytes(self.row_id_span)
-    }
-
-    #[inline]
-    fn first_present_delta(&self) -> u32 {
-        u32::from_le_bytes(self.first_present_delta)
-    }
-
-    #[inline]
-    fn row_count(&self) -> u16 {
-        u16::from_le_bytes(self.row_count)
-    }
-
-    #[inline]
-    fn del_count(&self) -> u16 {
-        u16::from_le_bytes(self.del_count)
-    }
-
-    #[inline]
-    fn row_section_offset(&self) -> u16 {
-        u16::from_le_bytes(self.row_section_offset)
-    }
-
-    #[inline]
-    fn row_section_len(&self) -> u16 {
-        u16::from_le_bytes(self.row_section_len)
-    }
-
-    #[inline]
-    fn delete_section_offset(&self) -> u16 {
-        u16::from_le_bytes(self.delete_section_offset)
-    }
-
-    #[inline]
-    fn delete_section_len(&self) -> u16 {
-        u16::from_le_bytes(self.delete_section_len)
-    }
-
-    #[inline]
-    fn row_codec(&self) -> u8 {
-        self.row_codec
-    }
-
-    #[inline]
-    fn delete_codec(&self) -> u8 {
-        self.delete_codec
-    }
-
-    #[inline]
-    fn delete_domain(&self) -> u8 {
-        self.delete_domain
-    }
-
-    #[inline]
-    fn row_shape_fingerprint(&self) -> u128 {
-        u128::from_le_bytes(self.row_shape_fingerprint)
-    }
-
-    #[inline]
-    fn end_row_id(&self) -> Result<RowID> {
-        self.start_row_id()
-            .checked_add(self.row_id_span() as RowID)
-            .ok_or(Error::InvalidFormat)
-    }
-
-    fn from_encoded(
-        entry: &EncodedLeafEntry,
-        row_section_offset: u16,
-        row_section_len: u16,
-        delete_section_offset: u16,
-        delete_section_len: u16,
-    ) -> Self {
-        ColumnBlockLeafPrefix {
-            start_row_id: entry.start_row_id.to_le_bytes(),
-            block_id: entry.block_id.to_le_bytes(),
-            row_id_span: entry.row_id_span.to_le_bytes(),
-            first_present_delta: entry.first_present_delta.to_le_bytes(),
-            row_count: entry.row_count.to_le_bytes(),
-            del_count: entry.del_count.to_le_bytes(),
-            row_section_offset: row_section_offset.to_le_bytes(),
-            row_section_len: row_section_len.to_le_bytes(),
-            delete_section_offset: delete_section_offset.to_le_bytes(),
-            delete_section_len: delete_section_len.to_le_bytes(),
-            row_codec: entry.row_section_kind,
-            delete_codec: entry.delete_section_kind,
-            delete_domain: entry.delete_domain,
-            prefix_version: COLUMN_LEAF_PREFIX_VERSION,
-            flags: 0,
-            reserved: [0; 7],
-            row_shape_fingerprint: entry.row_shape_fingerprint.to_le_bytes(),
-        }
     }
 }
 
@@ -1052,9 +1358,9 @@ impl<'a> ColumnBlockIndex<'a> {
         node: &'n ValidatedColumnBlockNode,
         entry: &ColumnLeafEntry,
     ) -> Result<LeafEntryView<'n>> {
-        let prefixes = node.leaf_prefixes(self.file_kind(), entry.leaf_page_id)?;
+        let prefixes = node.leaf_prefix_plane(self.file_kind(), entry.leaf_page_id)?;
         let idx = prefixes
-            .binary_search_by_key(&entry.start_row_id, |prefix| prefix.start_row_id())
+            .search_exact(entry.start_row_id)
             .map_err(|_| invalid_node_payload(self.file_kind(), entry.leaf_page_id))?;
         node.leaf_entry_view(idx, self.file_kind(), entry.leaf_page_id)
     }
@@ -1068,8 +1374,8 @@ impl<'a> ColumnBlockIndex<'a> {
         loop {
             let node = self.read_node(page_id).await?;
             if node.is_leaf() {
-                let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
-                let idx = match search_start_row_id(prefixes, row_id) {
+                let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
+                let idx = match search_start_row_id(&prefixes, row_id)? {
                     Some(idx) => idx,
                     None => return Ok(None),
                 };
@@ -1113,8 +1419,8 @@ impl<'a> ColumnBlockIndex<'a> {
         loop {
             let node = self.read_node(page_id).await?;
             if node.is_leaf() {
-                let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
-                let idx = match search_start_row_id(prefixes, row_id) {
+                let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
+                let idx = match search_start_row_id(&prefixes, row_id)? {
                     Some(idx) => idx,
                     None => return Ok(None),
                 };
@@ -1159,7 +1465,7 @@ impl<'a> ColumnBlockIndex<'a> {
         let view = self.read_entry_view(&node, entry)?;
         let row_set = decode_logical_row_set(&view, self.file_kind(), entry.leaf_page_id)?;
         decode_row_ids_from_row_set(
-            view.prefix.start_row_id(),
+            view.start_row_id,
             &row_set,
             self.file_kind(),
             entry.leaf_page_id,
@@ -1248,14 +1554,14 @@ impl<'a> ColumnBlockIndex<'a> {
         loop {
             let node = self.read_node(page_id).await?;
             if node.is_leaf() {
-                let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
+                let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
                 let idx = prefixes
-                    .binary_search_by_key(&start_row_id, |prefix| prefix.start_row_id())
+                    .search_exact(start_row_id)
                     .map_err(|_| Error::InvalidArgument)?;
                 let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
                 let row_set = decode_logical_row_set(&view, self.file_kind(), page_id)?;
-                let delete_domain = decode_delete_domain_or_invalid_node(
-                    view.prefix.delete_domain(),
+                let delete_domain = decode_default_delete_domain_from_row_header(
+                    view.row_header,
                     self.file_kind(),
                     page_id,
                 )?;
@@ -1278,8 +1584,8 @@ impl<'a> ColumnBlockIndex<'a> {
         while let Some(page_id) = stack.pop() {
             let node = self.read_node(page_id).await?;
             if node.is_leaf() {
-                let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
-                for idx in 0..prefixes.len() {
+                let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
+                for idx in 0..prefixes.count() {
                     let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
                     let entry = build_leaf_entry(page_id, &view, self.file_kind())?;
                     if let Some(prev_end) = last_end
@@ -1628,19 +1934,19 @@ impl<'a> ColumnBlockIndex<'a> {
         node: &ValidatedColumnBlockNode,
         page_id: PageID,
     ) -> Result<Vec<LogicalLeafEntry>> {
-        let prefixes = node.leaf_prefixes(self.file_kind(), page_id)?;
-        let mut entries = Vec::with_capacity(prefixes.len());
-        for idx in 0..prefixes.len() {
+        let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
+        let mut entries = Vec::with_capacity(prefixes.count());
+        for idx in 0..prefixes.count() {
             let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
             let row_set = decode_logical_row_set(&view, self.file_kind(), page_id)?;
             let delete_set =
                 decode_logical_delete_set_base(&view, &row_set, self.file_kind(), page_id)?;
             entries.push(LogicalLeafEntry::new(
-                view.prefix.start_row_id(),
-                view.prefix.block_id(),
+                view.start_row_id,
+                view.entry_header.block_id(),
                 row_set,
                 delete_set,
-                view.prefix.row_shape_fingerprint(),
+                view.entry_header.row_shape_fingerprint(),
             ));
         }
         Ok(entries)
@@ -1659,24 +1965,29 @@ impl<'a> ColumnBlockIndex<'a> {
         let mut leaf_entries = Vec::new();
         let mut start = 0usize;
         while start < encoded.len() {
-            let mut used = 0usize;
             let mut end = start;
+            let mut selected_search_type = None;
             while end < encoded.len() {
-                let next = encoded[end].encoded_len();
-                if end > start && used + next > COLUMN_BLOCK_DATA_SIZE {
+                let search_type = select_leaf_search_type(&encoded[start..=end])?;
+                let next_len = leaf_chunk_encoded_len(&encoded[start..=end], search_type)?;
+                if end > start && next_len > COLUMN_BLOCK_LEAF_DATA_SIZE {
                     break;
                 }
-                if next > COLUMN_BLOCK_DATA_SIZE {
+                if next_len > COLUMN_BLOCK_LEAF_DATA_SIZE {
                     return Err(Error::InvalidArgument);
                 }
-                used += next;
+                selected_search_type = Some(search_type);
                 end += 1;
             }
             let chunk = &encoded[start..end];
             let (page_id, mut node) =
                 self.allocate_node(mutable_file, 0, chunk[0].start_row_id, create_ts)?;
             node.header.count = chunk.len() as u32;
-            encode_leaf_chunk(node.data_mut(), chunk)?;
+            encode_leaf_chunk(
+                node.data_mut(),
+                chunk,
+                selected_search_type.ok_or(Error::InvalidState)?,
+            )?;
             self.write_node(mutable_file, page_id, &node).await?;
             leaf_entries.push(ColumnBlockBranchEntry {
                 start_row_id: chunk[0].start_row_id,
@@ -1792,161 +2103,120 @@ fn validate_row_ids(row_ids: &[RowID], start_row_id: RowID, end_row_id: RowID) -
     Ok(())
 }
 
-fn section_slice(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedRowSectionMetadata {
+    row_count: u16,
+    first_present_delta: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedDeleteSectionMetadata {
+    delete_codec: u8,
+    delete_domain: ColumnDeleteDomain,
+    del_count: u16,
+    blob_ref: Option<BlobRef>,
+}
+
+fn leaf_entry_slice(
     data: &[u8],
     prefix_end: usize,
-    offset: u16,
-    len: u16,
+    entry_offset: u16,
     file_kind: PersistedFileKind,
     page_id: PageID,
 ) -> Result<&[u8]> {
-    let offset = offset as usize;
-    let len = len as usize;
-    if offset == 0 || len == 0 {
+    let offset = entry_offset as usize;
+    let header_end = offset
+        .checked_add(COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE)
+        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+    if offset < prefix_end || header_end > data.len() {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    let header = bytemuck::try_from_bytes::<ColumnBlockLeafEntryHeader>(&data[offset..header_end])
+        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    let entry_len = header.entry_len() as usize;
+    if entry_len < COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + header.row_section_len() as usize {
         return Err(invalid_node_payload(file_kind, page_id));
     }
     let end = offset
-        .checked_add(len)
+        .checked_add(entry_len)
         .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
-    if offset < prefix_end || end > data.len() {
+    if end > data.len() {
         return Err(invalid_node_payload(file_kind, page_id));
     }
     Ok(&data[offset..end])
 }
 
 fn validate_leaf_prefixes(
-    prefixes: &[ColumnBlockLeafPrefix],
-    header_start_row_id: RowID,
+    prefixes: &LeafPrefixPlane<'_>,
     data: &[u8],
     file_kind: PersistedFileKind,
     page_id: PageID,
 ) -> Result<()> {
-    if prefixes.is_empty() {
+    if prefixes.count() == 0 {
         return Ok(());
     }
-    let prefix_end = prefixes.len() * COLUMN_BLOCK_LEAF_PREFIX_SIZE;
-    let mut ranges = Vec::with_capacity(prefixes.len() * 2);
+    let prefix_end = prefixes.prefix_bytes_len();
+    let mut ranges = Vec::with_capacity(prefixes.count());
     let mut last_end = None;
-    for (idx, prefix) in prefixes.iter().enumerate() {
-        if ColumnDeleteDomain::decode(prefix.delete_domain()).is_err() {
-            return Err(invalid_node_payload(file_kind, page_id));
-        }
-        if prefix.prefix_version != COLUMN_LEAF_PREFIX_VERSION
-            || prefix.row_codec() == COLUMN_ROW_CODEC_NONE
-            || prefix.row_id_span() == 0
-            || prefix.row_count() == 0
-            || u32::from(prefix.row_count()) > prefix.row_id_span()
-            || prefix.del_count() > prefix.row_count()
-        {
-            return Err(invalid_node_payload(file_kind, page_id));
-        }
-        let start = prefix.start_row_id();
-        let end = prefix
-            .end_row_id()
+    for idx in 0..prefixes.count() {
+        let prefix = prefixes
+            .prefix(idx)
             .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-        if idx == 0 && start != header_start_row_id {
+        let entry_bytes =
+            leaf_entry_slice(data, prefix_end, prefix.entry_offset, file_kind, page_id)?;
+        let entry_header = bytemuck::try_from_bytes::<ColumnBlockLeafEntryHeader>(
+            &entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE],
+        )
+        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        if entry_header.row_id_span() == 0 {
+            return Err(invalid_node_payload(file_kind, page_id));
+        }
+        let end_row_id = entry_header
+            .end_row_id(prefix.start_row_id)
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        if idx == 0 && prefix.start_row_id != prefixes.header_start_row_id() {
             return Err(invalid_node_payload(file_kind, page_id));
         }
         if let Some(prev_end) = last_end
-            && start < prev_end
+            && prefix.start_row_id < prev_end
         {
             return Err(invalid_node_payload(file_kind, page_id));
         }
-        last_end = Some(end);
 
-        let row_range = validate_present_section_range(
-            prefix_end,
-            prefix.row_section_offset(),
-            prefix.row_section_len(),
-            data.len(),
+        let row_section_end =
+            COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + entry_header.row_section_len() as usize;
+        let row_section = &entry_bytes[COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE..row_section_end];
+        let row_header = SectionHeader::decode(row_section)
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+        if row_header.version != COLUMN_ROW_SECTION_VERSION {
+            return Err(invalid_node_payload(file_kind, page_id));
+        }
+        let row_meta = decode_row_section_metadata(
+            row_section,
+            row_header,
+            entry_header.row_id_span(),
             file_kind,
             page_id,
         )?;
-        let row_header = SectionHeader::decode(&data[row_range.0..row_range.0 + 4])
-            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-        match prefix.row_codec() {
-            COLUMN_ROW_CODEC_DENSE => {
-                if row_header.kind != COLUMN_ROW_CODEC_DENSE
-                    || row_header.version != COLUMN_ROW_SECTION_VERSION
-                    || row_range.1 - row_range.0 != 4
-                    || prefix.first_present_delta() != 0
-                    || u32::from(prefix.row_count()) != prefix.row_id_span()
-                {
-                    return Err(invalid_node_payload(file_kind, page_id));
-                }
-            }
-            COLUMN_ROW_CODEC_DELTA_LIST => {
-                let expected_len = 4 + prefix.row_count() as usize * mem::size_of::<u32>();
-                if row_header.kind != COLUMN_ROW_CODEC_DELTA_LIST
-                    || row_header.version != COLUMN_ROW_SECTION_VERSION
-                    || row_range.1 - row_range.0 != expected_len
-                {
-                    return Err(invalid_node_payload(file_kind, page_id));
-                }
-            }
-            _ => return Err(invalid_node_payload(file_kind, page_id)),
+        if u32::from(row_meta.row_count) > entry_header.row_id_span() {
+            return Err(invalid_node_payload(file_kind, page_id));
         }
-        ranges.push(row_range);
 
-        match prefix.delete_codec() {
-            COLUMN_DELETE_CODEC_NONE => {
-                if prefix.del_count() != 0
-                    || prefix.delete_section_offset() != 0
-                    || prefix.delete_section_len() != 0
-                {
-                    return Err(invalid_node_payload(file_kind, page_id));
-                }
-            }
-            COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
-                if prefix.del_count() == 0 {
-                    return Err(invalid_node_payload(file_kind, page_id));
-                }
-                let delete_range = validate_present_section_range(
-                    prefix_end,
-                    prefix.delete_section_offset(),
-                    prefix.delete_section_len(),
-                    data.len(),
-                    file_kind,
-                    page_id,
-                )?;
-                let delete_header =
-                    SectionHeader::decode(&data[delete_range.0..delete_range.0 + 4])
-                        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-                let expected_len = 4 + prefix.del_count() as usize * mem::size_of::<u32>();
-                if delete_header.kind != COLUMN_DELETE_CODEC_INLINE_DELTA_LIST
-                    || delete_header.version != COLUMN_DELETE_SECTION_VERSION
-                    || delete_range.1 - delete_range.0 != expected_len
-                {
-                    return Err(invalid_node_payload(file_kind, page_id));
-                }
-                ranges.push(delete_range);
-            }
-            COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
-                if prefix.del_count() == 0 {
-                    return Err(invalid_node_payload(file_kind, page_id));
-                }
-                let delete_range = validate_present_section_range(
-                    prefix_end,
-                    prefix.delete_section_offset(),
-                    prefix.delete_section_len(),
-                    data.len(),
-                    file_kind,
-                    page_id,
-                )?;
-                let delete_header =
-                    SectionHeader::decode(&data[delete_range.0..delete_range.0 + 4])
-                        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-                if delete_header.kind != COLUMN_DELETE_CODEC_EXTERNAL_BLOB
-                    || delete_header.version != COLUMN_DELETE_SECTION_VERSION
-                    || delete_header.aux != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
-                    || delete_range.1 - delete_range.0 != 4 + COLUMN_BLOB_REF_SIZE
-                {
-                    return Err(invalid_node_payload(file_kind, page_id));
-                }
-                ranges.push(delete_range);
-            }
-            _ => return Err(invalid_node_payload(file_kind, page_id)),
+        let delete_section = if row_section_end == entry_bytes.len() {
+            None
+        } else {
+            Some(&entry_bytes[row_section_end..])
+        };
+        let delete_meta =
+            decode_delete_section_metadata(delete_section, row_header, file_kind, page_id)?;
+        if delete_meta.del_count > row_meta.row_count {
+            return Err(invalid_node_payload(file_kind, page_id));
         }
+        last_end = Some(end_row_id);
+        ranges.push((
+            prefix.entry_offset as usize,
+            prefix.entry_offset as usize + entry_bytes.len(),
+        ));
     }
     ranges.sort_unstable_by_key(|range| range.0);
     for pair in ranges.windows(2) {
@@ -1955,28 +2225,6 @@ fn validate_leaf_prefixes(
         }
     }
     Ok(())
-}
-
-fn validate_present_section_range(
-    prefix_end: usize,
-    offset: u16,
-    len: u16,
-    data_len: usize,
-    file_kind: PersistedFileKind,
-    page_id: PageID,
-) -> Result<(usize, usize)> {
-    let offset = offset as usize;
-    let len = len as usize;
-    if offset == 0 || len == 0 {
-        return Err(invalid_node_payload(file_kind, page_id));
-    }
-    let end = offset
-        .checked_add(len)
-        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
-    if offset < prefix_end || end > data_len {
-        return Err(invalid_node_payload(file_kind, page_id));
-    }
-    Ok((offset, end))
 }
 
 fn entry_contains_row_id(
@@ -1994,36 +2242,45 @@ fn resolve_row_idx_in_view(
     file_kind: PersistedFileKind,
     page_id: PageID,
 ) -> Result<Option<usize>> {
-    let start_row_id = view.prefix.start_row_id();
-    let delta_u64 = match row_id.checked_sub(start_row_id) {
+    let delta_u64 = match row_id.checked_sub(view.start_row_id) {
         Some(delta) => delta,
         None => return Ok(None),
     };
-    if delta_u64 >= view.prefix.row_id_span() as u64 {
+    if delta_u64 >= view.entry_header.row_id_span() as u64 {
         return Ok(None);
     }
+    let row_meta = decode_row_section_metadata(
+        view.row_section,
+        view.row_header,
+        view.entry_header.row_id_span(),
+        file_kind,
+        page_id,
+    )?;
     let delta = delta_u64 as u32;
-    if delta < view.prefix.first_present_delta() {
+    if delta < row_meta.first_present_delta {
         return Ok(None);
     }
     match view.row_header.kind {
         COLUMN_ROW_CODEC_DENSE => Ok(Some(delta as usize)),
-        COLUMN_ROW_CODEC_DELTA_LIST => resolve_delta_list_row_idx(view, delta, file_kind, page_id),
+        COLUMN_ROW_CODEC_DELTA_LIST => {
+            resolve_delta_list_row_idx(view, row_meta, delta, file_kind, page_id)
+        }
         _ => Err(invalid_node_payload(file_kind, page_id)),
     }
 }
 
 fn resolve_delta_list_row_idx(
     view: &LeafEntryView<'_>,
+    row_meta: DecodedRowSectionMetadata,
     delta: u32,
     file_kind: PersistedFileKind,
     page_id: PageID,
 ) -> Result<Option<usize>> {
     let deltas = decode_u32_row_deltas(
-        &view.row_section[4..],
-        view.prefix.row_count(),
-        view.prefix.row_id_span(),
-        view.prefix.first_present_delta(),
+        &view.row_section[mem::size_of::<SectionHeader>()..],
+        row_meta.row_count,
+        view.entry_header.row_id_span(),
+        row_meta.first_present_delta,
         file_kind,
         page_id,
     )?;
@@ -2035,22 +2292,29 @@ fn decode_logical_row_set(
     file_kind: PersistedFileKind,
     page_id: PageID,
 ) -> Result<LogicalRowSet> {
+    let row_meta = decode_row_section_metadata(
+        view.row_section,
+        view.row_header,
+        view.entry_header.row_id_span(),
+        file_kind,
+        page_id,
+    )?;
     match view.row_header.kind {
         COLUMN_ROW_CODEC_DENSE => Ok(LogicalRowSet::Dense {
-            row_id_span: view.prefix.row_id_span(),
+            row_id_span: view.entry_header.row_id_span(),
         }),
         COLUMN_ROW_CODEC_DELTA_LIST => {
             let deltas = decode_u32_row_deltas(
-                &view.row_section[4..],
-                view.prefix.row_count(),
-                view.prefix.row_id_span(),
-                view.prefix.first_present_delta(),
+                &view.row_section[mem::size_of::<SectionHeader>()..],
+                row_meta.row_count,
+                view.entry_header.row_id_span(),
+                row_meta.first_present_delta,
                 file_kind,
                 page_id,
             )?;
             Ok(LogicalRowSet::DeltaList {
-                row_id_span: view.prefix.row_id_span(),
-                first_present_delta: view.prefix.first_present_delta(),
+                row_id_span: view.entry_header.row_id_span(),
+                first_present_delta: row_meta.first_present_delta,
                 deltas,
             })
         }
@@ -2094,38 +2358,35 @@ fn decode_logical_delete_set_base(
     file_kind: PersistedFileKind,
     page_id: PageID,
 ) -> Result<LogicalDeleteSet> {
-    let delete_domain =
-        decode_delete_domain_or_invalid_node(view.prefix.delete_domain(), file_kind, page_id)?;
-    match view.prefix.delete_codec() {
+    let delete_meta =
+        decode_delete_section_metadata(view.delete_section, view.row_header, file_kind, page_id)?;
+    match delete_meta.delete_codec {
         COLUMN_DELETE_CODEC_NONE => Ok(LogicalDeleteSet::None {
-            domain: delete_domain,
+            domain: delete_meta.delete_domain,
         }),
         COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
             let bytes = view
                 .delete_section
                 .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
             let row_id_deltas = decode_delete_rows(
-                &bytes[4..],
-                view.prefix.del_count(),
-                delete_domain,
+                &bytes[COLUMN_DELETE_SECTION_HEADER_SIZE..],
+                delete_meta.del_count,
+                delete_meta.delete_domain,
                 row_set,
                 file_kind,
                 page_id,
             )?;
             Ok(LogicalDeleteSet::Inline {
-                domain: delete_domain,
+                domain: delete_meta.delete_domain,
                 row_id_deltas,
             })
         }
-        COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
-            let blob_ref = decode_external_delete_blob_ref(view, file_kind, page_id)?;
-            Ok(LogicalDeleteSet::External {
-                domain: delete_domain,
-                del_count: view.prefix.del_count(),
-                blob_ref,
-                row_id_deltas: None,
-            })
-        }
+        COLUMN_DELETE_CODEC_EXTERNAL_BLOB => Ok(LogicalDeleteSet::External {
+            domain: delete_meta.delete_domain,
+            del_count: delete_meta.del_count,
+            blob_ref: delete_meta.blob_ref.ok_or(Error::InvalidState)?,
+            row_id_deltas: None,
+        }),
         _ => Err(invalid_node_payload(file_kind, page_id)),
     }
 }
@@ -2135,46 +2396,35 @@ fn build_leaf_entry(
     view: &LeafEntryView<'_>,
     file_kind: PersistedFileKind,
 ) -> Result<ColumnLeafEntry> {
-    let delete_blob_ref = if view.prefix.delete_codec() == COLUMN_DELETE_CODEC_EXTERNAL_BLOB {
-        Some(decode_external_delete_blob_ref(
-            view,
-            file_kind,
-            leaf_page_id,
-        )?)
-    } else {
-        None
-    };
+    let row_meta = decode_row_section_metadata(
+        view.row_section,
+        view.row_header,
+        view.entry_header.row_id_span(),
+        file_kind,
+        leaf_page_id,
+    )?;
+    let delete_meta = decode_delete_section_metadata(
+        view.delete_section,
+        view.row_header,
+        file_kind,
+        leaf_page_id,
+    )?;
     Ok(ColumnLeafEntry {
         leaf_page_id,
-        start_row_id: view.prefix.start_row_id(),
-        block_id: view.prefix.block_id(),
+        start_row_id: view.start_row_id,
+        block_id: view.entry_header.block_id(),
         end_row_id: view
-            .prefix
-            .end_row_id()
+            .entry_header
+            .end_row_id(view.start_row_id)
             .map_err(|_| invalid_node_payload(file_kind, leaf_page_id))?,
-        row_count: view.prefix.row_count(),
-        del_count: view.prefix.del_count(),
-        row_id_span: view.prefix.row_id_span(),
-        first_present_delta: view.prefix.first_present_delta(),
-        delete_domain: decode_delete_domain_or_invalid_node(
-            view.prefix.delete_domain(),
-            file_kind,
-            leaf_page_id,
-        )?,
-        delete_blob_ref,
-        row_shape_fingerprint: view.prefix.row_shape_fingerprint(),
+        row_count: row_meta.row_count,
+        del_count: delete_meta.del_count,
+        row_id_span: view.entry_header.row_id_span(),
+        first_present_delta: row_meta.first_present_delta,
+        delete_domain: delete_meta.delete_domain,
+        delete_blob_ref: delete_meta.blob_ref,
+        row_shape_fingerprint: view.entry_header.row_shape_fingerprint(),
     })
-}
-
-fn decode_external_delete_blob_ref(
-    view: &LeafEntryView<'_>,
-    file_kind: PersistedFileKind,
-    page_id: PageID,
-) -> Result<BlobRef> {
-    let bytes = view
-        .delete_section
-        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
-    decode_blob_ref(&bytes[4..]).map_err(|_| invalid_node_payload(file_kind, page_id))
 }
 
 fn build_resolved_row(
@@ -2184,9 +2434,139 @@ fn build_resolved_row(
 ) -> ResolvedColumnRow {
     ResolvedColumnRow {
         leaf_page_id,
-        block_id: view.prefix.block_id(),
+        block_id: view.entry_header.block_id(),
         row_idx,
-        row_shape_fingerprint: view.prefix.row_shape_fingerprint(),
+        row_shape_fingerprint: view.entry_header.row_shape_fingerprint(),
+    }
+}
+
+fn decode_default_delete_domain_from_row_header(
+    row_header: SectionHeader,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<ColumnDeleteDomain> {
+    if row_header.flags != 0 {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    decode_delete_domain_or_invalid_node(row_header.aux, file_kind, page_id)
+}
+
+fn decode_row_section_metadata(
+    row_section: &[u8],
+    row_header: SectionHeader,
+    row_id_span: u32,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<DecodedRowSectionMetadata> {
+    let _delete_domain =
+        decode_default_delete_domain_from_row_header(row_header, file_kind, page_id)?;
+    if row_id_span == 0 {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    match row_header.kind {
+        COLUMN_ROW_CODEC_DENSE => {
+            if row_section.len() != mem::size_of::<SectionHeader>() || row_id_span > u16::MAX as u32
+            {
+                return Err(invalid_node_payload(file_kind, page_id));
+            }
+            Ok(DecodedRowSectionMetadata {
+                row_count: row_id_span as u16,
+                first_present_delta: 0,
+            })
+        }
+        COLUMN_ROW_CODEC_DELTA_LIST => {
+            let payload = &row_section[mem::size_of::<SectionHeader>()..];
+            if payload.is_empty() || !payload.len().is_multiple_of(mem::size_of::<u32>()) {
+                return Err(invalid_node_payload(file_kind, page_id));
+            }
+            let row_count = u16::try_from(payload.len() / mem::size_of::<u32>())
+                .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+            let first_present_delta = u32::from_le_bytes(
+                payload[..mem::size_of::<u32>()]
+                    .try_into()
+                    .map_err(|_| invalid_node_payload(file_kind, page_id))?,
+            );
+            decode_u32_row_deltas(
+                payload,
+                row_count,
+                row_id_span,
+                first_present_delta,
+                file_kind,
+                page_id,
+            )?;
+            Ok(DecodedRowSectionMetadata {
+                row_count,
+                first_present_delta,
+            })
+        }
+        _ => Err(invalid_node_payload(file_kind, page_id)),
+    }
+}
+
+fn decode_delete_section_metadata(
+    delete_section: Option<&[u8]>,
+    row_header: SectionHeader,
+    file_kind: PersistedFileKind,
+    page_id: PageID,
+) -> Result<DecodedDeleteSectionMetadata> {
+    let default_domain =
+        decode_default_delete_domain_from_row_header(row_header, file_kind, page_id)?;
+    let Some(bytes) = delete_section else {
+        return Ok(DecodedDeleteSectionMetadata {
+            delete_codec: COLUMN_DELETE_CODEC_NONE,
+            delete_domain: default_domain,
+            del_count: 0,
+            blob_ref: None,
+        });
+    };
+    let header = bytemuck::try_from_bytes::<DeleteSectionHeader>(
+        &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
+    )
+    .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    if header.version != COLUMN_DELETE_SECTION_VERSION || header.reserved != [0; 2] {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    let delete_domain = header
+        .domain()
+        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    if delete_domain != default_domain {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    let del_count = header.del_count();
+    if del_count == 0 {
+        return Err(invalid_node_payload(file_kind, page_id));
+    }
+    match header.kind {
+        COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
+            let expected_len =
+                COLUMN_DELETE_SECTION_HEADER_SIZE + del_count as usize * mem::size_of::<u32>();
+            if header.aux != 0 || bytes.len() != expected_len {
+                return Err(invalid_node_payload(file_kind, page_id));
+            }
+            Ok(DecodedDeleteSectionMetadata {
+                delete_codec: COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
+                delete_domain,
+                del_count,
+                blob_ref: None,
+            })
+        }
+        COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
+            if header.aux != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
+                || bytes.len() != COLUMN_DELETE_SECTION_HEADER_SIZE + COLUMN_BLOB_REF_SIZE
+            {
+                return Err(invalid_node_payload(file_kind, page_id));
+            }
+            Ok(DecodedDeleteSectionMetadata {
+                delete_codec: COLUMN_DELETE_CODEC_EXTERNAL_BLOB,
+                delete_domain,
+                del_count,
+                blob_ref: Some(
+                    decode_blob_ref(&bytes[COLUMN_DELETE_SECTION_HEADER_SIZE..])
+                        .map_err(|_| invalid_node_payload(file_kind, page_id))?,
+                ),
+            })
+        }
+        _ => Err(invalid_node_payload(file_kind, page_id)),
     }
 }
 
@@ -2199,48 +2579,39 @@ fn decode_delete_domain_or_invalid_node(
     ColumnDeleteDomain::decode(raw).map_err(|_| invalid_node_payload(file_kind, page_id))
 }
 
-fn encode_row_section(row_set: &LogicalRowSet) -> Result<(u8, Vec<u8>, u32, u32, u16)> {
+fn encode_row_section(
+    row_set: &LogicalRowSet,
+    delete_domain: ColumnDeleteDomain,
+) -> Result<Vec<u8>> {
     match row_set {
         LogicalRowSet::Dense { row_id_span } => {
-            let header = SectionHeader {
+            if *row_id_span > u16::MAX as u32 {
+                return Err(Error::InvalidArgument);
+            }
+            Ok(SectionHeader {
                 kind: COLUMN_ROW_CODEC_DENSE,
                 version: COLUMN_ROW_SECTION_VERSION,
                 flags: 0,
-                aux: 0,
-            };
-            Ok((
-                COLUMN_ROW_CODEC_DENSE,
-                header.encode().to_vec(),
-                *row_id_span,
-                0,
-                u16::try_from(*row_id_span).map_err(|_| Error::InvalidArgument)?,
-            ))
+                aux: delete_domain.encode(),
+            }
+            .encode()
+            .to_vec())
         }
-        LogicalRowSet::DeltaList {
-            row_id_span,
-            first_present_delta,
-            deltas,
-        } => {
+        LogicalRowSet::DeltaList { deltas, .. } => {
             let mut bytes = Vec::with_capacity(4 + deltas.len() * mem::size_of::<u32>());
             bytes.extend_from_slice(
                 &SectionHeader {
                     kind: COLUMN_ROW_CODEC_DELTA_LIST,
                     version: COLUMN_ROW_SECTION_VERSION,
                     flags: 0,
-                    aux: 0,
+                    aux: delete_domain.encode(),
                 }
                 .encode(),
             );
             for delta in deltas {
                 bytes.extend_from_slice(&delta.to_le_bytes());
             }
-            Ok((
-                COLUMN_ROW_CODEC_DELTA_LIST,
-                bytes,
-                *row_id_span,
-                *first_present_delta,
-                storage_count_u16(deltas.len())?,
-            ))
+            Ok(bytes)
         }
     }
 }
@@ -2248,9 +2619,9 @@ fn encode_row_section(row_set: &LogicalRowSet) -> Result<(u8, Vec<u8>, u32, u32,
 fn encode_delete_section(
     row_set: &LogicalRowSet,
     delete_set: &LogicalDeleteSet,
-) -> Result<(u8, ColumnDeleteDomain, Vec<u8>)> {
+) -> Result<Vec<u8>> {
     match delete_set {
-        LogicalDeleteSet::None { domain } => Ok((COLUMN_DELETE_CODEC_NONE, *domain, Vec::new())),
+        LogicalDeleteSet::None { .. } => Ok(Vec::new()),
         LogicalDeleteSet::Inline {
             domain,
             row_id_deltas,
@@ -2259,70 +2630,148 @@ fn encode_delete_section(
             if !inline_delete_values_fit(&delete_values)? {
                 return Err(Error::InvalidArgument);
             }
-            let mut bytes = Vec::with_capacity(4 + mem::size_of_val(delete_values.as_slice()));
-            bytes.extend_from_slice(
-                &SectionHeader {
-                    kind: COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
-                    version: COLUMN_DELETE_SECTION_VERSION,
-                    flags: 0,
-                    aux: 0,
-                }
-                .encode(),
+            let header = DeleteSectionHeader::new(
+                COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
+                *domain,
+                storage_count_u16(delete_values.len())?,
+                0,
             );
+            let mut bytes = Vec::with_capacity(
+                COLUMN_DELETE_SECTION_HEADER_SIZE + mem::size_of_val(delete_values.as_slice()),
+            );
+            bytes.extend_from_slice(bytes_of(&header));
             for value in delete_values {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
-            Ok((COLUMN_DELETE_CODEC_INLINE_DELTA_LIST, *domain, bytes))
+            Ok(bytes)
         }
         LogicalDeleteSet::External {
             domain, blob_ref, ..
         } => {
-            let mut bytes = Vec::with_capacity(4 + COLUMN_BLOB_REF_SIZE);
-            bytes.extend_from_slice(
-                &SectionHeader {
-                    kind: COLUMN_DELETE_CODEC_EXTERNAL_BLOB,
-                    version: COLUMN_DELETE_SECTION_VERSION,
-                    flags: 0,
-                    aux: COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
-                }
-                .encode(),
+            let header = DeleteSectionHeader::new(
+                COLUMN_DELETE_CODEC_EXTERNAL_BLOB,
+                *domain,
+                delete_set.del_count()?,
+                COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
             );
+            let mut bytes =
+                Vec::with_capacity(COLUMN_DELETE_SECTION_HEADER_SIZE + COLUMN_BLOB_REF_SIZE);
+            bytes.extend_from_slice(bytes_of(&header));
             encode_blob_ref(blob_ref, &mut bytes);
-            Ok((COLUMN_DELETE_CODEC_EXTERNAL_BLOB, *domain, bytes))
+            Ok(bytes)
         }
     }
 }
 
-fn encode_leaf_chunk(buf: &mut [u8], entries: &[EncodedLeafEntry]) -> Result<()> {
+fn encode_leaf_chunk(
+    buf: &mut [u8],
+    entries: &[EncodedLeafEntry],
+    search_type: ColumnBlockLeafSearchType,
+) -> Result<()> {
+    let leaf_start_row_id = entries.first().ok_or(Error::InvalidArgument)?.start_row_id;
     buf.fill(0);
-    let prefix_bytes_len = entries.len() * COLUMN_BLOCK_LEAF_PREFIX_SIZE;
+    let (leaf_header, leaf_data) = buf.split_at_mut(COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE);
+    leaf_header.copy_from_slice(bytes_of(&ColumnBlockLeafHeaderExt::new(search_type)));
+    let prefix_bytes_len = entries.len() * search_type.prefix_size();
     let mut prefix_cursor = 0usize;
-    let mut arena_end = buf.len();
+    let mut arena_end = leaf_data.len();
     for entry in entries {
-        let row_range = reserve_tail(&mut arena_end, entry.row_section.len(), buf.len())?;
-        buf[row_range.0..row_range.1].copy_from_slice(&entry.row_section);
-        let delete_range = if entry.delete_section.is_empty() {
-            None
-        } else {
-            let range = reserve_tail(&mut arena_end, entry.delete_section.len(), buf.len())?;
-            buf[range.0..range.1].copy_from_slice(&entry.delete_section);
-            Some(range)
-        };
+        let entry_range = reserve_tail(&mut arena_end, entry.payload_len(), leaf_data.len())?;
         if arena_end < prefix_bytes_len {
             return Err(Error::InvalidArgument);
         }
-        let prefix = ColumnBlockLeafPrefix::from_encoded(
-            entry,
-            row_range.0 as u16,
-            entry.row_section.len() as u16,
-            delete_range.map(|range| range.0 as u16).unwrap_or(0),
-            delete_range
-                .map(|range| (range.1 - range.0) as u16)
-                .unwrap_or(0),
-        );
-        let end = prefix_cursor + COLUMN_BLOCK_LEAF_PREFIX_SIZE;
-        buf[prefix_cursor..end].copy_from_slice(bytes_of(&prefix));
-        prefix_cursor = end;
+        let entry_header = ColumnBlockLeafEntryHeader::from_encoded(entry)?;
+        let entry_bytes = &mut leaf_data[entry_range.0..entry_range.1];
+        entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE].copy_from_slice(bytes_of(&entry_header));
+        let row_section_end = COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + entry.row_section.len();
+        entry_bytes[COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE..row_section_end]
+            .copy_from_slice(&entry.row_section);
+        entry_bytes[row_section_end..].copy_from_slice(&entry.delete_section);
+
+        encode_leaf_prefix(
+            &mut leaf_data[prefix_cursor..prefix_cursor + search_type.prefix_size()],
+            search_type,
+            leaf_start_row_id,
+            entry.start_row_id,
+            storage_len_u16(entry_range.0)?,
+        )?;
+        prefix_cursor += search_type.prefix_size();
+    }
+    Ok(())
+}
+
+fn select_leaf_search_type(entries: &[EncodedLeafEntry]) -> Result<ColumnBlockLeafSearchType> {
+    let leaf_start_row_id = entries.first().ok_or(Error::InvalidArgument)?.start_row_id;
+    let mut max_delta = 0u64;
+    for entry in entries {
+        let delta = entry
+            .start_row_id
+            .checked_sub(leaf_start_row_id)
+            .ok_or(Error::InvalidArgument)?;
+        max_delta = max_delta.max(delta);
+    }
+    Ok(if max_delta <= u16::MAX as u64 {
+        ColumnBlockLeafSearchType::DeltaU16
+    } else if max_delta <= u32::MAX as u64 {
+        ColumnBlockLeafSearchType::DeltaU32
+    } else {
+        ColumnBlockLeafSearchType::Plain
+    })
+}
+
+fn leaf_chunk_encoded_len(
+    entries: &[EncodedLeafEntry],
+    search_type: ColumnBlockLeafSearchType,
+) -> Result<usize> {
+    let mut total = entries
+        .len()
+        .checked_mul(search_type.prefix_size())
+        .ok_or(Error::InvalidArgument)?;
+    for entry in entries {
+        total = total
+            .checked_add(entry.payload_len())
+            .ok_or(Error::InvalidArgument)?;
+    }
+    Ok(total)
+}
+
+fn encode_leaf_prefix(
+    dst: &mut [u8],
+    search_type: ColumnBlockLeafSearchType,
+    leaf_start_row_id: RowID,
+    start_row_id: RowID,
+    entry_offset: u16,
+) -> Result<()> {
+    match search_type {
+        ColumnBlockLeafSearchType::Plain => {
+            if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE {
+                return Err(Error::InvalidArgument);
+            }
+            dst[..8].copy_from_slice(&start_row_id.to_le_bytes());
+            dst[8..10].copy_from_slice(&entry_offset.to_le_bytes());
+        }
+        ColumnBlockLeafSearchType::DeltaU32 => {
+            if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE {
+                return Err(Error::InvalidArgument);
+            }
+            let delta = start_row_id
+                .checked_sub(leaf_start_row_id)
+                .ok_or(Error::InvalidArgument)?;
+            let delta = u32::try_from(delta).map_err(|_| Error::InvalidArgument)?;
+            dst[..4].copy_from_slice(&delta.to_le_bytes());
+            dst[4..6].copy_from_slice(&entry_offset.to_le_bytes());
+        }
+        ColumnBlockLeafSearchType::DeltaU16 => {
+            if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE {
+                return Err(Error::InvalidArgument);
+            }
+            let delta = start_row_id
+                .checked_sub(leaf_start_row_id)
+                .ok_or(Error::InvalidArgument)?;
+            let delta = u16::try_from(delta).map_err(|_| Error::InvalidArgument)?;
+            dst[..2].copy_from_slice(&delta.to_le_bytes());
+            dst[2..4].copy_from_slice(&entry_offset.to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -2543,6 +2992,11 @@ fn storage_count_u16(len: usize) -> Result<u16> {
     u16::try_from(len).map_err(|_| Error::InvalidArgument)
 }
 
+#[inline]
+fn storage_len_u16(len: usize) -> Result<u16> {
+    u16::try_from(len).map_err(|_| Error::InvalidArgument)
+}
+
 fn entry_inputs_sorted(entries: &[ColumnBlockEntryInput]) -> bool {
     entries
         .windows(2)
@@ -2567,12 +3021,17 @@ where
     patches.windows(2).all(|pair| key(&pair[0]) < key(&pair[1]))
 }
 
-fn search_start_row_id(prefixes: &[ColumnBlockLeafPrefix], row_id: RowID) -> Option<usize> {
-    match prefixes.binary_search_by_key(&row_id, |prefix| prefix.start_row_id()) {
+#[inline]
+fn search_prefix_slice(search: std::result::Result<usize, usize>) -> Option<usize> {
+    match search {
         Ok(idx) => Some(idx),
         Err(0) => None,
         Err(idx) => Some(idx - 1),
     }
+}
+
+fn search_start_row_id(prefixes: &LeafPrefixPlane<'_>, row_id: RowID) -> Result<Option<usize>> {
+    prefixes.search(row_id)
 }
 
 fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Option<usize> {
@@ -2631,26 +3090,30 @@ mod tests {
     }
 
     #[test]
-    fn test_leaf_prefix_count_roundtrip_uses_u16() {
+    fn test_leaf_entry_header_roundtrip_uses_u16_lengths() {
         let encoded = EncodedLeafEntry {
             start_row_id: 10,
             block_id: 1001,
             row_id_span: 32,
-            first_present_delta: 3,
-            row_count: 7,
-            del_count: 2,
-            row_section_kind: COLUMN_ROW_CODEC_DELTA_LIST,
-            delete_section_kind: COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
-            delete_domain: COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
             row_shape_fingerprint: 42,
             row_section: vec![0u8; 4 + 7 * mem::size_of::<u32>()],
-            delete_section: vec![0u8; 4 + 2 * mem::size_of::<u32>()],
+            delete_section: vec![
+                0u8;
+                COLUMN_DELETE_SECTION_HEADER_SIZE + 2 * mem::size_of::<u32>()
+            ],
         };
-        let prefix = ColumnBlockLeafPrefix::from_encoded(&encoded, 128, 32, 160, 12);
-        assert_eq!(prefix.row_count(), 7);
-        assert_eq!(prefix.del_count(), 2);
-        assert_eq!(prefix.row_shape_fingerprint(), 42);
-        assert_eq!(mem::size_of::<ColumnBlockLeafPrefix>(), 64);
+        let header = ColumnBlockLeafEntryHeader::from_encoded(&encoded).unwrap();
+        assert_eq!(header.block_id(), 1001);
+        assert_eq!(header.row_id_span(), 32);
+        assert_eq!(header.entry_len(), 32 + 32 + 16);
+        assert_eq!(header.row_section_len(), 32);
+        assert_eq!(header.row_shape_fingerprint(), 42);
+        assert_eq!(mem::size_of::<ColumnBlockLeafEntryHeader>(), 32);
+        assert_eq!(mem::size_of::<ColumnBlockLeafHeaderExt>(), 8);
+        assert_eq!(COLUMN_BLOCK_LEAF_HEADER_SIZE, 32);
+        assert_eq!(COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE, 10);
+        assert_eq!(COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE, 6);
+        assert_eq!(COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE, 4);
     }
 
     #[test]
@@ -2675,9 +3138,12 @@ mod tests {
     #[test]
     fn test_encode_row_section_rejects_row_count_above_u16() {
         assert!(matches!(
-            encode_row_section(&LogicalRowSet::Dense {
-                row_id_span: u16::MAX as u32 + 1,
-            }),
+            encode_row_section(
+                &LogicalRowSet::Dense {
+                    row_id_span: u16::MAX as u32 + 1,
+                },
+                ColumnDeleteDomain::RowIdDelta
+            ),
             Err(Error::InvalidArgument)
         ));
     }
@@ -2728,6 +3194,89 @@ mod tests {
                 index.locate_block(22).await.unwrap().unwrap().block_id(),
                 1002
             );
+        });
+    }
+
+    async fn assert_search_type_lookup(
+        entries: Vec<ColumnBlockEntryInput>,
+        end_row_id: RowID,
+        probe_row_id: RowID,
+        expected_search_type: ColumnBlockLeafSearchType,
+        expected_block_id: PageID,
+    ) {
+        let (_temp_dir, fs) = build_test_fs();
+        let metadata = metadata();
+        let table = fs.create_table_file(1, metadata, false).unwrap();
+        let (table, old_root) = table.commit(1, false).await.unwrap();
+        drop(old_root);
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, 1, &table);
+        let disk_pool_guard = disk_pool.pool_guard();
+        let mut mutable = MutableTableFile::fork(&table);
+        let root_page_id = ColumnBlockIndex::new(0, 0, &disk_pool, &disk_pool_guard)
+            .batch_insert(&mut mutable, &entries, end_row_id, 2)
+            .await
+            .unwrap();
+        let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+        let index = ColumnBlockIndex::new(root_page_id, end_row_id, &disk_pool, &disk_pool_guard);
+        let entry = index.locate_block(probe_row_id).await.unwrap().unwrap();
+        assert_eq!(entry.block_id(), expected_block_id);
+        let node = index.read_node(entry.leaf_page_id).await.unwrap();
+        let header = node
+            .leaf_header_ext(index.file_kind(), entry.leaf_page_id)
+            .unwrap();
+        assert_eq!(header.search_type().unwrap(), expected_search_type);
+        assert!(
+            index
+                .locate_and_resolve_row(probe_row_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_leaf_search_type_selection_and_lookup_variants() {
+        smol::block_on(async {
+            let delta_u16_start = 1_000u64 + u16::MAX as u64;
+            assert_search_type_lookup(
+                vec![
+                    dense_entry(1_000, 1_001, 1001),
+                    dense_entry(delta_u16_start, delta_u16_start + 1, 1002),
+                ],
+                delta_u16_start + 1,
+                delta_u16_start,
+                ColumnBlockLeafSearchType::DeltaU16,
+                1002,
+            )
+            .await;
+
+            let delta_u32_start = 1_000u64 + u16::MAX as u64 + 1;
+            assert_search_type_lookup(
+                vec![
+                    dense_entry(1_000, 1_001, 2001),
+                    dense_entry(delta_u32_start, delta_u32_start + 1, 2002),
+                ],
+                delta_u32_start + 1,
+                delta_u32_start,
+                ColumnBlockLeafSearchType::DeltaU32,
+                2002,
+            )
+            .await;
+
+            let plain_start = 1_000u64 + u32::MAX as u64 + 1;
+            assert_search_type_lookup(
+                vec![
+                    dense_entry(1_000, 1_001, 3001),
+                    dense_entry(plain_start, plain_start + 1, 3002),
+                ],
+                plain_start + 1,
+                plain_start,
+                ColumnBlockLeafSearchType::Plain,
+                3002,
+            )
+            .await;
         });
     }
 
