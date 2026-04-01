@@ -1,7 +1,7 @@
 ---
 id: 000102
 title: Separate readonly pool interface and simplify ownership
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-03-31
 github_issue: 511
 ---
@@ -12,12 +12,13 @@ github_issue: 511
 
 Refactor the readonly buffer-pool path so `ReadonlyBufferPool` no longer
 implements the mutable `BufferPool` contract, expose a readonly-specific
-immutable persisted-block read API, and simplify
+immutable persisted-block read API around `ReadonlyBlockGuard` while keeping
+caller-owned `PoolGuard` provenance explicit, and simplify
 `GlobalReadonlyBufferPool` ownership by removing redundant outer `Arc` wrappers
 from fields already protected by quiescent pool guards. Keep the current
-shared-lock implementation internally in this task, but hide it behind the new
-readonly API so future synchronization work can optimize immutable-page reads
-without another public API break.
+shared-lock implementation internally in this task, document the narrow raw
+read use case, and leave readonly synchronization changes behind the new API
+boundary instead of the mutable `BufferPool` trait surface.
 
 ## Context
 
@@ -38,13 +39,13 @@ loader in `doradb-storage/src/file/cow_file.rs`, while other readers such as
 LWC, column-block-index, and deletion-blob readers already rely on
 readonly-specific validation helpers.
 
-This task should also be designed with
-`docs/backlogs/000040-readonly-buffer-pool-shared-lock-elision-for-immutable-pages.md`
-in mind. That backlog argues that shared locking may be avoidable for readonly
-pages because the bytes are immutable after load. This task does not implement
-lock elision, but it should introduce a public API that reflects immutable
-persisted-block semantics now so backlog `000040` can later change internal
-synchronization without forcing another consumer-facing API migration.
+This task was originally designed with
+`docs/backlogs/closed/000040-readonly-buffer-pool-shared-lock-elision-for-immutable-pages.md`
+in mind. During resolve, that follow-up was closed as `wontfix`: readonly
+eviction can reclaim and zero a resident frame, so removing the internal shared
+latch would first require a separate pin/lifetime mechanism. This task
+therefore keeps the existing shared-latch implementation and narrows only the
+public readonly interface.
 
 Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `Issue Labels:`
@@ -56,7 +57,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 
 1. Remove `ReadonlyBufferPool` from the mutable `BufferPool` trait surface.
 2. Introduce a readonly-specific immutable persisted-block read API and guard
-   that replace public `PoolGuard`-driven page access on readonly call paths.
+   while keeping caller-owned `PoolGuard` provenance explicit on readonly call
+   paths.
 3. Keep persisted-page invalidation and page-kind validation as first-class
    readonly operations.
 4. Refactor `ReadonlyRuntime` to hold `ArenaGuard` plus
@@ -67,8 +69,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
    preserving detached miss-load and eviction lifetimes.
 6. Preserve current behavior for miss deduplication, validation-before-publish,
    invalidation, drop-only eviction, and owner-drop ordering.
-7. Establish a readonly guard boundary that backlog `000040` can reuse for
-   future shared-lock elision work.
+7. Establish a readonly guard boundary that preserves room for future internal
+   synchronization changes without re-exposing mutable `BufferPool` behavior.
 
 ## Non-Goals
 
@@ -78,8 +80,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
    algorithms.
 3. Removing the final `shutdown_flag: Arc<AtomicBool>` dependency from
    `GlobalReadonlyBufferPool`; shared `Evictor` cleanup is outside this task.
-4. Implementing actual shared-lock elision or lock-free immutable-page borrows;
-   that remains follow-up work under backlog `000040`.
+4. Implementing actual shared-lock elision, lock-free immutable-page borrows,
+   or a new readonly pin/lifetime mechanism.
 5. Changing persisted page formats, page-integrity envelopes, or table-file
    recovery/checkpoint logic beyond the API fallout of the readonly cleanup.
 6. Broad refactoring of `buffer/guard.rs` or shared eviction infrastructure
@@ -141,18 +143,20 @@ Reference:
      - `page(&self) -> &Page`
      - `block_id(&self) -> PageID`
    - Add the new public readonly methods on `ReadonlyBufferPool`:
-     - `read_block(&self, block_id: PageID) -> Result<ReadonlyBlockGuard>`
-     - `read_validated_block(&self, block_id: PageID, validator: ReadonlyPageValidator) -> Result<ReadonlyBlockGuard>`
+     - `read_block(&self, guard: &PoolGuard, block_id: PageID) -> Result<ReadonlyBlockGuard>`
+     - `read_validated_block(&self, guard: &PoolGuard, block_id: PageID, validator: ReadonlyPageValidator) -> Result<ReadonlyBlockGuard>`
    - Keep `persisted_file_kind()`, `invalidate_block_id()`, and
      `invalidate_block_id_strict()` as readonly-specific metadata/invalidation
-     operations.
+     operations, and keep `pool_guard()` available for outer callers that need
+     an explicit readonly guard source.
    - Implement the new methods on top of the existing internal
      load/dedup/validation machinery so task scope stays narrow.
 
 3. Migrate readonly consumers to immutable persisted-block semantics.
    - Update `doradb-storage/src/file/cow_file.rs` so
      `CowFile::load_active_root_from_pool()` uses `invalidate_block_id()` plus
-     `read_block()` instead of `pool_guard()` plus `get_page::<Page>()`.
+     the new immutable block reads while preserving its explicit caller-owned
+     guard.
    - Update persisted readers such as:
      - `doradb-storage/src/lwc/page.rs`
      - `doradb-storage/src/index/column_block_index.rs`
@@ -160,6 +164,9 @@ Reference:
      - readonly page tests in `doradb-storage/src/file/table_file.rs`
      to use `read_validated_block()` and the returned immutable guard rather
      than `PageSharedGuard<Page>`.
+   - Thread `PoolGuards::disk_guard()` or `ReadonlyBufferPool::pool_guard()`
+     from outer call sites instead of reacquiring readonly guards inside the
+     read helpers.
    - Remove readonly-only `BufferPool` imports from modules that no longer need
      the trait in scope.
 
@@ -202,15 +209,57 @@ Reference:
      consumers.
 
 7. Preserve future lock-elision maneuvering room.
-   - The new public readonly API must not expose `PageSharedGuard<Page>` or
-     require callers to hold a `PoolGuard`.
+   - The new public readonly API must not expose `PageSharedGuard<Page>`.
+   - Caller guard provenance remains explicit via `&PoolGuard` even though
+     readonly callers no longer access the mutable `BufferPool` trait surface.
    - Internal implementation may still use current shared-latch mechanics in
      this task.
-   - Backlog `000040` should then be able to optimize resident immutable reads
-     by changing `ReadonlyBlockGuard` internals rather than rewriting all
-     callers.
+   - Future readonly synchronization work can change `ReadonlyBlockGuard`
+     internals without restoring mutable `BufferPool` behavior to readonly
+     consumers.
 
 ## Implementation Notes
+
+1. Split readonly access from the mutable pool trait surface:
+   - removed `impl BufferPool for ReadonlyBufferPool`;
+   - added `ReadonlyBlockGuard` and readonly-specific `read_block(...)` /
+     `read_validated_block(...)` entrypoints;
+   - kept `ReadonlyBufferPool::pool_guard()` public, and the final shipped API
+     requires callers to pass `&PoolGuard` explicitly for readonly reads.
+2. Simplified readonly ownership and runtime structure:
+   - `GlobalReadonlyBufferPool` now owns `mappings`, `inflight_loads`, and
+     `residency` directly without outer `Arc` wrappers;
+   - `ReadonlyRuntime` now dereferences readonly state through
+     `SyncQuiescentGuard<GlobalReadonlyBufferPool>` plus `ArenaGuard`;
+   - detached miss loads, page reservations, and eviction still complete
+     through guarded pool ownership.
+3. Migrated readonly consumers to the immutable block API:
+   - `CowFile` active-root loading now uses the readonly block API and keeps
+     root/meta validation at the call site;
+   - persisted LWC, column-block-index, deletion-blob, table, catalog, and
+     recovery/session paths now read readonly pages through immutable guards and
+     explicit disk-pool guard threading.
+4. Implementation review adjusted the final public shape:
+   - readonly reads keep caller-owned guard provenance instead of reacquiring
+     `global.pool_guard()` internally;
+   - raw `read_block()` is now documented as a narrow COW root/meta-page helper
+     and future expansion is explicitly cautioned;
+   - the resident-hit validation-failure invalidation path keeps synchronous
+     invalidation, with comments documenting why the current runtime use does
+     not make that a production async-executor issue.
+5. Related follow-up review outcome:
+   - backlog `000040` was closed as `wontfix` during resolve after verifying
+     that removing the readonly shared lock would require a new pin/lifetime
+     mechanism to keep resident pages safe against eviction and frame reuse.
+6. Verification executed:
+   - `cargo fmt --all`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+7. Review/traceability outcome:
+   - task issue: `#511`
+   - implementation PR: `#512`
+   - RFC linkage check during resolve reported no parent RFC for this task.
 
 ## Impacts
 
@@ -231,16 +280,17 @@ Reference:
   - validated persisted blob reads through the new readonly block guard.
 - `doradb-storage/src/file/table_file.rs`
   - readonly page-access tests updated to the new immutable-read API.
-- `docs/backlogs/000040-readonly-buffer-pool-shared-lock-elision-for-immutable-pages.md`
-  - related follow-up context only; this task should leave it open.
+- `docs/backlogs/closed/000040-readonly-buffer-pool-shared-lock-elision-for-immutable-pages.md`
+  - related follow-up reviewed during resolve and archived as `wontfix`.
 
 ## Test Cases
 
-1. `read_block()` reads persisted super/meta/data pages correctly after explicit
-   invalidation and still supports the CoW active-root loader flow.
-2. `read_validated_block()` accepts valid LWC pages, column-block-index pages,
-   and deletion-blob pages, and rejects corruption without publishing a bad
-   mapping.
+1. `read_block(&PoolGuard, ...)` reads persisted super/meta/data pages
+   correctly after explicit invalidation and still supports the CoW
+   active-root loader flow.
+2. `read_validated_block(&PoolGuard, ...)` accepts valid LWC pages,
+   column-block-index pages, and deletion-blob pages, and rejects corruption
+   without publishing a bad mapping.
 3. Concurrent readonly cache misses still deduplicate to one inflight load and
    joined waiters receive the same terminal result.
 4. Cancelled loaders and detached miss loads still complete correctly after
@@ -258,10 +308,12 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-1. Backlog `000040` remains the follow-up for actual shared-lock elision on
-   immutable readonly pages. Once this task lands, that work should reuse
-   `ReadonlyBlockGuard` as the stable public boundary instead of reintroducing
-   public `PoolGuard` or `PageSharedGuard<Page>` coupling.
-2. If later cleanup wants to remove the final `shutdown_flag` field-level
+1. If future readonly callers need raw `read_block()` outside the current COW
+   super/meta-page flow, should inflight-load joining start distinguishing
+   validated and unvalidated reads?
+2. If readonly lock elision becomes interesting again later, should it be
+   revisited only after a dedicated resident-page pin/lifetime mechanism is
+   designed?
+3. If later cleanup wants to remove the final `shutdown_flag` field-level
    `Arc`, treat that as shared `Evictor`/worker-runner refactoring rather than
    broadening this readonly task.
