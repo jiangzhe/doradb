@@ -223,7 +223,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         }
                     }
                     let vals = self
-                        .read_lwc_row(page_id, row_idx, row_shape_fingerprint, user_read_set)
+                        .read_lwc_row(
+                            stmt.pool_guards(),
+                            page_id,
+                            row_idx,
+                            row_shape_fingerprint,
+                            user_read_set,
+                        )
                         .await?;
                     return Ok(SelectMvcc::Found(vals));
                 }
@@ -257,6 +263,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
     async fn read_lwc_row(
         &self,
+        guards: &PoolGuards,
         page_id: PageID,
         row_idx: usize,
         row_shape_fingerprint: u128,
@@ -265,7 +272,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let Some(storage) = self.storage else {
             return Err(Error::InvalidState);
         };
-        let page = PersistedLwcPage::load(storage.disk_pool(), page_id).await?;
+        let page =
+            PersistedLwcPage::load(storage.disk_pool(), guards.disk_guard(), page_id).await?;
         if page.row_shape_fingerprint() != row_shape_fingerprint {
             return Err(Error::persisted_page_corrupted(
                 PersistedFileKind::TableFile,

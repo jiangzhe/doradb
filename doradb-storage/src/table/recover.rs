@@ -255,6 +255,7 @@ impl TableRecover for Table {
 
     async fn populate_index_via_persisted_data(&self, _guards: &PoolGuards) -> Result<()> {
         let index_pool_guard = self.index_pool_guard(_guards);
+        let disk_pool_guard = _guards.disk_guard();
         if self.sec_idx().is_empty() {
             return Ok(());
         }
@@ -267,10 +268,12 @@ impl TableRecover for Table {
             active_root.column_block_index_root,
             active_root.pivot_row_id,
             self.disk_pool(),
+            disk_pool_guard,
         );
         for entry in index.collect_leaf_entries().await? {
             let deleted = load_entry_deletion_deltas(&index, &entry).await?;
-            let page = PersistedLwcPage::load(self.disk_pool(), entry.block_id()).await?;
+            let page =
+                PersistedLwcPage::load(self.disk_pool(), disk_pool_guard, entry.block_id()).await?;
             let row_ids = index.load_entry_row_ids(&entry).await?;
             if page.row_count() != row_ids.len() {
                 return Err(Error::persisted_page_corrupted(

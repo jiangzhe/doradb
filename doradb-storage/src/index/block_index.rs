@@ -221,10 +221,11 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub(crate) async fn find_row(
         &self,
         meta_pool_guard: &PoolGuard,
+        disk_pool_guard: Option<&PoolGuard>,
         row_id: RowID,
         storage: Option<&ColumnStorage>,
     ) -> RowLocation {
-        self.try_find_row(meta_pool_guard, row_id, storage)
+        self.try_find_row(meta_pool_guard, disk_pool_guard, row_id, storage)
             .await
             .expect("block-index find_row should not ignore persisted lookup I/O failures")
     }
@@ -234,6 +235,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     pub(crate) async fn try_find_row(
         &self,
         meta_pool_guard: &PoolGuard,
+        disk_pool_guard: Option<&PoolGuard>,
         row_id: RowID,
         storage: Option<&ColumnStorage>,
     ) -> Result<RowLocation> {
@@ -243,8 +245,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                 pivot_row_id,
                 root_page_id,
             } => {
-                self.find_row_in_column(storage, row_id, pivot_row_id, root_page_id)
-                    .await
+                self.find_row_in_column(
+                    storage,
+                    disk_pool_guard,
+                    row_id,
+                    pivot_row_id,
+                    root_page_id,
+                )
+                .await
             }
             BlockIndexRoute::Row => {
                 let found = self.row.find_row(meta_pool_guard, row_id).await;
@@ -253,8 +261,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                 }
                 match self.root.try_column(row_id) {
                     Some((pivot_row_id, root_page_id)) => {
-                        self.find_row_in_column(storage, row_id, pivot_row_id, root_page_id)
-                            .await
+                        self.find_row_in_column(
+                            storage,
+                            disk_pool_guard,
+                            row_id,
+                            pivot_row_id,
+                            root_page_id,
+                        )
+                        .await
                     }
                     None => Ok(RowLocation::NotFound),
                 }
@@ -266,6 +280,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     async fn find_row_in_column(
         &self,
         storage: Option<&ColumnStorage>,
+        disk_pool_guard: Option<&PoolGuard>,
         row_id: RowID,
         pivot_row_id: RowID,
         root_page_id: PageID,
@@ -273,7 +288,15 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         let Some(storage) = storage else {
             return Err(Error::ColumnStorageMissing);
         };
-        let index = ColumnBlockIndex::new(root_page_id, pivot_row_id, storage.disk_pool());
+        let Some(disk_pool_guard) = disk_pool_guard else {
+            return Err(Error::InvalidState);
+        };
+        let index = ColumnBlockIndex::new(
+            root_page_id,
+            pivot_row_id,
+            storage.disk_pool(),
+            disk_pool_guard,
+        );
         match index.locate_and_resolve_row(row_id).await {
             Ok(Some(resolved)) => Ok(RowLocation::LwcPage {
                 page_id: resolved.block_id(),
@@ -421,7 +444,7 @@ mod tests {
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
         // Without column storage this must surface as an error, not as "not found".
-        let err = match smol::block_on(blk_idx.try_find_row(&meta_guard, 9, None)) {
+        let err = match smol::block_on(blk_idx.try_find_row(&meta_guard, None, 9, None)) {
             Ok(_location) => panic!("expected missing-column-storage error, got row location"),
             Err(err) => err,
         };
@@ -450,7 +473,7 @@ mod tests {
             let blk_idx = &blk_idx;
             let meta_guard = meta_guard.clone();
             let handle = s.spawn(move || {
-                smol::block_on(async { blk_idx.try_find_row(&meta_guard, 10, None).await })
+                smol::block_on(async { blk_idx.try_find_row(&meta_guard, None, 10, None).await })
             });
 
             // Wait until the row-store root fetch is paused, then move the pivot past

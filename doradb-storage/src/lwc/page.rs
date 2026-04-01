@@ -1,8 +1,7 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
-use crate::buffer::ReadonlyBufferPool;
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::buffer::page::{Page, PageID};
+use crate::buffer::page::PageID;
+use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::TableMetadata;
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
@@ -273,7 +272,7 @@ pub(crate) fn validate_persisted_lwc_page(
 
 /// Borrowed validated persisted LWC page backed by a readonly-cache guard.
 pub(crate) struct PersistedLwcPage {
-    guard: PageSharedGuard<Page>,
+    guard: ReadonlyBlockGuard,
     file_kind: PersistedFileKind,
     page_id: PageID,
 }
@@ -281,10 +280,14 @@ pub(crate) struct PersistedLwcPage {
 impl PersistedLwcPage {
     /// Loads one persisted LWC page through the validated readonly-cache path.
     #[inline]
-    pub async fn load(disk_pool: &ReadonlyBufferPool, page_id: PageID) -> Result<Self> {
+    pub async fn load(
+        disk_pool: &ReadonlyBufferPool,
+        disk_pool_guard: &PoolGuard,
+        page_id: PageID,
+    ) -> Result<Self> {
         let file_kind = disk_pool.persisted_file_kind();
         let guard = disk_pool
-            .get_validated_page_shared(page_id, validate_persisted_lwc_page)
+            .read_validated_block(disk_pool_guard, page_id, validate_persisted_lwc_page)
             .await?;
         Ok(PersistedLwcPage {
             guard,

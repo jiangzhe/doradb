@@ -22,7 +22,9 @@ pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
 pub(crate) use readonly::DiskPoolWorkers;
 pub(crate) use readonly::ReadSubmission;
-pub use readonly::{GlobalReadonlyBufferPool, PersistedBlockKey, ReadonlyBufferPool};
+pub use readonly::{
+    GlobalReadonlyBufferPool, PersistedBlockKey, ReadonlyBlockGuard, ReadonlyBufferPool,
+};
 
 /// Physical file identity used by persisted-block mappings and cache invalidation.
 pub type PersistedFileID = u64;

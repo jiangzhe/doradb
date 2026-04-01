@@ -1,16 +1,12 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::buffer::page::{PAGE_SIZE, Page, PageID};
-use crate::buffer::{
-    BufferPool, PersistedBlockKey, PersistedFileID, ReadSubmission, ReadonlyBufferPool,
-};
+use crate::buffer::page::{PAGE_SIZE, PageID};
+use crate::buffer::{PersistedBlockKey, PersistedFileID, ReadSubmission, ReadonlyBufferPool};
 use crate::error::{
     Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
 };
 use crate::file::super_page::{SUPER_PAGE_SIZE, SuperPage};
 use crate::file::{SparseFile, TableFsRequest, write_direct};
 use crate::io::{AIOClient, DirectBuf};
-use crate::latch::LatchFallbackMode;
 use crate::trx::TrxID;
 use std::fs;
 use std::ops::{Deref, DerefMut};
@@ -322,6 +318,13 @@ impl<M> CowFile<M> {
     /// valid slot, validates the referenced meta page through the configured
     /// codec, and rejects invalid root invariants before returning an
     /// in-memory [`ActiveRoot`].
+    ///
+    /// This is the intended runtime use of `ReadonlyBufferPool::read_block()`.
+    /// The raw block reads here are acceptable because super/meta-page
+    /// validation happens immediately through `pick_super_page`,
+    /// `parse_meta_page`, and `validate_root`. New callers should prefer
+    /// `read_validated_block()` unless they have an equivalent caller-owned
+    /// validation path and have reviewed the raw-read inflight semantics.
     #[inline]
     pub async fn load_active_root_from_pool(
         &self,
@@ -329,31 +332,15 @@ impl<M> CowFile<M> {
     ) -> Result<ActiveRoot<M>> {
         let _ = disk_pool.invalidate_block_id(0);
         let pool_guard = disk_pool.pool_guard();
-        let super_page_guard: PageSharedGuard<Page> = loop {
-            let guard = disk_pool
-                .get_page::<Page>(&pool_guard, 0, LatchFallbackMode::Shared)
-                .await?;
-            if let Some(shared) = guard.lock_shared_async().await {
-                break shared;
-            }
-        };
+        let super_page_guard = disk_pool.read_block(&pool_guard, 0).await?;
         let super_page =
             Self::pick_super_page(super_page_guard.page(), self.codec.parse_super_page)?;
         drop(super_page_guard);
 
         let _ = disk_pool.invalidate_block_id(super_page.body.meta_page_id);
-        let meta_page_guard: PageSharedGuard<Page> = loop {
-            let guard = disk_pool
-                .get_page::<Page>(
-                    &pool_guard,
-                    super_page.body.meta_page_id,
-                    LatchFallbackMode::Shared,
-                )
-                .await?;
-            if let Some(shared) = guard.lock_shared_async().await {
-                break shared;
-            }
-        };
+        let meta_page_guard = disk_pool
+            .read_block(&pool_guard, super_page.body.meta_page_id)
+            .await?;
         let parsed_meta =
             (self.codec.parse_meta_page)(super_page.body.meta_page_id, meta_page_guard.page())?;
         (self.codec.validate_root)(super_page.body.meta_page_id, &parsed_meta)?;

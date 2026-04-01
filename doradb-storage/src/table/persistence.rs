@@ -172,6 +172,7 @@ impl Table {
         checkpoint_ts: TrxID,
     ) -> Result<bool> {
         let disk_pool = self.disk_pool();
+        let disk_pool_guard = disk_pool.pool_guard();
         // Step 1: ensure there is a persisted column index to patch.
         let mutable_root = mutable_file.root();
         if mutable_root.column_block_index_root == 0 || mutable_root.pivot_row_id == 0 {
@@ -200,6 +201,7 @@ impl Table {
             mutable_root.column_block_index_root,
             mutable_root.pivot_row_id,
             disk_pool,
+            &disk_pool_guard,
         );
 
         let mut grouped: BTreeMap<u64, (BlockPatchSeed, BTreeSet<u32>)> = BTreeMap::new();

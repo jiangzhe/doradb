@@ -1,6 +1,6 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
 use crate::buffer::page::{BufferPage, PageID};
-use crate::buffer::{BufferPool, FixedBufferPool, PoolGuards};
+use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
@@ -68,7 +68,7 @@ impl CatalogStorage {
                 return Err(Error::InvalidState);
             }
             let rows = self
-                .load_visible_rows_from_root(self.tables[idx].metadata(), root)
+                .load_visible_rows_from_root(self.tables[idx].metadata(), guards.disk_guard(), root)
                 .await?;
             for row in rows {
                 self.tables[idx].insert_no_trx(guards, &row.vals).await?;
@@ -165,6 +165,7 @@ impl CatalogStorage {
         table_ops: &[RowRedoKind],
         checkpoint_cts: u64,
     ) -> Result<CatalogTableRootDesc> {
+        let disk_pool_guard = self.disk_pool.pool_guard();
         // Step 1: Validate root invariants and construct a base index snapshot for reads.
         if root.root_page_id.is_none() && root.pivot_row_id != 0 {
             return Err(Error::InvalidState);
@@ -173,9 +174,15 @@ impl CatalogStorage {
         let entries = if root_page_id == 0 {
             Vec::new()
         } else {
-            self.collect_index_entries(root_page_id).await?
+            self.collect_index_entries(&disk_pool_guard, root_page_id)
+                .await?
         };
-        let base_index = ColumnBlockIndex::new(root_page_id, root.pivot_row_id, &self.disk_pool);
+        let base_index = ColumnBlockIndex::new(
+            root_page_id,
+            root.pivot_row_id,
+            &self.disk_pool,
+            &disk_pool_guard,
+        );
         let mut next_row_id = root.pivot_row_id;
 
         // Step 2: Preload existing visible rows only when delete-by-key appears.
@@ -183,8 +190,13 @@ impl CatalogStorage {
             .iter()
             .any(|kind| matches!(kind, RowRedoKind::DeleteByUniqueKey(_)));
         let mut existing_rows = if need_delete_lookup {
-            self.load_visible_rows_for_delete_lookup(metadata, &entries, &base_index)
-                .await?
+            self.load_visible_rows_for_delete_lookup(
+                metadata,
+                &disk_pool_guard,
+                &entries,
+                &base_index,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -257,7 +269,7 @@ impl CatalogStorage {
             && let Some(last_entry) = entries.last().copied()
         {
             let existing_tail_rows = self
-                .decode_lwc_page_rows(metadata, &base_index, &last_entry)
+                .decode_lwc_page_rows(metadata, &disk_pool_guard, &base_index, &last_entry)
                 .await?;
             if !existing_tail_rows.is_empty()
                 && let Some((merged_tail_buf, merged_row_ids, consumed)) = self
@@ -295,6 +307,7 @@ impl CatalogStorage {
                     current_root_page_id,
                     current_end_row_id,
                     &self.disk_pool,
+                    &disk_pool_guard,
                 );
                 current_root_page_id = column_index
                     .batch_replace_entries(mutable, &patches, checkpoint_cts)
@@ -324,6 +337,7 @@ impl CatalogStorage {
                     current_root_page_id,
                     current_end_row_id,
                     &self.disk_pool,
+                    &disk_pool_guard,
                 );
                 current_root_page_id = column_index
                     .batch_insert(mutable, &new_entries, new_end_row_id, checkpoint_cts)
@@ -358,8 +372,12 @@ impl CatalogStorage {
                     delete_deltas,
                 })
                 .collect();
-            let column_index =
-                ColumnBlockIndex::new(current_root_page_id, current_end_row_id, &self.disk_pool);
+            let column_index = ColumnBlockIndex::new(
+                current_root_page_id,
+                current_end_row_id,
+                &self.disk_pool,
+                &disk_pool_guard,
+            );
             current_root_page_id = column_index
                 .batch_replace_delete_deltas(mutable, &patches, checkpoint_cts)
                 .await?;
@@ -379,15 +397,21 @@ impl CatalogStorage {
         })
     }
 
-    async fn collect_index_entries(&self, root_page_id: PageID) -> Result<Vec<CatalogIndexEntry>> {
+    async fn collect_index_entries(
+        &self,
+        disk_pool_guard: &PoolGuard,
+        root_page_id: PageID,
+    ) -> Result<Vec<CatalogIndexEntry>> {
         assert_ne!(root_page_id, 0, "root_page_id must be non-zero");
-        let index = ColumnBlockIndex::new(root_page_id, RowID::MAX, &self.disk_pool);
+        let index =
+            ColumnBlockIndex::new(root_page_id, RowID::MAX, &self.disk_pool, disk_pool_guard);
         index.collect_leaf_entries().await
     }
 
     async fn load_visible_rows_from_root(
         &self,
         metadata: &TableMetadata,
+        disk_pool_guard: &PoolGuard,
         root: CatalogTableRootDesc,
     ) -> Result<Vec<RowRecord>> {
         if root.root_page_id.is_none() {
@@ -397,13 +421,20 @@ impl CatalogStorage {
             return Ok(Vec::new());
         }
         let root_page_id = root.root_page_id.map(NonZeroU64::get).unwrap_or(0);
-        let entries = self.collect_index_entries(root_page_id).await?;
-        let column_index = ColumnBlockIndex::new(root_page_id, root.pivot_row_id, &self.disk_pool);
+        let entries = self
+            .collect_index_entries(disk_pool_guard, root_page_id)
+            .await?;
+        let column_index = ColumnBlockIndex::new(
+            root_page_id,
+            root.pivot_row_id,
+            &self.disk_pool,
+            disk_pool_guard,
+        );
         let mut rows = Vec::new();
         for entry in entries {
             let deleted = load_entry_deletion_deltas(&column_index, &entry).await?;
             let page_rows = self
-                .decode_lwc_page_rows(metadata, &column_index, &entry)
+                .decode_lwc_page_rows(metadata, disk_pool_guard, &column_index, &entry)
                 .await?;
             for row in page_rows {
                 let delta = row
@@ -425,6 +456,7 @@ impl CatalogStorage {
     async fn load_visible_rows_for_delete_lookup(
         &self,
         metadata: &TableMetadata,
+        disk_pool_guard: &PoolGuard,
         entries: &[CatalogIndexEntry],
         column_index: &ColumnBlockIndex<'_>,
     ) -> Result<Vec<ExistingVisibleRow>> {
@@ -432,7 +464,7 @@ impl CatalogStorage {
         for entry in entries {
             let deleted = load_entry_deletion_deltas(column_index, entry).await?;
             let page_rows = self
-                .decode_lwc_page_rows(metadata, column_index, entry)
+                .decode_lwc_page_rows(metadata, disk_pool_guard, column_index, entry)
                 .await?;
             for row in page_rows {
                 let delta = row
@@ -459,10 +491,12 @@ impl CatalogStorage {
     async fn decode_lwc_page_rows(
         &self,
         metadata: &TableMetadata,
+        disk_pool_guard: &PoolGuard,
         column_index: &ColumnBlockIndex<'_>,
         entry: &CatalogIndexEntry,
     ) -> Result<Vec<RowRecord>> {
-        let lwc_page = PersistedLwcPage::load(&self.disk_pool, entry.block_id()).await?;
+        let lwc_page =
+            PersistedLwcPage::load(&self.disk_pool, disk_pool_guard, entry.block_id()).await?;
         let row_count = lwc_page.row_count();
         let row_ids = column_index.load_entry_row_ids(entry).await?;
         if row_count != row_ids.len() {
@@ -677,13 +711,14 @@ mod tests {
             let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
             let tables_root = snap.meta.table_roots[0];
             let root_page_id = tables_root.root_page_id.unwrap().get();
+            let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
 
             assert_eq!(engine.disk_pool.allocated(), 0);
 
             let entries1 = engine
                 .catalog()
                 .storage
-                .collect_index_entries(root_page_id)
+                .collect_index_entries(&disk_pool_guard, root_page_id)
                 .await
                 .unwrap();
             assert!(!entries1.is_empty());
@@ -696,7 +731,7 @@ mod tests {
             let entries2 = engine
                 .catalog()
                 .storage
-                .collect_index_entries(root_page_id)
+                .collect_index_entries(&disk_pool_guard, root_page_id)
                 .await
                 .unwrap();
             assert_eq!(entries2.len(), entries1.len());
@@ -730,10 +765,11 @@ mod tests {
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             let tables_root1 = snap1.meta.table_roots[0];
             assert!(tables_root1.root_page_id.is_some());
+            let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
             let entries1 = engine
                 .catalog()
                 .storage
-                .collect_index_entries(tables_root1.root_page_id.unwrap().get())
+                .collect_index_entries(&disk_pool_guard, tables_root1.root_page_id.unwrap().get())
                 .await
                 .unwrap();
             assert!(!entries1.is_empty());
@@ -750,7 +786,7 @@ mod tests {
             let entries2 = engine
                 .catalog()
                 .storage
-                .collect_index_entries(tables_root2.root_page_id.unwrap().get())
+                .collect_index_entries(&disk_pool_guard, tables_root2.root_page_id.unwrap().get())
                 .await
                 .unwrap();
 
@@ -768,11 +804,13 @@ mod tests {
                 tables_root1.root_page_id.unwrap().get(),
                 tables_root1.pivot_row_id,
                 &engine.catalog().storage.disk_pool,
+                &disk_pool_guard,
             );
             let index2 = ColumnBlockIndex::new(
                 tables_root2.root_page_id.unwrap().get(),
                 tables_root2.pivot_row_id,
                 &engine.catalog().storage.disk_pool,
+                &disk_pool_guard,
             );
             assert_eq!(last2.start_row_id, last1.start_row_id);
             assert_ne!(last2.block_id(), last1.block_id());

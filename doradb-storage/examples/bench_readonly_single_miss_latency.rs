@@ -1,15 +1,13 @@
 use clap::Parser;
 use doradb_storage::buffer::frame::BufferFrame;
-use doradb_storage::buffer::guard::PageGuard;
 use doradb_storage::buffer::page::{PAGE_SIZE, Page, PageID};
-use doradb_storage::buffer::{BufferPool, BufferPoolStats, PoolRole, ReadonlyBufferPool};
+use doradb_storage::buffer::{BufferPoolStats, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
 use doradb_storage::conf::{
     EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
 };
 use doradb_storage::error::PersistedFileKind;
 use doradb_storage::io::{AIOBuf, DirectBuf, IOBackendStats};
-use doradb_storage::latch::LatchFallbackMode;
 use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::value::ValKind;
 use rand::RngCore;
@@ -203,7 +201,6 @@ fn main() {
             Arc::clone(&table_file),
             engine.disk_pool.clone_inner(),
         ));
-        let pool_guard = (*pool).pool_guard();
 
         println!(
             "readonly-single-miss-latency storage_root={} pages={} page_size={} dataset_bytes={} cache_bytes={} required_cache_bytes={} frame_bytes={}",
@@ -216,18 +213,16 @@ fn main() {
             readonly_frame_bytes(),
         );
 
+        let pool_guard = pool.pool_guard();
         let cold_pool_start = pool.global_stats();
         let cold_backend_start = engine.table_fs.io_backend_stats();
         let cold_start = std::time::Instant::now();
         let mut cold_checksum = 0u64;
         for page_id in 0..args.pages as PageID {
             let g = pool
-                .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                .read_block(&pool_guard, page_id)
                 .await
-                .expect("buffer-pool read failed in benchmark")
-                .lock_shared_async()
-                .await
-                .unwrap();
+                .expect("buffer-pool read failed in benchmark");
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&g.page()[0..8]);
             cold_checksum ^= u64::from_le_bytes(arr);
@@ -240,7 +235,7 @@ fn main() {
             "cold_miss",
             args.pages,
             cold_elapsed,
-            pool.allocated(),
+            engine.disk_pool.allocated(),
             cold_checksum,
             cold_pool_end.delta_since(cold_pool_start),
             cold_backend_end.delta_since(cold_backend_start),
@@ -254,12 +249,9 @@ fn main() {
         for _ in 0..args.warm_reads {
             let page_id = (rng.next_u64() % args.pages as u64) as PageID;
             let g = pool
-                .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                .read_block(&pool_guard, page_id)
                 .await
-                .expect("buffer-pool read failed in benchmark")
-                .lock_shared_async()
-                .await
-                .unwrap();
+                .expect("buffer-pool read failed in benchmark");
             warm_checksum ^= g.page()[0] as u64;
             drop(g);
         }
@@ -270,13 +262,12 @@ fn main() {
             "warm_hit",
             args.warm_reads,
             warm_elapsed,
-            pool.allocated(),
+            engine.disk_pool.allocated(),
             warm_checksum,
             warm_pool_end.delta_since(warm_pool_start),
             warm_backend_end.delta_since(warm_backend_start),
         );
 
-        drop(pool_guard);
         drop(pool);
         drop(table_file);
         drop(engine);

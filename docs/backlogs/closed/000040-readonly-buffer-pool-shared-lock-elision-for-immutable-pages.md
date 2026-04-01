@@ -35,3 +35,12 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: wontfix
+- Detail: Verified against the current readonly buffer pool. `ReadonlyBlockGuard` still owns a `PageSharedGuard`, and readonly eviction reclaims frames by taking an exclusive guard and zeroing the page bytes before returning the frame to the free list. Removing the shared lock would therefore need a separate pin/lifetime mechanism to keep a resident page alive while an immutable guard exists. Given that added machinery, the optimization is not attractive at this time.
+- Closed By: backlog close
+- Reference: Verified against the current code in `doradb-storage/src/buffer/readonly.rs` and the existing pin/unpin mechanism in `doradb-storage/src/buffer/evict.rs`.
+
+- Closed At: 2026-04-01
