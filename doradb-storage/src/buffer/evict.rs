@@ -1498,6 +1498,7 @@ mod tests {
     use super::*;
     use crate::buffer::EvictionArbiterBuilder;
     use crate::buffer::guard::PageGuard;
+    use crate::buffer::test_page_id;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
     use crate::thread::join_worker;
@@ -1665,7 +1666,7 @@ mod tests {
             }
             {
                 let g = pool
-                    .get_page::<RowPage>(&pool_guard, PageID::from(0), LatchFallbackMode::Spin)
+                    .get_page::<RowPage>(&pool_guard, test_page_id(0), LatchFallbackMode::Spin)
                     .await
                     .expect("buffer-pool read failed in test")
                     .downgrade();
@@ -1676,7 +1677,7 @@ mod tests {
                     .get_child_page::<RowPage>(
                         &pool_guard,
                         &p,
-                        PageID::from(1),
+                        test_page_id(1),
                         LatchFallbackMode::Exclusive,
                     )
                     .await;
@@ -1685,7 +1686,7 @@ mod tests {
             }
             {
                 let g = pool
-                    .get_page::<RowPage>(&pool_guard, PageID::from(0), LatchFallbackMode::Spin)
+                    .get_page::<RowPage>(&pool_guard, test_page_id(0), LatchFallbackMode::Spin)
                     .await
                     .expect("buffer-pool read failed in test")
                     .downgrade();
@@ -1694,7 +1695,7 @@ mod tests {
 
                 // modify page 0.
                 let g = pool
-                    .get_page::<RowPage>(&pool_guard, PageID::from(0), LatchFallbackMode::Exclusive)
+                    .get_page::<RowPage>(&pool_guard, test_page_id(0), LatchFallbackMode::Exclusive)
                     .await
                     .expect("buffer-pool read failed in test")
                     .verify_exclusive_async::<false>()
@@ -1706,7 +1707,7 @@ mod tests {
                     .get_child_page::<RowPage>(
                         &pool_guard,
                         &p,
-                        PageID::from(1),
+                        test_page_id(1),
                         LatchFallbackMode::Exclusive,
                     )
                     .await;
@@ -1994,10 +1995,10 @@ mod tests {
                 drop(g);
             }
 
-            wait_for(|| pool.arena.frame(PageID::from(0)).kind() == FrameKind::Evicted);
+            wait_for(|| pool.arena.frame(test_page_id(0)).kind() == FrameKind::Evicted);
 
             let g = pool
-                .get_page::<Page>(&pool_guard, PageID::from(0), LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, test_page_id(0), LatchFallbackMode::Shared)
                 .await
                 .expect("buffer-pool read failed in test");
             let g = g.lock_shared_async().await.unwrap();

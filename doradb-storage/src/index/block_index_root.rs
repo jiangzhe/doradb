@@ -107,11 +107,12 @@ unsafe impl Sync for BlockIndexRoot {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::test_block_id;
     use std::sync::Arc;
 
     #[test]
     fn test_root_guide_and_try_column() {
-        let root = BlockIndexRoot::new(1000, BlockID::from(77));
+        let root = BlockIndexRoot::new(1000, test_block_id(77));
         match root.guide(999) {
             BlockIndexRoute::Column {
                 pivot_row_id,
@@ -126,15 +127,15 @@ mod tests {
             BlockIndexRoute::Row => {}
             BlockIndexRoute::Column { .. } => panic!("unexpected column route"),
         }
-        assert_eq!(root.try_column(10), Some((1000, BlockID::from(77))));
+        assert_eq!(root.try_column(10), Some((1000, test_block_id(77))));
         assert_eq!(root.try_column(1000), None);
     }
 
     #[test]
     fn test_root_update_column_root() {
         smol::block_on(async {
-            let root = BlockIndexRoot::new(1000, BlockID::from(77));
-            root.update_column_root(2000, BlockID::from(88)).await;
+            let root = BlockIndexRoot::new(1000, test_block_id(77));
+            root.update_column_root(2000, test_block_id(88)).await;
 
             match root.guide(1999) {
                 BlockIndexRoute::Column {
@@ -146,7 +147,7 @@ mod tests {
                 }
                 BlockIndexRoute::Row => panic!("unexpected row route"),
             }
-            assert_eq!(root.try_column(10), Some((2000, BlockID::from(88))));
+            assert_eq!(root.try_column(10), Some((2000, test_block_id(88))));
             assert_eq!(root.try_column(2000), None);
         });
     }
@@ -154,7 +155,7 @@ mod tests {
     #[test]
     fn test_root_concurrent_guide_and_update() {
         smol::block_on(async {
-            let root = Arc::new(BlockIndexRoot::new(1000, BlockID::from(77)));
+            let root = Arc::new(BlockIndexRoot::new(1000, test_block_id(77)));
             let reader_root = Arc::clone(&root);
             let writer_root = Arc::clone(&root);
 

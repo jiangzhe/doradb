@@ -10,47 +10,47 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Identifies which persisted CoW file surfaced a corruption failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PersistedFileKind {
+pub enum FileKind {
     TableFile,
     CatalogMultiTableFile,
 }
 
-impl fmt::Display for PersistedFileKind {
+impl fmt::Display for FileKind {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            PersistedFileKind::TableFile => "table-file",
-            PersistedFileKind::CatalogMultiTableFile => "catalog.mtb",
+            FileKind::TableFile => "table-file",
+            FileKind::CatalogMultiTableFile => "catalog.mtb",
         })
     }
 }
 
-/// Identifies which persisted page kind failed integrity or root validation.
+/// Identifies which persisted block kind failed integrity or root validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PersistedPageKind {
+pub enum BlockKind {
     TableMeta,
     MultiTableMeta,
-    LwcPage,
+    LwcBlock,
     ColumnBlockIndex,
     ColumnDeletionBlob,
 }
 
-impl fmt::Display for PersistedPageKind {
+impl fmt::Display for BlockKind {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            PersistedPageKind::TableMeta => "table-meta",
-            PersistedPageKind::MultiTableMeta => "multi-table-meta",
-            PersistedPageKind::LwcPage => "lwc-page",
-            PersistedPageKind::ColumnBlockIndex => "column-block-index",
-            PersistedPageKind::ColumnDeletionBlob => "column-deletion-blob",
+            BlockKind::TableMeta => "table-meta",
+            BlockKind::MultiTableMeta => "multi-table-meta",
+            BlockKind::LwcBlock => "lwc-block",
+            BlockKind::ColumnBlockIndex => "column-block-index",
+            BlockKind::ColumnDeletionBlob => "column-deletion-blob",
         })
     }
 }
 
-/// Classifies why a persisted page was rejected during startup or checkpoint reads.
+/// Classifies why a persisted block was rejected during startup or checkpoint reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PersistedPageCorruptionCause {
+pub enum BlockCorruptionCause {
     InvalidMagic,
     InvalidVersion,
     ChecksumMismatch,
@@ -58,15 +58,15 @@ pub enum PersistedPageCorruptionCause {
     InvalidRootInvariant,
 }
 
-impl fmt::Display for PersistedPageCorruptionCause {
+impl fmt::Display for BlockCorruptionCause {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            PersistedPageCorruptionCause::InvalidMagic => "invalid magic",
-            PersistedPageCorruptionCause::InvalidVersion => "invalid version",
-            PersistedPageCorruptionCause::ChecksumMismatch => "checksum mismatch",
-            PersistedPageCorruptionCause::InvalidPayload => "invalid payload",
-            PersistedPageCorruptionCause::InvalidRootInvariant => "invalid root invariant",
+            BlockCorruptionCause::InvalidMagic => "invalid magic",
+            BlockCorruptionCause::InvalidVersion => "invalid version",
+            BlockCorruptionCause::ChecksumMismatch => "checksum mismatch",
+            BlockCorruptionCause::InvalidPayload => "invalid payload",
+            BlockCorruptionCause::InvalidRootInvariant => "invalid root invariant",
         })
     }
 }
@@ -173,13 +173,13 @@ pub enum Error {
     #[error("column storage is required for column-path row lookup")]
     ColumnStorageMissing,
     #[error(
-        "persisted page corrupted: file={file_kind}, page={page_kind}, page_id={page_id}, cause={cause}"
+        "block corrupted: file={file_kind}, block={block_kind}, block_id={block_id}, cause={cause}"
     )]
-    PersistedPageCorrupted {
-        file_kind: PersistedFileKind,
-        page_kind: PersistedPageKind,
-        page_id: BlockID,
-        cause: PersistedPageCorruptionCause,
+    BlockCorrupted {
+        file_kind: FileKind,
+        block_kind: BlockKind,
+        block_id: BlockID,
+        cause: BlockCorruptionCause,
     },
     #[error(
         "unexpected duplicate key during recovery index rebuild for index {index_no}: row_id={row_id}, deleted={deleted}"
@@ -224,18 +224,18 @@ impl From<std::num::ParseIntError> for Error {
 }
 
 impl Error {
-    /// Constructs a contextual corruption error for one persisted CoW page.
+    /// Constructs a contextual corruption error for one persisted CoW block.
     #[inline]
-    pub fn persisted_page_corrupted(
-        file_kind: PersistedFileKind,
-        page_kind: PersistedPageKind,
-        page_id: BlockID,
-        cause: PersistedPageCorruptionCause,
+    pub fn block_corrupted(
+        file_kind: FileKind,
+        block_kind: BlockKind,
+        block_id: BlockID,
+        cause: BlockCorruptionCause,
     ) -> Self {
-        Error::PersistedPageCorrupted {
+        Error::BlockCorrupted {
             file_kind,
-            page_kind,
-            page_id,
+            block_kind,
+            block_id,
             cause,
         }
     }

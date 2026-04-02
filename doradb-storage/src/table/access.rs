@@ -2,9 +2,7 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::INVALID_PAGE_ID;
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PageID, PoolGuards};
 use crate::catalog::{CatalogTable, TableMetadata};
-use crate::error::{
-    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
-};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex};
@@ -276,11 +274,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let block =
             PersistedLwcBlock::load(storage.disk_pool(), guards.disk_guard(), block_id).await?;
         if block.row_shape_fingerprint() != row_shape_fingerprint {
-            return Err(Error::persisted_page_corrupted(
-                PersistedFileKind::TableFile,
-                PersistedPageKind::LwcPage,
+            return Err(Error::block_corrupted(
+                FileKind::TableFile,
+                BlockKind::LwcBlock,
                 block_id,
-                PersistedPageCorruptionCause::InvalidPayload,
+                BlockCorruptionCause::InvalidPayload,
             ));
         }
         block.decode_row_values(self.metadata(), row_idx, read_set)

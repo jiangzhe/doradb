@@ -431,7 +431,7 @@ impl ColumnStorage {
         &self.file
     }
 
-    /// Returns the read-only buffer pool used for persisted pages.
+    /// Returns the read-only buffer pool used for persisted blocks.
     #[inline]
     pub fn disk_pool(&self) -> &ReadonlyBufferPool {
         &self.disk_pool

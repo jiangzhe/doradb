@@ -75,14 +75,14 @@ Once stabilized, the page state is set to `TRANSITION`. The conversion pipeline 
 ### Phase 4: Persist & Commit
 *Context: Persist checkpoint metadata, then commit $T_{cp}$.*
 
-1.  **Construct New MetaPage**:
+1.  **Construct New MetaBlock**:
     *   **`Pivot_RowID`**: Advanced to the end of the converted range.
     *   **`Heap_Redo_Start_TS`**: The value calculated in Phase 2.
     *   **`Last_Checkpoint_STS`**: Set to **`CP.STS`**. (Crucial for recovery).
     *   **`Block_Index_Root`**: Point to the new index root.
 2.  **Atomic Persistence**:
-    *   Write the new MetaPage to disk.
-    *   Update **SuperPage** to point to the new MetaPage.
+    *   Write the new MetaBlock to disk.
+    *   Update **SuperBlock** to point to the new MetaBlock.
     *   Perform `fdatasync`.
 3.  **Commit Transaction**: Commit $T_{cp}$ after the file root update.
 4.  **Completion**:
@@ -93,7 +93,7 @@ Once stabilized, the page state is set to `TRANSITION`. The conversion pipeline 
 
 During crash recovery, the system uses the persisted metadata to determine which Redo Log entries to replay. This involves a two-level filtering process.
 
-**Inputs from MetaPage:**
+**Inputs from MetaBlock:**
 1.  `Pivot_RowID`: The boundary separating the on-disk ColumnStore from the in-memory RowStore.
 2.  `Heap_Redo_Start_TS`: The **physical starting point** for scanning the log. This is a coarse-grained filter that allows the Log Manager to skip old log files entirely.
 3.  `Last_Checkpoint_STS`: The **logical snapshot time** of the persistent ColumnStore. This is a fine-grained filter used to determine if a specific change within the log is already reflected in the on-disk data.
@@ -104,7 +104,7 @@ The recovery process begins by seeking to the `Heap_Redo_Start_TS` in the commit
 
 ```rust
 // First-level check: Is the log entry for hot or cold data?
-if L.RowID >= MetaPage.Pivot_RowID {
+if L.RowID >= MetaBlock.Pivot_RowID {
     // Case 1: Hot Data (In-Memory RowStore)
     // The row belongs to an Active RowPage that was not checkpointed.
     // The Heap_Redo_Start_TS check was already implicitly handled by the
@@ -118,7 +118,7 @@ if L.RowID >= MetaPage.Pivot_RowID {
     // We must apply a second, logical filter to see if this specific
     // change is already included in those blocks.
     
-    if L.CTS <= MetaPage.Last_Checkpoint_STS {
+    if L.CTS <= MetaBlock.Last_Checkpoint_STS {
         // Case 2a: Change is Already Persisted
         // The change's commit timestamp is older than the logical snapshot
         // time of the on-disk data. This means the change is guaranteed
@@ -137,7 +137,7 @@ if L.RowID >= MetaPage.Pivot_RowID {
 
 ## 5. Metadata Structure Summary
 
-To support this logic, the **MetaPage** (referenced by SuperPage) must strictly contain:
+To support this logic, the **MetaBlock** (referenced by SuperBlock) must strictly contain:
 
 | Field | Description | Usage |
 | :--- | :--- | :--- |

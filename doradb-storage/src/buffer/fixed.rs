@@ -250,6 +250,7 @@ unsafe impl Sync for FixedBufferPool {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::test_page_id;
     use crate::index::BlockNode;
     use crate::quiescent::QuiescentBox;
     use std::sync::Arc;
@@ -279,7 +280,7 @@ mod tests {
             }
             {
                 let g = pool
-                    .get_page::<BlockNode>(&pool_guard, PageID::from(0), LatchFallbackMode::Spin)
+                    .get_page::<BlockNode>(&pool_guard, test_page_id(0), LatchFallbackMode::Spin)
                     .await
                     .expect("buffer-pool read failed in test")
                     .downgrade();

@@ -1,12 +1,10 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
-use crate::error::{
-    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::file::block_integrity::{
+    BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC, max_payload_len, validate_block,
+    write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
-use crate::file::page_integrity::{
-    COLUMN_BLOCK_INDEX_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
-    write_page_checksum, write_page_header,
-};
 use crate::index::column_deletion_blob::{
     BlobRef, COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST, COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
     ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
@@ -1141,28 +1139,23 @@ struct NodeRewriteResult {
 }
 
 #[inline]
-fn invalid_node_payload(file_kind: PersistedFileKind, page_id: BlockID) -> Error {
-    Error::persisted_page_corrupted(
+fn invalid_node_payload(file_kind: FileKind, page_id: BlockID) -> Error {
+    Error::block_corrupted(
         file_kind,
-        PersistedPageKind::ColumnBlockIndex,
+        BlockKind::ColumnBlockIndex,
         page_id,
-        PersistedPageCorruptionCause::InvalidPayload,
+        BlockCorruptionCause::InvalidPayload,
     )
 }
 
 #[inline]
 fn validate_node_payload(
     page: &[u8],
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<(&[u8], ColumnBlockNodeHeader)> {
-    let payload = validate_page(page, COLUMN_BLOCK_INDEX_PAGE_SPEC).map_err(|cause| {
-        Error::persisted_page_corrupted(
-            file_kind,
-            PersistedPageKind::ColumnBlockIndex,
-            page_id,
-            cause,
-        )
+    let payload = validate_block(page, COLUMN_BLOCK_INDEX_BLOCK_SPEC).map_err(|cause| {
+        Error::block_corrupted(file_kind, BlockKind::ColumnBlockIndex, page_id, cause)
     })?;
     let header =
         bytemuck::try_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
@@ -1179,7 +1172,7 @@ fn validate_node_payload(
 #[inline]
 pub(crate) fn validate_persisted_column_block_index_page(
     page: &[u8],
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<()> {
     validate_node_payload(page, file_kind, page_id).map(|_| ())
@@ -1187,7 +1180,7 @@ pub(crate) fn validate_persisted_column_block_index_page(
 
 #[inline]
 fn validated_node_payload(page: &[u8]) -> &[u8] {
-    let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+    let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
     &page[payload_start..payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE]
 }
 
@@ -1212,7 +1205,7 @@ impl ValidatedColumnBlockNode {
     #[inline]
     fn try_from_guard(
         guard: ReadonlyBlockGuard,
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<Self> {
         let (_, header) = validate_node_payload(guard.page(), file_kind, page_id)?;
@@ -1221,7 +1214,7 @@ impl ValidatedColumnBlockNode {
 
     fn leaf_header_ext(
         &self,
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<&ColumnBlockLeafHeaderExt> {
         bytemuck::try_from_bytes::<ColumnBlockLeafHeaderExt>(
@@ -1232,7 +1225,7 @@ impl ValidatedColumnBlockNode {
 
     fn leaf_prefix_plane(
         &self,
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<LeafPrefixPlane<'_>> {
         let search_type = self
@@ -1272,7 +1265,7 @@ impl ValidatedColumnBlockNode {
     fn leaf_entry_view(
         &self,
         idx: usize,
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<LeafEntryView<'_>> {
         let prefixes = self.leaf_prefix_plane(file_kind, page_id)?;
@@ -1370,8 +1363,8 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     #[inline]
-    pub(crate) fn file_kind(&self) -> PersistedFileKind {
-        self.disk_pool.persisted_file_kind()
+    pub(crate) fn file_kind(&self) -> FileKind {
+        self.disk_pool.file_kind()
     }
 
     #[inline]
@@ -1530,11 +1523,11 @@ impl<'a> ColumnBlockIndex<'a> {
                 .read_framed_blob(blob_ref)
                 .await
                 .map_err(|err| match err {
-                    Error::InvalidFormat => Error::persisted_page_corrupted(
+                    Error::InvalidFormat => Error::block_corrupted(
                         self.file_kind(),
-                        PersistedPageKind::ColumnDeletionBlob,
+                        BlockKind::ColumnDeletionBlob,
                         blob_ref.start_page_id,
-                        PersistedPageCorruptionCause::InvalidPayload,
+                        BlockCorruptionCause::InvalidPayload,
                     ),
                     other => other,
                 })?;
@@ -1546,11 +1539,11 @@ impl<'a> ColumnBlockIndex<'a> {
                     .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?
                     .version
         {
-            return Err(Error::persisted_page_corrupted(
+            return Err(Error::block_corrupted(
                 self.file_kind(),
-                PersistedPageKind::ColumnDeletionBlob,
+                BlockKind::ColumnDeletionBlob,
                 blob_ref.start_page_id,
-                PersistedPageCorruptionCause::InvalidPayload,
+                BlockCorruptionCause::InvalidPayload,
             ));
         }
         let row_id_deltas = decode_delete_rows(
@@ -1562,11 +1555,11 @@ impl<'a> ColumnBlockIndex<'a> {
             page_id,
         )
         .map_err(|err| match err {
-            Error::InvalidFormat => Error::persisted_page_corrupted(
+            Error::InvalidFormat => Error::block_corrupted(
                 self.file_kind(),
-                PersistedPageKind::ColumnDeletionBlob,
+                BlockKind::ColumnDeletionBlob,
                 blob_ref.start_page_id,
-                PersistedPageCorruptionCause::InvalidPayload,
+                BlockCorruptionCause::InvalidPayload,
             ),
             other => other,
         })?;
@@ -2108,13 +2101,13 @@ impl<'a> ColumnBlockIndex<'a> {
         node: &ColumnBlockNode,
     ) -> Result<()> {
         let mut buf = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
-        let payload_start = write_page_header(buf.data_mut(), COLUMN_BLOCK_INDEX_PAGE_SPEC);
+        let payload_start = write_block_header(buf.data_mut(), COLUMN_BLOCK_INDEX_BLOCK_SPEC);
         let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
         let dst = &mut buf.data_mut()[payload_start..payload_end];
         dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(bytes_of(&node.header));
         dst[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
             .copy_from_slice(node.data_ref());
-        write_page_checksum(buf.data_mut());
+        write_block_checksum(buf.data_mut());
         mutable_file.write_block(page_id, buf).await
     }
 }
@@ -2156,7 +2149,7 @@ fn leaf_entry_slice(
     data: &[u8],
     prefix_end: usize,
     entry_offset: u16,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<&[u8]> {
     let offset = entry_offset as usize;
@@ -2184,7 +2177,7 @@ fn leaf_entry_slice(
 fn validate_leaf_prefixes(
     prefixes: &LeafPrefixPlane<'_>,
     data: &[u8],
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<()> {
     if prefixes.count() == 0 {
@@ -2268,7 +2261,7 @@ fn validate_leaf_prefixes(
 fn entry_contains_row_id(
     view: &LeafEntryView<'_>,
     row_id: RowID,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<bool> {
     Ok(resolve_row_idx_in_view(view, row_id, file_kind, page_id)?.is_some())
@@ -2277,7 +2270,7 @@ fn entry_contains_row_id(
 fn resolve_row_idx_in_view(
     view: &LeafEntryView<'_>,
     row_id: RowID,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<Option<usize>> {
     let delta_u64 = match row_id.checked_sub(view.start_row_id) {
@@ -2311,7 +2304,7 @@ fn resolve_delta_list_row_idx(
     view: &LeafEntryView<'_>,
     row_meta: DecodedRowSectionMetadata,
     delta: u32,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<Option<usize>> {
     let deltas = decode_u32_row_deltas(
@@ -2327,7 +2320,7 @@ fn resolve_delta_list_row_idx(
 
 fn decode_logical_row_set(
     view: &LeafEntryView<'_>,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<LogicalRowSet> {
     let row_meta = decode_row_section_metadata(
@@ -2363,7 +2356,7 @@ fn decode_logical_row_set(
 fn decode_row_ids_from_row_set(
     start_row_id: RowID,
     row_set: &LogicalRowSet,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<Vec<RowID>> {
     let mut row_ids = Vec::with_capacity(row_set.row_count());
@@ -2393,7 +2386,7 @@ fn decode_row_ids_from_row_set(
 fn decode_logical_delete_set_base(
     view: &LeafEntryView<'_>,
     row_set: &LogicalRowSet,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<LogicalDeleteSet> {
     let delete_meta =
@@ -2432,7 +2425,7 @@ fn decode_logical_delete_set_base(
 fn build_leaf_entry(
     leaf_page_id: BlockID,
     view: &LeafEntryView<'_>,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
 ) -> Result<ColumnLeafEntry> {
     let row_meta = decode_row_section_metadata(
         view.row_section,
@@ -2480,7 +2473,7 @@ fn build_resolved_row(
 
 fn decode_default_delete_domain_from_row_header(
     row_header: SectionHeader,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<ColumnDeleteDomain> {
     if row_header.flags != 0 {
@@ -2493,7 +2486,7 @@ fn decode_row_section_metadata(
     row_section: &[u8],
     row_header: SectionHeader,
     row_id_span: u32,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<DecodedRowSectionMetadata> {
     let _delete_domain =
@@ -2544,7 +2537,7 @@ fn decode_row_section_metadata(
 fn decode_delete_section_metadata(
     delete_section: Option<&[u8]>,
     row_header: SectionHeader,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<DecodedDeleteSectionMetadata> {
     let default_domain =
@@ -2614,7 +2607,7 @@ fn decode_delete_section_metadata(
 #[inline]
 fn decode_delete_domain_or_invalid_node(
     raw: u8,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<ColumnDeleteDomain> {
     ColumnDeleteDomain::decode(raw).map_err(|_| invalid_node_payload(file_kind, page_id))
@@ -2855,7 +2848,7 @@ fn decode_u32_row_deltas(
     expected_count: u16,
     row_id_span: u32,
     first_present_delta: u32,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<Vec<u32>> {
     let deltas = decode_u32_bytes_strict(bytes, expected_count)?;
@@ -2872,7 +2865,7 @@ fn decode_delete_rows(
     expected_count: u16,
     delete_domain: ColumnDeleteDomain,
     row_set: &LogicalRowSet,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<Vec<u32>> {
     let delete_values = decode_u32_bytes_strict(bytes, expected_count)?;
@@ -3092,6 +3085,7 @@ mod tests {
     };
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
+    use crate::file::test_block_id;
     use crate::index::load_entry_deletion_deltas;
     use crate::value::ValKind;
     use std::collections::BTreeSet;
@@ -3138,7 +3132,7 @@ mod tests {
     fn test_leaf_entry_header_roundtrip_uses_u16_lengths() {
         let encoded = EncodedLeafEntry {
             start_row_id: 10,
-            block_id: BlockID::from(1001),
+            block_id: test_block_id(1001),
             row_id_span: 32,
             row_shape_fingerprint: 42,
             row_section: vec![0u8; 4 + 7 * mem::size_of::<u32>()],
@@ -3191,18 +3185,18 @@ mod tests {
         let err = decode_delete_section_metadata(
             Some(&[0u8; COLUMN_DELETE_SECTION_HEADER_SIZE - 1]),
             row_header,
-            PersistedFileKind::TableFile,
-            BlockID::from(42),
+            FileKind::TableFile,
+            test_block_id(42),
         )
         .unwrap_err();
         assert!(matches!(
             err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::ColumnBlockIndex,
-                page_id,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
-            } if page_id == BlockID::from(42)
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::ColumnBlockIndex,
+                block_id: page_id,
+                cause: BlockCorruptionCause::InvalidPayload,
+            } if page_id == test_block_id(42)
         ));
     }
 
@@ -3245,8 +3239,8 @@ mod tests {
             let mut mutable = MutableTableFile::fork(&table);
             let index = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard);
             let entries = vec![
-                sparse_entry(10, 20, vec![12, 15, 18], 1001),
-                dense_entry(20, 24, 1002),
+                sparse_entry(10, 20, vec![12, 15, 18], test_block_id(1001)),
+                dense_entry(20, 24, test_block_id(1002)),
             ];
             let root_block_id = index
                 .batch_insert(&mut mutable, &entries, 24, 2)
@@ -3313,39 +3307,39 @@ mod tests {
             let delta_u16_start = 1_000u64 + u16::MAX as u64;
             assert_search_type_lookup(
                 vec![
-                    dense_entry(1_000, 1_001, 1001),
-                    dense_entry(delta_u16_start, delta_u16_start + 1, 1002),
+                    dense_entry(1_000, 1_001, test_block_id(1001)),
+                    dense_entry(delta_u16_start, delta_u16_start + 1, test_block_id(1002)),
                 ],
                 delta_u16_start + 1,
                 delta_u16_start,
                 ColumnBlockLeafSearchType::DeltaU16,
-                1002,
+                test_block_id(1002),
             )
             .await;
 
             let delta_u32_start = 1_000u64 + u16::MAX as u64 + 1;
             assert_search_type_lookup(
                 vec![
-                    dense_entry(1_000, 1_001, 2001),
-                    dense_entry(delta_u32_start, delta_u32_start + 1, 2002),
+                    dense_entry(1_000, 1_001, test_block_id(2001)),
+                    dense_entry(delta_u32_start, delta_u32_start + 1, test_block_id(2002)),
                 ],
                 delta_u32_start + 1,
                 delta_u32_start,
                 ColumnBlockLeafSearchType::DeltaU32,
-                2002,
+                test_block_id(2002),
             )
             .await;
 
             let plain_start = 1_000u64 + u32::MAX as u64 + 1;
             assert_search_type_lookup(
                 vec![
-                    dense_entry(1_000, 1_001, 3001),
-                    dense_entry(plain_start, plain_start + 1, 3002),
+                    dense_entry(1_000, 1_001, test_block_id(3001)),
+                    dense_entry(plain_start, plain_start + 1, test_block_id(3002)),
                 ],
                 plain_start + 1,
                 plain_start,
                 ColumnBlockLeafSearchType::Plain,
-                3002,
+                test_block_id(3002),
             )
             .await;
         });
@@ -3368,8 +3362,8 @@ mod tests {
                     .batch_insert(
                         &mut mutable,
                         &[
-                            dense_entry(0, 4, 1001),
-                            sparse_entry(10, 20, vec![12, 15, 18], 1002),
+                            dense_entry(0, 4, test_block_id(1001)),
+                            sparse_entry(10, 20, vec![12, 15, 18], test_block_id(1002)),
                         ],
                         20,
                         2,
@@ -3414,8 +3408,8 @@ mod tests {
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
             let entries = vec![
-                dense_entry(0, 4, 1001),
-                sparse_entry(10, 20, vec![12, 15, 18], 1002),
+                dense_entry(0, 4, test_block_id(1001)),
+                sparse_entry(10, 20, vec![12, 15, 18], test_block_id(1002)),
             ];
             let root_block_id =
                 ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
@@ -3477,7 +3471,10 @@ mod tests {
             let root_v1 = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(
                     &mut mutable,
-                    &[dense_entry(0, 4, 1001), dense_entry(4, 8, 1002)],
+                    &[
+                        dense_entry(0, 4, test_block_id(1001)),
+                        dense_entry(4, 8, test_block_id(1002)),
+                    ],
                     8,
                     2,
                 )
@@ -3486,7 +3483,7 @@ mod tests {
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
             let mut mutable = MutableTableFile::fork(&table);
-            let replacement = sparse_entry(4, 10, vec![4, 5, 8, 9], 2002);
+            let replacement = sparse_entry(4, 10, vec![4, 5, 8, 9], test_block_id(2002));
             let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_entries(
                     &mut mutable,
@@ -3528,7 +3525,12 @@ mod tests {
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
             let root_v1 = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
-                .batch_insert(&mut mutable, &[dense_entry(0, 8, 1001)], 8, 2)
+                .batch_insert(
+                    &mut mutable,
+                    &[dense_entry(0, 8, test_block_id(1001))],
+                    8,
+                    2,
+                )
                 .await
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
@@ -3571,7 +3573,12 @@ mod tests {
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table);
             let root_v1 = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
-                .batch_insert(&mut mutable, &[dense_entry(0, 8, 1001)], 8, 2)
+                .batch_insert(
+                    &mut mutable,
+                    &[dense_entry(0, 8, test_block_id(1001))],
+                    8,
+                    2,
+                )
                 .await
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
@@ -3579,7 +3586,7 @@ mod tests {
             let replacement = ColumnBlockEntryShape::new(0, 8, (0..8).collect(), vec![1, 3, 6])
                 .unwrap()
                 .with_delete_domain(ColumnDeleteDomain::Ordinal)
-                .with_block_id(1001);
+                .with_block_id(test_block_id(1001));
             let mut mutable = MutableTableFile::fork(&table);
             let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_entries(
@@ -3619,7 +3626,7 @@ mod tests {
             let seed = ColumnBlockEntryShape::new(0, 8, (0..8).collect(), vec![1, 3])
                 .unwrap()
                 .with_delete_domain(ColumnDeleteDomain::Ordinal)
-                .with_block_id(1001);
+                .with_block_id(test_block_id(1001));
             let mut mutable = MutableTableFile::fork(&table);
             let root_v1 = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(&mut mutable, &[seed], 8, 2)

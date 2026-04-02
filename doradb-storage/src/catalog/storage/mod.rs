@@ -164,10 +164,10 @@ impl CatalogStorage {
             if table_id >= roots.len() {
                 continue;
             }
-            let (pivot_row_id, root_page_id) = table.blk_idx.root_snapshot();
+            let (pivot_row_id, root_block_id) = table.blk_idx.root_snapshot();
             roots[table_id] = CatalogTableRootDesc {
                 table_id: table_id as u64,
-                root_page_id: NonZeroU64::new(root_page_id.into()),
+                root_block_id: NonZeroU64::new(root_block_id.into()),
                 pivot_row_id,
             };
         }

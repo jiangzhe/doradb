@@ -89,7 +89,7 @@ Checkpoint task merges committed and dirty entries to DiskTree and reset them to
   1. The Checkpoint thread reads the active root.
   2. It applies a batch of updates (from commit log replay).
   3. Modified nodes are copied to new disk pages (CoW), propagating path updates up to a **new root**.
-  4. The new root pointer is written to the inactive slot in the header, and an atomic meta-page update switches the active root.
+  4. The new root pointer is written to the inactive slot in the header, and an atomic meta-block update switches the active root.
   - This ensures the DiskTree is always in a consistent state, even if the system crashes during a write.
 
 ## Transaction System

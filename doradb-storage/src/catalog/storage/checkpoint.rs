@@ -5,7 +5,7 @@ use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{Error, PersistedPageCorruptionCause, PersistedPageKind, Result};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, Result};
 use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
@@ -59,7 +59,7 @@ impl CatalogStorage {
             if idx >= self.tables.len() {
                 break;
             }
-            if root.root_page_id.is_none() {
+            if root.root_block_id.is_none() {
                 if root.pivot_row_id != 0 {
                     return Err(Error::InvalidState);
                 }
@@ -168,20 +168,18 @@ impl CatalogStorage {
     ) -> Result<CatalogTableRootDesc> {
         let disk_pool_guard = self.disk_pool.pool_guard();
         // Step 1: Validate root invariants and construct a base index snapshot for reads.
-        if root.root_page_id.is_none() && root.pivot_row_id != 0 {
+        if root.root_block_id.is_none() && root.pivot_row_id != 0 {
             return Err(Error::InvalidState);
         }
-        let root_block_id = root
-            .root_page_id
-            .map_or(SUPER_BLOCK_ID, |block_id| BlockID::from(block_id.get()));
-        let entries = if root_block_id == SUPER_BLOCK_ID {
-            Vec::new()
-        } else {
+        let root_block_id = root.checkpoint_root_block_id();
+        let entries = if let Some(root_block_id) = root_block_id {
             self.collect_index_entries(&disk_pool_guard, root_block_id)
                 .await?
+        } else {
+            Vec::new()
         };
         let base_index = ColumnBlockIndex::new(
-            root_block_id,
+            root_block_id.unwrap_or(SUPER_BLOCK_ID),
             root.pivot_row_id,
             &self.disk_pool,
             &disk_pool_guard,
@@ -254,7 +252,7 @@ impl CatalogStorage {
         }
 
         // Step 4: Build the live-insert batch after canceling same-batch insert+delete rows.
-        let mut current_root_block_id = root_block_id;
+        let mut current_root_block_id = root_block_id.unwrap_or(SUPER_BLOCK_ID);
         let mut current_end_row_id = root.pivot_row_id;
         let mut entries_changed = false;
         let mut live_inserts = Vec::new();
@@ -388,14 +386,14 @@ impl CatalogStorage {
         }
 
         // Step 9: Publish final per-table root descriptor for this checkpoint batch.
-        let root_page_id = if entries_changed {
+        let root_block_id = if entries_changed {
             Some(NonZeroU64::new(current_root_block_id.into()).ok_or(Error::InvalidState)?)
         } else {
-            root.root_page_id
+            root.root_block_id
         };
         Ok(CatalogTableRootDesc {
             table_id,
-            root_page_id,
+            root_block_id,
             pivot_row_id: next_row_id.max(root.pivot_row_id),
         })
     }
@@ -420,16 +418,15 @@ impl CatalogStorage {
         disk_pool_guard: &PoolGuard,
         root: CatalogTableRootDesc,
     ) -> Result<Vec<RowRecord>> {
-        if root.root_page_id.is_none() {
+        if root.root_block_id.is_none() {
             if root.pivot_row_id != 0 {
                 return Err(Error::InvalidState);
             }
             return Ok(Vec::new());
         }
         let root_block_id = root
-            .root_page_id
-            .map(|block_id| BlockID::from(block_id.get()))
-            .unwrap_or(SUPER_BLOCK_ID);
+            .checkpoint_root_block_id()
+            .expect("root_block_id checked above");
         let entries = self
             .collect_index_entries(disk_pool_guard, root_block_id)
             .await?;
@@ -509,11 +506,11 @@ impl CatalogStorage {
         let row_count = lwc_page.row_count();
         let row_ids = column_index.load_entry_row_ids(entry).await?;
         if row_count != row_ids.len() {
-            return Err(Error::persisted_page_corrupted(
-                self.disk_pool.persisted_file_kind(),
-                PersistedPageKind::LwcPage,
+            return Err(Error::block_corrupted(
+                self.disk_pool.file_kind(),
+                BlockKind::LwcBlock,
                 entry.block_id(),
-                PersistedPageCorruptionCause::InvalidPayload,
+                BlockCorruptionCause::InvalidPayload,
             ));
         }
         let mut rows = Vec::with_capacity(row_count);
@@ -720,7 +717,7 @@ mod tests {
 
             let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
             let tables_root = snap.meta.table_roots[0];
-            let root_block_id = BlockID::from(tables_root.root_page_id.unwrap().get());
+            let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
             let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
 
             assert_eq!(engine.disk_pool.allocated(), 0);
@@ -774,14 +771,14 @@ mod tests {
 
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             let tables_root1 = snap1.meta.table_roots[0];
-            assert!(tables_root1.root_page_id.is_some());
+            assert!(tables_root1.root_block_id.is_some());
             let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
             let entries1 = engine
                 .catalog()
                 .storage
                 .collect_index_entries(
                     &disk_pool_guard,
-                    BlockID::from(tables_root1.root_page_id.unwrap().get()),
+                    BlockID::from(tables_root1.root_block_id.unwrap().get()),
                 )
                 .await
                 .unwrap();
@@ -801,13 +798,13 @@ mod tests {
                 .storage
                 .collect_index_entries(
                     &disk_pool_guard,
-                    BlockID::from(tables_root2.root_page_id.unwrap().get()),
+                    BlockID::from(tables_root2.root_block_id.unwrap().get()),
                 )
                 .await
                 .unwrap();
 
             assert!(tables_root2.pivot_row_id > tables_root1.pivot_row_id);
-            assert!(tables_root2.root_page_id != tables_root1.root_page_id);
+            assert!(tables_root2.root_block_id != tables_root1.root_block_id);
             assert_eq!(
                 entries2.len(),
                 entries1.len(),
@@ -817,13 +814,13 @@ mod tests {
             let last1 = entries1.last().copied().unwrap();
             let last2 = entries2.last().copied().unwrap();
             let index1 = ColumnBlockIndex::new(
-                BlockID::from(tables_root1.root_page_id.unwrap().get()),
+                BlockID::from(tables_root1.root_block_id.unwrap().get()),
                 tables_root1.pivot_row_id,
                 &engine.catalog().storage.disk_pool,
                 &disk_pool_guard,
             );
             let index2 = ColumnBlockIndex::new(
-                BlockID::from(tables_root2.root_page_id.unwrap().get()),
+                BlockID::from(tables_root2.root_block_id.unwrap().get()),
                 tables_root2.pivot_row_id,
                 &engine.catalog().storage.disk_pool,
                 &disk_pool_guard,

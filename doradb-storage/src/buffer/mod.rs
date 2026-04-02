@@ -13,6 +13,8 @@ mod util;
 
 #[cfg(test)]
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
+#[cfg(test)]
+pub(crate) use self::tests::test_page_id;
 pub use evict::EvictableBufferPool;
 pub(crate) use evict::{IndexPoolWorkers, MemPoolWorkers};
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
@@ -36,7 +38,7 @@ use crate::component::{
 use crate::compression::BitPackable;
 use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
-use crate::error::{PersistedFileKind, Result};
+use crate::error::{FileKind, Result};
 use crate::file::BlockID;
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
@@ -94,14 +96,6 @@ impl From<u64> for PageID {
 impl From<u32> for PageID {
     #[inline]
     fn from(value: u32) -> Self {
-        Self(value as u64)
-    }
-}
-
-impl From<i32> for PageID {
-    #[inline]
-    fn from(value: i32) -> Self {
-        debug_assert!(value >= 0);
         Self(value as u64)
     }
 }
@@ -275,8 +269,8 @@ pub const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
 /// waiting behind writeback of the same page.
 pub(crate) type PageIOCompletion = Completion<Result<PageID>>;
 
-/// Validation callback for one persisted readonly-cache page image.
-pub(crate) type ReadonlyBlockValidator = fn(&[u8], PersistedFileKind, BlockID) -> Result<()>;
+/// Validation callback for one persisted readonly-cache block image.
+pub(crate) type ReadonlyBlockValidator = fn(&[u8], FileKind, BlockID) -> Result<()>;
 
 /// Snapshot of buffer-pool access and IO lifecycle counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -611,4 +605,14 @@ impl Component for crate::DiskPool {
 
     #[inline]
     fn shutdown(_component: &Self::Owned) {}
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::PageID;
+
+    #[inline]
+    pub(crate) fn test_page_id(value: i32) -> PageID {
+        PageID::new(u64::try_from(value).expect("test PageID must be non-negative"))
+    }
 }

@@ -486,10 +486,10 @@ pub mod tests {
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
     use crate::file::BlockID;
+    use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::table::TablePersistence;
     use crate::trx::MIN_SNAPSHOT_TS;
@@ -662,7 +662,7 @@ pub mod tests {
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.read_exact(&mut page).unwrap();
         rewrite(&mut page);
-        write_page_checksum(&mut page);
+        write_block_checksum(&mut page);
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&page).unwrap();
         file.flush().unwrap();
@@ -684,7 +684,7 @@ pub mod tests {
         const SEARCH_TYPE_DELTA_U32: u8 = 2;
         const SEARCH_TYPE_DELTA_U16: u8 = 3;
 
-        let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
         let search_type = page[payload_start + COLUMN_BLOCK_HEADER_SIZE];
         let (prefix_size, entry_offset_offset) = match search_type {
             SEARCH_TYPE_PLAIN => (10usize, 8usize),
@@ -827,7 +827,7 @@ pub mod tests {
                     .meta
                     .table_roots
                     .iter()
-                    .all(|root| root.root_page_id.is_none() && root.pivot_row_id == 0)
+                    .all(|root| root.root_block_id.is_none() && root.pivot_row_id == 0)
             );
 
             let _ = table1(&engine).await;
@@ -847,7 +847,7 @@ pub mod tests {
                     .meta
                     .table_roots
                     .iter()
-                    .any(|root| root.root_page_id.is_some())
+                    .any(|root| root.root_block_id.is_some())
             );
             assert!(
                 snap1
@@ -898,9 +898,9 @@ pub mod tests {
                 .table_roots
                 .iter()
                 .copied()
-                .find(|root| root.root_page_id.is_some())
+                .find(|root| root.root_block_id.is_some())
                 .expect("catalog checkpoint should publish at least one root");
-            let root_block_id = BlockID::from(root.root_page_id.unwrap().get());
+            let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
             let block_id = {
                 let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
                 let index = ColumnBlockIndex::new(
@@ -937,11 +937,11 @@ pub mod tests {
             };
             assert!(matches!(
                 err,
-                Error::PersistedPageCorrupted {
-                    file_kind: PersistedFileKind::CatalogMultiTableFile,
-                    page_kind: PersistedPageKind::LwcPage,
-                    page_id,
-                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                Error::BlockCorrupted {
+                    file_kind: FileKind::CatalogMultiTableFile,
+                    block_kind: BlockKind::LwcBlock,
+                    block_id: page_id,
+                    cause: BlockCorruptionCause::ChecksumMismatch,
                 } if page_id == block_id
             ));
         });
@@ -977,9 +977,9 @@ pub mod tests {
                 .table_roots
                 .iter()
                 .copied()
-                .find(|root| root.root_page_id.is_some())
+                .find(|root| root.root_block_id.is_some())
                 .expect("catalog checkpoint should publish at least one root");
-            let root_block_id = BlockID::from(root.root_page_id.unwrap().get());
+            let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
             let entry = {
                 let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
                 let index = ColumnBlockIndex::new(
@@ -1019,11 +1019,11 @@ pub mod tests {
             };
             assert!(matches!(
                 err,
-                Error::PersistedPageCorrupted {
-                    file_kind: PersistedFileKind::CatalogMultiTableFile,
-                    page_kind: PersistedPageKind::ColumnBlockIndex,
-                    page_id,
-                    cause: PersistedPageCorruptionCause::InvalidPayload,
+                Error::BlockCorrupted {
+                    file_kind: FileKind::CatalogMultiTableFile,
+                    block_kind: BlockKind::ColumnBlockIndex,
+                    block_id: page_id,
+                    cause: BlockCorruptionCause::InvalidPayload,
                 } if page_id == entry.leaf_page_id
             ));
         });

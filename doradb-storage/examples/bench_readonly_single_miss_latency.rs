@@ -6,7 +6,7 @@ use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
 use doradb_storage::conf::{
     EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
 };
-use doradb_storage::error::PersistedFileKind;
+use doradb_storage::error::FileKind;
 use doradb_storage::file::BlockID;
 use doradb_storage::io::{AIOBuf, DirectBuf, IOBackendStats};
 use doradb_storage::quiescent::QuiescentBox;
@@ -28,7 +28,7 @@ const MIN_READONLY_POOL_PAGES: usize = 256;
     about = "Readonly buffer-pool serialized single-miss latency benchmark"
 )]
 struct Args {
-    /// Number of persisted pages written to the table file.
+    /// Number of persisted blocks written to the table file.
     #[arg(long, default_value_t = DEFAULT_PAGES)]
     pages: usize,
     /// Number of random warm-hit control reads after the full resident set is loaded.
@@ -201,7 +201,7 @@ fn main() {
 
         let pool = QuiescentBox::new(ReadonlyBufferPool::from_table_file(
             901,
-            PersistedFileKind::TableFile,
+            FileKind::TableFile,
             Arc::clone(&table_file),
             engine.disk_pool.clone_inner(),
         ));

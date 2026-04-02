@@ -1,15 +1,17 @@
+pub mod block_integrity;
 pub mod cow_file;
-pub mod meta_page;
+pub mod meta_block;
 pub mod multi_table_file;
-pub mod page_integrity;
-pub mod super_page;
+pub mod super_block;
 pub mod table_file;
 pub mod table_fs;
 
 #[cfg(test)]
 pub(crate) use self::table_fs::tests::{build_test_fs, build_test_fs_in};
 #[cfg(test)]
-pub(crate) use self::tests::{FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
+pub(crate) use self::tests::{
+    FileSyncOp, FileSyncTestHook, set_file_sync_test_hook, test_block_id,
+};
 
 use crate::buffer::{BlockKey, ReadSubmission};
 use crate::compression::BitPackable;
@@ -85,14 +87,6 @@ impl From<u64> for BlockID {
 impl From<u32> for BlockID {
     #[inline]
     fn from(value: u32) -> Self {
-        Self(value as u64)
-    }
-}
-
-impl From<i32> for BlockID {
-    #[inline]
-    fn from(value: i32) -> Self {
-        debug_assert!(value >= 0);
         Self(value as u64)
     }
 }
@@ -682,6 +676,11 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[inline]
+    pub(crate) fn test_block_id(value: i32) -> BlockID {
+        BlockID::new(u64::try_from(value).expect("test BlockID must be non-negative"))
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct FileSyncOp {

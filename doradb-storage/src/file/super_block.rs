@@ -5,24 +5,24 @@ use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use std::mem;
 
-pub const SUPER_PAGE_VERSION: u64 = 1;
-pub const SUPER_PAGE_SIZE: usize = PAGE_SIZE / 2;
-pub const SUPER_PAGE_FOOTER_SIZE: usize = mem::size_of::<SuperPageFooter>();
-pub const SUPER_PAGE_FOOTER_OFFSET: usize = SUPER_PAGE_SIZE - SUPER_PAGE_FOOTER_SIZE;
+pub const SUPER_BLOCK_VERSION: u64 = 1;
+pub const SUPER_BLOCK_SIZE: usize = PAGE_SIZE / 2;
+pub const SUPER_BLOCK_FOOTER_SIZE: usize = mem::size_of::<SuperBlockFooter>();
+pub const SUPER_BLOCK_FOOTER_OFFSET: usize = SUPER_BLOCK_SIZE - SUPER_BLOCK_FOOTER_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SuperPageHeader {
+pub struct SuperBlockHeader {
     /// Magic word of table file, by default 'DORA\0\0\0\0'
     pub magic_word: [u8; 8],
-    /// Version of super page format.
+    /// Version of super block format.
     pub version: u64,
-    /// Slot number of this super page.
+    /// Slot number of this super block.
     pub slot_no: u64,
-    /// checkpoint timestamp of this super page.
+    /// checkpoint timestamp of this super block.
     pub checkpoint_cts: TrxID,
 }
 
-impl Ser<'_> for SuperPageHeader {
+impl Ser<'_> for SuperBlockHeader {
     #[inline]
     fn ser_len(&self) -> usize {
         mem::size_of::<[u8; 8]>() // magic word
@@ -40,14 +40,14 @@ impl Ser<'_> for SuperPageHeader {
     }
 }
 
-impl Deser for SuperPageHeader {
+impl Deser for SuperBlockHeader {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, magic_word) = input.deser_byte_array::<8>(start_idx)?;
         let (idx, version) = input.deser_u64(idx)?;
         let (idx, slot_no) = input.deser_u64(idx)?;
         let (idx, checkpoint_cts) = input.deser_u64(idx)?;
-        let res = SuperPageHeader {
+        let res = SuperBlockHeader {
             magic_word,
             version,
             slot_no,
@@ -58,11 +58,11 @@ impl Deser for SuperPageHeader {
 }
 
 #[derive(PartialEq, Eq)]
-pub struct SuperPageBody {
+pub struct SuperBlockBody {
     pub meta_block_id: BlockID,
 }
 
-impl Ser<'_> for SuperPageBody {
+impl Ser<'_> for SuperBlockBody {
     #[inline]
     fn ser_len(&self) -> usize {
         mem::size_of::<BlockID>()
@@ -74,13 +74,13 @@ impl Ser<'_> for SuperPageBody {
     }
 }
 
-impl Deser for SuperPageBody {
+impl Deser for SuperBlockBody {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, meta_block_id) = input.deser_u64(start_idx)?;
         Ok((
             idx,
-            SuperPageBody {
+            SuperBlockBody {
                 meta_block_id: BlockID::from(meta_block_id),
             },
         ))
@@ -88,19 +88,19 @@ impl Deser for SuperPageBody {
 }
 
 #[derive(Default, PartialEq, Eq)]
-pub struct SuperPageFooter {
+pub struct SuperBlockFooter {
     pub b3sum: [u8; 32],
     pub checkpoint_cts: TrxID,
 }
 
-impl Deser for SuperPageFooter {
+impl Deser for SuperBlockFooter {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;
         let (idx, checkpoint_cts) = input.deser_u64(idx)?;
         Ok((
             idx,
-            SuperPageFooter {
+            SuperBlockFooter {
                 b3sum,
                 checkpoint_cts,
             },
@@ -108,10 +108,10 @@ impl Deser for SuperPageFooter {
     }
 }
 
-impl Ser<'_> for SuperPageFooter {
+impl Ser<'_> for SuperBlockFooter {
     #[inline]
     fn ser_len(&self) -> usize {
-        SUPER_PAGE_FOOTER_SIZE
+        SUPER_BLOCK_FOOTER_SIZE
     }
 
     #[inline]
@@ -122,18 +122,18 @@ impl Ser<'_> for SuperPageFooter {
 }
 
 #[derive(PartialEq, Eq)]
-pub struct SuperPage {
-    pub header: SuperPageHeader,
-    pub body: SuperPageBody,
-    pub footer: SuperPageFooter,
+pub struct SuperBlock {
+    pub header: SuperBlockHeader,
+    pub body: SuperBlockBody,
+    pub footer: SuperBlockFooter,
 }
 
-pub struct SuperPageSerView {
-    pub header: SuperPageHeader,
-    pub body: SuperPageBody,
+pub struct SuperBlockSerView {
+    pub header: SuperBlockHeader,
+    pub body: SuperBlockBody,
 }
 
-impl Ser<'_> for SuperPageSerView {
+impl Ser<'_> for SuperBlockSerView {
     #[inline]
     fn ser_len(&self) -> usize {
         self.header.ser_len() + self.body.ser_len()
@@ -147,28 +147,28 @@ impl Ser<'_> for SuperPageSerView {
 }
 
 #[inline]
-pub fn parse_super_page(
+pub fn parse_super_block(
     buf: &[u8],
     expected_magic_word: [u8; 8],
     expected_version: u64,
-) -> Result<SuperPage> {
-    let (body_start, header) = SuperPageHeader::deser(buf, 0)?;
+) -> Result<SuperBlock> {
+    let (body_start, header) = SuperBlockHeader::deser(buf, 0)?;
     if header.magic_word != expected_magic_word {
         return Err(Error::InvalidFormat);
     }
     if header.version != expected_version {
         return Err(Error::InvalidFormat);
     }
-    let (_, footer) = SuperPageFooter::deser(buf, SUPER_PAGE_FOOTER_OFFSET)?;
+    let (_, footer) = SuperBlockFooter::deser(buf, SUPER_BLOCK_FOOTER_OFFSET)?;
     if header.checkpoint_cts != footer.checkpoint_cts {
         return Err(Error::TornWrite);
     }
-    let b3sum = blake3::hash(&buf[..SUPER_PAGE_FOOTER_OFFSET]);
+    let b3sum = blake3::hash(&buf[..SUPER_BLOCK_FOOTER_OFFSET]);
     if b3sum != footer.b3sum {
         return Err(Error::ChecksumMismatch);
     }
-    let (_, body) = SuperPageBody::deser(buf, body_start)?;
-    Ok(SuperPage {
+    let (_, body) = SuperBlockBody::deser(buf, body_start)?;
+    Ok(SuperBlock {
         header,
         body,
         footer,
@@ -179,19 +179,20 @@ pub fn parse_super_page(
 mod tests {
     use super::*;
     use crate::file::table_file::TABLE_FILE_MAGIC_WORD;
+    use crate::file::test_block_id;
 
     #[test]
-    fn test_super_page_serde() {
-        let header = SuperPageHeader {
+    fn test_super_block_serde() {
+        let header = SuperBlockHeader {
             magic_word: TABLE_FILE_MAGIC_WORD,
-            version: SUPER_PAGE_VERSION,
+            version: SUPER_BLOCK_VERSION,
             slot_no: 1,
             checkpoint_cts: 12,
         };
-        let body = SuperPageBody {
-            meta_block_id: BlockID::from(7),
+        let body = SuperBlockBody {
+            meta_block_id: test_block_id(7),
         };
-        let ser_view = SuperPageSerView {
+        let ser_view = SuperBlockSerView {
             header: header.clone(),
             body,
         };
@@ -200,9 +201,9 @@ mod tests {
         let res_idx = ser_view.ser(&mut data[..], 0);
         assert_eq!(res_idx, ser_len);
 
-        let (idx, deser_header) = SuperPageHeader::deser(&data[..], 0).unwrap();
-        let (_, deser_body) = SuperPageBody::deser(&data[..], idx).unwrap();
+        let (idx, deser_header) = SuperBlockHeader::deser(&data[..], 0).unwrap();
+        let (_, deser_body) = SuperBlockBody::deser(&data[..], idx).unwrap();
         assert_eq!(deser_header, header);
-        assert_eq!(deser_body.meta_block_id, 7);
+        assert_eq!(deser_body.meta_block_id, test_block_id(7));
     }
 }

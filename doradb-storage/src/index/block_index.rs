@@ -317,6 +317,7 @@ mod tests {
     use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::error::Validation;
+    use crate::file::test_block_id;
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use std::future::Future;
@@ -446,7 +447,7 @@ mod tests {
             pool.guard(),
             &meta_guard,
             10,
-            BlockID::from(77),
+            test_block_id(77),
         ));
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
@@ -476,7 +477,7 @@ mod tests {
             pool.guard(),
             &meta_guard,
             10,
-            BlockID::from(77),
+            test_block_id(77),
         ));
         pool.set_stall_page_id(blk_idx.row.root_page_id());
 
@@ -492,7 +493,7 @@ mod tests {
             // row_id so the subsequent `try_column()` fallback becomes eligible.
             // This avoids relying on timing-sensitive races to exercise the fallback.
             entered.wait();
-            smol::block_on(blk_idx.update_column_root(11, BlockID::from(88)));
+            smol::block_on(blk_idx.update_column_root(11, test_block_id(88)));
             release.wait();
 
             let res = handle.join().unwrap();

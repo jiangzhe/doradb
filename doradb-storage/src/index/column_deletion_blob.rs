@@ -1,12 +1,10 @@
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
-use crate::error::{
-    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::file::block_integrity::{
+    BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_DELETION_BLOB_BLOCK_SPEC, max_payload_len, validate_block,
+    write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
-use crate::file::page_integrity::{
-    COLUMN_DELETION_BLOB_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
-    write_page_checksum, write_page_header,
-};
 use crate::io::DirectBuf;
 use futures::future::try_join_all;
 use std::mem;
@@ -169,35 +167,26 @@ fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
 }
 
 #[inline]
-fn invalid_blob_payload(file_kind: PersistedFileKind, page_id: BlockID) -> Error {
-    Error::persisted_page_corrupted(
+fn invalid_blob_payload(file_kind: FileKind, page_id: BlockID) -> Error {
+    Error::block_corrupted(
         file_kind,
-        PersistedPageKind::ColumnDeletionBlob,
+        BlockKind::ColumnDeletionBlob,
         page_id,
-        PersistedPageCorruptionCause::InvalidPayload,
+        BlockCorruptionCause::InvalidPayload,
     )
 }
 
 #[inline]
-fn validate_blob_page(
-    page: &[u8],
-    file_kind: PersistedFileKind,
-    page_id: BlockID,
-) -> Result<&[u8]> {
-    validate_page(page, COLUMN_DELETION_BLOB_PAGE_SPEC).map_err(|cause| {
-        Error::persisted_page_corrupted(
-            file_kind,
-            PersistedPageKind::ColumnDeletionBlob,
-            page_id,
-            cause,
-        )
+fn validate_blob_page(page: &[u8], file_kind: FileKind, page_id: BlockID) -> Result<&[u8]> {
+    validate_block(page, COLUMN_DELETION_BLOB_BLOCK_SPEC).map_err(|cause| {
+        Error::block_corrupted(file_kind, BlockKind::ColumnDeletionBlob, page_id, cause)
     })
 }
 
 #[inline]
 pub(crate) fn validate_persisted_blob_page(
     page: &[u8],
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<()> {
     let payload = validate_blob_page(page, file_kind, page_id)?;
@@ -210,7 +199,7 @@ pub(crate) fn validate_persisted_blob_page(
 
 #[inline]
 fn validated_blob_page_payload(page: &[u8]) -> &[u8] {
-    let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+    let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
     let payload_end = payload_start + max_payload_len(COW_FILE_PAGE_SIZE);
     &page[payload_start..payload_end]
 }
@@ -237,8 +226,8 @@ impl PendingBlobPage {
     #[inline]
     fn new(page_id: BlockID) -> Self {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        let payload_start = write_page_header(buf.data_mut(), COLUMN_DELETION_BLOB_PAGE_SPEC);
-        debug_assert_eq!(payload_start, PAGE_INTEGRITY_HEADER_SIZE);
+        let payload_start = write_block_header(buf.data_mut(), COLUMN_DELETION_BLOB_BLOCK_SPEC);
+        debug_assert_eq!(payload_start, BLOCK_INTEGRITY_HEADER_SIZE);
         PendingBlobPage {
             page_id,
             used_size: 0,
@@ -255,7 +244,7 @@ impl PendingBlobPage {
     fn write_bytes(&mut self, src: &[u8]) {
         debug_assert!(src.len() <= self.free_space());
         let start =
-            PAGE_INTEGRITY_HEADER_SIZE + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + self.used_size;
+            BLOCK_INTEGRITY_HEADER_SIZE + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + self.used_size;
         let end = start + src.len();
         self.buf.data_mut()[start..end].copy_from_slice(src);
         self.used_size += src.len();
@@ -328,13 +317,13 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         let sealed_pages = std::mem::take(&mut self.sealed_pages);
         let mut writes = Vec::with_capacity(sealed_pages.len());
         for mut sealed in sealed_pages {
-            let payload_end = PAGE_INTEGRITY_HEADER_SIZE + max_payload_len(COW_FILE_PAGE_SIZE);
+            let payload_end = BLOCK_INTEGRITY_HEADER_SIZE + max_payload_len(COW_FILE_PAGE_SIZE);
             encode_blob_page_header(
-                &mut sealed.page.buf.data_mut()[PAGE_INTEGRITY_HEADER_SIZE..payload_end],
+                &mut sealed.page.buf.data_mut()[BLOCK_INTEGRITY_HEADER_SIZE..payload_end],
                 sealed.next_page_id,
                 sealed.page.used_size,
             )?;
-            write_page_checksum(sealed.page.buf.data_mut());
+            write_block_checksum(sealed.page.buf.data_mut());
             writes.push(
                 self.mutable_file
                     .write_block(sealed.page.page_id, sealed.page.buf),
@@ -430,7 +419,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         if blob_ref.start_page_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
             return Err(Error::InvalidFormat);
         }
-        let file_kind = self.disk_pool.persisted_file_kind();
+        let file_kind = self.disk_pool.file_kind();
         let mut out = Vec::with_capacity(blob_ref.byte_len as usize);
         let mut remaining = blob_ref.byte_len as usize;
         let mut page_id = blob_ref.start_page_id;

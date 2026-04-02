@@ -1096,6 +1096,7 @@ mod tests {
     use super::*;
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
     use crate::buffer::page::{BufferPage, VersionedPageID};
+    use crate::buffer::test_page_id;
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
@@ -1497,7 +1498,7 @@ mod tests {
             for row_page_id in 0..10000 {
                 loop {
                     if let Valid(_) = blk_idx
-                        .insert_row_page(&pool_guard, 100, PageID::from(row_page_id))
+                        .insert_row_page(&pool_guard, 100, test_page_id(row_page_id))
                         .await
                     {
                         break;
@@ -1522,7 +1523,7 @@ mod tests {
 
             // Assign right-most leaf node.
             let mut r_g = pool.allocate_page::<BlockNode>(&pool_guard).await;
-            r_g.page_mut().init(0, 50000, 10000, PageID::from(10001));
+            r_g.page_mut().init(0, 50000, 10000, test_page_id(10001));
             r_g.page_mut().header.count = NBR_PAGE_ENTRIES_IN_LEAF as u32;
             let r_page_id = r_g.page_id();
             drop(r_g);
@@ -1532,7 +1533,7 @@ mod tests {
 
             loop {
                 if let Valid(_) = blk_idx
-                    .insert_row_page(&pool_guard, 100, PageID::from(20000))
+                    .insert_row_page(&pool_guard, 100, test_page_id(20000))
                     .await
                 {
                     break;

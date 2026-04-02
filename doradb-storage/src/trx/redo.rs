@@ -582,6 +582,7 @@ impl Deser for TableDML {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::test_page_id;
 
     #[test]
     fn test_redo_log_insert_update_delete() {
@@ -589,7 +590,7 @@ mod tests {
 
         // Test case 1: Simple insert
         let insert_entry = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 100,
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
@@ -600,7 +601,7 @@ mod tests {
 
         // Test case 2: Update after insert
         let update_entry = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 100,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
@@ -617,7 +618,7 @@ mod tests {
 
         // Test case 3: Delete after update
         let delete_entry = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 100,
             kind: RowRedoKind::Delete,
         };
@@ -627,14 +628,14 @@ mod tests {
 
         // Test case 4: Multiple updates
         let insert_entry = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 200,
             kind: RowRedoKind::Insert(vec![Val::U64(1), Val::U64(2)]),
         };
         redo_logs.insert_dml(1, insert_entry);
 
         let update1 = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
@@ -644,7 +645,7 @@ mod tests {
         redo_logs.insert_dml(1, update1);
 
         let update2 = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 1,
@@ -663,7 +664,7 @@ mod tests {
 
         // Test case 5: Multiple tables
         let another_insert = RowRedo {
-            page_id: PageID::from(2),
+            page_id: test_page_id(2),
             row_id: 300,
             kind: RowRedoKind::Insert(vec![Val::U64(50)]),
         };
@@ -681,14 +682,14 @@ mod tests {
 
         // 测试用例1：合并不同表的日志
         let insert1 = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 100,
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
         redo_logs1.insert_dml(1, insert1);
 
         let insert2 = RowRedo {
-            page_id: PageID::from(2),
+            page_id: test_page_id(2),
             row_id: 200,
             kind: RowRedoKind::Insert(vec![Val::U64(43)]),
         };
@@ -702,7 +703,7 @@ mod tests {
         // 测试用例2：合并相同表中的不同行
         let mut redo_logs2 = RedoLogs::default();
         let insert3 = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 101,
             kind: RowRedoKind::Insert(vec![Val::U64(44)]),
         };
@@ -721,7 +722,7 @@ mod tests {
         // 测试用例3：合并相同表相同行的操作
         let mut redo_logs2 = RedoLogs::default();
         let update1 = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 100,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
@@ -745,7 +746,7 @@ mod tests {
         // 测试用例5：删除操作的合并
         let mut redo_logs2 = RedoLogs::default();
         let delete1 = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 101,
             kind: RowRedoKind::Delete,
         };
@@ -763,7 +764,7 @@ mod tests {
 
         // 测试用例1：插入操作
         let insert_entry = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 100,
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
@@ -771,7 +772,7 @@ mod tests {
 
         // 测试用例2：更新操作
         let update_entry = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 200,
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
@@ -782,7 +783,7 @@ mod tests {
 
         // 测试用例3：删除操作
         let delete_entry = RowRedo {
-            page_id: PageID::from(1),
+            page_id: test_page_id(1),
             row_id: 300,
             kind: RowRedoKind::Delete,
         };

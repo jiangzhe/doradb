@@ -1,23 +1,21 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{TableID, table::TableMetadata};
-use crate::error::{
-    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
-};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::TableFsRequest;
+use crate::file::block_integrity::{
+    BlockIntegritySpec, max_payload_len, validate_block, write_block_checksum, write_block_header,
+};
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
     MutableCowFile, OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
-use crate::file::meta_page::{
-    MetaPage, MetaPageSerView, TABLE_META_MAGIC_WORD, TABLE_META_VERSION,
+use crate::file::meta_block::{
+    MetaBlock, MetaBlockSerView, TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION,
 };
-use crate::file::page_integrity::{
-    PageIntegritySpec, max_payload_len, validate_page, write_page_checksum, write_page_header,
-};
-use crate::file::super_page::{
-    SUPER_PAGE_FOOTER_OFFSET, SUPER_PAGE_SIZE, SUPER_PAGE_VERSION, SuperPage, SuperPageBody,
-    SuperPageFooter, SuperPageHeader, SuperPageSerView, parse_super_page,
+use crate::file::super_block::{
+    SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlock, SuperBlockBody,
+    SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
 use crate::index::{ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
@@ -30,28 +28,28 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
-const TABLE_META_PAGE_SPEC: PageIntegritySpec =
-    PageIntegritySpec::new(TABLE_META_MAGIC_WORD, TABLE_META_VERSION);
+const TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
+    BlockIntegritySpec::new(TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION);
 
 /// Initial size of new table file.
 pub const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
 /// Super page size of table file is 32KB.
-pub const TABLE_FILE_SUPER_PAGE_SIZE: usize = SUPER_PAGE_SIZE;
+pub const TABLE_FILE_SUPER_BLOCK_SIZE: usize = SUPER_BLOCK_SIZE;
 /// Super page header size.
-pub const TABLE_FILE_SUPER_PAGE_HEADER_SIZE: usize = mem::size_of::<[u8; 8]>()
+pub const TABLE_FILE_SUPER_BLOCK_HEADER_SIZE: usize = mem::size_of::<[u8; 8]>()
     + mem::size_of::<u64>()
     + mem::size_of::<BlockID>()
     + mem::size_of::<TrxID>();
 
 /// Table-specific metadata payload embedded in shared active root.
 ///
-/// These fields are persisted in table meta pages and kept in memory through
+/// These fields are persisted in table meta blocks and kept in memory through
 /// `ActiveRoot` for fast access on hot paths.
 #[derive(Clone)]
 pub struct TableMeta {
     /// Metadata of this table.
     pub metadata: Arc<TableMetadata>,
-    /// Root page id of column block index.
+    /// Root block id of column block index.
     pub column_block_index_root: BlockID,
     /// Upper bound of row id in this file.
     pub pivot_row_id: RowID,
@@ -66,7 +64,7 @@ pub type ActiveRoot = GenericActiveRoot<TableMeta>;
 
 impl ActiveRoot {
     /// Create a new active root.
-    /// Page number is set to zero (the first super-page slot of this file).
+    /// Page number is set to zero (the first super-block slot of this file).
     #[inline]
     pub fn new(trx_id: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
         let alloc_map = AllocMap::new(max_pages);
@@ -88,26 +86,26 @@ impl ActiveRoot {
         )
     }
 
-    /// Build super-page serialization view for the current active root.
+    /// Build super-block serialization view for the current active root.
     #[inline]
-    pub fn ser_view(&self) -> SuperPageSerView {
-        SuperPageSerView {
-            header: SuperPageHeader {
+    pub fn super_block_ser_view(&self) -> SuperBlockSerView {
+        SuperBlockSerView {
+            header: SuperBlockHeader {
                 magic_word: TABLE_FILE_MAGIC_WORD,
-                version: SUPER_PAGE_VERSION,
+                version: SUPER_BLOCK_VERSION,
                 slot_no: self.slot_no,
                 checkpoint_cts: self.trx_id,
             },
-            body: SuperPageBody {
+            body: SuperBlockBody {
                 meta_block_id: self.meta_block_id,
             },
         }
     }
 
-    /// Build meta-page serialization view for the current active root.
+    /// Build meta-block serialization view for the current active root.
     #[inline]
-    pub fn meta_page_ser_view(&self) -> MetaPageSerView<'_> {
-        MetaPageSerView::new(
+    pub fn meta_block_ser_view(&self) -> MetaBlockSerView<'_> {
+        MetaBlockSerView::new(
             self.metadata.ser_view(),
             self.column_block_index_root,
             &self.alloc_map,
@@ -119,38 +117,33 @@ impl ActiveRoot {
 }
 
 #[inline]
-fn parse_table_super_page(buf: &[u8]) -> Result<SuperPage> {
-    parse_super_page(buf, TABLE_FILE_MAGIC_WORD, SUPER_PAGE_VERSION)
+fn parse_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
+    parse_super_block(buf, TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
 }
 
 #[inline]
-fn parse_table_meta_page(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
-    let payload = validate_page(buf, TABLE_META_PAGE_SPEC).map_err(|cause| {
-        Error::persisted_page_corrupted(
-            PersistedFileKind::TableFile,
-            PersistedPageKind::TableMeta,
-            page_id,
-            cause,
-        )
+fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
+    let payload = validate_block(buf, TABLE_META_BLOCK_SPEC).map_err(|cause| {
+        Error::block_corrupted(FileKind::TableFile, BlockKind::TableMeta, page_id, cause)
     })?;
-    let (_, meta_page) = MetaPage::deser(payload, 0).map_err(|err| match err {
-        Error::InvalidFormat => Error::persisted_page_corrupted(
-            PersistedFileKind::TableFile,
-            PersistedPageKind::TableMeta,
+    let (_, meta_block) = MetaBlock::deser(payload, 0).map_err(|err| match err {
+        Error::InvalidFormat => Error::block_corrupted(
+            FileKind::TableFile,
+            BlockKind::TableMeta,
             page_id,
-            PersistedPageCorruptionCause::InvalidPayload,
+            BlockCorruptionCause::InvalidPayload,
         ),
         other => other,
     })?;
     Ok(ParsedMeta {
         meta: TableMeta {
-            metadata: Arc::new(meta_page.schema),
-            column_block_index_root: meta_page.column_block_index_root,
-            pivot_row_id: meta_page.pivot_row_id,
-            heap_redo_start_ts: meta_page.heap_redo_start_ts,
+            metadata: Arc::new(meta_block.schema),
+            column_block_index_root: meta_block.column_block_index_root,
+            pivot_row_id: meta_block.pivot_row_id,
+            heap_redo_start_ts: meta_block.heap_redo_start_ts,
         },
-        alloc_map: meta_page.alloc_map,
-        gc_block_list: meta_page.gc_block_list,
+        alloc_map: meta_block.alloc_map,
+        gc_block_list: meta_block.gc_block_list,
     })
 }
 
@@ -159,59 +152,59 @@ fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMet
     validate_active_meta_block_id(
         &parsed_meta.alloc_map,
         meta_block_id,
-        PersistedFileKind::TableFile,
-        PersistedPageKind::TableMeta,
+        FileKind::TableFile,
+        BlockKind::TableMeta,
     )
 }
 
 #[inline]
-fn build_table_meta_page(root: &ActiveRoot) -> Result<DirectBuf> {
-    let meta_page = root.meta_page_ser_view();
+fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
+    let meta_block = root.meta_block_ser_view();
     let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-    let meta_len = meta_page.ser_len();
+    let meta_len = meta_block.ser_len();
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
         return Err(Error::InvalidState);
     }
-    let meta_idx = write_page_header(meta_buf.as_bytes_mut(), TABLE_META_PAGE_SPEC);
-    let meta_idx = meta_page.ser(meta_buf.as_bytes_mut(), meta_idx);
+    let meta_idx = write_block_header(meta_buf.as_bytes_mut(), TABLE_META_BLOCK_SPEC);
+    let meta_idx = meta_block.ser(meta_buf.as_bytes_mut(), meta_idx);
     debug_assert_eq!(
         meta_idx,
-        crate::file::page_integrity::PAGE_INTEGRITY_HEADER_SIZE + meta_len
+        crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE + meta_len
     );
-    write_page_checksum(meta_buf.as_bytes_mut());
+    write_block_checksum(meta_buf.as_bytes_mut());
     Ok(meta_buf)
 }
 
 #[inline]
-fn build_table_super_page(root: &ActiveRoot) -> Result<DirectBuf> {
-    let super_page = root.ser_view();
-    let mut buf = DirectBuf::zeroed(SUPER_PAGE_SIZE);
-    let ser_len = super_page.ser_len();
-    if ser_len > SUPER_PAGE_FOOTER_OFFSET {
-        // single super page cannot hold all data
+fn build_table_super_block(root: &ActiveRoot) -> Result<DirectBuf> {
+    let super_block = root.super_block_ser_view();
+    let mut buf = DirectBuf::zeroed(SUPER_BLOCK_SIZE);
+    let ser_len = super_block.ser_len();
+    if ser_len > SUPER_BLOCK_FOOTER_OFFSET {
+        // single super block cannot hold all data
         unimplemented!("multiple pages are required to hold super data");
     }
-    let ser_idx = super_page.ser(buf.as_bytes_mut(), 0);
+    let ser_idx = super_block.ser(buf.as_bytes_mut(), 0);
     debug_assert_eq!(ser_idx, ser_len);
 
-    let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_PAGE_FOOTER_OFFSET]);
-    let footer = SuperPageFooter {
+    let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]);
+    let footer = SuperBlockFooter {
         b3sum: *b3sum.as_bytes(),
         checkpoint_cts: root.trx_id,
     };
-    let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_PAGE_FOOTER_OFFSET);
-    debug_assert_eq!(ser_idx, SUPER_PAGE_SIZE);
+    let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_BLOCK_FOOTER_OFFSET);
+    debug_assert_eq!(ser_idx, SUPER_BLOCK_SIZE);
     Ok(buf)
 }
 
 #[inline]
 fn table_codec() -> CowCodec<TableMeta> {
     CowCodec {
-        parse_super_page: parse_table_super_page,
-        parse_meta_block: parse_table_meta_page,
+        parse_super_block: parse_table_super_block,
+        parse_meta_block: parse_table_meta_block,
         validate_root: validate_table_root,
-        build_meta_block: build_table_meta_page,
-        build_super_page: build_table_super_page,
+        build_meta_block: build_table_meta_block,
+        build_super_block: build_table_super_block,
     }
 }
 
@@ -250,7 +243,7 @@ impl TableFile {
         Ok(TableFile(cow_file))
     }
 
-    /// Load the active root after validating the selected table meta page through readonly cache.
+    /// Load the active root after validating the selected table meta block through readonly cache.
     #[inline]
     pub async fn load_active_root_from_pool(
         &self,
@@ -564,19 +557,15 @@ mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
-    use crate::file::page_integrity::PAGE_INTEGRITY_TRAILER_SIZE;
-    use crate::file::{build_test_fs, build_test_fs_in};
+    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
+    use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::AIOBuf;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
-    fn accept_any_page(
-        _page: &[u8],
-        _file_kind: PersistedFileKind,
-        _page_id: BlockID,
-    ) -> Result<()> {
+    fn accept_any_page(_page: &[u8], _file_kind: FileKind, _page_id: BlockID) -> Result<()> {
         Ok(())
     }
 
@@ -620,10 +609,10 @@ mod tests {
             let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
             buf.reset();
             buf.extend_from_slice(b"hello, world");
-            let res = table_file.write_block(BlockID::from(3), buf).await;
+            let res = table_file.write_block(test_block_id(3), buf).await;
             assert!(res.is_ok());
 
-            let res = read_page_for_test(&table_file, BlockID::from(3)).await;
+            let res = read_page_for_test(&table_file, test_block_id(3)).await;
             assert!(res.is_ok());
             let buf = res.unwrap();
             assert_eq!(&buf.as_bytes()[..12], b"hello, world");
@@ -663,7 +652,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 145, &table_file);
             let disk_pool_guard = disk_pool.pool_guard();
-            let out_of_range_page_id = BlockID::from(1_000_000);
+            let out_of_range_page_id = test_block_id(1_000_000);
             let res = disk_pool
                 .read_validated_block(&disk_pool_guard, out_of_range_page_id, accept_any_page)
                 .await;
@@ -699,7 +688,7 @@ mod tests {
             // it should fail.
             drop(fs);
 
-            let res = read_page_for_test(&table_file, BlockID::from(1)).await;
+            let res = read_page_for_test(&table_file, test_block_id(1)).await;
             assert!(res.is_err());
 
             drop(table_file);
@@ -737,17 +726,13 @@ mod tests {
         file.sync_all().unwrap();
     }
 
-    fn assert_table_meta_corruption(
-        err: Error,
-        page_id: BlockID,
-        cause: PersistedPageCorruptionCause,
-    ) {
+    fn assert_table_meta_corruption(err: Error, page_id: BlockID, cause: BlockCorruptionCause) {
         assert!(matches!(
             err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::TableMeta,
-                page_id: actual_page_id,
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::TableMeta,
+                block_id: actual_page_id,
                 cause: actual_cause,
             } if actual_page_id == page_id && actual_cause == cause
         ));
@@ -764,12 +749,12 @@ mod tests {
                 .unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            let active_meta_page_id = table_file.active_root().meta_block_id;
+            let active_meta_block_id = table_file.active_root().meta_block_id;
             drop(table_file);
             drop(fs);
 
-            let checksum_offset = u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64
-                + (COW_FILE_PAGE_SIZE - PAGE_INTEGRITY_TRAILER_SIZE) as u64;
+            let checksum_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64
+                + (COW_FILE_PAGE_SIZE - BLOCK_INTEGRITY_TRAILER_SIZE) as u64;
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
             let fs = build_test_fs_in(temp_dir.path());
@@ -780,8 +765,8 @@ mod tests {
             };
             assert_table_meta_corruption(
                 err,
-                active_meta_page_id,
-                PersistedPageCorruptionCause::ChecksumMismatch,
+                active_meta_block_id,
+                BlockCorruptionCause::ChecksumMismatch,
             );
         });
     }
@@ -797,16 +782,16 @@ mod tests {
                 .unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            let active_meta_page_id = table_file.active_root().meta_block_id;
+            let active_meta_block_id = table_file.active_root().meta_block_id;
             drop(table_file);
             drop(fs);
 
-            let version_offset = u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64
-                + TABLE_META_MAGIC_WORD.len() as u64;
+            let version_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64
+                + TABLE_META_BLOCK_MAGIC_WORD.len() as u64;
             overwrite_file_bytes(
                 &path,
                 version_offset,
-                &(TABLE_META_VERSION + 1).to_le_bytes(),
+                &(TABLE_META_BLOCK_VERSION + 1).to_le_bytes(),
             );
 
             let fs = build_test_fs_in(temp_dir.path());
@@ -817,8 +802,8 @@ mod tests {
             };
             assert_table_meta_corruption(
                 err,
-                active_meta_page_id,
-                PersistedPageCorruptionCause::InvalidVersion,
+                active_meta_block_id,
+                BlockCorruptionCause::InvalidVersion,
             );
         });
     }

@@ -624,10 +624,10 @@ mod tests {
         TableMetadata, TableSpec,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::build_test_fs_in;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol, UpdateMvcc};
@@ -672,7 +672,7 @@ mod tests {
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.read_exact(&mut page).unwrap();
         rewrite(&mut page);
-        write_page_checksum(&mut page);
+        write_block_checksum(&mut page);
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&page).unwrap();
         file.flush().unwrap();
@@ -683,7 +683,7 @@ mod tests {
         page_id: impl Into<u64>,
         start_offset: u16,
     ) {
-        let byte_offset = PAGE_INTEGRITY_HEADER_SIZE
+        let byte_offset = BLOCK_INTEGRITY_HEADER_SIZE
             + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE
             + start_offset as usize;
         rewrite_page_with_checksum(path, page_id, |page| {
@@ -1552,11 +1552,11 @@ mod tests {
             };
             assert!(matches!(
                 err,
-                Error::PersistedPageCorrupted {
-                    file_kind: PersistedFileKind::TableFile,
-                    page_kind: PersistedPageKind::LwcPage,
-                    page_id,
-                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                Error::BlockCorrupted {
+                    file_kind: FileKind::TableFile,
+                    block_kind: BlockKind::LwcBlock,
+                    block_id: page_id,
+                    cause: BlockCorruptionCause::ChecksumMismatch,
                 } if page_id == block_id
             ));
         })
@@ -1720,11 +1720,11 @@ mod tests {
             };
             assert!(matches!(
                 err,
-                Error::PersistedPageCorrupted {
-                    file_kind: PersistedFileKind::TableFile,
-                    page_kind: PersistedPageKind::ColumnDeletionBlob,
-                    page_id,
-                    cause: PersistedPageCorruptionCause::InvalidPayload,
+                Error::BlockCorrupted {
+                    file_kind: FileKind::TableFile,
+                    block_kind: BlockKind::ColumnDeletionBlob,
+                    block_id: page_id,
+                    cause: BlockCorruptionCause::InvalidPayload,
                 } if page_id == blob_ref.start_page_id
             ));
         })

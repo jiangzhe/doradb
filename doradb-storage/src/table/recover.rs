@@ -1,6 +1,6 @@
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
-use crate::error::{Error, PersistedPageCorruptionCause, PersistedPageKind, Result};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, Result};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_entry_deletion_deltas,
@@ -277,11 +277,11 @@ impl TableRecover for Table {
                 .await?;
             let row_ids = index.load_entry_row_ids(&entry).await?;
             if page.row_count() != row_ids.len() {
-                return Err(Error::persisted_page_corrupted(
-                    self.disk_pool().persisted_file_kind(),
-                    PersistedPageKind::LwcPage,
+                return Err(Error::block_corrupted(
+                    self.disk_pool().file_kind(),
+                    BlockKind::LwcBlock,
                     entry.block_id(),
-                    PersistedPageCorruptionCause::InvalidPayload,
+                    BlockCorruptionCause::InvalidPayload,
                 ));
             }
 

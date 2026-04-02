@@ -4,13 +4,10 @@ use crate::buffer::frame::FrameKind;
 use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
-use crate::error::{
-    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
-    StoragePoisonSource,
-};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
+use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::build_test_fs_in;
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
-use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, RowLocation,
     UniqueIndex, load_entry_deletion_deltas,
@@ -445,11 +442,11 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
         match res {
-            Err(Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::LwcPage,
-                page_id,
-                cause: PersistedPageCorruptionCause::ChecksumMismatch,
+            Err(Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::LwcBlock,
+                block_id: page_id,
+                cause: BlockCorruptionCause::ChecksumMismatch,
             }) => assert_eq!(page_id, block_id),
             other => panic!("expected persisted LWC corruption, got {other:?}"),
         }
@@ -499,11 +496,11 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
         match res {
-            Err(Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::ColumnBlockIndex,
-                page_id,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
+            Err(Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::ColumnBlockIndex,
+                block_id: page_id,
+                cause: BlockCorruptionCause::InvalidPayload,
             }) => assert_eq!(page_id, entry.leaf_page_id),
             other => panic!("expected persisted column-block-index corruption, got {other:?}"),
         }
@@ -553,11 +550,11 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
         match res {
-            Err(Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::ColumnBlockIndex,
-                page_id,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
+            Err(Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::ColumnBlockIndex,
+                block_id: page_id,
+                cause: BlockCorruptionCause::InvalidPayload,
             }) => assert_eq!(page_id, entry.leaf_page_id),
             other => panic!("expected persisted column-block-index corruption, got {other:?}"),
         }
@@ -603,11 +600,11 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         let stmt = trx.start_stmt();
         let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
         match res {
-            Err(Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::LwcPage,
-                page_id,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
+            Err(Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::LwcBlock,
+                block_id: page_id,
+                cause: BlockCorruptionCause::InvalidPayload,
             }) => assert_eq!(page_id, entry.block_id()),
             other => panic!("expected persisted LWC invalid-payload corruption, got {other:?}"),
         }
@@ -1003,11 +1000,11 @@ fn test_checkpoint_for_deletion_fails_on_invalid_v2_delete_metadata() {
             .unwrap_err();
         assert!(matches!(
             err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::ColumnBlockIndex,
-                page_id,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::ColumnBlockIndex,
+                block_id: page_id,
+                cause: BlockCorruptionCause::InvalidPayload,
             } if page_id == entry.leaf_page_id
         ));
 
@@ -1090,11 +1087,11 @@ fn test_checkpoint_for_deletion_fails_on_short_v2_delete_section_header() {
             .unwrap_err();
         assert!(matches!(
             err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::ColumnBlockIndex,
-                page_id,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::ColumnBlockIndex,
+                block_id: page_id,
+                cause: BlockCorruptionCause::InvalidPayload,
             } if page_id == entry.leaf_page_id
         ));
 
@@ -2867,7 +2864,7 @@ fn rewrite_page_with_checksum(
     file.seek(SeekFrom::Start(offset)).unwrap();
     file.read_exact(&mut page).unwrap();
     rewrite(&mut page);
-    write_page_checksum(&mut page);
+    write_block_checksum(&mut page);
     file.seek(SeekFrom::Start(offset)).unwrap();
     file.write_all(&page).unwrap();
     file.flush().unwrap();
@@ -2937,7 +2934,7 @@ fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
     const SEARCH_TYPE_DELTA_U32: u8 = 2;
     const SEARCH_TYPE_DELTA_U16: u8 = 3;
 
-    let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+    let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
     let search_type = page[payload_start + COLUMN_BLOCK_HEADER_SIZE];
     let (prefix_size, entry_offset_offset) = match search_type {
         SEARCH_TYPE_PLAIN => (10usize, 8usize),
@@ -2956,7 +2953,7 @@ fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
 
 fn corrupt_lwc_row_shape_fingerprint(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {
     rewrite_page_with_checksum(path, page_id, |page| {
-        let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
         page[payload_start] ^= 0xFF;
     });
 }

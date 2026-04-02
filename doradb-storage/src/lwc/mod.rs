@@ -8,8 +8,8 @@ use crate::bitmap::Bitmap;
 use crate::catalog::TableMetadata;
 use crate::compression::*;
 use crate::error::{Error, Result};
+use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::page_integrity::{LWC_PAGE_SPEC, write_page_checksum, write_page_header};
 use crate::io::DirectBuf;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
 use crate::row::{RowID, RowPage};
@@ -889,7 +889,7 @@ impl<'a> LwcBuilder<'a> {
         );
 
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        let payload_start = write_page_header(buf.data_mut(), LWC_PAGE_SPEC);
+        let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
         let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
         let page = LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end])?;
         page.header = header;
@@ -902,7 +902,7 @@ impl<'a> LwcBuilder<'a> {
             page.body[body_idx..end].copy_from_slice(&payload);
             body_idx = end;
         }
-        write_page_checksum(buf.data_mut());
+        write_block_checksum(buf.data_mut());
         Ok(buf)
     }
 
@@ -1587,8 +1587,8 @@ fn read_i8(input: &[u8]) -> Result<(i8, &[u8])> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
-    use crate::error::PersistedFileKind;
-    use crate::file::BlockID;
+    use crate::error::FileKind;
+    use crate::file::test_block_id;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::AIOBuf;
     use crate::row::{Delete, InsertRow, RowPage};
@@ -1942,8 +1942,8 @@ mod tests {
 
         let lwc_page = LwcPage::try_from_persisted_bytes(
             buf.as_bytes(),
-            PersistedFileKind::TableFile,
-            BlockID::from(1),
+            FileKind::TableFile,
+            test_block_id(1),
         )
         .unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, expected_rows.len());
@@ -2115,8 +2115,8 @@ mod tests {
 
         let lwc_page = LwcPage::try_from_persisted_bytes(
             buf.as_bytes(),
-            PersistedFileKind::TableFile,
-            BlockID::from(1),
+            FileKind::TableFile,
+            test_block_id(1),
         )
         .unwrap();
         assert_eq!(lwc_page.header.row_count() as usize, rows.len());

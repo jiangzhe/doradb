@@ -4,7 +4,7 @@ use crate::catalog::{TableID, USER_OBJ_ID_START};
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::TableFileSystemConfig;
 use crate::conf::path::{path_to_utf8, validate_catalog_file_name};
-use crate::error::{Error, PersistedFileKind, Result};
+use crate::error::{Error, FileKind, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MultiTableFile};
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
@@ -97,7 +97,7 @@ impl TableFileSystem {
         )?);
         let disk_pool = ReadonlyBufferPool::new(
             table_id,
-            PersistedFileKind::TableFile,
+            FileKind::TableFile,
             Arc::clone(&table_file),
             global_disk_pool,
         );
@@ -147,7 +147,7 @@ impl TableFileSystem {
                 .await?;
         let disk_pool = ReadonlyBufferPool::new(
             CATALOG_MTB_PERSISTED_FILE_ID,
-            PersistedFileKind::CatalogMultiTableFile,
+            FileKind::CatalogMultiTableFile,
             Arc::clone(&mtb),
             global_disk_pool,
         );

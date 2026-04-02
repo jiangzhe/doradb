@@ -1,23 +1,21 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::{PersistedFileID, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{
-    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
-};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::TableFsRequest;
+use crate::file::block_integrity::{
+    BlockIntegritySpec, max_payload_len, validate_block, write_block_checksum, write_block_header,
+};
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
     MutableCowFile, OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
-use crate::file::meta_page::{
-    MULTI_TABLE_META_MAGIC_WORD, MultiTableMetaPageData, MultiTableMetaPageSerView,
+use crate::file::meta_block::{
+    MULTI_TABLE_META_BLOCK_MAGIC_WORD, MultiTableMetaBlockData, MultiTableMetaBlockSerView,
 };
-use crate::file::page_integrity::{
-    PageIntegritySpec, max_payload_len, validate_page, write_page_checksum, write_page_header,
-};
-use crate::file::super_page::{
-    SUPER_PAGE_FOOTER_OFFSET, SUPER_PAGE_SIZE, SUPER_PAGE_VERSION, SuperPageBody, SuperPageFooter,
-    SuperPageHeader, SuperPageSerView, parse_super_page,
+use crate::file::super_block::{
+    SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlockBody,
+    SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
 use crate::file::table_file::TABLE_FILE_INITIAL_SIZE;
 use crate::io::{AIOBuf, AIOClient, DirectBuf};
@@ -39,33 +37,46 @@ pub const CATALOG_MTB_PERSISTED_FILE_ID: PersistedFileID = USER_OBJ_ID_START - 1
 pub const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
 
 const MULTI_TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', b'M', b'T', b'B', 0];
-const MULTI_TABLE_META_PAGE_SPEC: PageIntegritySpec =
-    PageIntegritySpec::new(MULTI_TABLE_META_MAGIC_WORD, CATALOG_MTB_VERSION);
+const MULTI_TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
+    BlockIntegritySpec::new(MULTI_TABLE_META_BLOCK_MAGIC_WORD, CATALOG_MTB_VERSION);
 
 /// Root descriptor reserved for one catalog logical table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CatalogTableRootDesc {
     /// Catalog table id.
     pub table_id: TableID,
-    /// Reserved on-disk root page id for future catalog table persistence.
-    pub root_page_id: Option<NonZeroU64>,
-    /// Reserved pivot row id paired with `root_page_id`.
+    /// Checkpointed persisted root block id for one catalog logical table.
+    ///
+    /// `None` means no checkpointed persisted root exists yet. On disk, the
+    /// absent case is encoded as raw `0` because block `0` is reserved for the
+    /// `catalog.mtb` super block and can never be a logical table root.
+    pub root_block_id: Option<NonZeroU64>,
+    /// Row-id boundary paired with `root_block_id`.
     pub pivot_row_id: RowID,
 }
 
-/// File-specific payload persisted in `catalog.mtb` meta pages.
+impl CatalogTableRootDesc {
+    /// Returns the checkpointed persisted root block id, if one exists.
+    #[inline]
+    pub fn checkpoint_root_block_id(&self) -> Option<BlockID> {
+        self.root_block_id
+            .map(|block_id| BlockID::from(block_id.get()))
+    }
+}
+
+/// File-specific payload persisted in `catalog.mtb` meta blocks.
 ///
 /// Generic CoW bookkeeping fields (`alloc_map`, `gc_block_list`, `meta_block_id`)
 /// are stored on the shared active root, not in this payload struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultiTableMetaPage {
+pub struct MultiTableMetaBlock {
     /// Global next user object-id allocator watermark.
     pub next_user_obj_id: ObjID,
     /// Reserved root descriptors for catalog logical tables.
     pub table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
 }
 
-impl MultiTableMetaPage {
+impl MultiTableMetaBlock {
     /// Create a meta payload initialized with allocator lower bound.
     #[inline]
     pub fn new(next_user_obj_id: ObjID) -> Self {
@@ -73,7 +84,7 @@ impl MultiTableMetaPage {
         for (idx, root) in table_roots.iter_mut().enumerate() {
             root.table_id = idx as TableID;
         }
-        MultiTableMetaPage {
+        MultiTableMetaBlock {
             next_user_obj_id: next_user_obj_id.max(USER_OBJ_ID_START),
             table_roots,
         }
@@ -81,7 +92,7 @@ impl MultiTableMetaPage {
 }
 
 /// Active-root type for `catalog.mtb`.
-pub type MultiTableActiveRoot = GenericActiveRoot<MultiTableMetaPage>;
+pub type MultiTableActiveRoot = GenericActiveRoot<MultiTableMetaBlock>;
 
 impl MultiTableActiveRoot {
     /// Create default active root for a newly created `catalog.mtb` file.
@@ -98,13 +109,13 @@ impl MultiTableActiveRoot {
             SUPER_BLOCK_ID,
             alloc_map,
             vec![],
-            MultiTableMetaPage::new(USER_OBJ_ID_START),
+            MultiTableMetaBlock::new(USER_OBJ_ID_START),
         )
     }
 
     #[inline]
-    pub fn meta_page_ser_view(&self) -> MultiTableMetaPageSerView<'_> {
-        MultiTableMetaPageSerView::new(&self.meta, &self.alloc_map, &self.gc_block_list)
+    pub fn meta_block_ser_view(&self) -> MultiTableMetaBlockSerView<'_> {
+        MultiTableMetaBlockSerView::new(&self.meta, &self.alloc_map, &self.gc_block_list)
     }
 }
 
@@ -123,18 +134,18 @@ impl Default for MultiTableActiveRoot {
 pub struct MultiTableFileSnapshot {
     /// Inclusive lower replay bound for catalog redo persisted in `catalog.mtb`.
     pub catalog_replay_start_ts: TrxID,
-    /// Active meta-page payload.
-    pub meta: MultiTableMetaPage,
+    /// Active meta-block payload.
+    pub meta: MultiTableMetaBlock,
 }
 
 #[inline]
-fn parse_multi_table_super_page(buf: &[u8]) -> Result<crate::file::super_page::SuperPage> {
-    parse_super_page(buf, MULTI_TABLE_FILE_MAGIC_WORD, SUPER_PAGE_VERSION)
+fn parse_multi_table_super_block(buf: &[u8]) -> Result<crate::file::super_block::SuperBlock> {
+    parse_super_block(buf, MULTI_TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
 }
 
 #[inline]
-fn build_multi_table_super_page(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
-    Ok(build_super_page(
+fn build_multi_table_super_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
+    Ok(build_super_block(
         root.slot_no,
         root.trx_id,
         root.meta_block_id,
@@ -142,89 +153,89 @@ fn build_multi_table_super_page(root: &MultiTableActiveRoot) -> Result<DirectBuf
 }
 
 #[inline]
-fn parse_multi_table_meta_page(
+fn parse_multi_table_meta_block(
     page_id: BlockID,
     buf: &[u8],
-) -> Result<ParsedMeta<MultiTableMetaPage>> {
-    let payload = validate_page(buf, MULTI_TABLE_META_PAGE_SPEC).map_err(|cause| {
-        Error::persisted_page_corrupted(
-            PersistedFileKind::CatalogMultiTableFile,
-            PersistedPageKind::MultiTableMeta,
+) -> Result<ParsedMeta<MultiTableMetaBlock>> {
+    let payload = validate_block(buf, MULTI_TABLE_META_BLOCK_SPEC).map_err(|cause| {
+        Error::block_corrupted(
+            FileKind::CatalogMultiTableFile,
+            BlockKind::MultiTableMeta,
             page_id,
             cause,
         )
     })?;
-    let (_, meta_page) = MultiTableMetaPageData::deser(payload, 0).map_err(|err| match err {
-        Error::InvalidFormat => Error::persisted_page_corrupted(
-            PersistedFileKind::CatalogMultiTableFile,
-            PersistedPageKind::MultiTableMeta,
+    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|err| match err {
+        Error::InvalidFormat => Error::block_corrupted(
+            FileKind::CatalogMultiTableFile,
+            BlockKind::MultiTableMeta,
             page_id,
-            PersistedPageCorruptionCause::InvalidPayload,
+            BlockCorruptionCause::InvalidPayload,
         ),
         other => other,
     })?;
 
     Ok(ParsedMeta {
-        meta: MultiTableMetaPage {
-            next_user_obj_id: meta_page.next_user_obj_id,
-            table_roots: meta_page.table_roots,
+        meta: MultiTableMetaBlock {
+            next_user_obj_id: meta_block.next_user_obj_id,
+            table_roots: meta_block.table_roots,
         },
-        alloc_map: meta_page.alloc_map,
-        gc_block_list: meta_page.gc_block_list,
+        alloc_map: meta_block.alloc_map,
+        gc_block_list: meta_block.gc_block_list,
     })
 }
 
 #[inline]
 fn validate_multi_table_root(
     meta_block_id: BlockID,
-    parsed_meta: &ParsedMeta<MultiTableMetaPage>,
+    parsed_meta: &ParsedMeta<MultiTableMetaBlock>,
 ) -> Result<()> {
     validate_active_meta_block_id(
         &parsed_meta.alloc_map,
         meta_block_id,
-        PersistedFileKind::CatalogMultiTableFile,
-        PersistedPageKind::MultiTableMeta,
+        FileKind::CatalogMultiTableFile,
+        BlockKind::MultiTableMeta,
     )
 }
 
 #[inline]
-fn build_multi_table_meta_page(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
-    let meta_page = root.meta_page_ser_view();
-    let meta_len = meta_page.ser_len();
+fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
+    let meta_block = root.meta_block_ser_view();
+    let meta_len = meta_block.ser_len();
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE)
         || root.gc_block_list.len() > u32::MAX as usize
     {
         return Err(Error::InvalidState);
     }
     let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-    let idx = write_page_header(buf.as_bytes_mut(), MULTI_TABLE_META_PAGE_SPEC);
-    let idx = meta_page.ser(buf.as_bytes_mut(), idx);
+    let idx = write_block_header(buf.as_bytes_mut(), MULTI_TABLE_META_BLOCK_SPEC);
+    let idx = meta_block.ser(buf.as_bytes_mut(), idx);
     debug_assert_eq!(
         idx,
-        crate::file::page_integrity::PAGE_INTEGRITY_HEADER_SIZE + meta_len
+        crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE + meta_len
     );
-    write_page_checksum(buf.as_bytes_mut());
+    write_block_checksum(buf.as_bytes_mut());
     Ok(buf)
 }
 
 #[inline]
-fn multi_table_codec() -> CowCodec<MultiTableMetaPage> {
+fn multi_table_codec() -> CowCodec<MultiTableMetaBlock> {
     CowCodec {
-        parse_super_page: parse_multi_table_super_page,
-        parse_meta_block: parse_multi_table_meta_page,
+        parse_super_block: parse_multi_table_super_block,
+        parse_meta_block: parse_multi_table_meta_block,
         validate_root: validate_multi_table_root,
-        build_meta_block: build_multi_table_meta_page,
-        build_super_page: build_multi_table_super_page,
+        build_meta_block: build_multi_table_meta_block,
+        build_super_block: build_multi_table_super_block,
     }
 }
 
 /// Persistent file facade for unified catalog metadata (`catalog.mtb`).
 ///
 /// The file layout follows `TableFile` conventions:
-/// - page 0 contains two ping-pong super pages,
-/// - meta pages are CoW-allocated and super pages point to active meta page,
-/// - updates are published by writing new meta page then swapping active super page.
-pub struct MultiTableFile(CowFile<MultiTableMetaPage>);
+/// - page 0 contains two ping-pong super blocks,
+/// - meta blocks are CoW-allocated and super blocks point to active meta block,
+/// - updates are published by writing new meta block then swapping active super block.
+pub struct MultiTableFile(CowFile<MultiTableMetaBlock>);
 
 impl MultiTableFile {
     /// Open existing file or create a new one, then load/publish initial active root.
@@ -265,7 +276,7 @@ impl MultiTableFile {
         Ok(file)
     }
 
-    /// Load the active root after validating the selected `catalog.mtb` meta page.
+    /// Load the active root after validating the selected `catalog.mtb` meta block.
     #[inline]
     pub async fn load_active_root_from_pool(
         &self,
@@ -305,7 +316,7 @@ impl MultiTableFile {
 }
 
 impl Deref for MultiTableFile {
-    type Target = CowFile<MultiTableMetaPage>;
+    type Target = CowFile<MultiTableMetaBlock>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -423,7 +434,7 @@ impl MutableMultiTableFile {
             return Err(Error::InvalidArgument);
         }
         for root in &table_roots {
-            if root.root_page_id.is_none() && root.pivot_row_id != 0 {
+            if root.root_block_id.is_none() && root.pivot_row_id != 0 {
                 return Err(Error::InvalidArgument);
             }
         }
@@ -434,7 +445,7 @@ impl MutableMultiTableFile {
         Ok(())
     }
 
-    /// Commit mutable root by writing meta page then ping-pong super page.
+    /// Commit mutable root by writing meta block then ping-pong super block.
     #[inline]
     pub async fn commit(mut self) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
         let new_root = self
@@ -481,32 +492,32 @@ impl MutableCowFile for MutableMultiTableFile {
 }
 
 /// Guard object for reclaimed replaced roots of `catalog.mtb`.
-pub type OldMultiTableRoot = OldCowRoot<MultiTableMetaPage>;
+pub type OldMultiTableRoot = OldCowRoot<MultiTableMetaBlock>;
 
 #[inline]
-fn build_super_page(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID) -> DirectBuf {
-    let mut buf = DirectBuf::zeroed(SUPER_PAGE_SIZE);
-    let ser_view = SuperPageSerView {
-        header: SuperPageHeader {
+fn build_super_block(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID) -> DirectBuf {
+    let mut buf = DirectBuf::zeroed(SUPER_BLOCK_SIZE);
+    let ser_view = SuperBlockSerView {
+        header: SuperBlockHeader {
             magic_word: MULTI_TABLE_FILE_MAGIC_WORD,
-            version: SUPER_PAGE_VERSION,
+            version: SUPER_BLOCK_VERSION,
             slot_no,
             checkpoint_cts,
         },
-        body: SuperPageBody { meta_block_id },
+        body: SuperBlockBody { meta_block_id },
     };
     let ser_len = ser_view.ser_len();
-    debug_assert!(ser_len <= SUPER_PAGE_FOOTER_OFFSET);
+    debug_assert!(ser_len <= SUPER_BLOCK_FOOTER_OFFSET);
     let ser_idx = ser_view.ser(buf.as_bytes_mut(), 0);
     debug_assert_eq!(ser_idx, ser_len);
 
-    let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_PAGE_FOOTER_OFFSET]);
-    let footer = SuperPageFooter {
+    let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]);
+    let footer = SuperBlockFooter {
         b3sum: *b3sum.as_bytes(),
         checkpoint_cts,
     };
-    let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_PAGE_FOOTER_OFFSET);
-    debug_assert_eq!(ser_idx, SUPER_PAGE_SIZE);
+    let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_BLOCK_FOOTER_OFFSET);
+    debug_assert_eq!(ser_idx, SUPER_BLOCK_SIZE);
     buf
 }
 
@@ -514,8 +525,9 @@ fn build_super_page(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID)
 mod tests {
     use super::*;
     use crate::buffer::global_readonly_pool_scope;
-    use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
-    use crate::file::page_integrity::PAGE_INTEGRITY_TRAILER_SIZE;
+    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
+    use crate::file::test_block_id;
     use crate::file::{build_test_fs, build_test_fs_in};
     use crate::io::AIOBuf;
     use std::fs::OpenOptions;
@@ -536,14 +548,14 @@ mod tests {
     fn assert_multi_table_meta_corruption(
         err: Error,
         page_id: BlockID,
-        cause: PersistedPageCorruptionCause,
+        cause: BlockCorruptionCause,
     ) {
         assert!(matches!(
             err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::CatalogMultiTableFile,
-                page_kind: PersistedPageKind::MultiTableMeta,
-                page_id: actual_page_id,
+            Error::BlockCorrupted {
+                file_kind: FileKind::CatalogMultiTableFile,
+                block_kind: BlockKind::MultiTableMeta,
+                block_id: actual_page_id,
                 cause: actual_cause,
             } if actual_page_id == page_id && actual_cause == cause
         ));
@@ -563,20 +575,20 @@ mod tests {
             let s0 = mtb.load_snapshot().unwrap();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(s0.meta.next_user_obj_id, USER_OBJ_ID_START);
-            let meta_page_id_0 = mtb.active_root().meta_block_id;
-            assert!(meta_page_id_0 > BlockID::from(0));
+            let meta_block_id_0 = mtb.active_root().meta_block_id;
+            assert!(meta_block_id_0 > test_block_id(0));
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
                 root.table_id = idx as u64;
-                root.root_page_id = NonZeroU64::new((idx + 10) as u64);
+                root.root_block_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = (idx * 100) as u64;
             }
             mtb.publish_checkpoint(7, USER_OBJ_ID_START + 16, roots)
                 .await
                 .unwrap();
-            let meta_page_id_1 = mtb.active_root().meta_block_id;
-            assert_ne!(meta_page_id_0, meta_page_id_1);
+            let meta_block_id_1 = mtb.active_root().meta_block_id;
+            assert_ne!(meta_block_id_0, meta_block_id_1);
             drop(mtb);
 
             let (mtb2, _) = fs
@@ -595,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_table_file_meta_page_copy_on_write() {
+    fn test_multi_table_file_meta_block_copy_on_write() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
@@ -609,25 +621,25 @@ mod tests {
                 root.table_id = idx as u64;
             }
 
-            let meta_page_id_0 = mtb.active_root().meta_block_id;
+            let meta_block_id_0 = mtb.active_root().meta_block_id;
             mtb.publish_checkpoint(3, USER_OBJ_ID_START + 1, roots)
                 .await
                 .unwrap();
-            let meta_page_id_1 = mtb.active_root().meta_block_id;
+            let meta_block_id_1 = mtb.active_root().meta_block_id;
             mtb.publish_checkpoint(4, USER_OBJ_ID_START + 2, roots)
                 .await
                 .unwrap();
-            let meta_page_id_2 = mtb.active_root().meta_block_id;
+            let meta_block_id_2 = mtb.active_root().meta_block_id;
 
-            assert_ne!(meta_page_id_0, meta_page_id_1);
-            assert_ne!(meta_page_id_1, meta_page_id_2);
-            assert!(mtb.active_root().gc_block_list.contains(&meta_page_id_0));
-            assert!(mtb.active_root().gc_block_list.contains(&meta_page_id_1));
+            assert_ne!(meta_block_id_0, meta_block_id_1);
+            assert_ne!(meta_block_id_1, meta_block_id_2);
+            assert!(mtb.active_root().gc_block_list.contains(&meta_block_id_0));
+            assert!(mtb.active_root().gc_block_list.contains(&meta_block_id_1));
         });
     }
 
     #[test]
-    fn test_multi_table_file_rejects_super_page_version_mismatch() {
+    fn test_multi_table_file_rejects_super_block_version_mismatch() {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
@@ -644,12 +656,12 @@ mod tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            // overwrite both super-page versions to simulate format mismatch.
+            // overwrite both super-block versions to simulate format mismatch.
             file.seek(SeekFrom::Start(MULTI_TABLE_FILE_MAGIC_WORD.len() as u64))
                 .unwrap();
             file.write_all(&2u64.to_le_bytes()).unwrap();
             file.seek(SeekFrom::Start(
-                SUPER_PAGE_SIZE as u64 + MULTI_TABLE_FILE_MAGIC_WORD.len() as u64,
+                SUPER_BLOCK_SIZE as u64 + MULTI_TABLE_FILE_MAGIC_WORD.len() as u64,
             ))
             .unwrap();
             file.write_all(&2u64.to_le_bytes()).unwrap();
@@ -671,7 +683,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let active_meta_page_id = mtb.active_root().meta_block_id;
+            let active_meta_block_id = mtb.active_root().meta_block_id;
             drop(mtb);
             drop(fs);
 
@@ -680,10 +692,11 @@ mod tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            // overwrite meta-page version to simulate format mismatch.
-            let meta_offset = u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64;
+            // overwrite meta-block version to simulate format mismatch.
+            let meta_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64;
             file.seek(SeekFrom::Start(
-                meta_offset + crate::file::meta_page::MULTI_TABLE_META_MAGIC_WORD.len() as u64,
+                meta_offset
+                    + crate::file::meta_block::MULTI_TABLE_META_BLOCK_MAGIC_WORD.len() as u64,
             ))
             .unwrap();
             file.write_all(&(CATALOG_MTB_VERSION + 1).to_le_bytes())
@@ -697,8 +710,8 @@ mod tests {
             };
             assert_multi_table_meta_corruption(
                 err,
-                active_meta_page_id,
-                PersistedPageCorruptionCause::InvalidVersion,
+                active_meta_block_id,
+                BlockCorruptionCause::InvalidVersion,
             );
         });
     }
@@ -713,12 +726,12 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let active_meta_page_id = mtb.active_root().meta_block_id;
+            let active_meta_block_id = mtb.active_root().meta_block_id;
             drop(mtb);
             drop(fs);
 
-            let checksum_offset = u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64
-                + (COW_FILE_PAGE_SIZE - PAGE_INTEGRITY_TRAILER_SIZE) as u64;
+            let checksum_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64
+                + (COW_FILE_PAGE_SIZE - BLOCK_INTEGRITY_TRAILER_SIZE) as u64;
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
             let fs = build_test_fs_in(dir.path());
@@ -728,8 +741,8 @@ mod tests {
             };
             assert_multi_table_meta_corruption(
                 err,
-                active_meta_page_id,
-                PersistedPageCorruptionCause::ChecksumMismatch,
+                active_meta_block_id,
+                BlockCorruptionCause::ChecksumMismatch,
             );
         });
     }
@@ -748,7 +761,7 @@ mod tests {
             let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots_v1.iter_mut().enumerate() {
                 root.table_id = idx as u64;
-                root.root_page_id = NonZeroU64::new((idx + 10) as u64);
+                root.root_block_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = (idx as u64) + 1;
             }
             mtb.publish_checkpoint(3, USER_OBJ_ID_START + 1, roots_v1)
@@ -757,7 +770,7 @@ mod tests {
             let older_snapshot = mtb.load_snapshot().unwrap();
 
             let mut roots_v2 = roots_v1;
-            roots_v2[0].root_page_id = NonZeroU64::new(99);
+            roots_v2[0].root_block_id = NonZeroU64::new(99);
             roots_v2[0].pivot_row_id = 100;
             mtb.publish_checkpoint(4, USER_OBJ_ID_START + 2, roots_v2)
                 .await
@@ -766,7 +779,7 @@ mod tests {
             drop(mtb);
             drop(fs);
 
-            let version_offset = active_super_slot * SUPER_PAGE_SIZE as u64
+            let version_offset = active_super_slot * SUPER_BLOCK_SIZE as u64
                 + MULTI_TABLE_FILE_MAGIC_WORD.len() as u64;
             overwrite_file_bytes(&path, version_offset, &2u64.to_le_bytes());
 
@@ -798,7 +811,7 @@ mod tests {
             let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots_v1.iter_mut().enumerate() {
                 root.table_id = idx as u64;
-                root.root_page_id = NonZeroU64::new((idx + 20) as u64);
+                root.root_block_id = NonZeroU64::new((idx + 20) as u64);
                 root.pivot_row_id = (idx as u64) + 10;
             }
             mtb.publish_checkpoint(5, USER_OBJ_ID_START + 10, roots_v1)
@@ -806,40 +819,40 @@ mod tests {
                 .unwrap();
 
             let mut roots_v2 = roots_v1;
-            roots_v2[1].root_page_id = NonZeroU64::new(123);
+            roots_v2[1].root_block_id = NonZeroU64::new(123);
             roots_v2[1].pivot_row_id = 222;
             mtb.publish_checkpoint(6, USER_OBJ_ID_START + 11, roots_v2)
                 .await
                 .unwrap();
-            let active_meta_page_id = mtb.active_root().meta_block_id;
+            let active_meta_block_id = mtb.active_root().meta_block_id;
             drop(mtb);
             drop(fs);
 
             let file_bytes = std::fs::read(&path).unwrap();
-            let meta_offset = usize::from(active_meta_page_id) * COW_FILE_PAGE_SIZE;
+            let meta_offset = usize::from(active_meta_block_id) * COW_FILE_PAGE_SIZE;
             let meta_end = meta_offset + COW_FILE_PAGE_SIZE;
-            let parsed_meta = parse_multi_table_meta_page(
-                active_meta_page_id,
+            let parsed_meta = parse_multi_table_meta_block(
+                active_meta_block_id,
                 &file_bytes[meta_offset..meta_end],
             )
             .unwrap();
             assert!(
                 parsed_meta
                     .alloc_map
-                    .deallocate(usize::from(active_meta_page_id))
+                    .deallocate(usize::from(active_meta_block_id))
             );
             let invalid_root = MultiTableActiveRoot::from_parts(
                 0,
                 0,
-                active_meta_page_id,
+                active_meta_block_id,
                 parsed_meta.alloc_map,
                 parsed_meta.gc_block_list,
                 parsed_meta.meta,
             );
-            let invalid_meta_buf = build_multi_table_meta_page(&invalid_root).unwrap();
+            let invalid_meta_buf = build_multi_table_meta_block(&invalid_root).unwrap();
             overwrite_file_bytes(
                 &path,
-                u64::from(active_meta_page_id) * COW_FILE_PAGE_SIZE as u64,
+                u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64,
                 invalid_meta_buf.as_bytes(),
             );
 
@@ -850,8 +863,8 @@ mod tests {
             };
             assert_multi_table_meta_corruption(
                 err,
-                active_meta_page_id,
-                PersistedPageCorruptionCause::InvalidRootInvariant,
+                active_meta_block_id,
+                BlockCorruptionCause::InvalidRootInvariant,
             );
         });
     }

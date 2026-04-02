@@ -117,13 +117,13 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
     *   Generate new Block Index Root via CoW.
 
 ### Phase 4: Commit & Watermark Advancement
-*   **Lock**: Acquire `SuperPage Lock`.
-*   **New MetaPage**: Create a new `MetaPage`.
+*   **Lock**: Acquire `SuperBlock Lock`.
+*   **New MetaBlock**: Create a new `MetaBlock`.
     *   Update `BlockIndexRoot` (if changed).
     *   **Crucial Update**: Set `Table.watermarks.deletion_rec_ts = Checkpoint_STS`.
     *   *Note*: This is set to the system timestamp acquired in Phase 1, regardless of the actual data timestamps.
-*   **Persist**: Write MetaPage to disk.
-*   **Switch**: Update `SuperPage` to point to the new MetaPage.
+*   **Persist**: Write MetaBlock to disk.
+*   **Switch**: Update `SuperBlock` to point to the new MetaBlock.
 
 ## Heartbeat Checkpoint (Log Truncation)
 
@@ -137,7 +137,7 @@ To prevent "cold" tables (tables with no recent deletions) from blocking the glo
     1.  Acquire `Checkpoint_STS`.
     2.  Verify `ColumnDeletionBuffer` has no pending commits with `CTS <= Checkpoint_STS`.
     3.  **Fast Path**: Skip Phases 2 and 3 (No Data I/O).
-    4.  **Meta Update**: Directly generate a new MetaPage with `deletion_rec_ts = Checkpoint_STS` and perform the SuperPage switch.
+    4.  **Meta Update**: Directly generate a new MetaBlock with `deletion_rec_ts = Checkpoint_STS` and perform the SuperBlock switch.
 *   **Result**: The watermark advances, allowing the Log Manager to safely discard old logs.
 
 ## 5. Garbage Collection (Memory Cleanup)
@@ -159,9 +159,9 @@ Memory entries are retained after the checkpoint to provide MVCC visibility (Und
 
 Recovery relies on the `deletion_rec_ts` as a strict **Persistence Barrier**.
 
-1.  **Load State**: Read the latest valid MetaPage from SuperPage.
+1.  **Load State**: Read the latest valid MetaBlock from SuperBlock.
 2.  **Determine Replay Start**:
-    *   Retrieve `Replay_Start_CTS = MetaPage.deletion_rec_ts`.
+    *   Retrieve `Replay_Start_CTS = MetaBlock.deletion_rec_ts`.
     *   This timestamp guarantees that **any** transaction with `CTS <= Replay_Start_CTS` has already been processed (either persisted to the Bitmap or confirmed non-existent).
 3.  **Log Replay**:
     *   The Log Reader scans entries starting from `Replay_Start_CTS`.
@@ -201,8 +201,8 @@ sequenceDiagram
     Note right of IDX: Returns New Index Root
 
     %% Phase 4
-    CP->>IO: 3. Write New MetaPage (Update Roots & Watermark)
-    CP->>IO: 4. Atomic SuperPage Switch
+    CP->>IO: 3. Write New MetaBlock (Update Roots & Watermark)
+    CP->>IO: 4. Atomic SuperBlock Switch
 
     %% GC (Independent)
     Note over Mem: Later: GC Task

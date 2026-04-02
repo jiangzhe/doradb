@@ -2,13 +2,11 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::TableMetadata;
-use crate::error::{
-    Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind, Result,
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::file::block_integrity::{
+    BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
 };
 use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE};
-use crate::file::page_integrity::{
-    LWC_PAGE_SPEC, PAGE_INTEGRITY_HEADER_SIZE, max_payload_len, validate_page,
-};
 use crate::lwc::{LwcData, LwcNullBitmap};
 use crate::serde::{Ser, Serde};
 use crate::value::{Val, ValKind};
@@ -20,7 +18,7 @@ pub const LWC_PAGE_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_SIZE);
 
 /// LwcPage stores the payload of one immutable checksummed LWC page.
 ///
-/// The surrounding page-integrity envelope is validated before this payload is
+/// The surrounding block-integrity envelope is validated before this payload is
 /// interpreted. The differences between LwcPage and row(PAX) page
 /// are:
 /// 1. Fields in row page are well aligned for typed access.
@@ -99,11 +97,11 @@ impl LwcPage {
     #[inline]
     pub fn try_from_persisted_bytes(
         input: &[u8],
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<&Self> {
-        let payload = validate_page(input, LWC_PAGE_SPEC).map_err(|cause| {
-            Error::persisted_page_corrupted(file_kind, PersistedPageKind::LwcPage, page_id, cause)
+        let payload = validate_block(input, LWC_BLOCK_SPEC).map_err(|cause| {
+            Error::block_corrupted(file_kind, BlockKind::LwcBlock, page_id, cause)
         })?;
         Self::try_from_bytes(payload)
             .map_err(|err| map_persisted_lwc_error(file_kind, page_id, err))
@@ -176,8 +174,8 @@ impl LwcPage {
         }
     }
 
-    /// Decodes selected values from one persisted page row in the requested
-    /// column order and maps payload failures to contextual persisted-page
+    /// Decodes selected values from one persisted block row in the requested
+    /// column order and maps payload failures to contextual persisted-block
     /// corruption.
     #[inline]
     pub fn decode_persisted_row_values(
@@ -185,7 +183,7 @@ impl LwcPage {
         metadata: &TableMetadata,
         row_idx: usize,
         read_set: &[usize],
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<Vec<Val>> {
         self.decode_persisted_row_values_inner(
@@ -198,14 +196,14 @@ impl LwcPage {
         )
     }
 
-    /// Decodes all values from one persisted page row and maps payload
-    /// failures to contextual persisted-page corruption.
+    /// Decodes all values from one persisted block row and maps payload
+    /// failures to contextual persisted-block corruption.
     #[inline]
     pub fn decode_persisted_full_row_values(
         &self,
         metadata: &TableMetadata,
         row_idx: usize,
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<Vec<Val>> {
         self.decode_persisted_row_values_inner(
@@ -225,7 +223,7 @@ impl LwcPage {
         row_idx: usize,
         col_indices: impl Iterator<Item = usize>,
         capacity: usize,
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<Vec<Val>> {
         let mut vals = Vec::with_capacity(capacity);
@@ -241,7 +239,7 @@ impl LwcPage {
         metadata: &TableMetadata,
         row_idx: usize,
         col_idx: usize,
-        file_kind: PersistedFileKind,
+        file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<Val> {
         let column = self
@@ -263,7 +261,7 @@ impl LwcPage {
 #[inline]
 pub(crate) fn validate_persisted_lwc_block(
     input: &[u8],
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<()> {
     LwcPage::try_from_persisted_bytes(input, file_kind, page_id).map(|_| ())
@@ -272,7 +270,7 @@ pub(crate) fn validate_persisted_lwc_block(
 /// Borrowed validated persisted LWC block backed by a readonly-cache guard.
 pub(crate) struct PersistedLwcBlock {
     guard: ReadonlyBlockGuard,
-    file_kind: PersistedFileKind,
+    file_kind: FileKind,
     page_id: BlockID,
 }
 
@@ -284,7 +282,7 @@ impl PersistedLwcBlock {
         disk_pool_guard: &PoolGuard,
         page_id: BlockID,
     ) -> Result<Self> {
-        let file_kind = disk_pool.persisted_file_kind();
+        let file_kind = disk_pool.file_kind();
         let guard = disk_pool
             .read_validated_block(disk_pool_guard, page_id, validate_persisted_lwc_block)
             .await?;
@@ -297,7 +295,7 @@ impl PersistedLwcBlock {
 
     #[inline]
     fn page(&self) -> &LwcPage {
-        let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
         let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
         LwcPage::try_from_bytes(&self.guard.page()[payload_start..payload_end])
             .expect("validated readonly LWC page must have a valid payload layout")
@@ -481,18 +479,14 @@ impl Ser<'_> for LwcPageHeader {
 }
 
 #[inline]
-pub(crate) fn map_persisted_lwc_error(
-    file_kind: PersistedFileKind,
-    page_id: BlockID,
-    err: Error,
-) -> Error {
+pub(crate) fn map_persisted_lwc_error(file_kind: FileKind, page_id: BlockID, err: Error) -> Error {
     match err {
         Error::InvalidCompressedData | Error::InvalidFormat | Error::NotSupported(_) => {
-            Error::persisted_page_corrupted(
+            Error::block_corrupted(
                 file_kind,
-                PersistedPageKind::LwcPage,
+                BlockKind::LwcBlock,
                 page_id,
-                PersistedPageCorruptionCause::InvalidPayload,
+                BlockCorruptionCause::InvalidPayload,
             )
         }
         other => other,
@@ -503,10 +497,11 @@ pub(crate) fn map_persisted_lwc_error(
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
-    use crate::error::{PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
-    use crate::file::page_integrity::{
-        PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum, write_page_header,
+    use crate::error::{BlockCorruptionCause, BlockKind, FileKind};
+    use crate::file::block_integrity::{
+        BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
     };
+    use crate::file::test_block_id;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::DirectBuf;
     use crate::lwc::{LwcBuilder, LwcCode, LwcPrimitiveSer};
@@ -523,13 +518,13 @@ mod tests {
 
     fn build_persisted_lwc_page() -> DirectBuf {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        let payload_start = write_page_header(buf.data_mut(), LWC_PAGE_SPEC);
+        let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
         let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
         let page =
             LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]).unwrap();
         page.header = LwcPageHeader::new(11, 1, 1, 0);
         page.body[..2].copy_from_slice(&(2u16).to_le_bytes());
-        write_page_checksum(buf.data_mut());
+        write_block_checksum(buf.data_mut());
         buf
     }
 
@@ -677,39 +672,36 @@ mod tests {
 
         let err = match LwcPage::try_from_persisted_bytes(
             buf.data(),
-            PersistedFileKind::TableFile,
-            BlockID::from(7),
+            FileKind::TableFile,
+            test_block_id(7),
         ) {
             Ok(_) => panic!("expected LWC checksum corruption"),
             Err(err) => err,
         };
         assert!(matches!(
             err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::LwcPage,
-                page_id,
-                cause: PersistedPageCorruptionCause::ChecksumMismatch,
-            } if page_id == BlockID::from(7)
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::LwcBlock,
+                block_id: page_id,
+                cause: BlockCorruptionCause::ChecksumMismatch,
+            } if page_id == test_block_id(7)
         ));
     }
 
     #[test]
     fn test_lwc_page_decode_persisted_row_values() {
         let (metadata, buf) = build_valid_persisted_lwc_page();
-        let page = LwcPage::try_from_persisted_bytes(
-            buf.data(),
-            PersistedFileKind::TableFile,
-            BlockID::from(8),
-        )
-        .unwrap();
+        let page =
+            LwcPage::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
+                .unwrap();
         let vals = page
             .decode_persisted_row_values(
                 &metadata,
                 1,
                 &[1, 0],
-                PersistedFileKind::TableFile,
-                BlockID::from(8),
+                FileKind::TableFile,
+                test_block_id(8),
             )
             .unwrap();
         assert_eq!(vals, vec![Val::Null, Val::U8(11)]);
@@ -722,18 +714,15 @@ mod tests {
     #[test]
     fn test_lwc_page_decode_persisted_full_row_values() {
         let (metadata, buf) = build_valid_persisted_lwc_page();
-        let page = LwcPage::try_from_persisted_bytes(
-            buf.data(),
-            PersistedFileKind::TableFile,
-            BlockID::from(8),
-        )
-        .unwrap();
+        let page =
+            LwcPage::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
+                .unwrap();
         assert_eq!(
             page.decode_persisted_full_row_values(
                 &metadata,
                 0,
-                PersistedFileKind::TableFile,
-                BlockID::from(8),
+                FileKind::TableFile,
+                test_block_id(8),
             )
             .unwrap(),
             vec![Val::U8(10), Val::I16(20)]
@@ -743,38 +732,38 @@ mod tests {
     #[test]
     fn test_lwc_page_rejects_invalid_offsets_as_persisted_corruption() {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        let payload_start = write_page_header(buf.data_mut(), LWC_PAGE_SPEC);
+        let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
         let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
         let page =
             LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]).unwrap();
         let invalid_end = (page.body.len() as u16).saturating_add(1);
         page.header = LwcPageHeader::new(0, 1, 1, 0);
         page.body[..2].copy_from_slice(&invalid_end.to_le_bytes());
-        write_page_checksum(buf.data_mut());
+        write_block_checksum(buf.data_mut());
 
         let err = match LwcPage::try_from_persisted_bytes(
             buf.data(),
-            PersistedFileKind::TableFile,
-            BlockID::from(9),
+            FileKind::TableFile,
+            test_block_id(9),
         ) {
             Ok(_) => panic!("expected invalid persisted offsets"),
             Err(err) => err,
         };
         assert!(matches!(
             err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::LwcPage,
-                page_id,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
-            } if page_id == BlockID::from(9)
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::LwcBlock,
+                block_id: page_id,
+                cause: BlockCorruptionCause::InvalidPayload,
+            } if page_id == test_block_id(9)
         ));
     }
 
     #[test]
     fn test_lwc_page_maps_persisted_value_decode_error_to_corruption() {
         let (metadata, mut buf) = build_valid_persisted_lwc_page();
-        let payload_start = PAGE_INTEGRITY_HEADER_SIZE;
+        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
         let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
         {
             let page = LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end])
@@ -793,30 +782,22 @@ mod tests {
             column[10] = 0;
             column[11..].fill(0);
         }
-        write_page_checksum(buf.data_mut());
+        write_block_checksum(buf.data_mut());
 
-        let page = LwcPage::try_from_persisted_bytes(
-            buf.data(),
-            PersistedFileKind::TableFile,
-            BlockID::from(10),
-        )
-        .unwrap();
+        let page =
+            LwcPage::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(10))
+                .unwrap();
         let err = page
-            .decode_persisted_full_row_values(
-                &metadata,
-                0,
-                PersistedFileKind::TableFile,
-                BlockID::from(10),
-            )
+            .decode_persisted_full_row_values(&metadata, 0, FileKind::TableFile, test_block_id(10))
             .unwrap_err();
         assert!(matches!(
             err,
-            Error::PersistedPageCorrupted {
-                file_kind: PersistedFileKind::TableFile,
-                page_kind: PersistedPageKind::LwcPage,
-                page_id,
-                cause: PersistedPageCorruptionCause::InvalidPayload,
-            } if page_id == BlockID::from(10)
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::LwcBlock,
+                block_id: page_id,
+                cause: BlockCorruptionCause::InvalidPayload,
+            } if page_id == test_block_id(10)
         ));
     }
 }

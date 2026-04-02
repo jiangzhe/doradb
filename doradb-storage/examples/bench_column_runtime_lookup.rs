@@ -7,7 +7,7 @@ use doradb_storage::conf::{
     EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
 };
 use doradb_storage::engine::Engine;
-use doradb_storage::error::PersistedFileKind;
+use doradb_storage::error::FileKind;
 use doradb_storage::file::BlockID;
 use doradb_storage::index::ColumnBlockIndex;
 use doradb_storage::quiescent::QuiescentBox;
@@ -129,7 +129,7 @@ async fn build_case(
     );
     let disk_pool = ReadonlyBufferPool::from_table_file(
         table.table_id(),
-        PersistedFileKind::TableFile,
+        FileKind::TableFile,
         Arc::clone(table.file()),
         global_pool.guard(),
     );

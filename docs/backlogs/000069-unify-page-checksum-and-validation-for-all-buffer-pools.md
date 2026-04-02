@@ -18,7 +18,7 @@ A follow-up task or RFC defines a decision-complete cross-pool checksum and vali
 
 ## Notes (Optional)
 
-User constraint: the checksum should live in a page footer and the work requires a buffer-pool API change. Existing integrity foundations live in docs/tasks/000059-file-integrity-foundation.md, docs/tasks/000060-checksum-rollout-for-data-pages.md, doradb-storage/src/file/page_integrity.rs, and readonly validated-load paths; fixed and evictable pools do not yet share that contract.
+User constraint: the checksum should live in a page footer and the work requires a buffer-pool API change. Existing integrity foundations live in docs/tasks/000059-file-integrity-foundation.md, docs/tasks/000060-checksum-rollout-for-data-pages.md, doradb-storage/src/file/block_integrity.rs, and readonly validated-load paths; fixed and evictable pools do not yet share that contract.
 
 ## Close Reason (Added When Closed)
 
