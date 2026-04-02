@@ -33,3 +33,12 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: already-implemented
+- Detail: This panic is no longer actionable. The strongest available fix reference is task 000056 / commit `f9bf477` (`recovery cutoff and consistency checks`), which materially changed recovery replay/bootstrap behavior in `doradb-storage/src/trx/recover.rs` and explicitly reran the `test_log_recover_` suite. `search_key_with_hints` itself has not changed since hints were introduced, which supports the conclusion that the intermittent panic was fixed indirectly by the recovery logic change rather than by a direct B-tree hint-path patch.
+- Closed By: backlog close
+- Reference: docs/tasks/000056-recovery-cutoff-and-consistency-checks.md; commit f9bf477 feat: recovery cutoff and consistency checks (#401)
+
+- Closed At: 2026-04-03
